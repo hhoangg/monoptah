@@ -6,18 +6,27 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   clearInboxCache,
   inboxListCacheKey,
+  listInboxItems,
   peekInboxList,
-  type InboxQuery,
 } from "../model/githubTasks";
-import { inboxFetchState, loadInboxFilters } from "../model/inboxFilters";
 import {
-  CLICKUP_CHANGE_EVENT,
   loadHiddenClickUpSpaceIds,
   saveHiddenClickUpSpaceIds,
 } from "../model/clickup";
+import { useInboxActivity } from "../hooks/useInboxUnseen";
 import { InboxView } from "./InboxView";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// Spies that call through, so the real view and hook run and only record the
+// project list and query they hand to the inbox cache.
+vi.mock("../model/githubTasks", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../model/githubTasks")>();
+  return {
+    ...actual,
+    listInboxItems: vi.fn(actual.listInboxItems),
+    peekInboxList: vi.fn(actual.peekInboxList),
+  };
+});
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: async () => () => {} }));
 vi.mock("@tauri-apps/api/window", () => ({
@@ -73,6 +82,8 @@ beforeEach(() => {
     }),
   );
   clearInboxCache();
+  vi.mocked(listInboxItems).mockClear();
+  vi.mocked(peekInboxList).mockClear();
   vi.mocked(invoke).mockReset();
   vi.mocked(invoke).mockImplementation(async (command, args) => {
     if (command === "clickup_status")
@@ -132,19 +143,6 @@ async function mount() {
   );
 }
 
-// The query useInboxUnseen builds for the same stored preferences.
-function railQuery(): InboxQuery {
-  const filters = loadInboxFilters();
-  return {
-    assignedToMe: filters.assignedToMe,
-    state: inboxFetchState(filters),
-    search: "",
-    linearHiddenTeamIds: [],
-    jiraHiddenProjectIds: [],
-    clickupHiddenSpaceIds: loadHiddenClickUpSpaceIds(),
-  };
-}
-
 const issueCalls = () =>
   vi.mocked(invoke).mock.calls.filter(([c]) => c === "clickup_list_issues");
 
@@ -158,14 +156,51 @@ it("lists ClickUp tasks and fetches only the spaces that are not hidden", async 
   expect(container.textContent).toContain("Engineering / Sprint 4");
 });
 
-it("caches the list under the same key the rail's unseen hook builds", async () => {
+it("builds one list cache key in the view, its rail peek and the unseen hook", async () => {
   saveHiddenClickUpSpaceIds(["902"]);
-  await mount();
-  const query = railQuery();
-  expect(inboxListCacheKey([], query)).toContain("902");
-  expect(peekInboxList([], query)?.items.map((entry) => entry.title)).toEqual([
-    "Fix export",
-  ]);
+  const cwd = "/tmp/app";
+  const keyOf = (call: readonly unknown[]) =>
+    inboxListCacheKey(
+      call[0] as Parameters<typeof inboxListCacheKey>[0],
+      call[1] as Parameters<typeof inboxListCacheKey>[1],
+    );
+
+  await act(async () =>
+    root.render(
+      createElement(InboxView, {
+        onAsk: async () => "",
+        onAskRestart: async () => "",
+        onAskMount: () => {},
+        cwd,
+        recents: [],
+        onOpenIntegrations: () => {},
+      }),
+    ),
+  );
+  // Every peek in the view (the rail peek in its initial state and the list
+  // effect) and every fetch it starts.
+  const viewKeys = [
+    ...vi.mocked(peekInboxList).mock.calls,
+    ...vi.mocked(listInboxItems).mock.calls,
+  ].map(keyOf);
+  expect(vi.mocked(peekInboxList).mock.calls.length).toBeGreaterThan(1);
+  expect(vi.mocked(listInboxItems)).toHaveBeenCalled();
+  await act(async () => root.unmount());
+
+  vi.mocked(listInboxItems).mockClear();
+  vi.mocked(peekInboxList).mockClear();
+  root = createRoot(container);
+  function Harness() {
+    useInboxActivity([], cwd, []);
+    return null;
+  }
+  await act(async () => root.render(createElement(Harness)));
+  const hookKeys = vi.mocked(listInboxItems).mock.calls.map(keyOf);
+  expect(hookKeys.length).toBeGreaterThan(0);
+
+  // Hidden space 902 is part of every key, and all of them are identical.
+  expect(viewKeys.every((key) => key.endsWith(":902"))).toBe(true);
+  expect(new Set([...viewKeys, ...hookKeys]).size).toBe(1);
 });
 
 it("refetches with the new space ids when the hidden spaces change", async () => {
@@ -175,10 +210,8 @@ it("refetches with the new space ids when the hidden spaces change", async () =>
   await act(async () => saveHiddenClickUpSpaceIds(["901"]));
   expect(issueCalls().length).toBeGreaterThan(before);
   expect(issueCalls().at(-1)?.[1]).toMatchObject({ spaceIds: ["902"] });
-  expect(
-    peekInboxList([], railQuery())?.items.map((entry) => entry.title),
-  ).toEqual(["Logo"]);
-  expect(CLICKUP_CHANGE_EVENT).toBe("monocode:clickup-change");
+  expect(container.textContent).toContain("Logo");
+  expect(container.textContent).not.toContain("Fix export");
 });
 
 it("shows the filter badge and a space checklist for the ClickUp source", async () => {

@@ -1790,32 +1790,34 @@ function TriggerRow({
       cancelled = true;
     };
   }, [projectPath, push]);
-  const [spaceNames, setSpaceNames] = useState<string[]>([]);
+  const [spaces, setSpaces] = useState<{ id: string; name: string }[]>([]);
   const clickup = trigger.kind === "clickup";
   useEffect(() => {
     if (!clickup) return;
     let cancelled = false;
     void listClickUpSpaces().then(
-      (spaces) => {
-        if (!cancelled) setSpaceNames(spaces.map((space) => space.name));
+      (next) => {
+        if (!cancelled) setSpaces(next);
       },
       () => {
-        if (!cancelled) setSpaceNames([]);
+        if (!cancelled) setSpaces([]);
       },
     );
     return () => {
       cancelled = true;
     };
   }, [clickup]);
-  // A ClickUp task carries its space name in `repo`, which is what the
-  // trigger's repo list is matched against.
+  // The trigger stores the space id, so renaming a space keeps the filter
+  // working. The name is only what the user reads.
   const spaceOptions = [
     { value: "", label: "Any space" },
-    ...spaceNames.map((name) => ({ value: name, label: name })),
+    ...spaces.map((space) => ({ value: space.id, label: space.name })),
   ];
   const savedSpace = (trigger.repos[0] ?? trigger.repo).trim();
   if (savedSpace && !spaceOptions.some((option) => option.value === savedSpace)) {
-    spaceOptions.push({ value: savedSpace, label: savedSpace });
+    // Not in the live list (deleted, or still loading): keep the saved id
+    // selectable rather than silently widening the filter.
+    spaceOptions.push({ value: savedSpace, label: `Space ${savedSpace}` });
   }
   const branchOptions = branches.map((name) => ({ value: name, label: name }));
   if (

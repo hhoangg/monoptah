@@ -223,7 +223,10 @@ function triggerMatchesInboxItem(
     .map((repo) => repo.trim().toLowerCase())
     .filter(Boolean);
   if (repos.length === 0) return true;
-  return repos.includes(item.repo.trim().toLowerCase());
+  // A ClickUp filter holds space ids, which survive a rename; its `repo` is
+  // only the space name.
+  const scope = item.provider === "clickup" ? item.teamId : item.repo;
+  return repos.includes((scope ?? "").trim().toLowerCase());
 }
 
 function matchesInboxProject(item: InboxItem, cwd: string): boolean {

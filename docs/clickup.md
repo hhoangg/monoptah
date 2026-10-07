@@ -29,8 +29,9 @@ comment threads show the latest 50 comments.
 Automations offer **ClickUp → Task appeared** after connecting. They run in the
 automation's selected local project when a ClickUp task first appears in the
 polled inbox, after its initial snapshot, once per task. The optional **Space**
-filter matches the space name, for example `Engineering`. This is polling, not a
-webhook for every task created in the workspace.
+filter lists spaces by name but stores the space id, so renaming a space in
+ClickUp does not break an existing filter. This is polling, not a webhook for
+every task created in the workspace.
 
 **Disconnect** removes the saved token and clears cached ClickUp content. The
 token is stored in `clickup-config.json` in the app's local data directory; on

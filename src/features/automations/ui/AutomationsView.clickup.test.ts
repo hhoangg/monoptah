@@ -119,7 +119,7 @@ it("offers ClickUp -> Task appeared with an optional space filter", async () => 
   );
   expect(pill("Space")?.getAttribute("aria-label")).toBe("Space: Design");
 
-  // The pick is stored in the trigger's repo list, which matches a task's space.
+  // The trigger keeps the space id, so a later rename does not break the filter.
   await act(async () =>
     [...document.querySelectorAll("button")]
       .find((button) => button.textContent === "Save")!
@@ -131,6 +131,50 @@ it("offers ClickUp -> Task appeared with an optional space filter", async () => 
   expect(saved.automation.triggers?.[0]).toMatchObject({
     kind: "clickup",
     event: "issue_created",
-    repos: ["Design"],
+    repos: ["902"],
   });
+});
+
+it("shows a saved space filter under the space's current name", async () => {
+  const saved: Automation = {
+    ...automation,
+    triggers: [
+      {
+        ...createAutomationTrigger("clickup", "issue_created"),
+        repos: ["901"],
+      },
+    ],
+  };
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "automations_list") return [saved];
+    if (command === "clickup_status")
+      return {
+        connected: true,
+        teamId: "1",
+        teamName: "Acme",
+        username: "ada",
+      };
+    // Space 901 was called "Engineering" when the filter was saved.
+    if (command === "clickup_list_spaces")
+      return [{ id: "901", name: "Platform" }];
+    if (command.endsWith("_status")) return { connected: false };
+    return [];
+  });
+  await act(async () =>
+    root.render(
+      createElement(AutomationsView, {
+        cwd: "/work/project",
+        recents: [],
+        onClose: vi.fn(),
+        onLaunch: vi.fn(),
+        onOpenSession: vi.fn(),
+      }),
+    ),
+  );
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="Open Triage ClickUp"]')!
+      .click(),
+  );
+  expect(pill("Space")?.getAttribute("aria-label")).toBe("Space: Platform");
 });

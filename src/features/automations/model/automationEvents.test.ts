@@ -67,15 +67,29 @@ describe("inbox automation events", () => {
   });
 
   it("matches ClickUp tasks and keys them by raw task id, not the display identifier", () => {
-    const clickup = item({ provider: "clickup", kind: "clickup", id: "86abc12", identifier: "ENG-42", repo: "Engineering", projectPath: "" });
-    const trigger = { ...createAutomationTrigger("clickup", "issue_created"), repos: ["Engineering"] };
+    const clickup = item({ provider: "clickup", kind: "clickup", id: "86abc12", identifier: "ENG-42", repo: "Engineering", teamId: "901", teamName: "Engineering", projectPath: "" });
+    const trigger = { ...createAutomationTrigger("clickup", "issue_created"), repos: ["901"] };
     expect(inboxAppearedEvent(clickup)).toEqual({ kind: "clickup", event: "issue_created" });
     expect(automationEventKey(clickup)).toBe("clickup:task:86abc12");
     expect(automationEventKey({ ...clickup, identifier: "#86abc12", number: 0 })).toBe("clickup:task:86abc12");
     const matches = matchInboxAutomations([automation({ triggers: [trigger] })], [clickup]);
     expect(matches).toHaveLength(1);
     expect(matches[0].prompt).toContain("Work on this ClickUp task:");
-    expect(matchInboxAutomations([automation({ triggers: [trigger] })], [{ ...clickup, repo: "Operations" }])).toEqual([]);
+    expect(matchInboxAutomations([automation({ triggers: [trigger] })], [{ ...clickup, repo: "Operations", teamId: "902", teamName: "Operations" }])).toEqual([]);
+  });
+
+  it("keeps a ClickUp space filter working after the space is renamed", () => {
+    const task = item({ provider: "clickup", kind: "clickup", id: "86abc12", identifier: "ENG-42", repo: "Engineering", teamId: "901", teamName: "Engineering", projectPath: "" });
+    // The filter is saved against the space id while the space is still called "Engineering".
+    const trigger = { ...createAutomationTrigger("clickup", "issue_created"), repos: [task.teamId!] };
+    expect(matchInboxAutomations([automation({ triggers: [trigger] })], [task])).toHaveLength(1);
+    // The space is renamed in ClickUp: same id, new name on every task.
+    const renamed = { ...task, repo: "Platform", teamName: "Platform" };
+    expect(matchInboxAutomations([automation({ triggers: [trigger] })], [renamed])).toHaveLength(1);
+    // A name is no longer a valid filter value, and another space still does not match.
+    const byName = { ...trigger, repos: ["Platform"] };
+    expect(matchInboxAutomations([automation({ triggers: [byName] })], [renamed])).toEqual([]);
+    expect(matchInboxAutomations([automation({ triggers: [trigger] })], [{ ...renamed, teamId: "902" }])).toEqual([]);
   });
 
   it("maps opened PRs, drafts, and issues", () => {
