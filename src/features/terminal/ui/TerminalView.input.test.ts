@@ -86,32 +86,107 @@ it("sends the whole string of a multi-character keydown to the PTY", async () =>
   }
 });
 
-it("does not repeat the text when beforeinput and input follow the keydown", async () => {
-  const { textarea, cleanup } = await mountTerminal();
-  try {
-    imeKeydown(textarea, "ếng");
-    // Delivered anyway, as in the observed log, in case the browser does not
-    // honour preventDefault for this input method.
+// What the browser may send after the keydown. In a real browser none of this
+// follows a keydown that was preventDefault()ed; it is dispatched anyway so the
+// test also covers xterm's own emit paths if that guarantee ever fails.
+function followUps(
+  textarea: HTMLTextAreaElement,
+  options: { composed: boolean; keypress: boolean },
+) {
+  const { composed, keypress } = options;
+  if (keypress) {
     textarea.dispatchEvent(
-      new InputEvent("beforeinput", {
-        inputType: "insertText",
-        data: "ếng",
-        composed: true,
+      new KeyboardEvent("keypress", {
+        key: "ếng",
+        code: "KeyA",
+        charCode: "ế".charCodeAt(0),
+        keyCode: "ế".charCodeAt(0),
         bubbles: true,
         cancelable: true,
       }),
     );
-    textarea.value = "ếng";
-    textarea.dispatchEvent(
-      new InputEvent("input", {
-        inputType: "insertText",
-        data: "ếng",
-        composed: true,
-        bubbles: true,
-      }),
-    );
+  }
+  textarea.dispatchEvent(
+    new InputEvent("beforeinput", {
+      inputType: "insertText",
+      data: "ếng",
+      composed,
+      bubbles: true,
+      cancelable: true,
+    }),
+  );
+  textarea.value = "ếng";
+  textarea.dispatchEvent(
+    new InputEvent("input", {
+      inputType: "insertText",
+      data: "ếng",
+      composed,
+      bubbles: true,
+    }),
+  );
+  textarea.dispatchEvent(
+    new KeyboardEvent("keyup", { key: "ếng", code: "KeyA", bubbles: true }),
+  );
+}
+
+it("sends the text once when the browser follows up as it does for a keydown that was not prevented", async () => {
+  const { textarea, cleanup } = await mountTerminal();
+  try {
+    imeKeydown(textarea, "ếng");
+    // The sequence from the observed log: keypress, beforeinput, input.
+    followUps(textarea, { composed: true, keypress: true });
+    await act(async () => {});
+    expect(written()).toEqual(["ếng"]);
+  } finally {
+    await cleanup();
+  }
+});
+
+it("honours preventDefault so no follow-up events are needed to stay at one copy", async () => {
+  const { textarea, cleanup } = await mountTerminal();
+  try {
+    const event = imeKeydown(textarea, "ếng");
+    // A browser sends nothing after a prevented keydown, only the keyup.
+    expect(event.defaultPrevented).toBe(true);
     textarea.dispatchEvent(
       new KeyboardEvent("keyup", { key: "ếng", code: "KeyA", bubbles: true }),
+    );
+    await act(async () => {});
+    expect(written()).toEqual(["ếng"]);
+  } finally {
+    await cleanup();
+  }
+});
+
+it("sends the text once when a non-composed input event would follow", async () => {
+  const { textarea, cleanup } = await mountTerminal();
+  try {
+    const event = imeKeydown(textarea, "ếng");
+    // xterm would emit a non-composed insertText itself, so the only guard is
+    // preventDefault: a browser then sends no beforeinput/input at all.
+    if (!event.defaultPrevented) {
+      followUps(textarea, { composed: false, keypress: false });
+    }
+    await act(async () => {});
+    expect(written()).toEqual(["ếng"]);
+  } finally {
+    await cleanup();
+  }
+});
+
+it("sends the text once for a keypress after the keydown", async () => {
+  const { textarea, cleanup } = await mountTerminal();
+  try {
+    imeKeydown(textarea, "ếng");
+    textarea.dispatchEvent(
+      new KeyboardEvent("keypress", {
+        key: "ếng",
+        code: "KeyA",
+        charCode: "ế".charCodeAt(0),
+        keyCode: "ế".charCodeAt(0),
+        bubbles: true,
+        cancelable: true,
+      }),
     );
     await act(async () => {});
     expect(written()).toEqual(["ếng"]);

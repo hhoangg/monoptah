@@ -39,10 +39,63 @@ export function isMacTerminalClearShortcut(event: TerminalKeyEvent): boolean {
 }
 
 /**
- * Named keys from the UI Events spec ("Enter", "ArrowLeft", "F11", "Dead",
- * "MediaPlayPause", ...) are alphanumeric and start with an uppercase letter.
+ * Named `key` values from the UI Events spec (plus the legacy ones browsers
+ * still send). The list is finite, so anything multi-character outside it is
+ * text, including capitalised ASCII such as "Tien" that an input method
+ * resends after a tone mark is removed.
  */
-const NAMED_KEY_SHAPE = /^[A-Z][A-Za-z0-9]*$/;
+const NAMED_KEYS: ReadonlySet<string> = new Set([
+  // Special and modifier keys.
+  "Unidentified", "Alt", "AltGraph", "CapsLock", "Control", "Fn", "FnLock",
+  "Meta", "NumLock", "ScrollLock", "Shift", "Symbol", "SymbolLock", "Hyper",
+  "Super", "OS", "Win",
+  // Whitespace and navigation.
+  "Enter", "Tab", "ArrowDown", "ArrowLeft", "ArrowRight", "ArrowUp", "End",
+  "Home", "PageDown", "PageUp", "Down", "Left", "Right", "Up",
+  // Editing.
+  "Backspace", "Clear", "Copy", "CrSel", "Cut", "Delete", "EraseEof",
+  "ExSel", "Insert", "Paste", "Redo", "Undo",
+  // UI.
+  "Accept", "Again", "Attn", "Cancel", "ContextMenu", "Escape", "Execute",
+  "Find", "Finish", "Help", "Pause", "Play", "Props", "Select", "ZoomIn",
+  "ZoomOut", "Apps", "Esc", "Scroll", "Spacebar", "Del",
+  // Device.
+  "BrightnessDown", "BrightnessUp", "Eject", "LogOff", "Power",
+  "PowerOff", "PrintScreen", "Hibernate", "Standby", "WakeUp",
+  // IME and composition.
+  "AllCandidates", "Alphanumeric", "CodeInput", "Compose", "Convert",
+  "Dead", "FinalMode", "GroupFirst", "GroupLast", "GroupNext",
+  "GroupPrevious", "ModeChange", "NextCandidate", "NonConvert",
+  "PreviousCandidate", "Process", "SingleCandidate",
+  // Korean, Japanese, Chinese.
+  "HangulMode", "HanjaMode", "JunjaMode", "Eisu", "Hankaku", "Hiragana",
+  "HiraganaKatakana", "KanaMode", "KanjiMode", "Katakana", "Romaji",
+  "Zenkaku", "ZenkakuHankaku",
+  // Function keys.
+  ...Array.from({ length: 35 }, (_, i) => `F${i + 1}`),
+  "Soft1", "Soft2", "Soft3", "Soft4",
+  // Multimedia, phone, TV, and browser keys.
+  "AppSwitch", "Call", "Camera", "CameraFocus", "EndCall", "GoBack",
+  "GoHome", "HeadsetHook", "LastNumberRedial", "Notification", "MannerMode",
+  "VoiceDial", "ChannelDown", "ChannelUp", "MediaFastForward", "MediaPause",
+  "MediaPlay", "MediaPlayPause", "MediaRecord", "MediaRewind", "MediaStop",
+  "MediaTrackNext", "MediaTrackPrevious", "AudioBalanceLeft",
+  "AudioBalanceRight", "AudioBassBoostDown", "AudioBassBoostToggle",
+  "AudioBassBoostUp", "AudioFaderFront", "AudioFaderRear",
+  "AudioSurroundModeNext", "AudioTrebleDown", "AudioTrebleUp",
+  "AudioVolumeDown", "AudioVolumeMute", "AudioVolumeUp", "MicrophoneToggle",
+  "MicrophoneVolumeDown", "MicrophoneVolumeMute", "MicrophoneVolumeUp",
+  "TV", "TVInput", "TVPower", "Exit", "Guide", "Info", "Settings", "Teletext",
+  "LaunchCalculator", "LaunchCalendar", "LaunchContacts", "LaunchMail",
+  "LaunchMediaPlayer", "LaunchMusicPlayer", "LaunchMyComputer",
+  "LaunchPhone", "LaunchScreenSaver", "LaunchSpreadsheet",
+  "LaunchWebBrowser", "LaunchWebCam", "LaunchWordProcessor",
+  "BrowserBack", "BrowserFavorites", "BrowserForward", "BrowserHome",
+  "BrowserRefresh", "BrowserSearch", "BrowserStop",
+  "Close", "MailForward", "MailReply", "MailSend", "New", "Open", "Print",
+  "Save", "SpellCheck", "Lang1", "Lang2", "Lang3", "Lang4", "Lang5",
+  "Dimmer", "Zoom", "ZoomToggle", "Key11", "Key12",
+]);
 const CONTROL_CHARACTER = /\p{Cc}/u;
 
 /**
@@ -53,11 +106,10 @@ const CONTROL_CHARACTER = /\p{Cc}/u;
  * deliver the replacement as a single non-composing keydown, e.g. `key` is
  * "ếng". xterm emits only the first character of that, so the rest is lost.
  *
- * Multi-character ASCII is text unless it looks like a named key. A lowercase
- * start ("eng", after the method strips a tone mark) cannot be a spec key
- * name, so it is text. A capitalised alphanumeric word ("Eng", "Enter") is
- * treated as a key name: sending an unknown name such as "MediaPlayPause" to
- * the shell would be worse than dropping the rare capitalised ASCII string.
+ * Any multi-character string that is not a known key name is text, ASCII
+ * included: "eng" and "Tien" are what the method resends after a tone mark is
+ * removed. The cost is that a capitalised ASCII word equal to a key name
+ * ("End", "Home") is left to xterm, which is never Vietnamese.
  */
 export function multiCharacterKeyText(
   event: TerminalKeyEvent & Partial<Pick<KeyboardEvent, "isComposing">>,
@@ -70,6 +122,6 @@ export function multiCharacterKeyText(
   const { key } = event;
   // Counted by code point so one astral character stays a single character.
   if ([...key].length < 2) return null;
-  if (NAMED_KEY_SHAPE.test(key) || CONTROL_CHARACTER.test(key)) return null;
+  if (NAMED_KEYS.has(key) || CONTROL_CHARACTER.test(key)) return null;
   return key;
 }

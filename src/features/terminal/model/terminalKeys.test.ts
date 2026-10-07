@@ -150,8 +150,16 @@ describe("multi-character key text", () => {
     expect(multiCharacterKeyText(key("ng"))).toBe("ng");
   });
 
-  it("rejects capitalised ASCII, which reads as a key name", () => {
-    expect(multiCharacterKeyText(key("Eng"))).toBeNull();
+  it("accepts capitalised ASCII that is not a key name", () => {
+    expect(multiCharacterKeyText(key("Tien"))).toBe("Tien");
+    expect(multiCharacterKeyText(key("ENG"))).toBe("ENG");
+    expect(multiCharacterKeyText(key("Hanoi"))).toBe("Hanoi");
+    expect(multiCharacterKeyText(key("Eng"))).toBe("Eng");
+  });
+
+  it("still rejects a key name that is only capitalised differently", () => {
+    expect(multiCharacterKeyText(key("enter"))).toBe("enter");
+    expect(multiCharacterKeyText(key("Enter"))).toBeNull();
   });
 
   it("rejects strings holding control characters", () => {
