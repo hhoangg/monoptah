@@ -709,7 +709,7 @@ fn parse_clickup_comment(node: &Value, task_id: &str) -> Option<ClickUpIssueComm
         kind: "comment".into(),
         author: author.unwrap_or_default(),
         author_avatar_url,
-        body: value_string(node, "comment_text").unwrap_or_default(),
+        body: comment_markdown(node),
         created_at: epoch_ms_to_iso(&value_string(node, "date").unwrap_or_default()),
         state: String::new(),
         path: String::new(),
@@ -719,6 +719,142 @@ fn parse_clickup_comment(node: &Value, task_id: &str) -> Option<ClickUpIssueComm
         replies: Vec::new(),
         id,
     })
+}
+
+/// ClickUp stores comment formatting as runs in the `comment` array and only
+/// keeps a plain-text flattening in `comment_text`. Rebuild markdown from the
+/// runs, falling back to the flattening when the runs are missing or empty.
+fn comment_markdown(node: &Value) -> String {
+    let from_runs = node
+        .get("comment")
+        .and_then(Value::as_array)
+        .map(|runs| runs.iter().filter_map(run_markdown).collect::<String>())
+        .map(|body| body.trim().to_string())
+        .filter(|body| !body.is_empty());
+    from_runs.unwrap_or_else(|| value_string(node, "comment_text").unwrap_or_default())
+}
+
+/// Renders one run. Only `bold`, `italic`, `code` and `link` are understood;
+/// any other attribute leaves the run as plain text rather than dropping it.
+fn run_markdown(run: &Value) -> Option<String> {
+    let text = run.get("text").and_then(Value::as_str)?;
+    let attributes = run.get("attributes");
+    let flag = |key: &str| {
+        attributes
+            .and_then(|attributes| attributes.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    let (bold, italic, code) = (flag("bold"), flag("italic"), flag("code"));
+    let link = attributes
+        .and_then(|attributes| attributes.get("link"))
+        .and_then(link_destination);
+    // Markers must hug the text, and emphasis cannot span a line break, so
+    // each line is wrapped on its own with its edge whitespace kept outside.
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| {
+            let core = line.trim();
+            if core.is_empty() {
+                return line.to_string();
+            }
+            let start = line.len() - line.trim_start().len();
+            let end = start + core.len();
+            let mut out = if code {
+                code_span(core)
+            } else {
+                escape_markdown(core)
+            };
+            out = match (bold, italic) {
+                (true, true) => format!("***{out}***"),
+                (true, false) => format!("**{out}**"),
+                (false, true) => format!("*{out}*"),
+                (false, false) => out,
+            };
+            if let Some(url) = &link {
+                out = format!("[{out}]({url})");
+            }
+            format!("{}{out}{}", &line[..start], &line[end..])
+        })
+        .collect();
+    Some(lines.join("\n"))
+}
+
+/// The documented link attribute is a plain URL string. An object with a `url`
+/// is accepted too in case a workspace returns that. Anything that is not a
+/// web or mail address is rejected so the run degrades to plain text.
+fn link_destination(value: &Value) -> Option<String> {
+    let raw = match value {
+        Value::String(url) => url.as_str(),
+        Value::Object(map) => map.get("url")?.as_str()?,
+        _ => return None,
+    }
+    .trim();
+    let lower = raw.to_ascii_lowercase();
+    let allowed = ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme));
+    if !allowed {
+        return None;
+    }
+    let mut url = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            ' ' | '(' | ')' | '<' | '>' | '\\' => url.push_str(&format!("%{:02X}", ch as u32)),
+            ch if ch.is_control() => {}
+            ch => url.push(ch),
+        }
+    }
+    Some(url)
+}
+
+/// Escapes markdown metacharacters in a single line so what the user typed,
+/// such as a literal `**`, is shown as typed. Backslash-escaping any ASCII
+/// punctuation is always valid markdown, so over-escaping is harmless.
+fn escape_markdown(line: &str) -> String {
+    let mut out = String::with_capacity(line.len() + 4);
+    let mut chars = line.chars().peekable();
+    // Block markers only matter at the start of a line.
+    match chars.peek() {
+        Some('#' | '+' | '-' | '=') => out.push('\\'),
+        Some(first) if first.is_ascii_digit() => {
+            let digits = line.chars().take_while(char::is_ascii_digit).count();
+            for _ in 0..digits {
+                out.extend(chars.next());
+            }
+            if matches!(chars.peek(), Some('.' | ')')) {
+                out.push('\\');
+            }
+        }
+        _ => {}
+    }
+    for ch in chars {
+        if matches!(
+            ch,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '~' | '|' | '&' | '$'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Inline code cannot be escaped, so use a fence longer than any backtick run
+/// inside the text.
+fn code_span(text: &str) -> String {
+    let (mut longest, mut current) = (0, 0);
+    for ch in text.chars() {
+        current = if ch == '`' { current + 1 } else { 0 };
+        longest = longest.max(current);
+    }
+    let fence = "`".repeat(longest + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
 }
 
 fn task_url(task_id: &str) -> String {
@@ -1241,6 +1377,144 @@ mod tests {
         assert_eq!(value_id(&json!({ "id": null }), "id"), None);
         assert_eq!(value_id(&json!({ "id": true }), "id"), None);
         assert_eq!(value_id(&json!({}), "id"), None);
+    }
+
+    fn comment_body(runs: Value) -> String {
+        comment_markdown(&json!({ "comment_text": "flat", "comment": runs }))
+    }
+
+    #[test]
+    fn comment_runs_become_markdown() {
+        // Shape observed on the live API.
+        let body = comment_body(json!([
+            { "text": "a", "attributes": { "bold": true } },
+            { "text": "\n\n", "attributes": {} },
+            { "text": "b", "attributes": { "bold": true, "italic": true } },
+            { "text": " ", "attributes": {} },
+            { "text": "c", "attributes": { "italic": true } },
+            { "text": " ", "attributes": {} },
+            { "text": "d", "attributes": { "code": true } }
+        ]));
+        assert_eq!(body, "**a**\n\n***b*** *c* `d`");
+    }
+
+    #[test]
+    fn literal_asterisks_stay_literal_next_to_real_bold() {
+        let body = comment_body(json!([
+            { "attributes": {}, "text": "**asd adas \n**" },
+            { "attributes": { "italic": true, "bold": true }, "text": "12312313" }
+        ]));
+        assert_eq!(body, "\\*\\*asd adas \n\\*\\****12312313***");
+    }
+
+    #[test]
+    fn comment_text_is_escaped_and_code_is_not() {
+        assert_eq!(
+            comment_body(json!([{ "text": "a_b [x] <i> `c` 1. \\", "attributes": {} }])),
+            "a\\_b \\[x\\] \\<i\\> \\`c\\` 1. \\\\"
+        );
+        assert_eq!(
+            comment_body(json!([{ "text": "# - 2) x", "attributes": {} }])),
+            "\\# - 2) x"
+        );
+        assert_eq!(
+            comment_body(json!([{ "text": "2) x", "attributes": {} }])),
+            "2\\) x"
+        );
+        assert_eq!(
+            comment_body(json!([{ "text": "a*b", "attributes": { "code": true } }])),
+            "`a*b`"
+        );
+        assert_eq!(
+            comment_body(json!([{ "text": "a`b", "attributes": { "code": true } }])),
+            "``a`b``"
+        );
+        assert_eq!(
+            comment_body(json!([{ "text": "`x`", "attributes": { "code": true } }])),
+            "`` `x` ``"
+        );
+    }
+
+    #[test]
+    fn emphasis_hugs_text_and_does_not_span_lines() {
+        let body = comment_body(json!([
+            { "text": "x ", "attributes": {} },
+            { "text": " hi \nthere ", "attributes": { "bold": true } },
+            { "text": "y", "attributes": {} }
+        ]));
+        assert_eq!(body, "x  **hi** \n**there** y");
+    }
+
+    #[test]
+    fn comment_links_use_the_link_attribute() {
+        assert_eq!(
+            comment_body(json!([{
+                "text": "docs",
+                "attributes": { "link": "https://clickup.com/a b(1)" }
+            }])),
+            "[docs](https://clickup.com/a%20b%281%29)"
+        );
+        assert_eq!(
+            comment_body(json!([{
+                "text": "docs",
+                "attributes": { "link": "https://x.test", "bold": true }
+            }])),
+            "[**docs**](https://x.test)"
+        );
+        assert_eq!(
+            comment_body(json!([{
+                "text": "docs",
+                "attributes": { "link": { "url": "https://x.test" } }
+            }])),
+            "[docs](https://x.test)"
+        );
+        // Unknown or unsafe shapes degrade to the run's plain text.
+        for link in [
+            json!("javascript:alert(1)"),
+            json!({ "href": "https://x.test" }),
+            json!(42),
+            json!(null),
+        ] {
+            assert_eq!(
+                comment_body(json!([{ "text": "docs", "attributes": { "link": link } }])),
+                "docs"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_attributes_keep_the_run_as_plain_text() {
+        let body = comment_body(json!([
+            { "text": "a", "attributes": { "underline": true, "list": { "list": "bullet" } } },
+            { "text": "b" },
+            { "text": "c", "attributes": { "bold": "yes" } },
+            { "type": "image" }
+        ]));
+        assert_eq!(body, "abc");
+    }
+
+    #[test]
+    fn comment_falls_back_to_the_flat_text() {
+        for node in [
+            json!({ "comment_text": " flat ", "comment": [] }),
+            json!({ "comment_text": " flat " }),
+            json!({ "comment_text": " flat ", "comment": "nope" }),
+            json!({ "comment_text": " flat ", "comment": [{ "attributes": {} }] }),
+        ] {
+            assert_eq!(comment_markdown(&node), "flat");
+        }
+        assert_eq!(comment_markdown(&json!({})), "");
+    }
+
+    #[test]
+    fn parsed_comments_carry_the_markdown_body() {
+        let node = json!({
+            "id": "9",
+            "comment_text": "bold",
+            "comment": [{ "text": "bold", "attributes": { "bold": true } }],
+            "date": "1000"
+        });
+        assert_eq!(parse_clickup_comment(&node, "t").unwrap().body, "**bold**");
     }
 
     #[test]
