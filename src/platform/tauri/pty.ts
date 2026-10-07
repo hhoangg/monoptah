@@ -127,13 +127,25 @@ function release() {
   }, 500);
 }
 
+/**
+ * A program to run in the PTY instead of the login shell. Mirrors the Rust
+ * `PtyLaunch`; `providerAccount` scopes it to a provider account profile the
+ * same way `spawnChild` does.
+ */
+export type PtyLaunch = {
+  program: string;
+  args: string[];
+  providerAccount?: { provider: "claude" | "codex"; id: string };
+};
+
 export async function spawnPty(
   id: string,
   cwd: string,
   cols: number,
   rows: number,
+  launch?: PtyLaunch,
 ): Promise<void> {
-  await invoke("pty_spawn", { id, cwd, cols, rows });
+  await invoke("pty_spawn", { id, cwd, cols, rows, launch });
 }
 
 export async function writePty(id: string, data: string): Promise<void> {

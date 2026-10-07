@@ -7,6 +7,7 @@ import {
   spawnPty,
   subscribePty,
   writePty,
+  type PtyLaunch,
 } from "../../../platform/tauri/pty";
 import { isOscColorQuery, oscColorReply } from "../model/terminalChrome";
 import {
@@ -32,6 +33,8 @@ type Props = {
   id: string;
   cwd: string;
   active: boolean;
+  /** Runs this program instead of the login shell. Read once per spawn. */
+  launch?: PtyLaunch;
   onMetaChange?: (patch: TerminalMetaPatch) => void;
 };
 
@@ -145,7 +148,13 @@ function oscColors() {
   };
 }
 
-export function TerminalView({ id, cwd, active, onMetaChange }: Props) {
+export function TerminalView({
+  id,
+  cwd,
+  active,
+  launch,
+  onMetaChange,
+}: Props) {
   const outerRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -153,6 +162,10 @@ export function TerminalView({ id, cwd, active, onMetaChange }: Props) {
   const applySizeRef = useRef<() => void>(() => {});
   const onMetaChangeRef = useRef(onMetaChange);
   onMetaChangeRef.current = onMetaChange;
+  // The spawn effect is keyed on `id` alone, so a new launch object must not
+  // restart the process; it is read when the spawn happens.
+  const launchRef = useRef(launch);
+  launchRef.current = launch;
   const runningProcessRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -255,7 +268,10 @@ export function TerminalView({ id, cwd, active, onMetaChange }: Props) {
         },
       );
       didStart = true;
-      return spawnPty(id, cwd, term.cols, term.rows);
+      const launchNow = launchRef.current;
+      return launchNow
+        ? spawnPty(id, cwd, term.cols, term.rows, launchNow)
+        : spawnPty(id, cwd, term.cols, term.rows);
     };
 
     const starting = (stoppingPtys.get(id) ?? Promise.resolve())

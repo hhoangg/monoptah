@@ -8,11 +8,12 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dirs_home;
 use crate::fs::expand_home;
+use crate::harness::{AccountEnv, HarnessAccount};
 
 const DATA_EVENT: &str = "pty-data";
 const EXIT_EVENT: &str = "pty-exit";
@@ -35,6 +36,45 @@ struct PtyData {
 struct PtyExit {
     id: String,
     code: Option<i32>,
+}
+
+/// A program to run in the PTY instead of the login shell, e.g. a provider's
+/// interactive CLI. `provider_account` scopes it to an account profile the same
+/// way harness children are.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyLaunch {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    provider_account: Option<HarnessAccount>,
+}
+
+/// What a spawn runs and which account env it layers on top of the PTY env.
+struct SpawnPlan {
+    program: String,
+    args: Vec<String>,
+    account_env: AccountEnv,
+}
+
+/// No launch means the login shell with no extra env, exactly as before.
+fn spawn_plan(launch: Option<PtyLaunch>, account_env: AccountEnv) -> SpawnPlan {
+    match launch {
+        Some(launch) => SpawnPlan {
+            program: launch.program,
+            args: launch.args,
+            account_env,
+        },
+        None => {
+            let (program, args) = default_shell();
+            SpawnPlan {
+                program,
+                args,
+                account_env: AccountEnv::default(),
+            }
+        }
+    }
 }
 
 struct LivePty {
@@ -132,9 +172,17 @@ pub fn pty_spawn(
     cwd: String,
     cols: u16,
     rows: u16,
+    launch: Option<PtyLaunch>,
 ) -> Result<(), String> {
     let workdir = working_dir(&cwd);
     let _reservation = crate::worktree_lifecycle::reserve_spawn(&workdir)?;
+    let account_env = match &launch {
+        Some(launch) => {
+            crate::harness::provider_account_env(&app, launch.provider_account.as_ref())?
+        }
+        None => AccountEnv::default(),
+    };
+    let plan = spawn_plan(launch, account_env);
     if let Some(prev) = host.remove(&id) {
         terminate(prev.pid);
         #[cfg(unix)]
@@ -143,17 +191,17 @@ pub fn pty_spawn(
 
     #[cfg(unix)]
     {
-        spawn_unix(app, host, id, workdir, cols.max(2), rows.max(2))
+        spawn_unix(app, host, id, workdir, cols.max(2), rows.max(2), plan)
     }
 
     #[cfg(windows)]
     {
-        spawn_windows(app, host, id, workdir, cols.max(2), rows.max(2))
+        spawn_windows(app, host, id, workdir, cols.max(2), rows.max(2), plan)
     }
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (app, cwd, cols, rows);
+        let _ = (app, cwd, cols, rows, plan);
         Err("Terminals are not supported on this platform.".into())
     }
 }
@@ -249,13 +297,18 @@ fn spawn_unix(
     workdir: std::path::PathBuf,
     cols: u16,
     rows: u16,
+    plan: SpawnPlan,
 ) -> Result<(), String> {
     use std::fs::File;
     use std::os::unix::io::FromRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
-    let (shell, args) = default_shell();
+    let SpawnPlan {
+        program: shell,
+        args,
+        account_env,
+    } = plan;
     let (master, slave) = open_pty(cols, rows)?;
 
     let mut cmd = Command::new(&shell);
@@ -273,6 +326,7 @@ fn spawn_unix(
         cmd.env("HOME", &home);
     }
     cmd.env("PWD", &workdir);
+    crate::harness::apply_account_env(&mut cmd, &account_env);
 
     // setsid() already creates a new session and process group. Calling
     // process_group(0) first makes the child a group leader, so setsid()
@@ -378,10 +432,15 @@ fn spawn_windows(
     workdir: std::path::PathBuf,
     cols: u16,
     rows: u16,
+    plan: SpawnPlan,
 ) -> Result<(), String> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-    let (shell, args) = default_shell();
+    let SpawnPlan {
+        program: shell,
+        args,
+        account_env,
+    } = plan;
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -405,6 +464,12 @@ fn spawn_windows(
         cmd.env("USERPROFILE", &home);
     }
     cmd.env("PWD", workdir.to_string_lossy().as_ref());
+    for (key, value) in &account_env.set {
+        cmd.env(key, value);
+    }
+    for key in &account_env.remove {
+        cmd.env_remove(key);
+    }
 
     let mut child = crate::windows::spawn_pty(pair.slave.as_ref(), cmd)
         .map_err(|err| format!("Failed to start {shell}: {err}"))?;
@@ -805,6 +870,61 @@ mod tests {
         assert_eq!(login_args("/bin/bash"), &["-l"]);
         assert_eq!(login_args("/usr/bin/fish"), &["-l"]);
         assert_eq!(login_args("/usr/local/bin/nu"), &[] as &[&str]);
+    }
+
+    #[test]
+    fn launch_deserializes_from_the_camel_case_wire_shape() {
+        let launch: PtyLaunch = serde_json::from_value(serde_json::json!({
+            "program": "/usr/local/bin/claude",
+            "args": ["--session-id", "abc"],
+            "providerAccount": { "provider": "claude", "id": "work" },
+        }))
+        .unwrap();
+        assert_eq!(launch.program, "/usr/local/bin/claude");
+        assert_eq!(launch.args, ["--session-id", "abc"]);
+        let account: HarnessAccount =
+            serde_json::from_value(serde_json::json!({ "provider": "claude", "id": "work" }))
+                .unwrap();
+        assert_eq!(launch.provider_account, Some(account));
+    }
+
+    #[test]
+    fn launch_args_and_account_are_optional() {
+        let launch: PtyLaunch =
+            serde_json::from_value(serde_json::json!({ "program": "codex" })).unwrap();
+        assert!(launch.args.is_empty());
+        assert!(launch.provider_account.is_none());
+    }
+
+    #[test]
+    fn no_launch_plans_the_login_shell_with_no_extra_env() {
+        let (shell, args) = default_shell();
+        // Even a stray env must not leak into a plain terminal.
+        let stray = AccountEnv {
+            set: vec![("CODEX_HOME".into(), "/x".into())],
+            remove: vec!["OPENAI_API_KEY".into()],
+        };
+        let plan = spawn_plan(None, stray);
+        assert_eq!(plan.program, shell);
+        assert_eq!(plan.args, args);
+        assert_eq!(plan.account_env, AccountEnv::default());
+    }
+
+    #[test]
+    fn a_launch_plans_its_own_program_instead_of_the_shell() {
+        let launch = PtyLaunch {
+            program: "/opt/bin/claude".into(),
+            args: vec!["--resume".into(), "abc".into()],
+            provider_account: None,
+        };
+        let env = AccountEnv {
+            set: vec![("CLAUDE_CONFIG_DIR".into(), "/acct".into())],
+            remove: vec!["ANTHROPIC_API_KEY".into()],
+        };
+        let plan = spawn_plan(Some(launch), env.clone());
+        assert_eq!(plan.program, "/opt/bin/claude");
+        assert_eq!(plan.args, ["--resume", "abc"]);
+        assert_eq!(plan.account_env, env);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -1032,36 +1033,75 @@ pub fn provider_account_remove(
     })
 }
 
+/// Env changes that point a spawned CLI at a provider account profile. Kept as
+/// plain data so `std::process::Command` (harness) and portable-pty's
+/// `CommandBuilder` (Windows PTY) apply the same mutations.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AccountEnv {
+    pub(crate) set: Vec<(String, OsString)>,
+    pub(crate) remove: Vec<String>,
+}
+
+/// The env mutations for `account`, creating its profile directory on demand.
+/// Empty for no account or the default one. The account's fields stay private:
+/// callers only ever need the resulting env, never the provider or id.
+pub(crate) fn provider_account_env(
+    app: &AppHandle,
+    account: Option<&HarnessAccount>,
+) -> Result<AccountEnv, String> {
+    let Some(account) = account else {
+        return Ok(AccountEnv::default());
+    };
+    let Some(dir) = provider_account_dir(app, &account.provider, Some(&account.id))? else {
+        return Ok(AccountEnv::default());
+    };
+    Ok(account_env_for(&account.provider, &dir))
+}
+
+fn account_env_for(provider: &str, dir: &Path) -> AccountEnv {
+    let dir = dir.as_os_str().to_owned();
+    match provider {
+        // Claude scopes both its ordinary config and its macOS Keychain
+        // credential to these exact strings. Setting both keeps profiles
+        // isolated on every supported platform.
+        "claude" => AccountEnv {
+            set: vec![
+                ("CLAUDE_CONFIG_DIR".into(), dir.clone()),
+                ("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), dir),
+            ],
+            remove: vec![
+                "ANTHROPIC_API_KEY".into(),
+                "ANTHROPIC_AUTH_TOKEN".into(),
+                "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            ],
+        },
+        "codex" => AccountEnv {
+            set: vec![("CODEX_HOME".into(), dir)],
+            remove: vec![
+                "OPENAI_API_KEY".into(),
+                "CODEX_API_KEY".into(),
+                "CODEX_ACCESS_TOKEN".into(),
+            ],
+        },
+        _ => unreachable!("provider_account_dir validates the provider"),
+    }
+}
+
+pub(crate) fn apply_account_env(cmd: &mut Command, env: &AccountEnv) {
+    for (key, value) in &env.set {
+        cmd.env(key, value);
+    }
+    for key in &env.remove {
+        cmd.env_remove(key);
+    }
+}
+
 fn apply_provider_account(
     app: &AppHandle,
     cmd: &mut Command,
     account: Option<&HarnessAccount>,
 ) -> Result<(), String> {
-    let Some(account) = account else {
-        return Ok(());
-    };
-    let Some(dir) = provider_account_dir(app, &account.provider, Some(&account.id))? else {
-        return Ok(());
-    };
-    match account.provider.as_str() {
-        "claude" => {
-            // Claude scopes both its ordinary config and its macOS Keychain
-            // credential to these exact strings. Setting both keeps profiles
-            // isolated on every supported platform.
-            cmd.env("CLAUDE_CONFIG_DIR", &dir)
-                .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", &dir)
-                .env_remove("ANTHROPIC_API_KEY")
-                .env_remove("ANTHROPIC_AUTH_TOKEN")
-                .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
-        }
-        "codex" => {
-            cmd.env("CODEX_HOME", &dir)
-                .env_remove("OPENAI_API_KEY")
-                .env_remove("CODEX_API_KEY")
-                .env_remove("CODEX_ACCESS_TOKEN");
-        }
-        _ => unreachable!("provider_account_dir validates the provider"),
-    }
+    apply_account_env(cmd, &provider_account_env(app, account)?);
     Ok(())
 }
 
@@ -3941,5 +3981,116 @@ mod reap_logic_tests {
         assert!(!is_legacy_orphaned_cursor_acp(
             "node /usr/local/bin/typescript-language-server --stdio"
         ));
+    }
+}
+
+#[cfg(test)]
+mod account_env_tests {
+    use super::*;
+
+    /// What `apply_provider_account` did to a `Command` before it was split
+    /// into an env-returning helper. Kept verbatim so the refactor is checked
+    /// against the old behaviour rather than against itself.
+    fn legacy_account_env(cmd: &mut Command, provider: &str, dir: &Path) {
+        match provider {
+            "claude" => {
+                cmd.env("CLAUDE_CONFIG_DIR", dir)
+                    .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", dir)
+                    .env_remove("ANTHROPIC_API_KEY")
+                    .env_remove("ANTHROPIC_AUTH_TOKEN")
+                    .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+            }
+            "codex" => {
+                cmd.env("CODEX_HOME", dir)
+                    .env_remove("OPENAI_API_KEY")
+                    .env_remove("CODEX_API_KEY")
+                    .env_remove("CODEX_ACCESS_TOKEN");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn command_envs(cmd: &Command) -> Vec<(String, Option<String>)> {
+        let mut envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        envs.sort();
+        envs
+    }
+
+    #[test]
+    fn claude_account_env_sets_both_config_dirs_and_strips_credentials() {
+        let dir = Path::new("/data/provider-accounts/claude/work");
+        let env = account_env_for("claude", dir);
+        assert_eq!(
+            env.set,
+            vec![
+                ("CLAUDE_CONFIG_DIR".to_string(), OsString::from(dir)),
+                (
+                    "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(),
+                    OsString::from(dir)
+                ),
+            ]
+        );
+        assert_eq!(
+            env.remove,
+            vec![
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_account_env_sets_codex_home_and_strips_credentials() {
+        let dir = Path::new("/data/provider-accounts/codex/work");
+        let env = account_env_for("codex", dir);
+        assert_eq!(
+            env.set,
+            vec![("CODEX_HOME".to_string(), OsString::from(dir))]
+        );
+        assert_eq!(
+            env.remove,
+            vec!["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn account_env_matches_what_the_harness_spawn_applied_before_the_split() {
+        let dir = Path::new("/data/provider-accounts/x/work");
+        for provider in ["claude", "codex"] {
+            let mut legacy = Command::new("true");
+            legacy_account_env(&mut legacy, provider, dir);
+            let mut current = Command::new("true");
+            apply_account_env(&mut current, &account_env_for(provider, dir));
+            assert_eq!(
+                command_envs(&current),
+                command_envs(&legacy),
+                "{provider} env drifted from the pre-refactor behaviour"
+            );
+        }
+    }
+
+    #[test]
+    fn account_env_is_applied_over_an_inherited_env() {
+        let mut cmd = Command::new("true");
+        cmd.env("ANTHROPIC_API_KEY", "sk-ambient");
+        apply_account_env(
+            &mut cmd,
+            &account_env_for("claude", Path::new("/data/claude/work")),
+        );
+        let envs = command_envs(&cmd);
+        assert!(envs.contains(&("ANTHROPIC_API_KEY".to_string(), None)));
+        assert!(envs.contains(&(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            Some("/data/claude/work".to_string())
+        )));
     }
 }

@@ -201,3 +201,73 @@ it("uses the terminal-specific font stack", async () => {
     document.documentElement.style.removeProperty("--font-terminal");
   }
 });
+
+it("spawns the plain shell with exactly four arguments when there is no launch", async () => {
+  const { host, root } = setup();
+  try {
+    await act(async () => {
+      root.render(
+        createElement(TerminalView, { id: "shell", cwd: "/tmp", active: true }),
+      );
+    });
+    expect(pty.spawnPty.mock.calls).toEqual([["shell", "/tmp", 80, 24]]);
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  }
+});
+
+it("passes a launch through to the spawn", async () => {
+  const { host, root } = setup();
+  const launch = {
+    program: "/opt/bin/claude",
+    args: ["--session-id", "abc"],
+    providerAccount: { provider: "claude" as const, id: "work" },
+  };
+  try {
+    await act(async () => {
+      root.render(
+        createElement(TerminalView, {
+          id: "tui",
+          cwd: "/tmp",
+          active: true,
+          launch,
+        }),
+      );
+    });
+    expect(pty.spawnPty.mock.calls).toEqual([["tui", "/tmp", 80, 24, launch]]);
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  }
+});
+
+it("does not respawn when only the launch object changes", async () => {
+  const { host, root } = setup();
+  const render = () =>
+    createElement(TerminalView, {
+      id: "stable",
+      cwd: "/tmp",
+      active: true,
+      launch: { program: "claude", args: ["--resume", "abc"] },
+    });
+  try {
+    await act(async () => {
+      root.render(render());
+    });
+    await act(async () => {
+      root.render(render());
+    });
+    expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+    expect(pty.killPty).not.toHaveBeenCalled();
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  }
+});

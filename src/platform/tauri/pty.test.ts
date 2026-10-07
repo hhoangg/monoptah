@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { decodePtyChunk, trimReplay } from "./pty";
+import { describe, expect, it, vi } from "vitest";
+
+const core = vi.hoisted(() => ({ invoke: vi.fn(async () => undefined) }));
+vi.mock("@tauri-apps/api/core", () => core);
+import { decodePtyChunk, spawnPty, trimReplay } from "./pty";
 
 const KB = 1024;
 
@@ -47,5 +50,41 @@ describe("trimReplay", () => {
   it("never drops the only chunk", () => {
     const sizes = [512 * KB];
     expect(trimReplay(sizes, 512 * KB)).toEqual({ drop: 0, bytes: 512 * KB });
+  });
+});
+
+describe("spawnPty", () => {
+  it("sends no launch key for a plain shell", async () => {
+    core.invoke.mockClear();
+    await spawnPty("t", "/tmp", 80, 24);
+    expect(core.invoke).toHaveBeenCalledTimes(1);
+    const [command, payload] = core.invoke.mock.calls[0] as unknown as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(command).toBe("pty_spawn");
+    expect(JSON.parse(JSON.stringify(payload))).toEqual({
+      id: "t",
+      cwd: "/tmp",
+      cols: 80,
+      rows: 24,
+    });
+  });
+
+  it("sends the launch under the camelCase wire names", async () => {
+    core.invoke.mockClear();
+    const launch = {
+      program: "/opt/bin/codex",
+      args: ["--flag"],
+      providerAccount: { provider: "codex" as const, id: "work" },
+    };
+    await spawnPty("t", "/tmp", 80, 24, launch);
+    expect(core.invoke).toHaveBeenCalledWith("pty_spawn", {
+      id: "t",
+      cwd: "/tmp",
+      cols: 80,
+      rows: 24,
+      launch,
+    });
   });
 });
