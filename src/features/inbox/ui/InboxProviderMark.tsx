@@ -61,6 +61,23 @@ export function InboxProviderMark({
       </svg>
     );
   }
+  if (provider === "clickup") {
+    // Two stacked chevrons, drawn inline so no remote or binary asset is needed.
+    return (
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        strokeWidth="2.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden
+        className={className}
+      >
+        <path d="M4.5 14.5 12 8l7.5 6.5" stroke="#8930FD" />
+        <path d="M7.5 19 12 15.2 16.5 19" stroke="#49CCF9" />
+      </svg>
+    );
+  }
   if (provider === "github") {
     return (
       <svg

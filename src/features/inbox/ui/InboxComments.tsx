@@ -157,11 +157,13 @@ export function InboxComments({
       ? "Linear"
       : provider === "jira"
         ? "Jira"
-        : provider === "gitlab"
-          ? "GitLab"
-          : provider === "azuredevops"
-            ? "ADO"
-            : "GitHub";
+        : provider === "clickup"
+          ? "ClickUp"
+          : provider === "gitlab"
+            ? "GitLab"
+            : provider === "azuredevops"
+              ? "ADO"
+              : "GitHub";
 
   return (
     <section className="flex flex-col gap-3 border-t border-stroke pt-5">
@@ -406,11 +408,13 @@ function InboxComment({
                     ? "Open in Linear"
                     : provider === "jira"
                       ? "Open in Jira"
-                      : provider === "gitlab"
-                        ? "Open on GitLab"
-                        : provider === "azuredevops"
-                          ? "Open on ADO"
-                          : "Open on GitHub"
+                      : provider === "clickup"
+                        ? "Open in ClickUp"
+                        : provider === "gitlab"
+                          ? "Open on GitLab"
+                          : provider === "azuredevops"
+                            ? "Open on ADO"
+                            : "Open on GitHub"
                 }
                 onClick={() => void openUrl(comment.url)}
                 className="hover:text-content"

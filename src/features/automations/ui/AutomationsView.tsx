@@ -93,6 +93,7 @@ import { JIRA_CHANGE_EVENT, jiraConnected } from "../../inbox/model/jira";
 import {
   CLICKUP_CHANGE_EVENT,
   clickupConnected,
+  listClickUpSpaces,
 } from "../../inbox/model/clickup";
 import { defaultSessionChoice, firstEnabledHarness, modelsFor, preferredModelId, resolveModel } from "../../sessions/model/models";
 import { projectKey, projectName } from "../../../shared/lib/paths";
@@ -1684,6 +1685,7 @@ const TRIGGER_CATEGORIES: readonly {
   { value: "github", label: "GitHub" },
   { value: "linear", label: "Linear" },
   { value: "jira", label: "Jira" },
+  { value: "clickup", label: "ClickUp" },
   { value: "gitlab", label: "GitLab" },
   { value: "azuredevops", label: "Azure DevOps" },
 ];
@@ -1788,6 +1790,33 @@ function TriggerRow({
       cancelled = true;
     };
   }, [projectPath, push]);
+  const [spaceNames, setSpaceNames] = useState<string[]>([]);
+  const clickup = trigger.kind === "clickup";
+  useEffect(() => {
+    if (!clickup) return;
+    let cancelled = false;
+    void listClickUpSpaces().then(
+      (spaces) => {
+        if (!cancelled) setSpaceNames(spaces.map((space) => space.name));
+      },
+      () => {
+        if (!cancelled) setSpaceNames([]);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [clickup]);
+  // A ClickUp task carries its space name in `repo`, which is what the
+  // trigger's repo list is matched against.
+  const spaceOptions = [
+    { value: "", label: "Any space" },
+    ...spaceNames.map((name) => ({ value: name, label: name })),
+  ];
+  const savedSpace = (trigger.repos[0] ?? trigger.repo).trim();
+  if (savedSpace && !spaceOptions.some((option) => option.value === savedSpace)) {
+    spaceOptions.push({ value: savedSpace, label: savedSpace });
+  }
   const branchOptions = branches.map((name) => ({ value: name, label: name }));
   if (
     trigger.branch &&
@@ -1814,6 +1843,7 @@ function TriggerRow({
           <EventTriggerSentence
             trigger={trigger}
             branchOptions={branchOptions}
+            spaceOptions={clickup ? spaceOptions : null}
             projectChosen={Boolean(projectPath)}
             onChange={onChange}
           />
@@ -1896,11 +1926,14 @@ function TimeTriggerSentence({
 function EventTriggerSentence({
   trigger,
   branchOptions,
+  spaceOptions,
   projectChosen,
   onChange,
 }: {
   trigger: AutomationTrigger;
   branchOptions: { value: string; label: string }[];
+  /** ClickUp only: the optional space filter. */
+  spaceOptions: { value: string; label: string }[] | null;
   projectChosen: boolean;
   onChange: (trigger: AutomationTrigger) => void;
 }) {
@@ -1925,6 +1958,19 @@ function EventTriggerSentence({
               projectChosen ? "No branches found" : "Choose a project first"
             }
             onChange={(value) => onChange({ ...trigger, branch: value })}
+          />
+        </>
+      ) : null}
+      {spaceOptions ? (
+        <>
+          <span>in</span>
+          <TriggerPill
+            label="Space"
+            value={(trigger.repos[0] ?? trigger.repo).trim()}
+            options={spaceOptions}
+            onChange={(value) =>
+              onChange({ ...trigger, repos: value ? [value] : [], repo: "" })
+            }
           />
         </>
       ) : null}

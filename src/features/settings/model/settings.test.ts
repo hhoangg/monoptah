@@ -658,6 +658,19 @@ describe("settings search", () => {
     });
   });
 
+  it("finds the ClickUp card in the inbox section", () => {
+    expect(searchSettings("clickup")[0]).toMatchObject({
+      section: "inbox",
+      settingId: "clickup",
+      label: "ClickUp",
+    });
+    expect(
+      searchSettings("clickup").some(
+        (result) => result.section === "inbox" && result.settingId === null,
+      ),
+    ).toBe(true);
+  });
+
   it("returns a whole page with no setting id", () => {
     expect(searchSettings("skills")).toEqual([
       {

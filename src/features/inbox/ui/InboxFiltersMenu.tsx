@@ -10,6 +10,10 @@ import {
   type InboxTimeFilter,
   type LinearProjectOption,
 } from "../model/inboxFilters";
+import {
+  reconcileHiddenClickUpSpaceIds,
+  type ClickUpSpace,
+} from "../model/clickup";
 import type { JiraProject } from "../model/jira";
 import type { LinearTeam } from "../model/linear";
 import { Popover } from "../../../shared/ui/Popover";
@@ -32,6 +36,8 @@ type Props = {
   hiddenLinearTeamIds: string[];
   jiraProjects: JiraProject[];
   hiddenJiraProjectIds: string[];
+  clickupSpaces: ClickUpSpace[];
+  hiddenClickUpSpaceIds: string[];
   source: InboxSource;
   filters: InboxFilters;
   onChange: (filters: InboxFilters) => void;
@@ -39,6 +45,8 @@ type Props = {
   onLinearTeamsChange: (ids: string[]) => void;
   /** Shared with Settings → Inbox → Jira; narrows the fetch, not just the list. */
   onJiraProjectsChange: (ids: string[]) => void;
+  /** Shared with Settings → Inbox → ClickUp; narrows the fetch, not just the list. */
+  onClickUpSpacesChange: (ids: string[]) => void;
   onClose: () => void;
 };
 
@@ -75,11 +83,14 @@ export function InboxFiltersMenu({
   hiddenLinearTeamIds,
   jiraProjects,
   hiddenJiraProjectIds,
+  clickupSpaces,
+  hiddenClickUpSpaceIds,
   source,
   filters,
   onChange,
   onLinearTeamsChange,
   onJiraProjectsChange,
+  onClickUpSpacesChange,
   onClose,
 }: Props) {
   const hiddenProjects = new Set(filters.hiddenProjects);
@@ -90,6 +101,9 @@ export function InboxFiltersMenu({
   const hiddenJira = new Set(hiddenJiraProjectIds);
   const jiraProjectsActive =
     source === "jira" && hiddenJiraProjectIds.length > 0;
+  const hiddenClickUp = new Set(hiddenClickUpSpaceIds);
+  const clickupSpacesActive =
+    source === "clickup" && hiddenClickUpSpaceIds.length > 0;
   const tracker = isTrackerSource(source);
 
   const toggleAssigned = () => {
@@ -122,6 +136,17 @@ export function InboxFiltersMenu({
     if (next.has(id)) next.delete(id);
     else next.add(id);
     onJiraProjectsChange([...next]);
+  };
+
+  const toggleClickUpSpace = (id: string) => {
+    const next = new Set(hiddenClickUp);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    // The backend rejects unknown space ids, so a stale hidden id is dropped
+    // here instead of being saved back.
+    onClickUpSpacesChange(
+      reconcileHiddenClickUpSpaceIds(clickupSpaces, [...next]),
+    );
   };
 
   const toggleLinearProject = (id: string) => {
@@ -158,7 +183,9 @@ export function InboxFiltersMenu({
         label={
           source === "gitlab" || source === "azuredevops"
             ? "Needs attention"
-            : "Assigned to me"
+            : source === "clickup"
+              ? "Assigned to me (newest 100)"
+              : "Assigned to me"
         }
         checked={filters.assignedToMe}
         onClick={toggleAssigned}
@@ -261,6 +288,20 @@ export function InboxFiltersMenu({
         </>
       ) : null}
 
+      {source === "clickup" && clickupSpaces.length > 0 ? (
+        <>
+          <SectionLabel>Spaces</SectionLabel>
+          {clickupSpaces.map((space) => (
+            <FilterItem
+              key={space.id}
+              label={space.name}
+              checked={!hiddenClickUp.has(space.id)}
+              onClick={() => toggleClickUpSpace(space.id)}
+            />
+          ))}
+        </>
+      ) : null}
+
       {!tracker &&
       !(
         (source === "gitlab" || source === "azuredevops") &&
@@ -294,6 +335,7 @@ export function InboxFiltersMenu({
         source,
         hiddenLinearTeamIds,
         hiddenJiraProjectIds,
+        hiddenClickUpSpaceIds,
       ) ? (
         <>
           <div role="separator" className="my-1 h-px bg-content/10" />
@@ -305,6 +347,7 @@ export function InboxFiltersMenu({
               onChange(DEFAULT_INBOX_FILTERS);
               if (teamsActive) onLinearTeamsChange([]);
               if (jiraProjectsActive) onJiraProjectsChange([]);
+              if (clickupSpacesActive) onClickUpSpacesChange([]);
             }}
             className="flex h-7 w-full items-center rounded-lg px-2 text-left text-[13px] leading-none text-content/70 hover:bg-content/5 hover:text-content"
           >

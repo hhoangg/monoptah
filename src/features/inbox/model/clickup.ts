@@ -124,8 +124,16 @@ export async function disconnectClickUp(): Promise<ClickUpStatus> {
   return status;
 }
 
-export function listClickUpWorkspaces(): Promise<ClickUpWorkspace[]> {
-  return invoke<ClickUpWorkspace[]>("clickup_list_workspaces");
+/**
+ * With a token, lists the workspaces it can reach before anything is saved.
+ * Without one, uses the saved connection.
+ */
+export function listClickUpWorkspaces(
+  token?: string,
+): Promise<ClickUpWorkspace[]> {
+  return invoke<ClickUpWorkspace[]>("clickup_list_workspaces", {
+    token: token?.trim() || null,
+  });
 }
 
 export function listClickUpSpaces(): Promise<ClickUpSpace[]> {

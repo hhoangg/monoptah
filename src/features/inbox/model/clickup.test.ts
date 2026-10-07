@@ -10,6 +10,7 @@ import {
   clickupIssuesAssignedTo,
   clickupSpaceIdsForFetch,
   disconnectClickUp,
+  listClickUpWorkspaces,
   loadHiddenClickUpSpaceIds,
   peekClickUpIssueDetails,
   peekClickUpIssueThread,
@@ -80,6 +81,7 @@ beforeEach(() => {
     if (command === "clickup_issue_thread")
       return { comments: [], truncated: false };
     if (command === "clickup_issue_comment") return issue.url;
+    if (command === "clickup_list_workspaces") return [];
     if (command === "clickup_set_config")
       return { connected: false, teamId: "", teamName: "", username: "" };
     throw new Error(`Unexpected command: ${command}`);
@@ -408,6 +410,17 @@ describe("ClickUp connection", () => {
     expect(invoke).toHaveBeenLastCalledWith("clickup_set_config", {
       token: "pk_1",
       teamId: null,
+    });
+  });
+
+  it("lists workspaces for a typed token, or for the saved connection without one", async () => {
+    await listClickUpWorkspaces(" pk_typed ");
+    expect(invoke).toHaveBeenLastCalledWith("clickup_list_workspaces", {
+      token: "pk_typed",
+    });
+    await listClickUpWorkspaces();
+    expect(invoke).toHaveBeenLastCalledWith("clickup_list_workspaces", {
+      token: null,
     });
   });
 

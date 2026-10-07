@@ -173,10 +173,13 @@ pub async fn clickup_set_config(
 }
 
 #[tauri::command]
-pub async fn clickup_list_workspaces(app: AppHandle) -> Result<Vec<ClickUpWorkspace>, String> {
+pub async fn clickup_list_workspaces(
+    app: AppHandle,
+    token: Option<String>,
+) -> Result<Vec<ClickUpWorkspace>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let config = require_config(&app)?;
-        parse_clickup_workspaces(&clickup_get(&config.token, "/team")?)
+        let token = workspace_lookup_token(token, || Ok(require_config(&app)?.token))?;
+        parse_clickup_workspaces(&clickup_get(&token, "/team")?)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -479,6 +482,18 @@ fn parse_clickup_workspaces(data: &Value) -> Result<Vec<ClickUpWorkspace>, Strin
             Some(ClickUpWorkspace { id, name })
         })
         .collect())
+}
+
+/// A token that has several workspaces cannot be saved until one is chosen, so
+/// Settings lists them with the typed token before any config exists.
+fn workspace_lookup_token(
+    typed: Option<String>,
+    stored: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    match typed.map(|token| token.trim().to_string()) {
+        Some(token) if !token.is_empty() => Ok(token),
+        _ => stored(),
+    }
 }
 
 fn select_workspace(
@@ -1118,6 +1133,18 @@ mod tests {
         assert!(missing.contains("Acme (1)") && missing.contains("Globex (2)"));
         assert!(select_workspace(&two, Some("9")).unwrap_err().contains("9"));
         assert!(select_workspace(&[], None).is_err());
+    }
+
+    #[test]
+    fn workspace_lookup_prefers_the_typed_token() {
+        let typed = workspace_lookup_token(Some(" pk_typed ".into()), || panic!("not needed"));
+        assert_eq!(typed.unwrap(), "pk_typed");
+        let stored = workspace_lookup_token(None, || Ok("pk_stored".into()));
+        assert_eq!(stored.unwrap(), "pk_stored");
+        let blank = workspace_lookup_token(Some("  ".into()), || Ok("pk_stored".into()));
+        assert_eq!(blank.unwrap(), "pk_stored");
+        let missing = workspace_lookup_token(None, || Err("Connect ClickUp in Settings".into()));
+        assert_eq!(missing.unwrap_err(), "Connect ClickUp in Settings");
     }
 
     #[test]

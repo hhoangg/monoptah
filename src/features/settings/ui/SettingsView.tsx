@@ -41,6 +41,7 @@ import {
 import { Popover } from "../../../shared/ui/Popover";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 import { JiraSettings } from "./JiraSettings";
+import { ClickUpSettings } from "./ClickUpSettings";
 import { GradientBlurBackground } from "./GradientBlurBackground";
 import { McpSettings } from "./McpSettings";
 import { InboxProviderMark } from "../../inbox/ui/InboxProviderMark";
@@ -1239,6 +1240,19 @@ function InboxPage({
         description="Jira Cloud issues from the projects you pick."
       >
         <JiraSettings />
+      </Group>
+
+      <Group
+        id="clickup"
+        title={
+          <span className="flex items-center gap-2">
+            <InboxProviderMark provider="clickup" className="size-4 shrink-0" />
+            ClickUp
+          </span>
+        }
+        description="ClickUp tasks from the spaces you pick."
+      >
+        <ClickUpSettings />
       </Group>
 
       <Group
