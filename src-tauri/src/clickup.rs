@@ -204,23 +204,28 @@ pub async fn clickup_list_issues(
             return Ok(Vec::new());
         };
         let limit = effective_limit(limit, include_closed) as usize;
+        // Validate before any request so a bad id fails instead of widening the query.
+        let first_path = tasks_path(&config.team_id, &space_ids, include_closed, 0)?;
         // Tasks only carry the space id, so names come from the space list.
         // Names are cosmetic: a failure here must not hide the tasks.
         let spaces = fetch_spaces(&config).unwrap_or_default();
         let mut issues: Vec<ClickUpIssue> = Vec::new();
         for page in 0..MAX_TASK_PAGES {
-            let data = clickup_get(
-                &config.token,
-                &tasks_path(&config.team_id, &space_ids, include_closed, page),
-            )?;
+            let path = if page == 0 {
+                first_path.clone()
+            } else {
+                tasks_path(&config.team_id, &space_ids, include_closed, page)?
+            };
+            let data = clickup_get(&config.token, &path)?;
             let raw_count = data["tasks"].as_array().map_or(0, Vec::len);
             issues.extend(parse_clickup_issues(&data, &spaces)?);
-            if issues.len() >= limit || raw_count < TASK_PAGE_SIZE {
+            // The API's default sort direction is undocumented, so read every
+            // page (not just enough for the cap) and sort locally below.
+            if raw_count < TASK_PAGE_SIZE {
                 break;
             }
         }
-        issues.truncate(limit);
-        Ok(issues)
+        Ok(newest_first(issues, limit))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -319,19 +324,33 @@ fn effective_limit(limit: Option<u32>, include_closed: bool) -> u32 {
     limit.unwrap_or(default).clamp(1, MAX_LIMIT)
 }
 
-fn tasks_path(team_id: &str, space_ids: &[String], include_closed: bool, page: u32) -> String {
+/// Sorts by `updated_at` descending, so the cap keeps the most recently updated
+/// tasks whichever direction the API returned them in. ISO strings sort
+/// lexicographically; tasks without a timestamp go last.
+fn newest_first(mut issues: Vec<ClickUpIssue>, limit: usize) -> Vec<ClickUpIssue> {
+    issues.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    issues.truncate(limit);
+    issues
+}
+
+fn tasks_path(
+    team_id: &str,
+    space_ids: &[String],
+    include_closed: bool,
+    page: u32,
+) -> Result<String, String> {
     let mut path = format!(
         "/team/{team_id}/task?order_by=updated&subtasks=true&include_closed={include_closed}"
     );
-    for id in space_ids
-        .iter()
-        .map(|id| id.trim())
-        .filter(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()))
-    {
+    for id in space_ids.iter().map(|id| id.trim()) {
+        // Dropping an unusable id would silently widen the query to every space.
+        if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err(format!("Invalid ClickUp space id \"{id}\""));
+        }
         path.push_str(&format!("&space_ids[]={id}"));
     }
     path.push_str(&format!("&page={page}"));
-    path
+    Ok(path)
 }
 
 fn fetch_spaces(config: &ClickUpConfig) -> Result<Vec<ClickUpSpace>, String> {
@@ -978,18 +997,98 @@ mod tests {
 
     #[test]
     fn builds_task_paths_with_numeric_space_filters() {
-        let path = tasks_path(
-            "123",
-            &["90100".into(), " 90101 ".into(), "bad".into(), "".into()],
-            true,
-            2,
-        );
+        let path = tasks_path("123", &["90100".into(), " 90101 ".into()], true, 2).unwrap();
         assert_eq!(
             path,
             "/team/123/task?order_by=updated&subtasks=true&include_closed=true\
              &space_ids[]=90100&space_ids[]=90101&page=2"
         );
-        assert!(tasks_path("123", &[], false, 0).ends_with("include_closed=false&page=0"));
+        assert!(tasks_path("123", &[], false, 0)
+            .unwrap()
+            .ends_with("include_closed=false&page=0"));
+    }
+
+    #[test]
+    fn rejects_unusable_space_ids_instead_of_widening_the_query() {
+        let error = tasks_path("123", &["90100".into(), "bad id".into()], false, 0).unwrap_err();
+        assert_eq!(error, "Invalid ClickUp space id \"bad id\"");
+        assert!(tasks_path("123", &["".into()], false, 0).is_err());
+        assert!(tasks_path("123", &["12/../3".into()], false, 0).is_err());
+    }
+
+    #[test]
+    fn cap_keeps_the_newest_tasks_whatever_order_the_api_returns() {
+        let updated = |id: &str, ms: &str| {
+            let mut node = task();
+            node["id"] = json!(id);
+            node["date_updated"] = json!(ms);
+            node
+        };
+        // Oldest first, with an undated task in the middle.
+        let mut undated = updated("undated", "0");
+        undated["date_updated"] = json!("");
+        let payload = json!({ "tasks": [
+            updated("old", "1600000000000"),
+            undated,
+            updated("newest", "1800000000000"),
+            updated("mid", "1700000000000"),
+        ] });
+        let issues = parse_clickup_issues(&payload, &spaces()).unwrap();
+        let kept = newest_first(issues.clone(), 2);
+        assert_eq!(
+            kept.iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest", "mid"]
+        );
+        let all = newest_first(issues, 10);
+        assert_eq!(all.last().unwrap().id, "undated");
+    }
+
+    fn response(raw: &str) -> ureq::Response {
+        raw.parse().unwrap()
+    }
+
+    #[test]
+    fn maps_401_to_an_invalid_token_message() {
+        let error = read_clickup_response(Err(ureq::Error::Status(
+            401,
+            response("HTTP/1.1 401 Unauthorized\r\n\r\n{\"err\":\"Token invalid\"}"),
+        )))
+        .unwrap_err();
+        assert_eq!(error, "ClickUp API token is invalid or expired");
+    }
+
+    #[test]
+    fn maps_429_to_a_rate_limit_message_and_starts_the_backoff() {
+        let error = read_clickup_response(Err(ureq::Error::Status(
+            429,
+            response("HTTP/1.1 429 Too Many Requests\r\nX-RateLimit-Reset: 1\r\n\r\n{}"),
+        )))
+        .unwrap_err();
+        assert_eq!(error, RATE_LIMITED);
+        assert_ne!(error, "ClickUp API token is invalid or expired");
+        // The shared slot is set, so the next request fails fast.
+        assert_eq!(wait_for_backoff().unwrap_err(), RATE_LIMITED);
+        *RATE_LIMIT_BACKOFF.lock().unwrap() = None;
+        assert!(wait_for_backoff().is_ok());
+    }
+
+    #[test]
+    fn maps_other_statuses_and_successes() {
+        let error = read_clickup_response(Err(ureq::Error::Status(
+            500,
+            response("HTTP/1.1 500 Internal Server Error\r\n\r\n"),
+        )))
+        .unwrap_err();
+        assert_eq!(error, "ClickUp request failed (500)");
+        let ok =
+            read_clickup_response(Ok(response("HTTP/1.1 200 OK\r\n\r\n{\"teams\":[]}"))).unwrap();
+        assert_eq!(ok, json!({ "teams": [] }));
+        assert_eq!(
+            read_clickup_response(Ok(response("HTTP/1.1 200 OK\r\n\r\nnot json"))).unwrap_err(),
+            "ClickUp returned invalid JSON"
+        );
     }
 
     #[test]
