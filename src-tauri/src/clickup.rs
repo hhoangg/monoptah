@@ -293,8 +293,7 @@ pub async fn clickup_issue_comment(
             &format!("/task/{task_id}/comment"),
             &json!({ "comment_text": body, "notify_all": false }),
         )?;
-        let id = value_string(&data, "id").unwrap_or_default();
-        if id.is_empty() {
+        if value_id(&data, "id").is_none() {
             return Err("Could not post ClickUp comment".into());
         }
         Ok(task_url(task_id))
@@ -813,6 +812,17 @@ fn value_string(value: &Value, key: &str) -> Option<String> {
         .map(|text| text.trim().to_string())
 }
 
+/// Reads an id that ClickUp documents as a string but may return as a JSON number.
+/// Kept apart from `value_string`: every other field there really is a string.
+fn value_id(value: &Value, key: &str) -> Option<String> {
+    let id = match value.get(key)? {
+        Value::String(text) => text.trim().to_string(),
+        Value::Number(number) => number.to_string(),
+        _ => return None,
+    };
+    Some(id).filter(|id| !id.is_empty())
+}
+
 // ---- Config storage ----
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1215,6 +1225,22 @@ mod tests {
         assert!(!thread.truncated);
         assert_eq!(thread.comments[0].body, "a");
         assert_eq!(thread.comments[0].url, "https://app.clickup.com/t/t");
+    }
+
+    #[test]
+    fn reads_ids_as_number_or_string() {
+        // The live comment POST returns a number, the API reference a string.
+        let live = json!({ "id": 1100290000049524u64, "hist_id": "5294670272230211025" });
+        assert_eq!(value_id(&live, "id").as_deref(), Some("1100290000049524"));
+        let documented = json!({ "id": " 1100290000049524 " });
+        assert_eq!(
+            value_id(&documented, "id").as_deref(),
+            Some("1100290000049524")
+        );
+        assert_eq!(value_id(&json!({ "id": "" }), "id"), None);
+        assert_eq!(value_id(&json!({ "id": null }), "id"), None);
+        assert_eq!(value_id(&json!({ "id": true }), "id"), None);
+        assert_eq!(value_id(&json!({}), "id"), None);
     }
 
     #[test]
