@@ -871,8 +871,12 @@ fn issue_identifier(custom_id: Option<&str>, id: &str) -> String {
 /// Maps ClickUp's status types onto the Jira-style categories the Inbox understands.
 fn state_type(clickup_type: &str) -> &'static str {
     match clickup_type.trim().to_ascii_lowercase().as_str() {
-        "open" => "new",
+        // `unstarted` is a status in the not-started group, like `open`.
+        "open" | "unstarted" => "new",
+        "custom" => "indeterminate",
         "closed" | "done" => "done",
+        // A type ClickUp adds later stays open work. Only an explicit done
+        // value may mark a task finished, because the Inbox hides those.
         _ => "indeterminate",
     }
 }
@@ -1063,11 +1067,15 @@ mod tests {
     #[test]
     fn maps_status_types() {
         assert_eq!(state_type("open"), "new");
+        assert_eq!(state_type("unstarted"), "new");
+        assert_eq!(state_type(" Unstarted "), "new");
         assert_eq!(state_type("custom"), "indeterminate");
         assert_eq!(state_type("closed"), "done");
         assert_eq!(state_type("done"), "done");
         assert_eq!(state_type("Closed"), "done");
         assert_eq!(state_type(""), "indeterminate");
+        // An unrecognised future type is open work, never done.
+        assert_eq!(state_type("paused"), "indeterminate");
     }
 
     #[test]
