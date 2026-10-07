@@ -747,6 +747,7 @@ export function retargetSessionToProject(
 export function newSessionLike(
   seed: Session | undefined,
   cwd: string,
+  options?: NewSessionOptions,
 ): Session {
   return newSession(
     seed?.harness ?? "claude",
@@ -754,6 +755,7 @@ export function newSessionLike(
     seed?.model,
     seed?.runtimeMode,
     seed?.modelSettings,
+    options,
   );
 }
 

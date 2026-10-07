@@ -71,7 +71,9 @@ export function applyAddToChatRequest({
     // session's harness/model/settings, but never its cwd.
     const donor = sessions[sessions.length - 1];
     createdSession = {
-      ...newSessionLike(donor, projectCwd),
+      // The quoted selection rides on the chat composer, so a terminal would
+      // drop it: always a chat.
+      ...newSessionLike(donor, projectCwd, { surface: "chat" }),
       composerSeed,
     };
     tab = newTab(createdSession.id);
@@ -97,7 +99,7 @@ export function applyAddToChatRequest({
     projectCwd;
   const file = focusedFileTab(tab);
   const session = createdSession ?? {
-    ...newDefaultSession(cwd, defaultRuntimeMode),
+    ...newDefaultSession(cwd, defaultRuntimeMode, { surface: "chat" }),
     ...(file?.projectCwd ? { worktreeCwd: file.cwd } : {}),
     composerSeed,
   };
