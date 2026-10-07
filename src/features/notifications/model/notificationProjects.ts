@@ -6,7 +6,7 @@ export type NotificationProject = {
   id: string;
   name: string;
   detail: string;
-  kind: "repository" | "local" | "linear" | "jira";
+  kind: "repository" | "local" | "linear" | "jira" | "clickup";
   paths: string[];
 };
 
@@ -74,7 +74,9 @@ export function loadNotificationProjects(): NotificationProject[] {
         typeof value.id === "string" &&
         typeof value.name === "string" &&
         typeof value.detail === "string" &&
-        ["repository", "local", "linear", "jira"].includes(value.kind) &&
+        ["repository", "local", "linear", "jira", "clickup"].includes(
+          value.kind,
+        ) &&
         Array.isArray(value.paths) &&
         value.paths.every((path: unknown) => typeof path === "string"),
     );
@@ -150,6 +152,21 @@ export function inboxNotificationProject(
       name: item.teamName || item.repo || "Jira project",
       detail: `Jira · ${site}`,
       kind: "jira",
+      paths: [],
+    };
+  }
+  if (item.provider === "clickup") {
+    let site = "unknown";
+    try {
+      site = new URL(item.url).host.toLowerCase();
+    } catch {
+      // Preserve a usable space identity even if a provider omits the URL.
+    }
+    return {
+      id: `clickup:${site}:space:${item.teamId || item.repo.toLowerCase() || "unknown"}`,
+      name: item.teamName || item.repo || "ClickUp space",
+      detail: `ClickUp · ${site}`,
+      kind: "clickup",
       paths: [],
     };
   }

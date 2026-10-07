@@ -2581,7 +2581,9 @@ function Workspace({
           item.projectPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
         setSidebarTab("sessions", cwd);
         const ref =
-          item.provider === "linear" || item.provider === "jira"
+          item.provider === "linear" ||
+          item.provider === "jira" ||
+          item.provider === "clickup"
             ? item.identifier?.trim() || `#${item.number}`
             : `#${item.number}`;
         const linkedWorkItem = linkedWorkItemFromInboxItem(item);
@@ -4329,7 +4331,9 @@ function Workspace({
               ? candidate
               : await invoke<string>("default_cwd");
           const description =
-            item.provider === "linear" || item.provider === "jira"
+            item.provider === "linear" ||
+            item.provider === "jira" ||
+            item.provider === "clickup"
               ? await inboxTrackerDescription(item)
               : item.provider === "gitlab" &&
                   (item.kind === "issue" || item.kind === "pr")

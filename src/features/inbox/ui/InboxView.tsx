@@ -154,6 +154,7 @@ import {
   type JiraIssueThread,
   type JiraProject,
 } from "../model/jira";
+import { CLICKUP_CHANGE_EVENT, clickupConnected } from "../model/clickup";
 import {
   GITLAB_CHANGE_EVENT,
   gitlabConnected,
@@ -580,9 +581,10 @@ export function InboxView({
         githubStatus(),
         linearConnected(),
         jiraConnected(),
+        clickupConnected(),
         gitlabConnected(),
         azureDevOpsConnected(),
-      ]).then(([github, linear, jira, gitlab, azuredevops]) => {
+      ]).then(([github, linear, jira, clickup, gitlab, azuredevops]) => {
         if (cancelled || generation !== latest) return;
         setConnections((prev) => ({
           github:
@@ -594,6 +596,10 @@ export function InboxView({
               ? linear.value.connected
               : prev.linear,
           jira: jira.status === "fulfilled" ? jira.value.connected : prev.jira,
+          clickup:
+            clickup.status === "fulfilled"
+              ? clickup.value.connected
+              : prev.clickup,
           gitlab:
             gitlab.status === "fulfilled"
               ? gitlab.value.connected
@@ -608,12 +614,14 @@ export function InboxView({
     read();
     window.addEventListener(LINEAR_CHANGE_EVENT, read);
     window.addEventListener(JIRA_CHANGE_EVENT, read);
+    window.addEventListener(CLICKUP_CHANGE_EVENT, read);
     window.addEventListener(GITLAB_CHANGE_EVENT, read);
     window.addEventListener(AZUREDEVOPS_CHANGE_EVENT, read);
     return () => {
       cancelled = true;
       window.removeEventListener(LINEAR_CHANGE_EVENT, read);
       window.removeEventListener(JIRA_CHANGE_EVENT, read);
+      window.removeEventListener(CLICKUP_CHANGE_EVENT, read);
       window.removeEventListener(GITLAB_CHANGE_EVENT, read);
       window.removeEventListener(AZUREDEVOPS_CHANGE_EVENT, read);
     };

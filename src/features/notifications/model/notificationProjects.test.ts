@@ -26,6 +26,21 @@ it("groups Jira notification preferences by site and stable project ID", () => {
   expect(loadNotificationProjects()).toContainEqual(project);
 });
 
+it("groups ClickUp notification preferences by site and stable space ID", () => {
+  const item = {
+    provider: "clickup" as const, repo: "Engineering", teamId: "1001",
+    teamName: "Engineering", url: "https://app.clickup.com/t/86abc12",
+  };
+  const project = inboxNotificationProject(item);
+  expect(project).toEqual({
+    id: "clickup:app.clickup.com:space:1001", name: "Engineering",
+    detail: "ClickUp · app.clickup.com", kind: "clickup", paths: [],
+  });
+  expect(inboxNotificationProject({ ...item, repo: "Renamed", teamName: "Renamed" }).id).toBe(project.id);
+  rememberNotificationProjects([project]);
+  expect(loadNotificationProjects()).toContainEqual(project);
+});
+
 it("derives local notification identity immediately from the normalized path", () => {
   expect(knownNotificationProject("C:/Work/App")).toEqual({
     id: "local:c:/work/app",

@@ -42,6 +42,10 @@ import {
 } from "../model/linkedSessionSeen";
 import { loadHiddenLinearTeamIds } from "../model/linear";
 import { JIRA_CHANGE_EVENT, loadHiddenJiraProjectIds } from "../model/jira";
+import {
+  CLICKUP_CHANGE_EVENT,
+  loadHiddenClickUpSpaceIds,
+} from "../model/clickup";
 import type { RecentProject } from "../../projects/model/recents";
 import type { SessionSummary } from "../../sessions/data/sessionStore";
 import { playCue } from "../../settings/model/sounds";
@@ -183,6 +187,7 @@ export function useInboxActivity(
         search: "",
         linearHiddenTeamIds: loadHiddenLinearTeamIds(),
         jiraHiddenProjectIds: loadHiddenJiraProjectIds(),
+        clickupHiddenSpaceIds: loadHiddenClickUpSpaceIds(),
       };
       try {
         const listed = await listInboxItems(projects, query, { force });
@@ -307,11 +312,14 @@ export function useInboxActivity(
     document.addEventListener("visibilitychange", onVis);
     const onJiraChange = () => void pull(true);
     window.addEventListener(JIRA_CHANGE_EVENT, onJiraChange);
+    const onClickUpChange = () => void pull(true);
+    window.addEventListener(CLICKUP_CHANGE_EVENT, onClickUpChange);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener(JIRA_CHANGE_EVENT, onJiraChange);
+      window.removeEventListener(CLICKUP_CHANGE_EVENT, onClickUpChange);
       stopSelfActivity();
     };
   }, [applyUnseen, cwd, recents]);

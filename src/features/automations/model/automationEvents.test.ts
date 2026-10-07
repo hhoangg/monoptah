@@ -66,6 +66,18 @@ describe("inbox automation events", () => {
     expect(matchInboxAutomations([automation({ triggers: [trigger] })], [{ ...jira, repo: "OPS" }])).toEqual([]);
   });
 
+  it("matches ClickUp tasks and keys them by raw task id, not the display identifier", () => {
+    const clickup = item({ provider: "clickup", kind: "clickup", id: "86abc12", identifier: "ENG-42", repo: "Engineering", projectPath: "" });
+    const trigger = { ...createAutomationTrigger("clickup", "issue_created"), repos: ["Engineering"] };
+    expect(inboxAppearedEvent(clickup)).toEqual({ kind: "clickup", event: "issue_created" });
+    expect(automationEventKey(clickup)).toBe("clickup:task:86abc12");
+    expect(automationEventKey({ ...clickup, identifier: "#86abc12", number: 0 })).toBe("clickup:task:86abc12");
+    const matches = matchInboxAutomations([automation({ triggers: [trigger] })], [clickup]);
+    expect(matches).toHaveLength(1);
+    expect(matches[0].prompt).toContain("Work on this ClickUp task:");
+    expect(matchInboxAutomations([automation({ triggers: [trigger] })], [{ ...clickup, repo: "Operations" }])).toEqual([]);
+  });
+
   it("maps opened PRs, drafts, and issues", () => {
     expect(inboxAppearedEvent(item())).toEqual({
       kind: "github",

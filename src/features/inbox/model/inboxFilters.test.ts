@@ -430,6 +430,25 @@ describe("hasActiveInboxFilters", () => {
     ).toBe(false);
   });
 
+  it("treats ClickUp as a tracker with hidden spaces outside InboxFilters", () => {
+    expect(
+      hasActiveInboxFilters(
+        {
+          ...DEFAULT_INBOX_FILTERS,
+          hiddenProjects: ["/tmp/web"],
+          hiddenKinds: ["pr"],
+        },
+        "clickup",
+      ),
+    ).toBe(false);
+    expect(
+      hasActiveInboxFilters(DEFAULT_INBOX_FILTERS, "clickup", [], [], ["1001"]),
+    ).toBe(true);
+    expect(
+      hasActiveInboxFilters(DEFAULT_INBOX_FILTERS, "github", [], [], ["1001"]),
+    ).toBe(false);
+  });
+
   it("is true when a Linear team is hidden on the Linear tab", () => {
     expect(hasActiveInboxFilters(DEFAULT_INBOX_FILTERS, "linear", ["t1"])).toBe(
       true,
@@ -502,6 +521,7 @@ describe("visibleInboxSources", () => {
         github: false,
         linear: false,
         jira: false,
+        clickup: false,
         gitlab: false,
         azuredevops: false,
       }),
@@ -511,6 +531,7 @@ describe("visibleInboxSources", () => {
         github: true,
         linear: false,
         jira: false,
+        clickup: false,
         gitlab: false,
         azuredevops: false,
       }),
@@ -520,19 +541,21 @@ describe("visibleInboxSources", () => {
         github: false,
         linear: true,
         jira: true,
+        clickup: true,
         gitlab: false,
         azuredevops: false,
       }),
-    ).toEqual(["linear", "jira"]);
+    ).toEqual(["linear", "jira", "clickup"]);
     expect(
       visibleInboxSources({
         github: true,
         linear: true,
         jira: true,
+        clickup: true,
         gitlab: true,
         azuredevops: true,
       }),
-    ).toEqual(["github", "linear", "jira", "gitlab", "azuredevops"]);
+    ).toEqual(["github", "linear", "jira", "clickup", "gitlab", "azuredevops"]);
   });
 
   it("keeps unresolved sources visible so tabs do not flash away", () => {
@@ -541,10 +564,11 @@ describe("visibleInboxSources", () => {
         github: null,
         linear: null,
         jira: null,
+        clickup: null,
         gitlab: null,
         azuredevops: null,
       }),
-    ).toEqual(["github", "linear", "jira", "gitlab", "azuredevops"]);
+    ).toEqual(["github", "linear", "jira", "clickup", "gitlab", "azuredevops"]);
   });
 });
 
@@ -555,19 +579,21 @@ describe("connectableInboxSources", () => {
         github: true,
         linear: false,
         jira: false,
+        clickup: false,
         gitlab: true,
         azuredevops: true,
       }),
-    ).toEqual(["linear", "jira"]);
+    ).toEqual(["linear", "jira", "clickup"]);
     expect(
       connectableInboxSources({
         github: false,
         linear: false,
         jira: false,
+        clickup: false,
         gitlab: false,
         azuredevops: false,
       }),
-    ).toEqual(["github", "linear", "jira", "gitlab", "azuredevops"]);
+    ).toEqual(["github", "linear", "jira", "clickup", "gitlab", "azuredevops"]);
   });
 
   it("offers nothing while the checks are unresolved", () => {
@@ -576,6 +602,7 @@ describe("connectableInboxSources", () => {
         github: null,
         linear: null,
         jira: null,
+        clickup: null,
         gitlab: null,
         azuredevops: null,
       }),
@@ -590,6 +617,7 @@ describe("resolveInboxSource", () => {
         github: true,
         linear: false,
         jira: false,
+        clickup: false,
         gitlab: true,
         azuredevops: false,
       }),
@@ -599,6 +627,7 @@ describe("resolveInboxSource", () => {
         github: false,
         linear: false,
         jira: false,
+        clickup: false,
         gitlab: true,
         azuredevops: false,
       }),
@@ -611,6 +640,7 @@ describe("resolveInboxSource", () => {
         github: false,
         linear: false,
         jira: false,
+        clickup: false,
         gitlab: false,
         azuredevops: false,
       }),
@@ -623,6 +653,7 @@ describe("resolveInboxSource", () => {
         github: false,
         linear: true,
         jira: true,
+        clickup: true,
         gitlab: false,
         azuredevops: false,
       }),
@@ -632,6 +663,7 @@ describe("resolveInboxSource", () => {
         github: true,
         linear: false,
         jira: false,
+        clickup: false,
         gitlab: false,
         azuredevops: false,
       }),
@@ -672,6 +704,7 @@ describe("inbox connection cache", () => {
       github: true,
       linear: true,
       jira: true,
+      clickup: true,
       gitlab: false,
       azuredevops: false,
     });
@@ -679,6 +712,7 @@ describe("inbox connection cache", () => {
       github: true,
       linear: true,
       jira: true,
+      clickup: true,
       gitlab: false,
       azuredevops: false,
     });
@@ -689,6 +723,7 @@ describe("inbox connection cache", () => {
       github: null,
       linear: null,
       jira: null,
+      clickup: null,
       gitlab: null,
       azuredevops: null,
     });
@@ -700,6 +735,7 @@ describe("inbox connection cache", () => {
       github: null,
       linear: null,
       jira: null,
+      clickup: null,
       gitlab: null,
       azuredevops: null,
     });
@@ -708,6 +744,7 @@ describe("inbox connection cache", () => {
       github: null,
       linear: null,
       jira: null,
+      clickup: null,
       gitlab: null,
       azuredevops: null,
     });

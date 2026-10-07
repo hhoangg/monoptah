@@ -18,6 +18,16 @@ import {
   type JiraIssue,
 } from "./jira";
 import {
+  clearClickUpCache,
+  clickupConnected,
+  clickupIssuesAssignedTo,
+  clickupSpaceIdsForFetch,
+  listClickUpIssues,
+  listClickUpSpaces,
+  loadHiddenClickUpSpaceIds,
+  type ClickUpIssue,
+} from "./clickup";
+import {
   clearGitlabCache,
   gitlabConnected,
   gitlabRepo,
@@ -44,7 +54,7 @@ import { recordInboxSelfActivity } from "./inboxSelfActivity";
 export type GithubTaskKind = "issue" | "pr";
 export type GithubPrAction =
   "merge" | "squash" | "rebase" | "draft" | "ready" | "close" | "reopen";
-export type InboxKind = GithubTaskKind | "linear" | "jira";
+export type InboxKind = GithubTaskKind | "linear" | "jira" | "clickup";
 
 export type GithubLabel = {
   name: string;
@@ -73,7 +83,7 @@ export type GithubWorkItem = {
 };
 
 export type InboxProvider =
-  "github" | "linear" | "jira" | "gitlab" | "azuredevops";
+  "github" | "linear" | "jira" | "clickup" | "gitlab" | "azuredevops";
 
 export type InboxItem = Omit<GithubWorkItem, "kind"> & {
   kind: InboxKind;
@@ -157,6 +167,7 @@ export type GithubWorkItemQuery = {
 export type InboxQuery = Omit<GithubWorkItemQuery, "kind"> & {
   linearHiddenTeamIds?: string[];
   jiraHiddenProjectIds?: string[];
+  clickupHiddenSpaceIds?: string[];
 };
 
 export type InboxProviderErrors = Partial<Record<InboxProvider, string>>;
@@ -212,6 +223,7 @@ function freshEnough(key: string, maxAgeMs: number | undefined): boolean {
 export function clearInboxCache() {
   inboxCacheGeneration += 1;
   clearJiraCache();
+  clearClickUpCache();
   clearKnownInboxItems();
   inboxListCache = null;
   inboxListInflight.clear();
@@ -240,7 +252,10 @@ export function inboxListCacheKey(
     .join("|");
   const teams = [...(query.linearHiddenTeamIds ?? [])].sort().join(",");
   const jiraProjects = [...(query.jiraHiddenProjectIds ?? [])].sort().join(",");
-  return `${query.assignedToMe ? 1 : 0}:${query.state}:${paths}:${teams}:${jiraProjects}`;
+  const clickupSpaces = [...(query.clickupHiddenSpaceIds ?? [])]
+    .sort()
+    .join(",");
+  return `${query.assignedToMe ? 1 : 0}:${query.state}:${paths}:${teams}:${jiraProjects}:${clickupSpaces}`;
 }
 
 export function peekInboxList(
@@ -790,6 +805,16 @@ async function fetchInboxItems(
     errors.jira = inboxErrorMessage(error);
   }
 
+  let clickupItems: InboxItem[] = [];
+  try {
+    const status = await clickupConnected();
+    if (status.connected) {
+      clickupItems = await fetchClickUpInboxItems(query, status.username);
+    }
+  } catch (error) {
+    errors.clickup = inboxErrorMessage(error);
+  }
+
   let gitlabItems: InboxItem[] = [];
   if ((await gitlabConnected()).connected) {
     const gitlab = await fetchRepositoryInboxItems(
@@ -820,6 +845,7 @@ async function fetchInboxItems(
         ...github.items,
         ...linearItems,
         ...jiraItems,
+        ...clickupItems,
         ...gitlabItems,
         ...azureDevOpsItems,
       ],
@@ -983,6 +1009,58 @@ function jiraIssueToInboxItem(issue: JiraIssue): InboxItem {
   };
 }
 
+async function fetchClickUpInboxItems(
+  query: InboxQuery,
+  username: string,
+): Promise<InboxItem[]> {
+  const hiddenIds = query.clickupHiddenSpaceIds ?? loadHiddenClickUpSpaceIds();
+  let spaceIds: string[] | null = null;
+  if (hiddenIds.length > 0) {
+    // The backend rejects unknown space ids, so only ids from the live list
+    // are sent. A hidden id for a deleted space is dropped here.
+    spaceIds = clickupSpaceIdsForFetch(await listClickUpSpaces(), hiddenIds);
+    if (spaceIds?.length === 0) return [];
+  }
+  const issues = await listClickUpIssues({
+    includeClosed: query.state === "all",
+    spaceIds: spaceIds ?? [],
+    limit: query.state === "all" ? INBOX_ALL_LIMIT : undefined,
+  });
+  const hidden = new Set(hiddenIds);
+  const visible = issues.filter(
+    (issue) => hidden.size === 0 || !hidden.has(issue.teamId),
+  );
+  return (
+    query.assignedToMe ? clickupIssuesAssignedTo(visible, username) : visible
+  ).map(clickupIssueToInboxItem);
+}
+
+function clickupIssueToInboxItem(issue: ClickUpIssue): InboxItem {
+  return {
+    provider: "clickup",
+    kind: "clickup",
+    id: issue.id,
+    identifier: issue.identifier,
+    number: issue.number,
+    title: issue.title,
+    url: issue.url,
+    state: issue.state,
+    stateType: issue.stateType,
+    updatedAt: issue.updatedAt,
+    labels: issue.labels,
+    assignees: issue.assignees,
+    draft: false,
+    repo: issue.repo,
+    teamId: issue.teamId,
+    teamName: issue.teamName,
+    // The backend sends the ClickUp list name as `projectPath`, but that field
+    // is a local directory (it becomes a session cwd), so keep the list name
+    // in `projectName` where search and display can use it.
+    projectName: issue.projectPath || "",
+    projectPath: "",
+  };
+}
+
 function gitlabWorkItemToInboxItem(
   item: GitlabWorkItem,
   projectPath: string,
@@ -1093,6 +1171,12 @@ export function inboxIdentityKey(item: {
     if (identity) return identity.toLowerCase();
     return `jira:${item.number}`;
   }
+  if (item.provider === "clickup") {
+    // Display identifiers change with custom ids, so identity is the raw id.
+    const identity = item.id?.trim() || item.identifier?.trim();
+    if (identity) return identity.toLowerCase();
+    return `clickup:${item.number}`;
+  }
   const repo = item.repo.trim().toLowerCase();
   if (repo) return `${repo}:${item.kind}:${item.number}`;
   const url = item.url.trim().toLowerCase();
@@ -1165,7 +1249,7 @@ export function inboxItemStatus(item: {
     if (type === "completed" || type === "canceled") return "Closed";
     return "Open";
   }
-  if (item.kind === "jira") {
+  if (item.kind === "jira" || item.kind === "clickup") {
     return item.stateType?.trim().toLowerCase() === "done" ? "Closed" : "Open";
   }
   if (item.draft) return "Draft";
@@ -1186,7 +1270,9 @@ export function matchesInboxQuery(item: InboxItem, query: string): boolean {
         ? "linear issue"
         : item.kind === "jira"
           ? "jira issue"
-          : "issue";
+          : item.kind === "clickup"
+            ? "clickup task"
+            : "issue";
   const haystack = [
     item.title,
     item.repo,
@@ -1218,18 +1304,33 @@ export function inboxItemRef(item: {
   number: number;
   identifier?: string;
 }): string {
-  if (item.provider === "linear" || item.provider === "jira") {
+  if (
+    item.provider === "linear" ||
+    item.provider === "jira" ||
+    item.provider === "clickup"
+  ) {
     return item.identifier?.trim() || `#${item.number}`;
   }
   return `#${item.number}`;
 }
 
+function trackerProviderName(provider: "linear" | "jira" | "clickup"): string {
+  if (provider === "jira") return "Jira";
+  if (provider === "clickup") return "ClickUp";
+  return "Linear";
+}
+
 export function inboxStartDraft(item: InboxItem, body?: string): string {
-  if (item.provider === "linear" || item.provider === "jira") {
-    const provider = item.provider === "jira" ? "Jira" : "Linear";
+  if (
+    item.provider === "linear" ||
+    item.provider === "jira" ||
+    item.provider === "clickup"
+  ) {
+    const provider = trackerProviderName(item.provider);
+    const noun = item.provider === "clickup" ? "task" : "issue";
     const id = item.identifier?.trim() || `${provider} #${item.number}`;
     const title = item.title.trim() || id;
-    const lines = [`Work on this ${provider} issue:`, "", `${id} ${title}`];
+    const lines = [`Work on this ${provider} ${noun}:`, "", `${id} ${title}`];
     const url = item.url.trim();
     if (url) lines.push(url);
     const description = body?.trim();
@@ -1275,7 +1376,10 @@ export function inboxComposerCard(
   item: InboxItem,
   body?: string,
 ): InboxComposerCard {
-  const tracker = item.provider === "linear" || item.provider === "jira";
+  const tracker =
+    item.provider === "linear" ||
+    item.provider === "jira" ||
+    item.provider === "clickup";
   return {
     provider: item.provider,
     kind: item.kind,
