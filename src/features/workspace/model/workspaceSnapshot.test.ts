@@ -139,6 +139,29 @@ describe("project return snapshots", () => {
     expect(memory.size).toBe(3);
   });
 
+  it("keeps a terminal session's surface when only the stub is left", () => {
+    const terminal = chat("t1", "/alpha");
+    terminal.surface = "tui";
+    const plain = chat("c1", "/alpha");
+    const tabs = [terminal, plain].map((session) => ({
+      ...newTab(session.id),
+      id: `tab-${session.id}`,
+    }));
+    const snapshot = collectWorkspaceSnapshot(
+      tabs,
+      [terminal, plain],
+      "tab-t1",
+      "/alpha",
+      new Map(),
+    );
+    const restored = hydrateWorkspaceSnapshot(snapshot, new Map());
+    const surfaces = new Map(
+      restored?.sessions.map((session) => [session.id, session.surface]),
+    );
+    expect(surfaces.get("t1")).toBe("tui");
+    expect(surfaces.get("c1")).toBe("chat");
+  });
+
   it("restores both project choices, not just the active tab", () => {
     const restored = hydrateWorkspaceSnapshot(saved(), new Map());
     expect(restored?.projectReturnMemory?.get("/alpha")).toBe("a2");

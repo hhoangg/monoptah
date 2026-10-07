@@ -46,6 +46,7 @@ import type {
 } from "../model/session";
 
 import { HARNESSES, RUNTIME_MODES } from "../model/session";
+import type { SessionSurface } from "../../providers/model/providerSurface";
 
 import { restoreOrchestrationProposal } from "../../orchestration/model/orchestrationPlan";
 
@@ -88,6 +89,8 @@ type SessionRecord = {
   modelSettings: Record<string, string>;
   runtimeMode: string;
   title: string;
+  /** NULL on rows saved before the column existed; both mean chat. */
+  surface?: string | null;
   providerSessionId?: string | null;
   providerAccountId?: string | null;
   blocks: Block[];
@@ -113,6 +116,7 @@ type SessionUpsertPayload = {
   modelSettings: Record<string, string>;
   runtimeMode: string;
   title: string;
+  surface: SessionSurface;
   providerSessionId?: string;
   providerAccountId?: string;
   blocks: Block[];
@@ -161,6 +165,7 @@ function persistableMeta(
     modelSettings: session.modelSettings,
     runtimeMode: session.runtimeMode,
     title: session.title,
+    surface: session.surface === "tui" ? "tui" : "chat",
     ...(session.sidebarHidden === true ? { sidebarHidden: true } : {}),
     ...(queuedMessages.length
       ? {
@@ -1400,6 +1405,7 @@ function recordToSession(record: SessionRecord): Session {
         : {},
     runtimeMode: asRuntimeMode(record.runtimeMode),
     title: record.title,
+    surface: record.surface === "tui" ? "tui" : "chat",
     blocks,
     // A restart interrupted the active turn. Let the user resume pending work.
     ...(queuedMessages.length

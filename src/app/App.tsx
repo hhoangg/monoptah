@@ -2561,7 +2561,10 @@ function Workspace({
       }
       // Reserve a dedicated tab immediately. An apparently blank remote tab
       // may hold composer text or a create/upload that the host has not accepted.
-      const session = newDefaultSession(project, sessionDefaults?.runtimeMode);
+      // The host owns this session, so it is always a chat here.
+      const session = newDefaultSession(project, sessionDefaults?.runtimeMode, {
+        surface: "chat",
+      });
       const tab = newTab(session.id);
       rememberRemoteSession(session.id, remoteSessionId);
       setSessions((prev) => [...prev, session]);
@@ -4365,7 +4368,8 @@ function Workspace({
                     ).body
                   : undefined;
           session = {
-            ...newDefaultSession(cwd),
+            // Inbox Ask is a temporary chat that never gets a terminal.
+            ...newDefaultSession(cwd, undefined, { surface: "chat" }),
             title: `Ask · ${item.title}`,
             inboxAsk: {
               key,
@@ -4415,6 +4419,7 @@ function Workspace({
             stopped.model,
             stopped.runtimeMode,
             stopped.modelSettings,
+            { surface: "chat" },
           ),
           title: stopped.title,
           inboxAsk: stopped.inboxAsk,
@@ -4460,7 +4465,9 @@ function Workspace({
       const session = await ensureMonoSession(monoId, {
         home: homeDir,
         load: ensureOpenSession,
-        create: (path) => newDefaultSession(path),
+        // A Mono's conversation is driven by the app, never a terminal.
+        create: (path) =>
+          newDefaultSession(path, undefined, { surface: "chat" }),
         add: (created) => {
           sessionsRef.current = [...sessionsRef.current, created];
           setSessions(sessionsRef.current);
@@ -8074,12 +8081,14 @@ function Workspace({
 
         if (!session) {
           session = {
+            // Automations submit their prompt themselves, so they need a chat.
             ...newSession(
               automation.harness,
               automation.cwd,
               automation.model,
               automation.runtimeMode,
               automation.modelSettings,
+              { surface: "chat" },
             ),
             title: eventRun
               ? HARNESS_LABEL[automation.harness]
@@ -8951,7 +8960,15 @@ function Workspace({
         cwd,
       });
       const session = {
-        ...newSession(harness, source.cwd, model, source.runtimeMode),
+        // The request is submitted right away, which only a chat can take.
+        ...newSession(
+          harness,
+          source.cwd,
+          model,
+          source.runtimeMode,
+          undefined,
+          { surface: "chat" },
+        ),
         worktreeCwd: source.worktreeCwd,
         branch: source.branch,
         modelSettings: mergeModelSettings(
@@ -9995,7 +10012,15 @@ function Workspace({
             "The saved worker no longer matches its approved model. Create a new assignment.",
           );
         const fresh = {
-          ...newSession(task.harness, projectCwd, task.model, lead.runtimeMode),
+          // Workers report back into their lead's panel, so they are chats.
+          ...newSession(
+            task.harness,
+            projectCwd,
+            task.model,
+            lead.runtimeMode,
+            undefined,
+            { surface: "chat" },
+          ),
           ...(sameProjectPath(projectCwd, checkoutCwd)
             ? {}
             : { worktreeCwd: checkoutCwd, branch: workspace.branch }),
@@ -11167,7 +11192,10 @@ function Workspace({
       }
       if (!session) {
         session = {
-          ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+          // The repair request is submitted right away, which needs a chat.
+          ...newDefaultSession(cwd, sessionDefaults?.runtimeMode, {
+            surface: "chat",
+          }),
           title: `Fix CI #${item.number}: ${item.title}`,
           linkedWorkItem: linkedWorkItemFromInboxItem(item) ?? undefined,
         };

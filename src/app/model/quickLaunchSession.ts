@@ -73,7 +73,16 @@ export async function acceptQuickLaunch(
   const session =
     existing ??
     applyQuickWorkspace(
-      newSession(launch.harness, launch.cwd, launch.model, launch.runtimeMode),
+      // The launch submits its prompt itself, so it starts as a chat. This also
+      // covers `/operator` sessions.start, which arrives here.
+      newSession(
+        launch.harness,
+        launch.cwd,
+        launch.model,
+        launch.runtimeMode,
+        undefined,
+        { surface: "chat" },
+      ),
       launch,
     );
   session.id = deliveryId;

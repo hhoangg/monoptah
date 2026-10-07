@@ -49,6 +49,8 @@ export type WorkspaceSessionStub = {
   modelSettings: Record<string, string>;
   runtimeMode: RuntimeMode;
   title: string;
+  /** Only written for a terminal session; missing means chat. */
+  surface?: "tui";
   providerSessionId?: string;
   providerAccountId?: string;
   branch?: string;
@@ -358,6 +360,7 @@ function sessionStub(session: Session): WorkspaceSessionStub | null {
     modelSettings: { ...session.modelSettings },
     runtimeMode: session.runtimeMode,
     title: session.title,
+    ...(session.surface === "tui" ? { surface: "tui" as const } : {}),
     ...(session.inboxAsk ? { inboxAsk: session.inboxAsk } : {}),
     ...(session.providerSessionId
       ? { providerSessionId: session.providerSessionId }
@@ -378,6 +381,9 @@ function sessionFromStub(stub: WorkspaceSessionStub): Session {
     stub.model,
     stub.runtimeMode,
     stub.modelSettings,
+    // A snapshot restores a saved conversation; today's preference must not
+    // flip its surface.
+    { surface: stub.surface ?? "chat" },
   );
   return {
     ...session,
@@ -428,6 +434,7 @@ function sanitizeStub(raw: unknown): WorkspaceSessionStub | null {
     modelSettings,
     runtimeMode,
     title: typeof value.title === "string" ? value.title : "",
+    ...(value.surface === "tui" ? { surface: "tui" as const } : {}),
     ...(value.inboxAsk && typeof value.inboxAsk === "object"
       ? { inboxAsk: value.inboxAsk as InboxAskContext }
       : {}),

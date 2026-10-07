@@ -105,6 +105,9 @@ pub struct SessionUpsert {
     pub model_settings: Value,
     pub runtime_mode: String,
     pub title: String,
+    /// "chat" or "tui". Absent from older clients and rows; both mean chat.
+    #[serde(default)]
+    pub surface: Option<String>,
     #[serde(default)]
     pub provider_session_id: Option<String>,
     #[serde(default)]
@@ -187,6 +190,8 @@ pub struct SessionRecord {
     pub runtime_mode: String,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_account_id: Option<String>,
@@ -235,6 +240,11 @@ pub fn session_upsert(
     if let Some(automation_id) = &session.automation_id {
         if !automation_id.is_empty() {
             validate_id(automation_id, "automation")?;
+        }
+    }
+    if let Some(surface) = &session.surface {
+        if surface != "chat" && surface != "tui" {
+            return Err("surface must be chat or tui".into());
         }
     }
     if !session.model_settings.is_object() {
@@ -783,6 +793,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("queued_messages_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("queue_status", "TEXT"),
         ("sidebar_hidden", "INTEGER NOT NULL DEFAULT 0"),
+        ("surface", "TEXT"),
     ] {
         ensure_session_column(conn, column, decl)?;
     }
@@ -1209,8 +1220,8 @@ pub(crate) fn upsert_session(
            provider_session_id, blocks_json, created_at, updated_at, branch,
            context_used, context_window, worktree_cwd, has_user_message,
            linked_work_item_json, provider_account_id, worktree_removed, is_draft,
-           automation_id, queued_messages_json, queue_status, sidebar_hidden
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+           automation_id, queued_messages_json, queue_status, sidebar_hidden, surface
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
          ON CONFLICT(id) DO UPDATE SET
            cwd = excluded.cwd,
            harness = excluded.harness,
@@ -1233,7 +1244,8 @@ pub(crate) fn upsert_session(
            automation_id = excluded.automation_id,
            queued_messages_json = excluded.queued_messages_json,
            queue_status = excluded.queue_status,
-           sidebar_hidden = excluded.sidebar_hidden",
+           sidebar_hidden = excluded.sidebar_hidden,
+           surface = excluded.surface",
         params![
             session.id,
             session.cwd,
@@ -1259,6 +1271,7 @@ pub(crate) fn upsert_session(
             queued_messages_json,
             session.queue_status,
             i64::from(session.sidebar_hidden),
+            session.surface,
         ],
     )?;
 
@@ -1929,7 +1942,8 @@ fn get_session_record(
                 provider_session_id, {blocks}, created_at, updated_at,
                 context_used, context_window, branch, worktree_cwd,
                 linked_work_item_json, provider_account_id, worktree_removed,
-                automation_id, queued_messages_json, queue_status, sidebar_hidden
+                automation_id, queued_messages_json, queue_status, sidebar_hidden,
+                surface
          FROM sessions
          WHERE id = ?1 AND inbox_ask IS NULL"
         ),
@@ -1953,6 +1967,7 @@ fn get_session_record(
             })?;
             Ok(SessionRecord {
                 sidebar_hidden: row.get::<_, i64>(21)? != 0,
+                surface: row.get(22)?,
                 id: row.get(0)?,
                 orchestration_lead_id: worker_parent(conn, session_id)?,
                 cwd: row.get(1)?,
@@ -2165,6 +2180,7 @@ mod tests {
     fn sample(id: &str, cwd: &str, title: &str) -> SessionUpsert {
         SessionUpsert {
             sidebar_hidden: false,
+            surface: None,
             id: id.into(),
             cwd: cwd.into(),
             harness: "cursor".into(),
@@ -2517,6 +2533,53 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .sidebar_hidden
+        );
+    }
+
+    #[test]
+    fn surface_round_trips_and_survives_later_saves() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mut row = sample("terminal", "/tmp/a", "Terminal");
+        row.surface = Some("tui".into());
+        upsert_session(&conn, &row).unwrap();
+        let stored = get_session(&conn, &row.id).unwrap().unwrap();
+        assert_eq!(stored.surface.as_deref(), Some("tui"));
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap()["surface"],
+            json!("tui")
+        );
+        row.title = "Renamed".into();
+        upsert_session(&conn, &row).unwrap();
+        assert_eq!(
+            get_session(&conn, &row.id)
+                .unwrap()
+                .unwrap()
+                .surface
+                .as_deref(),
+            Some("tui")
+        );
+    }
+
+    #[test]
+    fn rows_saved_before_the_surface_column_load_without_one() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        upsert_session(&conn, &sample("existing", "/tmp/a", "Existing")).unwrap();
+        conn.execute_batch("ALTER TABLE sessions DROP COLUMN surface;")
+            .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let stored = get_session(&conn, "existing").unwrap().unwrap();
+        assert_eq!(stored.surface, None);
+        // The client reads an absent surface as chat, so it must not be sent.
+        assert!(serde_json::to_value(&stored)
+            .unwrap()
+            .get("surface")
+            .is_none());
+        assert_eq!(
+            stored.blocks,
+            sample("existing", "/tmp/a", "Existing").blocks
         );
     }
 

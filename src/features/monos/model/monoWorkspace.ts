@@ -77,6 +77,7 @@ export async function resetMonoSession(
     stopped.model,
     stopped.runtimeMode,
     stopped.modelSettings,
+    { surface: "chat" },
   );
   // A failed deletion must leave the original conversation selected.
   await host.remove(stopped);

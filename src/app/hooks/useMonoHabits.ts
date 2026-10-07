@@ -177,6 +177,8 @@ export function useMonoHabits(host: MonoHabitHost, enabled = true) {
           mono.model,
           "full-access",
           mono.modelSettings,
+          // Habit runs are headless and ephemeral, so they are always chats.
+          { surface: "chat" },
         ),
         title: `${look.name} · ${habit.name}`,
         ephemeral: true,

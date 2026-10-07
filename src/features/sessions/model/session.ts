@@ -14,6 +14,11 @@ import {
   resolveModel,
 } from "./models";
 import { loadProjectProviderSettings } from "./projectProviders";
+import { isRemoteProjectPath } from "../../projects/model/recents";
+import {
+  loadProviderSurface,
+  type SessionSurface,
+} from "../../providers/model/providerSurface";
 
 export type HarnessId =
   | "claude"
@@ -469,6 +474,8 @@ export type Session = {
    * A Mono's habit runs are, and disappear when the run ends.
    */
   ephemeral?: boolean;
+  /** App chat or the provider's own CLI. Fixed at creation; missing means chat. */
+  surface?: SessionSurface;
   /** Provider-side conversation id (Cursor ACP session id). */
   providerSessionId?: string;
   /** Named local credential profile used by Claude or Codex. */
@@ -554,12 +561,22 @@ export function harnessSupportsAttachments(id: HarnessId): boolean {
   return id !== "fx";
 }
 
+/** Options for the surface a new session is created with. */
+export type NewSessionOptions = {
+  /**
+   * Pin the surface instead of reading the provider's preference. Sessions the
+   * app drives itself (a submitted prompt, a Mono, a remote host) pass "chat".
+   */
+  surface?: SessionSurface;
+};
+
 export function newSession(
   harness: HarnessId = "claude",
   cwd = "~",
   model?: string,
   runtimeMode: RuntimeMode = DEFAULT_RUNTIME_MODE,
   modelSettings?: Record<string, string>,
+  options: NewSessionOptions = {},
 ): Session {
   const resolved = resolveModel(harness, model ?? preferredModelId(harness));
   return {
@@ -571,6 +588,10 @@ export function newSession(
     title: HARNESS_LABEL[harness],
     cwd,
     blocks: [],
+    // The TUI runs on this machine, so a remote project's session is never one.
+    surface:
+      options.surface ??
+      (isRemoteProjectPath(cwd) ? "chat" : loadProviderSurface(harness)),
   };
 }
 
@@ -578,9 +599,17 @@ export function newSession(
 export function newDefaultSession(
   cwd = "~",
   runtimeMode: RuntimeMode = DEFAULT_RUNTIME_MODE,
+  options?: NewSessionOptions,
 ): Session {
   const choice = defaultSessionChoice(cwd);
-  return newSession(choice.harness, cwd, choice.model, runtimeMode);
+  return newSession(
+    choice.harness,
+    cwd,
+    choice.model,
+    runtimeMode,
+    undefined,
+    options,
+  );
 }
 
 /**

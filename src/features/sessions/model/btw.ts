@@ -400,7 +400,10 @@ export function applyBtwHarnessEvent(
   model: string,
   userMessageId: string,
 ): Block[] {
-  const session = newSession(harness, "~", model);
+  // Scratch session for applying events; never shown, so skip the preference.
+  const session = newSession(harness, "~", model, undefined, undefined, {
+    surface: "chat",
+  });
   session.blocks = [{ id: userMessageId, role: "user", text: "" }, ...blocks];
   return applyHarnessEvent(session, event).blocks.slice(1);
 }
