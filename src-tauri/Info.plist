@@ -5,10 +5,10 @@
 	<key>CFBundleIconName</key>
 	<string>AppIcon</string>
 	<key>NSDesktopFolderUsageDescription</key>
-	<string>MonoCode opens project folders you choose, including Desktop.</string>
+	<string>Monoptah opens project folders you choose, including Desktop.</string>
 	<key>NSDocumentsFolderUsageDescription</key>
-	<string>MonoCode opens project folders you choose, including Documents.</string>
+	<string>Monoptah opens project folders you choose, including Documents.</string>
 	<key>NSDownloadsFolderUsageDescription</key>
-	<string>MonoCode opens project folders you choose, including Downloads.</string>
+	<string>Monoptah opens project folders you choose, including Downloads.</string>
 </dict>
 </plist>
