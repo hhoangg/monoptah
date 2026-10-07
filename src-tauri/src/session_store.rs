@@ -1185,9 +1185,14 @@ pub(crate) fn upsert_session(
 
     // A terminal session never has chat blocks, but its provider conversation id
     // is the app's only handle to it. Listings filter on this flag, so a
-    // terminal session sets it to stay in the history list.
-    let has_user_message =
-        has_user_block(&session.blocks) || session.surface.as_deref() == Some("tui");
+    // terminal session sets it to stay in the history list. Without an id (a
+    // provider that cannot resume) there is nothing to reopen, so it stays out.
+    let has_resumable_terminal = session.surface.as_deref() == Some("tui")
+        && session
+            .provider_session_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+    let has_user_message = has_user_block(&session.blocks) || has_resumable_terminal;
     let is_draft = has_draft_block(&session.blocks);
 
     let existing: Option<(i64, i64, String, i64, i64, String)> = conn
@@ -2593,6 +2598,29 @@ mod tests {
             listed[0].provider_session_id.as_deref(),
             Some("acp-session-1")
         );
+    }
+
+    #[test]
+    fn terminal_session_without_a_conversation_id_is_not_listed() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        for (id, provider_session_id) in [
+            ("no-id", None),
+            ("blank-id", Some("  ".to_string())),
+            ("with-id", Some("conv-1".to_string())),
+        ] {
+            let mut row = sample(id, "/tmp/a", "Terminal");
+            row.surface = Some("tui".into());
+            row.blocks = json!([]);
+            row.provider_session_id = provider_session_id;
+            upsert_session(&conn, &row).unwrap();
+        }
+        let ids: Vec<String> = list_by_project(&conn, "/tmp/a")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, vec!["with-id".to_string()]);
     }
 
     #[test]

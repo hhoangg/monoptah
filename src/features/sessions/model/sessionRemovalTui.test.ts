@@ -12,7 +12,12 @@ vi.mock("../../../integrations/harness/core/registry", () => ({
   forgetHarnessSession: mocks.forget,
 }));
 
-function run(mode: "archive" | "delete", surface: "tui" | "chat") {
+function run(
+  mode: "archive" | "delete",
+  surface: "tui" | "chat",
+  // Only a terminal session with a conversation id has a row worth keeping.
+  providerSessionId: string | null = surface === "tui" ? "conv-1" : null,
+) {
   const closing: Session = newSession(
     "claude",
     "/tmp/project",
@@ -21,6 +26,7 @@ function run(mode: "archive" | "delete", surface: "tui" | "chat") {
     undefined,
     { surface },
   );
+  closing.providerSessionId = providerSessionId ?? undefined;
   const other = newSession("claude", "/tmp/project");
   const state = {
     tabs: [newTab(closing.id), newTab(other.id)],
@@ -79,6 +85,12 @@ describe.each(["archive", "delete"] as const)(
       } else {
         expect(commands).toContain("session_delete");
       }
+    });
+
+    it("saves no row for a terminal session without a conversation id", async () => {
+      await run(mode, "tui", null).done;
+      const commands = mocks.invoke.mock.calls.map(([command]) => command);
+      expect(commands).not.toContain("session_upsert");
     });
 
     it("does not touch the chat adapter", async () => {

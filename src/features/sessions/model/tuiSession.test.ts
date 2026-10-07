@@ -1,6 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { InboxComposerCard } from "../../inbox/model/githubTasks";
 import { newSession, type Session } from "./session";
+
+const paths = vi.hoisted(() => ({ configured: {} as Record<string, string> }));
+vi.mock("../../providers/model/providerBinaryPaths", () => ({
+  runtimeProviderBinaryPath: (provider: string) =>
+    paths.configured[provider] ?? null,
+}));
 import {
   TUI_EARLY_EXIT_MS,
   applyInboxStart,
@@ -11,6 +17,7 @@ import {
   isNoConversationOutput,
   isTuiSession,
   plainTerminalText,
+  tuiBinaryIdentity,
   tuiExitNotice,
   tuiLaunchCwd,
   tuiProviderAccount,
@@ -56,6 +63,35 @@ describe("terminal session identity", () => {
         worktreeRemoved: true,
       }),
     ).toBe("/work/app");
+  });
+});
+
+describe("binary identity for the PTY launch", () => {
+  it("names the provider alone when no binary path is configured", () => {
+    expect(tuiBinaryIdentity("codex")).toEqual({ binaryProvider: "codex" });
+  });
+
+  it("sends the configured binary path so the backend can check it", () => {
+    paths.configured.claude = "/opt/claude";
+    try {
+      expect(tuiBinaryIdentity("claude")).toEqual({
+        binaryProvider: "claude",
+        binaryPath: "/opt/claude",
+      });
+    } finally {
+      delete paths.configured.claude;
+    }
+  });
+
+  it("never sends antigravity's configured ACP server as the agy path", () => {
+    paths.configured.antigravity = "/opt/agy_acp_server.par";
+    try {
+      expect(tuiBinaryIdentity("antigravity")).toEqual({
+        binaryProvider: "antigravity",
+      });
+    } finally {
+      delete paths.configured.antigravity;
+    }
   });
 });
 

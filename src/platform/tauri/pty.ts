@@ -130,12 +130,15 @@ function release() {
 /**
  * A program to run in the PTY instead of the login shell. Mirrors the Rust
  * `PtyLaunch`; `providerAccount` scopes it to a provider account profile the
- * same way `spawnChild` does.
+ * same way `spawnChild` does. `binaryProvider` and `binaryPath` let the backend
+ * check that `program` is a resolved harness CLI, as `harness_spawn` does.
  */
 export type PtyLaunch = {
   program: string;
   args: string[];
   providerAccount?: { provider: "claude" | "codex"; id: string };
+  binaryProvider?: string;
+  binaryPath?: string;
 };
 
 export async function spawnPty(

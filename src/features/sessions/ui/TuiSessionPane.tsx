@@ -17,6 +17,7 @@ import {
   canRetitleFromTui,
   canStartFreshAfter,
   cleanTuiTitle,
+  tuiBinaryIdentity,
   tuiExitNotice,
   tuiLaunchCwd,
   tuiProviderAccount,
@@ -151,6 +152,7 @@ export function TuiSessionPane({
         launch: {
           program: built.program,
           args: built.args,
+          ...tuiBinaryIdentity(current.harness),
           ...(providerAccount ? { providerAccount } : {}),
         },
       });

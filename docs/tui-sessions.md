@@ -35,9 +35,11 @@ answers `No conversation found`; the app then relaunches once with
 launch still fails, the bar offers **Start new conversation**. Other providers
 start fresh on restart because the app does not know how to resume them.
 
-A terminal session is saved with the project's sessions, so it appears in the
-sidebar list, survives closing the tab (archive), and reopens from there into the
-same conversation. Its row has no preview text; it shows the tab title.
+A terminal session with a conversation id is saved with the project's sessions,
+so it appears in the sidebar list, survives closing the tab (archive), and
+reopens from there into the same conversation. Its row has no preview text; it
+shows the tab title. A terminal session with no id (every provider except
+Claude) has nothing to reopen, so closing its tab leaves no row.
 
 Closing a tab, archiving or deleting the session, and quitting the app all end
 the CLI process.

@@ -1,6 +1,7 @@
 import type { PtyLaunch } from "../../../platform/tauri/pty";
 import { TUI_CAPS } from "../../../integrations/harness/core/tuiLaunch";
 import type { InboxComposerCard } from "../../inbox/model/githubTasks";
+import { runtimeProviderBinaryPath } from "../../providers/model/providerBinaryPaths";
 import {
   DEFAULT_PROVIDER_ACCOUNT_ID,
   supportsProviderAccounts,
@@ -45,6 +46,21 @@ export function tuiProviderAccount(
   if (!supportsProviderAccounts(harness)) return undefined;
   if (!accountId || accountId === DEFAULT_PROVIDER_ACCOUNT_ID) return undefined;
   return { provider: harness, id: accountId };
+}
+
+/**
+ * Identifies the CLI the way a chat spawn does, so the backend can check the
+ * program is a resolved harness binary. Antigravity launches the bare `agy`,
+ * which has no configured path, so only its provider is sent.
+ */
+export function tuiBinaryIdentity(
+  harness: HarnessId,
+): Pick<PtyLaunch, "binaryProvider" | "binaryPath"> {
+  if (harness === "antigravity") return { binaryProvider: harness };
+  const binaryPath = runtimeProviderBinaryPath(harness);
+  return binaryPath
+    ? { binaryProvider: harness, binaryPath }
+    : { binaryProvider: harness };
 }
 
 /** What a terminal session may change about itself, saved with the workspace. */

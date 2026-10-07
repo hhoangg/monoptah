@@ -102,8 +102,24 @@ describe("persisting a terminal session with no chat blocks", () => {
     return { ...saved(surface), blocks: [], providerSessionId: "conv-1" };
   }
 
-  it("keeps a terminal session, which never has a user message", () => {
+  it("keeps a terminal session that has a conversation id", () => {
     expect(shouldPersistSession(blank("tui"))).toBe(true);
+  });
+
+  it("leaves a terminal session with no conversation id unsaved", () => {
+    expect(
+      shouldPersistSession({ ...blank("tui"), providerSessionId: undefined }),
+    ).toBe(false);
+    expect(
+      shouldPersistSession({ ...blank("tui"), providerSessionId: "" }),
+    ).toBe(false);
+  });
+
+  it("does not write a terminal session with no conversation id", async () => {
+    expect(
+      await upsertSession({ ...blank("tui"), providerSessionId: undefined }),
+    ).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("still leaves an empty chat tab unsaved", () => {

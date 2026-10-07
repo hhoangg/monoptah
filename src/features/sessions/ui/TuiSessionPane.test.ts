@@ -208,6 +208,7 @@ it("saves a new Claude conversation id before the CLI starts", async () => {
   expect(patch.providerSessionId).toMatch(UUID);
   const { launch } = spawnArgs();
   expect(launch.program).toBe("/bin/claude");
+  expect(launch.binaryProvider).toBe("claude");
   expect(launch.args).toContain("--session-id");
   expect(launch.args[launch.args.indexOf("--session-id") + 1]).toBe(
     patch.providerSessionId,
@@ -300,7 +301,11 @@ it("saves nothing for a provider with no conversation id and no accounts", async
   await act(async () => render(session));
   await settle();
   expect(onSessionChange).not.toHaveBeenCalled();
-  expect(spawnArgs().launch).toEqual({ program: "/bin/cursor", args: [] });
+  expect(spawnArgs().launch).toEqual({
+    program: "/bin/cursor",
+    args: [],
+    binaryProvider: "cursor",
+  });
 });
 
 it("does not start the CLI when the conversation id cannot be saved", async () => {

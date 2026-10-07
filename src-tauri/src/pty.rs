@@ -13,7 +13,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dirs_home;
 use crate::fs::expand_home;
-use crate::harness::{AccountEnv, HarnessAccount};
+use crate::harness::{is_resolved_harness_binary, AccountEnv, HarnessAccount};
 
 const DATA_EVENT: &str = "pty-data";
 const EXIT_EVENT: &str = "pty-exit";
@@ -40,7 +40,8 @@ struct PtyExit {
 
 /// A program to run in the PTY instead of the login shell, e.g. a provider's
 /// interactive CLI. `provider_account` scopes it to an account profile the same
-/// way harness children are.
+/// way harness children are. `binary_provider` and `binary_path` identify the
+/// CLI the same way `harness_spawn` does, so the program can be checked.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PtyLaunch {
@@ -49,6 +50,26 @@ pub struct PtyLaunch {
     args: Vec<String>,
     #[serde(default)]
     provider_account: Option<HarnessAccount>,
+    #[serde(default)]
+    binary_provider: Option<String>,
+    #[serde(default)]
+    binary_path: Option<String>,
+}
+
+/// Antigravity's resolver returns its ACP server, which is not a terminal UI.
+/// Its interactive CLI is the bare name `agy`, looked up on PATH at spawn.
+const ANTIGRAVITY_TUI_PROGRAM: &str = "agy";
+
+/// Same guard as `harness_spawn`: the program must be one a resolver would hand
+/// back for the named provider, not any binary the webview names. Antigravity
+/// is the one exception, and only for the exact literal `agy`.
+fn is_allowed_launch(launch: &PtyLaunch) -> bool {
+    match launch.binary_provider.as_deref() {
+        Some("antigravity") => launch.program == ANTIGRAVITY_TUI_PROGRAM,
+        provider => {
+            is_resolved_harness_binary(&launch.program, provider, launch.binary_path.as_deref())
+        }
+    }
 }
 
 /// What a spawn runs and which account env it layers on top of the PTY env.
@@ -174,6 +195,12 @@ pub fn pty_spawn(
     rows: u16,
     launch: Option<PtyLaunch>,
 ) -> Result<(), String> {
+    if launch
+        .as_ref()
+        .is_some_and(|launch| !is_allowed_launch(launch))
+    {
+        return Err("pty_spawn: not a resolved harness CLI".to_string());
+    }
     let workdir = working_dir(&cwd);
     let _reservation = crate::worktree_lifecycle::reserve_spawn(&workdir)?;
     let account_env = match &launch {
@@ -897,6 +924,85 @@ mod tests {
     }
 
     #[test]
+    fn launch_binary_identity_is_optional_on_the_wire() {
+        let launch: PtyLaunch = serde_json::from_value(serde_json::json!({
+            "program": "/usr/local/bin/codex",
+            "binaryProvider": "codex",
+            "binaryPath": "/usr/local/bin/codex",
+        }))
+        .unwrap();
+        assert_eq!(launch.binary_provider.as_deref(), Some("codex"));
+        assert_eq!(launch.binary_path.as_deref(), Some("/usr/local/bin/codex"));
+        let bare: PtyLaunch =
+            serde_json::from_value(serde_json::json!({ "program": "codex" })).unwrap();
+        assert!(bare.binary_provider.is_none());
+        assert!(bare.binary_path.is_none());
+    }
+
+    fn launch_of(program: &str, provider: Option<&str>) -> PtyLaunch {
+        PtyLaunch {
+            program: program.into(),
+            args: Vec::new(),
+            provider_account: None,
+            binary_provider: provider.map(str::to_owned),
+            binary_path: None,
+        }
+    }
+
+    #[test]
+    fn a_launch_naming_no_provider_is_refused() {
+        assert!(!is_allowed_launch(&launch_of("/bin/sh", None)));
+        assert!(!is_allowed_launch(&launch_of("agy", None)));
+    }
+
+    #[test]
+    fn a_launch_of_an_arbitrary_program_is_refused_for_every_provider() {
+        for provider in ["claude", "codex", "cursor", "opencode", "not-a-provider"] {
+            assert!(
+                !is_allowed_launch(&launch_of("/bin/sh", Some(provider))),
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_may_launch_only_the_literal_agy() {
+        assert!(is_allowed_launch(&launch_of("agy", Some("antigravity"))));
+        for program in [
+            "/bin/sh",
+            "/usr/local/bin/agy",
+            "agy_acp_server.par",
+            "agy ",
+        ] {
+            assert!(
+                !is_allowed_launch(&launch_of(program, Some("antigravity"))),
+                "{program}"
+            );
+        }
+        // The agy exception belongs to antigravity alone.
+        assert!(!is_allowed_launch(&launch_of("agy", Some("codex"))));
+    }
+
+    #[test]
+    fn a_configured_binary_is_allowed_through_the_shared_resolved_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("monocode-pty-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let codex = dir.join("codex");
+        std::fs::write(&codex, "#!/bin/sh\necho 'codex-cli 0.157.0'\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = codex.to_string_lossy().into_owned();
+        let mut launch = launch_of(&path, Some("codex"));
+        launch.binary_path = Some(path.clone());
+        assert!(is_allowed_launch(&launch));
+        // A different program does not borrow the configured path's approval.
+        launch.program = "/bin/sh".into();
+        assert!(!is_allowed_launch(&launch));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn no_launch_plans_the_login_shell_with_no_extra_env() {
         let (shell, args) = default_shell();
         // Even a stray env must not leak into a plain terminal.
@@ -916,6 +1022,8 @@ mod tests {
             program: "/opt/bin/claude".into(),
             args: vec!["--resume".into(), "abc".into()],
             provider_account: None,
+            binary_provider: None,
+            binary_path: None,
         };
         let env = AccountEnv {
             set: vec![("CLAUDE_CONFIG_DIR".into(), "/acct".into())],

@@ -140,7 +140,8 @@ export function shouldPersistSession(session: Session): boolean {
     session.cwd !== "~" &&
     // A terminal session has no chat blocks. Its provider conversation id is
     // the only handle to the conversation, so the row must outlive the tab.
-    (session.surface === "tui" ||
+    // Without an id (providers that cannot resume) there is nothing to reopen.
+    ((session.surface === "tui" && !!session.providerSessionId) ||
       session.blocks.some((block) => block.role === "user") ||
       (isMonoSession(session.id) &&
         (session.blocks.length > 0 || !!session.monoTranscript)))
