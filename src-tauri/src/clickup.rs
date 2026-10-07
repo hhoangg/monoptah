@@ -731,7 +731,32 @@ fn comment_markdown(node: &Value) -> String {
         .map(|runs| runs.iter().filter_map(run_markdown).collect::<String>())
         .map(|body| body.trim().to_string())
         .filter(|body| !body.is_empty());
-    from_runs.unwrap_or_else(|| value_string(node, "comment_text").unwrap_or_default())
+    with_hard_breaks(
+        &from_runs.unwrap_or_else(|| value_string(node, "comment_text").unwrap_or_default()),
+    )
+}
+
+/// The comment renderer folds a single newline into a space, but a ClickUp
+/// comment uses single newlines as real line breaks. Mark them as markdown hard
+/// breaks (two trailing spaces). Blank lines already separate paragraphs.
+fn with_hard_breaks(body: &str) -> String {
+    let lines: Vec<&str> = body.split('\n').collect();
+    let mut out = String::with_capacity(body.len() + 8);
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let next_has_text = lines
+            .get(index + 1)
+            .is_some_and(|next| !next.trim().is_empty());
+        if next_has_text && !line.trim().is_empty() {
+            out.push_str(line.trim_end());
+            out.push_str("  ");
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// Renders one run. Only `bold`, `italic`, `code` and `link` are understood;
@@ -810,25 +835,38 @@ fn link_destination(value: &Value) -> Option<String> {
 
 /// Escapes markdown metacharacters in a single line so what the user typed,
 /// such as a literal `**`, is shown as typed. Backslash-escaping any ASCII
-/// punctuation is always valid markdown, so over-escaping is harmless.
+/// punctuation is always valid markdown, so over-escaping is harmless, except
+/// inside a bare URL: ClickUp sends links as plain text, the renderer
+/// autolinks them, and a backslash would stay in the destination. Those spans
+/// are copied through untouched.
 fn escape_markdown(line: &str) -> String {
     let mut out = String::with_capacity(line.len() + 4);
-    let mut chars = line.chars().peekable();
     // Block markers only matter at the start of a line.
-    match chars.peek() {
+    let mut rest = line;
+    match line.chars().next() {
         Some('#' | '+' | '-' | '=') => out.push('\\'),
         Some(first) if first.is_ascii_digit() => {
-            let digits = line.chars().take_while(char::is_ascii_digit).count();
-            for _ in 0..digits {
-                out.extend(chars.next());
-            }
-            if matches!(chars.peek(), Some('.' | ')')) {
+            let digits = line.len()
+                - line
+                    .trim_start_matches(|ch: char| ch.is_ascii_digit())
+                    .len();
+            out.push_str(&line[..digits]);
+            rest = &line[digits..];
+            if rest.starts_with(['.', ')']) {
                 out.push('\\');
             }
         }
         _ => {}
     }
-    for ch in chars {
+    let mut previous = None;
+    while let Some(ch) = rest.chars().next() {
+        let span = bare_url_len(rest).filter(|_| !previous.is_some_and(char::is_alphanumeric));
+        if let Some(len) = span {
+            out.push_str(&rest[..len]);
+            previous = rest[..len].chars().last();
+            rest = &rest[len..];
+            continue;
+        }
         if matches!(
             ch,
             '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '~' | '|' | '&' | '$'
@@ -836,8 +874,24 @@ fn escape_markdown(line: &str) -> String {
             out.push('\\');
         }
         out.push(ch);
+        previous = Some(ch);
+        rest = &rest[ch.len_utf8()..];
     }
     out
+}
+
+/// Length of an `http://` or `https://` span at the start of `text`, up to
+/// whitespace. It also stops at `<` and a backtick, which would otherwise open
+/// HTML or code. Returns `None` when `text` does not start with a URL.
+fn bare_url_len(text: &str) -> Option<usize> {
+    let lower = text.get(..8).unwrap_or(text).to_ascii_lowercase();
+    let scheme = ["https://", "http://"]
+        .into_iter()
+        .find(|scheme| lower.starts_with(scheme))?;
+    let end = text
+        .find(|ch: char| ch.is_whitespace() || ch == '<' || ch == '`')
+        .unwrap_or(text.len());
+    (end > scheme.len()).then_some(end)
 }
 
 /// Inline code cannot be escaped, so use a fence longer than any backtick run
@@ -1412,7 +1466,7 @@ mod tests {
             { "attributes": {}, "text": "**asd adas \n**" },
             { "attributes": { "italic": true, "bold": true }, "text": "12312313" }
         ]));
-        assert_eq!(body, "\\*\\*asd adas \n\\*\\****12312313***");
+        assert_eq!(body, "\\*\\*asd adas  \n\\*\\****12312313***");
     }
 
     #[test]
@@ -1450,7 +1504,53 @@ mod tests {
             { "text": " hi \nthere ", "attributes": { "bold": true } },
             { "text": "y", "attributes": {} }
         ]));
-        assert_eq!(body, "x  **hi** \n**there** y");
+        assert_eq!(body, "x  **hi**  \n**there** y");
+    }
+
+    #[test]
+    fn bare_urls_pass_through_unescaped() {
+        // Observed on the live API: a URL is plain text in an ordinary run.
+        let body = comment_body(json!([
+            { "text": "probe see https://example.com/a?b=1&c=2 end" }
+        ]));
+        assert_eq!(body, "probe see https://example.com/a?b=1&c=2 end");
+        assert_eq!(
+            comment_body(json!([
+                { "text": "HTTP://a.com/x_y*z]. and_b ", "attributes": { "bold": true } }
+            ])),
+            "**HTTP://a.com/x_y*z]. and\\_b**"
+        );
+        // Not at a word boundary, no host, or a stop character: escaped as text.
+        assert_eq!(
+            comment_body(json!([{ "text": "xhttp://a_b http:// a_b" }])),
+            "xhttp://a\\_b http:// a\\_b"
+        );
+        assert_eq!(
+            comment_body(json!([{ "text": "http://a_b<i>" }])),
+            "http://a_b\\<i\\>"
+        );
+    }
+
+    #[test]
+    fn single_newlines_become_hard_breaks() {
+        assert_eq!(
+            comment_body(json!([{ "text": "one\ntwo\n\nthree" }])),
+            "one  \ntwo\n\nthree"
+        );
+        // A newline in its own run still joins the lines around it.
+        assert_eq!(
+            comment_body(json!([
+                { "text": "a", "attributes": { "bold": true } },
+                { "text": "\n" },
+                { "text": "b" }
+            ])),
+            "**a**  \nb"
+        );
+        // The flat fallback gets the same treatment.
+        assert_eq!(
+            comment_markdown(&json!({ "comment_text": "x\ny" })),
+            "x  \ny"
+        );
     }
 
     #[test]
