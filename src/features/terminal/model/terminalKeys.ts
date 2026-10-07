@@ -37,3 +37,39 @@ export function isMacTerminalClearShortcut(event: TerminalKeyEvent): boolean {
     event.key.toLowerCase() === "k"
   );
 }
+
+/**
+ * Named keys from the UI Events spec ("Enter", "ArrowLeft", "F11", "Dead",
+ * "MediaPlayPause", ...) are alphanumeric and start with an uppercase letter.
+ */
+const NAMED_KEY_SHAPE = /^[A-Z][A-Za-z0-9]*$/;
+const CONTROL_CHARACTER = /\p{Cc}/u;
+
+/**
+ * The text of a keydown whose `key` is a whole string rather than one
+ * character, or null when xterm should handle the event itself.
+ *
+ * Some input methods (GoTiengViet on macOS) erase the typed letters and then
+ * deliver the replacement as a single non-composing keydown, e.g. `key` is
+ * "ếng". xterm emits only the first character of that, so the rest is lost.
+ *
+ * Multi-character ASCII is text unless it looks like a named key. A lowercase
+ * start ("eng", after the method strips a tone mark) cannot be a spec key
+ * name, so it is text. A capitalised alphanumeric word ("Eng", "Enter") is
+ * treated as a key name: sending an unknown name such as "MediaPlayPause" to
+ * the shell would be worse than dropping the rare capitalised ASCII string.
+ */
+export function multiCharacterKeyText(
+  event: TerminalKeyEvent & Partial<Pick<KeyboardEvent, "isComposing">>,
+): string | null {
+  // Shortcut paths belong to the handlers that already own them, and a live
+  // composition is xterm's CompositionHelper's job.
+  if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing) {
+    return null;
+  }
+  const { key } = event;
+  // Counted by code point so one astral character stays a single character.
+  if ([...key].length < 2) return null;
+  if (NAMED_KEY_SHAPE.test(key) || CONTROL_CHARACTER.test(key)) return null;
+  return key;
+}

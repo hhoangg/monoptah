@@ -13,6 +13,7 @@ import { isOscColorQuery, oscColorReply } from "../model/terminalChrome";
 import {
   isMacTerminalClearShortcut,
   macTerminalShortcutData,
+  multiCharacterKeyText,
 } from "../model/terminalKeys";
 import {
   defaultTerminalTitle,
@@ -238,6 +239,18 @@ export function TerminalView({
         if (event.type === "keydown") {
           event.preventDefault();
           term.clear();
+        }
+        return false;
+      }
+
+      // An input method may hand over a whole string as one keydown; xterm
+      // would emit only its first character.
+      const text = multiCharacterKeyText(event);
+      if (text) {
+        if (event.type === "keydown") {
+          // Also stops the browser from following up with beforeinput/input.
+          event.preventDefault();
+          term.input(text);
         }
         return false;
       }
