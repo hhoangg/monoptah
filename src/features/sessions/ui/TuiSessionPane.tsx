@@ -13,6 +13,7 @@ import {
 import { HARNESS_TITLE, type Session } from "../model/session";
 import {
   TUI_EARLY_EXIT_MS,
+  isNoConversationOutput,
   canRetitleFromTui,
   canStartFreshAfter,
   cleanTuiTitle,
@@ -36,7 +37,14 @@ const TerminalView = lazySurface(async () => {
  */
 const autoTitles = new Map<string, string>();
 
-type Prepared = { attempt: number; launch: PtyLaunch; resumed: boolean };
+type Prepared = {
+  attempt: number;
+  launch: PtyLaunch;
+  /** The launch used an id saved earlier, by resuming or by claiming it. */
+  reusedId: boolean;
+  /** This launch is the automatic retry that claims a never-used saved id. */
+  claimed: boolean;
+};
 
 type Props = {
   session: Session;
@@ -71,6 +79,11 @@ export function TuiSessionPane({
   const [prepared, setPrepared] = useState<Prepared | null>(null);
   const [exit, setExit] = useState<TuiExit | null>(null);
   const startedAt = useRef(0);
+  const preparedRef = useRef(prepared);
+  preparedRef.current = prepared;
+  // Set to relaunch once under `--session-id` after a resume found nothing.
+  const claimId = useRef<string | undefined>(undefined);
+  const claimedAlready = useRef<string | undefined>(undefined);
   const label = HARNESS_TITLE[session.harness];
 
   const fail = useCallback((error: unknown) => {
@@ -107,16 +120,24 @@ export function TuiSessionPane({
       }
       const binaryPath = await resolveTuiBinary(current.harness);
       if (cancelled) return;
-      const built = buildTuiLaunch(current, {
-        binaryPath,
-        initialPrompt: current.initialPrompt,
-      });
+      const claim = claimId.current;
+      claimId.current = undefined;
+      const built = buildTuiLaunch(
+        claim ? { ...current, providerSessionId: undefined } : current,
+        claim
+          ? { binaryPath, newProviderSessionId: claim }
+          : { binaryPath, initialPrompt: current.initialPrompt },
+      );
       const pinAccount = accountId && accountId !== current.providerAccountId;
       // Saved before anything can start the CLI. A pane that remounted or an
       // app that died after spawning would otherwise orphan the conversation.
-      if (built.providerSessionId || pinAccount) {
+      const newId =
+        built.providerSessionId !== current.providerSessionId
+          ? built.providerSessionId
+          : undefined;
+      if (newId || pinAccount) {
         await onSessionChangeRef.current(current.id, {
-          providerSessionId: built.providerSessionId,
+          providerSessionId: newId,
           providerAccountId: pinAccount ? accountId : undefined,
         });
       }
@@ -125,8 +146,8 @@ export function TuiSessionPane({
       startedAt.current = Date.now();
       setPrepared({
         attempt,
-        // No id was minted, so the CLI reopens the one already saved.
-        resumed: !built.providerSessionId && !!current.providerSessionId,
+        reusedId: !!current.providerSessionId && !newId,
+        claimed: !!claim,
         launch: {
           program: built.program,
           args: built.args,
@@ -142,11 +163,28 @@ export function TuiSessionPane({
   }, [session.id, attempt, fail]);
 
   const onExit = useCallback(
-    (result: { code: number | null; error?: string }) => {
-      setExit({
-        ...result,
-        early: Date.now() - startedAt.current < TUI_EARLY_EXIT_MS,
-      });
+    (result: { code: number | null; error?: string; output?: string }) => {
+      const early = Date.now() - startedAt.current < TUI_EARLY_EXIT_MS;
+      const launched = preparedRef.current;
+      const id = sessionRef.current.providerSessionId;
+      // Claude only knows a conversation once it has one, so an untouched tab
+      // has a saved id that `--resume` rejects. The id cannot be "in use" if
+      // Claude never wrote it, so claim it once before showing an error.
+      if (
+        !result.error &&
+        early &&
+        id &&
+        launched?.reusedId &&
+        !launched.claimed &&
+        claimedAlready.current !== id &&
+        isNoConversationOutput(result.output)
+      ) {
+        claimedAlready.current = id;
+        claimId.current = id;
+        setAttempt((count) => count + 1);
+        return;
+      }
+      setExit({ code: result.code, error: result.error, early });
     },
     [],
   );
@@ -161,7 +199,11 @@ export function TuiSessionPane({
     onTitleChangeRef.current(current.id, title);
   }, []);
 
-  const restart = () => setAttempt((count) => count + 1);
+  const restart = () => {
+    // A manual restart starts a new chain, which may claim the id again.
+    claimedAlready.current = undefined;
+    setAttempt((count) => count + 1);
+  };
   const startFresh = () => {
     // The app applies the patch before this settles, so the restart reads a
     // session with no saved id.
@@ -225,7 +267,7 @@ export function TuiSessionPane({
             ) : null}
           </div>
           {exit &&
-          canStartFreshAfter(session.harness, exit, !!prepared?.resumed) ? (
+          canStartFreshAfter(session.harness, exit, !!prepared?.reusedId) ? (
             <button
               type="button"
               onClick={startFresh}

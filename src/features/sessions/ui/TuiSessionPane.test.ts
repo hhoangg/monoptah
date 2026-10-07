@@ -38,6 +38,7 @@ vi.mock("@xterm/xterm", () => ({
     focus() {}
     dispose() {}
     writeln() {}
+    write() {}
     onData() {
       return { dispose() {} };
     }
@@ -176,10 +177,15 @@ function spawnArgs(call = 0) {
   return { id, cwd, launch };
 }
 
-function reportExit(code: number | null) {
-  const handler = pty.subscribePty.mock.calls.at(-1)?.[2];
+function reportExit(code: number | null, output?: string) {
+  const [, onData, onExit] = pty.subscribePty.mock.calls.at(-1) as [
+    string,
+    (data: Uint8Array) => void,
+    (code: number | null) => void,
+  ];
   return act(async () => {
-    handler?.(code);
+    if (output) onData(new TextEncoder().encode(output));
+    onExit(code);
   });
 }
 
@@ -450,4 +456,126 @@ it("shows the new-worktree option as visibly unavailable", async () => {
   const control = button("New worktree unavailable") as HTMLButtonElement;
   expect(control.disabled).toBe(true);
   expect(control.title).toContain("terminal sessions");
+});
+
+const NO_CONVERSATION =
+  "No\u001b[4Gconversation\u001b[17Gfound\u001b[23Gwith\u001b[28Gsession\u001b[36GID:\u001b[40Gsaved-id\r\r\n";
+
+function resuming() {
+  return tui("claude", {
+    providerSessionId: "saved-id",
+    providerAccountId: "default",
+  });
+}
+
+it("claims the saved id once when --resume finds no conversation", async () => {
+  const session = resuming();
+  const { render, onSessionChange } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  expect(spawnArgs(0).launch.args).toContain("--resume");
+
+  now += 100;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+
+  expect(pty.spawnPty).toHaveBeenCalledTimes(2);
+  const { launch } = spawnArgs(1);
+  expect(launch.args).toContain("--session-id");
+  expect(launch.args[launch.args.indexOf("--session-id") + 1]).toBe("saved-id");
+  expect(launch.args).not.toContain("--resume");
+  // Same id, so there is nothing new to save, and no error was shown.
+  expect(onSessionChange).not.toHaveBeenCalled();
+  expect(bar()).toBeNull();
+});
+
+it("shows the error when the claim also fails, and offers a fresh start", async () => {
+  const session = resuming();
+  const { render } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 100;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+  now += 100;
+  await reportExit(1, "Error: Session ID saved-id is already in use.\r\n");
+  await settle();
+
+  expect(pty.spawnPty).toHaveBeenCalledTimes(2);
+  expect(bar()?.textContent).toContain("Process exited (code 1)");
+  expect(button("Start new conversation")).toBeDefined();
+});
+
+it("does not claim a second time when the claim again finds nothing", async () => {
+  const session = resuming();
+  const { render } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 100;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+  now += 100;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(2);
+  expect(bar()).not.toBeNull();
+});
+
+it("lets a manual restart claim the id again", async () => {
+  const session = resuming();
+  const { render } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 100;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+  now += 100;
+  await reportExit(1, "Error: Session ID saved-id is already in use.\r\n");
+  await act(async () => {
+    button("Restart")?.click();
+  });
+  await settle();
+  expect(spawnArgs(2).launch.args).toContain("--resume");
+  now += 100;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(4);
+  expect(spawnArgs(3).launch.args).toContain("--session-id");
+});
+
+it("does not claim for any other early exit", async () => {
+  const session = resuming();
+  const { render } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 100;
+  await reportExit(1, "Error: something else went wrong\r\n");
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  expect(bar()?.textContent).toContain("Process exited (code 1)");
+  expect(button("Start new conversation")).toBeDefined();
+});
+
+it("does not claim when the message appears long after launch", async () => {
+  const session = resuming();
+  const { render } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 60_000;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  expect(bar()).not.toBeNull();
+});
+
+it("does not claim a first launch that was not resuming", async () => {
+  const session = tui();
+  const { render } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 100;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  expect(bar()).not.toBeNull();
 });

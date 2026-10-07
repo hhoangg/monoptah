@@ -37,7 +37,12 @@ type Props = {
   launch?: PtyLaunch;
   onMetaChange?: (patch: TerminalMetaPatch) => void;
   /** Reports the process ending, or failing to start (`error`, no code). */
-  onExit?: (exit: { code: number | null; error?: string }) => void;
+  onExit?: (exit: {
+    code: number | null;
+    error?: string;
+    /** Last output the process wrote, for telling why it stopped. */
+    output?: string;
+  }) => void;
   /** Window title the program sets (OSC 0/2). Shells are left alone unless set. */
   onTitleChange?: (title: string) => void;
 };
@@ -133,6 +138,9 @@ function terminalFont(): string {
  * late kill lands on the replacement shell and drops its data handler.
  */
 const stoppingPtys = new Map<string, Promise<void>>();
+
+/** Enough to hold a CLI's one-line failure message. */
+const OUTPUT_TAIL_CHARS = 4000;
 
 function oscColors() {
   const light = isLightScheme();
@@ -253,6 +261,10 @@ export function TerminalView({
       : null;
 
     let oscBuffer = "";
+    // Kept only for a view that asked to hear about the exit, so shells and
+    // file-pane terminals do not decode every chunk twice.
+    let outputTail = "";
+    const outputDecoder = new TextDecoder();
 
     let unsubscribe = () => {};
     let didStart = false;
@@ -262,6 +274,11 @@ export function TerminalView({
         id,
         (data) => {
           if (closed) return;
+          if (onExitRef.current) {
+            outputTail = (
+              outputTail + outputDecoder.decode(data, { stream: true })
+            ).slice(-OUTPUT_TAIL_CHARS);
+          }
           const onMeta = onMetaChangeRef.current;
           if (onMeta) {
             const text = new TextDecoder().decode(data);
@@ -281,7 +298,7 @@ export function TerminalView({
           if (closed) return;
           const status = code == null ? "" : ` (${code})`;
           term.writeln(`\r\n[process exited${status}]`);
-          onExitRef.current?.({ code: code ?? null });
+          onExitRef.current?.({ code: code ?? null, output: outputTail });
         },
       );
       didStart = true;

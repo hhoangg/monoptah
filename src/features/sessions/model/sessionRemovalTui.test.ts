@@ -29,7 +29,9 @@ function run(mode: "archive" | "delete", surface: "tui" | "chat") {
     dirtyFiles: new Set<string>(),
   };
   state.activeTabId = state.tabs[0].id;
-  mocks.invoke.mockResolvedValue(undefined);
+  mocks.invoke.mockImplementation(async (command: string, args: any) =>
+    command === "session_upsert" ? { ...args.session } : undefined,
+  );
   const remover = createSessionRemover({
     mode,
     replacement: { cwd: "/tmp/project", harness: "claude" },
@@ -50,24 +52,47 @@ afterEach(() => {
   mocks.forget.mockClear();
 });
 
-describe.each(["archive", "delete"] as const)("closing a terminal session (%s)", (mode) => {
-  it("kills its PTY before the session leaves the workspace", async () => {
-    const { closing, done } = run(mode, "tui");
-    expect(await done).toBe(true);
-    expect(killed()).toEqual([`tui:${closing.id}`]);
-  });
+describe.each(["archive", "delete"] as const)(
+  "closing a terminal session (%s)",
+  (mode) => {
+    it("kills its PTY before the session leaves the workspace", async () => {
+      const { closing, done } = run(mode, "tui");
+      expect(await done).toBe(true);
+      expect(killed()).toEqual([`tui:${closing.id}`]);
+    });
 
-  it("does not touch the chat adapter", async () => {
-    await run(mode, "tui").done;
-    expect(mocks.forget).not.toHaveBeenCalled();
-  });
+    it("keeps the conversation handle: archive saves the row before archiving it", async () => {
+      const { closing, done } = run(mode, "tui");
+      await done;
+      const commands = mocks.invoke.mock.calls.map(([command]) => command);
+      if (mode === "archive") {
+        const upsert = mocks.invoke.mock.calls.find(
+          ([command]) => command === "session_upsert",
+        );
+        expect(upsert?.[1].session).toMatchObject({
+          id: closing.id,
+          surface: "tui",
+        });
+        expect(commands.indexOf("session_upsert")).toBeLessThan(
+          commands.indexOf("session_set_archived"),
+        );
+      } else {
+        expect(commands).toContain("session_delete");
+      }
+    });
 
-  it("leaves a chat session's cleanup as it was", async () => {
-    const { closing, done } = run(mode, "chat");
-    await done;
-    // Archive forgets after the commit without awaiting; let it settle.
-    await Promise.resolve();
-    expect(killed()).toEqual([]);
-    expect(mocks.forget).toHaveBeenCalledWith("claude", closing.id);
-  });
-});
+    it("does not touch the chat adapter", async () => {
+      await run(mode, "tui").done;
+      expect(mocks.forget).not.toHaveBeenCalled();
+    });
+
+    it("leaves a chat session's cleanup as it was", async () => {
+      const { closing, done } = run(mode, "chat");
+      await done;
+      // Archive forgets after the commit without awaiting; let it settle.
+      await Promise.resolve();
+      expect(killed()).toEqual([]);
+      expect(mocks.forget).toHaveBeenCalledWith("claude", closing.id);
+    });
+  },
+);

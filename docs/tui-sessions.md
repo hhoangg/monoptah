@@ -29,17 +29,21 @@ a **Restart** button.
 
 For Claude, the app saves a conversation id before the CLI starts. Quitting and
 reopening the app, or pressing **Restart**, reopens the same conversation with
-`claude --resume`. If that id turns out to be unknown to Claude, the bar offers
-**Start new conversation**. Other providers start fresh on restart because the
-app does not know how to resume them.
+`claude --resume`. A tab you never typed in has no conversation yet, so Claude
+answers `No conversation found`; the app then relaunches once with
+`claude --session-id` under the same id instead of showing an error. If the
+launch still fails, the bar offers **Start new conversation**. Other providers
+start fresh on restart because the app does not know how to resume them.
+
+A terminal session is saved with the project's sessions, so it appears in the
+sidebar list, survives closing the tab (archive), and reopens from there into the
+same conversation. Its row has no preview text; it shows the tab title.
 
 Closing a tab, archiving or deleting the session, and quitting the app all end
 the CLI process.
 
 ## Limits
 
-- Terminal sessions are not saved to the project history list; they come back
-  only through the workspace restore.
 - No chat features: no composer, queued messages, plans, second opinion or
   handoff. Anything the app opens with a prepared message (Add to chat, notes,
   handoffs, Inbox Ask, Monos, automations, remote sessions) always opens as chat.

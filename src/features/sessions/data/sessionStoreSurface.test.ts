@@ -7,8 +7,13 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invoke(...args),
 }));
 
-const { getSession, persistFingerprint, sanitizeSessionForPersist } =
-  await import("./sessionStore");
+const {
+  getSession,
+  persistFingerprint,
+  sanitizeSessionForPersist,
+  shouldPersistSession,
+  upsertSession,
+} = await import("./sessionStore");
 
 function saved(surface: "chat" | "tui") {
   const session = newSession(
@@ -87,5 +92,51 @@ describe("session surface persistence", () => {
     expect(persistFingerprint(saved("tui"))).not.toBe(
       persistFingerprint({ ...saved("tui"), surface: "chat" }),
     );
+  });
+});
+
+describe("persisting a terminal session with no chat blocks", () => {
+  beforeEach(() => invoke.mockReset());
+
+  function blank(surface: "chat" | "tui") {
+    return { ...saved(surface), blocks: [], providerSessionId: "conv-1" };
+  }
+
+  it("keeps a terminal session, which never has a user message", () => {
+    expect(shouldPersistSession(blank("tui"))).toBe(true);
+  });
+
+  it("still leaves an empty chat tab unsaved", () => {
+    expect(shouldPersistSession(blank("chat"))).toBe(false);
+  });
+
+  it("still never saves a terminal session in a remote or home project", () => {
+    expect(
+      shouldPersistSession({ ...blank("tui"), cwd: "remote://host/repo" }),
+    ).toBe(false);
+    expect(shouldPersistSession({ ...blank("tui"), cwd: "~" })).toBe(false);
+    expect(shouldPersistSession({ ...blank("tui"), ephemeral: true })).toBe(
+      false,
+    );
+  });
+
+  it("writes the row with its surface and conversation id", async () => {
+    invoke.mockResolvedValue({ id: "x" });
+    const session = blank("tui");
+    await upsertSession(session);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    const [command, args] = invoke.mock.calls[0];
+    expect(command).toBe("session_upsert");
+    expect(args.session).toMatchObject({
+      id: session.id,
+      surface: "tui",
+      providerSessionId: "conv-1",
+      blocks: [],
+    });
+  });
+
+  it("does not write an empty chat tab", async () => {
+    expect(await upsertSession(blank("chat"))).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
   });
 });

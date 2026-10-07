@@ -52,6 +52,11 @@ export type TuiLaunchOptions = {
   binaryPath: string;
   /** Sent as the first prompt of a new session only. */
   initialPrompt?: string;
+  /**
+   * Id for a new conversation, instead of minting one. Used to claim an id that
+   * was saved but never reached the CLI, which `--resume` cannot open.
+   */
+  newProviderSessionId?: string;
 };
 
 /** Program and arguments that start `session`'s interactive CLI in a PTY. */
@@ -80,7 +85,7 @@ export function buildTuiLaunch(
     if (session.providerSessionId) {
       args.push("--resume", session.providerSessionId);
     } else {
-      providerSessionId = crypto.randomUUID();
+      providerSessionId = options.newProviderSessionId ?? crypto.randomUUID();
       args.push("--session-id", providerSessionId);
     }
   }

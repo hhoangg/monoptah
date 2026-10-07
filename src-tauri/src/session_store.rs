@@ -1183,7 +1183,11 @@ pub(crate) fn upsert_session(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    let has_user_message = has_user_block(&session.blocks);
+    // A terminal session never has chat blocks, but its provider conversation id
+    // is the app's only handle to it. Listings filter on this flag, so a
+    // terminal session sets it to stay in the history list.
+    let has_user_message =
+        has_user_block(&session.blocks) || session.surface.as_deref() == Some("tui");
     let is_draft = has_draft_block(&session.blocks);
 
     let existing: Option<(i64, i64, String, i64, i64, String)> = conn
@@ -2558,6 +2562,36 @@ mod tests {
                 .surface
                 .as_deref(),
             Some("tui")
+        );
+    }
+
+    #[test]
+    fn terminal_session_with_no_blocks_is_listed_but_an_empty_chat_is_not() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mut terminal = sample("terminal", "/tmp/a", "Claude Code");
+        terminal.surface = Some("tui".into());
+        terminal.blocks = json!([]);
+        let mut chat = sample("blank-chat", "/tmp/a", "Blank");
+        chat.surface = Some("chat".into());
+        chat.blocks = json!([]);
+        upsert_session(&conn, &terminal).unwrap();
+        upsert_session(&conn, &chat).unwrap();
+        let ids: Vec<String> = list_by_project(&conn, "/tmp/a")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, vec!["terminal".to_string()]);
+        // A later save must not drop it from the listing again.
+        terminal.title = "Renamed".into();
+        upsert_session(&conn, &terminal).unwrap();
+        let listed = list_by_project(&conn, "/tmp/a").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Renamed");
+        assert_eq!(
+            listed[0].provider_session_id.as_deref(),
+            Some("acp-session-1")
         );
     }
 

@@ -142,6 +142,35 @@ export function tuiExitNotice(
 }
 
 /**
+ * Terminal output as the words a reader sees. Claude draws each word at an
+ * absolute column (`ESC[4G`) with no space between, so cursor moves must turn
+ * into a space before the escapes are dropped.
+ */
+export function plainTerminalText(raw: string): string {
+  return raw
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[[0-9;?]*[ABCDEFGHJKf`d]/g, " ")
+    .replace(/\u001b\[[0-9;?<>=! ]*[@-~]/g, "")
+    .replace(/\u001b[()][A-Za-z0-9]/g, "")
+    .replace(/\u001b[=>78]/g, "")
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Claude's answer to `--resume <id>` when it never wrote that conversation.
+ * The exit code is not reliable for this (print mode exits 0), so match the
+ * message itself.
+ */
+export function isNoConversationOutput(raw: string | undefined): boolean {
+  return (
+    !!raw &&
+    /no conversation found with session id/i.test(plainTerminalText(raw))
+  );
+}
+
+/**
  * Resuming an id the CLI never saved fails at once. Offer a fresh start for
  * exactly that case, so a bad saved id cannot trap the session.
  */

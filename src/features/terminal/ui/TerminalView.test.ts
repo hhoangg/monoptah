@@ -38,6 +38,7 @@ vi.mock("@xterm/xterm", () => ({
     focus() {}
     dispose() {}
     writeln() {}
+    write() {}
     onData() {
       return { dispose() {} };
     }
@@ -307,7 +308,7 @@ it("reports the process exit to the caller", async () => {
     await act(async () => {
       reportExit(2);
     });
-    expect(onExit).toHaveBeenCalledExactlyOnceWith({ code: 2 });
+    expect(onExit).toHaveBeenCalledExactlyOnceWith({ code: 2, output: "" });
   } finally {
     await act(async () => {
       root.unmount();
@@ -367,6 +368,49 @@ it("forwards the program's window title only to a view that asked for it", async
     expect(xterm.titleListeners).toHaveLength(1);
     xterm.titleListeners[0]("Claude Code");
     expect(onTitleChange).toHaveBeenCalledExactlyOnceWith("Claude Code");
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  }
+});
+
+it("hands the caller the output written before the process exited", async () => {
+  const { host, root } = setup();
+  const onExit = vi.fn();
+  let write!: (data: Uint8Array) => void;
+  let reportExit!: (code: number | null) => void;
+  pty.subscribePty.mockImplementationOnce(((
+    _id: string,
+    onData: (data: Uint8Array) => void,
+    onExitEvent: (code: number | null) => void,
+  ) => {
+    write = onData;
+    reportExit = onExitEvent;
+    return () => {};
+  }) as never);
+  try {
+    await act(async () => {
+      root.render(
+        createElement(TerminalView, {
+          id: "output",
+          cwd: "/tmp",
+          active: true,
+          onExit,
+        }),
+      );
+    });
+    const encode = (text: string) => new TextEncoder().encode(text);
+    await act(async () => {
+      write(encode("No conversation "));
+      write(encode("found\r\n"));
+      reportExit(1);
+    });
+    expect(onExit).toHaveBeenCalledExactlyOnceWith({
+      code: 1,
+      output: "No conversation found\r\n",
+    });
   } finally {
     await act(async () => {
       root.unmount();

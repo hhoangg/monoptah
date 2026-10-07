@@ -8,7 +8,9 @@ import {
   canRetitleFromTui,
   canStartFreshAfter,
   cleanTuiTitle,
+  isNoConversationOutput,
   isTuiSession,
+  plainTerminalText,
   tuiExitNotice,
   tuiLaunchCwd,
   tuiProviderAccount,
@@ -147,9 +149,9 @@ describe("tab title from the terminal", () => {
 
 describe("exit notice", () => {
   it("names the exit code", () => {
-    expect(
-      tuiExitNotice("claude", { code: 130, early: false }),
-    ).toEqual({ message: "Process exited (code 130)" });
+    expect(tuiExitNotice("claude", { code: 130, early: false })).toEqual({
+      message: "Process exited (code 130)",
+    });
   });
 
   it("omits the code when there is none", () => {
@@ -236,5 +238,34 @@ describe("Inbox start work", () => {
     const next = applyInboxStart(tui(), { ...card, prompt: "  " });
     expect(next.initialPrompt).toBeUndefined();
     expect(next.surface).toBe("tui");
+  });
+});
+
+// Captured from `claude 2.1.291 --resume 11111111-... ` run in a PTY: each
+// word sits at an absolute column with no space between.
+const REAL_NO_CONVERSATION =
+  "\u001b7\u001b[r\u001b8\u001b[?25h\u001b[?25l\u001b[?2004h\u001b[?2031h\u001b[?1004h\u001b]11;?\u0007\u001b[c\u001b[>0q\u001b[?u\u001b[c\u001b[>4m\u001b[?1004l\u001b[?2031l\u001b[?2004lNo\u001b[4Gconversation\u001b[17Gfound\u001b[23Gwith\u001b[28Gsession\u001b[36GID:\u001b[40G11111111-2222-3333-4444-555555555555\r\r\n\u001b[?25h\u001b(B\u000f\u001b[?1016l\u001b]0;\u0007";
+
+describe("recognising Claude's no-conversation exit", () => {
+  it("reads the real output, where words are placed by cursor moves", () => {
+    expect(plainTerminalText(REAL_NO_CONVERSATION)).toBe(
+      "No conversation found with session ID: 11111111-2222-3333-4444-555555555555",
+    );
+    expect(isNoConversationOutput(REAL_NO_CONVERSATION)).toBe(true);
+  });
+
+  it("reads the plain print-mode line", () => {
+    expect(
+      isNoConversationOutput("No conversation found with session ID: 1111\r\n"),
+    ).toBe(true);
+  });
+
+  it("does not match other failures", () => {
+    expect(
+      isNoConversationOutput("Error: Session ID abc is already in use."),
+    ).toBe(false);
+    expect(isNoConversationOutput("command not found: claude")).toBe(false);
+    expect(isNoConversationOutput("")).toBe(false);
+    expect(isNoConversationOutput(undefined)).toBe(false);
   });
 });

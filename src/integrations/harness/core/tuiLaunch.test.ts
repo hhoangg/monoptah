@@ -180,3 +180,42 @@ describe("buildTuiLaunch is driven by TUI_CAPS", () => {
     expect(TUI_CAPS.codex).not.toBe(TUI_CAPS.cursor);
   });
 });
+
+describe("claiming a saved id for a new conversation", () => {
+  const session = {
+    harness: "claude" as const,
+    model: "claude-sonnet-4-5",
+    runtimeMode: "supervised" as const,
+  };
+
+  it("starts the new conversation under the id it was given", () => {
+    const launch = buildTuiLaunch(session, {
+      binaryPath: "/bin/claude",
+      newProviderSessionId: "saved-id",
+    });
+    expect(launch.providerSessionId).toBe("saved-id");
+    expect(launch.args).toContain("--session-id");
+    expect(launch.args[launch.args.indexOf("--session-id") + 1]).toBe(
+      "saved-id",
+    );
+    expect(launch.args).not.toContain("--resume");
+  });
+
+  it("is ignored when the session already has an id to resume", () => {
+    const launch = buildTuiLaunch(
+      { ...session, providerSessionId: "existing" },
+      { binaryPath: "/bin/claude", newProviderSessionId: "other" },
+    );
+    expect(launch.args).toContain("--resume");
+    expect(launch.providerSessionId).toBeUndefined();
+  });
+
+  it("changes nothing for a provider that cannot resume", () => {
+    expect(
+      buildTuiLaunch(
+        { ...session, harness: "codex" },
+        { binaryPath: "/bin/codex", newProviderSessionId: "saved-id" },
+      ),
+    ).toEqual({ program: "/bin/codex", args: [] });
+  });
+});
