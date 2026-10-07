@@ -51,7 +51,7 @@ const issue: ClickUpIssue = {
   repo: "Engineering",
   teamId: "1001",
   teamName: "Engineering",
-  projectPath: "Sprint 12",
+  listName: "Sprint 12",
 };
 const spaces = [
   { id: "1001", name: "Engineering" },

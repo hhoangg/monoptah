@@ -93,7 +93,7 @@ pub struct ClickUpIssue {
     pub repo: String,
     pub team_id: String,
     pub team_name: String,
-    pub project_path: String,
+    pub list_name: String,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -624,7 +624,7 @@ fn parse_clickup_issue(node: &Value, spaces: &[ClickUpSpace]) -> Option<ClickUpI
         repo: space_name.clone(),
         team_id: space_id,
         team_name: space_name,
-        project_path: node
+        list_name: node
             .pointer("/list/name")
             .and_then(Value::as_str)
             .unwrap_or_default()
@@ -964,7 +964,7 @@ mod tests {
         assert_eq!(issue.assignees[0].avatar_url, "https://x/ada.png");
         assert_eq!(issue.team_id, "90100");
         assert_eq!(issue.team_name, "Engineering");
-        assert_eq!(issue.project_path, "Sprint 4");
+        assert_eq!(issue.list_name, "Sprint 4");
 
         let mut with_custom = task();
         with_custom["custom_id"] = json!("ENG-7");
@@ -982,13 +982,7 @@ mod tests {
     #[test]
     fn serializes_issues_with_camel_case_keys() {
         let value = serde_json::to_value(parse_clickup_issue(&task(), &spaces()).unwrap()).unwrap();
-        for key in [
-            "stateType",
-            "updatedAt",
-            "teamId",
-            "teamName",
-            "projectPath",
-        ] {
+        for key in ["stateType", "updatedAt", "teamId", "teamName", "listName"] {
             assert!(value.get(key).is_some(), "missing {key}");
         }
         assert!(value["assignees"][0].get("avatarUrl").is_some());

@@ -59,7 +59,7 @@ function task(id: string, title: string, spaceId: string) {
     repo: spaceId === "901" ? "Engineering" : "Design",
     teamId: spaceId,
     teamName: spaceId === "901" ? "Engineering" : "Design",
-    projectPath: "Sprint 4",
+    listName: "Sprint 4",
   };
 }
 

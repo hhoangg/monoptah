@@ -1056,10 +1056,7 @@ function clickupIssueToInboxItem(issue: ClickUpIssue): InboxItem {
     repo: issue.repo,
     teamId: issue.teamId,
     teamName: issue.teamName,
-    // The backend sends the ClickUp list name as `projectPath`, but that field
-    // is a local directory (it becomes a session cwd), so keep the list name
-    // in `projectName` where search and display can use it.
-    projectName: issue.projectPath || "",
+    projectName: issue.listName || "",
     projectPath: "",
   };
 }

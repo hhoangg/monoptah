@@ -35,7 +35,7 @@ export type ClickUpIssue = {
   /** Space name. */
   teamName: string;
   /** List name. */
-  projectPath: string;
+  listName: string;
 };
 
 export type ClickUpIssueDetails = {
