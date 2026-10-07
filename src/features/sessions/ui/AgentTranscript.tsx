@@ -46,6 +46,8 @@ import { TaskListPreview } from "./TaskListPreview";
 import { HandoffButton, SecondOpinionButton } from "./SecondOpinionButton";
 import { SecondOpinionCard } from "./SecondOpinionCard";
 import { NoteMiniCard } from "../../notes/ui/NoteMiniCard";
+import { ArtifactCard } from "../../artifacts/ui/ArtifactCard";
+import { artifactCards } from "../../artifacts/artifacts";
 
 import { TerminalSpinner } from "./TerminalSpinner";
 import { Popover } from "../../../shared/ui/Popover";
@@ -131,6 +133,9 @@ import {
   turnCopyText,
   workKind,
   workSummaryLine,
+  monoTurnLatestStart,
+  monoTurnRuns,
+  opensNewStretch,
   type ActivityPhase,
   type ActivityPhaseKind,
   type ToolCallState,
@@ -218,6 +223,7 @@ type Props = {
   onRemoveDraft?: (block: Block) => boolean | void;
   onSaveSelectionNote?: (text: string) => void | Promise<void>;
   onOpenFile?: (path: string) => void;
+  onOpenArtifact?: (id: string) => void;
   onOpenDiff?: (path: string) => void;
   onOpenPlan?: (blockId: string) => void;
   onBuildPlan?: (blockId: string, target?: PlanBuildTarget) => void;
@@ -280,6 +286,7 @@ function AgentTranscriptComponent({
   onRemoveDraft,
   onSaveSelectionNote,
   onOpenFile,
+  onOpenArtifact,
   onOpenDiff,
   onOpenPlan,
   onBuildPlan,
@@ -940,21 +947,37 @@ function AgentTranscriptComponent({
         ) : null}
         {visibleTurns.map((turn, turnIndex) => {
           const isLastTurn = firstVisibleTurn + turnIndex === turns.length - 1;
+          // A Mono's own follow-up replies join the turn they follow; each
+          // run keeps its prompt, but the turn reads as one message.
+          const runs = inlineWork ? monoTurnRuns(turn) : [turn];
           const userBlock = inlineWork
-            ? monoTurnUserBlock(turn, messageDeliveries)
+            ? monoTurnUserBlock(runs[0], messageDeliveries)
             : turnUserBlock(turn, managed);
+          const lastRun =
+            runs.length > 1
+              ? monoTurnUserBlock(runs[runs.length - 1], messageDeliveries)
+              : userBlock;
           const habit = turn[0].monoHabit;
           // Older saved reports may have lost their habit tag. A Mono's
           // standalone reply still needs its identity and response actions.
           const standaloneReply =
             !userBlock && !!(agentName || habit) && turn.some(isProseBlock);
-          const durationMs = userBlock?.durationMs;
+          const durationMs =
+            runs.length > 1
+              ? sumDurations(
+                  runs.map(
+                    (run) =>
+                      monoTurnUserBlock(run, messageDeliveries)?.durationMs,
+                  ),
+                )
+              : userBlock?.durationMs;
           const settled = !(
             busy &&
             !standaloneReply &&
             firstVisibleTurn + turnIndex === activeTurnIndex
           );
           const proposals = turn.filter((block) => block.orchestration);
+          const artifacts = artifactCards(turn);
           // Proposals are turn results, like the changes card. Keep them out
           // of the live work and append them after all of the lead's output.
           const items = turnCache.turnItems(turn, settled, {
@@ -969,11 +992,13 @@ function AgentTranscriptComponent({
           const startedAt =
             userBlock?.startedAt ?? habit?.at ?? turn[0].startedAt;
           const previousTurn = turns[firstVisibleTurn + turnIndex - 1];
-          const previousAt = previousTurn
-            ? (turnUserBlock(previousTurn, managed)?.startedAt ??
-              previousTurn[0].monoHabit?.at ??
-              previousTurn[0].startedAt)
-            : undefined;
+          const previousAt = !previousTurn
+            ? undefined
+            : inlineWork
+              ? monoTurnLatestStart(previousTurn)
+              : (turnUserBlock(previousTurn, managed)?.startedAt ??
+                previousTurn[0].monoHabit?.at ??
+                previousTurn[0].startedAt);
           const stampAt =
             daySeparators &&
             startedAt != null &&
@@ -1340,6 +1365,20 @@ function AgentTranscriptComponent({
                       <OrchestrationPreview block={block} busy={!!busy} />
                     </div>
                   ))}
+              {settled && artifacts.length > 0 ? (
+                <div
+                  data-artifact-results
+                  className="flex flex-col gap-2 px-4 pt-1 pb-3"
+                >
+                  {artifacts.map((card) => (
+                    <ArtifactCard
+                      key={card.id}
+                      card={card}
+                      onOpen={onOpenArtifact}
+                    />
+                  ))}
+                </div>
+              ) : null}
               {/* The accessory keeps the pane's props, which go stale once parked. */}
               {isLastTurn && latestTurnAccessory && !parked
                 ? latestTurnAccessory
@@ -1359,9 +1398,11 @@ function AgentTranscriptComponent({
                   modelName={turnModelName}
                   completedAt={
                     habit?.at ??
-                    (startedAt != null
-                      ? startedAt + (durationMs ?? 0)
-                      : undefined)
+                    (runs.length > 1 && lastRun?.startedAt != null
+                      ? lastRun.startedAt + (lastRun.durationMs ?? 0)
+                      : startedAt != null
+                        ? startedAt + (durationMs ?? 0)
+                        : undefined)
                   }
                   copyText={turnCopyText(
                     inlineWork
@@ -1447,18 +1488,6 @@ export const AgentTranscript = memo(
   AgentTranscriptComponent,
   (previous, next) => previous.visible === false && next.visible === false,
 );
-
-/** A message this long after the one before gets its own day and time. */
-const STRETCH_GAP = 60 * 60 * 1000;
-
-/** Whether a turn starts a new stretch: the first, a new day or after a break. */
-export function opensNewStretch(at: number, previousAt?: number): boolean {
-  if (previousAt == null) return true;
-  return (
-    at - previousAt > STRETCH_GAP ||
-    new Date(at).toDateString() !== new Date(previousAt).toDateString()
-  );
-}
 
 /** "Today", "Yesterday" or the date, in bold, with the time beside it. */
 export function dayStamp(at: number, now = Date.now()): [string, string] {
@@ -4734,6 +4763,11 @@ function monoTurnUserBlock(
       return block;
   }
   return blocks.find((block) => block.role === "user");
+}
+
+function sumDurations(durations: (number | undefined)[]): number | undefined {
+  const known = durations.filter((ms): ms is number => ms != null);
+  return known.length ? known.reduce((total, ms) => total + ms, 0) : undefined;
 }
 
 function userTurnCount(blocks: Block[], managed = false): number {
