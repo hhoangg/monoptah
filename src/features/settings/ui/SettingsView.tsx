@@ -165,6 +165,12 @@ import {
   type ConfigurableBinaryProvider,
 } from "../../providers/model/providerBinaryPaths";
 import {
+  loadProviderSurface,
+  saveProviderSurface,
+  subscribeProviderSurface,
+  type SessionSurface,
+} from "../../providers/model/providerSurface";
+import {
   compareSemver,
   MINIMUM_OPENCODE_VERSION,
   parseOpenCodeVersion,
@@ -3271,7 +3277,7 @@ function ProvidersPage({
             : "A provider is listed as installed once its CLI is found on your PATH. Uninstalled CLIs stay listed but are left out of the model picker, as are installed ones with Show in picker off. The model beside a provider is what its new conversations start with; Use by default picks the provider itself. CLI paths are global for MonoCode and apply to every project."
         }
       >
-        {HARNESSES.map((harness) => {
+        {HARNESSES.map((harness, index) => {
           const inPicker = project
             ? !(projectSettings.hidden ?? []).includes(harness) &&
               !hiddenGlobally.includes(harness)
@@ -3299,6 +3305,7 @@ function ProvidersPage({
           return (
             <ProviderRow
               key={harness}
+              settingId={index === 0 ? "session-surface" : undefined}
               harness={harness}
               selectedModel={selectedModel}
               isDefault={isDefault}
@@ -3712,6 +3719,7 @@ function ProjectScopeIcon({ path }: { path: string }) {
 }
 
 function ProviderRow({
+  settingId,
   harness,
   selectedModel,
   isDefault,
@@ -3721,6 +3729,8 @@ function ProviderRow({
   onModelChange,
   onPickerVisible,
 }: {
+  /** Search reveals the first provider row for the shared surface setting. */
+  settingId?: string;
   harness: HarnessId;
   selectedModel: string;
   isDefault: boolean;
@@ -3735,6 +3745,11 @@ function ProviderRow({
   const available = isHarnessAvailable(harness);
   const current =
     models.length > 0 ? resolveModel(harness, selectedModel) : null;
+  const surface = useSyncExternalStore(
+    subscribeProviderSurface,
+    () => loadProviderSurface(harness),
+    () => loadProviderSurface(harness),
+  );
 
   useEffect(() => {
     if (!available || models.length > 0) return;
@@ -3743,6 +3758,7 @@ function ProviderRow({
 
   return (
     <Row
+      id={settingId}
       label={
         <span className="flex items-center gap-2">
           <HarnessIcon harness={harness} className="size-4 shrink-0" />
@@ -3778,6 +3794,18 @@ function ProviderRow({
       >
         {isDefault ? "Default" : "Use by default"}
       </SecondaryButton>
+      <div className="flex items-center gap-2">
+        <span className="text-[12px] text-content/50">Session surface</span>
+        <Segmented<SessionSurface>
+          label={`${HARNESS_TITLE[harness]} session surface`}
+          value={surface}
+          onChange={(next) => saveProviderSurface(harness, next)}
+          options={[
+            { value: "chat", label: "Chat" },
+            { value: "tui", label: "Terminal (TUI)" },
+          ]}
+        />
+      </div>
       {available ? (
         <div className="flex items-center gap-2">
           <span className="text-[12px] text-content/50">

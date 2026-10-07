@@ -401,6 +401,12 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
       "codex opencode cursor grok pi omp fx hermes antigravity binary path",
   },
   {
+    id: "session-surface",
+    section: "providers",
+    label: "Session surface",
+    keywords: "tui terminal interactive cli surface",
+  },
+  {
     id: "provider-accounts",
     section: "providers",
     label: "Provider accounts",
