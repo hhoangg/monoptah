@@ -617,7 +617,7 @@ fn relaunch_from_dev_bundle() -> Result<(), String> {
         write_dev_bundle_icons(&app, &app_name)?;
         return Ok(());
     }
-    let app_name = dev_bundle_name_from_env(DEV_BUNDLE_DEFAULT_NAME);
+    let app_name = dev_bundle_name_from_env(&dev_bundle_default_name());
 
     let app = exe
         .parent()
@@ -642,7 +642,7 @@ fn relaunch_from_dev_bundle() -> Result<(), String> {
     // UNUserNotificationCenter refuses authorization, without prompting,
     // unless the signing identifier matches CFBundleIdentifier.
     let signed = Command::new("/usr/bin/codesign")
-        .args(["--force", "--sign", "-", "--identifier", DEV_BUNDLE_ID])
+        .args(["--force", "--sign", "-", "--identifier", &dev_bundle_id()])
         .arg(&app)
         .status()
         .map(|status| status.success())
@@ -671,17 +671,36 @@ fn write_dev_bundle_icons(app: &Path, app_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Must match `CFBundleIdentifier` in the generated dev bundle plist and tauri.conf.json.
+/// The dev bundle takes its name and identifier from tauri.conf.json instead of
+/// keeping a second copy. A stale identifier would make `tauri dev` share
+/// notification and permission identity with another install of the app.
 #[cfg(debug_assertions)]
-const DEV_BUNDLE_DEFAULT_NAME: &str = "MonoCode";
+const TAURI_CONFIG: &str = include_str!("../tauri.conf.json");
 #[cfg(debug_assertions)]
 const DEV_BUNDLE_NAME_ENV: &str = "MONOCODE_DEV_APP_NAME";
-#[cfg(debug_assertions)]
-const DEV_BUNDLE_ID: &str = "com.monocode.desktop";
 #[cfg(debug_assertions)]
 const DEV_ICNS: &[u8] = include_bytes!("../icons/icon.icns");
 #[cfg(debug_assertions)]
 const DEV_ASSETS_CAR: &[u8] = include_bytes!("../macos/Assets.car");
+#[cfg(debug_assertions)]
+fn tauri_config_string(key: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(TAURI_CONFIG)
+        .ok()
+        .and_then(|config| config.get(key)?.as_str().map(str::to_owned))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| panic!("tauri.conf.json has no {key}"))
+}
+
+#[cfg(debug_assertions)]
+fn dev_bundle_default_name() -> String {
+    tauri_config_string("productName")
+}
+
+#[cfg(debug_assertions)]
+fn dev_bundle_id() -> String {
+    tauri_config_string("identifier")
+}
+
 #[cfg(debug_assertions)]
 fn dev_bundle_dir_name(app_name: &str) -> String {
     format!("{app_name}.app")
@@ -728,6 +747,7 @@ fn escape_plist_text(value: &str) -> String {
 #[cfg(debug_assertions)]
 fn dev_bundle_plist(app_name: &str) -> Vec<u8> {
     let app_name = escape_plist_text(app_name);
+    let bundle_id = escape_plist_text(&dev_bundle_id());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -744,7 +764,7 @@ fn dev_bundle_plist(app_name: &str) -> Vec<u8> {
 	<key>CFBundleIconName</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.monocode.desktop</string>
+	<string>{bundle_id}</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -823,5 +843,19 @@ mod tests {
         let plist = String::from_utf8(dev_bundle_plist("MonoCode Dev")).unwrap();
         assert!(plist.contains("<string>MonoCode Dev</string>"));
         assert!(!plist.contains("<string>MonoCode</string>"));
+    }
+
+    #[test]
+    fn dev_bundle_identity_follows_tauri_conf() {
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(dev_bundle_default_name(), config["productName"]);
+        assert_eq!(dev_bundle_id(), config["identifier"]);
+        let plist = String::from_utf8(dev_bundle_plist("Anything")).unwrap();
+        assert!(plist.contains(&format!("<string>{}</string>", dev_bundle_id())));
+        assert!(!plist.contains("com.monocode"));
     }
 }
