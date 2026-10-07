@@ -588,10 +588,63 @@ export function newSession(
     title: HARNESS_LABEL[harness],
     cwd,
     blocks: [],
-    // The TUI runs on this machine, so a remote project's session is never one.
-    surface:
-      options.surface ??
-      (isRemoteProjectPath(cwd) ? "chat" : loadProviderSurface(harness)),
+    // The TUI runs on this machine, so a remote project's session is never
+    // one, even when the caller asks for it.
+    surface: isRemoteProjectPath(cwd)
+      ? "chat"
+      : (options.surface ?? loadProviderSurface(harness)),
+  };
+}
+
+/**
+ * Blank session that carries on `source` after a clear, an account switch or a
+ * worktree switch. It keeps the source's surface: the user sees one session
+ * continuing, so a later change to the preference must not flip it.
+ */
+export function newContinuationSession(source: Session): Session {
+  return newSession(
+    source.harness,
+    source.cwd,
+    source.model,
+    source.runtimeMode,
+    source.modelSettings,
+    { surface: source.surface ?? "chat" },
+  );
+}
+
+/**
+ * New conversation opened from a note. The note rides on the chat composer, so
+ * a terminal would drop it: always a chat.
+ */
+export function newNoteSession(
+  card: NoteComposerCard,
+  cwd: string,
+  runtimeMode: RuntimeMode = DEFAULT_RUNTIME_MODE,
+): Session {
+  const title = card.title.trim();
+  return {
+    ...newDefaultSession(cwd, runtimeMode, { surface: "chat" }),
+    ...(title ? { title } : {}),
+    noteCard: card,
+  };
+}
+
+/**
+ * New conversation that continues another provider's turn. The handoff brief
+ * rides on the chat composer, so a terminal would drop it: always a chat.
+ */
+export function newHandoffSession(
+  harness: HarnessId,
+  cwd: string,
+  model: string,
+  runtimeMode: RuntimeMode,
+  card: HandoffComposerCard,
+): Session {
+  return {
+    ...newSession(harness, cwd, model, runtimeMode, undefined, {
+      surface: "chat",
+    }),
+    handoffCard: card,
   };
 }
 

@@ -433,7 +433,10 @@ import {
   canReplaceSessionTitle,
   formatSessionTitle,
   sessionNeedsInput,
+  newContinuationSession,
   newDefaultSession,
+  newHandoffSession,
+  newNoteSession,
   newSession,
   retargetSessionToProject,
   removeSessionDraft,
@@ -2468,13 +2471,7 @@ function Workspace({
       // Provider thread ids are account-owned. Keep the current conversation
       // pinned to its account and open a clean one for the selected profile.
       const session = {
-        ...newSession(
-          active.harness,
-          active.cwd,
-          active.model,
-          active.runtimeMode,
-          active.modelSettings,
-        ),
+        ...newContinuationSession(active),
         providerAccountId: accountId,
       };
       const tab = newTab(session.id);
@@ -2629,12 +2626,7 @@ function Workspace({
         sessionDefaults?.cwd ||
         projectCwd;
       setSidebarTab("sessions", cwd);
-      const title = card.title.trim();
-      const session = {
-        ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
-        ...(title ? { title } : {}),
-        noteCard: card,
-      };
+      const session = newNoteSession(card, cwd, sessionDefaults?.runtimeMode);
       const tab = newTab(session.id);
       setSessions((prev) => [...prev, session]);
       appendTab(tab, cwd);
@@ -3431,13 +3423,7 @@ function Workspace({
         const workspace = tabWorkspace(tab, sessionsRef.current);
         const focus = worktreeFocus(oldSession.cwd);
         const session = {
-          ...newSession(
-            oldSession.harness,
-            oldSession.cwd,
-            oldSession.model,
-            oldSession.runtimeMode,
-            oldSession.modelSettings,
-          ),
+          ...newContinuationSession(oldSession),
           ...(workspace && !sameProjectPath(workspace, oldSession.cwd)
             ? {
                 worktreeCwd: workspace,
@@ -9585,7 +9571,19 @@ function Workspace({
       const files = turnEditedFiles(sliced.blocks, cwd);
       const display = sessionDisplayTitle(source.title, source.harness);
       const session = {
-        ...newSession(harness, source.cwd, model, source.runtimeMode),
+        ...newHandoffSession(
+          harness,
+          source.cwd,
+          model,
+          source.runtimeMode,
+          buildHandoffComposerCard({
+            from,
+            to: harness,
+            brief: buildDeterministicHandoff(sliced),
+            userRequest,
+            files,
+          }),
+        ),
         worktreeCwd: source.worktreeCwd,
         branch: source.branch,
         modelSettings: mergeModelSettings(
@@ -9596,13 +9594,6 @@ function Workspace({
           harness,
           display === "New session" ? HANDOFF_TITLE : display,
         ),
-        handoffCard: buildHandoffComposerCard({
-          from,
-          to: harness,
-          brief: buildDeterministicHandoff(sliced),
-          userRequest,
-          files,
-        }),
       };
       openSessionBeside(sourceId, session, source.cwd, true);
     },

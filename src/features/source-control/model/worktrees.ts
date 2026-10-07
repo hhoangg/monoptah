@@ -4,7 +4,7 @@ import { invokeWorkspace, notifyGitChanged } from "../../../platform/tauri/fs";
 import { isFilesystemTab, type FilePaneTab } from "../../workspace/model/layout";
 import { isEqualOrInside, pathKey } from "../../../shared/lib/paths";
 import { isBlankSession } from "../../projects/model/projectReturn";
-import { newSession, sessionWorkCwd, type Session } from "../../sessions/model/session";
+import { newContinuationSession, sessionWorkCwd, type Session } from "../../sessions/model/session";
 
 export type Worktree = {
   path: string;
@@ -204,13 +204,7 @@ export function sessionInWorktree(session: Session, tree: Worktree): Session {
       : isBlankSession(session)
         ? session
         : {
-            ...newSession(
-              session.harness,
-              session.cwd,
-              session.model,
-              session.runtimeMode,
-              session.modelSettings,
-            ),
+            ...newContinuationSession(session),
             providerAccountId: session.providerAccountId,
           };
   return {
