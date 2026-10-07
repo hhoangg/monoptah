@@ -159,14 +159,15 @@ export function clickupSpaceIdsForFetch(
 
 /**
  * The backend has no assignee filter, so "assigned to me" is matched locally
- * against the username it cached with the token.
+ * against the username it cached with the token. Without a username nothing
+ * can match: showing the whole workspace would mislead the user.
  */
 export function clickupIssuesAssignedTo(
   issues: readonly ClickUpIssue[],
   username: string,
 ): ClickUpIssue[] {
   const me = username.trim().toLowerCase();
-  if (!me) return [...issues];
+  if (!me) return [];
   return issues.filter((issue) =>
     issue.assignees.some((person) => person.login.trim().toLowerCase() === me),
   );

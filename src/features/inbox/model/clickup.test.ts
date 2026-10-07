@@ -142,8 +142,9 @@ describe("ClickUp assignee filter", () => {
     ).toEqual(["86abc12"]);
   });
 
-  it("keeps everything when the username is unknown", () => {
-    expect(clickupIssuesAssignedTo([issue], "")).toEqual([issue]);
+  it("fails closed when the username is unknown", () => {
+    expect(clickupIssuesAssignedTo([issue], "")).toEqual([]);
+    expect(clickupIssuesAssignedTo([issue], "   ")).toEqual([]);
   });
 });
 
@@ -258,6 +259,35 @@ describe("ClickUp inbox", () => {
       assignedToMe: true,
     });
     expect(items.map((item) => item.id)).toEqual(["86abc12"]);
+  });
+
+  it("shows nothing for assigned-to-me when the cached username is empty", async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "clickup_status") return { connected: true, username: "" };
+      if (command.endsWith("_status")) return { connected: false };
+      if (command === "clickup_list_issues") return [issue];
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    expect(
+      (await listInboxItems([], { ...query, assignedToMe: true })).items,
+    ).toEqual([]);
+    clearInboxCache();
+    expect((await listInboxItems([], query)).items).toHaveLength(1);
+  });
+
+  it("asks the backend for its maximum window when filtering to my tasks", async () => {
+    await listInboxItems([], { ...query, assignedToMe: true });
+    expect(listIssueCalls()[0]![1]).toMatchObject({
+      includeClosed: false,
+      limit: 100,
+    });
+    vi.mocked(invoke).mockClear();
+    clearInboxCache();
+    // Without the filter the backend default is kept.
+    await listInboxItems([], query);
+    expect(
+      (listIssueCalls()[0]![1] as { limit?: number }).limit,
+    ).toBeUndefined();
   });
 
   it("keeps GitHub items when ClickUp settings cannot be read", async () => {

@@ -1024,7 +1024,10 @@ async function fetchClickUpInboxItems(
   const issues = await listClickUpIssues({
     includeClosed: query.state === "all",
     spaceIds: spaceIds ?? [],
-    limit: query.state === "all" ? INBOX_ALL_LIMIT : undefined,
+    // "Assigned to me" is matched locally, so it needs the widest window the
+    // backend allows or older assigned tasks would silently drop out.
+    limit:
+      query.state === "all" || query.assignedToMe ? INBOX_ALL_LIMIT : undefined,
   });
   const hidden = new Set(hiddenIds);
   const visible = issues.filter(
