@@ -5,6 +5,7 @@ mod automations;
 mod azure_devops;
 mod chat_background;
 mod checkpoint;
+mod clickup;
 mod control;
 pub mod control_cli;
 mod cursor_store;
@@ -378,6 +379,14 @@ pub fn run() {
             jira::jira_issue_details,
             jira::jira_issue_thread,
             jira::jira_issue_comment,
+            clickup::clickup_status,
+            clickup::clickup_set_config,
+            clickup::clickup_list_workspaces,
+            clickup::clickup_list_spaces,
+            clickup::clickup_list_issues,
+            clickup::clickup_issue_details,
+            clickup::clickup_issue_thread,
+            clickup::clickup_issue_comment,
             link_preview::fetch_link_preview,
             fs::git_branches,
             fs::git_checkout,
