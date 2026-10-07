@@ -12,7 +12,10 @@ const pty = vi.hoisted(() => ({
   getPtyStatus: vi.fn(async () => ({ foreground: null })),
 }));
 vi.mock("../../../platform/tauri/pty", () => pty);
-const xterm = vi.hoisted(() => ({ options: [] as { fontFamily?: string }[] }));
+const xterm = vi.hoisted(() => ({
+  options: [] as { fontFamily?: string }[],
+  titleListeners: [] as ((title: string) => void)[],
+}));
 vi.mock("../model/terminalLayout", () => ({
   fitTerminal: () => null,
   applyTerminalChrome: () => {},
@@ -43,12 +46,17 @@ vi.mock("@xterm/xterm", () => ({
     }
     attachCustomKeyEventHandler() {}
     attachCustomWheelEventHandler() {}
+    onTitleChange(listener: (title: string) => void) {
+      xterm.titleListeners.push(listener);
+      return { dispose() {} };
+    }
   },
 }));
 import { TerminalView } from "./TerminalView";
 
 afterEach(() => {
   xterm.options.length = 0;
+  xterm.titleListeners.length = 0;
   vi.clearAllMocks();
   vi.unstubAllGlobals();
 });
@@ -264,6 +272,101 @@ it("does not respawn when only the launch object changes", async () => {
     });
     expect(pty.spawnPty).toHaveBeenCalledTimes(1);
     expect(pty.killPty).not.toHaveBeenCalled();
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  }
+});
+
+it("reports the process exit to the caller", async () => {
+  const { host, root } = setup();
+  const onExit = vi.fn();
+  let reportExit!: (code: number | null) => void;
+  pty.subscribePty.mockImplementationOnce(((
+    _id: string,
+    _onData: unknown,
+    onExitEvent: (code: number | null) => void,
+  ) => {
+    reportExit = onExitEvent;
+    return () => {};
+  }) as never);
+  try {
+    await act(async () => {
+      root.render(
+        createElement(TerminalView, {
+          id: "exits",
+          cwd: "/tmp",
+          active: true,
+          onExit,
+        }),
+      );
+    });
+    expect(onExit).not.toHaveBeenCalled();
+    await act(async () => {
+      reportExit(2);
+    });
+    expect(onExit).toHaveBeenCalledExactlyOnceWith({ code: 2 });
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  }
+});
+
+it("reports a process that could not start as an error with no code", async () => {
+  const { host, root } = setup();
+  const onExit = vi.fn();
+  pty.spawnPty.mockRejectedValueOnce(new Error("Failed to start claude"));
+  try {
+    await act(async () => {
+      root.render(
+        createElement(TerminalView, {
+          id: "missing",
+          cwd: "/tmp",
+          active: true,
+          onExit,
+        }),
+      );
+    });
+    expect(onExit).toHaveBeenCalledExactlyOnceWith({
+      code: null,
+      error: "Failed to start claude",
+    });
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  }
+});
+
+it("forwards the program's window title only to a view that asked for it", async () => {
+  const { host, root } = setup();
+  const onTitleChange = vi.fn();
+  try {
+    await act(async () => {
+      root.render(
+        createElement(TerminalView, { id: "plain", cwd: "/tmp", active: true }),
+      );
+    });
+    expect(xterm.titleListeners).toHaveLength(0);
+    await act(async () => {
+      root.render(
+        createElement(TerminalView, {
+          key: "titled",
+          id: "titled",
+          cwd: "/tmp",
+          active: true,
+          onTitleChange,
+        }),
+      );
+    });
+    expect(xterm.titleListeners).toHaveLength(1);
+    xterm.titleListeners[0]("Claude Code");
+    expect(onTitleChange).toHaveBeenCalledExactlyOnceWith("Claude Code");
   } finally {
     await act(async () => {
       root.unmount();

@@ -22,6 +22,9 @@ export type ProjectReturnDecision =
 
 export function isBlankSession(session: Session | undefined): boolean {
   if (!session || session.busy) return false;
+  // A terminal session never has chat blocks, but it holds a live CLI that a
+  // blank-tab reuse would unmount and kill.
+  if (session.surface === "tui") return false;
   return !session.blocks.some((block) => block.role === "user");
 }
 

@@ -1,0 +1,171 @@
+import type { PtyLaunch } from "../../../platform/tauri/pty";
+import { TUI_CAPS } from "../../../integrations/harness/core/tuiLaunch";
+import type { InboxComposerCard } from "../../inbox/model/githubTasks";
+import {
+  DEFAULT_PROVIDER_ACCOUNT_ID,
+  supportsProviderAccounts,
+} from "../../providers/model/providerAccounts";
+import {
+  HARNESS_TITLE,
+  sessionDisplayTitle,
+  type HarnessId,
+  type Session,
+} from "./session";
+
+/** An exit sooner than this after launch reads as "never really started". */
+export const TUI_EARLY_EXIT_MS = 5000;
+
+const MAX_TITLE_LENGTH = 80;
+
+export function isTuiSession(
+  session: Pick<Session, "surface"> | undefined,
+): boolean {
+  return session?.surface === "tui";
+}
+
+/** One PTY per session; the prefix keeps it apart from file-pane terminals. */
+export function tuiPtyId(sessionId: string): string {
+  return `tui:${sessionId}`;
+}
+
+/** A deleted worktree no longer exists, so fall back to the project folder. */
+export function tuiLaunchCwd(
+  session: Pick<Session, "cwd" | "worktreeCwd" | "worktreeRemoved">,
+): string {
+  return session.worktreeRemoved
+    ? session.cwd
+    : (session.worktreeCwd ?? session.cwd);
+}
+
+/** The default profile needs no env, so only a named account is sent. */
+export function tuiProviderAccount(
+  harness: HarnessId,
+  accountId: string | undefined,
+): PtyLaunch["providerAccount"] {
+  if (!supportsProviderAccounts(harness)) return undefined;
+  if (!accountId || accountId === DEFAULT_PROVIDER_ACCOUNT_ID) return undefined;
+  return { provider: harness, id: accountId };
+}
+
+/** What a terminal session may change about itself, saved with the workspace. */
+export type TuiSessionPatch = {
+  /** `null` forgets the saved conversation so the next launch starts fresh. */
+  providerSessionId?: string | null;
+  providerAccountId?: string;
+};
+
+export function applyTuiSessionPatch(
+  session: Session,
+  patch: TuiSessionPatch,
+): Session {
+  let next = session;
+  if (patch.providerSessionId === null) {
+    if (next.providerSessionId !== undefined) {
+      next = { ...next, providerSessionId: undefined };
+    }
+  } else if (
+    patch.providerSessionId &&
+    patch.providerSessionId !== next.providerSessionId
+  ) {
+    next = { ...next, providerSessionId: patch.providerSessionId };
+  }
+  if (
+    patch.providerAccountId &&
+    patch.providerAccountId !== next.providerAccountId
+  ) {
+    next = { ...next, providerAccountId: patch.providerAccountId };
+  }
+  return next;
+}
+
+/**
+ * Provider CLIs prefix the terminal title with a status glyph or spinner frame.
+ * Keep the words only, so the tab does not flicker through animation frames.
+ */
+export function cleanTuiTitle(raw: string): string {
+  const words = raw
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/^[^\p{L}\p{N}]+/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return words.length > MAX_TITLE_LENGTH
+    ? `${words.slice(0, MAX_TITLE_LENGTH - 1).trimEnd()}…`
+    : words;
+}
+
+/**
+ * The CLI may only retitle a tab that still shows a placeholder or its own
+ * earlier title. An Inbox title or a rename the user typed stays.
+ */
+export function canRetitleFromTui(
+  session: Pick<Session, "title" | "harness">,
+  lastAutoTitle: string | undefined,
+): boolean {
+  if (lastAutoTitle !== undefined && session.title === lastAutoTitle) {
+    return true;
+  }
+  return sessionDisplayTitle(session.title, session.harness) === "New session";
+}
+
+export type TuiExit = {
+  code: number | null;
+  /** The process never started, so there is no exit code. */
+  error?: string;
+  /** Exited within `TUI_EARLY_EXIT_MS` of launch. */
+  early: boolean;
+};
+
+export type TuiExitNotice = {
+  message: string;
+  hint?: string;
+};
+
+/** Plain-language bar copy; an instant exit is how "no interactive mode" shows. */
+export function tuiExitNotice(
+  harness: HarnessId,
+  exit: TuiExit,
+): TuiExitNotice {
+  const label = HARNESS_TITLE[harness];
+  if (exit.error) {
+    return {
+      message: `Could not start ${label}`,
+      hint: exit.error,
+    };
+  }
+  const message =
+    exit.code == null ? "Process exited" : `Process exited (code ${exit.code})`;
+  if (!exit.early) return { message };
+  return {
+    message,
+    hint: `${label} stopped right after it started. It may not have an interactive mode, may need you to sign in, or may be missing. Check the output above.`,
+  };
+}
+
+/**
+ * Resuming an id the CLI never saved fails at once. Offer a fresh start for
+ * exactly that case, so a bad saved id cannot trap the session.
+ */
+export function canStartFreshAfter(
+  harness: HarnessId,
+  exit: TuiExit,
+  resumed: boolean,
+): boolean {
+  return !exit.error && exit.early && resumed && TUI_CAPS[harness].resume;
+}
+
+/**
+ * Inbox "Start work". A chat shows the card above its composer; a terminal has
+ * no composer, so the composed prompt becomes the CLI's first prompt. A CLI
+ * that cannot take a first prompt would drop it, so that session stays chat.
+ */
+export function applyInboxStart(
+  session: Session,
+  card: InboxComposerCard,
+): Session {
+  if (session.surface !== "tui") return { ...session, inboxCard: card };
+  if (!TUI_CAPS[session.harness].initialPrompt) {
+    return { ...session, surface: "chat", inboxCard: card };
+  }
+  const prompt = card.prompt.trim();
+  return prompt ? { ...session, initialPrompt: prompt } : session;
+}

@@ -1,5 +1,6 @@
 import { stopStreaming } from "../../../integrations/harness/core/apply";
 import { forgetHarnessSession } from "../../../integrations/harness/core/registry";
+import { killPty } from "../../../platform/tauri/pty";
 import {
   buildDeterministicHandoff,
   completeHandoff,
@@ -9,6 +10,7 @@ import {
 import { flushSessionCheckpoint } from "./checkpoint";
 import { isFilesystemTab, type WorkspaceTab } from "../../workspace/model/layout";
 import { orchestrator } from "../../orchestration/model/orchestration";
+import { isTuiSession, tuiPtyId } from "./tuiSession";
 import {
   newSession,
   type HarnessId,
@@ -138,9 +140,16 @@ async function removeSession(
     // session even when the following storage operation fails.
     options.workspace.apply({ type: "stopped", session: stopped });
   }
-  const harnesses: HarnessId[] = stopped
-    ? sessionChildHarnesses(stopped)
-    : [options.replacement.harness ?? "cursor"];
+  // A terminal session has no adapter child. Its PTY is what must end, here
+  // and not at unmount, so an archived or deleted session cannot leave the CLI
+  // running while the pane is still being torn down.
+  const tui = isTuiSession(stopped);
+  if (tui) await killPty(tuiPtyId(sessionId)).catch(() => undefined);
+  const harnesses: HarnessId[] = tui
+    ? []
+    : stopped
+      ? sessionChildHarnesses(stopped)
+      : [options.replacement.harness ?? "cursor"];
   if (options.mode === "delete") {
     // Release native processes before deleting the record, so a following
     // worktree removal cannot race fire-and-forget cleanup.

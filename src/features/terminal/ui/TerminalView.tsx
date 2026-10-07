@@ -36,6 +36,10 @@ type Props = {
   /** Runs this program instead of the login shell. Read once per spawn. */
   launch?: PtyLaunch;
   onMetaChange?: (patch: TerminalMetaPatch) => void;
+  /** Reports the process ending, or failing to start (`error`, no code). */
+  onExit?: (exit: { code: number | null; error?: string }) => void;
+  /** Window title the program sets (OSC 0/2). Shells are left alone unless set. */
+  onTitleChange?: (title: string) => void;
 };
 
 function cssColor(expr: string, fallback: string): string {
@@ -154,6 +158,8 @@ export function TerminalView({
   active,
   launch,
   onMetaChange,
+  onExit,
+  onTitleChange,
 }: Props) {
   const outerRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
@@ -162,6 +168,10 @@ export function TerminalView({
   const applySizeRef = useRef<() => void>(() => {});
   const onMetaChangeRef = useRef(onMetaChange);
   onMetaChangeRef.current = onMetaChange;
+  const onExitRef = useRef(onExit);
+  onExitRef.current = onExit;
+  const onTitleChangeRef = useRef(onTitleChange);
+  onTitleChangeRef.current = onTitleChange;
   // The spawn effect is keyed on `id` alone, so a new launch object must not
   // restart the process; it is read when the spawn happens.
   const launchRef = useRef(launch);
@@ -236,6 +246,12 @@ export function TerminalView({
       return true;
     });
 
+    // Only a view that asked for titles listens, so shell tabs keep the
+    // process-name titles they already get.
+    const titleSub = onTitleChangeRef.current
+      ? term.onTitleChange((title) => onTitleChangeRef.current?.(title))
+      : null;
+
     let oscBuffer = "";
 
     let unsubscribe = () => {};
@@ -265,6 +281,7 @@ export function TerminalView({
           if (closed) return;
           const status = code == null ? "" : ` (${code})`;
           term.writeln(`\r\n[process exited${status}]`);
+          onExitRef.current?.({ code: code ?? null });
         },
       );
       didStart = true;
@@ -285,6 +302,7 @@ export function TerminalView({
           const message =
             error instanceof Error ? error.message : String(error);
           term.writeln(`\x1b[31m${message}\x1b[0m`);
+          onExitRef.current?.({ code: null, error: message });
         }
         throw error;
       });
@@ -394,6 +412,7 @@ export function TerminalView({
       oscCursor.dispose();
       renderSub.dispose();
       bufferSub.dispose();
+      titleSub?.dispose();
       const stopping = starting
         .catch(() => undefined)
         .then(() => {

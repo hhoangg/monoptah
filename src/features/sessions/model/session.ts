@@ -501,6 +501,11 @@ export type Session = {
   worktreeRemoved?: boolean;
   /** One-shot composer text when opening a session from Inbox. */
   composerSeed?: string;
+  /**
+   * First prompt of a terminal session, passed to the CLI at launch. A chat
+   * session has a composer instead. In-memory, one-shot.
+   */
+  initialPrompt?: string;
   /** Inbox issue/PR chip shown above the composer. In-memory, one-shot. */
   inboxCard?: InboxComposerCard;
   /** GitHub issue or pull request shown on the persisted session card. */

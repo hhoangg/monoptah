@@ -418,6 +418,12 @@ import {
   type AddToChatRequest,
 } from "../features/sessions/model/quoteDraft";
 import { createSessionRemover } from "../features/sessions/model/sessionRemoval";
+import {
+  applyInboxStart,
+  applyTuiSessionPatch,
+  isTuiSession,
+  type TuiSessionPatch,
+} from "../features/sessions/model/tuiSession";
 import { shouldGenerateSessionTitle } from "../features/sessions/model/sessionTitle";
 import {
   DEFAULT_PROVIDER_ACCOUNT_ID,
@@ -2457,7 +2463,13 @@ function Workspace({
       const currentId = active.providerAccountId ?? DEFAULT_PROVIDER_ACCOUNT_ID;
       if (currentId === accountId) return;
 
-      if (active.blocks.length === 0 && !active.busy) {
+      // A terminal session's saved conversation belongs to its account, so a
+      // switch opens a clean session instead of re-pointing the running one.
+      if (
+        active.blocks.length === 0 &&
+        !active.busy &&
+        !isTuiSession(active)
+      ) {
         setSessions((current) =>
           current.map((session) =>
             session.id === active.id
@@ -2588,9 +2600,11 @@ function Workspace({
             : `#${item.number}`;
         const linkedWorkItem = linkedWorkItemFromInboxItem(item);
         const session = {
-          ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+          ...applyInboxStart(
+            newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+            inboxComposerCard(item, description),
+          ),
           title: `${ref} ${item.title}`,
-          inboxCard: inboxComposerCard(item, description),
           ...(linkedWorkItem ? { linkedWorkItem } : {}),
         };
         const tab = newTab(session.id);
@@ -2990,6 +3004,50 @@ function Workspace({
     },
     [],
   );
+
+  const onTuiSessionChange = useCallback(
+    async (sessionId: string, patch: TuiSessionPatch) => {
+      const current = sessionsRef.current.find(
+        (session) => session.id === sessionId,
+      );
+      if (!current) throw new Error("This session is no longer open.");
+      const updated = applyTuiSessionPatch(current, patch);
+      if (updated === current) return;
+      const next = sessionsRef.current.map((session) =>
+        session.id === sessionId ? updated : session,
+      );
+      sessionsRef.current = next;
+      setSessions(next);
+      if (windowTransfer) return;
+      // The debounced snapshot effect is too late for this: the CLI is about
+      // to start under the new conversation id, so write it before it does.
+      await saveWorkspaceSnapshot(
+        collectWorkspaceSnapshot(
+          tabsRef.current,
+          next,
+          activeTabIdRef.current,
+          projectCwdRef.current,
+          readProjectReturnMemory(),
+          projectTerminalsRef.current,
+          lastDockSideRef.current ?? undefined,
+          keepWorkspaceTab,
+        ),
+      );
+    },
+    [keepWorkspaceTab, readProjectReturnMemory, windowTransfer],
+  );
+
+  const onTuiTitleChange = useCallback((sessionId: string, title: string) => {
+    setSessions((prev) =>
+      prev.map((session) =>
+        session.id === sessionId &&
+        isTuiSession(session) &&
+        session.title !== title
+          ? { ...session, title }
+          : session,
+      ),
+    );
+  }, []);
 
   const onToggleRunningTerminal = useCallback(
     (fileId: string) => {
@@ -4176,6 +4234,7 @@ function Workspace({
       if (
         !restored.worktreeRemoved &&
         restored.providerSessionId &&
+        !isTuiSession(restored) &&
         isLiveHarness(restored.harness)
       ) {
         bindHarnessSession(
@@ -5586,6 +5645,8 @@ function Workspace({
         prev.map((session) => {
           if (
             session.id !== sessionId ||
+            // Nothing creates the worktree for a terminal session.
+            isTuiSession(session) ||
             (!isBlankSession(session) &&
               !(session.workspaceMode && !session.worktreeCwd && !session.busy))
           ) {
@@ -6485,6 +6546,16 @@ function Workspace({
           attachments,
           options,
         );
+      // A terminal session has no turns: its CLI owns the conversation, so no
+      // adapter call (send, title, steer, usage) may start for it.
+      if (isTuiSession(remote)) {
+        options?.onSettled?.({
+          status: "failed",
+          text: "",
+          error: "Terminal sessions take input in their terminal",
+        });
+        return false;
+      }
       if (editedResends.isActive(sessionId)) return false;
       // Output already received belongs before the submitted user message.
       // Flush before reading the session too, since pending errors can settle it.
@@ -9636,6 +9707,7 @@ function Workspace({
       if (current && remoteProjectFor(current.cwd))
         return remoteSessionActions(sessionId)?.compact() ?? false;
       if (!current || current.busy || current.worktreeRemoved) return false;
+      if (isTuiSession(current)) return false;
       if (!canCompactHarnessContext(current.harness)) {
         const unsupported = sessionsRef.current.map((session) =>
           session.id === sessionId
@@ -12505,6 +12577,8 @@ function Workspace({
                                     onMovePane={onMovePane}
                                     onDetachPane={onDetachPane}
                                     onTerminalMetaChange={onTerminalMetaChange}
+                                    onTuiSessionChange={onTuiSessionChange}
+                                    onTuiTitleChange={onTuiTitleChange}
                                   />
                                 </div>
                               </div>

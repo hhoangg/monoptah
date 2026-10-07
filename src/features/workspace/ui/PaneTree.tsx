@@ -51,6 +51,8 @@ import {
 } from "../../sessions/model/session";
 import { FilePane } from "../../files/ui/FilePane";
 import { SessionPane } from "../../sessions/ui/SessionPane";
+import { TuiSessionPane } from "../../sessions/ui/TuiSessionPane";
+import type { TuiSessionPatch } from "../../sessions/model/tuiSession";
 import type { TranscriptPool } from "../../sessions/ui/TranscriptPool";
 import type { SessionFolderTarget } from "../../sessions/model/sessionFolders";
 import type { Worktree } from "../../source-control/model/worktrees";
@@ -188,6 +190,11 @@ type Shared = {
   ) => void;
   onNewTerminal: (sessionId: string) => void;
   onTerminalMetaChange?: (fileId: string, patch: TerminalMetaPatch) => void;
+  onTuiSessionChange: (
+    sessionId: string,
+    patch: TuiSessionPatch,
+  ) => Promise<void>;
+  onTuiTitleChange: (sessionId: string, title: string) => void;
   transcriptPool?: TranscriptPool;
 };
 
@@ -275,6 +282,8 @@ function PaneTreeComponent({
   onDetachPane,
   onNewTerminal,
   onTerminalMetaChange,
+  onTuiSessionChange,
+  onTuiTitleChange,
   transcriptPool,
 }: Props) {
   const treeRef = useRef<HTMLDivElement>(null);
@@ -491,6 +500,15 @@ function PaneTreeComponent({
                   editorNavigation={editorNavigation}
                   onPaneDragStart={onPaneDragStart}
                   onTerminalMetaChange={onTerminalMetaChange}
+                />
+              ) : session?.surface === "tui" ? (
+                <TuiSessionPane
+                  session={session}
+                  visible={visible}
+                  focused={focusedId === session.id}
+                  onFocus={onFocus}
+                  onSessionChange={onTuiSessionChange}
+                  onTitleChange={onTuiTitleChange}
                 />
               ) : session ? (
                 <SessionPane

@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { newFileTab, newTab, placePane, type WorkspaceTab } from "../../workspace/model/layout";
 import { newSession, type Session } from "../../sessions/model/session";
-import { planProjectReturn, reconcileProjectReturn } from "./projectReturn";
+import {
+  isBlankSession,
+  planProjectReturn,
+  reconcileProjectReturn,
+} from "./projectReturn";
 import {
   emptyTabVisitHistory,
   recordTabVisit,
@@ -330,5 +334,25 @@ describe("project selection", () => {
         projectPath: "/gamma",
       }),
     ).toEqual({ action: "keep" });
+  });
+});
+
+describe("isBlankSession", () => {
+  it("treats a chat with no user message as blank", () => {
+    expect(isBlankSession(newSession("claude", "/alpha"))).toBe(true);
+    expect(isBlankSession(chat("a1", "/alpha"))).toBe(false);
+  });
+
+  it("never treats a terminal session as blank, so reuse cannot kill its CLI", () => {
+    const terminal = newSession(
+      "claude",
+      "/alpha",
+      undefined,
+      undefined,
+      undefined,
+      { surface: "tui" },
+    );
+    expect(terminal.blocks).toEqual([]);
+    expect(isBlankSession(terminal)).toBe(false);
   });
 });

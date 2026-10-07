@@ -25,6 +25,7 @@ import {
 } from "../../features/projects/model/projectTerminal";
 import { sessionWorkCwd, type Session } from "../../features/sessions/model/session";
 import { sessionChildHarnesses } from "../../features/sessions/model/handoff";
+import { isTuiSession, tuiPtyId } from "../../features/sessions/model/tuiSession";
 import {
   getSession,
   listInFlightSessions,
@@ -333,6 +334,8 @@ export function bindResumedSessions(sessions: Session[]): void {
     if (
       session.worktreeRemoved ||
       !session.providerSessionId ||
+      // A terminal session's id belongs to the CLI, not to a chat adapter.
+      isTuiSession(session) ||
       !isLiveHarness(session.harness)
     )
       continue;
@@ -501,18 +504,24 @@ export async function reapWindowRuntime(
   includeAllChildren = true,
 ): Promise<void> {
   await Promise.all(
-    sessions.map((session) =>
-      Promise.all(
-        sessionChildHarnesses(session).map((harness) =>
-          forgetHarnessSession(harness, session.id),
+    sessions
+      .filter((session) => !isTuiSession(session))
+      .map((session) =>
+        Promise.all(
+          sessionChildHarnesses(session).map((harness) =>
+            forgetHarnessSession(harness, session.id),
+          ),
         ),
       ),
-    ),
   );
   await Promise.all(
-    [...terminalFileIds(tabs), ...projectTerminalFileIds(projectTerminals)].map(
-      (id) => killPty(id),
-    ),
+    [
+      ...terminalFileIds(tabs),
+      ...projectTerminalFileIds(projectTerminals),
+      // Closing one of several windows does not reach the host's own exit
+      // cleanup, so its terminal sessions are reaped here.
+      ...sessions.filter(isTuiSession).map((session) => tuiPtyId(session.id)),
+    ].map((id) => killPty(id)),
   );
   // Catalog probes, title generators, and usage scrapers are not session
   // children. Drop them so an unused Pi/Codex probe cannot outlive the window.
