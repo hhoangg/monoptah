@@ -293,13 +293,17 @@ pub async fn clickup_issue_comment(
             &format!("/task/{task_id}/comment"),
             &json!({ "comment_text": body, "notify_all": false }),
         )?;
-        if value_id(&data, "id").is_none() {
-            return Err("Could not post ClickUp comment".into());
-        }
+        created_comment_id(&data)?;
         Ok(task_url(task_id))
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// The id of the comment ClickUp just created. A missing id means the post did
+/// not take, so it must be an error rather than a silent success.
+fn created_comment_id(data: &Value) -> Result<String, String> {
+    value_id(data, "id").ok_or_else(|| "Could not post ClickUp comment".to_string())
 }
 
 fn status_for(config: Option<&ClickUpConfig>) -> ClickUpStatus {
@@ -1423,6 +1427,22 @@ mod tests {
         assert!(!thread.truncated);
         assert_eq!(thread.comments[0].body, "a");
         assert_eq!(thread.comments[0].url, "https://app.clickup.com/t/t");
+    }
+
+    #[test]
+    fn created_comment_needs_an_id_in_either_shape() {
+        let live = json!({ "id": 1100290000049524u64, "hist_id": "5294670272230211025" });
+        assert_eq!(created_comment_id(&live).unwrap(), "1100290000049524");
+        assert_eq!(
+            created_comment_id(&json!({ "id": "1100290000049524" })).unwrap(),
+            "1100290000049524"
+        );
+        for data in [json!({}), json!({ "id": "" }), json!({ "id": null })] {
+            assert_eq!(
+                created_comment_id(&data).unwrap_err(),
+                "Could not post ClickUp comment"
+            );
+        }
     }
 
     #[test]
