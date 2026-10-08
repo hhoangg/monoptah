@@ -24,7 +24,6 @@ import { isLightScheme, SCHEME_CHANGE_EVENT } from "../../settings/model/appeara
 import {
   applyTerminalChrome,
   fitTerminal,
-  resetGridStretch,
   type TerminalFitMode,
 } from "../model/terminalLayout";
 import { IS_MAC } from "../../../platform/tauri/platform";
@@ -386,7 +385,6 @@ export function TerminalView({
       if (next === tuiMode) return;
       tuiMode = next;
       applyTerminalChrome(term, outer, next);
-      if (!next) resetGridStretch(term);
       lastCols = 0;
       lastRows = 0;
       schedule();

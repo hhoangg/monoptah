@@ -15,7 +15,6 @@ vi.mock("../../../platform/tauri/pty", () => pty);
 vi.mock("../model/terminalLayout", () => ({
   fitTerminal: () => null,
   applyTerminalChrome: () => {},
-  resetGridStretch: () => {},
 }));
 import { TerminalView } from "./TerminalView";
 

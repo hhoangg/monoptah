@@ -3,7 +3,11 @@ import type { Terminal } from "@xterm/xterm";
 export type TerminalFitMode = "shell" | "tui";
 
 const DEFAULT_SCROLLBAR_WIDTH = 14;
-const MIN_TUI_SCROLLBAR_WIDTH = 1;
+/**
+ * The alt screen has no scrollback to scroll and its scrollbar is hidden, so
+ * the full pane width belongs to the grid.
+ */
+const TUI_GUTTER_WIDTH = 0;
 
 type CellSize = { width: number; height: number };
 
@@ -33,46 +37,12 @@ function availableSize(
 ): { width: number; height: number } | null {
   const gutter =
     mode === "tui"
-      ? MIN_TUI_SCROLLBAR_WIDTH
+      ? TUI_GUTTER_WIDTH
       : terminalScrollbarWidth(term.options.overviewRuler);
   const width = host.clientWidth - gutter;
   const height = host.clientHeight;
   if (width < 8 || height < 8) return null;
   return { width, height };
-}
-
-/** Grow letter-spacing / line-height so the cell grid covers the host (TUI mode). */
-export function stretchGridToHost(
-  term: Terminal,
-  host: HTMLElement,
-  mode: TerminalFitMode,
-): void {
-  if (mode !== "tui") return;
-  const size = availableSize(host, mode, term);
-  if (!size) return;
-
-  for (let pass = 0; pass < 4; pass++) {
-    const cell = cellSize(term);
-    if (!cell) break;
-    const gapW = size.width - term.cols * cell.width;
-    const gapH = size.height - term.rows * cell.height;
-    if (gapW <= 0.5 && gapH <= 0.5) break;
-    if (gapW > 0.5) {
-      term.options.letterSpacing =
-        (term.options.letterSpacing ?? 0) + gapW / term.cols;
-    }
-    if (gapH > 0.5) {
-      const rowHeight = cell.height;
-      const targetRow = size.height / term.rows;
-      term.options.lineHeight =
-        (term.options.lineHeight ?? 1) * (targetRow / rowHeight);
-    }
-  }
-}
-
-export function resetGridStretch(term: Terminal): void {
-  term.options.letterSpacing = 0;
-  term.options.lineHeight = 1;
 }
 
 export function fitTerminal(
@@ -83,30 +53,18 @@ export function fitTerminal(
   const size = availableSize(host, mode, term);
   if (!size) return null;
 
-  let cell = cellSize(term);
+  const cell = cellSize(term);
   if (!cell) return null;
 
-  const round = mode === "tui" ? Math.ceil : Math.floor;
-  let cols = Math.max(2, round(size.width / cell.width));
-  let rows = Math.max(1, round(size.height / cell.height));
+  // Round down, in both modes. A grid rounded up, or stretched to cover the
+  // pane, reaches past the host, which clips it — and what a full-screen TUI
+  // loses that way is its bottom line. The strip left over is under one cell;
+  // the terminal paints no background of its own, so nothing shows there.
+  const cols = Math.max(2, Math.floor(size.width / cell.width));
+  const rows = Math.max(1, Math.floor(size.height / cell.height));
 
   if (term.cols !== cols || term.rows !== rows) {
     term.resize(cols, rows);
-    cell = cellSize(term);
-    if (!cell) return { cols, rows };
-    if (mode === "tui") {
-      while (cols * cell.width < size.width - 0.5) cols++;
-      while (rows * cell.height < size.height - 0.5) rows++;
-      if (term.cols !== cols || term.rows !== rows) {
-        term.resize(cols, rows);
-      }
-    }
-  }
-
-  if (mode === "tui") {
-    stretchGridToHost(term, host, mode);
-  } else {
-    resetGridStretch(term);
   }
 
   return { cols: term.cols, rows: term.rows };
@@ -118,5 +76,8 @@ export function applyTerminalChrome(
   tui: boolean,
 ): void {
   outer.classList.toggle("monocode-terminal--alt-screen", tui);
-  term.options.overviewRuler = tui ? { width: MIN_TUI_SCROLLBAR_WIDTH } : {};
+  // xterm's decoration overview ruler paints a 1px outline down the whole
+  // right edge, which reads as a border the TUI did not draw. The alt screen
+  // has no scrollback to summarise, so leave the ruler off.
+  term.options.overviewRuler = {};
 }

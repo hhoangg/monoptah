@@ -19,7 +19,6 @@ const xterm = vi.hoisted(() => ({
 vi.mock("../model/terminalLayout", () => ({
   fitTerminal: () => null,
   applyTerminalChrome: () => {},
-  resetGridStretch: () => {},
 }));
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
