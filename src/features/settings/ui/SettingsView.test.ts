@@ -670,6 +670,67 @@ describe("settings pages", () => {
     expect(localStorage.getItem("monocode.fileTabMode")).toBe("workspace");
   });
 
+  it("renders the session surface as an icon-only control with tooltips", async () => {
+    await render("providers");
+    const groups = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        '[role="radiogroup"][aria-label$="session surface"]',
+      ),
+    );
+
+    expect(groups).toHaveLength(HARNESSES.length);
+    // The visible label was dropped to keep the provider row on one line.
+    expect(container.textContent).not.toContain("Session surface");
+    for (const group of groups) {
+      const [chat, terminal] = Array.from(
+        group.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+      );
+      expect(group.querySelectorAll('[role="radio"]')).toHaveLength(2);
+      expect(chat?.getAttribute("aria-label")).toBe("Chat");
+      expect(terminal?.getAttribute("aria-label")).toBe("Terminal (TUI)");
+      expect(chat?.title).toBe("New sessions open as a chat transcript");
+      expect(terminal?.title).toBe(
+        "New sessions open the provider's terminal UI",
+      );
+      for (const option of [chat, terminal]) {
+        expect(option?.textContent).toBe("");
+        expect(option?.querySelector("svg")).not.toBeNull();
+      }
+    }
+
+    const [chat, terminal] = Array.from(
+      groups[0].querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+    );
+    expect(chat?.getAttribute("aria-checked")).toBe("true");
+    expect(terminal?.getAttribute("aria-checked")).toBe("false");
+    await act(async () => terminal?.click());
+    expect(terminal?.getAttribute("aria-checked")).toBe("true");
+    expect(chat?.getAttribute("aria-checked")).toBe("false");
+    expect(localStorage.getItem("monocode.providerSurface.v1")).toContain(
+      '"tui"',
+    );
+  });
+
+  it("keeps text-only segmented controls unchanged", async () => {
+    await render("general");
+    const options = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(
+        '[role="radiogroup"][aria-label="File tabs"] [role="radio"]',
+      ),
+    );
+
+    expect(options.map((option) => option.textContent)).toEqual([
+      "Beside chat",
+      "Top bar",
+    ]);
+    for (const option of options) {
+      expect(option.hasAttribute("aria-label")).toBe(false);
+      expect(option.hasAttribute("title")).toBe(false);
+      expect(option.querySelector("svg")).toBeNull();
+      expect(option.className).not.toContain("flex");
+    }
+  });
+
   it("offers tab animations as an opt-in", async () => {
     await render("general");
     const control = container.querySelector<HTMLButtonElement>(

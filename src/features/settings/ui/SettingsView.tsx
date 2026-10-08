@@ -4,6 +4,7 @@ import { ConnectionsSettings } from "../../connections/ui/ConnectionsSettings";
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownCircle,
+  Chatting,
   Check,
   ChevronDown,
   ExternalLink,
@@ -16,6 +17,7 @@ import {
   RefreshCw,
   RotateCcw,
   Search,
+  Terminal,
   Trash2,
   X,
 } from "../../../shared/ui/icons";
@@ -3795,18 +3797,25 @@ function ProviderRow({
       >
         {isDefault ? "Default" : "Use by default"}
       </SecondaryButton>
-      <div className="flex items-center gap-2">
-        <span className="text-[12px] text-content/50">Session surface</span>
-        <Segmented<SessionSurface>
-          label={`${HARNESS_TITLE[harness]} session surface`}
-          value={surface}
-          onChange={(next) => saveProviderSurface(harness, next)}
-          options={[
-            { value: "chat", label: "Chat" },
-            { value: "tui", label: "Terminal (TUI)" },
-          ]}
-        />
-      </div>
+      <Segmented<SessionSurface>
+        label={`${HARNESS_TITLE[harness]} session surface`}
+        value={surface}
+        onChange={(next) => saveProviderSurface(harness, next)}
+        options={[
+          {
+            value: "chat",
+            label: "Chat",
+            icon: Chatting,
+            title: "New sessions open as a chat transcript",
+          },
+          {
+            value: "tui",
+            label: "Terminal (TUI)",
+            icon: Terminal,
+            title: "New sessions open the provider's terminal UI",
+          },
+        ]}
+      />
       {available ? (
         <div className="flex items-center gap-2">
           <span className="text-[12px] text-content/50">
@@ -4217,7 +4226,16 @@ function Segmented<T extends string>({
 }: {
   label: string;
   value: T;
-  options: { value: T; label: string }[];
+  /**
+   * With `icon`, the icon is the visible content and `label` becomes the
+   * accessible name. `title` is the native hover tooltip.
+   */
+  options: {
+    value: T;
+    label: string;
+    icon?: typeof Chatting;
+    title?: string;
+  }[];
   onChange: (value: T) => void;
   optionIdPrefix?: string;
 }) {
@@ -4241,14 +4259,22 @@ function Segmented<T extends string>({
           type="button"
           role="radio"
           aria-checked={value === option.value}
+          aria-label={option.icon ? option.label : undefined}
+          title={option.title}
           onClick={() => onChange(option.value)}
           className={`min-w-0 rounded-[5px] px-2.5 py-1 ${
+            option.icon ? "flex items-center justify-center " : ""
+          }${
             value === option.value
               ? "bg-selection text-content"
               : "text-content/50 hover:text-content"
           }`}
         >
-          {option.label}
+          {option.icon ? (
+            <option.icon className="size-3.5 shrink-0" aria-hidden="true" />
+          ) : (
+            option.label
+          )}
         </button>
       ))}
     </div>

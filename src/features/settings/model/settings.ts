@@ -404,7 +404,7 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     id: "session-surface",
     section: "providers",
     label: "Session surface",
-    keywords: "tui terminal interactive cli surface",
+    keywords: "chat tui terminal interactive cli surface",
   },
   {
     id: "provider-accounts",
