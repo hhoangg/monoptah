@@ -48,7 +48,15 @@ the CLI process.
 
 - No chat features: no composer, queued messages, plans, second opinion or
   handoff. Anything the app opens with a prepared message (Add to chat, notes,
-  handoffs, Inbox Ask, Monos, automations, remote sessions) always opens as chat.
+  handoffs, Inbox Ask, Monos, remote sessions) always opens as chat.
+- An automation follows the provider's surface when its CLI can take a first
+  prompt (Claude); otherwise it opens as chat. In a terminal the prompt is
+  passed to the CLI as its first prompt, and every run opens a new terminal
+  session, so the Conversation setting (continue the last run) is unavailable.
+  A "new worktree" automation creates its worktree before the CLI starts. The
+  run is recorded as succeeded once the CLI stays up for a few seconds, and as
+  failed if it exits or cannot start in that time. The app cannot see when a
+  terminal turn ends, so success means the CLI took the prompt.
 - Inbox **Start work** passes its prompt to Claude as the first prompt. For a
   provider whose CLI cannot take one, the session opens as chat instead.
 - "New worktree" on first send is unavailable; the header shows it disabled.

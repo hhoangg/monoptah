@@ -131,6 +131,13 @@ export type TuiExit = {
   early: boolean;
 };
 
+/**
+ * What a terminal pane reports about its CLI launch: `started` once the PTY
+ * has spawned the process, `exit` when the pane settles on an exit.
+ */
+export type TuiLaunchEvent =
+  { kind: "started" } | { kind: "exit"; exit: TuiExit };
+
 export type TuiExitNotice = {
   message: string;
   hint?: string;

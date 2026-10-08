@@ -9,6 +9,8 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
+import { automationRunSurface } from "../model/automationSession";
+import { subscribeProviderSurface } from "../../providers/model/providerSurface";
 import { AccessPicker } from "../../sessions/ui/AccessPicker";
 import { HarnessIcon } from "../../sessions/ui/HarnessIcon";
 import {
@@ -824,6 +826,12 @@ function AutomationEditor({
   onOpenSession: (sessionId: string) => void | Promise<void>;
 }) {
   const [tab, setTab] = useState<"settings" | "history">("settings");
+  const terminalRun =
+    useSyncExternalStore(
+      subscribeProviderSurface,
+      () => automationRunSurface(draft.harness, draft.cwd),
+      () => automationRunSurface(draft.harness, draft.cwd),
+    ) === "tui";
   const settingsTabId = useId();
   const historyTabId = useId();
   const tabPanelId = useId();
@@ -1410,12 +1418,18 @@ function AutomationEditor({
                 </SettingsRow>
                 <SettingsRow
                   label="Conversation"
-                  hint="New chat, or continue the last run"
+                  hint={
+                    terminalRun
+                      ? "A terminal session always starts a new conversation"
+                      : "New chat, or continue the last run"
+                  }
                 >
                   <SettingsSelect
                     label="Conversation"
-                    value={draft.reuseSession ? "reuse" : "fresh"}
-                    disabled={draft.workspaceMode === "worktree"}
+                    value={
+                      draft.reuseSession && !terminalRun ? "reuse" : "fresh"
+                    }
+                    disabled={draft.workspaceMode === "worktree" || terminalRun}
                     options={CONVERSATION_OPTIONS}
                     onChange={(value) =>
                       update("reuseSession", value === "reuse")

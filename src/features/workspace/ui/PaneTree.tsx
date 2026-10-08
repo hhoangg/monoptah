@@ -52,7 +52,10 @@ import {
 import { FilePane } from "../../files/ui/FilePane";
 import { SessionPane } from "../../sessions/ui/SessionPane";
 import { TuiSessionPane } from "../../sessions/ui/TuiSessionPane";
-import type { TuiSessionPatch } from "../../sessions/model/tuiSession";
+import type {
+  TuiLaunchEvent,
+  TuiSessionPatch,
+} from "../../sessions/model/tuiSession";
 import type { TranscriptPool } from "../../sessions/ui/TranscriptPool";
 import type { SessionFolderTarget } from "../../sessions/model/sessionFolders";
 import type { Worktree } from "../../source-control/model/worktrees";
@@ -195,6 +198,7 @@ type Shared = {
     patch: TuiSessionPatch,
   ) => Promise<void>;
   onTuiTitleChange: (sessionId: string, title: string) => void;
+  onTuiLaunchEvent?: (sessionId: string, event: TuiLaunchEvent) => void;
   transcriptPool?: TranscriptPool;
 };
 
@@ -284,6 +288,7 @@ function PaneTreeComponent({
   onTerminalMetaChange,
   onTuiSessionChange,
   onTuiTitleChange,
+  onTuiLaunchEvent,
   transcriptPool,
 }: Props) {
   const treeRef = useRef<HTMLDivElement>(null);
@@ -509,6 +514,7 @@ function PaneTreeComponent({
                   onFocus={onFocus}
                   onSessionChange={onTuiSessionChange}
                   onTitleChange={onTuiTitleChange}
+                  onLaunchEvent={onTuiLaunchEvent}
                 />
               ) : session ? (
                 <SessionPane

@@ -23,6 +23,7 @@ import {
   tuiProviderAccount,
   tuiPtyId,
   type TuiExit,
+  type TuiLaunchEvent,
   type TuiSessionPatch,
 } from "../model/tuiSession";
 import { HarnessIcon } from "./HarnessIcon";
@@ -58,6 +59,8 @@ type Props = {
    */
   onSessionChange: (sessionId: string, patch: TuiSessionPatch) => Promise<void>;
   onTitleChange: (sessionId: string, title: string) => void;
+  /** Reports each launch outcome: started, or settled on an exit. */
+  onLaunchEvent?: (sessionId: string, event: TuiLaunchEvent) => void;
 };
 
 /** A provider's own interactive CLI in a PTY, in place of the chat transcript. */
@@ -68,6 +71,7 @@ export function TuiSessionPane({
   onFocus,
   onSessionChange,
   onTitleChange,
+  onLaunchEvent,
 }: Props) {
   const sessionRef = useRef(session);
   sessionRef.current = session;
@@ -75,6 +79,8 @@ export function TuiSessionPane({
   onSessionChangeRef.current = onSessionChange;
   const onTitleChangeRef = useRef(onTitleChange);
   onTitleChangeRef.current = onTitleChange;
+  const onLaunchEventRef = useRef(onLaunchEvent);
+  onLaunchEventRef.current = onLaunchEvent;
 
   const [attempt, setAttempt] = useState(0);
   const [prepared, setPrepared] = useState<Prepared | null>(null);
@@ -88,11 +94,13 @@ export function TuiSessionPane({
   const label = HARNESS_TITLE[session.harness];
 
   const fail = useCallback((error: unknown) => {
-    setExit({
+    const exit: TuiExit = {
       code: null,
       error: error instanceof Error ? error.message : String(error),
       early: true,
-    });
+    };
+    setExit(exit);
+    onLaunchEventRef.current?.(sessionRef.current.id, { kind: "exit", exit });
   }, []);
 
   useEffect(() => {
@@ -186,10 +194,16 @@ export function TuiSessionPane({
         setAttempt((count) => count + 1);
         return;
       }
-      setExit({ code: result.code, error: result.error, early });
+      const exit: TuiExit = { code: result.code, error: result.error, early };
+      setExit(exit);
+      onLaunchEventRef.current?.(sessionRef.current.id, { kind: "exit", exit });
     },
     [],
   );
+
+  const onSpawn = useCallback(() => {
+    onLaunchEventRef.current?.(sessionRef.current.id, { kind: "started" });
+  }, []);
 
   const onTitle = useCallback((raw: string) => {
     const title = cleanTuiTitle(raw);
@@ -228,16 +242,18 @@ export function TuiSessionPane({
         <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-content/40">
           {prettyCwd(tuiLaunchCwd(session))}
         </span>
-        <button
-          type="button"
-          disabled
-          title="Not available in terminal sessions. A terminal session runs in the current checkout. Use a chat session to start in a new worktree."
-          aria-label="New worktree is not available in terminal sessions"
-          className="flex h-6 shrink-0 items-center gap-1.5 rounded-md px-1.5 text-content/55 disabled:opacity-40"
-        >
-          <FolderTree className="size-3.5 shrink-0" />
-          <span>New worktree unavailable</span>
-        </button>
+        {session.worktreeCwd ? null : (
+          <button
+            type="button"
+            disabled
+            title="Not available in terminal sessions. A terminal session runs in the current checkout. Use a chat session to start in a new worktree."
+            aria-label="New worktree is not available in terminal sessions"
+            className="flex h-6 shrink-0 items-center gap-1.5 rounded-md px-1.5 text-content/55 disabled:opacity-40"
+          >
+            <FolderTree className="size-3.5 shrink-0" />
+            <span>New worktree unavailable</span>
+          </button>
+        )}
       </div>
       <div className="relative min-h-0 min-w-0 flex-1">
         {prepared ? (
@@ -249,6 +265,7 @@ export function TuiSessionPane({
             launch={prepared.launch}
             onExit={onExit}
             onTitleChange={onTitle}
+            onSpawn={onSpawn}
           />
         ) : exit ? null : (
           <p className="p-3 text-[12px] text-content/45">Starting {label}...</p>

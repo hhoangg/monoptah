@@ -72,7 +72,7 @@ vi.mock("../../providers/model/providerAccounts", async (importOriginal) => ({
 }));
 
 import { newSession, type Session } from "../model/session";
-import type { TuiSessionPatch } from "../model/tuiSession";
+import type { TuiLaunchEvent, TuiSessionPatch } from "../model/tuiSession";
 import { TuiSessionPane } from "./TuiSessionPane";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -141,6 +141,7 @@ async function settle() {
 type Handlers = {
   onSessionChange?: (id: string, patch: TuiSessionPatch) => Promise<void>;
   onTitleChange?: (id: string, title: string) => void;
+  onLaunchEvent?: (id: string, event: TuiLaunchEvent) => void;
 };
 
 function mount(session: Session, handlers: Handlers = {}) {
@@ -151,6 +152,7 @@ function mount(session: Session, handlers: Handlers = {}) {
       }),
   );
   const onTitleChange = vi.fn(handlers.onTitleChange ?? (() => {}));
+  const onLaunchEvent = vi.fn(handlers.onLaunchEvent ?? (() => {}));
   const render = (current: Session) =>
     root.render(
       createElement(TuiSessionPane, {
@@ -160,9 +162,10 @@ function mount(session: Session, handlers: Handlers = {}) {
         onFocus: () => {},
         onSessionChange,
         onTitleChange,
+        onLaunchEvent,
       }),
     );
-  return { render, onSessionChange, onTitleChange };
+  return { render, onSessionChange, onTitleChange, onLaunchEvent };
 }
 
 function spawnArgs(call = 0) {
@@ -462,6 +465,49 @@ it("shows the new-worktree option as visibly unavailable", async () => {
   expect(control.title).toContain("terminal sessions");
 });
 
+it("hides the new-worktree option for a session that already has a worktree", async () => {
+  const session = tui("claude", { worktreeCwd: "/work/wt" });
+  const { render } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  expect(button("New worktree unavailable")).toBeUndefined();
+});
+
+it("reports started once, after the PTY has spawned", async () => {
+  const session = tui();
+  const { render, onLaunchEvent } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  expect(onLaunchEvent).toHaveBeenCalledExactlyOnceWith(session.id, {
+    kind: "started",
+  });
+});
+
+it("reports no started event when the process fails to spawn", async () => {
+  pty.spawnPty.mockRejectedValueOnce(new Error("nope"));
+  const session = tui("codex");
+  const { render, onLaunchEvent } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  expect(onLaunchEvent.mock.calls.map(([, event]) => event.kind)).toEqual([
+    "exit",
+  ]);
+});
+
+it("reports an early exit", async () => {
+  const session = tui("codex");
+  const { render, onLaunchEvent } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 200;
+  await reportExit(1);
+  expect(onLaunchEvent).toHaveBeenLastCalledWith(session.id, {
+    kind: "exit",
+    exit: { code: 1, error: undefined, early: true },
+  });
+});
+
 const NO_CONVERSATION =
   "No\u001b[4Gconversation\u001b[17Gfound\u001b[23Gwith\u001b[28Gsession\u001b[36GID:\u001b[40Gsaved-id\r\r\n";
 
@@ -474,7 +520,7 @@ function resuming() {
 
 it("claims the saved id once when --resume finds no conversation", async () => {
   const session = resuming();
-  const { render, onSessionChange } = mount(session);
+  const { render, onSessionChange, onLaunchEvent } = mount(session);
   await act(async () => render(session));
   await settle();
   expect(spawnArgs(0).launch.args).toContain("--resume");
@@ -487,6 +533,11 @@ it("claims the saved id once when --resume finds no conversation", async () => {
   const { launch } = spawnArgs(1);
   expect(launch.args).toContain("--session-id");
   expect(launch.args[launch.args.indexOf("--session-id") + 1]).toBe("saved-id");
+  // The retry is not an exit: it reports a fresh start and nothing else.
+  expect(onLaunchEvent.mock.calls.map(([, event]) => event.kind)).toEqual([
+    "started",
+    "started",
+  ]);
   expect(launch.args).not.toContain("--resume");
   // Same id, so there is nothing new to save, and no error was shown.
   expect(onSessionChange).not.toHaveBeenCalled();

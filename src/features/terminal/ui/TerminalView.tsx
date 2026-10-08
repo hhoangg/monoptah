@@ -45,6 +45,8 @@ type Props = {
   }) => void;
   /** Window title the program sets (OSC 0/2). Shells are left alone unless set. */
   onTitleChange?: (title: string) => void;
+  /** Called once the process has actually been spawned. */
+  onSpawn?: () => void;
 };
 
 function cssColor(expr: string, fallback: string): string {
@@ -168,6 +170,7 @@ export function TerminalView({
   onMetaChange,
   onExit,
   onTitleChange,
+  onSpawn,
 }: Props) {
   const outerRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
@@ -178,6 +181,8 @@ export function TerminalView({
   onMetaChangeRef.current = onMetaChange;
   const onExitRef = useRef(onExit);
   onExitRef.current = onExit;
+  const onSpawnRef = useRef(onSpawn);
+  onSpawnRef.current = onSpawn;
   const onTitleChangeRef = useRef(onTitleChange);
   onTitleChangeRef.current = onTitleChange;
   // The spawn effect is keyed on `id` alone, so a new launch object must not
@@ -323,7 +328,9 @@ export function TerminalView({
     const starting = (stoppingPtys.get(id) ?? Promise.resolve())
       .then(start)
       .then(() => {
-        if (!closed) spawned.current = true;
+        if (closed) return;
+        spawned.current = true;
+        onSpawnRef.current?.();
       })
       .catch((error) => {
         spawned.current = false;

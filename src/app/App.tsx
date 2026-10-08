@@ -424,8 +424,14 @@ import {
   applyInboxStart,
   applyTuiSessionPatch,
   isTuiSession,
+  TUI_EARLY_EXIT_MS,
+  type TuiLaunchEvent,
   type TuiSessionPatch,
 } from "../features/sessions/model/tuiSession";
+import {
+  automationRunSurface,
+  tuiRunError,
+} from "../features/automations/model/automationSession";
 import { shouldGenerateSessionTitle } from "../features/sessions/model/sessionTitle";
 import {
   DEFAULT_PROVIDER_ACCOUNT_ID,
@@ -8177,6 +8183,44 @@ function Workspace({
   });
 
   const automationSessionReservations = useRef(new Set<string>());
+  // Automation runs that opened a terminal session, keyed by session id. The
+  // run settles from the pane's launch events, not from a chat turn.
+  const tuiAutomationRuns = useRef(
+    new Map<string, { runId: string; timer?: number }>(),
+  );
+  // Ends the tracking of a terminal automation run and records its outcome.
+  // The entry is dropped first, so each run settles at most once.
+  const settleTuiRun = useCallback(
+    (
+      sessionId: string,
+      status: "succeeded" | "failed" | "cancelled",
+      error?: string,
+    ) => {
+      const tracked = tuiAutomationRuns.current.get(sessionId);
+      if (!tracked) return;
+      window.clearTimeout(tracked.timer);
+      tuiAutomationRuns.current.delete(sessionId);
+      automationSessionReservations.current.delete(sessionId);
+      void updateAutomationRun(tracked.runId, status, {
+        sessionId,
+        ...(error ? { error } : {}),
+      }).catch(() => undefined);
+    },
+    [],
+  );
+  // A terminal run whose session is gone (tab closed, session removed) can
+  // never report again, so it is a cancelled run.
+  useEffect(() => {
+    for (const sessionId of [...tuiAutomationRuns.current.keys()]) {
+      if (sessionsRef.current.some((entry) => entry.id === sessionId))
+        continue;
+      settleTuiRun(
+        sessionId,
+        "cancelled",
+        "The terminal session closed before the run could start.",
+      );
+    }
+  }, [sessions, settleTuiRun]);
   const automationRecoveryRef = useRef<Promise<void> | null>(null);
   const automationRecoveryCutoffRef = useRef(Date.now());
 
@@ -8199,12 +8243,21 @@ function Workspace({
         const eventRun = run.trigger === "event";
         const linkedWorkItem =
           sourceWorkItem ?? linkedWorkItemFromAutomationEvent(run);
+        const surface = automationRunSurface(
+          automation.harness,
+          automation.cwd,
+        );
+        // A terminal run always starts a new conversation: a resumed CLI
+        // already has its first prompt, so it would drop this one.
         let session =
-          automation.reuseSession && automation.lastSessionId
+          surface !== "tui" &&
+          automation.reuseSession &&
+          automation.lastSessionId
             ? sessionsRef.current.find(
                 (entry) =>
                   entry.id === automation.lastSessionId &&
                   entry.harness === automation.harness &&
+                  !isTuiSession(entry) &&
                   !entry.busy &&
                   !entry.worktreeRemoved &&
                   !automationSessionReservations.current.has(entry.id) &&
@@ -8220,27 +8273,56 @@ function Workspace({
             : undefined;
 
         if (!session) {
+          const created = newSession(
+            automation.harness,
+            automation.cwd,
+            automation.model,
+            automation.runtimeMode,
+            automation.modelSettings,
+            { surface },
+          );
+          const terminalRun = isTuiSession(created);
+          const terminalPrompt = prompt.trim();
+          // The CLI starts in this folder and a terminal has no first send to
+          // create it later, so a "new worktree" run creates it up front.
+          const terminalTree =
+            terminalRun && automation.workspaceMode === "worktree"
+              ? await createWorktree(
+                  automation.cwd,
+                  temporaryWorktreeBranchName(),
+                  "HEAD",
+                  false,
+                )
+              : undefined;
+          if (terminalTree) {
+            workspacePins.current.set(
+              created.id,
+              currentWorkspace(automation.cwd),
+            );
+          }
           session = {
-            // Automations submit their prompt themselves, so they need a chat.
-            ...newSession(
-              automation.harness,
-              automation.cwd,
-              automation.model,
-              automation.runtimeMode,
-              automation.modelSettings,
-              { surface: "chat" },
-            ),
+            // A chat run submits its prompt itself; a terminal run hands it
+            // to the CLI as its first prompt.
+            ...created,
+            ...(terminalRun && terminalPrompt
+              ? { initialPrompt: terminalPrompt }
+              : {}),
             title: eventRun
               ? HARNESS_LABEL[automation.harness]
               : formatSessionTitle(automation.harness, automation.name),
             automationId: automation.id,
             ...(linkedWorkItem ? { linkedWorkItem } : {}),
-            ...(automation.workspaceMode === "worktree"
-              ? { workspaceMode: "worktree" as const, worktreeBase: "HEAD" }
-              : automation.workspaceMode === "existing" &&
-                  automation.worktreeCwd
-                ? { worktreeCwd: automation.worktreeCwd }
-                : {}),
+            ...(terminalTree
+              ? {
+                  worktreeCwd: terminalTree.path,
+                  branch: terminalTree.branch ?? undefined,
+                }
+              : automation.workspaceMode === "worktree"
+                ? { workspaceMode: "worktree" as const, worktreeBase: "HEAD" }
+                : automation.workspaceMode === "existing" &&
+                    automation.worktreeCwd
+                  ? { worktreeCwd: automation.worktreeCwd }
+                  : {}),
           };
           const nextSessions = [...sessionsRef.current, session];
           sessionsRef.current = nextSessions;
@@ -8250,6 +8332,34 @@ function Workspace({
           if (reveal) {
             setActiveTabId(tab.id);
             setComposerFocused(false);
+          }
+          if (terminalTree) {
+            notifyReviewChanged(session.id);
+            const createdId = session.id;
+            void generateHarnessBranchName(
+              pickTextHarness(automation.harness),
+              terminalTree.path,
+              terminalPrompt,
+            )
+              .then(async (fragment) => {
+                const branch = fragment ? namedWorktreeBranch(fragment) : null;
+                if (!branch) return;
+                const renamed = await renameWorktreeBranch(
+                  automation.cwd,
+                  terminalTree.path,
+                  branch,
+                );
+                setSessions((prev) =>
+                  prev.map((entry) =>
+                    entry.id === createdId &&
+                    pathKey(sessionWorkCwd(entry)) ===
+                      pathKey(terminalTree.path)
+                      ? { ...entry, branch: renamed.branch ?? undefined }
+                      : entry,
+                  ),
+                );
+              })
+              .catch(() => undefined);
           }
         } else {
           const stamped = {
@@ -8293,12 +8403,31 @@ function Workspace({
           setSidebarTab("sessions", session.cwd);
         }
 
-        await updateAutomationRun(run.id, "running", {
-          sessionId: session.id,
-        });
+        // Registered before the awaited update: the pane can launch, and
+        // report, while that update is still in flight.
+        const terminalSessionId = isTuiSession(session)
+          ? session.id
+          : undefined;
+        if (terminalSessionId)
+          tuiAutomationRuns.current.set(terminalSessionId, { runId: run.id });
+        try {
+          await updateAutomationRun(run.id, "running", {
+            sessionId: session.id,
+          });
+        } catch (reason: unknown) {
+          // The terminal is already launching the prompt, so a failed
+          // "running" write is not fatal: the launch events still settle it.
+          if (!terminalSessionId) throw reason;
+          releaseAfterSettle = true;
+          return;
+        }
         // From here the settlement callback owns reservation cleanup, including
         // a rejected submission that never starts an agent turn.
         releaseAfterSettle = true;
+        if (isTuiSession(session)) {
+          // The pane reports the launch; `onTuiLaunchEvent` settles the run.
+          return;
+        }
         await submitWithSettlement({
           submit: (onSettled) =>
             submitSession(session.id, prompt, [], {
@@ -8332,6 +8461,40 @@ function Workspace({
       }
     },
     [appendTab, focusOpenSession, submitSession],
+  );
+
+  const onTuiLaunchEvent = useCallback(
+    (sessionId: string, event: TuiLaunchEvent) => {
+      const tracked = tuiAutomationRuns.current.get(sessionId);
+      if (!tracked) return;
+      window.clearTimeout(tracked.timer);
+      if (event.kind === "started") {
+        // Success means the CLI took the prompt and stayed up: a terminal
+        // turn has no end the app can see.
+        tracked.timer = window.setTimeout(() => {
+          const alive = sessionsRef.current.some(
+            (entry) => entry.id === sessionId,
+          );
+          if (alive) settleTuiRun(sessionId, "succeeded");
+          else
+            settleTuiRun(
+              sessionId,
+              "cancelled",
+              "The terminal session closed before the run could start.",
+            );
+        }, TUI_EARLY_EXIT_MS);
+        return;
+      }
+      const harness = sessionsRef.current.find(
+        (entry) => entry.id === sessionId,
+      )?.harness;
+      settleTuiRun(
+        sessionId,
+        "failed",
+        harness ? tuiRunError(harness, event.exit) : "The terminal exited",
+      );
+    },
+    [settleTuiRun],
   );
 
   const queueMonoSessionCompletion = useCallback(
@@ -12728,6 +12891,7 @@ function Workspace({
                                     onTerminalMetaChange={onTerminalMetaChange}
                                     onTuiSessionChange={onTuiSessionChange}
                                     onTuiTitleChange={onTuiTitleChange}
+                                    onTuiLaunchEvent={onTuiLaunchEvent}
                                   />
                                 </div>
                               </div>
