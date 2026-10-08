@@ -37,6 +37,7 @@ mod project_logo;
 mod pty;
 #[cfg(target_os = "macos")]
 mod quick_composer;
+mod quit_hotkey;
 mod rate_limits;
 mod reminders;
 mod remote;
@@ -238,6 +239,9 @@ pub fn run() {
             reminders::init(app.handle());
             checkpoint::init(app.handle())?;
             menu::install(app.handle())?;
+            // Puts the hold gate in front of the Quit item's ⌘Q on macOS, and
+            // does nothing anywhere else.
+            quit_hotkey::install(app.handle());
             #[cfg(target_os = "windows")]
             tray::install(app.handle())?;
             #[cfg(target_os = "macos")]
@@ -526,6 +530,7 @@ pub fn run() {
             window::quit_poll_reply,
             window::quit_decision,
             window::quit_ready,
+            quit_hotkey::quit_now,
             window::set_window_glass_enabled,
             #[cfg(target_os = "macos")]
             quick_composer::quick_composer_set_enabled,

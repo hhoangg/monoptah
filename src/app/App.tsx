@@ -86,6 +86,7 @@ import {
 import { Sidebar } from "./shell/Sidebar";
 import { ApprovalToasts } from "../features/sessions/ui/ApprovalToasts";
 import { HarnessUpdateNotice } from "../features/providers/ui/HarnessUpdateNotice";
+import { QuitGateNotice } from "./shell/QuitGateNotice";
 import { WhatsNewDialog } from "./shell/WhatsNewDialog";
 import { ProviderSignInDialog } from "../features/sessions/ui/ProviderSignInDialog";
 import { TitleBar, type Tab as TitleTab } from "./shell/TitleBar";
@@ -13005,6 +13006,7 @@ function Workspace({
               }}
             />
           )}
+          <QuitGateNotice />
           <HarnessUpdateNotice
             topOffset={
               12 + (reminderNoticesHeight ? reminderNoticesHeight + 8 : 0)
