@@ -6755,7 +6755,7 @@ mod tests {
                 return false;
             }
         }
-        git(dir, &["config", "user.name", "MonoCode"])
+        git(dir, &["config", "user.name", "Monoptah"])
             && git(dir, &["config", "user.email", "monocode@test"])
             && git(dir, &["config", "commit.gpgsign", "false"])
             && git(dir, &["config", "core.autocrlf", "false"])
@@ -6794,7 +6794,7 @@ mod tests {
         Command::new("git")
             .args([
                 "-c",
-                "user.name=MonoCode",
+                "user.name=Monoptah",
                 "-c",
                 "user.email=monocode@test",
                 "-c",
@@ -6802,9 +6802,9 @@ mod tests {
             ])
             .args(args)
             .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "MonoCode")
+            .env("GIT_AUTHOR_NAME", "Monoptah")
             .env("GIT_AUTHOR_EMAIL", "monocode@test")
-            .env("GIT_COMMITTER_NAME", "MonoCode")
+            .env("GIT_COMMITTER_NAME", "Monoptah")
             .env("GIT_COMMITTER_EMAIL", "monocode@test")
             .status()
             .map(|status| status.success())
@@ -7726,7 +7726,7 @@ mod tests {
                 .status()
                 .map(|status| !status.success())
                 .unwrap_or(true)
-            || !git(&b.0, &["config", "user.name", "MonoCode"])
+            || !git(&b.0, &["config", "user.name", "Monoptah"])
             || !git(&b.0, &["config", "user.email", "monocode@test"])
             || !git(&b.0, &["config", "commit.gpgsign", "false"])
             || !git(&b.0, &["config", "core.autocrlf", "false"])

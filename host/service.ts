@@ -84,7 +84,7 @@ const unitQuote = (value: string) =>
   `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%").replaceAll("\n", "\\n")}"`;
 export function systemdUnit(options: ServiceOptions, path: string): string {
   return `[Unit]
-Description=MonoCode Host
+Description=Monoptah Host
 After=network.target
 
 [Service]
@@ -169,7 +169,7 @@ export async function uninstallService(
     await (system.powershell ?? runPowerShell)(windowsUninstallScript());
     return [];
   }
-  throw new Error("MonoCode Host supports Windows, Linux and macOS");
+  throw new Error("Monoptah Host supports Windows, Linux and macOS");
 }
 
 export async function installService(
@@ -199,7 +199,7 @@ export async function installService(
       await run("launchctl", ["print", domain]);
     } catch {
       throw new Error(
-        "Sign in at the Mac's desktop once, then reconnect. MonoCode Host runs as a login service; keep the Mac signed in and awake.",
+        "Sign in at the Mac's desktop once, then reconnect. Monoptah Host runs as a login service; keep the Mac signed in and awake.",
       );
     }
     const folder = join(homedir(), "Library/LaunchAgents");
@@ -257,7 +257,7 @@ export async function installService(
   } else if (process.platform === "win32") {
     await runPowerShell(windowsTaskScript(options, process.env.PATH ?? ""));
   } else {
-    throw new Error("MonoCode Host supports Windows, Linux and macOS");
+    throw new Error("Monoptah Host supports Windows, Linux and macOS");
   }
   for (let attempt = 0; attempt < 50; attempt++) {
     try {
