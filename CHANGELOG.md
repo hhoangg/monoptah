@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-08
+
+First release of the Monoptah fork. It carries everything in MonoCode 0.9.0 plus the additions below.
+
+### Added
+
+- **ClickUp inbox integration.** Connect a personal API token in Settings → Inbox, pick a workspace, and choose which Spaces to follow. Tasks appear in the inbox ordered by last update, with the task's Markdown description, its comment thread, and labels and assignees. Posting a comment, "Ask", and "Start work" all work from the task, and an automation can trigger when a task appears, optionally filtered to one Space. Disconnecting removes the stored token and the cached tasks.
+- **Per-provider session surface.** Settings → Providers gives each provider a choice between the chat transcript and the provider's own terminal interface. A provider set to Terminal opens its native interactive CLI in the session tab instead of the composer. For Claude the conversation id is shared, so a session restores and resumes after a restart. Remote sessions, Monos, orchestration workers, automations, and Inbox Ask always stay on chat.
+
+### Fixed
+
+- Input methods that replace several characters at once — such as Vietnamese tone marks with GoTiengViet — no longer lose characters in any terminal in the app. Typing `tiếng` produced `tiế` before, because a key event carrying a whole string was truncated to its first character.
+
+### Changed
+
+- The application is named **Monoptah** and installs alongside MonoCode with its own bundle identifier, so the two keep separate settings, sessions, and window state.
+
+
 ## [0.9.0] - 2026-10-07
 
 ### Added
@@ -1331,6 +1349,7 @@ First public release. macOS (Apple Silicon) only.
 - macOS release builds sign with `APPLE_SIGNING_IDENTITY` via a config overlay; the committed default remains ad-hoc `-` for community builds.
 
 [Unreleased]: https://github.com/hardbeat920/monocode/compare/v0.9.0...HEAD
+[0.9.1]: https://github.com/hhoangg/monoptah/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/hardbeat920/monocode/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/hardbeat920/monocode/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/hardbeat920/monocode/compare/v0.7.0...v0.7.1
