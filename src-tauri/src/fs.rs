@@ -7815,10 +7815,10 @@ mod tests {
 
     #[test]
     fn parse_github_repositories_reads_a_repo_of_its_own() {
-        let json = r#"{ "nameWithOwner": "hardbeat920/monocode" }"#;
+        let json = r#"{ "nameWithOwner": "hhoangg/monoptah" }"#;
         assert_eq!(
             parse_github_repositories(json).unwrap(),
-            vec!["hardbeat920/monocode"]
+            vec!["hhoangg/monoptah"]
         );
     }
 
