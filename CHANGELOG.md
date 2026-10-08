@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [0.12.0] - 2026-10-08
+
 Carries the upstream MonoCode 0.10.0 changes below.
 
 ### Added
@@ -1441,7 +1444,8 @@ First public release. macOS (Apple Silicon) only.
 - Updater endpoint and minisign public key are injected at release time rather than committed, so forks do not inherit the maintainer's update channel.
 - macOS release builds sign with `APPLE_SIGNING_IDENTITY` via a config overlay; the committed default remains ad-hoc `-` for community builds.
 
-[Unreleased]: https://github.com/hardbeat920/monocode/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/hhoangg/monoptah/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/hhoangg/monoptah/compare/v0.11.0...v0.12.0
 [0.9.4]: https://github.com/hhoangg/monoptah/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/hhoangg/monoptah/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/hhoangg/monoptah/compare/v0.9.1...v0.9.2
