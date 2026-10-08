@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::harness::{exec_output, is_resolved_harness_binary};
 
 const REGISTRY_URL: &str = "https://registry.npmjs.org";
-const USER_AGENT: &str = "MonoCode";
+const USER_AGENT: &str = "Monoptah";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Only harnesses whose releases are published to npm. The rest ship through

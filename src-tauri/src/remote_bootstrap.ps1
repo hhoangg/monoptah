@@ -55,7 +55,7 @@ try {
     switch ($arch.ToUpperInvariant()) {
       'AMD64' { $target = 'win32-x64' }
       'ARM64' { $target = 'win32-arm64' }
-      default { throw 'MonoCode Host requires x64 or ARM64 Windows.' }
+      default { throw 'Monoptah Host requires x64 or ARM64 Windows.' }
     }
     $filename = "monocode-host-$target.zip"
     $runtimeRoot = Join-Path $base 'runtime'
@@ -70,11 +70,11 @@ try {
     } catch { throw "The Windows host package for version $version could not be downloaded. Install a release with host packages. $($_.Exception.Message)" }
     $expected = ((Get-Content -LiteralPath $checksum -Raw).Trim() -split '\s+')[0]
     if ($expected -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid host package checksum.' }
-    if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) { throw 'MonoCode Host package checksum mismatch.' }
+    if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) { throw 'Monoptah Host package checksum mismatch.' }
     $unpacked = Join-Path $temporary 'unpacked'
     Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
     $actual = & (Join-Path $unpacked 'node.exe') (Join-Path $unpacked 'host.mjs') --version
-    if ($LASTEXITCODE -ne 0 -or $actual -ne $version) { throw 'MonoCode Host version mismatch.' }
+    if ($LASTEXITCODE -ne 0 -or $actual -ne $version) { throw 'Monoptah Host version mismatch.' }
     $runtime = Join-Path $runtimeRoot ("$version-$target-" + [Guid]::NewGuid().ToString('N'))
     Move-Item -LiteralPath $unpacked -Destination $runtime
     $bin = Join-Path $base 'bin'

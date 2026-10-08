@@ -49,7 +49,7 @@ export const MODE_COMMAND_STYLES: Record<string, ModeCommandStyle> = {
     },
     menu: {
       label: "Operator",
-      description: "Give this thread access to MonoCode",
+      description: "Give this thread access to Monoptah",
       iconClassName: "text-sky-300/80",
     },
   },

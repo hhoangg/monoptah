@@ -424,7 +424,7 @@ fn start_ssh_job(
             let mut machine = if let Some(mut existing) = existing {
                 if upgrade {
                     let platform = remote_ssh::detect_platform(&target, &job, &askpass)?;
-                    job.message("Updating MonoCode Host on the machine…");
+                    job.message("Updating Monoptah Host on the machine…");
                     let output = remote_ssh::run_script(
                         &target,
                         platform,
@@ -447,7 +447,7 @@ fn start_ssh_job(
                 existing
             } else {
                 let platform = remote_ssh::detect_platform(&target, &job, &askpass)?;
-                job.message("Installing or starting MonoCode Host…");
+                job.message("Installing or starting Monoptah Host…");
                 let output = remote_ssh::run_script(
                     &target,
                     platform,
@@ -530,7 +530,7 @@ fn start_ssh_job(
                     || !supports("files.create")
                     || !supports("files.searchContent")
                 {
-                    return Err("The installed host package still lacks Explorer and Changes. Install a newer MonoCode release with updated host packages.".into());
+                    return Err("The installed host package still lacks Explorer and Changes. Install a newer Monoptah release with updated host packages.".into());
                 }
             }
             if machine.name.trim().is_empty() {

@@ -2209,7 +2209,7 @@ export function Composer({
                       <span className="min-w-0 flex-1">
                         <span className="block text-[13px]">Operator</span>
                         <span className="block truncate whitespace-nowrap text-[11px] leading-4 text-content/45">
-                          Give this thread access to MonoCode
+                          Give this thread access to Monoptah
                         </span>
                       </span>
                       {operatorActive ? (

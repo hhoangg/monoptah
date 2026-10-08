@@ -127,7 +127,7 @@ export function AddRemoteProjectDialog({
           <p className="text-[12px] leading-snug text-content/55">
             Sessions in this project run on that machine, using its checkout and
             its Codex or Claude Code sign-in. They keep running when you close
-            MonoCode here.
+            Monoptah here.
           </p>
         </div>
         {!loaded ? null : !machine ? (

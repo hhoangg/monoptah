@@ -74,7 +74,7 @@ export async function discoverOpenCodeModels(
   const version = parseOpenCodeVersion(versionOut);
   if (!version) {
     throw new Error(
-      `Unable to determine OpenCode version. MonoCode requires v${MINIMUM_OPENCODE_VERSION} or newer.`,
+      `Unable to determine OpenCode version. Monoptah requires v${MINIMUM_OPENCODE_VERSION} or newer.`,
     );
   }
   if (compareSemver(version, MINIMUM_OPENCODE_VERSION) < 0) {

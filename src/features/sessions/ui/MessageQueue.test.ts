@@ -26,7 +26,7 @@ it("labels a pending completion and offers removal without editing or steering i
   );
   expect(container.textContent).toContain("Session completed: Agent session");
   expect(container.textContent).not.toContain(
-    "MonoCode completion notification",
+    "Monoptah completion notification",
   );
   expect(container.textContent).not.toContain("Steer");
   expect(
@@ -52,5 +52,5 @@ it("labels a combined report without exposing the app prompt", () => {
     createElement(MessageQueue, { messages: [message] }),
   );
   expect(markup).toContain("3 sessions finished");
-  expect(markup).not.toContain("MonoCode completion notification");
+  expect(markup).not.toContain("Monoptah completion notification");
 });

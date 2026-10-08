@@ -66,7 +66,7 @@ const PROBE_TTL_MS = 30_000;
 export function harnessUnavailableHint(id: HarnessId): string {
   const { name, install } = CLI[id];
   const how = install ? ` (\`${install}\`)` : "";
-  return `${name} not found${how}. Install it, or restart MonoCode if it is already installed.`;
+  return `${name} not found${how}. Install it, or restart Monoptah if it is already installed.`;
 }
 
 export function probeHarnessAvailability(

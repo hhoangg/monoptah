@@ -245,7 +245,7 @@ export function ConnectionsSettings() {
           </h2>
           <p className="mt-1 text-[12px] leading-relaxed text-content/45">
             Run agents on another computer and return to them from your laptop.
-            The host keeps working when you close MonoCode here.
+            The host keeps working when you close Monoptah here.
           </p>
         </div>
         {!adding && (
@@ -444,7 +444,7 @@ export function ConnectionsSettings() {
             </label>
           </details>
           <p className="text-[12px] leading-relaxed text-content/45">
-            MonoCode installs and starts its background host, then connects
+            Monoptah installs and starts its background host, then connects
             securely. Your SSH keys and config are used automatically. Enable
             SSH on the host and sign in to Codex or Claude Code there. On
             Windows and Mac, keep the host’s desktop account signed in and the

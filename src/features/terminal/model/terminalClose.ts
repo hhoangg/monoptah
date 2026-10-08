@@ -31,7 +31,7 @@ export async function confirmCloseTerminal(file: FilePaneTab): Promise<boolean> 
   const label = terminalTabLabel(file);
   return ask(
     `"${process}" is still running in ${label}. Close this terminal anyway?`,
-    { title: "MonoCode", kind: "warning" },
+    { title: "Monoptah", kind: "warning" },
   );
 }
 
@@ -43,7 +43,7 @@ export async function confirmCloseTerminals(files: FilePaneTab[]): Promise<boole
     const { file, process } = running[0];
     return ask(
       `"${process}" is still running in ${terminalTabLabel(file)}. Close this terminal anyway?`,
-      { title: "MonoCode", kind: "warning" },
+      { title: "Monoptah", kind: "warning" },
     );
   }
   const lines = running
@@ -51,6 +51,6 @@ export async function confirmCloseTerminals(files: FilePaneTab[]): Promise<boole
     .join("\n");
   return ask(
     `These terminals are still running:\n${lines}\n\nClose them anyway?`,
-    { title: "MonoCode", kind: "warning" },
+    { title: "Monoptah", kind: "warning" },
   );
 }

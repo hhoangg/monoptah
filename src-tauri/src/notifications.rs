@@ -446,7 +446,7 @@ mod platform {
     ) -> Result<(), String> {
         let mut notification = notify_rust::Notification::new();
         notification
-            .appname("MonoCode")
+            .appname("Monoptah")
             .summary(&format!("{title}: {subtitle}"))
             // The body is agent output; servers render it as markup.
             .body(&escape_markup(body))

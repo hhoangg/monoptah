@@ -123,8 +123,8 @@ describe("MonoCode CLI tool calls", () => {
       shell("monocode app --help"),
       shell("monocode app notes.list"),
     ];
-    expect(monoCodeWorkSummary(calls, true)).toBe("Using MonoCode");
-    expect(monoCodeWorkSummary(calls, false)).toBe("Used MonoCode");
+    expect(monoCodeWorkSummary(calls, true)).toBe("Using Monoptah");
+    expect(monoCodeWorkSummary(calls, false)).toBe("Used Monoptah");
     expect(
       monoCodeWorkSummary([...calls, shell("git status")], true),
     ).toBeUndefined();

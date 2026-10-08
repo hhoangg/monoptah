@@ -2,14 +2,14 @@
 export const CREATE_SKILL_NAME = "create-skill";
 
 export const CREATE_SKILL_DESCRIPTION =
-  "Create a MonoCode skill as a SKILL.md in .agents/skills. Use when the user wants to author, write, save, or scaffold a skill, or asks about skill format.";
+  "Create a Monoptah skill as a SKILL.md in .agents/skills. Use when the user wants to author, write, save, or scaffold a skill, or asks about skill format.";
 
 export const CREATE_SKILL_BODY = `---
 name: create-skill
-description: Create a MonoCode skill as a SKILL.md in .agents/skills. Use when the user wants to author, write, save, or scaffold a skill, or asks about skill format.
+description: Create a Monoptah skill as a SKILL.md in .agents/skills. Use when the user wants to author, write, save, or scaffold a skill, or asks about skill format.
 ---
 
-# Create a MonoCode skill
+# Create a Monoptah skill
 
 Write a portable Agent Skill so every harness (Claude, Cursor, Codex, Grok Build, OpenCode, Pi, omp, fx, Hermes Agent) can load it.
 

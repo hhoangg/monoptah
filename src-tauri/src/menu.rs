@@ -120,19 +120,19 @@ fn menu_item(
 pub fn dispatch(app: &AppHandle, id: &str) {
     match id {
         "help_website" => {
-            let _ = open::that("https://usemono.dev");
+            let _ = open::that("https://zptah.app");
         }
         "help_github" => {
-            let _ = open::that("https://github.com/hardbeat920/monocode");
+            let _ = open::that("https://github.com/hhoangg/monoptah");
         }
         "help_report_bug" => {
             let _ = open::that(
-                "https://github.com/hardbeat920/monocode/issues/new?template=bug_report.yml",
+                "https://github.com/hhoangg/monoptah/issues/new?template=bug_report.yml",
             );
         }
         "help_request_feature" => {
             let _ = open::that(
-                "https://github.com/hardbeat920/monocode/issues/new?template=feature_request.yml",
+                "https://github.com/hhoangg/monoptah/issues/new?template=feature_request.yml",
             );
         }
         "new_window" => {
@@ -513,10 +513,10 @@ fn build(
 
     #[cfg(target_os = "macos")]
     {
-        let quit = MenuItemBuilder::with_id("quit", "Quit MonoCode")
+        let quit = MenuItemBuilder::with_id("quit", "Quit Monoptah")
             .accelerator("CmdOrCtrl+Q")
             .build(app)?;
-        let app_menu = SubmenuBuilder::new(app, "MonoCode")
+        let app_menu = SubmenuBuilder::new(app, "Monoptah")
             .about(Some(AboutMetadata::default()))
             .separator()
             .item(&open_settings)
@@ -534,7 +534,7 @@ fn build(
             .minimize()
             .maximize()
             .build()?;
-        let website = MenuItemBuilder::with_id("help_website", "MonoCode Website").build(app)?;
+        let website = MenuItemBuilder::with_id("help_website", "Monoptah Website").build(app)?;
         let github = MenuItemBuilder::with_id("help_github", "View on GitHub").build(app)?;
         let report_bug = MenuItemBuilder::with_id("help_report_bug", "Report a Bug…").build(app)?;
         let request_feature =

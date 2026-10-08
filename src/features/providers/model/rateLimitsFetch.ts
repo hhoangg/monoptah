@@ -256,7 +256,7 @@ async function runCodexAccountRequest<T>(
           {
             clientInfo: {
               name: "monocode",
-              title: "MonoCode",
+              title: "Monoptah",
               version: "0.1.0",
             },
             capabilities: { experimentalApi: true },

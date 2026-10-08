@@ -613,7 +613,7 @@ export function QuickComposer({ onShown }: { onShown: () => void }) {
           placeholder={
             cwd
               ? `Start a ${HARNESS_TITLE[model.harness]} session in ${projectName(cwd)}…`
-              : "Open a project in MonoCode first"
+              : "Open a project in Monoptah first"
           }
           disabled={!cwd}
           aria-label="Prompt"

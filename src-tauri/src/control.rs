@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
-const APP_TURN_INACTIVE: &str = "MonoCode app access is inactive. Use /operator once in this thread to enable it, then call the CLI during an active agent turn. Retrying this request now will not enable access.";
+const APP_TURN_INACTIVE: &str = "Monoptah app access is inactive. Use /operator once in this thread to enable it, then call the CLI during an active agent turn. Retrying this request now will not enable access.";
 
 #[derive(Clone)]
 struct Grant {
@@ -112,7 +112,7 @@ impl Inner {
             }
             let _ = pending
                 .reply
-                .send(json!({"ok":false,"error":"MonoCode window closed"}));
+                .send(json!({"ok":false,"error":"Monoptah window closed"}));
             false
         });
         ids
@@ -261,7 +261,7 @@ fn serve(mut stream: TcpStream, app: &AppHandle, inner: &Arc<Mutex<Inner>>) {
         };
         let delivered = app.emit_to(grant.window.as_str(), "monocode-control-request", event);
         let result = if delivered.is_err() {
-            Err("MonoCode executor is unavailable".into())
+            Err("Monoptah executor is unavailable".into())
         } else {
             rx.recv_timeout(Duration::from_secs(35))
                 .map_err(|_| "Control request timed out. Retry with the same request ID.".into())

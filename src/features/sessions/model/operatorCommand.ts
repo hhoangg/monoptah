@@ -6,7 +6,7 @@ export const OPERATOR_COMMAND: BuiltinSkill = {
   name: "operator",
   invocation: "operator",
   description:
-    "Give this thread access to MonoCode sessions, folders, and notes.",
+    "Give this thread access to Monoptah sessions, folders, and notes.",
   scope: "builtin",
   source: "monocode",
 };
@@ -41,7 +41,7 @@ export function operatorUserPrompt(block: Block): string {
   if (!legacy) return block.text;
   return (
     block.text.slice(legacy[0].length).trim() ||
-    "Explain what you can do in MonoCode with the app CLI."
+    "Explain what you can do in Monoptah with the app CLI."
   );
 }
 

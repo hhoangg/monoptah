@@ -61,7 +61,7 @@ const ENTRY_RESULTS = new Set(["list_dir", "list_project_files", "stat_files"]);
 
 const UNAVAILABLE = "This isn’t available for projects on another machine yet.";
 const OUTDATED =
-  "Update MonoCode Host in Connections settings to use this project’s files.";
+  "Update Monoptah Host in Connections settings to use this project’s files.";
 
 /** Runs a file command whose paths are `remote://` paths on the machine that
  * owns them, translating paths both ways so callers never see host paths. */

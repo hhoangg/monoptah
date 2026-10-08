@@ -240,7 +240,7 @@ export function requireHostDescriptor(value: HostDescriptor): HostDescriptor {
     !Array.isArray(value.providers) ||
     !value.providers.every(isRemoteProvider)
   ) {
-    throw new Error("This machine is running an incompatible MonoCode Host");
+    throw new Error("This machine is running an incompatible Monoptah Host");
   }
   return value;
 }

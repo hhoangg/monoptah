@@ -334,7 +334,7 @@ export function SkillsPage({
                             {skill.scope === "user"
                               ? "Personal"
                               : skill.scope === "builtin"
-                                ? "MonoCode"
+                                ? "Monoptah"
                                 : "Project"}
                           </span>
                           <span className="w-20 shrink-0 truncate text-right font-sans text-[11px] text-content/40">
@@ -343,7 +343,7 @@ export function SkillsPage({
                           <button
                             type="button"
                             role="switch"
-                            aria-label={`Include ${skill.name} in MonoCode catalog`}
+                            aria-label={`Include ${skill.name} in Monoptah catalog`}
                             aria-checked={!disabled}
                             onClick={() => onToggle(skill.path, disabled)}
                             className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${disabled ? "bg-content/20" : "bg-accent"}`}
@@ -411,7 +411,7 @@ export function SkillsPage({
             )}
 
             <p className="pt-3 text-[12px] text-content/40">
-              Hidden skills stay on disk and are excluded from MonoCode's
+              Hidden skills stay on disk and are excluded from Monoptah's
               file-skill catalog. Provider-managed skills and native commands
               are unaffected. Skills live in{" "}
               <span className="font-sans">.agents/skills</span> for this project

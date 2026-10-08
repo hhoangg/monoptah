@@ -116,7 +116,7 @@ it("says how to keep memory and update the soul only at the user's request", () 
     ],
   };
   const full = monoContext(look, files(), { soul: true, memory: true });
-  expect(full).toContain("You are Skull, a Mono in MonoCode");
+  expect(full).toContain("You are Skull, a Mono in Monoptah");
   expect(full).toContain("these 2 projects (monocode and site)");
   expect(full).toContain("- site: /code/site");
   expect(full).toContain("Be brief.");

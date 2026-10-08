@@ -145,6 +145,6 @@ it("refuses what the host cannot do and explains outdated hosts", async () => {
   remoteRequest.mockRejectedValueOnce("Unsupported remote operation");
   await expect(
     runRemoteCommand("list_dir", { path: "remote://env/home/me" }),
-  ).rejects.toThrow("Update MonoCode Host");
+  ).rejects.toThrow("Update Monoptah Host");
   expect(remoteRequest).toHaveBeenCalledTimes(1);
 });

@@ -121,7 +121,7 @@ describe("MonoCode CLI disclosure", () => {
     );
 
     const trigger = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Show error details for MonoCode: List notes"]',
+      'button[aria-label="Show error details for Monoptah: List notes"]',
     );
     expect(trigger?.getAttribute("aria-expanded")).toBe("false");
     expect(container.textContent).not.toContain("Connection refused");

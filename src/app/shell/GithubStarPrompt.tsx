@@ -6,7 +6,7 @@ import {
 } from "../../features/inbox/model/githubTasks";
 import { Loader, Star, X } from "../../shared/ui/icons";
 
-const MONOCODE_GITHUB_URL = "https://github.com/hardbeat920/monocode";
+const MONOCODE_GITHUB_URL = "https://github.com/hhoangg/monoptah";
 const DISMISSED_STORAGE_KEY = "monocode.githubStarPrompt.dismissed.v1";
 
 type PromptSnapshot = "loading" | "visible" | "starring" | "hidden";
@@ -121,7 +121,7 @@ export function GithubStarPrompt() {
     <div data-github-star-prompt className="relative mb-1 h-8 w-full">
       <button
         type="button"
-        aria-label="Star MonoCode on GitHub"
+        aria-label="Star Monoptah on GitHub"
         aria-busy={busy}
         disabled={busy}
         onClick={() => void starFromPrompt()}

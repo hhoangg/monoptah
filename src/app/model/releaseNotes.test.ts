@@ -36,7 +36,7 @@ describe("releaseNotesForVersion", () => {
 
     expect(release?.source).toEqual({ version: "0.1.2" });
     expect(releaseNotesTitle(release!.source.version)).toBe(
-      "What's new in MonoCode 0.1.2",
+      "What's new in Monoptah 0.1.2",
     );
     expect(release?.markdown).toContain("## [0.1.2]");
     expect(release?.markdown).not.toContain("## [0.1.3]");

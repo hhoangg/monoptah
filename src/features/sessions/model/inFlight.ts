@@ -63,9 +63,9 @@ export function inFlightRefs(
 
 export function quitWhileBusyMessage(count: number): string {
   if (count === 1) {
-    return "1 chat is still running. Quit anyway? It will resume when you reopen MonoCode.";
+    return "1 chat is still running. Quit anyway? It will resume when you reopen Monoptah.";
   }
-  return `${count} chats are still running. Quit anyway? They will resume when you reopen MonoCode.`;
+  return `${count} chats are still running. Quit anyway? They will resume when you reopen Monoptah.`;
 }
 
 /**

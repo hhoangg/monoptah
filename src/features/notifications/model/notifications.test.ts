@@ -173,7 +173,7 @@ describe("notificationText", () => {
       ],
     });
     expect(notificationText(session, "finished")).toEqual({
-      title: "MonoCode",
+      title: "Monoptah",
       subtitle: "Fix the sidebar",
       body: "Done. Sidebar fixed.",
     });
@@ -207,7 +207,7 @@ describe("notificationText", () => {
       ],
     });
     expect(notificationText(session, { kind: "approval", requestId: 1 })).toEqual({
-      title: "MonoCode",
+      title: "Monoptah",
       subtitle: "Fix the sidebar",
       body: "Approve: Run npm test",
     });
@@ -229,7 +229,7 @@ describe("notificationText", () => {
       },
     });
     expect(notificationText(session, { kind: "question", requestId: 2 })).toEqual({
-      title: "MonoCode",
+      title: "Monoptah",
       subtitle: "Fix the sidebar",
       body: "Which database?",
     });

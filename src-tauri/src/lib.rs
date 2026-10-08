@@ -586,7 +586,7 @@ pub fn run() {
             project_logo::forget_logo_file,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building MonoCode");
+        .expect("error while building Monoptah");
 
     app.run(|handle, event| match event {
         #[cfg(target_os = "macos")]

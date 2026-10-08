@@ -48,7 +48,7 @@ pub(super) const ACTIONS: [Action; 2] = [
     },
     Action {
         id: "mono-chat-quit",
-        title: "Quit MonoCode",
+        title: "Quit Monoptah",
         symbol: "power",
         destructive: true,
     },

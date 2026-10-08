@@ -276,7 +276,7 @@ fn menu(
     let mut builder = MenuBuilder::new(app).item(&header).separator();
     if monos.is_empty() {
         let empty =
-            MenuItemBuilder::with_id("mono-chat-empty", "Create a Mono in MonoCode to chat here")
+            MenuItemBuilder::with_id("mono-chat-empty", "Create a Mono in Monoptah to chat here")
                 .enabled(false)
                 .build(app)?;
         builder = builder.item(&empty);
