@@ -2690,8 +2690,45 @@ fn git_github_repo_for(root: &Path) -> Result<String, String> {
     Ok(slug.to_string())
 }
 
+/// `HOST/OWNER/NAME` for a git remote URL, the form `gh` takes for a repository
+/// argument. The host is carried along so an Enterprise checkout is not asked
+/// about on github.com.
+fn git_remote_repo_target(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    // scheme://[user@]host/owner/name, or the scp-like git@host:owner/name.
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let rest = rest.split_once('@').map(|(_, rest)| rest).unwrap_or(rest);
+    let (host, path) = rest.split_once([':', '/'])?;
+    let (owner, name) = path.trim_matches('/').split_once('/')?;
+    if host.is_empty() || owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    if [host, owner, name]
+        .iter()
+        .any(|part| part.chars().any(char::is_whitespace))
+    {
+        return None;
+    }
+    Some(format!("{host}/{owner}/{name}"))
+}
+
 fn git_github_repositories_for(root: &Path) -> Result<Vec<String>, String> {
-    let json = gh_checked(root, &["repo", "view", "--json", "nameWithOwner,parent"])?;
+    // Name the repository rather than letting `gh` pick one. With no argument
+    // it resolves a base repo from the remotes and prefers one called
+    // `upstream` over `origin`, so a fork that tracks upstream reports the
+    // upstream repo and never its own - and the Inbox lists somebody else's
+    // issues. Falling back to no argument keeps a checkout whose origin is
+    // missing or unparseable working as before.
+    let target = git_stdout(root, &["remote", "get-url", "origin"])
+        .as_deref()
+        .and_then(git_remote_repo_target);
+    let mut args = vec!["repo", "view"];
+    if let Some(target) = target.as_deref() {
+        args.push(target);
+    }
+    args.extend(["--json", "nameWithOwner,parent"]);
+    let json = gh_checked(root, &args)?;
     parse_github_repositories(&json)
 }
 
@@ -7937,6 +7974,44 @@ mod tests {
         assert_eq!(details.base_ref_name, "main");
         assert_eq!(details.head_ref_name, "agent-terminal");
         assert_eq!(details.review_decision, "REVIEW_REQUIRED");
+    }
+
+    #[test]
+    fn remote_url_names_the_repo_with_its_host() {
+        for url in [
+            "https://github.com/hhoangg/monoptah.git",
+            "https://github.com/hhoangg/monoptah",
+            "https://user@github.com/hhoangg/monoptah.git",
+            "git@github.com:hhoangg/monoptah.git",
+            "ssh://git@github.com/hhoangg/monoptah.git",
+            "  https://github.com/hhoangg/monoptah.git/  ",
+        ] {
+            assert_eq!(
+                git_remote_repo_target(url).as_deref(),
+                Some("github.com/hhoangg/monoptah"),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enterprise_host_is_kept_so_gh_asks_the_right_server() {
+        assert_eq!(
+            git_remote_repo_target("git@github.acme.com:team/web.git").as_deref(),
+            Some("github.acme.com/team/web")
+        );
+    }
+
+    #[test]
+    fn a_url_without_an_owner_and_name_names_nothing() {
+        for url in [
+            "",
+            "https://github.com/",
+            "https://github.com/monoptah",
+            "   ",
+        ] {
+            assert!(git_remote_repo_target(url).is_none(), "{url}");
+        }
     }
 
     #[test]
