@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-08
+
+### Added
+
+- An automation can now run in the provider's terminal. A run used to open an app chat whatever the provider's **Session surface** setting said; it now follows the setting wherever a terminal can honour it, which today means Claude on a local project, and falls back to chat elsewhere. The automation's prompt becomes the CLI's first prompt, a "new worktree" run gets its worktree before the CLI starts, and the run is recorded as succeeded once the CLI has taken the prompt and stayed up - the app cannot see when a terminal turn ends. Continuing the last run's conversation is unavailable in a terminal, because a resumed CLI already has its first prompt, so the Automations editor disables that choice.
+
+### Changed
+
+- The app has a new logo.
+
+
 ## [0.10.1] - 2026-10-08
 
 ### Fixed
