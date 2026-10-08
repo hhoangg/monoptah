@@ -15,13 +15,14 @@ different ones.
 Run this and resolve every hit before the merge is considered done:
 
 ```bash
-# Anything user-visible or any link that still points at upstream.
-# Test fixtures and historical CHANGELOG entries are expected hits; the rest are not.
-grep -rn "hardbeat920/monocode\|usemono\.dev\|MonoCode" \
-  src/ src-tauri/src/ host/ index.html README.md \
-  --include="*.ts" --include="*.tsx" --include="*.rs" --include="*.html" --include="*.md" \
-  | grep -v "\.test\."
+./scripts/check-fork-branding.sh
 ```
+
+It exits non-zero while anything remains, so it can gate a merge. It looks only at
+string literals and links, so an identifier like `MonoCodeMark` does not trip it, and
+it carries an ALLOW list of deliberate keeps with the reason for each. When you decide
+a new hit should stay, add it to that list **with its reason** — never loosen the
+pattern, because a checker that passes by looking away is worse than no checker.
 
 For each hit, decide:
 
