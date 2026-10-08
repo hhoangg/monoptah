@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-08
+
+### Added
+
+- The app can now **update itself**, and only from this fork. Releases are signed with Monoptah's own key and the app checks that signature before installing, so a build can never be replaced by one it did not publish. Builds before this one have no updater configured and must be replaced manually once.
+
+### Changed
+
+- Every link and name in the app now refers to Monoptah: the Star on GitHub button, the Help menu's repository and issue links, the update and host-download links, dialog titles, the tray tooltip and the window title. The Website menu item opens zptah.app. Commits the app makes on your behalf are authored by Monoptah rather than MonoCode.
+- The per-provider **Session surface** control in Settings → Providers is now two icons with tooltips instead of a labelled pair of buttons, so the provider row fits on one line again.
+- Releases are built by this fork's own workflow for macOS, Linux and Windows, without the signing and storage credentials the upstream project uses.
+
+
 ## [0.9.1] - 2026-10-08
 
 First release of the Monoptah fork. It carries everything in MonoCode 0.9.0 plus the additions below.
@@ -1349,6 +1362,7 @@ First public release. macOS (Apple Silicon) only.
 - macOS release builds sign with `APPLE_SIGNING_IDENTITY` via a config overlay; the committed default remains ad-hoc `-` for community builds.
 
 [Unreleased]: https://github.com/hardbeat920/monocode/compare/v0.9.0...HEAD
+[0.9.2]: https://github.com/hhoangg/monoptah/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/hhoangg/monoptah/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/hardbeat920/monocode/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/hardbeat920/monocode/compare/v0.7.1...v0.8.0
