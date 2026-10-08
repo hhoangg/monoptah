@@ -57,6 +57,25 @@ Read its exit status directly — never through a pipe. `npm run check | tail` r
 `tail`'s status, which is always 0, so a failing suite looks green. Use
 `npm run check > log 2>&1; echo $?` or `${PIPESTATUS[0]}`.
 
+## Seeing a change live
+
+After changing code, run the dev build from source:
+
+```bash
+npm run tauri:dev
+```
+
+It uses `src-tauri/tauri.dev.conf.json` to give the app the identifier
+`com.monoptah.desktop.dev` and the name "Monoptah Dev", so it keeps its own data
+(`~/Library/Application Support/com.monoptah.desktop.dev` and
+`~/Library/WebKit/com.monoptah.desktop.dev`). The installed Monoptah, with its
+sessions, settings and ClickUp token, is not touched. Never run plain
+`npm run tauri dev`: it uses the production identifier and shares that data.
+
+On macOS the dev bundle reads the same overlay through `TAURI_CONFIG` in
+`src-tauri/src/macos.rs`. Without that, the bundle would keep the production
+identifier and share WebKit storage (localStorage) with the installed app.
+
 ## Releasing
 
 `npm run set-version -- X.Y.Z`, add a `CHANGELOG.md` section, commit as `Release vX.Y.Z`,

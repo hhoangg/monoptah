@@ -802,6 +802,13 @@ fn write_dev_bundle_icons(app: &Path, app_name: &str) -> Result<(), String> {
 /// notification and permission identity with another install of the app.
 #[cfg(debug_assertions)]
 const TAURI_CONFIG: &str = include_str!("../tauri.conf.json");
+/// `tauri dev --config <overlay>` hands the overlay to cargo here, and
+/// `generate_context!` merges it into the app's real config at compile time.
+/// The bundle must follow the same merge: WebKit keys localStorage and caches
+/// on CFBundleIdentifier, so a bundle that kept the base identifier would share
+/// them with the installed app while Rust data moved to the overlay's directory.
+#[cfg(debug_assertions)]
+const TAURI_CONFIG_OVERLAY: Option<&str> = option_env!("TAURI_CONFIG");
 #[cfg(debug_assertions)]
 const DEV_BUNDLE_NAME_ENV: &str = "MONOCODE_DEV_APP_NAME";
 #[cfg(debug_assertions)]
@@ -809,11 +816,21 @@ const DEV_ICNS: &[u8] = include_bytes!("../icons/icon.icns");
 #[cfg(debug_assertions)]
 const DEV_ASSETS_CAR: &[u8] = include_bytes!("../macos/Assets.car");
 #[cfg(debug_assertions)]
+fn config_string(base: &str, overlay: Option<&str>, key: &str) -> Option<String> {
+    let lookup = |json: &str| {
+        serde_json::from_str::<serde_json::Value>(json)
+            .ok()?
+            .get(key)?
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    overlay.and_then(lookup).or_else(|| lookup(base))
+}
+
+#[cfg(debug_assertions)]
 fn tauri_config_string(key: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(TAURI_CONFIG)
-        .ok()
-        .and_then(|config| config.get(key)?.as_str().map(str::to_owned))
-        .filter(|value| !value.is_empty())
+    config_string(TAURI_CONFIG, TAURI_CONFIG_OVERLAY, key)
         .unwrap_or_else(|| panic!("tauri.conf.json has no {key}"))
 }
 
@@ -988,6 +1005,26 @@ mod tests {
         let plist = String::from_utf8(dev_bundle_plist("MonoCode Dev")).unwrap();
         assert!(plist.contains("<string>MonoCode Dev</string>"));
         assert!(!plist.contains("<string>MonoCode</string>"));
+    }
+
+    #[test]
+    fn config_string_prefers_the_overlay_over_the_base() {
+        let base = r#"{"productName":"Monoptah","identifier":"com.monoptah.desktop"}"#;
+        let overlay = r#"{"identifier":"com.monoptah.desktop.dev"}"#;
+        assert_eq!(
+            config_string(base, Some(overlay), "identifier").as_deref(),
+            Some("com.monoptah.desktop.dev")
+        );
+        // Keys the overlay leaves out still come from the base.
+        assert_eq!(
+            config_string(base, Some(overlay), "productName").as_deref(),
+            Some("Monoptah")
+        );
+        assert_eq!(
+            config_string(base, None, "identifier").as_deref(),
+            Some("com.monoptah.desktop")
+        );
+        assert_eq!(config_string(base, Some(overlay), "missing"), None);
     }
 
     #[test]
