@@ -5,6 +5,13 @@
 # TAURI_SIGNING_PRIVATE_KEY and its password, plus the automatic GITHUB_TOKEN.
 # Those sign the updater bundles that latest.json points at. There is no Apple
 # signing, notarization, or R2 upload here.
+#
+# tauri.linux.conf.json and tauri.windows.conf.json set createUpdaterArtifacts
+# to false so a plain local build needs no key. The Linux and Windows jobs
+# therefore pass src-tauri/tauri.updater.conf.json, which turns it back on.
+# Staging never asserts a signature file name. It globs for *.sig, pairs each
+# with the file it signs, and fails when there is none, so a build that did
+# not sign cannot slip into a release.
 name: Release
 
 on:
@@ -78,8 +85,9 @@ jobs:
           writeFileSync(out, body + "\n");
           NODE
 
-      # tauri.conf.json has createUpdaterArtifacts on, so this build also
-      # writes Monoptah.app.tar.gz and signs it with the key below. A missing
+      # tauri.conf.json has createUpdaterArtifacts on and there is no macOS
+      # platform config to turn it off, so this build also writes an updater
+      # archive next to the .app and signs it with the key below. A missing
       # key makes the build fail, which is what we want: no unsigned update.
       - name: Build macOS app
         env:
@@ -100,17 +108,15 @@ jobs:
             exit 1
           fi
           codesign --verify --deep --strict --verbose=2 "$APP"
-          for f in "$APP.tar.gz" "$APP.tar.gz.sig"; do
-            test -s "$f" || { echo "Missing updater artifact: $f" >&2; exit 1; }
-          done
 
       # ditto keeps symlinks and extended attributes that plain zip can break
       # inside an .app bundle. The sha256 file is what the cask pins. The
-      # updater tarball keeps the name tauri gave it, because its signature
-      # records that file name.
+      # updater archive is found by its signature and keeps the name tauri
+      # gave it, because the signature records that file name.
       - name: Package app as zip
         run: |
           set -euo pipefail
+          shopt -s nullglob
           VERSION="${GITHUB_REF_NAME#v}"
           APP="target/$TARGET/release/bundle/macos/Monoptah.app"
           ASSETS="$RUNNER_TEMP/release-assets"
@@ -118,7 +124,16 @@ jobs:
           mkdir -p "$ASSETS"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$ASSETS/$ZIP"
           (cd "$ASSETS" && shasum -a 256 "$ZIP" > "$ZIP.sha256" && cat "$ZIP.sha256")
-          cp "$APP.tar.gz" "$APP.tar.gz.sig" "$ASSETS/"
+          sigs=("$(dirname "$APP")"/*.sig)
+          if (( ${#sigs[@]} == 0 )); then
+            echo "tauri wrote no updater signature next to $APP" >&2
+            exit 1
+          fi
+          for sig in "${sigs[@]}"; do
+            signed="${sig%.sig}"
+            test -s "$signed" || { echo "Signature has no signed file: $sig" >&2; exit 1; }
+            cp "$signed" "$sig" "$ASSETS/"
+          done
 
       - name: Download Linux packages
         uses: actions/download-artifact@v4
@@ -151,6 +166,12 @@ jobs:
       # before writing it. Every asset name is checked for duplicates first
       # because release assets are flat and a clash would fail the upload
       # after the release already exists.
+      #
+      # Each platform job staged only the installers plus the signed pairs it
+      # found, so everything in the download directories is published as is.
+      # The updater bundle per platform is whichever signed file is left once
+      # .deb and .rpm are set aside. Exactly one must remain, otherwise the
+      # release stops here instead of shipping an update nobody can verify.
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -160,11 +181,49 @@ jobs:
           ASSETS="$RUNNER_TEMP/release-assets"
           DOWNLOADS="release-downloads"
           shopt -s nullglob
-          RPMS=("$DOWNLOADS"/rpm/*.rpm)
-          if (( ${#RPMS[@]} != 1 )); then
-            echo "Expected exactly one .rpm" >&2
-            exit 1
-          fi
+          # usage: expect_one <label> <matches...>
+          expect_one() {
+            local label="$1"
+            shift
+            if (( $# != 1 )); then
+              echo "Expected exactly one $label, found $#" >&2
+              return 1
+            fi
+          }
+          # Prints the one file in <dir> that has a .sig, ignoring files that
+          # end in one of the given extensions. Every .sig must have its
+          # signed file next to it, and at least one must exist.
+          # usage: signed_bundle <dir> [skipped-extension...]
+          signed_bundle() {
+            local dir="$1" sig signed skip ext
+            local found=()
+            shift
+            for sig in "$dir"/*.sig; do
+              signed="${sig%.sig}"
+              if [[ ! -s "$signed" ]]; then
+                echo "Signature has no signed file: $sig" >&2
+                return 1
+              fi
+              skip=0
+              for ext in "$@"; do
+                if [[ "$signed" == *".$ext" ]]; then skip=1; fi
+              done
+              if (( skip == 0 )); then found+=("$signed"); fi
+            done
+            if (( ${#found[@]} != 1 )); then
+              echo "Expected exactly one signed updater bundle in $dir, found ${#found[@]}" >&2
+              return 1
+            fi
+            printf '%s\n' "${found[0]}"
+          }
+          expect_one "macOS zip" "$ASSETS"/*.zip
+          expect_one ".deb" "$DOWNLOADS"/linux/*.deb
+          expect_one "AppImage" "$DOWNLOADS"/linux/*.AppImage
+          expect_one ".rpm" "$DOWNLOADS"/rpm/*.rpm
+          expect_one "NSIS installer" "$DOWNLOADS"/windows/*.exe
+          MAC_BUNDLE=$(signed_bundle "$ASSETS")
+          LINUX_BUNDLE=$(signed_bundle "$DOWNLOADS/linux" deb rpm)
+          WINDOWS_BUNDLE=$(signed_bundle "$DOWNLOADS/windows")
           HOST_ARCHIVES=("$DOWNLOADS"/host/*.tar.gz "$DOWNLOADS"/host/*.zip)
           if (( ${#HOST_ARCHIVES[@]} != 6 )); then
             echo "Expected six host archives" >&2
@@ -179,37 +238,22 @@ jobs:
             HOST_FILES+=("$archive" "$archive.sha256")
           done
           RELEASE_FILES=(
-            "$ASSETS/Monoptah_${VERSION}_aarch64.zip"
-            "$ASSETS/Monoptah_${VERSION}_aarch64.zip.sha256"
-            "$ASSETS/Monoptah.app.tar.gz"
-            "$ASSETS/Monoptah.app.tar.gz.sig"
-            "$DOWNLOADS/linux/Monoptah_${VERSION}_amd64.deb"
-            "$DOWNLOADS/linux/Monoptah_${VERSION}_amd64.deb.sig"
-            "$DOWNLOADS/linux/Monoptah_${VERSION}_amd64.AppImage"
-            "$DOWNLOADS/linux/Monoptah_${VERSION}_amd64.AppImage.sig"
-            "${RPMS[0]}"
-            "${RPMS[0]}.sig"
-            "$DOWNLOADS/windows/Monoptah_${VERSION}_x64-setup.exe"
-            "$DOWNLOADS/windows/Monoptah_${VERSION}_x64-setup.exe.sig"
+            "$ASSETS"/*
+            "$DOWNLOADS"/linux/*
+            "$DOWNLOADS"/rpm/*
+            "$DOWNLOADS"/windows/*
             "${HOST_FILES[@]}"
           )
-          for artifact in "${RELEASE_FILES[@]}"; do
-            if [[ ! -f "$artifact" ]]; then
-              echo "Missing release artifact: $artifact" >&2
-              exit 1
-            fi
-          done
           # The plain {os}-{arch} keys are the fallback the updater uses when
           # no installer-specific key matches. They must exist for every
           # platform, because the updater looks its target up even when the
-          # app is already current.
+          # app is already current. There is no deb or rpm key: those
+          # packages are downloads only and have no updater bundle.
           node scripts/make-update-manifest.mjs "$VERSION" "$GITHUB_REF_NAME" \
             "$RUNNER_TEMP/release-notes.md" "$ASSETS/latest.json" \
-            "darwin-aarch64,darwin-aarch64-app=$ASSETS/Monoptah.app.tar.gz" \
-            "linux-x86_64,linux-x86_64-appimage=$DOWNLOADS/linux/Monoptah_${VERSION}_amd64.AppImage" \
-            "linux-x86_64-deb=$DOWNLOADS/linux/Monoptah_${VERSION}_amd64.deb" \
-            "linux-x86_64-rpm=${RPMS[0]}" \
-            "windows-x86_64,windows-x86_64-nsis=$DOWNLOADS/windows/Monoptah_${VERSION}_x64-setup.exe"
+            "darwin-aarch64,darwin-aarch64-app=$MAC_BUNDLE" \
+            "linux-x86_64,linux-x86_64-appimage=$LINUX_BUNDLE" \
+            "windows-x86_64,windows-x86_64-nsis=$WINDOWS_BUNDLE"
           RELEASE_FILES+=("$ASSETS/latest.json")
           DUPLICATES=$(printf '%s\n' "${RELEASE_FILES[@]}" | xargs -n1 basename | sort | uniq -d)
           if [[ -n "$DUPLICATES" ]]; then
@@ -271,13 +315,14 @@ jobs:
 
       - run: npm ci
 
-      # The AppImage and deb are updater bundles, so tauri signs each one
-      # and writes a .sig next to it.
+      # tauri.linux.conf.json turns updater artifacts off, so the overlay
+      # config turns them back on and tauri signs what it considers
+      # updatable. Which files those are is decided at staging time.
       - name: Build Linux packages
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run build:linux
+        run: npm run build:linux -- --config src-tauri/tauri.updater.conf.json
 
       - name: Stage Linux packages
         run: |
@@ -289,11 +334,21 @@ jobs:
             echo "Expected exactly one .deb and one AppImage" >&2
             exit 1
           fi
-          for f in "${deb[0]}.sig" "${appimage[0]}.sig"; do
-            test -s "$f" || { echo "Missing updater signature: $f" >&2; exit 1; }
-          done
+          # Pair every signature tauri wrote with the file it signs instead
+          # of assuming which installers get one. No signature at all means
+          # the build did not sign, so stop.
+          sigs=(target/release/bundle/*/*.sig)
+          if (( ${#sigs[@]} == 0 )); then
+            echo "tauri wrote no updater signature under target/release/bundle" >&2
+            exit 1
+          fi
           mkdir -p release-artifacts
-          cp "${deb[0]}" "${deb[0]}.sig" "${appimage[0]}" "${appimage[0]}.sig" release-artifacts/
+          cp "${deb[0]}" "${appimage[0]}" release-artifacts/
+          for sig in "${sigs[@]}"; do
+            signed="${sig%.sig}"
+            test -s "$signed" || { echo "Signature has no signed file: $sig" >&2; exit 1; }
+            cp "$signed" "$sig" release-artifacts/
+          done
 
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
@@ -331,10 +386,9 @@ jobs:
 
       - run: npm ci
 
+      # The rpm is a download only, not an updater target, so this build
+      # keeps updater artifacts off and needs no signing key.
       - name: Build rpm package
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run build:fedora
 
       - name: Install and stage the generated rpm
@@ -358,9 +412,8 @@ jobs:
           done
           dnf install -y "${bundle[0]}"
           rpm -q "$(rpm -qp --queryformat '%{NAME}' "${bundle[0]}")"
-          test -s "${bundle[0]}.sig" || { echo "Missing updater signature: ${bundle[0]}.sig" >&2; exit 1; }
           mkdir -p release-artifacts
-          cp "${bundle[0]}" "${bundle[0]}.sig" release-artifacts/
+          cp "${bundle[0]}" release-artifacts/
 
       - name: Upload rpm package
         uses: actions/upload-artifact@v4
@@ -384,15 +437,16 @@ jobs:
 
       - run: npm ci
 
-      # The NSIS installer is the updater bundle, so tauri signs it and
-      # writes a .sig next to it.
+      # tauri.windows.conf.json turns updater artifacts off, so the overlay
+      # config turns them back on and tauri signs what it considers
+      # updatable. Which files those are is decided at staging time.
       - name: Build Windows packages
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           $env:RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-msvc"
-          npx tauri build --bundles nsis
+          npx tauri build --bundles nsis --config src-tauri/tauri.updater.conf.json
 
       - name: Stage Windows packages
         run: |
@@ -400,12 +454,22 @@ jobs:
           if ($installers.Count -ne 1) {
             throw "Expected exactly one NSIS installer"
           }
-          $signature = "$($installers[0].FullName).sig"
-          if (-not (Test-Path $signature)) {
-            throw "Missing updater signature: $signature"
+          # Pair every signature tauri wrote with the file it signs instead
+          # of assuming which installers get one. No signature at all means
+          # the build did not sign, so stop.
+          $sigs = @(Get-ChildItem -Path "target/release/bundle/*" -Filter "*.sig" -File)
+          if ($sigs.Count -eq 0) {
+            throw "tauri wrote no updater signature under target/release/bundle"
           }
           New-Item -ItemType Directory -Force "release-artifacts" | Out-Null
-          Copy-Item -Path $installers[0].FullName, $signature -Destination "release-artifacts/"
+          Copy-Item -Path $installers[0].FullName -Destination "release-artifacts/"
+          foreach ($sig in $sigs) {
+            $signed = $sig.FullName.Substring(0, $sig.FullName.Length - ".sig".Length)
+            if (-not (Test-Path -LiteralPath $signed -PathType Leaf)) {
+              throw "Signature has no signed file: $($sig.FullName)"
+            }
+            Copy-Item -LiteralPath $signed, $sig.FullName -Destination "release-artifacts/"
+          }
 
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4
