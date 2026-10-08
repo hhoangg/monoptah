@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-08
+
+### Fixed
+
+- The Inbox lists the GitHub repository a project actually pushes to. It used to let `gh` choose, and with no default set `gh` prefers a remote named `upstream` over `origin`, so a fork that tracks upstream showed the upstream project's issues and pull requests and none of its own.
+- A fork's Inbox no longer mixes in its parent repository's issues and pull requests.
+
+
 ## [0.10.0] - 2026-10-08
 
 ### Added
