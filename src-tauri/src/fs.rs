@@ -2727,41 +2727,24 @@ fn git_github_repositories_for(root: &Path) -> Result<Vec<String>, String> {
     if let Some(target) = target.as_deref() {
         args.push(target);
     }
-    args.extend(["--json", "nameWithOwner,parent"]);
+    args.extend(["--json", "nameWithOwner"]);
     let json = gh_checked(root, &args)?;
     parse_github_repositories(&json)
 }
 
+/// The one repository a project belongs to. A fork's parent is deliberately
+/// left out: its issues and pull requests are somebody else's work, and a fork
+/// carrying its own changes wants its own Inbox.
 fn parse_github_repositories(json: &str) -> Result<Vec<String>, String> {
-    #[derive(Deserialize)]
-    struct Owner {
-        login: String,
-    }
-    #[derive(Deserialize)]
-    struct Parent {
-        name: String,
-        owner: Owner,
-    }
     #[derive(Deserialize)]
     struct View {
         #[serde(rename = "nameWithOwner")]
         name_with_owner: String,
-        #[serde(default)]
-        parent: Option<Parent>,
     }
 
     let view: View = serde_json::from_str(json).map_err(|error| error.to_string())?;
     let (owner, name) = split_github_repo(&view.name_with_owner)?;
-    let mut repos = vec![format!("{owner}/{name}")];
-    if let Some(parent) = view.parent {
-        let parent = format!("{}/{}", parent.owner.login, parent.name);
-        let (owner, name) = split_github_repo(&parent)?;
-        let parent = format!("{owner}/{name}");
-        if !repos[0].eq_ignore_ascii_case(&parent) {
-            repos.push(parent);
-        }
-    }
-    Ok(repos)
+    Ok(vec![format!("{owner}/{name}")])
 }
 
 fn git_github_work_items_for(
@@ -7816,7 +7799,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_github_repositories_includes_a_forks_parent() {
+    fn parse_github_repositories_leaves_a_forks_parent_out() {
         let json = r#"{
             "nameWithOwner": "EricRasputin/monocode-eric",
             "parent": {
@@ -7826,16 +7809,13 @@ mod tests {
         }"#;
         assert_eq!(
             parse_github_repositories(json).unwrap(),
-            vec!["EricRasputin/monocode-eric", "hardbeat920/monocode"]
+            vec!["EricRasputin/monocode-eric"]
         );
     }
 
     #[test]
-    fn parse_github_repositories_keeps_a_normal_repo_single() {
-        let json = r#"{
-            "nameWithOwner": "hardbeat920/monocode",
-            "parent": null
-        }"#;
+    fn parse_github_repositories_reads_a_repo_of_its_own() {
+        let json = r#"{ "nameWithOwner": "hardbeat920/monocode" }"#;
         assert_eq!(
             parse_github_repositories(json).unwrap(),
             vec!["hardbeat920/monocode"]
