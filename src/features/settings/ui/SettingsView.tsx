@@ -391,6 +391,8 @@ import {
 } from "../../notifications/model/notifications";
 import {
   installPendingUpdate,
+  packageManagedInstall,
+  packageManagerHint,
   readAppVersion,
   runUpdateFlow,
   type UpdaterSnapshot,
@@ -1769,10 +1771,16 @@ function UpdateRow({
 
   useEffect(() => {
     let cancelled = false;
-    void readAppVersion().then((currentVersion) => {
-      if (cancelled) return;
-      setSnapshot((current) => ({ ...current, currentVersion }));
-    });
+    void Promise.all([readAppVersion(), packageManagedInstall()]).then(
+      ([currentVersion, packageManaged]) => {
+        if (cancelled) return;
+        setSnapshot((current) => ({
+          ...current,
+          currentVersion,
+          packageManaged: packageManaged ?? undefined,
+        }));
+      },
+    );
     return () => {
       cancelled = true;
     };
@@ -1802,7 +1810,9 @@ function UpdateRow({
             ? "You're on the latest version."
             : snapshot.phase === "error"
               ? (snapshot.error ?? "Update check failed.")
-              : "Monoptah updates itself from the release feed.";
+              : snapshot.packageManaged
+                ? packageManagerHint(snapshot.packageManaged)
+                : "Monoptah updates itself from the release feed.";
 
   return (
     <Row
@@ -3786,6 +3796,14 @@ function ProviderRow({
           label={`${HARNESS_TITLE[harness]} model`}
           value={current.id}
           onChange={(next) => onModelChange(harness, next)}
+          onOpen={() => {
+            // Opening the dropdown is an explicit refresh: fallbacks keep
+            // `models` non-empty, and routine refreshes skip once a live
+            // catalog exists, so force this one past that skip.
+            if (available) {
+              void refreshHarnessCatalogs([harness], { force: true });
+            }
+          }}
           options={models.map((item) => ({
             value: item.id,
             label: item.name,
@@ -4467,11 +4485,13 @@ function Select({
   value,
   options,
   onChange,
+  onOpen,
 }: {
   label: string;
   value: string;
   options: { value: string; label: string; icon?: ReactNode }[];
   onChange: (value: string) => void;
+  onOpen?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(() =>
@@ -4497,6 +4517,11 @@ function Select({
       ),
     );
   }, [open, value, options]);
+
+  useEffect(() => {
+    if (open) onOpen?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
