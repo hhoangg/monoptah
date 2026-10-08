@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-08
+
+### Fixed
+
+- Windows release builds now publish their update signature. It was being written and then overlooked while collecting the files to release, which stopped 0.9.3 from publishing.
+
+
 ## [0.9.3] - 2026-10-08
 
 ### Fixed
@@ -1369,6 +1376,7 @@ First public release. macOS (Apple Silicon) only.
 - macOS release builds sign with `APPLE_SIGNING_IDENTITY` via a config overlay; the committed default remains ad-hoc `-` for community builds.
 
 [Unreleased]: https://github.com/hardbeat920/monocode/compare/v0.9.0...HEAD
+[0.9.4]: https://github.com/hhoangg/monoptah/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/hhoangg/monoptah/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/hhoangg/monoptah/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/hhoangg/monoptah/compare/v0.9.0...v0.9.1
