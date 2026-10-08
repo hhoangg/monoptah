@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-08
+
+### Added
+
+- The quit hotkey now asks twice. Pressing it once shows **Hold ⌘Q to Quit** instead of quitting, and the app closes only when the key is held for a second or pressed again within two. A mistyped shortcut no longer throws away running sessions. On Windows and Linux the same gate covers Ctrl+Q, except inside a terminal, where Ctrl+Q still belongs to the shell. Quitting from the menu, the tray, or by closing the app is unchanged, as is the confirmation shown when sessions are still working.
+
+### Fixed
+
+- A full-screen TUI session no longer loses its bottom line. The terminal grid was rounded up and then stretched to cover the pane, which pushed the last row past the pane and clipped it — cutting the hint row under Claude's input box in half.
+- A full-screen TUI no longer shows a thin vertical line down the right edge of its pane. It came from xterm's decoration overview ruler, which has nothing to summarise on the alt screen.
+
+
 ## [0.9.4] - 2026-10-08
 
 ### Fixed
