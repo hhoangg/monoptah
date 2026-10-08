@@ -457,7 +457,9 @@ jobs:
           # Pair every signature tauri wrote with the file it signs instead
           # of assuming which installers get one. No signature at all means
           # the build did not sign, so stop.
-          $sigs = @(Get-ChildItem -Path "target/release/bundle/*" -Filter "*.sig" -File)
+          # -Recurse because the signatures sit inside the per-bundle folders
+          # (bundle/nsis/*.sig); listing bundle/* only yields those folders.
+          $sigs = @(Get-ChildItem -Path "target/release/bundle" -Filter "*.sig" -File -Recurse)
           if ($sigs.Count -eq 0) {
             throw "tauri wrote no updater signature under target/release/bundle"
           }
