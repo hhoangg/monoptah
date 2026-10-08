@@ -586,6 +586,7 @@ export function newSession(
   options: NewSessionOptions = {},
 ): Session {
   const resolved = resolveModel(harness, model ?? preferredModelId(harness));
+  const requested = options.surface ?? loadProviderSurface(harness);
   return {
     id: crypto.randomUUID(),
     harness,
@@ -596,10 +597,10 @@ export function newSession(
     cwd,
     blocks: [],
     // The TUI runs on this machine, so a remote project's session is never
-    // one, even when the caller asks for it.
-    surface: isRemoteProjectPath(cwd)
-      ? "chat"
-      : (options.surface ?? loadProviderSurface(harness)),
+    // one, even when the caller asks for it. Only a terminal request needs the
+    // check, which keeps chat sessions independent of the path helpers.
+    surface:
+      requested === "tui" && isRemoteProjectPath(cwd) ? "chat" : requested,
   };
 }
 

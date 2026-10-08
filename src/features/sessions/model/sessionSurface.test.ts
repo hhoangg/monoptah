@@ -59,6 +59,18 @@ describe("new session surface", () => {
     saveProviderSurface("claude", "tui");
     expect(newSession("claude", "remote://env/repo").surface).toBe("chat");
   });
+
+  it("keeps a project on another machine in chat when a terminal is requested", () => {
+    const session = newSession(
+      "claude",
+      "remote://env/repo",
+      undefined,
+      undefined,
+      undefined,
+      { surface: "tui" },
+    );
+    expect(session.surface).toBe("chat");
+  });
 });
 
 describe("sessions that carry a composer card", () => {
