@@ -14,6 +14,7 @@ const child = vi.hoisted(() => {
     resolveOmpBinary: resolver("omp"),
     resolveFxBinary: resolver("fx"),
     resolveHermesBinary: resolver("hermes"),
+    resolveDevinBinary: resolver("devin"),
     resolveAntigravityBinary: vi.fn(async () => ({
       path: "/bin/agy_acp_server.par",
       args: ["--acp"],

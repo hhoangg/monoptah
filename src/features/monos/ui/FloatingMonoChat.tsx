@@ -28,6 +28,7 @@ import {
   type FloatingMonoView,
 } from "../model/floatingMono";
 import { MonoComposer } from "./MonoComposer";
+import { MonoStatusDot } from "./MonoRailMascot";
 import { MonoStatus } from "./MonoStatus";
 import { MONO_PAGE_TURNS } from "../../sessions/data/sessionStore";
 
@@ -334,7 +335,7 @@ function MonoRail({
               aria-current={selected ? "true" : undefined}
               onClick={() => onSwitch(mono.id)}
               className={`grid size-8 place-items-center rounded-lg transition-opacity ${
-                selected ? "" : "opacity-70 hover:opacity-100"
+                selected ? "" : "opacity-40 hover:opacity-100 focus-visible:opacity-100"
               }`}
             >
               <PixelMascot
@@ -343,6 +344,11 @@ function MonoRail({
                 className="pointer-events-none size-7"
               />
             </button>
+            <MonoStatusDot
+              status={mono.status}
+              color={mono.color}
+              className="pointer-events-none top-0.5 right-2.5 size-2"
+            />
           </div>
         );
       })}

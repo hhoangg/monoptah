@@ -16,6 +16,7 @@ const RESOLVERS: Record<
   omp: () => child.resolveOmpBinary(),
   fx: () => child.resolveFxBinary(),
   hermes: () => child.resolveHermesBinary(),
+  devin: () => child.resolveDevinBinary(),
 };
 
 /**

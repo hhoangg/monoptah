@@ -315,14 +315,37 @@ jobs:
 
       - run: npm ci
 
-      # tauri.linux.conf.json turns updater artifacts off, so the overlay
-      # config turns them back on and tauri signs what it considers
-      # updatable. Which files those are is decided at staging time.
+      # Same as `npm run build:linux`, with the overlay config that turns
+      # updater artifacts back on: tauri.linux.conf.json turns them off.
+      # npm would append the extra args to the repack script, not tauri build.
       - name: Build Linux packages
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run build:linux -- --config src-tauri/tauri.updater.conf.json
+        run: |
+          set -euo pipefail
+          npx tauri build --bundles deb,appimage --config src-tauri/tauri.updater.conf.json
+          bash scripts/repack-appimage.sh
+
+      - name: Assert AppImage uses host libraries
+        run: bash scripts/assert-appimage-host-libs.sh
+
+      # Sign after repack-appimage.sh: the signature tauri wrote during the
+      # build covers the pre-repack file and would fail updater verification.
+      - name: Sign AppImage for the updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimage=(target/release/bundle/appimage/*.AppImage)
+          if (( ${#appimage[@]} != 1 )); then
+            echo "Expected exactly one AppImage" >&2
+            exit 1
+          fi
+          npx tauri signer sign "${appimage[0]}"
+          test -s "${appimage[0]}.sig"
 
       - name: Stage Linux packages
         run: |
@@ -340,6 +363,10 @@ jobs:
           sigs=(target/release/bundle/*/*.sig)
           if (( ${#sigs[@]} == 0 )); then
             echo "tauri wrote no updater signature under target/release/bundle" >&2
+            exit 1
+          fi
+          if [[ ! -s "${appimage[0]}.sig" ]]; then
+            echo "Missing AppImage updater signature" >&2
             exit 1
           fi
           mkdir -p release-artifacts

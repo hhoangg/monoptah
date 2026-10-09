@@ -1,7 +1,7 @@
 import { leafIds, type WorkspaceTab } from "../../workspace/model/layout";
 import type { Session } from "../../sessions/model/session";
 import { pathKey } from "../../../shared/lib/paths";
-import { sameProjectPath } from "./recents";
+import { isRemoteProjectPath, sameProjectPath } from "./recents";
 
 export type ProjectReturnMemory = ReadonlyMap<string, string>;
 
@@ -21,7 +21,9 @@ export type ProjectReturnDecision =
   | { action: "create" };
 
 export function isBlankSession(session: Session | undefined): boolean {
-  if (!session || session.busy) return false;
+  // Remote transcripts may not have loaded yet, and a shell can hold an
+  // unfinished create or composer text. Local blocks cannot prove it is blank.
+  if (!session || session.busy || isRemoteProjectPath(session.cwd)) return false;
   // A terminal session never has chat blocks, but it holds a live CLI that a
   // blank-tab reuse would unmount and kill.
   if (session.surface === "tui") return false;

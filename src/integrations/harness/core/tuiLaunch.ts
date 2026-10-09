@@ -37,6 +37,7 @@ export const TUI_CAPS: Record<HarnessId, TuiCaps> = {
   omp: { ...NONE },
   fx: { ...NONE },
   hermes: { ...NONE },
+  devin: { ...NONE },
   antigravity: { ...NONE },
 };
 

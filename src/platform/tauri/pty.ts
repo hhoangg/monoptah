@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import type { ProviderAccountProvider } from "../../features/providers/model/providerAccounts";
+
 type DataPayload = { id: string; data: string };
 type ExitPayload = { id: string; code: number | null };
 
@@ -136,7 +138,7 @@ function release() {
 export type PtyLaunch = {
   program: string;
   args: string[];
-  providerAccount?: { provider: "claude" | "codex"; id: string };
+  providerAccount?: { provider: ProviderAccountProvider; id: string };
   binaryProvider?: string;
   binaryPath?: string;
 };
