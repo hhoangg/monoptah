@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.13.0] - 2026-10-10
+
+### Added
+
+- A **Claude terminal (TUI) session shows as busy while its turn runs**, so it appears in the live-agent views and is counted by the quit prompt the way a chat is. The app adds Claude Code hooks to the launch with `--settings`: submitting a prompt marks the session busy, and `Stop`, `StopFailure`, `SessionEnd` or the CLI exiting mark it idle again. Your own hooks keep running, because Claude merges the injected ones with them. Interrupting a turn with Esc fires no hook, so that case clears only when Claude's idle notification arrives, about a minute later. With **Claude Code hooks** turned off nothing is injected, and nothing is injected on Windows either, where one hook command cannot work in both Git Bash and PowerShell. Other providers have no hook integration and never show as busy.
+
+### Changed
+
+- The **quit confirmation counts terminal turns apart from chats** and says what is true of each kind: a chat turn resumes when you reopen Monoptah, while a terminal turn stops with its CLI and only its conversation is saved.
+
+### Fixed
+
+- Hiding the last window no longer **drops the workspace layout**: closing it now saves the workspace snapshot, so a later quit or kill reopens the same tabs. A window being transferred still leaves the one global snapshot alone.
+- A **busy terminal session is saved as soon as it changes** instead of waiting for its turn to end, so a title its CLI set is no longer lost when the app quits mid-turn.
+- Closing or deleting a busy terminal session no longer tries to **cancel a turn that has no adapter**; its CLI is stopped with its terminal instead.
+
+
 ## [0.12.1] - 2026-10-10
 
 Carries the upstream MonoCode 0.11.0 changes below, plus the fork-local
@@ -1488,7 +1505,8 @@ First public release. macOS (Apple Silicon) only.
 - Updater endpoint and minisign public key are injected at release time rather than committed, so forks do not inherit the maintainer's update channel.
 - macOS release builds sign with `APPLE_SIGNING_IDENTITY` via a config overlay; the committed default remains ad-hoc `-` for community builds.
 
-[Unreleased]: https://github.com/hhoangg/monoptah/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/hhoangg/monoptah/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/hhoangg/monoptah/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/hhoangg/monoptah/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/hhoangg/monoptah/compare/v0.11.0...v0.12.0
 [0.9.4]: https://github.com/hhoangg/monoptah/compare/v0.9.3...v0.9.4
