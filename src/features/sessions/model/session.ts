@@ -350,6 +350,8 @@ export type Block = {
     status?: string;
     detail?: string;
     preview?: ToolPreview;
+    /** Every file in a multi-file edit, retained for checkpoint recovery. */
+    paths?: string[];
     /** Left running by the agent when it yielded; the turn waits on it. */
     background?: boolean;
   };
@@ -395,6 +397,11 @@ export type Block = {
   monoHabit?: { id: string; name: string; at: number };
   /** A card a Mono put in its chat; see `features/monos/model/monoCards`. */
   monoCard?: import("../../monos/model/monoCards").MonoCard;
+  /**
+   * The emoji a Mono answered this user message with. Drawn from its reply
+   * when the chat renders; see `features/monos/model/monoReaction`.
+   */
+  monoReaction?: string;
 };
 
 export type RuntimeMode =
