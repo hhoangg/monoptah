@@ -1070,7 +1070,7 @@ function SidebarComponent({
     createSessionThen(onNew, (sessionId) => {
       // A deferred creation can land after a project switch; the folder list
       // in state then belongs to another project, so do not touch storage.
-      if (clickCwd !== cwdRef.current) return;
+      if (!sameProjectPath(clickCwd, cwdRef.current)) return;
       placeSessionInFolder(folderId, sessionId);
     });
   };

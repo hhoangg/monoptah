@@ -2756,12 +2756,11 @@ function Workspace({
 
   const onNew = useCallback(
     (onCreated?: (id: string) => void): string | void => {
-      setSearchViewOpen(false);
-      setInboxViewOpen(false);
-      setNotesViewOpen(false);
-      setAutomationsViewOpen(false);
+      // The side views are closed by createNewSession, once a session is
+      // actually created, so cancelling the prompt leaves them open.
       if (shouldPromptForProvider(sidebarCwd)) {
-        setNewSessionPrompt({ cwd: sidebarCwd, onCreated });
+        // A second request must not drop the continuation the first one carried.
+        setNewSessionPrompt((prev) => prev ?? { cwd: sidebarCwd, onCreated });
         return;
       }
       const id = createNewSession();

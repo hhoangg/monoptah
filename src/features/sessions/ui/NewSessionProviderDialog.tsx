@@ -46,11 +46,14 @@ export function NewSessionProviderDialog({
     projectProvidersRevision,
     projectProvidersRevision,
   );
+  const readSurfaces = () => HARNESSES.map(loadProviderSurface).join(",");
   const surfaceVersion = useSyncExternalStore(
     subscribeProviderSurface,
-    () => HARNESSES.map(loadProviderSurface).join(","),
-    () => "",
+    readSurfaces,
+    readSurfaces,
   );
+  // Subscribing re-renders on a surface change; the value itself is read per row.
+  void surfaceVersion;
   const providers = useMemo(() => {
     void availabilityVersion;
     void projectVersion;
@@ -90,12 +93,12 @@ export function NewSessionProviderDialog({
       title="Choose a provider"
       description="For this session only"
       size="sm"
+      fitViewport
     >
       <div
         role="listbox"
         aria-label="Provider"
         className="flex flex-col gap-0.5 p-2 text-[12px]"
-        data-surface-version={surfaceVersion}
       >
         <p className="px-2.5 pb-1 text-[11px] text-content/55">
           The default provider opens as a terminal session, which can't switch
