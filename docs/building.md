@@ -1,6 +1,6 @@
 # Build from source
 
-MonoCode supports macOS, Linux, and Windows. You need Node.js 20+ and a current stable Rust toolchain. Install and sign in to at least one agent CLI using [provider setup](providers.md).
+Monoptah supports macOS, Linux, and Windows. You need Node.js 20+ and a current stable Rust toolchain. Install and sign in to at least one agent CLI using [provider setup](providers.md).
 
 ## Platform prerequisites
 
@@ -44,7 +44,7 @@ On EL 10, the setup helper enables EPEL 10 and CRB automatically, since the deve
 The build emits a `.rpm` under `target/release/bundle/rpm/`, installable with:
 
 ```bash
-sudo dnf install ./target/release/bundle/rpm/MonoCode-*.rpm
+sudo dnf install ./target/release/bundle/rpm/Monoptah-*.rpm
 ```
 
 EL 9 and older are unsupported (`webkit2gtk4.1-devel` only exists in EPEL 10). The published release `.rpm` is built on Enterprise Linux 10 so it loads on Fedora and EL 10. See [Linux installation](install.md#fedora--enterprise-linux-packages) for release package installation and runtime repository setup.
