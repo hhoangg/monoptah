@@ -824,11 +824,20 @@ export function defaultSessionChoice(cwd?: string): LastModelChoice {
     cwd,
     project.defaultHarness ?? last?.harness ?? "cursor",
   );
-  const model =
+  return { harness, model: sessionModelForHarness(harness, cwd) };
+}
+
+/** Model a new conversation should use when its provider is chosen explicitly. */
+export function sessionModelForHarness(
+  harness: HarnessId,
+  cwd?: string,
+): string {
+  const project = loadProjectProviderSettings(cwd);
+  return (
     project.models?.[harness] ??
     (project.defaultHarness === harness ? project.defaultModel : undefined) ??
-    preferredModelId(harness);
-  return { harness, model };
+    preferredModelId(harness)
+  );
 }
 
 export function loadLastModelChoice(): LastModelChoice | null {

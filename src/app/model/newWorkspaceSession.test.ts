@@ -1,6 +1,10 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { setProjectDefaultProvider } from "../../features/sessions/model/projectProviders";
+import {
+  setProjectDefaultModel,
+  setProjectDefaultProvider,
+} from "../../features/sessions/model/projectProviders";
+import { saveProviderSurface } from "../../features/providers/model/providerSurface";
 import { newSession } from "../../features/sessions/model/session";
 import { setWorktreeFocus } from "../../features/source-control/model/worktreeFocus";
 import { newWorkspaceSession } from "./newWorkspaceSession";
@@ -43,4 +47,23 @@ it("starts in the project root without session defaults or a separate worktree",
   expect(session.cwd).toBe("/current");
   expect(session.runtimeMode).toBe("supervised");
   expect(session.worktreeCwd).toBeUndefined();
+});
+
+it("uses an explicit provider with its own surface preference and project model", () => {
+  setProjectDefaultProvider("/current", "codex", "codex:gpt-5.4");
+  setProjectDefaultModel("/current", "claude", "claude:opus-5");
+  saveProviderSurface("claude", "tui");
+  saveProviderSurface("cursor", "chat");
+
+  const tui = newWorkspaceSession("/current", "auto", "claude");
+  expect(tui.harness).toBe("claude");
+  expect(tui.surface).toBe("tui");
+  expect(tui.model).toBe("claude:opus-5");
+  expect(tui.runtimeMode).toBe("auto");
+  expect(tui.cwd).toBe("/current");
+
+  const chat = newWorkspaceSession("/current", undefined, "cursor");
+  expect(chat.harness).toBe("cursor");
+  expect(chat.surface).toBe("chat");
+  expect(chat.runtimeMode).toBe("supervised");
 });
