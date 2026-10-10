@@ -212,19 +212,12 @@ function VideoView({
       document.removeEventListener("visibilitychange", pauseWhenHidden);
   }, [visible, failed]);
 
+  // React owns the src attribute. Only pause here: stripping it and calling
+  // load() on a re-run would abort the load React just started. The source is
+  // a blob the loader revokes, so a detached player holds no connection open.
   useEffect(() => {
     const video = videoRef.current;
-    // Restore the source and restart loading if React replays effects after cleanup.
-    if (video && !video.hasAttribute("src")) {
-      video.src = url;
-      video.load();
-    }
-    return () => {
-      if (!video) return;
-      video.pause();
-      video.removeAttribute("src");
-      video.load();
-    };
+    return () => video?.pause();
   }, [url, failed]);
 
   if (failed) {
