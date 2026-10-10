@@ -427,6 +427,9 @@ import {
   applyInboxStart,
   applyTuiSessionPatch,
   isTuiSession,
+  applyTuiBusyToSessions,
+  findTuiSessionByProviderId,
+  type TuiHookEvent,
   TUI_EARLY_EXIT_MS,
   type TuiLaunchEvent,
   type TuiSessionPatch,
@@ -1666,7 +1669,9 @@ function Workspace({
       const open = sessionsRef.current.find(
         (session) => session.id === sessionId,
       );
-      if (!open?.busy) return open;
+      // A busy terminal session has no adapter turn to cancel; its CLI is
+      // stopped with the pty, so skip the cancel by intent, not by accident.
+      if (!open?.busy || isTuiSession(open)) return open;
 
       turnGen.current.set(sessionId, (turnGen.current.get(sessionId) ?? 0) + 1);
       flushHarnessEvents();
@@ -2225,6 +2230,23 @@ function Workspace({
           }
           // Not `persistQuitState`: that marks the live turns interrupted.
           void persistLiveTranscripts(sessionsRef.current);
+          // The layout still has to survive a later kill. Unlike
+          // `persistQuitState` this marks nothing interrupted. A transferred
+          // window never writes the one global snapshot.
+          if (!windowTransfer) {
+            void saveWorkspaceSnapshot(
+              collectWorkspaceSnapshot(
+                tabsRef.current,
+                sessionsRef.current,
+                activeTabIdRef.current,
+                projectCwdRef.current,
+                readProjectReturnMemory(),
+                projectTerminalsRef.current,
+                lastDockSideRef.current ?? undefined,
+                keepWorkspaceTab,
+              ),
+            ).catch(() => undefined);
+          }
           void hideCurrentWindow();
           return;
         }
@@ -2249,7 +2271,12 @@ function Workspace({
       releaseQuit();
       unlistenClose?.();
     };
-  }, [flushHarnessEvents, keepWorkspaceTab, readProjectReturnMemory]);
+  }, [
+    flushHarnessEvents,
+    keepWorkspaceTab,
+    readProjectReturnMemory,
+    windowTransfer,
+  ]);
 
   const refreshHistory = useCallback(async (cwd: string) => {
     if (!cwd || cwd === "~") return;
@@ -2360,6 +2387,7 @@ function Workspace({
       if (
         shouldPersistSession(session) &&
         (!session.busy ||
+          isTuiSession(session) ||
           parked ||
           newlyBound ||
           newUserTurn ||
@@ -8588,8 +8616,30 @@ function Workspace({
     [appendTab, focusOpenSession, submitSession],
   );
 
+  const setTuiBusy = useCallback((sessionId: string, busy: boolean) => {
+    // Functional, like the other TUI handlers: a snapshot would drop a title
+    // the CLI set in the same batch. `sessionsRef` resyncs on render.
+    setSessions((prev) => applyTuiBusyToSessions(prev, sessionId, busy));
+  }, []);
+
+  useEffect(() => {
+    // Every window hears every hook; only the one holding the session acts.
+    const unlisten = listen<TuiHookEvent>("tui-hook", ({ payload }) => {
+      const owner = findTuiSessionByProviderId(
+        sessionsRef.current,
+        payload.providerSessionId,
+      );
+      if (owner) setTuiBusy(owner.id, !!payload.busy);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [setTuiBusy]);
+
   const onTuiLaunchEvent = useCallback(
     (sessionId: string, event: TuiLaunchEvent) => {
+      // A dead CLI can no longer report that its turn ended.
+      if (event.kind === "exit") setTuiBusy(sessionId, false);
       const tracked = tuiAutomationRuns.current.get(sessionId);
       if (!tracked) return;
       window.clearTimeout(tracked.timer);
@@ -8619,7 +8669,7 @@ function Workspace({
         harness ? tuiRunError(harness, event.exit) : "The terminal exited",
       );
     },
-    [settleTuiRun],
+    [setTuiBusy, settleTuiRun],
   );
 
   const queueMonoSessionCompletion = useCallback(

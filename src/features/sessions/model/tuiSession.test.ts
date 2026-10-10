@@ -10,15 +10,19 @@ vi.mock("../../providers/model/providerBinaryPaths", () => ({
 import {
   TUI_EARLY_EXIT_MS,
   applyInboxStart,
+  applyTuiBusyToSessions,
+  applyTuiHookEvent,
   applyTuiSessionPatch,
   canRetitleFromTui,
   canStartFreshAfter,
   cleanTuiTitle,
+  findTuiSessionByProviderId,
   isNoConversationOutput,
   isTuiSession,
   plainTerminalText,
   tuiBinaryIdentity,
   tuiExitNotice,
+  tuiHookNotify,
   tuiLaunchCwd,
   tuiProviderAccount,
   tuiPtyId,
@@ -303,5 +307,69 @@ describe("recognising Claude's no-conversation exit", () => {
     expect(isNoConversationOutput("command not found: claude")).toBe(false);
     expect(isNoConversationOutput("")).toBe(false);
     expect(isNoConversationOutput(undefined)).toBe(false);
+  });
+});
+
+describe("tuiHookNotify", () => {
+  it("returns the paths only when hooks are on and both are known", () => {
+    expect(tuiHookNotify(true, "/bin/app", "/spool")).toEqual({
+      cliPath: "/bin/app",
+      spoolDir: "/spool",
+    });
+    expect(tuiHookNotify(false, "/bin/app", "/spool")).toBeUndefined();
+    expect(tuiHookNotify(true, undefined, "/spool")).toBeUndefined();
+    expect(tuiHookNotify(true, "/bin/app", "")).toBeUndefined();
+  });
+});
+
+describe("findTuiSessionByProviderId", () => {
+  it("matches a terminal session by provider id and ignores the rest", () => {
+    const a = { ...tui(), providerSessionId: "p-a" };
+    const b = { ...tui(), providerSessionId: "p-b" };
+    const chat: Session = {
+      ...newSession("claude", "/work/app"),
+      providerSessionId: "p-chat",
+    };
+    const all = [chat, a, b];
+    expect(findTuiSessionByProviderId(all, "p-b")).toBe(b);
+    expect(findTuiSessionByProviderId(all, "p-chat")).toBeUndefined();
+    expect(findTuiSessionByProviderId(all, "nope")).toBeUndefined();
+    expect(findTuiSessionByProviderId(all, "")).toBeUndefined();
+  });
+});
+
+describe("applyTuiBusyToSessions", () => {
+  it("sets busy on the matching session only", () => {
+    const [first, second] = [tui(), tui()];
+    const [a, b] = applyTuiBusyToSessions([first, second], first.id, true);
+    expect(a.busy).toBe(true);
+    expect(b).toBe(second);
+  });
+
+  it("returns the same array when nothing changes", () => {
+    const list = [tui()];
+    expect(applyTuiBusyToSessions(list, list[0].id, false)).toBe(list);
+    expect(applyTuiBusyToSessions(list, "missing", true)).toBe(list);
+  });
+});
+
+describe("applyTuiHookEvent", () => {
+  it("sets and clears busy on a terminal session", () => {
+    const idle = tui();
+    const busy = applyTuiHookEvent(idle, { busy: true });
+    expect(busy.busy).toBe(true);
+    expect(applyTuiHookEvent(busy, { busy: false }).busy).toBe(false);
+  });
+
+  it("returns the same object when nothing changes", () => {
+    const idle = tui();
+    expect(applyTuiHookEvent(idle, { busy: false })).toBe(idle);
+    const busy = { ...idle, busy: true };
+    expect(applyTuiHookEvent(busy, { busy: true })).toBe(busy);
+  });
+
+  it("never marks a chat session busy", () => {
+    const chat = newSession("claude", "/work/app");
+    expect(applyTuiHookEvent(chat, { busy: true })).toBe(chat);
   });
 });

@@ -19,7 +19,10 @@ import {
   hydrateWorkspaceSnapshot,
   parseWorkspaceSnapshot,
 } from "../../features/workspace/model/workspaceSnapshot";
-import { loadWorkspaceSnapshot, saveWorkspaceSnapshot } from "../../features/sessions/data/sessionStore";
+import {
+  loadWorkspaceSnapshot,
+  saveWorkspaceSnapshot,
+} from "../../features/sessions/data/sessionStore";
 import { reconcileProjectReturn } from "../../features/projects/model/projectReturn";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -32,7 +35,10 @@ vi.mock("./windowTransferBootstrap", () => ({
   loadWindowTransfer: vi.fn().mockResolvedValue(null),
 }));
 vi.mock("../../features/sessions/data/sessionStore", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../features/sessions/data/sessionStore")>();
+  const actual =
+    await importOriginal<
+      typeof import("../../features/sessions/data/sessionStore")
+    >();
   return {
     ...actual,
     loadWorkspaceSnapshot: vi.fn().mockResolvedValue(null),
@@ -207,12 +213,17 @@ describe("project choices through lifecycle saves", () => {
     const { handleQuitRequested } = await import("./appLifecycle");
     await handleQuitRequested();
     expect([...(lastSavedMemory() ?? [])]).toEqual([...state.memory]);
-    const args = vi.mocked(invoke).mock.calls
-      .filter(([command]) => command === "workspace_set_snapshot").at(-1)?.[1];
-    const saved = args && typeof args === "object" && "snapshot" in args
-      ? parseWorkspaceSnapshot(args.snapshot) : null;
-    expect(saved?.sessions.find((session) => session.id === "a1")?.worktreeCwd)
-      .toBe("/alpha-worktrees/feature");
+    const args = vi
+      .mocked(invoke)
+      .mock.calls.filter(([command]) => command === "workspace_set_snapshot")
+      .at(-1)?.[1];
+    const saved =
+      args && typeof args === "object" && "snapshot" in args
+        ? parseWorkspaceSnapshot(args.snapshot)
+        : null;
+    expect(
+      saved?.sessions.find((session) => session.id === "a1")?.worktreeCwd,
+    ).toBe("/alpha-worktrees/feature");
   });
 });
 
@@ -294,16 +305,18 @@ describe("coordinated quit", () => {
   }
 
   function invokedWith(command: string) {
-    return vi
-      .mocked(invoke)
-      .mock.calls.find(([name]) => name === command)?.[1];
+    return vi.mocked(invoke).mock.calls.find(([name]) => name === command)?.[1];
   }
 
   it("reports this window's live turns to the coordinator", async () => {
     const release = busyWorkspace();
     try {
       await reportQuitPoll(7);
-      expect(invokedWith("quit_poll_reply")).toEqual({ id: 7, inFlight: 1 });
+      expect(invokedWith("quit_poll_reply")).toEqual({
+        id: 7,
+        inFlight: 1,
+        terminal: 0,
+      });
     } finally {
       release();
     }
@@ -325,7 +338,45 @@ describe("coordinated quit", () => {
     );
     try {
       await reportQuitPoll(1);
-      expect(invokedWith("quit_poll_reply")).toEqual({ id: 1, inFlight: 1 });
+      expect(invokedWith("quit_poll_reply")).toEqual({
+        id: 1,
+        inFlight: 1,
+        terminal: 0,
+      });
+    } finally {
+      release();
+    }
+  });
+
+  it("reports a running terminal session as terminal", async () => {
+    const session = newSession(
+      "claude",
+      "C:/test",
+      undefined,
+      undefined,
+      undefined,
+      {
+        surface: "tui",
+      },
+    );
+    session.busy = true;
+    const tab = newTab(session.id);
+    const release = setQuitWorkspace(
+      () => [session],
+      () => [tab],
+      () => tab.id,
+      () => session.cwd,
+      () => [],
+      () => new Map(),
+      vi.fn(),
+    );
+    try {
+      await reportQuitPoll(5);
+      expect(invokedWith("quit_poll_reply")).toEqual({
+        id: 5,
+        inFlight: 1,
+        terminal: 1,
+      });
     } finally {
       release();
     }
@@ -333,7 +384,11 @@ describe("coordinated quit", () => {
 
   it("reports nothing from a window with no workspace yet", async () => {
     await reportQuitPoll(2);
-    expect(invokedWith("quit_poll_reply")).toEqual({ id: 2, inFlight: 0 });
+    expect(invokedWith("quit_poll_reply")).toEqual({
+      id: 2,
+      inFlight: 0,
+      terminal: 0,
+    });
   });
 
   it("passes a declined dialog back as a refusal", async () => {
@@ -345,7 +400,7 @@ describe("coordinated quit", () => {
   it("asks once using the count from every window", async () => {
     await askQuitConfirmation(4, 5);
     expect(ask).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(ask).mock.calls[0]?.[0]).toContain("5");
+    expect(vi.mocked(ask).mock.calls[0]?.[0]).toContain("5 chats");
     expect(invokedWith("quit_decision")).toEqual({ id: 4, confirmed: true });
   });
 
@@ -454,9 +509,8 @@ describe("remembering the terminal dock side across restarts", () => {
 
   it("saves the chosen side on a coordinated quit", async () => {
     const state = dockWorkspace("right");
-    const { handleQuitRequested, setQuitWorkspace } = await import(
-      "./appLifecycle"
-    );
+    const { handleQuitRequested, setQuitWorkspace } =
+      await import("./appLifecycle");
     const release = setQuitWorkspace(
       () => state.sessions,
       () => state.tabs,

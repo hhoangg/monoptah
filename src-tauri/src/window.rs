@@ -54,6 +54,10 @@ struct QuitRun {
     /// Windows that answered the poll, so their listeners are known to be live.
     replied: HashSet<String>,
     in_flight: u32,
+    /// How many of `in_flight` are terminal turns, which a quit cuts short. A
+    /// window that never answered counts here too: its kind is unknown, and the
+    /// dialog must not promise a resume it cannot vouch for.
+    terminal: u32,
     /// The window showing the dialog, so its close can abort the quit.
     prompt: Option<String>,
 }
@@ -66,6 +70,7 @@ static QUIT_COUNTER: AtomicU32 = AtomicU32::new(1);
 struct QuitConfirm {
     id: u32,
     in_flight: u32,
+    terminal: u32,
 }
 
 pub fn open_new_window(app: &AppHandle) -> Result<(), String> {
@@ -292,12 +297,19 @@ fn begin_run(slot: &mut Option<QuitRun>, id: u32, labels: Vec<String>) -> bool {
         pending: labels.into_iter().collect(),
         replied: HashSet::new(),
         in_flight: 0,
+        terminal: 0,
         prompt: None,
     });
     true
 }
 
-fn record_reply(slot: &mut Option<QuitRun>, id: u32, label: &str, in_flight: u32) -> Next {
+fn record_reply(
+    slot: &mut Option<QuitRun>,
+    id: u32,
+    label: &str,
+    in_flight: u32,
+    terminal: u32,
+) -> Next {
     let Some(run) = slot.as_mut() else {
         return Next::Wait;
     };
@@ -307,6 +319,7 @@ fn record_reply(slot: &mut Option<QuitRun>, id: u32, label: &str, in_flight: u32
     run.pending.remove(label);
     run.replied.insert(label.to_string());
     run.in_flight += in_flight;
+    run.terminal += terminal.min(in_flight);
     if run.pending.is_empty() {
         Next::Confirm
     } else {
@@ -319,14 +332,18 @@ fn record_reply(slot: &mut Option<QuitRun>, id: u32, label: &str, in_flight: u32
 ///
 /// Closes once: a final reply and the poll timeout can land together, and
 /// asking twice would send a second dialog that cancels the first.
-fn close_poll(slot: &mut Option<QuitRun>, id: u32) -> Option<u32> {
+///
+/// Returns `(in_flight, terminal)` read under the one lock, so the pair cannot
+/// be torn by a run cleared in between.
+fn close_poll(slot: &mut Option<QuitRun>, id: u32) -> Option<(u32, u32)> {
     let run = slot
         .as_mut()
         .filter(|run| run.id == id && run.stage == Stage::Polling)?;
     run.in_flight += run.pending.len() as u32;
+    run.terminal += run.pending.len() as u32;
     run.pending.clear();
     run.stage = Stage::Confirming;
-    Some(run.in_flight)
+    Some((run.in_flight, run.terminal))
 }
 
 fn open_commit(slot: &mut Option<QuitRun>, id: u32, labels: Vec<String>) -> bool {
@@ -396,8 +413,20 @@ pub fn request_quit(app: &AppHandle) {
 
 /// One window's live turn count, counted before anything is killed.
 #[tauri::command]
-pub fn quit_poll_reply(app: AppHandle, window: WebviewWindow, id: u32, in_flight: u32) {
-    let next = record_reply(&mut QUIT_RUN.lock().unwrap(), id, window.label(), in_flight);
+pub fn quit_poll_reply(
+    app: AppHandle,
+    window: WebviewWindow,
+    id: u32,
+    in_flight: u32,
+    terminal: u32,
+) {
+    let next = record_reply(
+        &mut QUIT_RUN.lock().unwrap(),
+        id,
+        window.label(),
+        in_flight,
+        terminal,
+    );
     if next == Next::Confirm {
         start_confirm(&app, id);
     }
@@ -479,7 +508,7 @@ pub fn forget_quit_window(app: &AppHandle, label: &str) {
 }
 
 fn start_confirm(app: &AppHandle, id: u32) {
-    let Some(in_flight) = close_poll(&mut QUIT_RUN.lock().unwrap(), id) else {
+    let Some((in_flight, terminal)) = close_poll(&mut QUIT_RUN.lock().unwrap(), id) else {
         return;
     };
     if in_flight == 0 {
@@ -512,7 +541,11 @@ fn start_confirm(app: &AppHandle, id: u32) {
             run.prompt = Some(label.clone());
         }
     }
-    let payload = QuitConfirm { id, in_flight };
+    let payload = QuitConfirm {
+        id,
+        in_flight,
+        terminal,
+    };
     if app
         .emit_to(EventTarget::webview_window(&label), QUIT_CONFIRM, payload)
         .is_err()
@@ -675,23 +708,34 @@ mod tests {
     #[test]
     fn one_window_answering_does_not_decide_for_the_others() {
         let mut slot = polling(&["main", "window-2"]);
-        assert_eq!(record_reply(&mut slot, 1, "main", 0), Next::Wait);
-        assert_eq!(record_reply(&mut slot, 1, "window-2", 2), Next::Confirm);
-        assert_eq!(close_poll(&mut slot, 1), Some(2));
+        assert_eq!(record_reply(&mut slot, 1, "main", 0, 0), Next::Wait);
+        assert_eq!(record_reply(&mut slot, 1, "window-2", 2, 0), Next::Confirm);
+        assert_eq!(close_poll(&mut slot, 1), Some((2, 0)));
     }
 
     #[test]
     fn a_window_that_never_answers_counts_as_busy() {
         let mut slot = polling(&["main", "window-2"]);
-        record_reply(&mut slot, 1, "main", 0);
+        record_reply(&mut slot, 1, "main", 0, 0);
         // The poll timed out with window-2 still owing an answer.
-        assert_eq!(close_poll(&mut slot, 1), Some(1));
+        assert_eq!(close_poll(&mut slot, 1), Some((1, 1)));
+    }
+
+    #[test]
+    fn terminal_turns_are_counted_and_silence_counts_as_terminal() {
+        let mut slot = polling(&["main", "window-2", "window-3"]);
+        record_reply(&mut slot, 1, "main", 3, 1);
+        record_reply(&mut slot, 1, "window-2", 2, 9);
+        // window-3 never answered: busy, and not vouched for as resumable.
+        assert_eq!(close_poll(&mut slot, 1), Some((6, 4)));
+        // A window cannot report more terminal turns than turns.
+        assert_eq!(slot.as_ref().map(|run| run.terminal), Some(1 + 2 + 1));
     }
 
     #[test]
     fn replies_from_a_stale_run_are_ignored() {
         let mut slot = polling(&["main"]);
-        assert_eq!(record_reply(&mut slot, 99, "main", 5), Next::Wait);
+        assert_eq!(record_reply(&mut slot, 99, "main", 5, 0), Next::Wait);
         assert_eq!(in_flight(&slot), Some(0));
     }
 
@@ -705,7 +749,7 @@ mod tests {
     #[test]
     fn a_second_quit_leaves_the_open_dialog_in_charge() {
         let mut slot = polling(&["main"]);
-        record_reply(&mut slot, 1, "main", 1);
+        record_reply(&mut slot, 1, "main", 1, 0);
         close_poll(&mut slot, 1);
         assert!(!begin_run(&mut slot, 2, vec!["main".to_string()]));
         assert_eq!(slot.as_ref().map(|run| run.id), Some(1));
@@ -714,7 +758,7 @@ mod tests {
     #[test]
     fn only_windows_that_answered_are_offered_the_dialog() {
         let mut slot = polling(&["main", "window-2"]);
-        record_reply(&mut slot, 1, "window-2", 1);
+        record_reply(&mut slot, 1, "window-2", 1, 0);
         // main never answered, so it is still booting or wedged: asking it
         // would leave the dialog unshown and the quit with nothing to await.
         let replied = slot.as_ref().map(|run| run.replied.clone());
@@ -724,16 +768,16 @@ mod tests {
     #[test]
     fn a_final_reply_and_the_timeout_cannot_both_close_the_poll() {
         let mut slot = polling(&["main"]);
-        record_reply(&mut slot, 1, "main", 1);
-        assert_eq!(close_poll(&mut slot, 1), Some(1));
+        record_reply(&mut slot, 1, "main", 1, 0);
+        assert_eq!(close_poll(&mut slot, 1), Some((1, 0)));
         assert_eq!(close_poll(&mut slot, 1), None);
     }
 
     #[test]
     fn the_app_exits_only_once_every_window_has_persisted() {
         let mut slot = polling(&["main", "window-2"]);
-        record_reply(&mut slot, 1, "main", 1);
-        record_reply(&mut slot, 1, "window-2", 0);
+        record_reply(&mut slot, 1, "main", 1, 0);
+        record_reply(&mut slot, 1, "window-2", 0, 0);
         close_poll(&mut slot, 1);
         let labels = vec!["main".to_string(), "window-2".to_string()];
         assert!(open_commit(&mut slot, 1, labels));
@@ -744,14 +788,14 @@ mod tests {
     #[test]
     fn a_window_closing_mid_poll_is_not_waited_on() {
         let mut slot = polling(&["main", "window-2"]);
-        record_reply(&mut slot, 1, "main", 0);
+        record_reply(&mut slot, 1, "main", 0, 0);
         assert_eq!(drop_window(&mut slot, "window-2"), Next::Confirm);
     }
 
     #[test]
     fn closing_the_window_holding_the_dialog_aborts_the_quit() {
         let mut slot = polling(&["main"]);
-        record_reply(&mut slot, 1, "main", 1);
+        record_reply(&mut slot, 1, "main", 1, 0);
         close_poll(&mut slot, 1);
         if let Some(run) = slot.as_mut() {
             run.prompt = Some("main".to_string());
@@ -762,8 +806,8 @@ mod tests {
     #[test]
     fn another_window_closing_leaves_the_dialog_alone() {
         let mut slot = polling(&["main", "window-2"]);
-        record_reply(&mut slot, 1, "main", 1);
-        record_reply(&mut slot, 1, "window-2", 0);
+        record_reply(&mut slot, 1, "main", 1, 0);
+        record_reply(&mut slot, 1, "window-2", 0, 0);
         close_poll(&mut slot, 1);
         if let Some(run) = slot.as_mut() {
             run.prompt = Some("main".to_string());

@@ -3,6 +3,7 @@ import type {
   HarnessId,
   Session,
 } from "../../../features/sessions/model/session";
+import { shellPath } from "../../../features/orchestration/model/orchestration";
 import { runtimeModeToPermission } from "../providers/claude/claudeProtocol";
 
 /** What a provider's interactive CLI is known to accept at launch. */
@@ -58,7 +59,43 @@ export type TuiLaunchOptions = {
    * was saved but never reached the CLI, which `--resume` cannot open.
    */
   newProviderSessionId?: string;
+  /**
+   * Where Claude Code hooks should report busy/idle. Absent when the user turned
+   * hooks off or the paths are unknown, and then no `--settings` is passed.
+   */
+  hookNotify?: { cliPath: string; spoolDir: string };
+  /**
+   * The app runs on Windows. Claude runs a hook command through Git Bash or
+   * PowerShell there, and no one command string is safe in both, so hooks are
+   * not injected and busy detection is simply unavailable.
+   */
+  isWindows?: boolean;
 };
+
+/** Hook events that tell the app a terminal turn started or ended. */
+export const TUI_HOOK_EVENTS = [
+  "UserPromptSubmit",
+  "Stop",
+  "StopFailure",
+  "SessionEnd",
+  "Notification",
+] as const;
+
+/**
+ * The `--settings` JSON that makes Claude call back into this app. Claude merges
+ * it with the user's own hooks. `async` keeps a hook from ever slowing the CLI.
+ */
+export function tuiHookSettings(notify: {
+  cliPath: string;
+  spoolDir: string;
+}): string {
+  const command = `${shellPath(notify.cliPath)} tui-hook --spool ${shellPath(notify.spoolDir)}`;
+  const hooks: Record<string, unknown> = {};
+  for (const event of TUI_HOOK_EVENTS) {
+    hooks[event] = [{ hooks: [{ type: "command", command, async: true }] }];
+  }
+  return JSON.stringify({ hooks });
+}
 
 /** Program and arguments that start `session`'s interactive CLI in a PTY. */
 export function buildTuiLaunch(
@@ -79,6 +116,14 @@ export function buildTuiLaunch(
       "--permission-mode",
       runtimeModeToPermission(session.runtimeMode),
     );
+  }
+
+  if (
+    session.harness === "claude" &&
+    options.hookNotify &&
+    !options.isWindows
+  ) {
+    args.push("--settings", tuiHookSettings(options.hookNotify));
   }
 
   const resuming = caps.resume && !!session.providerSessionId;

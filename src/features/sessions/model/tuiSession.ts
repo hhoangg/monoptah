@@ -63,6 +63,64 @@ export function tuiBinaryIdentity(
     : { binaryProvider: harness };
 }
 
+/**
+ * Hook reporting for a terminal launch, or nothing when the user turned Claude
+ * Code hooks off or a path is unknown. Without it busy detection stays dark.
+ */
+export function tuiHookNotify(
+  hooksEnabled: boolean,
+  cliPath: string | undefined,
+  spoolDir: string | undefined,
+): { cliPath: string; spoolDir: string } | undefined {
+  return hooksEnabled && cliPath && spoolDir
+    ? { cliPath, spoolDir }
+    : undefined;
+}
+
+/** A busy/idle change reported by a Claude Code hook (`tui-hook` event). */
+export type TuiHookEvent = { providerSessionId: string; busy: boolean };
+
+/** The terminal session that owns a hook's provider session id, if any. */
+export function findTuiSessionByProviderId<
+  T extends Pick<Session, "surface" | "providerSessionId">,
+>(sessions: readonly T[], providerSessionId: string): T | undefined {
+  if (!providerSessionId) return undefined;
+  return sessions.find(
+    (session) =>
+      session.surface === "tui" &&
+      session.providerSessionId === providerSessionId,
+  );
+}
+
+/** Applies a hook's busy state. Returns the same object when nothing changes. */
+export function applyTuiHookEvent(
+  session: Session,
+  event: Pick<TuiHookEvent, "busy">,
+): Session {
+  if (session.surface !== "tui" || !!session.busy === event.busy) {
+    return session;
+  }
+  return { ...session, busy: event.busy };
+}
+
+/**
+ * `applyTuiHookEvent` over a list, for a functional state update: it must work
+ * on the list React hands it, never a snapshot, or it would undo a concurrent
+ * change (such as the CLI's title). Returns the same array when nothing changes.
+ */
+export function applyTuiBusyToSessions(
+  sessions: Session[],
+  sessionId: string,
+  busy: boolean,
+): Session[] {
+  const next = sessions.map((session) =>
+    session.id === sessionId ? applyTuiHookEvent(session, { busy }) : session,
+  );
+  return next.some((session, index) => session !== sessions[index])
+    ? next
+    : sessions;
+}
+
 /** What a terminal session may change about itself, saved with the workspace. */
 export type TuiSessionPatch = {
   /** `null` forgets the saved conversation so the next launch starts fresh. */

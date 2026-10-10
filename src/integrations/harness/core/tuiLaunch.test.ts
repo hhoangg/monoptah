@@ -4,7 +4,7 @@ import {
   type HarnessId,
   type RuntimeMode,
 } from "../../../features/sessions/model/session";
-import { buildTuiLaunch, TUI_CAPS } from "./tuiLaunch";
+import { buildTuiLaunch, TUI_CAPS, tuiHookSettings } from "./tuiLaunch";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -217,5 +217,89 @@ describe("claiming a saved id for a new conversation", () => {
         { binaryPath: "/bin/codex", newProviderSessionId: "saved-id" },
       ),
     ).toEqual({ program: "/bin/codex", args: [] });
+  });
+});
+
+describe("buildTuiLaunch hook injection", () => {
+  const hookNotify = {
+    cliPath: "/Applications/Monoptah.app/Contents/MacOS/monocode",
+    spoolDir: "/Users/me/Library/Application Support/x/tui-hooks",
+  };
+
+  it("passes no --settings without hookNotify", () => {
+    const { args } = buildTuiLaunch(session(), { binaryPath });
+    expect(args).not.toContain("--settings");
+  });
+
+  it("passes no --settings on Windows, where no one command suits both shells", () => {
+    const { args } = buildTuiLaunch(session(), {
+      binaryPath: "C:\\Users\\me\\claude.exe",
+      hookNotify: {
+        cliPath: "C:\\Program Files\\Monoptah\\monocode.exe",
+        spoolDir: "C:\\Users\\me\\AppData\\tui-hooks",
+      },
+      isWindows: true,
+    });
+    expect(args).not.toContain("--settings");
+  });
+
+  it("registers async hooks on the argv when hookNotify is given", () => {
+    const { args } = buildTuiLaunch(session(), { binaryPath, hookNotify });
+    const json = JSON.parse(args[args.indexOf("--settings") + 1]);
+    expect(Object.keys(json.hooks).sort()).toEqual(
+      [
+        "Notification",
+        "SessionEnd",
+        "Stop",
+        "StopFailure",
+        "UserPromptSubmit",
+      ].sort(),
+    );
+    for (const groups of Object.values<any>(json.hooks)) {
+      expect(groups[0].hooks[0]).toMatchObject({
+        type: "command",
+        async: true,
+      });
+    }
+  });
+
+  it("quotes paths that contain spaces", () => {
+    const json = JSON.parse(tuiHookSettings(hookNotify));
+    const command = json.hooks.Stop[0].hooks[0].command;
+    expect(command).toBe(
+      "/Applications/Monoptah.app/Contents/MacOS/monocode tui-hook --spool '/Users/me/Library/Application Support/x/tui-hooks'",
+    );
+    const spaced = JSON.parse(
+      tuiHookSettings({ ...hookNotify, cliPath: "/My Apps/monocode" }),
+    );
+    expect(spaced.hooks.Stop[0].hooks[0].command).toContain(
+      "'/My Apps/monocode' tui-hook",
+    );
+  });
+
+  it("keeps the resume id and trailing prompt in place", () => {
+    const fresh = buildTuiLaunch(session(), {
+      binaryPath,
+      hookNotify,
+      initialPrompt: "go",
+    });
+    expect(fresh.args.at(-1)).toBe("go");
+    expect(fresh.args.at(-2)).toBe(fresh.providerSessionId);
+    const resumed = buildTuiLaunch(session({ providerSessionId: "p1" }), {
+      binaryPath,
+      hookNotify,
+    });
+    expect(resumed.args.at(-1)).toBe("p1");
+    expect(resumed.args).toContain("--settings");
+  });
+
+  it("never injects hooks for other providers", () => {
+    for (const harness of HARNESSES.filter((id) => id !== "claude")) {
+      const { args } = buildTuiLaunch(session({ harness }), {
+        binaryPath,
+        hookNotify,
+      });
+      expect(args).not.toContain("--settings");
+    }
   });
 });

@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { buildTuiLaunch } from "../../../integrations/harness/core/tuiLaunch";
 import { resolveTuiBinary } from "../../../integrations/harness/core/tuiBinary";
@@ -10,6 +11,8 @@ import {
   selectedProviderAccountId,
   supportsProviderAccounts,
 } from "../../providers/model/providerAccounts";
+import { IS_WIN } from "../../../platform/tauri/platform";
+import { loadClaudeHooks } from "../../settings/model/settings";
 import { HARNESS_TITLE, type Session } from "../model/session";
 import {
   TUI_EARLY_EXIT_MS,
@@ -19,6 +22,7 @@ import {
   cleanTuiTitle,
   tuiBinaryIdentity,
   tuiExitNotice,
+  tuiHookNotify,
   tuiLaunchCwd,
   tuiProviderAccount,
   tuiPtyId,
@@ -129,13 +133,34 @@ export function TuiSessionPane({
       }
       const binaryPath = await resolveTuiBinary(current.harness);
       if (cancelled) return;
+      // Busy/idle comes from Claude Code hooks calling back into this app. A
+      // failed lookup just leaves the session without it.
+      const [cliPath, spoolDir] =
+        current.harness === "claude" && loadClaudeHooks() && !IS_WIN
+          ? await Promise.all([
+              invoke<string>("app_cli_path").catch(() => undefined),
+              invoke<string>("tui_hook_spool_dir").catch(() => undefined),
+            ])
+          : [undefined, undefined];
+      if (cancelled) return;
+      const hookNotify = tuiHookNotify(loadClaudeHooks(), cliPath, spoolDir);
       const claim = claimId.current;
       claimId.current = undefined;
       const built = buildTuiLaunch(
         claim ? { ...current, providerSessionId: undefined } : current,
         claim
-          ? { binaryPath, newProviderSessionId: claim }
-          : { binaryPath, initialPrompt: current.initialPrompt },
+          ? {
+              binaryPath,
+              newProviderSessionId: claim,
+              hookNotify,
+              isWindows: IS_WIN,
+            }
+          : {
+              binaryPath,
+              initialPrompt: current.initialPrompt,
+              hookNotify,
+              isWindows: IS_WIN,
+            },
       );
       const pinAccount = accountId && accountId !== current.providerAccountId;
       // Saved before anything can start the CLI. A pane that remounted or an

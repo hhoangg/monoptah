@@ -1,11 +1,17 @@
-import { leafIds, newTab, type WorkspaceTab } from "../../workspace/model/layout";
-import type { DockSide, ProjectTerminalDock } from "../../projects/model/projectTerminal";
+import {
+  leafIds,
+  newTab,
+  type WorkspaceTab,
+} from "../../workspace/model/layout";
+import type {
+  DockSide,
+  ProjectTerminalDock,
+} from "../../projects/model/projectTerminal";
 import { sessionNeedsInput, type Session } from "./session";
 import { stopStreaming } from "../../../integrations/harness/core/apply";
 import type { ProjectReturnMemory } from "../../projects/model/projectReturn";
 
-export const INTERRUPT_MESSAGE =
-  "Turn interrupted when MonoCode quit.";
+export const INTERRUPT_MESSAGE = "Turn interrupted when MonoCode quit.";
 
 export const CONTINUE_PROMPT = "Continue from where you left off.";
 
@@ -61,11 +67,39 @@ export function inFlightRefs(
   return refs;
 }
 
-export function quitWhileBusyMessage(count: number): string {
-  if (count === 1) {
-    return "1 chat is still running. Quit anyway? It will resume when you reopen Monoptah.";
+/**
+ * Says what is true of each kind: a chat turn is resumed on reopen
+ * (`persistQuitState` records it); a terminal turn dies with the CLI and is
+ * never re-sent, but its conversation is kept, because the session stores the
+ * conversation id minted before the CLI started and relaunches with
+ * `claude --resume`.
+ *
+ * The terminal clause promises the conversation is saved, not that it comes
+ * back on its own. Reopening the tab for you needs the session to be in the
+ * workspace snapshot, which a parked session or a second window that lost the
+ * last-writer race is not, and `close_poll` charges a window that never
+ * answered the poll one terminal turn whose kind nobody can vouch for.
+ */
+export function quitWhileBusyMessage(chats: number, terminals: number): string {
+  const chatText = `${chats} ${chats === 1 ? "chat" : "chats"}`;
+  const terminalText = `${terminals} terminal ${terminals === 1 ? "turn" : "turns"}`;
+  if (terminals === 0) {
+    return chats === 1
+      ? `${chatText} is still running. Quit anyway? It will resume when you reopen Monoptah.`
+      : `${chatText} are still running. Quit anyway? They will resume when you reopen Monoptah.`;
   }
-  return `${count} chats are still running. Quit anyway? They will resume when you reopen Monoptah.`;
+  if (chats === 0) {
+    return terminals === 1
+      ? `${terminalText} is still running. Quit anyway? It will stop, though its conversation is saved.`
+      : `${terminalText} are still running. Quit anyway? They will stop, though their conversations are saved.`;
+  }
+  const chatClause =
+    chats === 1 ? "The chat will resume" : "The chats will resume";
+  const terminalClause =
+    terminals === 1
+      ? "the terminal turn will stop, though its conversation is saved"
+      : "the terminal turns will stop, though their conversations are saved";
+  return `${chatText} and ${terminalText} are still running. Quit anyway? ${chatClause} when you reopen Monoptah; ${terminalClause}.`;
 }
 
 /**

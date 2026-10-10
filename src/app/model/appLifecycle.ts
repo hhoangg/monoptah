@@ -16,16 +16,25 @@ import {
   workspaceFromResumed,
   type ResumedWorkspace,
 } from "../../features/sessions/model/inFlight";
-import { leafIds, type WorkspaceTab } from "../../features/workspace/model/layout";
+import {
+  leafIds,
+  type WorkspaceTab,
+} from "../../features/workspace/model/layout";
 import { killPty } from "../../platform/tauri/pty";
 import {
   projectTerminalFileIds,
   type DockSide,
   type ProjectTerminalDock,
 } from "../../features/projects/model/projectTerminal";
-import { sessionWorkCwd, type Session } from "../../features/sessions/model/session";
+import {
+  sessionWorkCwd,
+  type Session,
+} from "../../features/sessions/model/session";
 import { sessionChildHarnesses } from "../../features/sessions/model/handoff";
-import { isTuiSession, tuiPtyId } from "../../features/sessions/model/tuiSession";
+import {
+  isTuiSession,
+  tuiPtyId,
+} from "../../features/sessions/model/tuiSession";
 import {
   getSession,
   listInFlightSessions,
@@ -44,7 +53,11 @@ import {
 } from "../../features/workspace/model/workspaceSnapshot";
 import { loadWindowTransfer } from "./windowTransferBootstrap";
 import type { WindowTransferPayload } from "./windowTransfer";
-import { lastProjectPath, normalizeProjectPath, sameProjectPath } from "../../features/projects/model/recents";
+import {
+  lastProjectPath,
+  normalizeProjectPath,
+  sameProjectPath,
+} from "../../features/projects/model/recents";
 import type { ProjectReturnMemory } from "../../features/projects/model/projectReturn";
 
 export type { ResumedWorkspace };
@@ -149,29 +162,38 @@ export async function handleQuitRequested(): Promise<boolean> {
 /** Each window counts its own live turns; Rust sums them into one decision. */
 export async function reportQuitPoll(id: number): Promise<void> {
   let inFlight = 0;
+  let terminal = 0;
   if (liveWorkspace) {
     liveWorkspace.flush();
     // Every running turn, not just the resumable ones `inFlightRefs` keeps:
     // an Inbox Ask still counts as work nobody agreed to throw away.
-    inFlight = liveWorkspace.sessions().filter(isInFlightSession).length;
+    const running = liveWorkspace.sessions().filter(isInFlightSession);
+    inFlight = running.length;
+    terminal = running.filter(isTuiSession).length;
   }
-  await invoke("quit_poll_reply", { id, inFlight }).catch(() => undefined);
+  await invoke("quit_poll_reply", { id, inFlight, terminal }).catch(
+    () => undefined,
+  );
 }
 
 /** The one quit dialog, shown by whichever window the coordinator picked. */
 export async function askQuitConfirmation(
   id: number,
   inFlight: number,
+  terminal = 0,
 ): Promise<void> {
   let confirmed = false;
   if (!quitDialogOpen) {
     quitDialogOpen = true;
     try {
-      confirmed = await ask(quitWhileBusyMessage(inFlight), {
-        title: "Monoptah",
-        kind: "warning",
-        okLabel: "Quit",
-      });
+      confirmed = await ask(
+        quitWhileBusyMessage(inFlight - terminal, terminal),
+        {
+          title: "Monoptah",
+          kind: "warning",
+          okLabel: "Quit",
+        },
+      );
     } catch {
       confirmed = false;
     } finally {
@@ -321,7 +343,8 @@ async function loadResumedWorkspaceOnce(): Promise<ResumedWorkspace | null> {
         // Idle transcripts already came from disk. Rewriting every open chat
         // here serialized/indexed the entire workspace before first paint.
         .filter(
-          (session) => interrupted.has(session.id) && shouldPersistSession(session),
+          (session) =>
+            interrupted.has(session.id) && shouldPersistSession(session),
         )
         .map((session) => upsertSession(session).catch(() => null)),
     );
@@ -395,7 +418,7 @@ export async function persistQuitState(
   // A quit ends the process, so a swallowed write is work that never comes
   // back: let it reject and let the caller call the quit off. An unload is a
   // reload, where best effort is enough and failing loudly helps nobody.
-  const write = <T,>(pending: Promise<T>): Promise<T | null> =>
+  const write = <T>(pending: Promise<T>): Promise<T | null> =>
     mode === "quit" ? pending : pending.catch(() => null);
 
   await Promise.all(
@@ -428,7 +451,9 @@ export async function persistQuitState(
   }
 }
 
-async function persistBootingResume(workspace: ResumedWorkspace): Promise<void> {
+async function persistBootingResume(
+  workspace: ResumedWorkspace,
+): Promise<void> {
   await Promise.all(
     workspace.sessions
       .filter(shouldPersistSession)
@@ -446,12 +471,10 @@ async function persistBootingResume(workspace: ResumedWorkspace): Promise<void> 
     ),
   ).catch(() => undefined);
   await replaceInFlightSessions(
-    workspace.sessions
-      .filter(wasTurnInterrupted)
-      .map((session) => ({
-        sessionId: session.id,
-        cwd: session.cwd,
-      })),
+    workspace.sessions.filter(wasTurnInterrupted).map((session) => ({
+      sessionId: session.id,
+      cwd: session.cwd,
+    })),
   ).catch(() => undefined);
 }
 

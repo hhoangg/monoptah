@@ -5,7 +5,7 @@ sessions in the provider's own interactive CLI instead: **Settings → Providers
 (provider) → Session surface → Terminal (TUI)**.
 
 The choice is made when a session is created and stays with it. Switching the
-setting back to Chat only affects *new* sessions; open terminal sessions stay
+setting back to Chat only affects _new_ sessions; open terminal sessions stay
 terminal sessions. There is no way to convert an existing session.
 
 ## What runs
@@ -14,11 +14,11 @@ The tab runs the provider's CLI in a terminal, in the project folder, using the
 binary path from the provider settings. If you picked a non-default Claude or
 Codex account, the CLI starts under that account's profile.
 
-| Provider | Launch |
-| --- | --- |
-| Claude Code | `claude --model <model> --permission-mode <mode>`, plus a conversation id (below) and the first prompt, if any |
-| Antigravity | `agy` (the interactive CLI, not the ACP server the chat uses) |
-| Everyone else | the bare CLI, fresh each time |
+| Provider      | Launch                                                                                                         |
+| ------------- | -------------------------------------------------------------------------------------------------------------- |
+| Claude Code   | `claude --model <model> --permission-mode <mode>`, plus a conversation id (below) and the first prompt, if any |
+| Antigravity   | `agy` (the interactive CLI, not the ACP server the chat uses)                                                  |
+| Everyone else | the bare CLI, fresh each time                                                                                  |
 
 Every provider is offered, whether or not its CLI has an interactive mode. A
 CLI without one exits right away. The bar under the terminal then reads
@@ -55,8 +55,34 @@ the CLI process.
   session, so the Conversation setting (continue the last run) is unavailable.
   A "new worktree" automation creates its worktree before the CLI starts. The
   run is recorded as succeeded once the CLI stays up for a few seconds, and as
-  failed if it exits or cannot start in that time. The app cannot see when a
-  terminal turn ends, so success means the CLI took the prompt.
+  failed if it exits or cannot start in that time. Run success still means the
+  CLI took the prompt, not that its turn finished.
+- A Claude terminal session shows as busy while a turn runs. The app learns this
+  from Claude Code hooks it adds to the launch with `--settings`: a submitted
+  prompt marks it busy, and `Stop`, `StopFailure`, `SessionEnd` or the CLI
+  exiting mark it idle. Permission and "needs input" notifications do not clear
+  busy.
+  - Claude does not fire `Stop` when you interrupt a turn with Esc. That case
+    only clears when Claude's idle prompt notification arrives, which comes after
+    Claude has been waiting for about a minute, so the session stays busy that
+    long.
+  - Your own hooks are not affected: Claude merges the injected ones with them.
+    With **Claude Code hooks** turned off in Settings this app injects nothing,
+    so a terminal session never shows as busy.
+  - Known limitation: the **Claude Code hooks** setting behaves differently on
+    the two surfaces. For a chat session it also turns off every hook, yours
+    included. For a terminal session it only stops this app injecting its own
+    hooks, and your own global hooks still run. Someone who turned the setting
+    off because a hook is slow or destructive will still see that hook fire in
+    every terminal session.
+  - Busy state does not survive a restart: the workspace snapshot always
+    restores `busy: false`, and any event left in the spool is pruned before the
+    first read. Afterwards only a stale _busy_ event is ignored; a stale idle one
+    still applies, because nothing else would ever clear the flag.
+  - On Windows nothing is injected, because Claude runs a hook command through
+    Git Bash or PowerShell and no one command works in both. A terminal session
+    never shows as busy there.
+  - Other providers have no hook integration and also never show as busy.
 - Inbox **Start work** passes its prompt to Claude as the first prompt. For a
   provider whose CLI cannot take one, the session opens as chat instead.
 - "New worktree" on first send is unavailable; the header shows it disabled.

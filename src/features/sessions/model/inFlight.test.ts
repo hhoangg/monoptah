@@ -14,10 +14,7 @@ import {
 } from "./inFlight";
 import { newSession, type Session } from "./session";
 
-function chat(
-  cwd: string,
-  patch: Partial<Session> = {},
-): Session {
+function chat(cwd: string, patch: Partial<Session> = {}): Session {
   const session = newSession("cursor", cwd);
   session.blocks = [{ id: "u1", role: "user", text: "hello" }];
   return { ...session, ...patch, blocks: patch.blocks ?? session.blocks };
@@ -72,9 +69,7 @@ describe("inFlightRefs", () => {
     blank.busy = true;
 
     const tabs = [newTab(idle.id), newTab(openBusy.id)];
-    expect(
-      inFlightRefs([parked, openBusy, idle, blank], tabs),
-    ).toEqual([
+    expect(inFlightRefs([parked, openBusy, idle, blank], tabs)).toEqual([
       { sessionId: openBusy.id, cwd: "/tmp/open" },
       { sessionId: parked.id, cwd: "/tmp/parked" },
     ]);
@@ -178,7 +173,9 @@ describe("markTurnInterrupted", () => {
     expect(
       second.blocks.filter((block) => block.text === INTERRUPT_MESSAGE),
     ).toHaveLength(2);
-    expect(second.blocks[second.blocks.length - 1]?.text).toBe(INTERRUPT_MESSAGE);
+    expect(second.blocks[second.blocks.length - 1]?.text).toBe(
+      INTERRUPT_MESSAGE,
+    );
     expect(canAutoContinue(second)).toBe(true);
   });
 
@@ -202,9 +199,39 @@ describe("markTurnInterrupted", () => {
 });
 
 describe("quitWhileBusyMessage", () => {
-  it("mentions resume on reopen", () => {
-    expect(quitWhileBusyMessage(1)).toContain("1 chat is still running");
-    expect(quitWhileBusyMessage(3)).toContain("3 chats are still running");
+  it("says chats resume", () => {
+    expect(quitWhileBusyMessage(1, 0)).toBe(
+      "1 chat is still running. Quit anyway? It will resume when you reopen Monoptah.",
+    );
+    expect(quitWhileBusyMessage(3, 0)).toBe(
+      "3 chats are still running. Quit anyway? They will resume when you reopen Monoptah.",
+    );
+  });
+
+  it("says a terminal turn stops with its conversation saved", () => {
+    expect(quitWhileBusyMessage(0, 1)).toBe(
+      "1 terminal turn is still running. Quit anyway? It will stop, though its conversation is saved.",
+    );
+    expect(quitWhileBusyMessage(0, 2)).toBe(
+      "2 terminal turns are still running. Quit anyway? They will stop, though their conversations are saved.",
+    );
+  });
+
+  it("splits a mix by kind with correct plurals", () => {
+    expect(quitWhileBusyMessage(1, 1)).toBe(
+      "1 chat and 1 terminal turn are still running. Quit anyway? The chat will resume when you reopen Monoptah; the terminal turn will stop, though its conversation is saved.",
+    );
+    expect(quitWhileBusyMessage(2, 3)).toBe(
+      "2 chats and 3 terminal turns are still running. Quit anyway? The chats will resume when you reopen Monoptah; the terminal turns will stop, though their conversations are saved.",
+    );
+    // Each kind takes its own plural, and the resume promise stays with the
+    // chat clause.
+    expect(quitWhileBusyMessage(1, 2)).toBe(
+      "1 chat and 2 terminal turns are still running. Quit anyway? The chat will resume when you reopen Monoptah; the terminal turns will stop, though their conversations are saved.",
+    );
+    expect(quitWhileBusyMessage(2, 1)).toBe(
+      "2 chats and 1 terminal turn are still running. Quit anyway? The chats will resume when you reopen Monoptah; the terminal turn will stop, though its conversation is saved.",
+    );
   });
 });
 
@@ -237,9 +264,9 @@ describe("canAutoContinue", () => {
     expect(canAutoContinue(chat("/tmp/a", { providerSessionId: "p1" }))).toBe(
       false,
     );
-    expect(canAutoContinue(markTurnInterrupted(chat("/tmp/a", { busy: true })))).toBe(
-      false,
-    );
+    expect(
+      canAutoContinue(markTurnInterrupted(chat("/tmp/a", { busy: true }))),
+    ).toBe(false);
     expect(
       canAutoContinue({
         ...interrupted,
@@ -263,7 +290,12 @@ describe("shouldWriteInFlightSnapshot", () => {
 
   it("writes when a chat becomes in-flight", () => {
     expect(
-      shouldWriteInFlightSnapshot("a", [{ sessionId: "a", cwd: "/tmp" }], null, false),
+      shouldWriteInFlightSnapshot(
+        "a",
+        [{ sessionId: "a", cwd: "/tmp" }],
+        null,
+        false,
+      ),
     ).toBe(true);
   });
 
@@ -273,7 +305,12 @@ describe("shouldWriteInFlightSnapshot", () => {
 
   it("skips unchanged keys", () => {
     expect(
-      shouldWriteInFlightSnapshot("a", [{ sessionId: "a", cwd: "/tmp" }], "a", true),
+      shouldWriteInFlightSnapshot(
+        "a",
+        [{ sessionId: "a", cwd: "/tmp" }],
+        "a",
+        true,
+      ),
     ).toBe(false);
   });
 });
