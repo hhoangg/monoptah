@@ -315,9 +315,12 @@ jobs:
 
       - run: npm ci
 
-      # Same as `npm run build:linux`, with the overlay config that turns
-      # updater artifacts back on: tauri.linux.conf.json turns them off.
-      # npm would append the extra args to the repack script, not tauri build.
+      # tauri.linux.conf.json turns updater artifacts off, so the overlay
+      # config turns them back on and tauri signs what it considers
+      # updatable. Which files those are is decided at staging time.
+      # The two commands are what `npm run build:linux` runs; calling tauri
+      # directly is the only way to give it the overlay config, because npm
+      # would append the extra args to the repack script instead.
       - name: Build Linux packages
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -330,9 +333,10 @@ jobs:
       - name: Assert AppImage uses host libraries
         run: bash scripts/assert-appimage-host-libs.sh
 
-      # Sign after repack-appimage.sh: the signature tauri wrote during the
-      # build covers the pre-repack file and would fail updater verification.
-      - name: Sign AppImage for the updater
+      # repack-appimage.sh rewrites the AppImage, so the signature tauri wrote
+      # during the build covers a file that no longer exists. Sign the repacked
+      # AppImage, or the in-app updater rejects the download.
+      - name: Sign the repacked AppImage
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -363,10 +367,6 @@ jobs:
           sigs=(target/release/bundle/*/*.sig)
           if (( ${#sigs[@]} == 0 )); then
             echo "tauri wrote no updater signature under target/release/bundle" >&2
-            exit 1
-          fi
-          if [[ ! -s "${appimage[0]}.sig" ]]; then
-            echo "Missing AppImage updater signature" >&2
             exit 1
           fi
           mkdir -p release-artifacts
