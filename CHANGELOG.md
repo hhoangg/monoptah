@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.15.0] - 2026-10-10
+
+### Added
+
+- Creating a session **asks which provider to use when the default one opens as a terminal session**. A terminal (TUI) session runs the provider's own CLI, so it carries no model picker: once it exists there is no way to switch provider from inside the app, and a TUI default therefore pinned every new session to that one provider. `Cmd+T`, the **New Tab** menu item and the sidebar **+** buttons now open a dialog listing every provider the model picker would show, each badged with the surface it opens, and start the session with the one you pick. The choice applies to that session only, so the default stays whatever **Settings > Providers** says. Nothing changes when the default provider opens as chat, when the project is remote, where a terminal session is downgraded to chat anyway, or when only one provider is available and there is nothing to choose. Creating a session from a sidebar folder's **+** still files it into that folder, and cancelling the dialog leaves no session behind.
+
+
 ## [0.14.0] - 2026-10-10
 
 Carries the upstream MonoCode 0.12.0 changes below.
