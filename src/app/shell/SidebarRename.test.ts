@@ -2132,10 +2132,15 @@ describe("new session in a folder", () => {
 
   it("places nothing when the deferred creation is cancelled", () => {
     seedFolder();
-    props.onNew = () => {};
+    let captured: ((id: string) => void) | undefined;
+    props.onNew = (onCreated) => {
+      captured = onCreated;
+    };
     act(() => render());
     clickNewSession();
 
+    // A continuation was handed over; the prompt is cancelled by never calling it.
+    expect(captured).toBeTypeOf("function");
     expect(loadSessionFolders(props.cwd)[0].sessionIds).toEqual(["session-1"]);
   });
 
