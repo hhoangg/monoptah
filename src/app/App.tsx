@@ -44,7 +44,10 @@ import {
   workspaceIdentity,
   type ControlOutcome,
 } from "../features/orchestration/model/orchestration";
-import { modelsFor } from "../features/sessions/model/models";
+import {
+  defaultSessionChoice,
+  modelsFor,
+} from "../features/sessions/model/models";
 import { isHarnessAvailable } from "../integrations/harness/core/availability";
 import {
   completeOrchestrationProposal,
@@ -421,6 +424,8 @@ import {
 } from "../features/workspace/model/workspaceTabGroups";
 import { applyAddToChatRequest } from "../features/sessions/model/addChatToWorkspace";
 import { newWorkspaceSession } from "./model/newWorkspaceSession";
+import { shouldPromptForProvider } from "../features/sessions/model/newSessionProviderPrompt";
+import { NewSessionProviderDialog } from "../features/sessions/ui/NewSessionProviderDialog";
 import {
   ADD_TO_CHAT_EVENT,
   type AddToChatRequest,
@@ -1089,6 +1094,10 @@ function Workspace({
     title: string;
     unusedWorktree: string;
     resolve: (choice: SessionDeleteChoice) => void;
+  }>();
+  const [newSessionPrompt, setNewSessionPrompt] = useState<{
+    cwd: string;
+    onCreated?: (id: string) => void;
   }>();
   const switchingWorktrees = useRef(new Map<string, string>());
   const removingWorktreePaths = useRef(new Set<string>());
@@ -2722,24 +2731,51 @@ function Workspace({
     [appendTab, sessionDefaults?.runtimeMode],
   );
 
-  const onNew = useCallback(() => {
-    setSearchViewOpen(false);
-    setInboxViewOpen(false);
-    setNotesViewOpen(false);
-    setAutomationsViewOpen(false);
-    const cwd = sidebarCwd;
-    const session = newWorkspaceSession(cwd, sessionDefaults?.runtimeMode);
-    const tab = newTab(session.id);
-    setSessions((prev) => [...prev, session]);
-    appendTab(tab, cwd);
-    setActiveTabId(tab.id);
-    setComposerFocused(true);
-    return session.id;
-  }, [
-    appendTab,
-    sessionDefaults?.runtimeMode,
-    sidebarCwd,
-  ]);
+  /** `cwd` is captured by the caller so a deferred creation still lands in the
+   *  project that was visible when the user asked for it. */
+  const createNewSession = useCallback(
+    (harness?: HarnessId, cwd: string = sidebarCwd): string => {
+      setSearchViewOpen(false);
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      setAutomationsViewOpen(false);
+      const session = newWorkspaceSession(
+        cwd,
+        sessionDefaults?.runtimeMode,
+        harness,
+      );
+      const tab = newTab(session.id);
+      setSessions((prev) => [...prev, session]);
+      appendTab(tab, cwd);
+      setActiveTabId(tab.id);
+      setComposerFocused(true);
+      return session.id;
+    },
+    [appendTab, sessionDefaults?.runtimeMode, sidebarCwd],
+  );
+
+  const onNew = useCallback(
+    (onCreated?: (id: string) => void): string | void => {
+      setSearchViewOpen(false);
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      setAutomationsViewOpen(false);
+      if (shouldPromptForProvider(sidebarCwd)) {
+        setNewSessionPrompt({ cwd: sidebarCwd, onCreated });
+        return;
+      }
+      const id = createNewSession();
+      onCreated?.(id);
+      return id;
+    },
+    [createNewSession, sidebarCwd],
+  );
+
+  useEffect(() => {
+    setNewSessionPrompt((prompt) =>
+      prompt && !sameProjectPath(prompt.cwd, sidebarCwd) ? undefined : prompt,
+    );
+  }, [sidebarCwd]);
 
   const onSelectRemoteSession = useCallback(
     (project: string, remoteSessionId: string) => {
@@ -13464,6 +13500,20 @@ function Workspace({
                 sessionDeleteDialog.resolve(choice);
                 setSessionDeleteDialog(undefined);
               }}
+            />
+          )}
+          {newSessionPrompt && (
+            <NewSessionProviderDialog
+              cwd={newSessionPrompt.cwd}
+              defaultHarness={
+                defaultSessionChoice(newSessionPrompt.cwd).harness
+              }
+              onPick={(harness) => {
+                const id = createNewSession(harness, newSessionPrompt.cwd);
+                newSessionPrompt.onCreated?.(id);
+                setNewSessionPrompt(undefined);
+              }}
+              onClose={() => setNewSessionPrompt(undefined)}
             />
           )}
           <QuitGateNotice />

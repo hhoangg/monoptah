@@ -5,6 +5,7 @@ import {
   coerceModelPickerTab,
   defaultModelId,
   defaultSessionChoice,
+  sessionModelForHarness,
   encodeModelLaunchId,
   firstEnabledHarness,
   hasLiveCatalog,
@@ -33,6 +34,7 @@ import {
   type AgentModel,
 } from "./models";
 import {
+  setProjectDefaultModel,
   setProjectDefaultProvider,
   setProjectProviderHidden,
 } from "./projectProviders";
@@ -288,6 +290,22 @@ describe("provider defaults", () => {
       harness: "claude",
       model: "claude:opus-5",
     });
+  });
+
+  it("resolves an explicit provider's model by project precedence", () => {
+    expect(sessionModelForHarness("claude", "/repo/a")).toBe(
+      preferredModelId("claude"),
+    );
+    setProjectDefaultProvider("/repo/a", "claude", "claude:opus-5");
+    expect(sessionModelForHarness("claude", "/repo/a")).toBe("claude:opus-5");
+    expect(sessionModelForHarness("codex", "/repo/a")).toBe(
+      preferredModelId("codex"),
+    );
+    setProjectDefaultModel("/repo/a", "claude", "claude:sonnet-5");
+    expect(sessionModelForHarness("claude", "/repo/a")).toBe("claude:sonnet-5");
+    expect(sessionModelForHarness("claude", "/repo/b")).toBe(
+      preferredModelId("claude"),
+    );
   });
 
   it("keeps a provider the project still allows", () => {

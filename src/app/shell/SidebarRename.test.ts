@@ -2085,3 +2085,76 @@ it("labels preserved sessions as having no branch selected", () => {
   expect(card().textContent).not.toContain("No branch selected");
   expect(card().textContent).toContain("project/main");
 });
+
+describe("new session in a folder", () => {
+  const FOLDER_KEY = "monocode.sessionFolders";
+
+  function seedFolder() {
+    localStorage.setItem(
+      FOLDER_KEY,
+      JSON.stringify({
+        "/workspace/project": [
+          {
+            id: "folder-1",
+            name: "Work",
+            sessionIds: ["session-1"],
+            collapsed: false,
+          },
+        ],
+      }),
+    );
+  }
+
+  function clickNewSession() {
+    const button = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="New session"][title="New session"]',
+    )!;
+    act(() => button.click());
+  }
+
+  it("places the session only once a deferred creation reports its id", () => {
+    seedFolder();
+    let captured: ((id: string) => void) | undefined;
+    props.onNew = (onCreated) => {
+      captured = onCreated;
+    };
+    act(() => render());
+    clickNewSession();
+
+    expect(captured).toBeDefined();
+    expect(loadSessionFolders(props.cwd)[0].sessionIds).toEqual(["session-1"]);
+    act(() => captured!("s1"));
+    expect(loadSessionFolders(props.cwd)[0].sessionIds).toEqual([
+      "session-1",
+      "s1",
+    ]);
+  });
+
+  it("places nothing when the deferred creation is cancelled", () => {
+    seedFolder();
+    props.onNew = () => {};
+    act(() => render());
+    clickNewSession();
+
+    expect(loadSessionFolders(props.cwd)[0].sessionIds).toEqual(["session-1"]);
+  });
+
+  it("does not touch storage when the project changed before creation", () => {
+    seedFolder();
+    let captured: ((id: string) => void) | undefined;
+    props.onNew = (onCreated) => {
+      captured = onCreated;
+    };
+    act(() => render());
+    clickNewSession();
+
+    props = { ...props, cwd: "/workspace/other" };
+    act(() => render());
+    act(() => captured!("s1"));
+
+    expect(loadSessionFolders("/workspace/project")[0].sessionIds).toEqual([
+      "session-1",
+    ]);
+    expect(loadSessionFolders("/workspace/other")).toEqual([]);
+  });
+});

@@ -111,6 +111,7 @@ import {
   type SessionFolder,
   type SessionListDropTarget,
 } from "../../features/sessions/model/sessionFolders";
+import { createSessionThen } from "../../features/sessions/model/newSessionInFolder";
 import { LIST_PAGE_SIZE, listWindowSize } from "../../shared/lib/listWindow";
 import {
   filterSessionsByHarness,
@@ -314,7 +315,7 @@ type Props = {
   onSelectProject?: (path: string) => void;
   onOpenProject?: () => void;
   onRemoveProject?: (path: string, options: { purgeData: boolean }) => void;
-  onNew?: () => string | void;
+  onNew?: (onCreated?: (id: string) => void) => string | void;
   onNewTerminal?: () => void;
   onSearch?: () => void;
   onOpenInbox?: () => void;
@@ -1041,14 +1042,15 @@ function SidebarComponent({
     };
   }, [selectedSessionIds.size]);
 
+  const cwdRef = useRef(cwd);
+  cwdRef.current = cwd;
+
   const commitSessionFolders = (next: SessionFolder[]) => {
     setSessionFolders(next);
     saveSessionFolders(cwd, next);
   };
 
-  const onNewInFolder = (folderId: string) => {
-    const sessionId = onNew?.();
-    if (!sessionId) return;
+  const placeSessionInFolder = (folderId: string, sessionId: string) => {
     pendingFolderSessionIds.current.add(sessionId);
     setSearchQuery("");
     setSessionFolders((current) => {
@@ -1059,6 +1061,17 @@ function SidebarComponent({
       );
       saveSessionFolders(cwd, next);
       return next;
+    });
+  };
+
+  const onNewInFolder = (folderId: string) => {
+    if (!onNew) return;
+    const clickCwd = cwd;
+    createSessionThen(onNew, (sessionId) => {
+      // A deferred creation can land after a project switch; the folder list
+      // in state then belongs to another project, so do not touch storage.
+      if (clickCwd !== cwdRef.current) return;
+      placeSessionInFolder(folderId, sessionId);
     });
   };
 
@@ -2375,7 +2388,7 @@ function SidebarProjectPicker({
   onSelectProject: (path: string) => void;
   onOpenProject?: () => void;
   onRemoveProject?: Props["onRemoveProject"];
-  onNew?: () => string | void;
+  onNew?: (onCreated?: (id: string) => void) => string | void;
   onSearch?: () => void;
   onOpenInbox?: () => void;
   onOpenNotificationSettings?: (projectPath?: string) => void;
@@ -2408,7 +2421,7 @@ function SidebarProjectPicker({
       />
       <div className="ml-auto flex items-center">
         {onNew ? (
-          <IconButton label={`New tab (${MOD}T)`} onClick={onNew}>
+          <IconButton label={`New tab (${MOD}T)`} onClick={() => onNew()}>
             <Plus className="size-3.5" strokeWidth={1.75} />
           </IconButton>
         ) : null}
@@ -2849,7 +2862,7 @@ function WorkspaceTitleActions({
   onNew,
 }: {
   onSearch?: () => void;
-  onNew?: () => void;
+  onNew?: (onCreated?: (id: string) => void) => string | void;
 }) {
   if (!onSearch && !onNew) return null;
   return (
@@ -2863,7 +2876,7 @@ function WorkspaceTitleActions({
         </IconButton>
       ) : null}
       {onNew ? (
-        <IconButton label={`New session (${MOD}T)`} onClick={onNew}>
+        <IconButton label={`New session (${MOD}T)`} onClick={() => onNew()}>
           <Plus className="size-3.5" strokeWidth={1.75} />
         </IconButton>
       ) : null}
