@@ -189,24 +189,31 @@ describe("BinaryFileView video playback", () => {
     await renderViewer("/repo/clip.mp4");
     const video = container.querySelector("video")!;
     const pause = vi.spyOn(video, "pause");
-    const load = vi.spyOn(video, "load");
     act(() => root.render(null));
     expect(pause).toHaveBeenCalledOnce();
-    expect(video.hasAttribute("src")).toBe(false);
-    expect(load).toHaveBeenCalledOnce();
+    expect(container.querySelector("video")).toBeNull();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:image-preview");
   });
 
-  it("restarts loading the restored source after StrictMode replays its effects", async () => {
+  it("never strips the source or loads without one after StrictMode replays its effects", async () => {
     const loadedSources: Array<string | null> = [];
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(function (
       this: HTMLMediaElement,
     ) {
       loadedSources.push(this.getAttribute("src"));
     });
+    const removed: string[] = [];
+    const removeAttribute = Element.prototype.removeAttribute;
+    vi.spyOn(Element.prototype, "removeAttribute").mockImplementation(
+      function (this: Element, name: string) {
+        if (this instanceof HTMLVideoElement) removed.push(name);
+        return removeAttribute.call(this, name);
+      },
+    );
     await renderViewer("/repo/clip.mp4", true, true);
     expect(container.querySelector("video")?.src).toBe("blob:image-preview");
-    expect(loadedSources).toEqual([null, "blob:image-preview"]);
+    expect(removed).toEqual([]);
+    expect(loadedSources).toEqual([]);
   });
 
   it("shows file read errors and allows retry", async () => {
