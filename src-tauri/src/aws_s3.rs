@@ -13,6 +13,7 @@ use crate::aws_sigv4::{
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ERROR_BODY: u64 = 64 * 1024;
+// SES inbound mail is capped at 40 MB; anything past this is not a message.
 const MAX_BODY: u64 = 256 * 1024 * 1024;
 const DELETE_BATCH: usize = 1000;
 
@@ -46,6 +47,8 @@ pub(crate) enum S3ErrorKind {
     NoSuchKey,
     /// Wrong key id or secret.
     InvalidCredentials,
+    /// The bucket lives in another region than the one configured.
+    WrongRegion,
     ClockSkew,
     Network,
     Other,
@@ -77,7 +80,9 @@ pub(crate) trait S3Api {
     ) -> Result<ObjectPage, S3Error>;
     fn get_object(&self, key: &str) -> Result<Vec<u8>, S3Error>;
     fn put_object(&self, key: &str, body: &[u8], content_type: &str) -> Result<(), S3Error>;
-    fn delete_objects(&self, keys: &[String]) -> Result<Vec<DeleteOutcome>, S3Error>;
+    /// One outcome per key, in order. No `Result`: a dead network shows up as
+    /// every key carrying an error, so a caller cannot read failure as success.
+    fn delete_objects(&self, keys: &[String]) -> Vec<DeleteOutcome>;
 }
 
 pub(crate) struct S3Client {
@@ -199,25 +204,39 @@ impl S3Client {
         match result {
             Ok(response) => {
                 let status = response.status();
+                let region = response.header("x-amz-bucket-region").map(str::to_string);
                 let mut bytes = Vec::new();
                 response
                     .into_reader()
-                    .take(MAX_BODY)
+                    .take(MAX_BODY + 1)
                     .read_to_end(&mut bytes)
                     .map_err(|_| S3Error {
                         kind: S3ErrorKind::Network,
                         code: None,
                         message: "The connection to S3 dropped while reading the response.".into(),
                     })?;
-                check_status(status, bytes, action)
+                if bytes.len() as u64 > MAX_BODY {
+                    return Err(S3Error {
+                        kind: S3ErrorKind::Other,
+                        code: None,
+                        message: "S3 returned an object too large to read.".into(),
+                    });
+                }
+                check_status(status, bytes, action, region.as_deref())
             }
             Err(ureq::Error::Status(status, response)) => {
+                let region = response.header("x-amz-bucket-region").map(str::to_string);
                 let mut body = String::new();
                 let _ = response
                     .into_reader()
                     .take(MAX_ERROR_BODY)
                     .read_to_string(&mut body);
-                Err(error_from_response(status, &body, action))
+                Err(error_from_response(
+                    status,
+                    &body,
+                    action,
+                    region.as_deref(),
+                ))
             }
             Err(_) => Err(S3Error {
                 kind: S3ErrorKind::Network,
@@ -230,12 +249,18 @@ impl S3Client {
 
 // ureq with redirects(0) hands a 3xx back as Ok, not Err(Status). Without this a
 // wrong-region 301 would read as an empty, healthy bucket.
-fn check_status(status: u16, body: Vec<u8>, action: &str) -> Result<Vec<u8>, S3Error> {
+fn check_status(
+    status: u16,
+    body: Vec<u8>,
+    action: &str,
+    bucket_region: Option<&str>,
+) -> Result<Vec<u8>, S3Error> {
     if status >= 300 {
         return Err(error_from_response(
             status,
             &String::from_utf8_lossy(&body),
             action,
+            bucket_region,
         ));
     }
     Ok(body)
@@ -282,15 +307,14 @@ impl S3Api for S3Client {
         .map(|_| ())
     }
 
-    fn delete_objects(&self, keys: &[String]) -> Result<Vec<DeleteOutcome>, S3Error> {
-        let mut outcomes = Vec::with_capacity(keys.len());
-        for batch in keys.chunks(DELETE_BATCH) {
+    fn delete_objects(&self, keys: &[String]) -> Vec<DeleteOutcome> {
+        delete_in_batches(keys, DELETE_BATCH, |batch| {
             let body = delete_request_body(batch);
             // DeleteObjects requires an integrity header; there is no MD5 crate here,
             // so use the SHA-256 checksum header S3 accepts in its place.
             let checksum = base64::engine::general_purpose::STANDARD
                 .encode(sha2::Sha256::digest(body.as_bytes()));
-            let sent = self.send(
+            self.send(
                 "POST",
                 "",
                 &[("delete", "")],
@@ -301,25 +325,36 @@ impl S3Api for S3Client {
                     ("x-amz-sdk-checksum-algorithm", "SHA256"),
                 ],
                 "s3:DeleteObject",
-            );
-            match sent {
-                Ok(response) => outcomes.extend(parse_delete_result(
-                    &String::from_utf8_lossy(&response),
-                    batch,
-                )),
-                Err(error) => {
-                    // Keep what earlier batches really deleted; fail only the rest.
-                    let done = outcomes.len();
-                    outcomes.extend(keys[done..].iter().map(|key| DeleteOutcome {
-                        key: key.clone(),
-                        error: Some(error.clone()),
-                    }));
-                    break;
-                }
+            )
+        })
+    }
+}
+
+/// Runs `send` per batch. A failed batch keeps what earlier batches really
+/// deleted and fails every key from there on, each exactly once.
+fn delete_in_batches(
+    keys: &[String],
+    batch_size: usize,
+    mut send: impl FnMut(&[String]) -> Result<Vec<u8>, S3Error>,
+) -> Vec<DeleteOutcome> {
+    let mut outcomes = Vec::with_capacity(keys.len());
+    for batch in keys.chunks(batch_size) {
+        match send(batch) {
+            Ok(response) => outcomes.extend(parse_delete_result(
+                &String::from_utf8_lossy(&response),
+                batch,
+            )),
+            Err(error) => {
+                let done = outcomes.len();
+                outcomes.extend(keys[done..].iter().map(|key| DeleteOutcome {
+                    key: key.clone(),
+                    error: Some(error.clone()),
+                }));
+                break;
             }
         }
-        Ok(outcomes)
     }
+    outcomes
 }
 
 fn delete_request_body(keys: &[String]) -> String {
@@ -443,7 +478,7 @@ fn parse_delete_result(xml: &str, requested: &[String]) -> Vec<DeleteOutcome> {
         .iter()
         .map(|key| {
             let error = if let Some((_, code)) = failed.iter().find(|(k, _)| k == key) {
-                Some(classify(None, Some(code), "s3:DeleteObject"))
+                Some(classify(None, Some(code), "s3:DeleteObject", None))
             } else if deleted.contains(key) {
                 None
             } else {
@@ -462,12 +497,27 @@ fn parse_delete_result(xml: &str, requested: &[String]) -> Vec<DeleteOutcome> {
         .collect()
 }
 
-fn error_from_response(status: u16, body: &str, action: &str) -> S3Error {
+fn error_from_response(
+    status: u16,
+    body: &str,
+    action: &str,
+    bucket_region: Option<&str>,
+) -> S3Error {
     let code = first(body, "Code");
-    classify(Some(status), code.as_deref(), action)
+    // The header comes first; AuthorizationHeaderMalformed carries it in the body.
+    let region = bucket_region
+        .map(str::to_string)
+        .or_else(|| first(body, "Region"))
+        .filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    classify(Some(status), code.as_deref(), action, region.as_deref())
 }
 
-fn classify(status: Option<u16>, code: Option<&str>, action: &str) -> S3Error {
+fn classify(
+    status: Option<u16>,
+    code: Option<&str>,
+    action: &str,
+    region: Option<&str>,
+) -> S3Error {
     let code = code.filter(|c| !c.is_empty());
     let (kind, message) = match code {
         Some("AccessDenied") => (
@@ -487,6 +537,17 @@ fn classify(status: Option<u16>, code: Option<&str>, action: &str) -> S3Error {
             S3ErrorKind::ClockSkew,
             "This computer's clock is more than 5 minutes off AWS time. Fix the system clock and try again."
                 .to_string(),
+        ),
+        Some("PermanentRedirect" | "AuthorizationHeaderMalformed") if region.is_some() => (
+            S3ErrorKind::WrongRegion,
+            format!(
+                "The bucket is in region {}. Change this source's region to match.",
+                region.unwrap_or_default()
+            ),
+        ),
+        Some("PermanentRedirect") => (
+            S3ErrorKind::WrongRegion,
+            "The bucket is in a different region. Check this source's region.".to_string(),
         ),
         Some(other) => (S3ErrorKind::Other, format!("S3 returned an error ({other}).")),
         // No parsable body: a bare 403 is still an access problem.
@@ -528,7 +589,7 @@ mod tests {
     fn parses_access_denied_body() {
         let body = r#"<?xml version="1.0" encoding="UTF-8"?>
 <Error><Code>AccessDenied</Code><Message>Access Denied</Message><RequestId>4442587FB7D0A2F9</RequestId></Error>"#;
-        let err = error_from_response(403, body, "s3:ListBucket");
+        let err = error_from_response(403, body, "s3:ListBucket", None);
         assert_eq!(err.kind, S3ErrorKind::AccessDenied);
         assert_eq!(err.code.as_deref(), Some("AccessDenied"));
         assert!(err.message.contains("s3:ListBucket"));
@@ -540,19 +601,21 @@ mod tests {
             404,
             "<Error><Code>NoSuchBucket</Code></Error>",
             "s3:ListBucket",
+            None,
         );
         assert_eq!(no_bucket.kind, S3ErrorKind::NoSuchBucket);
         let skew = error_from_response(
             403,
             "<Error><Code>RequestTimeTooSkewed</Code></Error>",
             "s3:GetObject",
+            None,
         );
         assert_eq!(skew.kind, S3ErrorKind::ClockSkew);
-        let garbage = error_from_response(500, "<html>oops", "s3:GetObject");
+        let garbage = error_from_response(500, "<html>oops", "s3:GetObject", None);
         assert_eq!(garbage.kind, S3ErrorKind::Other);
         assert_eq!(garbage.code, None);
         assert_eq!(
-            error_from_response(403, "", "s3:GetObject").kind,
+            error_from_response(403, "", "s3:GetObject", None).kind,
             S3ErrorKind::AccessDenied
         );
     }
@@ -643,11 +706,11 @@ mod tests {
     #[test]
     fn redirect_status_is_an_error_not_a_payload() {
         let body = b"<Error><Code>PermanentRedirect</Code></Error>".to_vec();
-        let err = check_status(301, body, "s3:ListBucket").unwrap_err();
+        let err = check_status(301, body, "s3:ListBucket", None).unwrap_err();
         assert_eq!(err.code.as_deref(), Some("PermanentRedirect"));
-        assert_eq!(err.kind, S3ErrorKind::Other);
+        assert_eq!(err.kind, S3ErrorKind::WrongRegion);
         assert_eq!(
-            check_status(200, b"ok".to_vec(), "s3:GetObject").unwrap(),
+            check_status(200, b"ok".to_vec(), "s3:GetObject", None).unwrap(),
             b"ok"
         );
     }
@@ -674,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn list_query_carries_delimiter() {
+    fn delimiter_is_url_encoded_in_the_query() {
         let p = client("b").prepare(
             "GET",
             "",
@@ -684,5 +747,82 @@ mod tests {
             "20240102T030405Z",
         );
         assert!(p.url.ends_with("?delimiter=%2F&list-type=2"));
+    }
+
+    fn ok_xml(keys: &[String]) -> Result<Vec<u8>, S3Error> {
+        let items: String = keys
+            .iter()
+            .map(|k| format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(k)))
+            .collect();
+        Ok(format!("<DeleteResult>{items}</DeleteResult>").into_bytes())
+    }
+
+    fn net_err() -> S3Error {
+        S3Error {
+            kind: S3ErrorKind::Network,
+            code: None,
+            message: "down".into(),
+        }
+    }
+
+    fn five() -> Vec<String> {
+        (0..5).map(|i| format!("k{i}")).collect()
+    }
+
+    fn assert_each_once(out: &[DeleteOutcome], keys: &[String]) {
+        let got: Vec<&String> = out.iter().map(|o| &o.key).collect();
+        assert_eq!(got, keys.iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn batches_clean_run() {
+        let keys = five();
+        let out = delete_in_batches(&keys, 2, ok_xml);
+        assert_each_once(&out, &keys);
+        assert!(out.iter().all(|o| o.error.is_none()));
+    }
+
+    #[test]
+    fn batches_fail_on_first_batch() {
+        let keys = five();
+        let out = delete_in_batches(&keys, 2, |_| Err(net_err()));
+        assert_each_once(&out, &keys);
+        assert!(out.iter().all(|o| o.error.is_some()));
+    }
+
+    #[test]
+    fn batches_fail_on_middle_batch_keep_earlier_results() {
+        let keys = five();
+        let mut calls = 0;
+        let out = delete_in_batches(&keys, 2, |b| {
+            calls += 1;
+            if calls == 2 {
+                Err(net_err())
+            } else {
+                ok_xml(b)
+            }
+        });
+        assert_each_once(&out, &keys);
+        assert_eq!(calls, 2);
+        assert!(out[..2].iter().all(|o| o.error.is_none()));
+        assert!(out[2..].iter().all(|o| o.error.is_some()));
+    }
+
+    #[test]
+    fn delete_result_has_one_entry_per_requested_key() {
+        let keys = five();
+        assert_eq!(parse_delete_result("garbage", &keys).len(), keys.len());
+    }
+
+    #[test]
+    fn redirect_names_the_region_and_ignores_junk() {
+        let body =
+            "<Error><Code>PermanentRedirect</Code><Endpoint>b.s3.amazonaws.com</Endpoint></Error>";
+        let err = error_from_response(301, body, "s3:ListBucket", Some("eu-west-1"));
+        assert_eq!(err.kind, S3ErrorKind::WrongRegion);
+        assert!(err.message.contains("eu-west-1"));
+        let bad = error_from_response(301, body, "s3:ListBucket", Some("x<y"));
+        assert_eq!(bad.kind, S3ErrorKind::WrongRegion);
+        assert!(!bad.message.contains('<'));
     }
 }
