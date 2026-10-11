@@ -229,3 +229,14 @@ it("shows only the start of a huge source, with a note", async () => {
   expect(document.body.textContent).toContain("Truncated");
   expect(pre.className).not.toContain("break-all");
 });
+
+it("opens the delete dialog from the header, with nothing sent yet", async () => {
+  vi.mocked(mailThread).mockResolvedValue(detail([msg(1)]));
+  await render();
+  const button = [...container.querySelectorAll("button")].find(
+    (b) => b.textContent === "Delete",
+  ) as HTMLButtonElement;
+  await act(async () => button.click());
+  expect(document.body.textContent).toContain("Archive locally");
+  expect(document.body.textContent).toContain("Delete on S3 as well");
+});

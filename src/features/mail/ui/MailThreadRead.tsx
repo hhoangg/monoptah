@@ -24,6 +24,7 @@ import type {
   MessageRow,
   ThreadDetail,
 } from "../model/mailTypes";
+import { DeleteMailDialog } from "./DeleteMailDialog";
 import { MailMessageBody, canTogglePlain } from "./MailMessageBody";
 import { formatMailDate } from "./MailThreadList";
 
@@ -297,6 +298,10 @@ function ThreadBody({ threadId }: { threadId: number }) {
   // Kept here, not in the card, so collapsing a message keeps its images.
   const [imagesOk, setImagesOk] = useState<ReadonlySet<number>>(new Set());
   const markedOpen = useRef(false);
+  const [deleting, setDeleting] = useState(false);
+  // Set once S3 confirmed every message gone, so the pane stops reloading a
+  // thread that no longer exists.
+  const [deleted, setDeleted] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -314,6 +319,7 @@ function ThreadBody({ threadId }: { threadId: number }) {
   }, []);
 
   useEffect(() => {
+    if (deleted) return;
     let stale = false;
     mailThread(threadId)
       .then((next) => {
@@ -327,7 +333,7 @@ function ThreadBody({ threadId }: { threadId: number }) {
     return () => {
       stale = true;
     };
-  }, [threadId, reloadKey]);
+  }, [threadId, reloadKey, deleted]);
 
   // Opening a thread reads it. Once per open, so "Mark as unread" stays undone.
   useEffect(() => {
@@ -338,6 +344,13 @@ function ThreadBody({ threadId }: { threadId: number }) {
     }
   }, [detail, threadId]);
 
+  if (deleted) {
+    return (
+      <p className="px-4 py-3 text-[12px] text-content/50">
+        This conversation was deleted.
+      </p>
+    );
+  }
   if (error && !detail) {
     return <p className="px-4 py-3 text-[12px] text-red-400">{error}</p>;
   }
@@ -391,7 +404,24 @@ function ThreadBody({ threadId }: { threadId: number }) {
         >
           {unread ? "Mark as read" : "Mark as unread"}
         </SecondaryButton>
+        <SecondaryButton danger onClick={() => setDeleting(true)}>
+          Delete
+        </SecondaryButton>
       </header>
+      {deleting ? (
+        <DeleteMailDialog
+          threadIds={[thread.id]}
+          subject={thread.subject}
+          messageCount={messages.length}
+          mailbox={thread.mailboxAddress}
+          onClose={() => setDeleting(false)}
+          onDone={(report, hard) => {
+            if (hard && report.kept === 0 && report.errors.length === 0) {
+              setDeleted(true);
+            }
+          }}
+        />
+      ) : null}
       {error ? (
         <p className="px-4 py-2 text-[12px] text-red-400">{error}</p>
       ) : null}
