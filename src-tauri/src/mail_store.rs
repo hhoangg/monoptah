@@ -3666,7 +3666,8 @@ mod tests {
         assert_eq!(fields.len(), 13);
         for field in fields {
             let allowed = allowed_ops(field).unwrap();
-            for op in ops.clone() {
+            for op in &ops {
+                let op = *op;
                 let value = match (field, op) {
                     (_, "contains_any") => serde_json::json!(["SENTINEL'a", "SENTINEL%b"]),
                     ("date", "within_days") => serde_json::json!(30),
@@ -4342,10 +4343,24 @@ mod tests {
                 ..Msg::default()
             },
         );
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "ancient",
+                date: 1_262_304_000,
+                ..Msg::default()
+            },
+        );
         let mut input = folder("Promos");
         input.hide_from_mailbox = true;
         let f =
             upsert_folder(&conn, &input, &[rule("from", "ends_with", s("@spam.test"))]).unwrap();
+        // A fixed-instant date rule is not clock-relative, so this folder hides
+        // too. Guards `CLOCK_RELATIVE_OPS` against `before`/`after` being added.
+        let mut old = folder("Old");
+        old.hide_from_mailbox = true;
+        upsert_folder(&conn, &old, &[rule("date", "before", s("2020-01-01"))]).unwrap();
         let listed = |scope| {
             let mut v: Vec<String> = list_threads(
                 &conn,
