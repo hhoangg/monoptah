@@ -90,8 +90,24 @@ describe("mail command wrappers", () => {
     [() => mail.mailMailboxesDelete(2), "mail_mailboxes_delete", { id: 2 }],
     [() => mail.mailSourceDelete(2), "mail_source_delete", { id: 2 }],
     [() => mail.mailIdentities(3), "mail_identities", { accountId: 3 }],
+    [() => mail.mailFolderDelete(4), "mail_folder_delete", { id: 4 }],
+    [
+      () => mail.mailFolderPreview([], "any"),
+      "mail_folder_preview",
+      { rules: [], matchMode: "any" },
+    ],
+    [
+      () => mail.mailFolderUpsert({ id: null } as never, []),
+      "mail_folder_upsert",
+      { folder: { id: null }, rules: [] },
+    ],
   ])("passes the argument names Rust expects", async (call, command, args) => {
     await call();
     expect(invoke).toHaveBeenCalledWith(command, args);
   });
+});
+
+it("lists folders without arguments", async () => {
+  await mail.mailFolders();
+  expect(invoke).toHaveBeenCalledWith("mail_folders");
 });

@@ -172,3 +172,67 @@ it("starts collapsed for a domain already saved as collapsed", () => {
   expect(group("hhoangg.com").querySelectorAll("button").length).toBe(1);
   expect(group("byptah.com").querySelectorAll("button").length).toBe(2);
 });
+
+it("lists smart folders and selects one by its numeric id", () => {
+  const onSelectFolder = vi.fn();
+  act(() =>
+    root.render(
+      createElement(MailFolderList, {
+        status,
+        mailboxId: null,
+        folderId: 7,
+        smartFolders: [
+          { id: 7, name: "Buyers", unread: 3, color: null },
+          { id: 8, name: "Invoices", unread: 0, color: "hsl(12 80% 58%)" },
+        ],
+        onSelectAll: vi.fn(),
+        onSelectMailbox: vi.fn(),
+        onSelectFolder,
+      }),
+    ),
+  );
+  const buttons = [...container.querySelectorAll("button")];
+  const buyers = buttons.find((b) => b.textContent?.includes("Buyers"))!;
+  const invoices = buttons.find((b) => b.textContent?.includes("Invoices"))!;
+  expect(buyers.getAttribute("aria-current")).toBe("true");
+  expect(buyers.textContent).toContain("3");
+  expect(invoices.getAttribute("aria-current")).toBeNull();
+  act(() => invoices.click());
+  expect(onSelectFolder).toHaveBeenCalledWith(8);
+  // Selecting a folder leaves "All mail" unselected.
+  const all = buttons.find((b) => b.textContent?.includes("All mail"))!;
+  expect(all.getAttribute("aria-current")).toBeNull();
+});
+
+it("says folders are loading, then empty, then shows an error", () => {
+  const props = {
+    status,
+    mailboxId: null,
+    folderId: null,
+    onSelectAll: vi.fn(),
+    onSelectMailbox: vi.fn(),
+    onSelectFolder: vi.fn(),
+  };
+  act(() =>
+    root.render(
+      createElement(MailFolderList, { ...props, smartFolders: null }),
+    ),
+  );
+  expect(container.textContent).toContain("Loading");
+  act(() =>
+    root.render(createElement(MailFolderList, { ...props, smartFolders: [] })),
+  );
+  expect(container.textContent).toContain("No smart folders yet.");
+  act(() =>
+    root.render(
+      createElement(MailFolderList, {
+        ...props,
+        smartFolders: null,
+        foldersError: "boom",
+      }),
+    ),
+  );
+  expect(container.querySelector("[role='alert']")?.textContent).toContain(
+    "boom",
+  );
+});

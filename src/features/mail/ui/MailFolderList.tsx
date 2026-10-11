@@ -6,6 +6,7 @@ import {
   ListFilter,
   Inbox,
   Loader,
+  Plus,
   RefreshCw,
 } from "../../../shared/ui/icons";
 import { mailSyncNow } from "../model/mail";
@@ -17,12 +18,13 @@ import type {
 } from "../model/mailTypes";
 import { collapsedDomains, useCollapsedDomains } from "../model/mailPrefs";
 
-// Seam: MailView imports this from here. Delete once MailView (or Task 13)
-// imports it from the model.
-export { useMailStatus } from "../model/useMailStatus";
-
-/** A saved filter. Task 12 supplies these; until then the list is empty. */
-export type SmartFolderEntry = { id: number; name: string; unread: number };
+/** A saved filter, as the folder column shows it. */
+export type SmartFolderEntry = {
+  id: number;
+  name: string;
+  unread: number;
+  color: string | null;
+};
 
 export type MailDomainGroup = {
   domain: string;
@@ -97,11 +99,15 @@ type Props = {
   error?: string | null;
   /** Selected mailbox id; null with no folder means "All mail". */
   mailboxId: number | null;
-  folderId: string | null;
-  smartFolders?: SmartFolderEntry[];
+  folderId: number | null;
+  /** Null while the folders load. */
+  smartFolders?: SmartFolderEntry[] | null;
+  foldersError?: string | null;
   onSelectAll: () => void;
   onSelectMailbox: (id: number) => void;
-  onSelectFolder: (id: string) => void;
+  onSelectFolder: (id: number) => void;
+  /** Opens an empty folder editor. */
+  onNewFolder?: () => void;
   onSynced?: () => void;
 };
 
@@ -111,9 +117,11 @@ export function MailFolderList({
   mailboxId,
   folderId,
   smartFolders = [],
+  foldersError = null,
   onSelectAll,
   onSelectMailbox,
   onSelectFolder,
+  onNewFolder,
   onSynced,
 }: Props) {
   const collapsed = useCollapsedDomains();
@@ -205,7 +213,8 @@ export function MailFolderList({
               {isCollapsed
                 ? null
                 : group.mailboxes.map(({ mailbox, source }) => {
-                    const selected = mailboxId === mailbox.id && !folderId;
+                    const selected =
+                      mailboxId === mailbox.id && folderId === null;
                     return (
                       <button
                         key={mailbox.id}
@@ -241,33 +250,57 @@ export function MailFolderList({
           );
         })}
 
-        <div className="mt-3 px-2 pb-1 text-[10px] font-medium uppercase tracking-wide text-content/40">
-          Smart folders
+        <div className="mt-3 flex items-center px-2 pb-1">
+          <span className="min-w-0 flex-1 text-[10px] font-medium uppercase tracking-wide text-content/40">
+            Smart folders
+          </span>
+          {onNewFolder ? (
+            <button
+              type="button"
+              title="New smart folder"
+              aria-label="New smart folder"
+              onClick={onNewFolder}
+              className="rounded-md p-0.5 text-content/45 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-accent"
+            >
+              <Plus className="size-3" strokeWidth={1.75} />
+            </button>
+          ) : null}
         </div>
-        {smartFolders.length === 0 ? (
+        {foldersError && !smartFolders ? (
+          <p role="alert" className="px-2 py-1 text-[12px] text-red-400/90">
+            Could not load smart folders: {foldersError}
+          </p>
+        ) : null}
+        {smartFolders === null && !foldersError ? (
+          <p className="px-2 py-1 text-[12px] text-content/50">Loading</p>
+        ) : null}
+        {smartFolders?.length === 0 ? (
           <p className="px-2 py-1 text-[12px] text-content/50">
             No smart folders yet.
           </p>
-        ) : (
-          smartFolders.map((folder) => {
-            const selected = folderId === String(folder.id);
-            return (
-              <button
-                key={folder.id}
-                type="button"
-                aria-current={selected ? "true" : undefined}
-                onClick={() => onSelectFolder(String(folder.id))}
-                className={`${NODE} ${selected ? "bg-content/10 text-content" : "text-content/80"}`}
-              >
-                <ListFilter className="size-3.5 shrink-0" strokeWidth={1.75} />
-                <span className="min-w-0 flex-1 truncate">{folder.name}</span>
-                {folder.unread > 0 ? (
-                  <span className={BADGE}>{folder.unread}</span>
-                ) : null}
-              </button>
-            );
-          })
-        )}
+        ) : null}
+        {smartFolders?.map((folder) => {
+          const selected = folderId === folder.id;
+          return (
+            <button
+              key={folder.id}
+              type="button"
+              aria-current={selected ? "true" : undefined}
+              onClick={() => onSelectFolder(folder.id)}
+              className={`${NODE} ${selected ? "bg-content/10 text-content" : "text-content/80"}`}
+            >
+              <ListFilter
+                className="size-3.5 shrink-0"
+                strokeWidth={1.75}
+                style={folder.color ? { color: folder.color } : undefined}
+              />
+              <span className="min-w-0 flex-1 truncate">{folder.name}</span>
+              {folder.unread > 0 ? (
+                <span className={BADGE}>{folder.unread}</span>
+              ) : null}
+            </button>
+          );
+        })}
       </div>
       <div className="flex shrink-0 items-center gap-2 border-t border-stroke px-3 py-2 text-[11px] text-content/50">
         <span className="min-w-0 flex-1 truncate">

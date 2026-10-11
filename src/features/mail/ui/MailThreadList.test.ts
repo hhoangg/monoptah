@@ -1,18 +1,18 @@
 // @vitest-environment happy-dom
 import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MailThreadList,
   useMailThreadList,
-  filterThreads,
   formatMailDate,
-  NO_FILTERS,
   scopeSpansDomains,
+  type ListBase,
 } from "./MailThreadList";
 import { mailThreads } from "../model/mail";
 import { listen } from "@tauri-apps/api/event";
-import type { ThreadRow, ThreadScope } from "../model/mailTypes";
+import { SEARCH_DEBOUNCE_MS } from "../model/mailQuery";
+import type { Rule, ThreadRow, ThreadScope } from "../model/mailTypes";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -43,6 +43,14 @@ const thread = (id: number, over: Partial<ThreadRow> = {}): ThreadRow => ({
 
 const all: ThreadScope = { kind: "all" };
 const oneBox: ThreadScope = { kind: "mailbox", mailboxId: 1 };
+const folder: ThreadScope = { kind: "folder", folderId: 7 };
+
+const baseOf = (scope: ThreadScope): ListBase =>
+  scope.kind === "mailbox"
+    ? { kind: "mailbox", mailboxId: scope.mailboxId, address: "owner@a.com" }
+    : scope.kind === "folder"
+      ? { kind: "folder", folderId: scope.folderId }
+      : { kind: "all" };
 const twoDomains = [{ address: "owner@a.com" }, { address: "x@b.com" }];
 const oneDomain = [{ address: "owner@a.com" }, { address: "y@a.com" }];
 
@@ -90,7 +98,7 @@ function Harness({
   listKey: string;
   extra: Record<string, unknown>;
 }): ReactNode {
-  const list = useMailThreadList(scope, extra.folderSelected === true);
+  const list = useMailThreadList(baseOf(scope));
   return createElement(MailThreadList, {
     key: listKey,
     list,
@@ -206,14 +214,6 @@ it("renders unread, star, attachment and message count", async () => {
   expect(text).toContain("Linh");
 });
 
-it("filters loaded rows by content", () => {
-  const rows = [thread(1), thread(2, { subject: "Invoice" })];
-  expect(filterThreads(rows, NO_FILTERS)).toHaveLength(2);
-  expect(
-    filterThreads(rows, { ...NO_FILTERS, content: "invoice" }).map((r) => r.id),
-  ).toEqual([2]);
-});
-
 it("formats dates from epoch seconds, not milliseconds", () => {
   const at = (y: number, m: number, d: number, h = 0, min = 0) =>
     Math.floor(new Date(y, m, d, h, min).getTime() / 1000);
@@ -275,125 +275,6 @@ it("keeps the window across a background reload of the same scope", async () => 
   expect(rowCount()).toBe(64);
 });
 
-const setFilter = async (label: string, value: string) => {
-  const chip = [...container.querySelectorAll("button")].find(
-    (b) => b.textContent === label,
-  )!;
-  await act(async () => chip.click());
-  const field = container.querySelector<HTMLInputElement>("input")!;
-  await act(async () => {
-    Object.getOwnPropertyDescriptor(
-      HTMLInputElement.prototype,
-      "value",
-    )!.set!.call(field, value);
-    field.dispatchEvent(new Event("input", { bubbles: true }));
-  });
-};
-
-// Reports only when observe() is called, in a later task, like a browser. An
-// observer that is never re-created therefore never reports again.
-const useReportOnObserve = () => {
-  class OnObserve {
-    private live = true;
-    constructor(private cb: (e: { isIntersecting: boolean }[]) => void) {}
-    observe() {
-      setTimeout(() => {
-        if (this.live) this.cb([{ isIntersecting: true }]);
-      }, 0);
-    }
-    disconnect() {
-      this.live = false;
-    }
-  }
-  vi.stubGlobal("IntersectionObserver", OnObserve);
-};
-const settle = async () => {
-  for (let i = 0; i < 6; i++)
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 5));
-    });
-};
-const miss = (from: number) =>
-  Array.from({ length: 32 }, (_, i) => thread(from + i));
-
-it("keeps paging while a filter hides every row of the fetched pages", async () => {
-  const cursor = { lastMessageAt: 1, id: 1 };
-  vi.mocked(mailThreads)
-    .mockResolvedValueOnce({ rows: miss(1), nextCursor: cursor })
-    .mockResolvedValueOnce({ rows: miss(100), nextCursor: cursor })
-    .mockResolvedValueOnce({
-      rows: [thread(900, { subject: "Needle" })],
-      nextCursor: null,
-    });
-  await render(all, twoDomains);
-  // Observer turns automatic only now, so nothing pages before the filter.
-  useReportOnObserve();
-  await setFilter("Content", "needle");
-  await settle();
-  expect(mailThreads).toHaveBeenCalledTimes(3);
-  expect(rowCount()).toBe(1);
-});
-
-it("pauses automatic paging when a filter matches nothing, until Load more", async () => {
-  const cursor = { lastMessageAt: 1, id: 1 };
-  let next = 1;
-  vi.mocked(mailThreads).mockImplementation(async () => ({
-    rows: miss((next += 100)),
-    nextCursor: cursor,
-  }));
-  await render(all, twoDomains);
-  const before = vi.mocked(mailThreads).mock.calls.length;
-  // Observer turns automatic only now, so nothing pages before the filter.
-  useReportOnObserve();
-  await setFilter("Content", "nothing-matches");
-  await settle();
-  // MAX_IDLE_PAGES follow-on fetches, then it waits for a press.
-  expect(mailThreads).toHaveBeenCalledTimes(before + 3);
-  const more = [...container.querySelectorAll("button")].find(
-    (b) => b.textContent === "Load more",
-  )!;
-  await act(async () => more.click());
-  await settle();
-  // Each press buys another MAX_IDLE_PAGES, then it waits again.
-  expect(mailThreads).toHaveBeenCalledTimes(before + 6);
-});
-
-it("shows the partial-filter note only while more pages exist", async () => {
-  vi.mocked(mailThreads).mockResolvedValueOnce({
-    rows: [thread(1)],
-    nextCursor: null,
-  });
-  await render(all, twoDomains);
-  await setFilter("Content", "subject");
-  expect(container.textContent).not.toContain("loaded so far");
-  expect(rowCount()).toBe(1);
-});
-
-it("shows the partial-filter note when the server has more", async () => {
-  vi.mocked(mailThreads).mockResolvedValueOnce({
-    rows: [thread(1)],
-    nextCursor: { lastMessageAt: 1, id: 1 },
-  });
-  await render(all, twoDomains);
-  await setFilter("Content", "subject");
-  expect(container.textContent).toContain("loaded so far");
-});
-
-it("drops an in-flight page when a smart folder is selected", async () => {
-  const cursor = { lastMessageAt: 1, id: 32 };
-  let resolveOld!: (v: { rows: ThreadRow[]; nextCursor: null }) => void;
-  vi.mocked(mailThreads)
-    .mockResolvedValueOnce({ rows: miss(1), nextCursor: cursor })
-    .mockImplementationOnce(
-      () => new Promise((resolve) => (resolveOld = resolve)),
-    );
-  await render(all, twoDomains);
-  await act(async () => intersect!());
-  await render(all, twoDomains, { folderSelected: true });
-  await act(async () => resolveOld({ rows: [thread(900)], nextCursor: null }));
-  expect(rowCount()).toBe(0);
-});
-
 it("resets the window on a scope change even when the first fetch fails", async () => {
   const rows = Array.from({ length: 70 }, (_, i) => thread(i + 1));
   vi.mocked(mailThreads)
@@ -421,4 +302,276 @@ it("exposes rows as list items holding buttons", async () => {
   ).not.toBeNull();
   // role="listitem" on the button would hide that it is clickable.
   expect(container.querySelector("button[role]")).toBeNull();
+});
+
+// ── server-side filters ────────────────────────────────────────────
+
+describe("search box and chips", () => {
+  const rule = (
+    field: Rule["field"],
+    op: Rule["op"],
+    value: Rule["value"] = "",
+    negate = false,
+  ): Rule => ({ field, op, value, negate });
+
+  const typeInto = async (el: HTMLInputElement, value: string) =>
+    act(async () => {
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )!.set!.call(el, value);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  const box = () =>
+    container.querySelector<HTMLInputElement>(
+      "input[aria-label='Search mail']",
+    )!;
+  const pause = (ms = SEARCH_DEBOUNCE_MS) =>
+    act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  const lastScope = () => vi.mocked(mailThreads).mock.calls.at(-1)![0].scope;
+  const calls = () => vi.mocked(mailThreads).mock.calls.length;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(mailThreads).mockResolvedValue({ rows: [], nextCursor: null });
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("waits for a pause in typing before it queries", async () => {
+    await render(all, twoDomains);
+    expect(calls()).toBe(1);
+    await typeInto(box(), "inv");
+    await pause(SEARCH_DEBOUNCE_MS - 1);
+    await typeInto(box(), "invo");
+    await pause(SEARCH_DEBOUNCE_MS - 1);
+    // Two keystrokes and a nearly-elapsed pause: still nothing sent.
+    expect(calls()).toBe(1);
+    await pause(1);
+    expect(calls()).toBe(2);
+    expect(lastScope()).toEqual({
+      kind: "rules",
+      rules: [rule("body", "contains_prefix", "invo")],
+      matchMode: "all",
+    });
+  });
+
+  it("prefix-matches only the last word, and only once it is long enough", async () => {
+    await render(all, twoDomains);
+    await typeInto(box(), "from:bob inv");
+    await pause();
+    expect(lastScope()).toEqual({
+      kind: "rules",
+      rules: [
+        rule("from", "contains", "bob"),
+        rule("body", "contains_prefix", "inv"),
+      ],
+      matchMode: "all",
+    });
+    await typeInto(box(), "from:bob in");
+    await pause();
+    expect(lastScope()).toEqual({
+      kind: "rules",
+      rules: [rule("from", "contains", "bob"), rule("body", "contains", "in")],
+      matchMode: "all",
+    });
+  });
+
+  it("keeps a chip an exact phrase", async () => {
+    await render(all, twoDomains);
+    const chip = [...container.querySelectorAll("button")].find(
+      (b) => b.textContent === "Content",
+    )!;
+    await act(async () => chip.click());
+    await typeInto(
+      container.querySelector<HTMLInputElement>(
+        "input[aria-label='Filter by content']",
+      )!,
+      "invoice",
+    );
+    await pause();
+    expect(lastScope()).toEqual({
+      kind: "rules",
+      rules: [rule("body", "contains", "invoice")],
+      matchMode: "all",
+    });
+  });
+
+  it("refuses a bare wildcard instead of listing the whole mailbox", async () => {
+    await render(all, twoDomains);
+    await typeInto(box(), "-%");
+    await pause();
+    // No query went out, so nothing replaced the list.
+    expect(calls()).toBe(1);
+    expect(container.querySelector("[role='status']")?.textContent).toContain(
+      "%",
+    );
+  });
+
+  it("keeps the last valid query while the text is not valid", async () => {
+    await render(all, twoDomains);
+    await typeInto(box(), "invoice is:unread");
+    await pause();
+    expect(calls()).toBe(2);
+    // Half-way through retyping the flag, the token is dropped by the parser.
+    // Running that would flash every invoice, read or not.
+    await typeInto(box(), "invoice is:unre");
+    await pause();
+    expect(calls()).toBe(2);
+    expect(container.querySelector("[role='status']")?.textContent).toContain(
+      "is:unre",
+    );
+    await typeInto(box(), "invoice is:starred");
+    await pause();
+    expect(lastScope()).toEqual({
+      kind: "rules",
+      rules: [rule("body", "contains", "invoice"), rule("is_starred", "true")],
+      matchMode: "all",
+    });
+  });
+
+  it("scopes a filter to the open mailbox and drops back when cleared", async () => {
+    await render(oneBox, twoDomains);
+    await typeInto(box(), "invoice ");
+    await pause();
+    expect(lastScope()).toEqual({
+      kind: "rules",
+      rules: [
+        rule("mailbox", "is", "owner@a.com"),
+        rule("body", "contains", "invoice"),
+      ],
+      matchMode: "all",
+    });
+    await typeInto(box(), "");
+    await pause();
+    expect(lastScope()).toEqual({ kind: "mailbox", mailboxId: 1 });
+  });
+
+  it("filters the whole mailbox, not the pages loaded so far", async () => {
+    vi.mocked(mailThreads).mockImplementation(async ({ scope }) => ({
+      rows:
+        scope.kind === "rules"
+          ? [thread(900, { subject: "Needle far down the mailbox" })]
+          : [thread(1)],
+      nextCursor: null,
+    }));
+    await render(all, twoDomains);
+    await typeInto(box(), "needle ");
+    await pause();
+    expect(rowCount()).toBe(1);
+    expect(container.textContent).toContain("Needle far down");
+    expect(container.textContent).not.toContain("loaded so far");
+  });
+
+  it("keeps the text when the list remounts", async () => {
+    await render(all, twoDomains);
+    await typeInto(box(), "invoice");
+    await render(all, twoDomains, {}, "stacked");
+    expect(box().value).toBe("invoice");
+  });
+
+  it("saves the exact phrases, not the prefix used while typing", async () => {
+    const onSaveAsFolder = vi.fn();
+    await render(all, twoDomains, { onSaveAsFolder });
+    await typeInto(box(), "from:bob invo");
+    const save = [...container.querySelectorAll("button")].find(
+      (b) => b.textContent === "Save as folder",
+    )!;
+    await act(async () => save.click());
+    expect(onSaveAsFolder).toHaveBeenCalledWith(
+      [rule("from", "contains", "bob"), rule("body", "contains", "invo")],
+      "all",
+    );
+  });
+
+  it("will not save an empty filter or one with a mistake", async () => {
+    await render(all, twoDomains, { onSaveAsFolder: vi.fn() });
+    const save = () =>
+      [...container.querySelectorAll("button")].find(
+        (b) => b.textContent === "Save as folder",
+      ) as HTMLButtonElement;
+    expect(save().disabled).toBe(true);
+    await typeInto(box(), "-%");
+    expect(save().disabled).toBe(true);
+    await typeInto(box(), "bob");
+    expect(save().disabled).toBe(false);
+  });
+});
+
+describe("a smart folder", () => {
+  it("lists its members with no filters on top", async () => {
+    vi.mocked(mailThreads).mockResolvedValue({
+      rows: [thread(5)],
+      nextCursor: null,
+    });
+    const onEditFolder = vi.fn();
+    await render(folder, twoDomains, { onEditFolder });
+    expect(mailThreads).toHaveBeenCalledWith({
+      scope: { kind: "folder", folderId: 7 },
+      limit: 100,
+    });
+    expect(
+      container.querySelector("input[aria-label='Search mail']"),
+    ).toBeNull();
+    const edit = [...container.querySelectorAll("button")].find((b) =>
+      b.textContent?.includes("Edit folder"),
+    )!;
+    await act(async () => edit.click());
+    expect(onEditFolder).toHaveBeenCalled();
+  });
+
+  it("shows mail that arrives after it was saved", async () => {
+    vi.mocked(mailThreads)
+      .mockResolvedValueOnce({
+        rows: [thread(1, { subject: "stored invoice" })],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          thread(2, { subject: "later invoice" }),
+          thread(1, { subject: "stored invoice" }),
+        ],
+        nextCursor: null,
+      });
+    let fire: (() => void) | undefined;
+    vi.mocked(listen).mockImplementation((async (
+      _event: string,
+      cb: () => void,
+    ) => {
+      fire = cb;
+      return () => undefined;
+    }) as unknown as typeof listen);
+    await render(folder, twoDomains);
+    expect(container.textContent).toContain("stored invoice");
+    expect(container.textContent).not.toContain("later invoice");
+    // Sync files the new message and announces it; the list reads the folder again.
+    await act(async () => fire!());
+    expect(container.textContent).toContain("later invoice");
+    expect(mailThreads).toHaveBeenLastCalledWith({
+      scope: { kind: "folder", folderId: 7 },
+      limit: 100,
+    });
+  });
+
+  it("drops an in-flight page when the scope moves on", async () => {
+    const cursor = { lastMessageAt: 1, id: 32 };
+    let resolveOld!: (v: { rows: ThreadRow[]; nextCursor: null }) => void;
+    vi.mocked(mailThreads)
+      .mockResolvedValueOnce({
+        rows: Array.from({ length: 32 }, (_, i) => thread(i + 1)),
+        nextCursor: cursor,
+      })
+      .mockImplementationOnce(
+        () => new Promise((resolve) => (resolveOld = resolve)),
+      )
+      .mockResolvedValueOnce({ rows: [], nextCursor: null });
+    await render(all, twoDomains);
+    await act(async () => intersect!());
+    await render(folder, twoDomains);
+    await act(async () =>
+      resolveOld({ rows: [thread(900)], nextCursor: null }),
+    );
+    expect(rowCount()).toBe(0);
+  });
 });

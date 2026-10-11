@@ -13,14 +13,21 @@ import {
   useSelectedFolder,
   useSelectedMailbox,
 } from "../model/mailPrefs";
-import type { ThreadScope } from "../model/mailTypes";
+import type { FolderRow, MatchMode, Rule } from "../model/mailTypes";
+import { parseFolderId, useMailFolders } from "../model/useMailFolders";
+import { useMailStatus } from "../model/useMailStatus";
+import { MailFolderList, groupMailboxesByDomain } from "./MailFolderList";
 import {
-  MailFolderList,
-  groupMailboxesByDomain,
-  useMailStatus,
-} from "./MailFolderList";
-import { MailThreadList, useMailThreadList } from "./MailThreadList";
+  MailThreadList,
+  useMailThreadList,
+  type ListBase,
+} from "./MailThreadList";
 import { MailThreadRead } from "./MailThreadRead";
+import { SmartFolderSheet } from "./SmartFolderSheet";
+
+type Sheet =
+  | { kind: "new"; rules: Rule[]; matchMode: MatchMode }
+  | { kind: "edit"; folder: FolderRow };
 
 type Props = {
   besideRail?: boolean;
@@ -49,8 +56,14 @@ export function MailView({
   const side = useReadingPaneSide();
   const { status, error, refresh } = useMailStatus();
   const mailboxPref = useSelectedMailbox();
-  const folderId = useSelectedFolder();
+  const folderPref = useSelectedFolder();
+  const {
+    folders,
+    error: foldersError,
+    refresh: refreshFolders,
+  } = useMailFolders();
   const [threadId, setThreadId] = useState<number | null>(null);
+  const [sheet, setSheet] = useState<Sheet | null>(null);
   const mailboxes = status
     ? groupMailboxesByDomain(status.sources).flatMap((g) =>
         g.mailboxes.map((m) => m.mailbox),
@@ -62,9 +75,24 @@ export function MailView({
     mailboxPref !== null && mailboxes.some((m) => String(m.id) === mailboxPref)
       ? Number(mailboxPref)
       : null;
-  const scope: ThreadScope =
-    mailboxId === null ? { kind: "all" } : { kind: "mailbox", mailboxId };
-  const list = useMailThreadList(scope, folderId !== null);
+  // A saved folder can be deleted elsewhere; like a mailbox, fall back to all
+  // mail rather than querying an id that no longer exists.
+  const prefFolderId = parseFolderId(folderPref);
+  const folderId =
+    prefFolderId !== null && folders?.some((f) => f.id === prefFolderId)
+      ? prefFolderId
+      : null;
+  const folderPending =
+    prefFolderId !== null && folders === null && foldersError === null;
+  const mailboxAddress = mailboxes.find((m) => m.id === mailboxId)?.address;
+  const scope: ListBase | null = folderPending
+    ? null
+    : folderId !== null
+      ? { kind: "folder", folderId }
+      : mailboxId !== null && mailboxAddress
+        ? { kind: "mailbox", mailboxId, address: mailboxAddress }
+        : { kind: "all" };
+  const list = useMailThreadList(scope);
   const pick = (mailbox: string | null, folder: string | null) => {
     selectedMailbox.save(mailbox);
     selectedFolder.save(folder);
@@ -127,9 +155,21 @@ export function MailView({
             error={error}
             mailboxId={mailboxId}
             folderId={folderId}
+            smartFolders={
+              folders?.map((f) => ({
+                id: f.id,
+                name: f.name,
+                color: f.color,
+                unread: f.countUnread ? f.unreadCount : 0,
+              })) ?? null
+            }
+            foldersError={foldersError}
+            onNewFolder={() =>
+              setSheet({ kind: "new", rules: [], matchMode: "all" })
+            }
             onSelectAll={() => pick(null, null)}
             onSelectMailbox={(id) => pick(String(id), null)}
-            onSelectFolder={(id) => pick(null, id)}
+            onSelectFolder={(id) => pick(null, String(id))}
             onSynced={() => void refresh()}
           />
         </aside>
@@ -167,11 +207,17 @@ export function MailView({
             ) : null}
             <MailThreadList
               list={list}
-              scope={scope}
+              scope={scope ?? { kind: "all" }}
               mailboxes={mailboxes}
               selectedId={threadId}
               onSelect={(thread) => setThreadId(thread.id)}
-              folderSelected={folderId !== null}
+              onSaveAsFolder={(rules, matchMode) =>
+                setSheet({ kind: "new", rules, matchMode })
+              }
+              onEditFolder={() => {
+                const folder = folders?.find((f) => f.id === folderId);
+                if (folder) setSheet({ kind: "edit", folder });
+              }}
             />
           </section>
           {side === "off" ? null : (
@@ -185,6 +231,37 @@ export function MailView({
           )}
         </div>
       </div>
+      {sheet ? (
+        <SmartFolderSheet
+          // Remount per opening: its fields start from the folder or filters.
+          key={sheet.kind === "edit" ? `edit-${sheet.folder.id}` : "new"}
+          folder={sheet.kind === "edit" ? sheet.folder : null}
+          initial={
+            sheet.kind === "new"
+              ? { rules: sheet.rules, matchMode: sheet.matchMode }
+              : null
+          }
+          suggestions={{
+            mailboxes: mailboxes.map((m) => m.address),
+            domains: [...new Set(mailboxes.map((m) => m.domain))],
+            sources: status?.sources.map((s) => s.label) ?? [],
+          }}
+          onClose={() => setSheet(null)}
+          onSaved={(saved) => {
+            setSheet(null);
+            void refreshFolders();
+            void refresh();
+            list.reload();
+            if (sheet.kind === "new") pick(null, String(saved.id));
+          }}
+          onDeleted={(id) => {
+            setSheet(null);
+            void refreshFolders();
+            void refresh();
+            if (id === folderId) pick(null, null);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

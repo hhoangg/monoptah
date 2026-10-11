@@ -96,7 +96,7 @@ const escapeId = (id: string) =>
   // Uppercase is escaped, not folded: the reader lowercases cids, so folding
   // would make "A" and "a" the same cid. "_" escapes itself, keeping this
   // injective, and "." (the joiner below) is never emitted by it.
-  id.replace(/[^a-z0-9-]/g, (c) => `_${c.charCodeAt(0).toString(16)}`);
+  id.replace(/[^a-z0-9-]/g, (c) => `_${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 
 /**
  * The draft id salts the cid so a stale `cid:` inside the appended quoted
@@ -111,11 +111,11 @@ export function contentIdFor(draftId: string, attachmentId: string): string {
 // encoding; tab and newline are real content.
 const BAD_CHARS =
   // eslint-disable-next-line no-control-regex
-  /[\u0000-\u0008\u000b-\u001f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+  /[\ud800-\udbff][\udc00-\udfff]|[\u0000-\u0008\u000b-\u001f\ud800-\udfff]/g;
 
 function clean(n: TipTapNode): TipTapNode {
   const str = (v: unknown) =>
-    typeof v === "string" ? v.replace(BAD_CHARS, "") : v;
+    typeof v === "string" ? v.replace(BAD_CHARS, (m) => (m.length === 2 ? m : "")) : v;
   return {
     ...n,
     ...(n.text !== undefined ? { text: str(n.text) as string } : {}),
@@ -169,7 +169,9 @@ function runs(
 
 function attId(n: TipTapNode): string | null {
   const v = n.attrs?.["data-mono-att"];
-  return typeof v === "string" || typeof v === "number" ? String(v) : null;
+  const id = typeof v === "string" || typeof v === "number" ? String(v) : "";
+  // An empty id would yield a malformed cid; treat it as no attachment.
+  return id === "" ? null : id;
 }
 
 const altOf = (n: TipTapNode) =>

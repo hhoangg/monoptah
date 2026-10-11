@@ -1,12 +1,23 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { LIST_PAGE_SIZE, listWindowSize } from "../../../shared/lib/listWindow";
-import { Loader, Paperclip, Star } from "../../../shared/ui/icons";
+import { Loader, Paperclip, Pencil, Star } from "../../../shared/ui/icons";
 import { MAIL_MESSAGES_CHANGED_EVENT, mailThreads } from "../model/mail";
 import { useDensity } from "../model/mailPrefs";
+import {
+  NO_CHIPS,
+  QUERY_MATCH_MODE,
+  SEARCH_DEBOUNCE_MS,
+  buildRule,
+  chipRules,
+  parseQuery,
+  type ChipFilters,
+} from "../model/mailQuery";
 import type {
   MailAddress,
   MailMailbox,
+  MatchMode,
+  Rule,
   ThreadCursor,
   ThreadRow,
   ThreadScope,
@@ -16,18 +27,19 @@ import { domainOf } from "../model/mailDomain";
 /** Rows fetched per backend page; the DOM window grows in LIST_PAGE_SIZE steps. */
 const FETCH_LIMIT = 100;
 
-/**
- * Consecutive fetched pages that add no row matching the active filter before
- * paging pauses for a "Load more" press. Without it a filter matching nothing
- * would pull the whole mailbox with no user gesture.
- */
-const MAX_IDLE_PAGES = 3;
-
 const DAY_MS = 86_400_000;
-const FILTER_FIELDS = ["from", "to", "content"] as const;
-type FilterField = (typeof FILTER_FIELDS)[number];
-export type ThreadFilters = Record<FilterField, string>;
-export const NO_FILTERS: ThreadFilters = { from: "", to: "", content: "" };
+const CHIP_FIELDS = ["from", "to", "content"] as const;
+type ChipField = (typeof CHIP_FIELDS)[number];
+const CHIP_LABEL: Record<ChipField, string> = {
+  from: "From",
+  to: "To",
+  content: "Content",
+};
+const CHIP_HINT: Record<ChipField, string> = {
+  from: "The sender's name or address contains this",
+  to: "A To recipient's name or address contains this",
+  content: "The message body contains this phrase",
+};
 
 /**
  * `seconds` is epoch seconds (ThreadRow.lastMessageAt). Passing it straight to
@@ -81,59 +93,56 @@ export function participantsLabel(row: ThreadRow): string {
   return (others.length > 0 ? others : row.participants).map(nameOf).join(", ");
 }
 
-const anyActive = (filters: ThreadFilters) =>
-  FILTER_FIELDS.some((f) => filters[f].trim() !== "");
-
-export function filterThreads(rows: ThreadRow[], filters: ThreadFilters) {
-  const f = {
-    from: filters.from.trim().toLowerCase(),
-    to: filters.to.trim().toLowerCase(),
-    content: filters.content.trim().toLowerCase(),
-  };
-  if (!f.from && !f.to && !f.content) return rows;
-  const people = (row: ThreadRow) =>
-    row.participants
-      .map((p) => `${p.name ?? ""} ${p.addr}`)
-      .join(" ")
-      .toLowerCase();
-  return rows.filter((row) => {
-    // A thread row carries one participant list, not a from/to split, so both
-    // filters match against it.
-    if (f.from && !people(row).includes(f.from)) return false;
-    if (f.to && !people(row).includes(f.to)) return false;
-    if (
-      f.content &&
-      !`${row.subject} ${row.snippet}`.toLowerCase().includes(f.content)
-    )
-      return false;
-    return true;
-  });
-}
-
 const CHIP =
   "rounded-full border px-2 py-0.5 text-[11px] focus-visible:outline-2 focus-visible:outline-accent";
+
+/**
+ * Where a listing starts before any filter is applied. MailView resolves the
+ * stored prefs into one of these; null means the choice is still loading, so
+ * nothing is fetched under a scope that may not exist.
+ */
+export type ListBase =
+  | { kind: "all" }
+  | { kind: "mailbox"; mailboxId: number; address: string }
+  | { kind: "folder"; folderId: number };
+
+function useDebounced<T>(value: T, ms: number): T {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setSettled(value), ms);
+    return () => clearTimeout(timer);
+  }, [value, ms]);
+  return settled;
+}
+
+type Draft = { chips: ChipFilters; text: string };
+const EMPTY_DRAFT: Draft = { chips: NO_CHIPS, text: "" };
+
+/** A mailbox is scoped in a filtered listing by the same rule `in:` makes. */
+function mailboxScopeRule(address: string): Rule {
+  const built = buildRule("in", address, false);
+  if (!("rule" in built)) throw new Error("unreachable: in: always builds");
+  return built.rule;
+}
 
 /**
  * List state lives in MailView, above the keyed threads section: that section
  * remounts when the reading pane changes side, and the loaded pages, window
  * size, filters and scroll offset must survive it.
+ *
+ * Filters are rules the backend evaluates, so they cover the whole mailbox and
+ * not just the pages loaded so far. A smart folder is already a filter and
+ * takes none on top, since a folder's own match mode cannot be combined with
+ * these.
  */
-export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
+export function useMailThreadList(base: ListBase | null) {
   const [rows, setRows] = useState<ThreadRow[]>([]);
   const [cursor, setCursor] = useState<ThreadCursor | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [limit, setLimit] = useState(LIST_PAGE_SIZE);
-  const [filters, setFilters] = useState<ThreadFilters>(NO_FILTERS);
+  const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const [reloadKey, setReloadKey] = useState(0);
-  const [idlePages, setIdlePagesState] = useState(0);
-  const idleRef = useRef(0);
-  const setIdlePages = (n: number) => {
-    idleRef.current = n;
-    setIdlePagesState(n);
-  };
-  const filtersRef = useRef(filters);
-  filtersRef.current = filters;
   // Survives the list remounting, so a layout change keeps the user's place.
   const scrollTop = useRef(0);
   // Bumped per first-page load so a page fetch begun under an older scope or
@@ -141,7 +150,57 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
   const fetchingRef = useRef(false);
   const generation = useRef(0);
   const loadedScope = useRef<string | null>(null);
-  const scopeKey = scope.kind === "all" ? "all" : `m${scope.mailboxId}`;
+
+  // The box and the chips act after a pause: each settled change is a real
+  // query, and the last word may run a prefix scan of the index.
+  const settled = useDebounced(draft, SEARCH_DEBOUNCE_MS);
+  const applied = useMemo(() => {
+    const chips = chipRules(settled.chips);
+    const box = parseQuery(settled.text, { prefixLast: true });
+    return {
+      rules: [...chips.rules, ...box.rules],
+      errors: [...chips.errors, ...box.errors],
+    };
+  }, [settled]);
+  // A half-typed `is:unre` is an error, not "no filter": keep the last query
+  // that was valid instead of flashing the whole mailbox.
+  const lastValid = useRef<Rule[]>([]);
+  if (applied.errors.length === 0) lastValid.current = applied.rules;
+  const filterRules =
+    applied.errors.length === 0 ? applied.rules : lastValid.current;
+
+  const mailboxAddress = base?.kind === "mailbox" ? base.address : null;
+  const mailboxRules = useMemo(
+    () => (mailboxAddress ? [mailboxScopeRule(mailboxAddress)] : []),
+    [mailboxAddress],
+  );
+  let serverScope: ThreadScope | null = null;
+  if (base?.kind === "folder") {
+    serverScope = { kind: "folder", folderId: base.folderId };
+  } else if (base && filterRules.length > 0) {
+    serverScope = {
+      kind: "rules",
+      rules: [...mailboxRules, ...filterRules],
+      matchMode: QUERY_MATCH_MODE,
+    };
+  } else if (base?.kind === "mailbox") {
+    serverScope = { kind: "mailbox", mailboxId: base.mailboxId };
+  } else if (base) {
+    serverScope = { kind: "all" };
+  }
+  const scopeKey = JSON.stringify(serverScope);
+  const scopeRef = useRef(serverScope);
+  scopeRef.current = serverScope;
+
+  // What "Save as folder" copies: exact phrases, never the typing-time prefix.
+  const saved = useMemo(() => {
+    const chips = chipRules(draft.chips);
+    const box = parseQuery(draft.text);
+    return {
+      rules: [...mailboxRules, ...chips.rules, ...box.rules],
+      errors: [...chips.errors, ...box.errors],
+    };
+  }, [draft, mailboxRules]);
 
   // Reload from the first page; the sync event means rows may have moved.
   useEffect(() => {
@@ -160,20 +219,20 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
   }, []);
 
   useEffect(() => {
-    // Before the folder early return: a page in flight from the previous scope
-    // must not append onto the list cleared below.
+    // Before the early return: a page in flight from the previous scope must
+    // not append onto the list cleared below.
     generation.current += 1;
     fetchingRef.current = false;
-    setIdlePages(0);
     // Reset on the scope change itself, so a failed first fetch does not leave
     // the previous scope's window behind. A background reload keeps it.
     const scopeChanged = loadedScope.current !== scopeKey;
     loadedScope.current = scopeKey;
     if (scopeChanged) setLimit(LIST_PAGE_SIZE);
-    if (folderSelected) {
+    const scope = scopeRef.current;
+    if (!scope) {
       setRows([]);
       setCursor(null);
-      setLoading(false);
+      setLoading(true);
       return;
     }
     let stale = false;
@@ -194,36 +253,26 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
     return () => {
       stale = true;
     };
-    // `scope` is an object; scopeKey is its identity.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scopeKey, folderSelected, reloadKey]);
+  }, [scopeKey, reloadKey]);
 
-  const filtered = filterThreads(rows, filters);
-  const shown = listWindowSize(filtered.length, limit);
-  const windowHasMore = shown < filtered.length;
+  const shown = listWindowSize(rows.length, limit);
+  const windowHasMore = shown < rows.length;
   const pageHasMore = cursor !== null;
   const hasMore = windowHasMore || pageHasMore;
 
-  const grow = (manual = false) => {
+  const grow = () => {
     if (windowHasMore) {
       setLimit((current) => current + LIST_PAGE_SIZE);
       return;
     }
-    if (!cursor || fetchingRef.current) return;
-    if (!manual && idleRef.current >= MAX_IDLE_PAGES) return;
-    if (manual) setIdlePages(0);
+    const scope = scopeRef.current;
+    if (!cursor || !scope || fetchingRef.current) return;
     fetchingRef.current = true;
     const after = cursor;
     const mine = generation.current;
     mailThreads({ scope, cursor: after, limit: FETCH_LIMIT })
       .then((page) => {
         if (mine !== generation.current) return;
-        setIdlePages(
-          filterThreads(page.rows, filtersRef.current).length > 0 ||
-            !anyActive(filtersRef.current)
-            ? 0
-            : idleRef.current + 1,
-        );
         setRows((current) => [...current, ...page.rows]);
         setCursor(page.nextCursor);
         setLimit((current) => current + LIST_PAGE_SIZE);
@@ -237,22 +286,29 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
       });
   };
 
-  const paused = pageHasMore && idlePages >= MAX_IDLE_PAGES;
   return {
-    moreOnServer: pageHasMore,
-    paused,
-    loadMore: () => grow(true),
     rows,
-    filtered,
     shown,
     hasMore,
     loading,
     error,
-    filters,
-    setFilters: (next: ThreadFilters) => {
-      setIdlePages(0);
-      setFilters(next);
-    },
+    chips: draft.chips,
+    text: draft.text,
+    setChips: (chips: ChipFilters) => setDraft({ ...draft, chips }),
+    setText: (text: string) => setDraft({ ...draft, text }),
+    clearFilters: () => setDraft(EMPTY_DRAFT),
+    /** Why the box's current text is not (fully) applied, or null. */
+    queryError: applied.errors[0] ?? null,
+    filtering: filterRules.length > 0,
+    hasInput:
+      draft.text.trim() !== "" ||
+      CHIP_FIELDS.some((f) => draft.chips[f].trim() !== ""),
+    /** The rules and mode "Save as folder" starts from, and what is wrong with them. */
+    saveRules: saved.rules,
+    saveErrors: saved.errors,
+    saveMatchMode: QUERY_MATCH_MODE as MatchMode,
+    /** Re-reads the first page, for a change the sync event does not announce. */
+    reload: () => setReloadKey((k) => k + 1),
     grow,
     scrollTop,
   };
@@ -267,8 +323,10 @@ type Props = {
   mailboxes: Pick<MailMailbox, "address">[];
   selectedId: number | null;
   onSelect: (thread: ThreadRow) => void;
-  /** Smart folders are not queryable yet; their threads come with Task 13. */
-  folderSelected?: boolean;
+  /** Opens the folder editor with the current filters as its rules. */
+  onSaveAsFolder?: (rules: Rule[], matchMode: MatchMode) => void;
+  /** Opens the editor for the folder being viewed. */
+  onEditFolder?: () => void;
 };
 
 export function MailThreadList({
@@ -277,23 +335,30 @@ export function MailThreadList({
   mailboxes,
   selectedId,
   onSelect,
-  folderSelected = false,
+  onSaveAsFolder,
+  onEditFolder,
 }: Props) {
   const {
     rows,
-    filtered,
     shown,
     hasMore,
     loading,
     error,
-    filters,
-    setFilters,
-    moreOnServer,
-    paused,
-    loadMore,
+    chips,
+    text,
+    setChips,
+    setText,
+    clearFilters,
+    queryError,
+    filtering,
+    hasInput,
+    saveRules,
+    saveErrors,
+    saveMatchMode,
   } = list;
+  const inFolder = scope.kind === "folder";
   const density = useDensity();
-  const [open, setOpen] = useState<FilterField | null>(null);
+  const [open, setOpen] = useState<ChipField | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const growRef = useRef(list.grow);
@@ -322,76 +387,118 @@ export function MailThreadList({
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-    // rows.length: with a filter active a fetched page may not change `shown`,
-    // and a new observer is what re-reports a sentinel that is still visible.
+    // rows.length: a new observer is what re-reports a sentinel that is still
+    // visible after a page lands.
   }, [hasMore, shown, rows.length]);
 
   const showDomain = scopeSpansDomains(scope, mailboxes);
   const compact = density === "compact";
   const now = Date.now();
-  const anyFilter = FILTER_FIELDS.some((f) => filters[f].trim() !== "");
+  const canSave = hasInput && saveErrors.length === 0 && saveRules.length > 0;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-mail-threads>
-      <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-stroke px-3 py-2">
-        {FILTER_FIELDS.map((field) => {
-          const active = filters[field].trim() !== "";
-          return (
-            <span key={field} className="flex items-center gap-1">
+      {inFolder ? (
+        <div className="flex shrink-0 items-center gap-2 border-b border-stroke px-3 py-2">
+          <p className="min-w-0 flex-1 text-[11px] text-content/50">
+            A smart folder is its own filter. Edit its conditions to change what
+            it shows.
+          </p>
+          {onEditFolder ? (
+            <button
+              type="button"
+              onClick={onEditFolder}
+              className="flex shrink-0 items-center gap-1 rounded-md border border-content/10 px-2 py-0.5 text-[11px] text-content/70 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-accent"
+            >
+              <Pencil className="size-3" strokeWidth={1.75} />
+              Edit folder
+            </button>
+          ) : null}
+        </div>
+      ) : (
+        <div className="shrink-0 border-b border-stroke px-3 py-2">
+          <input
+            type="search"
+            aria-label="Search mail"
+            placeholder="Search: from:  subject:  has:attachment  is:unread"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            className="h-7 w-full rounded-md border border-content/10 bg-transparent px-2 text-[12px] text-content outline-none placeholder:text-content/35 focus:border-accent/50"
+          />
+          {queryError ? (
+            <p role="status" className="mt-1 text-[11px] text-red-400/90">
+              {queryError}
+            </p>
+          ) : null}
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            {CHIP_FIELDS.map((field) => {
+              const active = chips[field].trim() !== "";
+              return (
+                <span key={field} className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    aria-pressed={active || open === field}
+                    title={CHIP_HINT[field]}
+                    onClick={() => setOpen(open === field ? null : field)}
+                    className={`${CHIP} ${
+                      active
+                        ? "border-accent/40 bg-accent/10 text-content"
+                        : "border-content/10 bg-content/5 text-content/70 hover:bg-content/10"
+                    }`}
+                  >
+                    {CHIP_LABEL[field]}
+                    {active ? `: ${chips[field].trim()}` : ""}
+                  </button>
+                  {open === field ? (
+                    <input
+                      autoFocus
+                      aria-label={`Filter by ${field}`}
+                      value={chips[field]}
+                      onChange={(e) =>
+                        setChips({ ...chips, [field]: e.target.value })
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === "Escape")
+                          setOpen(null);
+                      }}
+                      className="h-6 w-28 rounded-md border border-content/10 bg-transparent px-1.5 text-[11px] text-content outline-none focus:border-accent/50"
+                    />
+                  ) : null}
+                </span>
+              );
+            })}
+            {hasInput ? (
               <button
                 type="button"
-                aria-pressed={active || open === field}
-                title="Filters the threads loaded so far"
-                onClick={() => setOpen(open === field ? null : field)}
-                className={`${CHIP} ${
-                  active
-                    ? "border-accent/40 bg-accent/10 text-content"
-                    : "border-content/10 bg-content/5 text-content/70 hover:bg-content/10"
-                }`}
+                onClick={clearFilters}
+                className="text-[11px] text-content/50 hover:text-content"
               >
-                {field === "from" ? "From" : field === "to" ? "To" : "Content"}
-                {active ? `: ${filters[field].trim()}` : ""}
+                Clear
               </button>
-              {open === field ? (
-                <input
-                  autoFocus
-                  aria-label={`Filter by ${field}`}
-                  value={filters[field]}
-                  onChange={(e) =>
-                    setFilters({ ...filters, [field]: e.target.value })
-                  }
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === "Escape") setOpen(null);
-                  }}
-                  className="h-6 w-28 rounded-md border border-content/10 bg-transparent px-1.5 text-[11px] text-content outline-none focus:border-accent/50"
-                />
-              ) : null}
-            </span>
-          );
-        })}
-        {anyFilter ? (
-          <button
-            type="button"
-            onClick={() => setFilters(NO_FILTERS)}
-            className="text-[11px] text-content/50 hover:text-content"
-          >
-            Clear
-          </button>
-        ) : null}
-        <button
-          type="button"
-          disabled
-          title="Smart folders are not available yet"
-          className="ml-auto rounded-md border border-content/10 px-2 py-0.5 text-[11px] text-content/70 opacity-50"
-        >
-          Save as folder
-        </button>
-      </div>
+            ) : null}
+            {onSaveAsFolder ? (
+              <button
+                type="button"
+                disabled={!canSave}
+                title={
+                  canSave
+                    ? "Keep these filters as a smart folder"
+                    : "Type a search or a filter to save it as a smart folder"
+                }
+                onClick={() => onSaveAsFolder(saveRules, saveMatchMode)}
+                className="ml-auto rounded-md border border-content/10 px-2 py-0.5 text-[11px] text-content/70 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50 disabled:hover:bg-transparent"
+              >
+                Save as folder
+              </button>
+            ) : null}
+          </div>
+        </div>
+      )}
 
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
         {/* role restored: list-style none strips list semantics in WebKit */}
         <ul role="list" aria-label="Threads" className="m-0 list-none p-0">
-          {filtered.slice(0, shown).map((row) => {
+          {rows.slice(0, shown).map((row) => {
             const unread = row.unreadCount > 0;
             const selected = row.id === selectedId;
             return (
@@ -479,23 +586,6 @@ export function MailThreadList({
             );
           })}
         </ul>
-        {anyFilter && moreOnServer ? (
-          <p className="px-3 py-1 text-[11px] text-content/45">
-            Filtering the {rows.length} threads loaded so far, not the whole
-            mailbox.
-          </p>
-        ) : null}
-        {paused ? (
-          <div className="px-3 py-2">
-            <button
-              type="button"
-              onClick={loadMore}
-              className="rounded-md border border-content/10 px-2.5 py-1 text-[12px] text-content/70 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-accent"
-            >
-              Load more
-            </button>
-          </div>
-        ) : null}
         {hasMore ? (
           <div ref={sentinelRef} aria-hidden className="h-px" />
         ) : null}
@@ -510,14 +600,13 @@ export function MailThreadList({
             Could not load threads: {error}
           </p>
         ) : null}
-        {!loading && !error && folderSelected ? (
+        {!loading && !error && rows.length === 0 ? (
           <p className="px-3 py-2 text-[12px] text-content/50">
-            Smart folder results are not available yet.
-          </p>
-        ) : null}
-        {!loading && !error && !folderSelected && filtered.length === 0 ? (
-          <p className="px-3 py-2 text-[12px] text-content/50">
-            {rows.length === 0 ? "No mail here yet." : "No threads match."}
+            {inFolder
+              ? "Nothing in this folder yet. Matching mail that arrives will show up here."
+              : filtering
+                ? "No threads match."
+                : "No mail here yet."}
           </p>
         ) : null}
       </div>

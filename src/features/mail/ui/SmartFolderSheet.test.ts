@@ -1,0 +1,241 @@
+// @vitest-environment happy-dom
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { SmartFolderSheet } from "./SmartFolderSheet";
+import {
+  mailFolderDelete,
+  mailFolderPreview,
+  mailFolderUpsert,
+} from "../model/mail";
+import { SEARCH_DEBOUNCE_MS } from "../model/mailQuery";
+import type { FolderRow, Rule } from "../model/mailTypes";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("../model/mail", () => ({
+  mailFolderPreview: vi.fn(),
+  mailFolderUpsert: vi.fn(),
+  mailFolderDelete: vi.fn(),
+}));
+
+const rule = (
+  field: Rule["field"],
+  op: Rule["op"],
+  value: Rule["value"] = "",
+  negate = false,
+): Rule => ({ field, op, value, negate });
+
+const savedFolder = (over: Partial<FolderRow> = {}): FolderRow => ({
+  id: 4,
+  name: "Buyers",
+  color: null,
+  sortOrder: 2,
+  matchMode: "all",
+  hideFromMailbox: false,
+  countUnread: true,
+  rules: [rule("from", "ends_with", "@gmail.com")],
+  threadCount: 0,
+  unreadCount: 0,
+  ...over,
+});
+
+const suggestions = { mailboxes: [], domains: [], sources: [] };
+
+let container: HTMLDivElement;
+let root: Root;
+const onClose = vi.fn();
+const onSaved = vi.fn();
+const onDeleted = vi.fn();
+
+beforeEach(() => {
+  (
+    globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
+  ).IS_REACT_ACT_ENVIRONMENT = true;
+  vi.useFakeTimers();
+  for (const fn of [
+    mailFolderPreview,
+    mailFolderUpsert,
+    mailFolderDelete,
+    onClose,
+    onSaved,
+    onDeleted,
+  ])
+    vi.mocked(fn).mockReset();
+  vi.mocked(mailFolderPreview).mockResolvedValue({ count: 38 });
+  vi.mocked(mailFolderUpsert).mockResolvedValue(savedFolder());
+  vi.mocked(mailFolderDelete).mockResolvedValue(undefined);
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+});
+
+afterEach(() => {
+  act(() => root.unmount());
+  container.remove();
+  vi.useRealTimers();
+});
+
+const open = async (
+  props: Partial<Parameters<typeof SmartFolderSheet>[0]> = {},
+) => {
+  await act(async () =>
+    root.render(
+      createElement(SmartFolderSheet, {
+        folder: null,
+        suggestions,
+        onClose,
+        onSaved,
+        onDeleted,
+        ...props,
+      }),
+    ),
+  );
+  await settle();
+};
+const settle = () =>
+  act(async () => {
+    await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS);
+  });
+const button = (text: string) =>
+  [...document.body.querySelectorAll("button")].find(
+    (b) => b.textContent?.trim() === text,
+  ) as HTMLButtonElement;
+const field = (label: string) =>
+  document.body.querySelector<HTMLInputElement>(`[aria-label='${label}']`)!;
+const typeInto = async (el: HTMLInputElement, value: string) => {
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )!.set!.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await settle();
+};
+
+it("runs the live count in the editor's match mode", async () => {
+  await open({ folder: savedFolder({ matchMode: "all" }) });
+  expect(mailFolderPreview).toHaveBeenLastCalledWith(
+    [rule("from", "ends_with", "@gmail.com")],
+    "all",
+  );
+  expect(document.body.textContent).toContain("38");
+  await act(async () => button("Any condition").click());
+  await settle();
+  // The mode changes the count, so the preview must be asked in the new one.
+  expect(mailFolderPreview).toHaveBeenLastCalledWith(
+    [rule("from", "ends_with", "@gmail.com")],
+    "any",
+  );
+});
+
+it("does not count while typing, only after a pause", async () => {
+  await open({ folder: savedFolder() });
+  const before = vi.mocked(mailFolderPreview).mock.calls.length;
+  await act(async () => {
+    const el = field("From value");
+    Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )!.set!.call(el, "@x.com");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS - 1);
+  });
+  expect(mailFolderPreview).toHaveBeenCalledTimes(before);
+  await settle();
+  expect(mailFolderPreview).toHaveBeenCalledTimes(before + 1);
+});
+
+it("reads a day count that came back from the database as text", async () => {
+  // Saved as a JSON number, read back as the string "30".
+  await open({
+    folder: savedFolder({ rules: [rule("date", "within_days", "30")] }),
+  });
+  expect(field("Date value").value).toBe("30");
+  expect(document.body.querySelector("[role='alert']")).toBeNull();
+  expect(button("Save folder").disabled).toBe(false);
+});
+
+it("labels contains_any on a mailbox 'is any of'", async () => {
+  await open({
+    folder: savedFolder({
+      rules: [
+        rule("mailbox", "contains_any", ["a@x.com", "b@x.com"]),
+        rule("subject", "contains_any", ["order"]),
+      ],
+    }),
+  });
+  const text = document.body.textContent!;
+  expect(text).toContain("is any of");
+  expect(text).toContain("contains any of");
+  // One of each: not "contains any of" on the mailbox row.
+  expect(text.match(/is any of/g)).toHaveLength(1);
+  expect(text.match(/contains any of/g)).toHaveLength(1);
+});
+
+it("holds a bare wildcard back from the count and from saving", async () => {
+  await open({
+    folder: savedFolder({ rules: [rule("subject", "contains", "%", true)] }),
+  });
+  expect(document.body.querySelector("[role='alert']")?.textContent).toContain(
+    "word",
+  );
+  expect(button("Save folder").disabled).toBe(true);
+  expect(mailFolderPreview).not.toHaveBeenCalled();
+});
+
+it("saves the folder with its rules and options", async () => {
+  await open({
+    folder: null,
+    initial: {
+      rules: [rule("from", "contains", "bob")],
+      matchMode: "all",
+    },
+  });
+  expect(button("Save folder").disabled).toBe(true);
+  await typeInto(
+    document.getElementById("smart-folder-name") as HTMLInputElement,
+    "Bobs",
+  );
+  expect(button("Save folder").disabled).toBe(false);
+  await act(async () => button("Save folder").click());
+  expect(mailFolderUpsert).toHaveBeenCalledWith(
+    {
+      id: null,
+      name: "Bobs",
+      color: null,
+      sortOrder: null,
+      matchMode: "all",
+      hideFromMailbox: false,
+      countUnread: true,
+    },
+    [rule("from", "contains", "bob")],
+  );
+  expect(onSaved).toHaveBeenCalled();
+});
+
+it("says plainly what hiding from the mailbox does", async () => {
+  await open({ folder: savedFolder() });
+  const text = document.body.textContent!;
+  expect(text).toContain("Hide matches from All mail and mailboxes");
+  expect(text).toContain("leave All mail and their mailbox");
+});
+
+it("deletes only after a second press", async () => {
+  await open({ folder: savedFolder() });
+  await act(async () => button("Delete").click());
+  expect(mailFolderDelete).not.toHaveBeenCalled();
+  await act(async () => button("Delete folder").click());
+  expect(mailFolderDelete).toHaveBeenCalledWith(4);
+  expect(onDeleted).toHaveBeenCalledWith(4);
+});
+
+it("shows the server's reason when saving fails", async () => {
+  vi.mocked(mailFolderUpsert).mockRejectedValue(
+    new Error("A folder named Buyers already exists."),
+  );
+  await open({ folder: savedFolder() });
+  await act(async () => button("Save folder").click());
+  expect(document.body.textContent).toContain("already exists");
+  expect(onSaved).not.toHaveBeenCalled();
+});
