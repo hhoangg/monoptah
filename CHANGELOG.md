@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.16.0] - 2026-10-11
+
+### Added
+
+- A **terminal session pane in a split can be taken back out of it**. Terminal session panes were the one kind that could be put into a split and never separated again: they rendered no split chrome at all, so there was neither a handle to drag them to the tab strip nor a button to close them. They now carry the same grip and close button as a chat pane, and dragging the grip onto the tab strip moves the pane into its own tab. The controls in the pane's header, such as the worktree button, no longer start a drag.
+
+### Changed
+
+- **A pane closes itself once its process has exited.** Quitting an agent CLI with `Ctrl+C`, or typing `exit` in a terminal, used to leave the pane sitting on an exit notice with nothing left to do. Both now close. Closing a session's pane does not archive or delete the session: it stays in the session list, so archiving remains something you do deliberately. Only an exit worth dismissing closes the pane - a launch failure, an exit in the first few seconds, a non-zero exit code, and `--resume` not finding its conversation all keep the pane with its notice and **Restart**, because that message is the only explanation of what went wrong. A clean exit that empties the last tab leaves a blank chat behind rather than a continuation of the session that just exited, which for a terminal session would have started the CLI again.
+
+### Fixed
+
+- **Moving a pane between tabs no longer restarts its process.** Each tab draws its own panes, so dragging a pane to another tab replaced its view, and replacing the view was what ended the process: a terminal lost its shell, and an agent session relaunched with `--resume`, reloading the conversation and discarding whatever the CLI was in the middle of. A move now hands the running process to the arriving pane, which reattaches to it and repaints. A pane that is genuinely closing still ends its process, a pane that is moved while its process has already exited keeps the notice and **Restart** it was showing, and an exit arriving mid-move is no longer lost.
+
 ## [0.15.0] - 2026-10-10
 
 ### Added
