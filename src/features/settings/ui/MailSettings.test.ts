@@ -404,3 +404,35 @@ it("lets a new source use a region outside the list through Custom region", asyn
   await setValue(field, "us-gov-west-1");
   expect(field.value).toBe("us-gov-west-1");
 });
+
+it("writes the remote-image choice to every source", async () => {
+  await render();
+  const upserts: unknown[] = [];
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "mail_source_upsert") {
+      upserts.push((args as { source: unknown }).source);
+      return undefined;
+    }
+    if (command === "mail_sources") return sources;
+    if (command === "mail_credentials") return credentials;
+    if (command === "mail_identities") return identities;
+    if (command === "mail_status")
+      return { sources: statuses, unreadTotal: 0, syncIntervalSecs: 3600 };
+    return undefined;
+  });
+  await act(async () =>
+    container
+      .querySelector<HTMLElement>('[aria-label^="Load remote images:"]')!
+      .click(),
+  );
+  await act(async () =>
+    [...document.querySelectorAll('[role="option"]')]
+      .find((b) => b.textContent?.includes("Never load"))!
+      .dispatchEvent(new MouseEvent("click", { bubbles: true })),
+  );
+  expect(upserts).toHaveLength(2);
+  expect(
+    upserts.map((u) => (u as { imagePolicy: string }).imagePolicy),
+  ).toEqual(["never", "never"]);
+  expect(container.textContent).not.toContain("never sees your IP");
+});

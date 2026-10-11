@@ -3,7 +3,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { MailThreadRead } from "./MailThreadRead";
-import { mailMark, mailStar, mailThread } from "../model/mail";
+import { mailMark, mailMessageRaw, mailStar, mailThread } from "../model/mail";
 import type { MessageRow, ThreadDetail } from "../model/mailTypes";
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -17,6 +17,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 vi.mock("../model/mail", () => ({
   MAIL_MESSAGES_CHANGED_EVENT: "mail://messages-changed",
   mailThread: vi.fn(),
+  mailMessageRaw: vi.fn(),
   mailMark: vi.fn(async () => undefined),
   mailStar: vi.fn(async () => undefined),
   mailAttachmentOpen: vi.fn(),
@@ -85,6 +86,8 @@ beforeEach(() => {
   document.body.append(container);
   root = createRoot(container);
   vi.mocked(mailThread).mockReset();
+  vi.mocked(mailMark).mockClear();
+  vi.mocked(mailStar).mockClear();
 });
 
 afterEach(() => {
@@ -144,7 +147,46 @@ it("stars and marks the whole thread", async () => {
     b.textContent?.includes("Mark as read"),
   )!;
   await act(async () => mark.click());
+  expect(mailMark).toHaveBeenLastCalledWith([5], true);
+});
+
+it("marks an unread thread read once when it opens", async () => {
+  vi.mocked(mailThread).mockResolvedValue(detail([msg(1)]));
+  await render();
+  expect(mailMark).toHaveBeenCalledTimes(1);
   expect(mailMark).toHaveBeenCalledWith([5], true);
+});
+
+it("does not mark an already-read thread", async () => {
+  vi.mocked(mailThread).mockResolvedValue(detail([msg(1, { isRead: true })]));
+  await render();
+  expect(mailMark).not.toHaveBeenCalled();
+});
+
+it("shows the raw source as text in a dialog", async () => {
+  vi.mocked(mailThread).mockResolvedValue(detail([msg(1)]));
+  vi.mocked(mailMessageRaw).mockResolvedValue("Received: <b>x</b>\r\n\r\nbody");
+  await render();
+  const open = [...container.querySelectorAll("button")].find((b) =>
+    b.textContent?.includes("View source"),
+  )!;
+  await act(async () => open.click());
+  expect(mailMessageRaw).toHaveBeenCalledWith(1);
+  expect(document.body.textContent).toContain("Received: <b>x</b>");
+  expect(document.body.querySelector("pre b")).toBeNull();
+});
+
+it("shows permerror as a warning, not as a forgery", async () => {
+  vi.mocked(mailThread).mockResolvedValue(
+    detail([msg(1, { spf: "permerror", dkim: "fail" })]),
+  );
+  await render();
+  const tone = (label: string) =>
+    [...container.querySelectorAll("span span")].find(
+      (s) => s.textContent === label,
+    )!.className;
+  expect(tone("permerror")).toContain("amber");
+  expect(tone("fail")).toContain("red");
 });
 
 it("prompts when nothing is selected", async () => {

@@ -3,16 +3,16 @@ import {
   mailCredentials,
   mailIdentities,
   mailSources,
+  mailSourceUpsert,
   mailStatus,
   mailSyncIntervalSet,
 } from "../../mail/model/mail";
 import {
-  showImages,
   syncIntervalSeconds,
   SYNC_INTERVAL_MIN_SECONDS,
-  type ShowImages,
 } from "../../mail/model/mailPrefs";
 import type {
+  ImagePolicy,
   IdentityRow,
   MailCredential,
   MailStatus,
@@ -42,7 +42,7 @@ const INTERVALS: [number, string][] = [
   [86400, "Every day"],
 ];
 
-const IMAGE_OPTIONS: { value: ShowImages; label: string }[] = [
+const IMAGE_OPTIONS: { value: ImagePolicy; label: string }[] = [
   { value: "ask", label: "Ask each time" },
   { value: "always", label: "Always load" },
   { value: "never", label: "Never load" },
@@ -62,7 +62,6 @@ export function MailSettings() {
     () => false,
   );
   const interval = syncIntervalSeconds.useValue();
-  const images = showImages.useValue();
   const [data, setData] = useState<Loaded>({
     credentials: [],
     sources: [],
@@ -106,6 +105,40 @@ export function MailSettings() {
     sources
       .filter((s) => s.credentialId === id || s.s3CredentialId === id)
       .map((s) => s.label);
+
+  // The policy is stored per source and Rust enforces it, so this control is
+  // a shortcut that writes the same value to every source.
+  const policies = new Set(sources.map((s) => s.imagePolicy));
+  const imagesMixed = policies.size > 1;
+  const images: string = imagesMixed
+    ? "mixed"
+    : (sources[0]?.imagePolicy ?? "ask");
+  const [imagesError, setImagesError] = useState<string | null>(null);
+  const changeImages = async (policy: ImagePolicy) => {
+    setImagesError(null);
+    try {
+      for (const s of sources) {
+        await mailSourceUpsert({
+          id: s.id,
+          provider: s.provider,
+          credentialId: s.credentialId,
+          s3CredentialId: s.s3CredentialId,
+          label: s.label,
+          sesRegion: s.sesRegion,
+          bucket: s.bucket,
+          s3Region: s.s3Region,
+          defaultFrom: s.defaultFrom,
+          attachPolicy: s.attachPolicy,
+          imagePolicy: policy,
+          enabled: s.enabled,
+          sortOrder: s.sortOrder,
+        });
+      }
+    } catch (err) {
+      setImagesError(errorMessage(err));
+    }
+    refresh();
+  };
 
   const changeInterval = (secs: number) => {
     syncIntervalSeconds.save(secs);
@@ -247,14 +280,31 @@ export function MailSettings() {
         <Row
           id="mail-show-images"
           label="Load remote images"
-          description="Blocked images are fetched through Monoptah, so the sender never sees your IP."
+          description="Loading an image still tells the sender you opened the message and from which IP address. Monoptah fetches it itself, so there are no cookies, no Referer, and addresses on your own network are refused. Applies to every source."
         >
           <Select
             label="Load remote images"
             value={images}
-            options={IMAGE_OPTIONS}
-            onChange={(value) => showImages.save(value as ShowImages)}
+            options={
+              imagesMixed
+                ? [
+                    { value: "mixed", label: "Set per source" },
+                    ...IMAGE_OPTIONS,
+                  ]
+                : IMAGE_OPTIONS
+            }
+            onChange={(value) => {
+              if (value !== "mixed") void changeImages(value as ImagePolicy);
+            }}
           />
+          {imagesError ? (
+            <p
+              role="alert"
+              className="basis-full text-right text-[12px] text-red-400"
+            >
+              {imagesError}
+            </p>
+          ) : null}
         </Row>
       </Group>
     </>

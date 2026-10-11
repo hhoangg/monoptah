@@ -1,11 +1,12 @@
 // @vitest-environment happy-dom
-import { act, createElement } from "react";
+import { act, createElement, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   FRAME_CSP,
   MAX_FRAME_HEIGHT,
   MailMessageBody,
+  canTogglePlain,
   buildFrameDocument,
   cidReferences,
   linkifyText,
@@ -79,14 +80,26 @@ afterEach(() => {
   container.remove();
 });
 
+// Stands in for ThreadBody, which owns the per-message allow-state.
+function Harness(props: Parameters<typeof MailMessageBody>[0]) {
+  const [allowed, setAllowed] = useState(false);
+  return createElement(MailMessageBody, {
+    ...props,
+    messageAllowed: allowed,
+    onAllowMessage: () => setAllowed(true),
+  });
+}
+
 const render = async (
   msg: MessageRow,
   over: Partial<Parameters<typeof MailMessageBody>[0]> = {},
 ) => {
   await act(async () => {
     root.render(
-      createElement(MailMessageBody, {
+      createElement(Harness, {
         message: msg,
+        messageAllowed: false,
+        onAllowMessage: vi.fn(),
         imagePolicy: "ask",
         senderAllowed: false,
         senderLabel: "linh@x.com",
@@ -242,4 +255,47 @@ it("linkifies URLs without their trailing punctuation", () => {
     { url: "https://a.example/x" },
     ", ok",
   ]);
+});
+
+it("counts only the images it can load and says so for the rest", async () => {
+  await render(
+    message({
+      bodyHtml: `<img data-mono-src="${REMOTE}"><img data-mono-src="/rel.png">`,
+      remoteImagesBlocked: 2,
+    }),
+  );
+  expect(container.textContent).toContain("2 remote images blocked");
+  expect(container.textContent).toContain("1 of them cannot be loaded");
+  await render(
+    message({
+      bodyHtml: '<img data-mono-src="/rel.png">',
+      remoteImagesBlocked: 1,
+    }),
+  );
+  expect(container.textContent).toContain("None of them can be loaded");
+  expect(button("Show images")).toBeUndefined();
+});
+
+it("labels the sender action with its real lifetime", async () => {
+  await render(message());
+  expect(button("this session")).toBeDefined();
+  expect(container.textContent).not.toContain("Always show");
+});
+
+it("removes base, meta, style and link from the frame document", () => {
+  const out = buildFrameDocument(
+    '<base href="https://evil/"><meta http-equiv="refresh" content="0;url=https://evil"><link rel="stylesheet" href="data:text/css,p{}"><style>p{}</style><p>x</p>',
+    new Map(),
+    new Map(),
+  );
+  const body = out.slice(out.indexOf("<body>"));
+  expect(body).not.toMatch(/base|meta|link|style/);
+  expect(out).not.toContain("evil");
+});
+
+it("offers the plain-text toggle only when both bodies have content", () => {
+  expect(canTogglePlain(message())).toBe(true);
+  expect(canTogglePlain(message({ bodyText: null }))).toBe(false);
+  expect(canTogglePlain(message({ bodyText: "  " }))).toBe(false);
+  expect(canTogglePlain(message({ bodyHtml: null }))).toBe(false);
 });

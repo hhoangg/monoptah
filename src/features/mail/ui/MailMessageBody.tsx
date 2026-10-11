@@ -58,6 +58,15 @@ export function remoteImageUrls(html: string): string[] {
   return [...urls];
 }
 
+/** Blocked images that can actually be fetched; Rust's count includes the rest. */
+export function loadableImageCount(html: string): number {
+  let n = 0;
+  for (const img of parse(html).querySelectorAll("img[data-mono-src]")) {
+    if (ABSOLUTE_HTTP.test(img.getAttribute("data-mono-src") ?? "")) n += 1;
+  }
+  return n;
+}
+
 /** `cid:` references appear on `img src` and inside `style` url(...). */
 export function cidReferences(html: string): string[] {
   const keys = new Set<string>();
@@ -86,6 +95,10 @@ export function buildFrameDocument(
   cid: ReadonlyMap<string, string>,
 ): string {
   const doc = parse(html);
+  // Layer 1 already drops these; removing them here keeps this layer from
+  // depending on layer 1 being perfect.
+  for (const el of doc.querySelectorAll("base,meta,link,style,script"))
+    el.remove();
   const produced = new Set([...remote.values(), ...cid.values()]);
   for (const img of doc.querySelectorAll("img")) {
     const blocked = img.getAttribute("data-mono-src");
@@ -247,7 +260,7 @@ export function PlainTextBody({ text }: { text: string }) {
 
 /** HTML-only mail has no `bodyText`, so the toggle would show nothing. */
 export const canTogglePlain = (message: MessageRow) =>
-  Boolean(message.bodyHtml?.trim()) && message.bodyText !== null;
+  Boolean(message.bodyHtml?.trim()) && Boolean(message.bodyText?.trim());
 
 type Props = {
   message: MessageRow;
@@ -258,6 +271,9 @@ type Props = {
   senderAllowed: boolean;
   senderLabel: string;
   onAllowSender: () => void;
+  /** Kept by the parent so collapsing the card does not forget the choice. */
+  messageAllowed: boolean;
+  onAllowMessage: () => void;
 };
 
 export function MailMessageBody({
@@ -267,10 +283,11 @@ export function MailMessageBody({
   senderAllowed,
   senderLabel,
   onAllowSender,
+  messageAllowed,
+  onAllowMessage,
 }: Props) {
   const html = message.bodyHtml?.trim() ? message.bodyHtml : null;
   const showText = html === null || (plain && message.bodyText !== null);
-  const [messageAllowed, setMessageAllowed] = useState(false);
   const blocked = message.remoteImagesBlocked;
   const imagesOff = imagePolicy === "never";
   const allowed =
@@ -279,6 +296,10 @@ export function MailMessageBody({
   const frameHtml = showText ? null : html;
   const remoteKeys = useMemo(
     () => (frameHtml ? remoteImageUrls(frameHtml) : []),
+    [frameHtml],
+  );
+  const loadable = useMemo(
+    () => (frameHtml ? loadableImageCount(frameHtml) : 0),
     [frameHtml],
   );
   const cidKeys = useMemo(() => {
@@ -370,11 +391,18 @@ export function MailMessageBody({
           <div className="text-content">
             {blocked} remote {blocked === 1 ? "image" : "images"} blocked
           </div>
+          {loadable < blocked ? (
+            <div className="text-content/50">
+              {loadable === 0
+                ? "None of them can be loaded."
+                : `${blocked - loadable} of them cannot be loaded.`}
+            </div>
+          ) : null}
           {imagesOff ? (
             <div className="text-content/50">
               Remote images are turned off for this account.
             </div>
-          ) : (
+          ) : loadable === 0 ? null : (
             <>
               <div className="text-content/50">
                 Loading images tells the sender you opened this message, when,
@@ -382,14 +410,11 @@ export function MailMessageBody({
                 or a Referer, but that is all it hides.
               </div>
               <div className="flex flex-wrap gap-2">
-                <SecondaryButton onClick={() => setMessageAllowed(true)}>
+                <SecondaryButton onClick={onAllowMessage}>
                   Show images
                 </SecondaryButton>
-                <SecondaryButton
-                  onClick={onAllowSender}
-                  title="Until Monoptah restarts"
-                >
-                  Always show from {senderLabel}
+                <SecondaryButton onClick={onAllowSender}>
+                  Show from {senderLabel} this session
                 </SecondaryButton>
               </div>
             </>

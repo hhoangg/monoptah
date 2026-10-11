@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { emit, listen } from "@tauri-apps/api/event";
+import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   ChevronDown,
@@ -8,11 +8,13 @@ import {
   Paperclip,
   Star,
 } from "../../../shared/ui/icons";
+import { Modal } from "../../../shared/ui/Modal";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 import {
   MAIL_MESSAGES_CHANGED_EVENT,
   mailAttachmentOpen,
   mailMark,
+  mailMessageRaw,
   mailStar,
   mailThread,
 } from "../model/mail";
@@ -49,9 +51,10 @@ const sizeLabel = (bytes: number) =>
 /** The verdict as the receiving server wrote it; NULL means `none`. */
 function Verdict({ label, value }: { label: string; value: string | null }) {
   const tone =
-    value === "fail" || value === "permerror"
+    value === "fail"
       ? "text-red-400"
-      : value === "softfail"
+      : // permerror is a broken record on the sender's side, not a forgery signal.
+        value === "softfail" || value === "permerror"
         ? "text-amber-400"
         : "text-content/60";
   return (
@@ -100,6 +103,52 @@ function AttachmentChip({ attachment }: { attachment: AttachmentRow }) {
   );
 }
 
+/** The stored message as received, for when the sanitiser removed something. */
+function RawSource({
+  messageId,
+  onClose,
+}: {
+  messageId: number;
+  onClose: () => void;
+}) {
+  const [raw, setRaw] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let stale = false;
+    mailMessageRaw(messageId)
+      .then((text) => {
+        if (!stale) setRaw(text);
+      })
+      .catch((err) => {
+        if (!stale) setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      stale = true;
+    };
+  }, [messageId]);
+  return (
+    <Modal
+      title="Message source"
+      size="md"
+      className="!w-[min(900px,calc(100vw-24px))]"
+      onClose={onClose}
+    >
+      {error ? (
+        <p className="px-4 py-3 text-[12px] text-red-400">{error}</p>
+      ) : raw === null ? (
+        <div className="flex justify-center py-6 text-content/45">
+          <Loader className="size-4 animate-spin" />
+        </div>
+      ) : (
+        // Sender-controlled text, shown as a text node and never parsed.
+        <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap break-all px-4 py-3 font-mono text-[11px] text-content/80">
+          {raw}
+        </pre>
+      )}
+    </Modal>
+  );
+}
+
 function MessageCard({
   message,
   detail,
@@ -107,6 +156,8 @@ function MessageCard({
   onToggle,
   senderAllowed,
   onAllowSender,
+  messageAllowed,
+  onAllowMessage,
 }: {
   message: MessageRow;
   detail: ThreadDetail;
@@ -114,8 +165,11 @@ function MessageCard({
   onToggle: () => void;
   senderAllowed: boolean;
   onAllowSender: () => void;
+  messageAllowed: boolean;
+  onAllowMessage: () => void;
 }) {
   const [plain, setPlain] = useState(false);
+  const [source, setSource] = useState(false);
   const attachments = message.attachments.filter((a) => !a.isInline);
   const Chevron = expanded ? ChevronDown : ChevronRight;
 
@@ -186,6 +240,19 @@ function MessageCard({
                   Plain text
                 </button>
               ) : null}
+              <button
+                type="button"
+                onClick={() => setSource(true)}
+                className="rounded-full border border-content/10 px-1.5 text-[10px] text-content/70 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-accent"
+              >
+                View source
+              </button>
+              {source ? (
+                <RawSource
+                  messageId={message.id}
+                  onClose={() => setSource(false)}
+                />
+              ) : null}
             </div>
           </div>
           <MailMessageBody
@@ -195,6 +262,8 @@ function MessageCard({
             senderAllowed={senderAllowed}
             senderLabel={message.fromAddr}
             onAllowSender={onAllowSender}
+            messageAllowed={messageAllowed}
+            onAllowMessage={onAllowMessage}
           />
           {attachments.length > 0 ? (
             <div className="flex flex-wrap gap-2 px-4 py-3">
@@ -216,6 +285,9 @@ function ThreadBody({ threadId }: { threadId: number }) {
   // Only the user's changes from the default (newest open, rest closed) are kept.
   const [flipped, setFlipped] = useState<ReadonlySet<number>>(new Set());
   const [, bump] = useState(0);
+  // Kept here, not in the card, so collapsing a message keeps its images.
+  const [imagesOk, setImagesOk] = useState<ReadonlySet<number>>(new Set());
+  const markedOpen = useRef(false);
 
   useEffect(() => {
     let disposed = false;
@@ -248,6 +320,15 @@ function ThreadBody({ threadId }: { threadId: number }) {
     };
   }, [threadId, reloadKey]);
 
+  // Opening a thread reads it. Once per open, so "Mark as unread" stays undone.
+  useEffect(() => {
+    if (!detail || markedOpen.current) return;
+    markedOpen.current = true;
+    if (detail.messages.some((m) => !m.isRead)) {
+      void mailMark([threadId], true).catch(() => undefined);
+    }
+  }, [detail, threadId]);
+
   if (error && !detail) {
     return <p className="px-4 py-3 text-[12px] text-red-400">{error}</p>;
   }
@@ -269,10 +350,8 @@ function ThreadBody({ threadId }: { threadId: number }) {
 
   const run = async (action: () => Promise<void>) => {
     try {
+      // mail_mark and mail_star emit the change event; the listener reloads.
       await action();
-      // The list reloads on this event; mark and star do not emit it themselves.
-      await emit(MAIL_MESSAGES_CHANGED_EVENT);
-      setReloadKey((k) => k + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -323,6 +402,10 @@ function ThreadBody({ threadId }: { threadId: number }) {
               })
             }
             senderAllowed={allowedSenders.has(sender)}
+            messageAllowed={imagesOk.has(message.id)}
+            onAllowMessage={() =>
+              setImagesOk((prev) => new Set(prev).add(message.id))
+            }
             onAllowSender={() => {
               allowedSenders.add(sender);
               bump((n) => n + 1);
