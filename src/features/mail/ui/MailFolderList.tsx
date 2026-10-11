@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { useState } from "react";
 import {
   AlertCircle,
   ChevronDown,
@@ -9,12 +8,8 @@ import {
   Loader,
   RefreshCw,
 } from "../../../shared/ui/icons";
-import {
-  MAIL_MESSAGES_CHANGED_EVENT,
-  MAIL_SYNC_STATE_EVENT,
-  mailStatus,
-  mailSyncNow,
-} from "../model/mail";
+import { mailSyncNow } from "../model/mail";
+import { domainOf } from "../model/mailDomain";
 import type {
   MailStatus,
   MailboxStatus,
@@ -22,8 +17,12 @@ import type {
 } from "../model/mailTypes";
 import { collapsedDomains, useCollapsedDomains } from "../model/mailPrefs";
 
+// Re-exported so existing importers keep one entry point.
+export { domainOf } from "../model/mailDomain";
+export { useMailStatus } from "../model/useMailStatus";
+
 /** A saved filter. Task 12 supplies these; until then the list is empty. */
-export type SmartFolderEntry = { id: string; name: string; unread: number };
+export type SmartFolderEntry = { id: number; name: string; unread: number };
 
 export type MailDomainGroup = {
   domain: string;
@@ -34,11 +33,6 @@ export type MailDomainGroup = {
   /** More than one source serves the domain, so rows name their source. */
   multiSource: boolean;
 };
-
-/** Domain is a display concern, read off the address. There is no domain table. */
-export function domainOf(address: string): string {
-  return address.slice(address.lastIndexOf("@") + 1).toLowerCase();
-}
 
 /**
  * One group per domain even when two sources serve it (different regions):
@@ -91,40 +85,6 @@ export function mailboxLabel(mailbox: MailboxStatus): string {
   if (mailbox.displayName) return mailbox.displayName;
   const at = mailbox.address.lastIndexOf("@");
   return at > 0 ? `${mailbox.address.slice(0, at)}@` : mailbox.address;
-}
-
-/** Status for the whole Mail view, refreshed when sync state or messages change. */
-export function useMailStatus() {
-  const [status, setStatus] = useState<MailStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const refresh = useCallback(async () => {
-    try {
-      setStatus(await mailStatus());
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }, []);
-
-  useEffect(() => {
-    let disposed = false;
-    const stops: (() => void)[] = [];
-    void refresh();
-    for (const event of [MAIL_SYNC_STATE_EVENT, MAIL_MESSAGES_CHANGED_EVENT]) {
-      void listen(event, () => void refresh())
-        .then((stop) => {
-          if (disposed) stop();
-          else stops.push(stop);
-        })
-        .catch(() => undefined);
-    }
-    return () => {
-      disposed = true;
-      for (const stop of stops) stop();
-    };
-  }, [refresh]);
-
-  return { status, error, refresh };
 }
 
 const BADGE =
@@ -290,13 +250,13 @@ export function MailFolderList({
           </p>
         ) : (
           smartFolders.map((folder) => {
-            const selected = folderId === folder.id;
+            const selected = folderId === String(folder.id);
             return (
               <button
                 key={folder.id}
                 type="button"
                 aria-current={selected ? "true" : undefined}
-                onClick={() => onSelectFolder(folder.id)}
+                onClick={() => onSelectFolder(String(folder.id))}
                 className={`${NODE} ${selected ? "bg-content/10 text-content" : "text-content/80"}`}
               >
                 <ListFilter className="size-3.5 shrink-0" strokeWidth={1.75} />

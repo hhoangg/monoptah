@@ -11,7 +11,7 @@ import type {
   ThreadRow,
   ThreadScope,
 } from "../model/mailTypes";
-import { domainOf } from "./MailFolderList";
+import { domainOf } from "../model/mailDomain";
 
 /** Rows fetched per backend page; the DOM window grows in LIST_PAGE_SIZE steps. */
 const FETCH_LIMIT = 100;
@@ -118,6 +118,11 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
   const [reloadKey, setReloadKey] = useState(0);
   // Survives the list remounting, so a layout change keeps the user's place.
   const scrollTop = useRef(0);
+  // Bumped per first-page load so a page fetch begun under an older scope or
+  // reload cannot append into the current list.
+  const fetchingRef = useRef(false);
+  const generation = useRef(0);
+  const loadedScope = useRef<string | null>(null);
   const scopeKey = scope.kind === "all" ? "all" : `m${scope.mailboxId}`;
 
   // Reload from the first page; the sync event means rows may have moved.
@@ -144,6 +149,10 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
       return;
     }
     let stale = false;
+    generation.current += 1;
+    fetchingRef.current = false;
+    const scopeChanged = loadedScope.current !== scopeKey;
+    loadedScope.current = scopeKey;
     setLoading(true);
     mailThreads({ scope, limit: FETCH_LIMIT })
       .then((page) => {
@@ -151,7 +160,8 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
         setRows(page.rows);
         setCursor(page.nextCursor);
         setError(null);
-        setLimit(LIST_PAGE_SIZE);
+        // A background reload keeps the window so the list does not jump.
+        if (scopeChanged) setLimit(LIST_PAGE_SIZE);
       })
       .catch((err) => {
         if (!stale) setError(err instanceof Error ? err.message : String(err));
@@ -172,7 +182,6 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
   const pageHasMore = cursor !== null;
   const hasMore = windowHasMore || pageHasMore;
 
-  const fetchingRef = useRef(false);
   const grow = () => {
     if (windowHasMore) {
       setLimit((current) => current + LIST_PAGE_SIZE);
@@ -181,17 +190,20 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
     if (!cursor || fetchingRef.current) return;
     fetchingRef.current = true;
     const after = cursor;
+    const mine = generation.current;
     mailThreads({ scope, cursor: after, limit: FETCH_LIMIT })
       .then((page) => {
+        if (mine !== generation.current) return;
         setRows((current) => [...current, ...page.rows]);
         setCursor(page.nextCursor);
         setLimit((current) => current + LIST_PAGE_SIZE);
       })
-      .catch((err) =>
-        setError(err instanceof Error ? err.message : String(err)),
-      )
+      .catch((err) => {
+        if (mine === generation.current)
+          setError(err instanceof Error ? err.message : String(err));
+      })
       .finally(() => {
-        fetchingRef.current = false;
+        if (mine === generation.current) fetchingRef.current = false;
       });
   };
 
@@ -270,7 +282,9 @@ export function MailThreadList({
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [hasMore, shown]);
+    // rows.length: with a filter active a fetched page may not change `shown`,
+    // and a new observer is what re-reports a sentinel that is still visible.
+  }, [hasMore, shown, rows.length]);
 
   const showDomain = scopeSpansDomains(scope, mailboxes);
   const compact = density === "compact";
@@ -287,6 +301,7 @@ export function MailThreadList({
               <button
                 type="button"
                 aria-pressed={active || open === field}
+                title="Filters the threads loaded so far"
                 onClick={() => setOpen(open === field ? null : field)}
                 className={`${CHIP} ${
                   active
@@ -335,97 +350,104 @@ export function MailThreadList({
 
       <div
         ref={scrollRef}
-        role="list"
         aria-label="Threads"
         className="min-h-0 flex-1 overflow-y-auto"
       >
-        {filtered.slice(0, shown).map((row) => {
-          const unread = row.unreadCount > 0;
-          const selected = row.id === selectedId;
-          return (
-            <button
-              key={row.id}
-              type="button"
-              role="listitem"
-              data-thread-id={row.id}
-              aria-current={selected ? "true" : undefined}
-              onClick={() => onSelect(row)}
-              className={`flex w-full min-w-0 items-start gap-2 border-b border-content/5 px-3 text-left hover:bg-content/5 focus-visible:outline-2 focus-visible:outline-accent ${
-                compact ? "py-1" : "py-2"
-              } ${selected ? "bg-content/10" : ""}`}
-            >
-              <span
-                aria-label={unread ? "Unread" : undefined}
-                className={`mt-1.5 size-1.5 shrink-0 rounded-full ${unread ? "bg-accent" : ""}`}
-              />
-              <span className="flex min-w-0 flex-1 flex-col">
-                <span className="flex min-w-0 items-center gap-1.5 text-[12px]">
-                  <span
-                    className={`min-w-0 truncate ${unread ? "font-semibold text-content" : "text-content/80"}`}
-                  >
-                    {participantsLabel(row)}
-                  </span>
-                  {row.messageCount > 1 ? (
-                    <span
-                      title={`${row.messageCount} messages`}
-                      className="shrink-0 text-[10px] text-content/50"
-                    >
-                      {row.messageCount}
-                    </span>
-                  ) : null}
-                </span>
-                <span
-                  className={`truncate text-[12px] ${unread ? "text-content" : "text-content/70"}`}
+        <ul className="m-0 list-none p-0">
+          {filtered.slice(0, shown).map((row) => {
+            const unread = row.unreadCount > 0;
+            const selected = row.id === selectedId;
+            return (
+              <li key={row.id}>
+                <button
+                  type="button"
+                  data-thread-id={row.id}
+                  aria-current={selected ? "true" : undefined}
+                  onClick={() => onSelect(row)}
+                  className={`flex w-full min-w-0 items-start gap-2 border-b border-content/5 px-3 text-left hover:bg-content/5 focus-visible:outline-2 focus-visible:outline-accent ${
+                    compact ? "py-1" : "py-2"
+                  } ${selected ? "bg-content/10" : ""}`}
                 >
-                  {row.subject || "(no subject)"}
-                </span>
-                {compact ? null : (
-                  <span className="truncate text-[11px] text-content/45">
-                    {row.snippet}
-                  </span>
-                )}
-              </span>
-              <span className="flex shrink-0 flex-col items-end gap-0.5">
-                <span className="text-[11px] text-content/50">
-                  {formatMailDate(row.lastMessageAt, now)}
-                </span>
-                <span className="flex items-center gap-1">
-                  {showDomain ? (
-                    <span
-                      data-chip="domain"
-                      className="rounded-full border border-content/10 bg-content/5 px-1.5 text-[10px] text-content/60"
-                    >
-                      {domainOf(row.mailboxAddress)}
-                    </span>
-                  ) : null}
                   <span
-                    data-chip="mailbox"
-                    className="max-w-28 truncate rounded-full border border-content/10 bg-content/5 px-1.5 text-[10px] text-content/60"
-                  >
-                    {row.mailboxAddress.slice(
-                      0,
-                      row.mailboxAddress.lastIndexOf("@") + 1,
+                    aria-label={unread ? "Unread" : undefined}
+                    className={`mt-1.5 size-1.5 shrink-0 rounded-full ${unread ? "bg-accent" : ""}`}
+                  />
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span className="flex min-w-0 items-center gap-1.5 text-[12px]">
+                      <span
+                        className={`min-w-0 truncate ${unread ? "font-semibold text-content" : "text-content/80"}`}
+                      >
+                        {participantsLabel(row)}
+                      </span>
+                      {row.messageCount > 1 ? (
+                        <span
+                          title={`${row.messageCount} messages`}
+                          className="shrink-0 text-[10px] text-content/50"
+                        >
+                          {row.messageCount}
+                        </span>
+                      ) : null}
+                    </span>
+                    <span
+                      className={`truncate text-[12px] ${unread ? "text-content" : "text-content/70"}`}
+                    >
+                      {row.subject || "(no subject)"}
+                    </span>
+                    {compact ? null : (
+                      <span className="truncate text-[11px] text-content/45">
+                        {row.snippet}
+                      </span>
                     )}
                   </span>
-                  {row.hasAttachments ? (
-                    <Paperclip
-                      aria-label="Has attachments"
-                      className="size-3 text-content/50"
-                      strokeWidth={1.75}
-                    />
-                  ) : null}
-                  {row.isStarred ? (
-                    <Star
-                      aria-label="Starred"
-                      className="size-3 text-content/70"
-                      strokeWidth={1.75}
-                    />
-                  ) : null}
-                </span>
-              </span>
-            </button>
-          );
-        })}
+                  <span className="flex shrink-0 flex-col items-end gap-0.5">
+                    <span className="text-[11px] text-content/50">
+                      {formatMailDate(row.lastMessageAt, now)}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      {showDomain ? (
+                        <span
+                          data-chip="domain"
+                          className="rounded-full border border-content/10 bg-content/5 px-1.5 text-[10px] text-content/60"
+                        >
+                          {row.domain}
+                        </span>
+                      ) : null}
+                      <span
+                        data-chip="mailbox"
+                        className="max-w-28 truncate rounded-full border border-content/10 bg-content/5 px-1.5 text-[10px] text-content/60"
+                      >
+                        {row.mailboxAddress.slice(
+                          0,
+                          row.mailboxAddress.lastIndexOf("@") + 1,
+                        )}
+                      </span>
+                      {row.hasAttachments ? (
+                        <Paperclip
+                          aria-label="Has attachments"
+                          className="size-3 text-content/50"
+                          strokeWidth={1.75}
+                        />
+                      ) : null}
+                      {row.isStarred ? (
+                        <Star
+                          aria-label="Starred"
+                          className="size-3 text-content/70"
+                          strokeWidth={1.75}
+                        />
+                      ) : null}
+                    </span>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+        {anyFilter ? (
+          <p className="px-3 py-1 text-[11px] text-content/45">
+            Filtering the {rows.length} threads loaded so far, not the whole
+            mailbox.
+          </p>
+        ) : null}
         {hasMore ? (
           <div ref={sentinelRef} aria-hidden className="h-px" />
         ) : null}
