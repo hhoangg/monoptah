@@ -353,9 +353,12 @@ CREATE TABLE IF NOT EXISTS mail_object (
   s3_key       TEXT NOT NULL,
   etag         TEXT,
   size_bytes   INTEGER,
-  s3_modified  INTEGER,
-  first_seen_at INTEGER NOT NULL,
-  last_seen_at INTEGER NOT NULL,             -- bumped every sync it is listed
+  s3_modified  INTEGER,                      -- epoch SECONDS, from LastModified
+  first_seen_at INTEGER NOT NULL,            -- MILLISECONDS, like every other
+  last_seen_at INTEGER NOT NULL,             -- bookkeeping column. This table
+                                             -- mixes the two units on purpose:
+                                             -- s3_modified feeds date_utc, which
+                                             -- is seconds. Never compare across.
   state        TEXT NOT NULL,                -- pending | parsed | gone | error
   parse_error  TEXT,
   parse_attempts INTEGER NOT NULL DEFAULT 0, -- §5 step 4 caps retries at 3
