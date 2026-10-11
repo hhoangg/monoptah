@@ -1,6 +1,5 @@
-//! The read side of SES v2: which identities are verified, and whether the
-//! account is still in the sandbox. Sending joins this file with the compose
-//! work.
+//! SES v2: which identities are verified, whether the account is still in the
+//! sandbox, and sending a raw message.
 
 use std::io::Read;
 use std::time::Duration;
@@ -13,6 +12,9 @@ use crate::aws_sigv4::{
 use crate::mail_store::MailIdentity;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+// A send uploads up to the 40 MB raw limit (about 53 MB once base64 wrapped in
+// JSON), which does not fit in the read timeout's budget on a slow uplink.
+const SEND_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_BODY: u64 = 4 * 1024 * 1024;
 const PAGE_SIZE: &str = "1000";
 // A runaway token loop must end somewhere; 50 pages is 50,000 identities.
@@ -23,7 +25,13 @@ pub(crate) enum SesErrorKind {
     AccessDenied,
     InvalidCredentials,
     ClockSkew,
+    /// Could not reach SES at all: nothing was sent.
     Network,
+    /// The request went out but no answer came back. For a send this means
+    /// the message may have been delivered.
+    Unconfirmed,
+    /// SES understood the request and refused it; `message` carries its reason.
+    Rejected,
     Other,
 }
 
@@ -48,6 +56,15 @@ pub(crate) struct SesAccount {
     pub sending_enabled: bool,
 }
 
+/// Envelope recipients of a raw send. SES delivers to these and ignores the
+/// MIME headers, which is what lets `Bcc` stay out of the message itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Destination {
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+}
+
 /// The seam the command layer mocks, so its tests never touch the network.
 pub(crate) trait SesApi {
     // Identity `status` values: `verified`, `pending`, `failed`, and
@@ -56,6 +73,14 @@ pub(crate) trait SesApi {
     // AWS console, not in DNS. Settings copy must say that, not "failed".
     fn list_identities(&self) -> Result<Vec<MailIdentity>, SesError>;
     fn get_account(&self) -> Result<SesAccount, SesError>;
+    /// Returns SES's own message id. Never retried here: a half-delivered
+    /// email sent again silently is worse than a visible failure.
+    fn send_raw(
+        &self,
+        from: &str,
+        destination: &Destination,
+        raw: &[u8],
+    ) -> Result<String, SesError>;
 }
 
 pub(crate) struct SesClient {
@@ -71,25 +96,40 @@ impl SesClient {
         }
     }
 
-    fn get(&self, path: &str, query: &[(&str, &str)], action: &str) -> Result<Vec<u8>, SesError> {
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &[u8],
+        action: &str,
+    ) -> Result<Vec<u8>, SesError> {
         let host = format!("email.{}.amazonaws.com", self.region);
         let amz_date = amz_timestamp(time::OffsetDateTime::now_utc().unix_timestamp());
-        let headers = [("host", host.as_str()), ("x-amz-date", amz_date.as_str())];
+        let (wire_path, canonical_path) = ses_paths(path);
+        let mut headers = vec![("host", host.as_str()), ("x-amz-date", amz_date.as_str())];
+        if !body.is_empty() {
+            headers.push(("content-type", "application/json"));
+        }
         let auth = authorization(
             &self.creds,
             &SigningRequest {
-                method: "GET",
-                canonical_uri: path,
+                method,
+                canonical_uri: &canonical_path,
                 query,
                 headers: &headers,
-                payload_hash: &sha256_hex(b""),
+                payload_hash: &sha256_hex(body),
             },
             &self.region,
             "ses",
             &amz_date,
         );
         let agent = ureq::AgentBuilder::new()
-            .timeout(HTTP_TIMEOUT)
+            .timeout(if body.is_empty() {
+                HTTP_TIMEOUT
+            } else {
+                SEND_TIMEOUT
+            })
             .redirects(0)
             .build();
         // Encoded by the signer's own routine, so the URL and the signature agree.
@@ -98,23 +138,37 @@ impl SesClient {
             .map(|(k, v)| format!("{}={}", uri_encode(k, false), uri_encode(v, false)))
             .collect();
         pairs.sort();
-        let mut url = format!("https://{host}{path}");
+        let mut url = format!("https://{host}{wire_path}");
         if !pairs.is_empty() {
             url.push('?');
             url.push_str(&pairs.join("&"));
         }
-        let request = agent
-            .get(&url)
+        let mut request = agent
+            .request(method, &url)
             .set("x-amz-date", &amz_date)
             .set("Authorization", &auth);
-        match request.call() {
+        if !body.is_empty() {
+            request = request.set("content-type", "application/json");
+        }
+        let result = if body.is_empty() {
+            request.call()
+        } else {
+            request.send_bytes(body)
+        };
+        match result {
             Ok(response) if response.status() < 300 => {
                 let mut bytes = Vec::new();
                 response
                     .into_reader()
                     .take(MAX_BODY)
                     .read_to_end(&mut bytes)
-                    .map_err(|_| network("The connection to SES dropped."))?;
+                    .map_err(|_| {
+                        if body.is_empty() {
+                            network("The connection to SES dropped.")
+                        } else {
+                            unconfirmed()
+                        }
+                    })?;
                 Ok(bytes)
             }
             Ok(response) => Err(classify(response.status(), None, "", action)),
@@ -127,10 +181,44 @@ impl SesClient {
                     .read_to_string(&mut body);
                 Err(classify(status, error_type.as_deref(), &body, action))
             }
+            // Only a failure to connect proves nothing left this machine.
+            Err(ureq::Error::Transport(t))
+                if !body.is_empty()
+                    && !matches!(
+                        t.kind(),
+                        ureq::ErrorKind::Dns
+                            | ureq::ErrorKind::ConnectionFailed
+                            | ureq::ErrorKind::InvalidUrl
+                            | ureq::ErrorKind::UnknownScheme
+                    ) =>
+            {
+                Err(unconfirmed())
+            }
             Err(_) => Err(network(
                 "Could not reach SES. Check the network connection and the SES region.",
             )),
         }
+    }
+
+    fn get(&self, path: &str, query: &[(&str, &str)], action: &str) -> Result<Vec<u8>, SesError> {
+        self.request("GET", path, query, &[], action)
+    }
+}
+
+/// `(path as sent, path as signed)`. SigV4 encodes the path of every service
+/// except S3 twice in the canonical request; the URL itself carries it once.
+/// Getting this wrong only shows on a path with a reserved character, which no
+/// call here has had until an identity name appears in one.
+fn ses_paths(path: &str) -> (String, String) {
+    let wire = uri_encode(path, true);
+    let canonical = uri_encode(&wire, true);
+    (wire, canonical)
+}
+
+fn unconfirmed() -> SesError {
+    SesError {
+        kind: SesErrorKind::Unconfirmed,
+        message: "The connection dropped before SES confirmed the message. It may have been delivered, so check the recipient before sending it again.".to_string(),
     }
 }
 
@@ -165,6 +253,46 @@ impl SesApi for SesClient {
         let body = self.get("/v2/email/account", &[], "ses:GetAccount")?;
         parse_account(&body)
     }
+
+    fn send_raw(
+        &self,
+        from: &str,
+        destination: &Destination,
+        raw: &[u8],
+    ) -> Result<String, SesError> {
+        let body = send_request_body(from, destination, raw);
+        let response = self.request("POST", SEND_PATH, &[], &body, "ses:SendEmail")?;
+        // The send is already accepted by now, so an odd body is not a failure.
+        Ok(serde_json::from_slice::<serde_json::Value>(&response)
+            .ok()
+            .and_then(|v| v.get("MessageId")?.as_str().map(str::to_string))
+            .unwrap_or_default())
+    }
+}
+
+const SEND_PATH: &str = "/v2/email/outbound-emails";
+
+fn send_request_body(from: &str, destination: &Destination, raw: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    let mut dest = serde_json::Map::new();
+    for (key, list) in [
+        ("ToAddresses", &destination.to),
+        ("CcAddresses", &destination.cc),
+        ("BccAddresses", &destination.bcc),
+    ] {
+        if !list.is_empty() {
+            dest.insert(key.into(), serde_json::json!(list));
+        }
+    }
+    serde_json::to_vec(&serde_json::json!({
+        "FromEmailAddress": from,
+        "Destination": dest,
+        "Content": {
+            "Raw": { "Data": base64::engine::general_purpose::STANDARD.encode(raw) }
+        },
+    }))
+    // A map of strings always serialises.
+    .unwrap_or_default()
 }
 
 fn unreadable() -> SesError {
@@ -236,15 +364,16 @@ fn classify(status: u16, error_type: Option<&str>, body: &str, action: &str) -> 
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    let message_text = serde_json::from_str::<serde_json::Value>(body)
+    let aws_message = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| {
             v.get("message")
                 .or_else(|| v.get("Message"))?
                 .as_str()
-                .map(str::to_lowercase)
+                .map(str::to_string)
         })
         .unwrap_or_default();
+    let message_text = aws_message.to_lowercase();
     let (kind, message) = if message_text.contains("expired") || code == "RequestExpired" {
         (
             SesErrorKind::ClockSkew,
@@ -266,6 +395,18 @@ fn classify(status: u16, error_type: Option<&str>, body: &str, action: &str) -> 
                 SesErrorKind::InvalidCredentials,
                 "AWS rejected the access key id or secret.".to_string(),
             ),
+            // SES refused this message and says why in words meant for a person
+            // ("Email address is not verified..."), so pass that through.
+            "MessageRejected"
+            | "AccountSuspendedException"
+            | "SendingPausedException"
+            | "MailFromDomainNotVerifiedException"
+            | "NotFoundException"
+            | "BadRequestException"
+            | "TooManyRequestsException"
+            | "LimitExceededException" => {
+                (SesErrorKind::Rejected, rejection_text(&code, &aws_message))
+            }
             _ if status == 403 => (
                 SesErrorKind::AccessDenied,
                 format!("Access denied. The key pair needs {action}."),
@@ -277,6 +418,15 @@ fn classify(status: u16, error_type: Option<&str>, body: &str, action: &str) -> 
         }
     };
     SesError { kind, message }
+}
+
+fn rejection_text(code: &str, aws_message: &str) -> String {
+    let reason: String = aws_message.trim().chars().take(400).collect();
+    if reason.is_empty() {
+        format!("SES refused the message ({code}).")
+    } else {
+        format!("SES refused the message: {reason}")
+    }
 }
 
 #[cfg(test)]
@@ -350,6 +500,61 @@ mod tests {
             )
             .kind,
             SesErrorKind::ClockSkew
+        );
+    }
+
+    #[test]
+    fn bcc_travels_in_the_destination_and_the_raw_data_is_base64() {
+        use base64::Engine;
+        let dest = Destination {
+            to: vec!["a@x.com".into()],
+            cc: vec![],
+            bcc: vec!["secret@x.com".into()],
+        };
+        let body = send_request_body("me@y.com", &dest, b"Subject: hi\r\n\r\nbody");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["FromEmailAddress"], "me@y.com");
+        assert_eq!(json["Destination"]["ToAddresses"][0], "a@x.com");
+        assert_eq!(json["Destination"]["BccAddresses"][0], "secret@x.com");
+        assert!(json["Destination"].get("CcAddresses").is_none());
+        let data = json["Content"]["Raw"]["Data"].as_str().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap(),
+            b"Subject: hi\r\n\r\nbody"
+        );
+    }
+
+    #[test]
+    fn the_signed_path_is_encoded_twice_and_the_url_path_once() {
+        assert_eq!(
+            ses_paths("/v2/email/identities/a@b.com"),
+            (
+                "/v2/email/identities/a%40b.com".to_string(),
+                "/v2/email/identities/a%2540b.com".to_string()
+            )
+        );
+        // The send path has no reserved character, so both forms agree.
+        assert_eq!(
+            ses_paths(SEND_PATH),
+            (SEND_PATH.to_string(), SEND_PATH.to_string())
+        );
+    }
+
+    #[test]
+    fn a_rejection_passes_ses_s_reason_through() {
+        let error = classify(
+            400,
+            Some("MessageRejected"),
+            r#"{"message":"Email address is not verified. The following identities failed the check in region EU-WEST-1: a@x.com"}"#,
+            "ses:SendEmail",
+        );
+        assert_eq!(error.kind, SesErrorKind::Rejected);
+        assert!(error.message.contains("a@x.com"));
+        assert_eq!(
+            classify(400, Some("MessageRejected"), "{}", "ses:SendEmail").message,
+            "SES refused the message (MessageRejected)."
         );
     }
 }

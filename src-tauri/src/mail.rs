@@ -16,6 +16,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::aws_s3::{S3Api, S3Client, S3ErrorKind};
 use crate::aws_ses::{SesApi, SesClient, SesErrorKind};
 use crate::aws_sigv4::Credentials;
+use crate::mail_send;
 use crate::mail_store::{
     self, AccountInput, CredentialInput, MailAccount, MailCredential, MailIdentity, MailMailbox,
     MailSyncState, MailboxInput, Page, ThreadDetail, ThreadQuery, ThreadRow,
@@ -185,6 +186,12 @@ pub fn init(app: &AppHandle) {
         factory: live.clone(),
         sync: sync.clone(),
     });
+    if let Some(store) = app.try_state::<SessionStore>() {
+        // A send cut off by a quit is unknown, not failed, and not retried.
+        if let Ok(conn) = store.lock_conn() {
+            let _ = mail_store::fail_interrupted_sends(&conn);
+        }
+    }
     mail_sync::spawn_scheduler(app.clone(), sync, live.clone());
     spawn_identity_refresh(app.clone(), live);
 }
@@ -361,7 +368,7 @@ fn source_row(conn: &rusqlite::Connection, account: MailAccount) -> Result<Sourc
     Ok(SourceRow {
         identities_refreshed_at: mail_store::identities_refreshed_at(conn, account.id)
             .map_err(db)?,
-        mailboxes: mail_store::list_mailboxes(conn, Some(account.id)).map_err(db)?,
+        mailboxes: mail_store::list_user_mailboxes(conn, Some(account.id)).map_err(db)?,
         account,
     })
 }
@@ -479,6 +486,12 @@ pub(crate) fn mailboxes_upsert(
             row
         })
         .collect();
+    if rows.iter().any(|r| r.s3_prefix == mail_store::SENT_PREFIX) {
+        return Err(format!(
+            "Prefix '{}' is reserved for the copies of mail you send.",
+            mail_store::SENT_PREFIX
+        ));
+    }
     if let Some(row) = rows.iter().find(|r| r.s3_prefix.starts_with('/')) {
         return Err(format!(
             "Prefix '{}' must not start with '/'.",
@@ -493,7 +506,7 @@ pub(crate) fn mailboxes_upsert(
         return Err("That source no longer exists.".into());
     }
     mail_store::upsert_mailboxes(&conn, account_id, &rows).map_err(db)?;
-    mail_store::list_mailboxes(&conn, Some(account_id)).map_err(db)
+    mail_store::list_user_mailboxes(&conn, Some(account_id)).map_err(db)
 }
 
 pub(crate) fn mailboxes_delete(store: &SessionStore, id: i64) -> Result<Vec<i64>, String> {
@@ -674,6 +687,8 @@ fn ses_kind(kind: SesErrorKind) -> &'static str {
         SesErrorKind::InvalidCredentials => "invalidCredentials",
         SesErrorKind::ClockSkew => "clockSkew",
         SesErrorKind::Network => "network",
+        SesErrorKind::Unconfirmed => "unconfirmed",
+        SesErrorKind::Rejected => "rejected",
         SesErrorKind::Other => "other",
     }
 }
@@ -836,7 +851,7 @@ pub(crate) fn status(store: &SessionStore, sync_interval_secs: u64) -> Result<Ma
     let mut unread_total = 0;
     for account in mail_store::list_accounts(&conn).map_err(db)? {
         let mut mailboxes = Vec::new();
-        for mailbox in mail_store::list_mailboxes(&conn, Some(account.id)).map_err(db)? {
+        for mailbox in mail_store::list_user_mailboxes(&conn, Some(account.id)).map_err(db)? {
             mailboxes.push(MailboxStatus {
                 unread: unread.get(&mailbox.id).copied().unwrap_or(0),
                 sync: mail_store::get_sync_state(&conn, mailbox.id).map_err(db)?,
@@ -1644,6 +1659,57 @@ pub async fn mail_delete(
     report
 }
 
+#[tauri::command(async)]
+pub fn mail_outbox_save(
+    store: State<'_, SessionStore>,
+    draft: mail_send::OutboxDraft,
+) -> Result<i64, String> {
+    mail_send::outbox_save(&store, draft)
+}
+
+/// Sends once. A failure is reported and recorded, never retried here.
+#[tauri::command]
+pub async fn mail_outbox_send(app: AppHandle, id: i64) -> Result<mail_send::SendReport, String> {
+    let report = blocking(app.clone(), move |store, mail| {
+        mail_send::outbox_send(store, &*mail.clients, id)
+    })
+    .await;
+    // Also after an error: the row's state changed either way.
+    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    report
+}
+
+/// What would make SES refuse this message, found without sending it.
+#[tauri::command]
+pub async fn mail_outbox_check(
+    app: AppHandle,
+    id: i64,
+) -> Result<Vec<mail_send::SendProblem>, String> {
+    blocking(app, move |store, mail| {
+        mail_send::outbox_check(store, &*mail.clients, id)
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub fn mail_outbox_list(
+    store: State<'_, SessionStore>,
+) -> Result<Vec<mail_store::OutboxRow>, String> {
+    mail_send::outbox_list(&store)
+}
+
+#[tauri::command(async)]
+pub fn mail_outbox_delete(store: State<'_, SessionStore>, id: i64) -> Result<(), String> {
+    mail_send::outbox_delete(&store, id)
+}
+
+#[tauri::command(async)]
+pub fn mail_sendable_mailboxes(
+    store: State<'_, SessionStore>,
+) -> Result<Vec<mail_send::SendableMailbox>, String> {
+    mail_send::sendable_mailboxes(&store)
+}
+
 /// Downloads the attachment if needed and returns where it is. Opening it is
 /// the webview's call, through the same default-app path other files use.
 #[tauri::command]
@@ -1810,6 +1876,14 @@ mod tests {
                 sandbox: self.sandbox,
                 sending_enabled: true,
             })
+        }
+        fn send_raw(
+            &self,
+            _: &str,
+            _: &crate::aws_ses::Destination,
+            _: &[u8],
+        ) -> Result<String, SesError> {
+            unreachable!("these tests never send")
         }
     }
 

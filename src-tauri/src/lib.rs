@@ -31,7 +31,9 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod macos_background;
 mod mail;
+mod mail_build;
 mod mail_mime;
+mod mail_send;
 mod mail_store;
 mod mail_sync;
 mod mail_thread;
@@ -375,6 +377,12 @@ pub fn run() {
             mail::mail_attachment_open,
             mail::mail_attachment_bytes,
             mail::mail_remote_image,
+            mail::mail_outbox_save,
+            mail::mail_outbox_send,
+            mail::mail_outbox_check,
+            mail::mail_outbox_list,
+            mail::mail_outbox_delete,
+            mail::mail_sendable_mailboxes,
             external_editor::list_external_editors,
             external_editor::open_in_external_editor,
             fs::resolve_project_location,

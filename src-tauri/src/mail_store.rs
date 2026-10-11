@@ -21,6 +21,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::session_store::now_millis;
 
+/// Where sent copies live in a source's bucket. A mailbox with this prefix is
+/// the sent archive: the sync reads it so other machines see sent mail, but it
+/// is never a From address, whatever the identities say.
+pub(crate) const SENT_PREFIX: &str = "sent/";
+
 const MASK_BULLETS: &str = "\u{2022}\u{2022}\u{2022}\u{2022}";
 const MASK_VISIBLE_PREFIX: usize = 4;
 const MASK_VISIBLE_SUFFIX: usize = 4;
@@ -492,7 +497,8 @@ fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailAccount> {
 /// Forgets the cached SES identities of a source and what they decided. They
 /// belong to one (credential, SES region) pair, so after either changes they
 /// describe a different account; `is_sendable` returns to its pre-refresh
-/// default until the next refresh.
+/// default until the next refresh (the sent archive excepted, see
+/// [`resolve_sendable`]).
 fn clear_identities(conn: &Connection, account_id: i64) -> rusqlite::Result<()> {
     conn.execute(
         "DELETE FROM mail_identity WHERE account_id = ?1",
@@ -503,8 +509,8 @@ fn clear_identities(conn: &Connection, account_id: i64) -> rusqlite::Result<()> 
         params![account_id],
     )?;
     conn.execute(
-        "UPDATE mail_mailbox SET is_sendable = 1 WHERE account_id = ?1",
-        params![account_id],
+        "UPDATE mail_mailbox SET is_sendable = 1 WHERE account_id = ?1 AND s3_prefix <> ?2",
+        params![account_id, SENT_PREFIX],
     )?;
     Ok(())
 }
@@ -773,6 +779,103 @@ pub(crate) fn delete_mailbox(conn: &Connection, id: i64) -> rusqlite::Result<boo
     Ok(conn.execute("DELETE FROM mail_mailbox WHERE id = ?1", params![id])? > 0)
 }
 
+impl MailMailbox {
+    pub(crate) fn is_sent_archive(&self) -> bool {
+        self.s3_prefix == SENT_PREFIX
+    }
+}
+
+/// Mailboxes a person set up, without the sent archive. The sync uses
+/// [`list_mailboxes`] because it must read the archive too.
+pub(crate) fn list_user_mailboxes(
+    conn: &Connection,
+    account_id: Option<i64>,
+) -> rusqlite::Result<Vec<MailMailbox>> {
+    Ok(list_mailboxes(conn, account_id)?
+        .into_iter()
+        .filter(|m| !m.is_sent_archive())
+        .collect())
+}
+
+/// Registers the source's `sent/` prefix as a mailbox the first time a copy is
+/// written there, so the normal sync reads it. It is created unsendable and
+/// [`resolve_sendable`] never touches it. The address is a placeholder that
+/// cannot receive mail: `address` must be unique across sources.
+pub(crate) fn ensure_sent_mailbox(conn: &Connection, account_id: i64) -> rusqlite::Result<i64> {
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM mail_mailbox WHERE account_id = ?1 AND s3_prefix = ?2",
+            params![account_id, SENT_PREFIX],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    conn.query_row(
+        "INSERT INTO mail_mailbox
+           (account_id, address, domain, s3_prefix, display_name, sort_order, is_sendable)
+         VALUES (?1, ?2, 'monoptah.invalid', ?3, 'Sent', 1000000, 0)
+         RETURNING id",
+        params![
+            account_id,
+            format!("sent-archive-{account_id}@monoptah.invalid"),
+            SENT_PREFIX
+        ],
+        |row| row.get(0),
+    )
+}
+
+/// Where a sent message is filed: the mailbox of the message it answers when
+/// the source holds one (so the reply joins its conversation, since threads
+/// never cross mailboxes), else the mailbox it was sent from. `referenced` is
+/// `In-Reply-To` first, as the parser lists it.
+pub(crate) fn filing_mailbox(
+    conn: &Connection,
+    account_id: i64,
+    from_mailbox: Option<i64>,
+    referenced: &[String],
+) -> rusqlite::Result<Option<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.mailbox_id FROM mail_message m
+         JOIN mail_mailbox b ON b.id = m.mailbox_id
+         WHERE b.account_id = ?1 AND m.message_id_hdr = ?2
+         ORDER BY (m.mailbox_id = ?3) DESC, m.id LIMIT 1",
+    )?;
+    for hdr in referenced {
+        let found: Option<i64> = stmt
+            .query_row(params![account_id, hdr, from_mailbox], |row| row.get(0))
+            .optional()?;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(from_mailbox)
+}
+
+/// The mailbox of the source that owns this address, never the sent archive.
+pub(crate) fn mailbox_by_address(
+    conn: &Connection,
+    address: &str,
+) -> rusqlite::Result<Option<MailMailbox>> {
+    let address = address.trim().to_ascii_lowercase();
+    Ok(list_mailboxes(conn, None)?
+        .into_iter()
+        .find(|m| !m.is_sent_archive() && m.address == address))
+}
+
+pub(crate) fn message_direction(
+    conn: &Connection,
+    message_id: i64,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT direction FROM mail_message WHERE id = ?1",
+        params![message_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 // ── identities ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -789,14 +892,19 @@ pub struct MailIdentity {
 /// Sets `is_sendable` on a source's mailboxes: true when the address, or its
 /// domain, is a verified identity. Callers decide whether identities were ever
 /// refreshed (`identities_refreshed_at`); this clears the flag unconditionally.
+///
+/// The sent archive is left out: its `is_sendable = 0` is a decision, not a
+/// result, so it must not depend on what its placeholder address happens to
+/// match. [`clear_identities`] needs the same exclusion for a plainer reason:
+/// it resets every mailbox to the sendable default.
 fn resolve_sendable(conn: &Connection, account_id: i64) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE mail_mailbox SET is_sendable = EXISTS (
            SELECT 1 FROM mail_identity i
            WHERE i.account_id = mail_mailbox.account_id AND i.status = 'verified'
              AND (i.identity = mail_mailbox.address OR i.identity = mail_mailbox.domain))
-         WHERE account_id = ?1",
-        params![account_id],
+         WHERE account_id = ?1 AND s3_prefix <> ?2",
+        params![account_id, SENT_PREFIX],
     )?;
     Ok(())
 }
@@ -1385,6 +1493,19 @@ pub(crate) fn insert_object(
         ],
         |row| row.get(0),
     )
+}
+
+pub(crate) fn object_by_key(
+    conn: &Connection,
+    mailbox_id: i64,
+    s3_key: &str,
+) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM mail_object WHERE mailbox_id = ?1 AND s3_key = ?2",
+        params![mailbox_id, s3_key],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Records that the listing saw this object again, and moves it to `state`.
@@ -3152,6 +3273,279 @@ pub(crate) fn preview_rules(
         },
     )?;
     Ok(PreviewCount { count })
+}
+
+// ── outbox ─────────────────────────────────────────────────────────
+
+/// One recipient. Same shape as the webview's `MailAddress`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recipient {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub addr: String,
+}
+
+/// A file to attach. `cid` set means an inline image, referenced from the body
+/// as `cid:<value>`; the value is the `contentId` the composer's serializer
+/// produced, stored without angle brackets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxAttachment {
+    pub path: String,
+    pub filename: String,
+    pub mime: String,
+    #[serde(default)]
+    pub cid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxRow {
+    pub id: i64,
+    pub account_id: i64,
+    pub mailbox_id: Option<i64>,
+    pub thread_id: Option<i64>,
+    pub reply_to_message_id: Option<i64>,
+    /// `new | reply | reply_all | forward`
+    pub kind: String,
+    pub from_addr: String,
+    pub to: Vec<Recipient>,
+    pub cc: Vec<Recipient>,
+    pub bcc: Vec<Recipient>,
+    pub subject: String,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    /// The TipTap document: the draft's source of truth.
+    pub body_json: Option<serde_json::Value>,
+    pub quoted_html: Option<String>,
+    pub attachments: Vec<OutboxAttachment>,
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
+    /// `draft | queued | sending | sent | failed`
+    pub state: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub ses_message_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub sent_at: Option<i64>,
+}
+
+/// What a save writes. JSON columns are already serialised by the caller.
+pub(crate) struct OutboxWrite {
+    pub account_id: i64,
+    pub mailbox_id: Option<i64>,
+    pub thread_id: Option<i64>,
+    pub reply_to_message_id: Option<i64>,
+    pub kind: String,
+    pub from_addr: String,
+    pub to_json: String,
+    pub cc_json: String,
+    pub bcc_json: String,
+    pub subject: String,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub body_json: Option<String>,
+    pub quoted_html: Option<String>,
+    pub attachments_json: String,
+    pub in_reply_to: Option<String>,
+    pub references_json: String,
+}
+
+const OUTBOX_COLUMNS: &str = "id, account_id, mailbox_id, thread_id, reply_to_message_id, kind,
+    from_addr, to_json, cc_json, bcc_json, subject, body_text, body_html, body_json,
+    quoted_html, attachments_json, in_reply_to, references_json, state, attempts,
+    last_error, ses_message_id, created_at, updated_at, sent_at";
+
+fn outbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
+    fn list<T: serde::de::DeserializeOwned>(text: String) -> Vec<T> {
+        serde_json::from_str(&text).unwrap_or_default()
+    }
+    Ok(OutboxRow {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        mailbox_id: row.get(2)?,
+        thread_id: row.get(3)?,
+        reply_to_message_id: row.get(4)?,
+        kind: row.get(5)?,
+        from_addr: row.get(6)?,
+        to: list(row.get(7)?),
+        cc: list(row.get(8)?),
+        bcc: list(row.get(9)?),
+        subject: row.get(10)?,
+        body_text: row.get(11)?,
+        body_html: row.get(12)?,
+        body_json: row
+            .get::<_, Option<String>>(13)?
+            .and_then(|t| serde_json::from_str(&t).ok()),
+        quoted_html: row.get(14)?,
+        attachments: list(row.get(15)?),
+        in_reply_to: row.get(16)?,
+        references: list(row.get(17)?),
+        state: row.get(18)?,
+        attempts: row.get(19)?,
+        last_error: row.get(20)?,
+        ses_message_id: row.get(21)?,
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
+        sent_at: row.get(24)?,
+    })
+}
+
+pub(crate) fn insert_outbox(conn: &Connection, w: &OutboxWrite) -> rusqlite::Result<i64> {
+    let now = now_millis();
+    conn.query_row(
+        "INSERT INTO mail_outbox
+           (account_id, mailbox_id, thread_id, reply_to_message_id, kind, from_addr,
+            to_json, cc_json, bcc_json, subject, body_text, body_html, body_json,
+            quoted_html, attachments_json, in_reply_to, references_json,
+            created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                 ?18, ?18)
+         RETURNING id",
+        params![
+            w.account_id,
+            w.mailbox_id,
+            w.thread_id,
+            w.reply_to_message_id,
+            w.kind,
+            w.from_addr,
+            w.to_json,
+            w.cc_json,
+            w.bcc_json,
+            w.subject,
+            w.body_text,
+            w.body_html,
+            w.body_json,
+            w.quoted_html,
+            w.attachments_json,
+            w.in_reply_to,
+            w.references_json,
+            now
+        ],
+        |row| row.get(0),
+    )
+}
+
+/// Rewrites a draft or a failed send. A `failed` row goes back to `draft`
+/// (the person edited it, so it is theirs to send again); any other state is
+/// left alone and reported as not updated, because a row being sent or already
+/// sent must not be changed under the send.
+pub(crate) fn update_outbox(conn: &Connection, id: i64, w: &OutboxWrite) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE mail_outbox SET
+           account_id = ?2, mailbox_id = ?3, thread_id = ?4, reply_to_message_id = ?5,
+           kind = ?6, from_addr = ?7, to_json = ?8, cc_json = ?9, bcc_json = ?10,
+           subject = ?11, body_text = ?12, body_html = ?13, body_json = ?14,
+           quoted_html = ?15, attachments_json = ?16, in_reply_to = ?17,
+           references_json = ?18, state = 'draft', last_error = NULL, updated_at = ?19
+         WHERE id = ?1 AND state IN ('draft', 'queued', 'failed')",
+        params![
+            id,
+            w.account_id,
+            w.mailbox_id,
+            w.thread_id,
+            w.reply_to_message_id,
+            w.kind,
+            w.from_addr,
+            w.to_json,
+            w.cc_json,
+            w.bcc_json,
+            w.subject,
+            w.body_text,
+            w.body_html,
+            w.body_json,
+            w.quoted_html,
+            w.attachments_json,
+            w.in_reply_to,
+            w.references_json,
+            now_millis()
+        ],
+    )? > 0)
+}
+
+pub(crate) fn get_outbox(conn: &Connection, id: i64) -> rusqlite::Result<Option<OutboxRow>> {
+    conn.query_row(
+        &format!("SELECT {OUTBOX_COLUMNS} FROM mail_outbox WHERE id = ?1"),
+        params![id],
+        outbox_from_row,
+    )
+    .optional()
+}
+
+/// Newest first. Capped, because sent rows are bookkeeping that only grows.
+pub(crate) fn list_outbox(conn: &Connection) -> rusqlite::Result<Vec<OutboxRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {OUTBOX_COLUMNS} FROM mail_outbox ORDER BY updated_at DESC, id DESC LIMIT 200"
+    ))?;
+    let rows = stmt.query_map([], outbox_from_row)?;
+    rows.collect()
+}
+
+/// A row being sent cannot be deleted: the send would then record its result
+/// against nothing.
+pub(crate) fn delete_outbox(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM mail_outbox WHERE id = ?1 AND state <> 'sending'",
+        params![id],
+    )? > 0)
+}
+
+/// Moves a sendable row to `sending`. Exactly one caller wins: a double click,
+/// or two windows, must not put the same email on the wire twice.
+pub(crate) fn claim_outbox_for_send(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE mail_outbox SET state = 'sending', attempts = attempts + 1,
+           last_error = NULL, updated_at = ?2
+         WHERE id = ?1 AND state IN ('draft', 'queued', 'failed')",
+        params![id, now_millis()],
+    )? > 0)
+}
+
+pub(crate) fn mark_outbox_sent(
+    conn: &Connection,
+    id: i64,
+    ses_message_id: &str,
+) -> rusqlite::Result<()> {
+    let now = now_millis();
+    conn.execute(
+        "UPDATE mail_outbox SET state = 'sent', ses_message_id = ?2, sent_at = ?3,
+           updated_at = ?3, last_error = NULL WHERE id = ?1",
+        params![id, ses_message_id, now],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn set_outbox_thread(
+    conn: &Connection,
+    id: i64,
+    thread_id: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_outbox SET thread_id = ?2 WHERE id = ?1",
+        params![id, thread_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn mark_outbox_failed(conn: &Connection, id: i64, error: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_outbox SET state = 'failed', last_error = ?2, updated_at = ?3
+         WHERE id = ?1 AND state = 'sending'",
+        params![id, error, now_millis()],
+    )?;
+    Ok(())
+}
+
+/// A row still `sending` at startup was cut off by a quit or a crash, and
+/// nobody knows whether SES took it. It becomes `failed` with that said, so the
+/// person decides; it is never retried on its own.
+pub(crate) fn fail_interrupted_sends(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE mail_outbox SET state = 'failed', updated_at = ?1,
+           last_error = 'Monoptah quit while this was being sent. It may have been delivered, so check the recipient before sending it again.'
+         WHERE state = 'sending'",
+        params![now_millis()],
+    )
 }
 
 #[cfg(test)]

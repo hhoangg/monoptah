@@ -561,12 +561,48 @@ fn ingest_one(
             return Ok(());
         }
     };
+    // A `sent/` object is mail we sent: another machine's copy, or ours not yet
+    // linked. It belongs in the mailbox of the conversation it answers, not in
+    // the archive mailbox that merely points at the prefix.
+    let sent_archive = mailbox.is_sent_archive();
+    let (target, direction) = if sent_archive {
+        let account_id = mail_store::mailbox_account_id(conn, mailbox.id)?;
+        let from_mailbox = match mail.from.as_ref() {
+            Some(from) => mail_store::mailbox_by_address(conn, &from.address)?
+                .filter(|m| m.account_id == account_id)
+                .map(|m| m.id),
+            None => None,
+        };
+        match mail_store::filing_mailbox(conn, account_id, from_mailbox, &mail.referenced_ids)? {
+            Some(target) => (target, "outbound"),
+            None => {
+                let note = "Sent from an address that is no longer a mailbox here.";
+                mail_store::set_object_outcome(
+                    conn,
+                    item.object_id,
+                    "error",
+                    Some(note),
+                    item.attempts + 1,
+                )?;
+                counts.failed += 1;
+                return Ok(());
+            }
+        }
+    } else {
+        (mailbox.id, "inbound")
+    };
     let existing = mail_store::message_for_object(conn, item.object_id)?;
     match existing {
+        // We wrote this object and never rewrite it, so a changed etag is S3
+        // bookkeeping. Re-parsing would also drop the Bcc, which only the local
+        // row knows.
+        Some((message_id, _))
+            if item.reparse
+                && mail_store::message_direction(conn, message_id)?.as_deref()
+                    == Some("outbound") => {}
         Some((message_id, old_thread)) if item.reparse => {
             let fallback = item.s3_modified.unwrap_or_else(|| now_millis() / 1000);
-            let replaced =
-                mail_thread::replace_message(conn, mailbox.id, message_id, &mail, fallback)?;
+            let replaced = mail_thread::replace_message(conn, target, message_id, &mail, fallback)?;
             if replaced.duplicate {
                 // Leave a visible mark rather than a silent `parsed`.
                 let note = "Message-ID is already used by another message.";
@@ -595,13 +631,20 @@ fn ingest_one(
             let fallback = item.s3_modified.unwrap_or_else(|| now_millis() / 1000);
             let ingested = mail_thread::ingest_message(
                 conn,
-                mailbox.id,
-                "inbound",
+                target,
+                direction,
                 Some(item.object_id),
                 &mail,
                 fallback,
             )?;
             if !ingested.duplicate {
+                if sent_archive {
+                    crate::mail_send::mark_outbound_read(
+                        conn,
+                        ingested.message_id,
+                        ingested.thread_id,
+                    )?;
+                }
                 // A new message surfaces its thread again. This is not the
                 // re-listed-key case, which never un-archives (spec section 10).
                 mail_store::reactivate_thread(conn, ingested.thread_id)?;
