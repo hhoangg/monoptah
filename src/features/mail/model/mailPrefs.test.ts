@@ -8,7 +8,6 @@ import {
   readingPaneSide,
   selectedFolder,
   selectedMailbox,
-  showImages,
   SYNC_INTERVAL_DEFAULT_SECONDS,
   syncIntervalSeconds,
 } from "./mailPrefs";
@@ -26,7 +25,6 @@ const cases = [
   ["listWidth", listWidth, 340, 400],
   ["readingPaneSide", readingPaneSide, "right", "bottom"],
   ["density", density, "comfortable", "compact"],
-  ["showImages", showImages, "ask", "never"],
 ] as const;
 
 afterEach(() => {
@@ -71,7 +69,6 @@ describe("mail prefs", () => {
       listWidth: "monocode:mail-listwidth-change",
       readingPaneSide: "monocode:mail-readingpaneside-change",
       density: "monocode:mail-density-change",
-      showImages: "monocode:mail-showimages-change",
     });
   });
 

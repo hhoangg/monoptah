@@ -436,3 +436,13 @@ it("writes the remote-image choice to every source", async () => {
   ).toEqual(["never", "never"]);
   expect(container.textContent).not.toContain("never sees your IP");
 });
+
+it("says the image policy is set per source when sources differ", async () => {
+  sources = [{ ...sources[0], imagePolicy: "never" }, sources[1]];
+  await render();
+  expect(
+    container.querySelector(
+      '[aria-label="Load remote images: Set per source"]',
+    ),
+  ).not.toBeNull();
+});

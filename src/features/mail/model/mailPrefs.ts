@@ -14,12 +14,10 @@ export const MAIL_PREF_KEYS = {
   listWidth: "monocode.mail.listWidth",
   readingPaneSide: "monocode.mail.readingPaneSide",
   density: "monocode.mail.density",
-  showImages: "monocode.mail.showImages",
 } as const;
 
 export type ReadingPaneSide = "right" | "bottom" | "off";
 export type MailDensity = "comfortable" | "compact";
-export type ShowImages = "ask" | "always" | "never";
 
 export const SYNC_INTERVAL_DEFAULT_SECONDS = 3600;
 /** Rust clamps to the same floor; mirrored so the UI never offers less. */
@@ -170,12 +168,6 @@ export const density = enumPref<MailDensity>(
   ["comfortable", "compact"],
   "comfortable",
 );
-/** Mirrors the per-source value in the database; this is the default for new views. */
-export const showImages = enumPref<ShowImages>(
-  MAIL_PREF_KEYS.showImages,
-  ["ask", "always", "never"],
-  "ask",
-);
 
 export const useSelectedMailbox = selectedMailbox.useValue;
 export const useSelectedFolder = selectedFolder.useValue;
@@ -184,4 +176,3 @@ export const useSyncIntervalSeconds = syncIntervalSeconds.useValue;
 export const useListWidth = listWidth.useValue;
 export const useReadingPaneSide = readingPaneSide.useValue;
 export const useDensity = density.useValue;
-export const useShowImages = showImages.useValue;

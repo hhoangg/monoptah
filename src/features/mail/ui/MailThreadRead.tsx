@@ -104,6 +104,12 @@ function AttachmentChip({ attachment }: { attachment: AttachmentRow }) {
 }
 
 /** The stored message as received, for when the sanitiser removed something. */
+/**
+ * The stored source can be tens of MB. Laying all of it out would freeze the
+ * app, and the start is what shows what the sanitiser removed.
+ */
+export const RAW_PREVIEW_CHARS = 512 * 1024;
+
 function RawSource({
   messageId,
   onClose,
@@ -127,12 +133,7 @@ function RawSource({
     };
   }, [messageId]);
   return (
-    <Modal
-      title="Message source"
-      size="md"
-      className="!w-[min(900px,calc(100vw-24px))]"
-      onClose={onClose}
-    >
+    <Modal title="Message source" size="md" onClose={onClose}>
       {error ? (
         <p className="px-4 py-3 text-[12px] text-red-400">{error}</p>
       ) : raw === null ? (
@@ -141,9 +142,17 @@ function RawSource({
         </div>
       ) : (
         // Sender-controlled text, shown as a text node and never parsed.
-        <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap break-all px-4 py-3 font-mono text-[11px] text-content/80">
-          {raw}
-        </pre>
+        <>
+          {raw.length > RAW_PREVIEW_CHARS ? (
+            <p className="px-4 pt-3 text-[12px] text-content/50">
+              Truncated: showing the first 512 KB of{" "}
+              {(raw.length / (1024 * 1024)).toFixed(1)} MB.
+            </p>
+          ) : null}
+          <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap break-words px-4 py-3 font-mono text-[11px] text-content/80">
+            {raw.slice(0, RAW_PREVIEW_CHARS)}
+          </pre>
+        </>
       )}
     </Modal>
   );

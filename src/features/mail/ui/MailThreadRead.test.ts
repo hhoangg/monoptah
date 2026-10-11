@@ -2,7 +2,8 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { MailThreadRead } from "./MailThreadRead";
+import { RAW_PREVIEW_CHARS, MailThreadRead } from "./MailThreadRead";
+import { listen } from "@tauri-apps/api/event";
 import { mailMark, mailMessageRaw, mailStar, mailThread } from "../model/mail";
 import type { MessageRow, ThreadDetail } from "../model/mailTypes";
 
@@ -147,6 +148,8 @@ it("stars and marks the whole thread", async () => {
     b.textContent?.includes("Mark as read"),
   )!;
   await act(async () => mark.click());
+  // One call from opening the thread, one from this click.
+  expect(mailMark).toHaveBeenCalledTimes(2);
   expect(mailMark).toHaveBeenLastCalledWith([5], true);
 });
 
@@ -193,4 +196,36 @@ it("prompts when nothing is selected", async () => {
   await render(null);
   expect(container.textContent).toContain("Select a message");
   expect(mailThread).not.toHaveBeenCalled();
+});
+
+it("does not mark the thread read again when it reloads unread", async () => {
+  let reload: () => void = () => undefined;
+  vi.mocked(listen).mockImplementation(async (_event, handler) => {
+    reload = () => (handler as () => void)();
+    return () => undefined;
+  });
+  vi.mocked(mailThread).mockResolvedValue(detail([msg(1)]));
+  await render();
+  expect(mailMark).toHaveBeenCalledTimes(1);
+  // The user marked it unread; the reload brings back an unread thread.
+  vi.mocked(mailThread).mockResolvedValue(detail([msg(1, { isRead: false })]));
+  await act(async () => reload());
+  expect(mailThread).toHaveBeenCalledTimes(2);
+  expect(mailMark).toHaveBeenCalledTimes(1);
+});
+
+it("shows only the start of a huge source, with a note", async () => {
+  vi.mocked(mailThread).mockResolvedValue(detail([msg(1)]));
+  const huge = "A".repeat(RAW_PREVIEW_CHARS) + "TAIL".repeat(500_000);
+  vi.mocked(mailMessageRaw).mockResolvedValue(huge);
+  await render();
+  const open = [...container.querySelectorAll("button")].find((b) =>
+    b.textContent?.includes("View source"),
+  )!;
+  await act(async () => open.click());
+  const pre = document.body.querySelector("pre")!;
+  expect(pre.textContent!.length).toBe(RAW_PREVIEW_CHARS);
+  expect(pre.textContent).not.toContain("TAIL");
+  expect(document.body.textContent).toContain("Truncated");
+  expect(pre.className).not.toContain("break-all");
 });
