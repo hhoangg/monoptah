@@ -1469,6 +1469,7 @@ pub(crate) fn mark_vanished_objects(
             // The badge must be right the moment the sync ends, not after the
             // next unrelated recompute.
             crate::mail_thread::refresh_thread(tx, thread_id)?;
+            reevaluate_thread(tx, thread_id)?;
             tx.execute(
                 "UPDATE mail_thread SET state = 'archived', archived_at = ?2
                  WHERE id = ?1 AND state = 'active'
@@ -1501,6 +1502,7 @@ pub(crate) fn revive_gone_message(conn: &Connection, object_id: i64) -> rusqlite
             params![object_id],
         )?;
         crate::mail_thread::refresh_thread(tx, thread_id)?;
+        reevaluate_thread(tx, thread_id)?;
         tx.execute(
             "UPDATE mail_thread SET state = 'active', archived_at = NULL
              WHERE id = ?1 AND state = 'archived'
@@ -1655,10 +1657,10 @@ pub(crate) fn identities_refreshed_at(
 pub(crate) fn unread_by_mailbox(
     conn: &Connection,
 ) -> rusqlite::Result<std::collections::HashMap<i64, i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT mailbox_id, SUM(unread_count) FROM mail_thread
-         WHERE state = 'active' GROUP BY mailbox_id",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.mailbox_id, SUM(t.unread_count) FROM mail_thread t
+             WHERE t.state = 'active' AND {NOT_FILED_AWAY} GROUP BY t.mailbox_id"
+    ))?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     rows.collect()
 }
@@ -1668,8 +1670,8 @@ pub(crate) fn unread_by_mailbox(
 const DEFAULT_PAGE: u32 = 50;
 const MAX_PAGE: u32 = 200;
 
-/// Which threads a listing covers. Smart folders and ad-hoc rules join as
-/// further variants; each only has to say how it narrows [`scope_filter`].
+/// Which threads a listing covers; each variant only says how it narrows
+/// [`scope_filter`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ThreadScope {
@@ -1677,6 +1679,16 @@ pub enum ThreadScope {
     All,
     #[serde(rename_all = "camelCase")]
     Mailbox { mailbox_id: i64 },
+    /// A smart folder's materialised members.
+    #[serde(rename_all = "camelCase")]
+    Folder { folder_id: i64 },
+    /// Filter chips or the search box, not saved. Empty rules list everything.
+    #[serde(rename_all = "camelCase")]
+    Rules {
+        rules: Vec<Rule>,
+        #[serde(default)]
+        match_mode: MatchMode,
+    },
 }
 
 /// Position after the last row of the previous page. Threads sort by
@@ -1757,12 +1769,63 @@ fn thread_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
     })
 }
 
+/// The listing's visibility test, shared by [`list_threads`] and
+/// [`count_threads`] so a preview count cannot drift from the list it previews.
+/// Folder membership is kept for hidden threads too; this is what keeps them
+/// from reappearing in a folder view.
+const LISTED: &str = "t.state = 'active'
+           AND EXISTS (SELECT 1 FROM mail_message m WHERE m.thread_id = t.id AND m.state = 'active')";
+
+/// Threads in a folder that behaves like a real folder leave the mailbox views.
+const NOT_FILED_AWAY: &str = "NOT EXISTS (SELECT 1 FROM mail_folder_member fm
+             JOIN mail_folder f ON f.id = fm.folder_id
+             WHERE fm.thread_id = t.id AND f.hide_from_mailbox = 1)";
+
 /// A SQL condition on `t`, `b` and `a` plus its parameters.
-fn scope_filter(scope: &ThreadScope) -> (&'static str, Vec<rusqlite::types::Value>) {
-    match scope {
-        ThreadScope::All => ("a.enabled = 1", Vec::new()),
-        ThreadScope::Mailbox { mailbox_id } => ("t.mailbox_id = ?", vec![(*mailbox_id).into()]),
-    }
+fn scope_filter(
+    scope: &ThreadScope,
+    now: i64,
+) -> rusqlite::Result<(String, Vec<rusqlite::types::Value>)> {
+    Ok(match scope {
+        ThreadScope::All => (format!("a.enabled = 1 AND {NOT_FILED_AWAY}"), Vec::new()),
+        ThreadScope::Mailbox { mailbox_id } => (
+            format!("t.mailbox_id = ? AND {NOT_FILED_AWAY}"),
+            vec![(*mailbox_id).into()],
+        ),
+        ThreadScope::Folder { folder_id } => (
+            "a.enabled = 1 AND t.id IN
+               (SELECT thread_id FROM mail_folder_member WHERE folder_id = ?)"
+                .to_string(),
+            vec![(*folder_id).into()],
+        ),
+        ThreadScope::Rules { rules, match_mode } => match compile_rules(rules, *match_mode, now)? {
+            Some(c) => (format!("a.enabled = 1 AND {}", c.sql), c.params),
+            None => ("a.enabled = 1".to_string(), Vec::new()),
+        },
+    })
+}
+
+fn listing_conditions(
+    scope: &ThreadScope,
+    now: i64,
+) -> rusqlite::Result<(String, Vec<rusqlite::types::Value>)> {
+    let (scope_sql, values) = scope_filter(scope, now)?;
+    Ok((format!("{LISTED} AND {scope_sql}"), values))
+}
+
+/// How many threads a listing of `scope` holds across all its pages.
+pub(crate) fn count_threads(conn: &Connection, scope: &ThreadScope) -> rusqlite::Result<i64> {
+    let (cond, values) = listing_conditions(scope, now_millis() / 1000)?;
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM mail_thread t
+             JOIN mail_mailbox b ON b.id = t.mailbox_id
+             JOIN mail_account a ON a.id = t.account_id
+             WHERE {cond}"
+        ),
+        rusqlite::params_from_iter(values),
+        |row| row.get(0),
+    )
 }
 
 /// One page of listed threads, newest first. A thread is listed while it has an
@@ -1775,12 +1838,8 @@ pub(crate) fn list_threads(
 ) -> rusqlite::Result<Page<ThreadRow>> {
     use rusqlite::types::Value;
     let limit = query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
-    let (scope_sql, mut values) = scope_filter(&query.scope);
-    let mut sql = format!(
-        "{THREAD_SELECT} WHERE t.state = 'active'
-           AND EXISTS (SELECT 1 FROM mail_message m WHERE m.thread_id = t.id AND m.state = 'active')
-           AND {scope_sql}"
-    );
+    let (cond, mut values) = listing_conditions(&query.scope, now_millis() / 1000)?;
+    let mut sql = format!("{THREAD_SELECT} WHERE {cond}");
     if let Some(cursor) = query.cursor {
         sql.push_str(" AND (t.last_message_at < ? OR (t.last_message_at = ? AND t.id < ?))");
         values.push(Value::from(cursor.last_message_at));
@@ -1992,6 +2051,8 @@ pub(crate) fn set_threads_read(
              WHERE id = ?1",
             params![id],
         )?;
+        // `is_unread` rules read the count just rewritten.
+        reevaluate_thread(&tx, *id)?;
     }
     tx.commit()
 }
@@ -2011,6 +2072,7 @@ pub(crate) fn set_threads_starred(
             "UPDATE mail_thread SET is_starred = ?2 WHERE id = ?1",
             params![id, starred],
         )?;
+        reevaluate_thread(&tx, *id)?;
     }
     tx.commit()
 }
@@ -2070,6 +2132,791 @@ pub(crate) fn set_attachment_path(
         params![attachment_id, path],
     )?;
     Ok(())
+}
+
+// ── rules and smart folders ────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchMode {
+    #[default]
+    All,
+    Any,
+}
+
+impl MatchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            MatchMode::All => "all",
+            MatchMode::Any => "any",
+        }
+    }
+}
+
+/// One condition. The same type backs the filter chips, the search box and a
+/// saved folder, so "Save as folder" is a copy of data. `value` is a string,
+/// a number, or for `contains_any` an array of strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Rule {
+    pub field: String,
+    pub op: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
+    #[serde(default)]
+    pub negate: bool,
+}
+
+const TEXT_OPS: &[&str] = &[
+    "is",
+    "contains",
+    "contains_any",
+    "starts_with",
+    "ends_with",
+    "matches",
+];
+const FTS_OPS: &[&str] = &["contains", "contains_any"];
+const SCOPE_OPS: &[&str] = &["is", "contains_any"];
+const FLAG_OPS: &[&str] = &["true"];
+const DATE_OPS: &[&str] = &["before", "after", "within_days"];
+const MAX_LIST_VALUES: usize = 100;
+const MAX_RULES: usize = 50;
+
+/// Every field and the operators that mean something on it.
+pub(crate) fn allowed_ops(field: &str) -> Option<&'static [&'static str]> {
+    Some(match field {
+        "from" | "to" | "cc" | "recipient" | "subject" => TEXT_OPS,
+        "body" => FTS_OPS,
+        "mailbox" | "domain" | "account" => SCOPE_OPS,
+        "has_attachment" | "is_unread" | "is_starred" => FLAG_OPS,
+        "date" => DATE_OPS,
+        _ => return None,
+    })
+}
+
+/// A `WHERE` fragment over the aliases `t` (thread), `b` (mailbox) and `a`
+/// (source), with its bound values in placeholder order.
+pub(crate) struct Compiled {
+    pub sql: String,
+    pub params: Vec<rusqlite::types::Value>,
+}
+
+fn rule_value_error(rule: &Rule) -> rusqlite::Error {
+    user_error(format!("A \"{}\" rule needs a value.", rule.field))
+}
+
+fn scalar_value(rule: &Rule) -> rusqlite::Result<String> {
+    let text = match &rule.value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return Err(rule_value_error(rule)),
+    };
+    if text.trim().is_empty() {
+        return Err(rule_value_error(rule));
+    }
+    Ok(text)
+}
+
+/// The values of a `contains_any` rule. The database keeps them as JSON text,
+/// so a string holding an array is accepted as well as the array itself.
+fn list_value(rule: &Rule) -> rusqlite::Result<Vec<String>> {
+    let items: Vec<serde_json::Value> = match &rule.value {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(serde_json::Value::Array(a)) => a,
+            _ => vec![serde_json::Value::String(s.clone())],
+        },
+        _ => return Err(rule_value_error(rule)),
+    };
+    let out: Vec<String> = items
+        .iter()
+        .filter_map(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    if out.is_empty() {
+        return Err(rule_value_error(rule));
+    }
+    if out.len() > MAX_LIST_VALUES {
+        return Err(user_error(format!(
+            "A \"{}\" rule can list at most {MAX_LIST_VALUES} values.",
+            rule.field
+        )));
+    }
+    Ok(out)
+}
+
+/// `LIKE` treats `%` and `_` as wildcards; a literal match needs them, and the
+/// escape character itself, backslashed (paired with `ESCAPE '\'`).
+fn escape_like(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Epoch seconds from `YYYY-MM-DD` (UTC midnight) or from the number itself.
+fn parse_when(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if let Ok(secs) = text.parse::<i64>() {
+        return Some(secs);
+    }
+    let mut parts = text.split('-');
+    let (y, m, d) = (
+        parts.next()?.parse::<i64>().ok()?,
+        parts.next()?.parse::<i64>().ok()?,
+        parts.next()?.parse::<i64>().ok()?,
+    );
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d) * 86_400)
+}
+
+/// One comparison of `expr` against `value`. The operator picks the template;
+/// the value is always a bound parameter.
+fn text_term(
+    expr: &str,
+    op: &str,
+    value: &str,
+    params: &mut Vec<rusqlite::types::Value>,
+) -> String {
+    use rusqlite::types::Value;
+    let (sql, bound) = match op {
+        "is" => (format!("{expr} = ? COLLATE NOCASE"), value.to_string()),
+        "starts_with" => (
+            format!("{expr} LIKE ? ESCAPE '\\'"),
+            format!("{}%", escape_like(value)),
+        ),
+        "ends_with" => (
+            format!("{expr} LIKE ? ESCAPE '\\'"),
+            format!("%{}", escape_like(value)),
+        ),
+        "matches" => (format!("{expr} GLOB ?"), value.to_string()),
+        // "contains"
+        _ => (
+            format!("{expr} LIKE ? ESCAPE '\\'"),
+            format!("%{}%", escape_like(value)),
+        ),
+    };
+    params.push(Value::Text(bound));
+    sql
+}
+
+/// An address list column (`to_json`, `cc_json`) is `[{name,addr}]`; searching
+/// the JSON text would match its punctuation and keys, so each entry is read.
+fn address_term(
+    column: &str,
+    op: &str,
+    value: &str,
+    params: &mut Vec<rusqlite::types::Value>,
+) -> String {
+    let addr = text_term(
+        "COALESCE(json_extract(j.value, '$.addr'), '')",
+        op,
+        value,
+        params,
+    );
+    let name = text_term(
+        "COALESCE(json_extract(j.value, '$.name'), '')",
+        op,
+        value,
+        params,
+    );
+    format!(
+        "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid({column}) THEN {column} ELSE '[]' END) j
+                 WHERE ({addr} OR {name}))"
+    )
+}
+
+/// FTS5 phrase for `text`: quoted, so `*`, `-`, `:`, `OR` and the like are
+/// words and cannot change the query's shape. Folded like the index.
+fn fts_phrase(text: &str) -> Option<String> {
+    let folded = fold_fts(text);
+    if !folded.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    Some(format!("\"{}\"", folded.replace('"', "\"\"")))
+}
+
+fn fts_term(column: &str, values: &[String], params: &mut Vec<rusqlite::types::Value>) -> String {
+    let phrases: Vec<String> = values.iter().filter_map(|v| fts_phrase(v)).collect();
+    if phrases.is_empty() {
+        // Nothing the index could hold, so nothing matches.
+        return "0".to_string();
+    }
+    params.push(rusqlite::types::Value::Text(format!(
+        "{column} : ({})",
+        phrases.join(" OR ")
+    )));
+    "m.id IN (SELECT rowid FROM mail_message_fts WHERE mail_message_fts MATCH ?)".to_string()
+}
+
+/// A thread matches when any of its visible messages satisfies `pred`.
+fn any_message(pred: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM mail_message m
+                 WHERE m.thread_id = t.id AND m.state != 'gone' AND ({pred}))"
+    )
+}
+
+/// One bound id-or-name test. A number is an id; anything else is looked up by
+/// `name_column`.
+fn id_or_name(
+    id_expr: &str,
+    table: &str,
+    name_column: &str,
+    value: &str,
+    params: &mut Vec<rusqlite::types::Value>,
+) -> String {
+    use rusqlite::types::Value;
+    match value.trim().parse::<i64>() {
+        Ok(id) => {
+            params.push(Value::Integer(id));
+            format!("{id_expr} = ?")
+        }
+        Err(_) => {
+            params.push(Value::Text(value.trim().to_string()));
+            format!("{id_expr} IN (SELECT id FROM {table} WHERE {name_column} = ? COLLATE NOCASE)")
+        }
+    }
+}
+
+fn compile_rule(
+    rule: &Rule,
+    now: i64,
+    params: &mut Vec<rusqlite::types::Value>,
+) -> rusqlite::Result<String> {
+    use rusqlite::types::Value;
+    let field = rule.field.as_str();
+    let ops = allowed_ops(field)
+        .ok_or_else(|| user_error(format!("\"{}\" is not a field mail can filter on.", field)))?;
+    let op = rule.op.as_str();
+    if !ops.contains(&op) {
+        return Err(user_error(format!(
+            "\"{op}\" does not apply to a \"{field}\" rule."
+        )));
+    }
+    // `contains_any` is `contains` over a list, joined with OR.
+    let (op, values) = match op {
+        "contains_any" => ("contains", list_value(rule)?),
+        "true" | "before" | "after" | "within_days" => ("", Vec::new()),
+        _ => (op, vec![scalar_value(rule)?]),
+    };
+    let or_all = |terms: Vec<String>| format!("({})", terms.join(" OR "));
+    let clause = match field {
+        "from" => any_message(&or_all(
+            values
+                .iter()
+                .map(|v| {
+                    let a = text_term("m.from_addr", op, v, params);
+                    let n = text_term("COALESCE(m.from_name, '')", op, v, params);
+                    format!("({a} OR {n})")
+                })
+                .collect(),
+        )),
+        "to" | "cc" | "recipient" => {
+            let columns: &[&str] = match field {
+                "to" => &["m.to_json"],
+                "cc" => &["m.cc_json"],
+                _ => &["m.to_json", "m.cc_json"],
+            };
+            any_message(&or_all(
+                values
+                    .iter()
+                    .flat_map(|v| columns.iter().map(move |c| (*c, v)))
+                    .map(|(c, v)| address_term(c, op, v, params))
+                    .collect(),
+            ))
+        }
+        "subject" | "body" if op == "contains" => any_message(&fts_term(field, &values, params)),
+        "subject" => any_message(&or_all(
+            values
+                .iter()
+                .map(|v| text_term("m.subject", op, v, params))
+                .collect(),
+        )),
+        "mailbox" => or_all(
+            values
+                .iter()
+                .map(|v| id_or_name("t.mailbox_id", "mail_mailbox", "address", v, params))
+                .collect(),
+        ),
+        "account" => or_all(
+            values
+                .iter()
+                .map(|v| id_or_name("t.account_id", "mail_account", "label", v, params))
+                .collect(),
+        ),
+        "domain" => or_all(
+            values
+                .iter()
+                .map(|v| {
+                    params.push(Value::Text(
+                        v.trim().trim_start_matches('@').to_ascii_lowercase(),
+                    ));
+                    "b.domain = ?".to_string()
+                })
+                .collect(),
+        ),
+        "has_attachment" => "t.has_attachments = 1".to_string(),
+        "is_unread" => "t.unread_count > 0".to_string(),
+        "is_starred" => "t.is_starred = 1".to_string(),
+        _ => {
+            // date
+            let raw = scalar_value(rule)?;
+            match rule.op.as_str() {
+                "within_days" => {
+                    let days = raw
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|d| (1..=36_500).contains(d))
+                        .ok_or_else(|| user_error("Enter a number of days.".to_string()))?;
+                    params.push(Value::Integer(now - days * 86_400));
+                    any_message("m.date_utc >= ?")
+                }
+                bound => {
+                    let when = parse_when(&raw).ok_or_else(|| {
+                        user_error(format!("\"{}\" is not a date. Use YYYY-MM-DD.", raw.trim()))
+                    })?;
+                    params.push(Value::Integer(when));
+                    any_message(if bound == "before" {
+                        "m.date_utc < ?"
+                    } else {
+                        "m.date_utc >= ?"
+                    })
+                }
+            }
+        }
+    };
+    Ok(if rule.negate {
+        format!("(NOT ({clause}))")
+    } else {
+        format!("({clause})")
+    })
+}
+
+/// Compiles rules to one condition. `None` means no rules, which the caller
+/// reads as "no restriction" (a listing) or rejects (a folder). Each rule is
+/// parenthesised on its own and `negate` binds to that rule alone, so
+/// `any` with two negated rules is `(NOT a) OR (NOT b)`, while `all` with the
+/// same two is `NOT (a OR b)`. A negated message-level rule means "no message
+/// of the thread matches".
+pub(crate) fn compile_rules(
+    rules: &[Rule],
+    mode: MatchMode,
+    now: i64,
+) -> rusqlite::Result<Option<Compiled>> {
+    if rules.is_empty() {
+        return Ok(None);
+    }
+    if rules.len() > MAX_RULES {
+        return Err(user_error(format!(
+            "A filter can have at most {MAX_RULES} rules."
+        )));
+    }
+    let mut params = Vec::new();
+    let mut parts = Vec::with_capacity(rules.len());
+    for rule in rules {
+        parts.push(compile_rule(rule, now, &mut params)?);
+    }
+    let joiner = if mode == MatchMode::Any {
+        " OR "
+    } else {
+        " AND "
+    };
+    Ok(Some(Compiled {
+        sql: format!("({})", parts.join(joiner)),
+        params,
+    }))
+}
+
+// ── folders ────────────────────────────────────────────────────────
+
+const MAX_FOLDER_NAME: usize = 80;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderInput {
+    pub id: Option<i64>,
+    pub name: String,
+    pub color: Option<String>,
+    /// `None` keeps a folder where it is and appends a new one.
+    pub sort_order: Option<i64>,
+    #[serde(default)]
+    pub match_mode: MatchMode,
+    #[serde(default)]
+    pub hide_from_mailbox: bool,
+    #[serde(default = "default_true")]
+    pub count_unread: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderRow {
+    pub id: i64,
+    pub name: String,
+    pub color: Option<String>,
+    pub sort_order: i64,
+    pub match_mode: MatchMode,
+    pub hide_from_mailbox: bool,
+    pub count_unread: bool,
+    pub rules: Vec<Rule>,
+    /// Listed threads in the folder.
+    pub thread_count: i64,
+    /// Unread messages in those threads.
+    pub unread_count: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewCount {
+    pub count: i64,
+}
+
+/// `contains_any` is stored as JSON text; every other value as itself.
+fn rule_value_to_text(rule: &Rule) -> String {
+    match &rule.value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn rule_value_from_text(op: &str, text: String) -> serde_json::Value {
+    if op == "contains_any" {
+        if let Ok(v @ serde_json::Value::Array(_)) = serde_json::from_str(&text) {
+            return v;
+        }
+    }
+    serde_json::Value::String(text)
+}
+
+fn folder_rules(conn: &Connection, folder_id: i64) -> rusqlite::Result<Vec<Rule>> {
+    let mut stmt = conn.prepare(
+        "SELECT field, op, value, negate FROM mail_folder_rule
+         WHERE folder_id = ?1 ORDER BY position, id",
+    )?;
+    let rows = stmt.query_map(params![folder_id], |row| {
+        let op: String = row.get(1)?;
+        let text: String = row.get(2)?;
+        Ok(Rule {
+            field: row.get(0)?,
+            value: rule_value_from_text(&op, text),
+            op,
+            negate: row.get::<_, i64>(3)? != 0,
+        })
+    })?;
+    rows.collect()
+}
+
+fn folder_match_mode(text: &str) -> MatchMode {
+    if text == "any" {
+        MatchMode::Any
+    } else {
+        MatchMode::All
+    }
+}
+
+fn load_folder(conn: &Connection, id: i64) -> rusqlite::Result<Option<FolderRow>> {
+    let head = conn
+        .query_row(
+            "SELECT id, name, color, sort_order, match_mode, hide_from_mailbox, count_unread
+             FROM mail_folder WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(FolderRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                    sort_order: row.get(3)?,
+                    match_mode: folder_match_mode(&row.get::<_, String>(4)?),
+                    hide_from_mailbox: row.get::<_, i64>(5)? != 0,
+                    count_unread: row.get::<_, i64>(6)? != 0,
+                    rules: Vec::new(),
+                    thread_count: 0,
+                    unread_count: 0,
+                })
+            },
+        )
+        .optional()?;
+    let Some(mut folder) = head else {
+        return Ok(None);
+    };
+    folder.rules = folder_rules(conn, id)?;
+    // Counted like the listing: hidden and vanished threads do not count.
+    let (threads, unread) = conn.query_row(
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(t.unread_count), 0) FROM mail_thread t
+             JOIN mail_account a ON a.id = t.account_id
+             WHERE {LISTED} AND a.enabled = 1
+               AND t.id IN (SELECT thread_id FROM mail_folder_member WHERE folder_id = ?1)"
+        ),
+        params![id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    folder.thread_count = threads;
+    folder.unread_count = unread;
+    Ok(Some(folder))
+}
+
+pub(crate) fn list_folders(conn: &Connection) -> rusqlite::Result<Vec<FolderRow>> {
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM mail_folder ORDER BY sort_order, id")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        out.extend(load_folder(conn, id)?);
+    }
+    Ok(out)
+}
+
+/// Creates or edits a folder and re-materialises its members from every stored
+/// thread, in one transaction. The rules are compiled before anything is
+/// written, so a bad rule leaves the folder as it was.
+pub(crate) fn upsert_folder(
+    conn: &Connection,
+    folder: &FolderInput,
+    rules: &[Rule],
+) -> rusqlite::Result<FolderRow> {
+    let name = folder.name.trim();
+    if name.is_empty() {
+        return Err(user_error("Give the folder a name.".to_string()));
+    }
+    if name.chars().count() > MAX_FOLDER_NAME {
+        return Err(user_error(format!(
+            "A folder name can be at most {MAX_FOLDER_NAME} characters."
+        )));
+    }
+    if rules.is_empty() {
+        return Err(user_error("A folder needs at least one rule.".to_string()));
+    }
+    compile_rules(rules, folder.match_mode, now_millis() / 1000)?;
+    let clash: Option<String> = conn
+        .query_row(
+            "SELECT name FROM mail_folder WHERE name = ?1 COLLATE NOCASE AND id IS NOT ?2",
+            params![name, folder.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = clash {
+        return Err(user_error(format!(
+            "A folder named \"{existing}\" already exists."
+        )));
+    }
+    let now = now_millis();
+    let tx = conn.unchecked_transaction()?;
+    let id = match folder.id {
+        Some(id) => {
+            let changed = tx.execute(
+                "UPDATE mail_folder SET name = ?2, color = ?3, match_mode = ?4,
+                   hide_from_mailbox = ?5, count_unread = ?6, updated_at = ?7,
+                   sort_order = COALESCE(?8, sort_order)
+                 WHERE id = ?1",
+                params![
+                    id,
+                    name,
+                    folder.color,
+                    folder.match_mode.as_str(),
+                    folder.hide_from_mailbox,
+                    folder.count_unread,
+                    now,
+                    folder.sort_order
+                ],
+            )?;
+            if changed == 0 {
+                return Err(user_error("That folder no longer exists.".to_string()));
+            }
+            id
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO mail_folder
+                   (name, color, sort_order, match_mode, hide_from_mailbox, count_unread,
+                    created_at, updated_at)
+                 VALUES (?1, ?2,
+                   COALESCE(?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM mail_folder)),
+                   ?4, ?5, ?6, ?7, ?7)",
+                params![
+                    name,
+                    folder.color,
+                    folder.sort_order,
+                    folder.match_mode.as_str(),
+                    folder.hide_from_mailbox,
+                    folder.count_unread,
+                    now
+                ],
+            )?;
+            tx.last_insert_rowid()
+        }
+    };
+    tx.execute(
+        "DELETE FROM mail_folder_rule WHERE folder_id = ?1",
+        params![id],
+    )?;
+    for (position, rule) in rules.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO mail_folder_rule (folder_id, position, field, op, value, negate)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                position as i64,
+                rule.field,
+                rule.op,
+                rule_value_to_text(rule),
+                rule.negate
+            ],
+        )?;
+    }
+    rematerialize_folder(&tx, id)?;
+    tx.commit()?;
+    Ok(load_folder(conn, id)?.expect("folder was just written"))
+}
+
+pub(crate) fn delete_folder(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    // Rules and members go by cascade; no message is touched.
+    conn.execute("DELETE FROM mail_folder WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// A folder's compiled rules, or `None` when it has none (such a folder holds
+/// nothing rather than everything).
+fn folder_condition(
+    conn: &Connection,
+    folder_id: i64,
+    mode: MatchMode,
+) -> rusqlite::Result<Option<Compiled>> {
+    let rules = folder_rules(conn, folder_id)?;
+    compile_rules(&rules, mode, now_millis() / 1000)
+}
+
+/// Replaces a folder's members with every stored thread its rules match, for
+/// a new folder or an edited rule ("Apply to mail already stored"). Takes the
+/// caller's connection and opens no transaction.
+pub(crate) fn rematerialize_folder(conn: &Connection, folder_id: i64) -> rusqlite::Result<()> {
+    let mode: String = conn.query_row(
+        "SELECT match_mode FROM mail_folder WHERE id = ?1",
+        params![folder_id],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "DELETE FROM mail_folder_member WHERE folder_id = ?1",
+        params![folder_id],
+    )?;
+    let Some(c) = folder_condition(conn, folder_id, folder_match_mode(&mode))? else {
+        return Ok(());
+    };
+    // Membership ignores listing visibility on purpose: archiving or disabling
+    // a source must not lose the folder, and the listing hides what it should.
+    let mut values = vec![rusqlite::types::Value::Integer(folder_id)];
+    values.extend(c.params);
+    conn.execute(
+        &format!(
+            "INSERT INTO mail_folder_member (folder_id, thread_id)
+             SELECT ?, t.id FROM mail_thread t
+             JOIN mail_mailbox b ON b.id = t.mailbox_id
+             JOIN mail_account a ON a.id = t.account_id
+             WHERE {}",
+            c.sql
+        ),
+        rusqlite::params_from_iter(values),
+    )?;
+    Ok(())
+}
+
+/// Re-evaluates one thread against every folder, for a message arriving or a
+/// flag changing. A thread that no longer exists is skipped. Runs on the
+/// caller's connection, inside its transaction.
+pub(crate) fn reevaluate_thread(conn: &Connection, thread_id: i64) -> rusqlite::Result<()> {
+    let folders: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, match_mode FROM mail_folder")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if folders.is_empty() {
+        return Ok(());
+    }
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM mail_thread WHERE id = ?1)",
+        params![thread_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
+    for (folder_id, mode) in folders {
+        let matched = match folder_condition(conn, folder_id, folder_match_mode(&mode))? {
+            None => false,
+            Some(c) => {
+                let mut values = vec![rusqlite::types::Value::Integer(thread_id)];
+                values.extend(c.params);
+                conn.query_row(
+                    &format!(
+                        "SELECT EXISTS (SELECT 1 FROM mail_thread t
+                         JOIN mail_mailbox b ON b.id = t.mailbox_id
+                         JOIN mail_account a ON a.id = t.account_id
+                         WHERE t.id = ? AND {})",
+                        c.sql
+                    ),
+                    rusqlite::params_from_iter(values),
+                    |row| row.get(0),
+                )?
+            }
+        };
+        if matched {
+            conn.execute(
+                "INSERT OR IGNORE INTO mail_folder_member (folder_id, thread_id) VALUES (?1, ?2)",
+                params![folder_id, thread_id],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM mail_folder_member WHERE folder_id = ?1 AND thread_id = ?2",
+                params![folder_id, thread_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The live count in the folder editor: what [`list_threads`] would return,
+/// across all pages, for these rules.
+pub(crate) fn preview_rules(
+    conn: &Connection,
+    rules: &[Rule],
+    mode: MatchMode,
+) -> rusqlite::Result<PreviewCount> {
+    let count = count_threads(
+        conn,
+        &ThreadScope::Rules {
+            rules: rules.to_vec(),
+            match_mode: mode,
+        },
+    )?;
+    Ok(PreviewCount { count })
 }
 
 #[cfg(test)]
@@ -2525,5 +3372,1057 @@ mod tests {
             "INSERT INTO mail_folder (name, created_at, updated_at) VALUES ('Invoices', 0, 0)";
         conn.execute(insert, []).unwrap();
         assert!(conn.execute(insert, []).is_err());
+    }
+
+    // ── rules and smart folders ────────────────────────────────────
+
+    struct Msg<'a> {
+        subject: &'a str,
+        from_name: &'a str,
+        from_addr: &'a str,
+        to: &'a str,
+        cc: &'a str,
+        body: &'a str,
+        date: i64,
+    }
+
+    impl Default for Msg<'_> {
+        fn default() -> Self {
+            Msg {
+                subject: "s",
+                from_name: "",
+                from_addr: "x@example.com",
+                to: "[]",
+                cc: "[]",
+                body: "",
+                date: 1_700_000_000,
+            }
+        }
+    }
+
+    /// One credential, one source, `boxes` mailboxes; returns the mailbox ids.
+    fn seed_boxes(conn: &Connection, boxes: &[(&str, &str)]) -> Vec<i64> {
+        let cred = upsert_credential(conn, &credential("a")).unwrap();
+        let acct = upsert_account(conn, &account(cred, "Alpha mail", "bucket-a")).unwrap();
+        let inputs: Vec<MailboxInput> = boxes.iter().map(|(a, p)| mailbox(a, p)).collect();
+        upsert_mailboxes(conn, acct, &inputs).unwrap();
+        list_mailboxes(conn, Some(acct))
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect()
+    }
+
+    /// A one-message thread, the way ingest leaves it, then re-evaluated
+    /// against the folders as the sync loop does.
+    fn arrive(conn: &Connection, mailbox_id: i64, m: &Msg) -> (i64, i64) {
+        let thread = insert_thread(conn, mailbox_id, m.subject, m.subject, m.date).unwrap();
+        let hdr = format!("<{}-{}@t>", m.subject, thread);
+        let from_name = (!m.from_name.is_empty()).then_some(m.from_name);
+        let id = insert_message(
+            conn,
+            &NewMessage {
+                mailbox_id,
+                thread_id: thread,
+                object_id: None,
+                direction: "inbound",
+                message_id_hdr: Some(&hdr),
+                in_reply_to: None,
+                subject: m.subject,
+                subject_key: m.subject,
+                from_name,
+                from_addr: m.from_addr,
+                reply_to_addr: None,
+                to_json: m.to,
+                cc_json: m.cc,
+                bcc_json: "[]",
+                date_utc: m.date,
+                received_at: m.date,
+                snippet: "",
+                body_text: Some(m.body),
+                body_html: None,
+                has_attachments: false,
+                size_bytes: 1,
+                spf: None,
+                dkim: None,
+                dmarc: None,
+                headers_json: "[]",
+            },
+        )
+        .unwrap();
+        crate::mail_thread::refresh_thread(conn, thread).unwrap();
+        reevaluate_thread(conn, thread).unwrap();
+        (id, thread)
+    }
+
+    fn rule(field: &str, op: &str, value: serde_json::Value) -> Rule {
+        Rule {
+            field: field.into(),
+            op: op.into(),
+            value,
+            negate: false,
+        }
+    }
+
+    fn not(mut r: Rule) -> Rule {
+        r.negate = true;
+        r
+    }
+
+    fn s(text: &str) -> serde_json::Value {
+        serde_json::Value::String(text.into())
+    }
+
+    fn list_rules(conn: &Connection, rules: &[Rule], mode: MatchMode) -> Vec<String> {
+        let page = list_threads(
+            conn,
+            &ThreadQuery {
+                scope: ThreadScope::Rules {
+                    rules: rules.to_vec(),
+                    match_mode: mode,
+                },
+                cursor: None,
+                limit: Some(200),
+            },
+        )
+        .unwrap();
+        let mut subjects: Vec<String> = page.rows.into_iter().map(|t| t.subject).collect();
+        subjects.sort();
+        subjects
+    }
+
+    fn folder(name: &str) -> FolderInput {
+        FolderInput {
+            id: None,
+            name: name.into(),
+            color: None,
+            sort_order: None,
+            match_mode: MatchMode::All,
+            hide_from_mailbox: false,
+            count_unread: true,
+        }
+    }
+
+    fn members(conn: &Connection, folder_id: i64) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.subject FROM mail_folder_member fm
+                 JOIN mail_thread t ON t.id = fm.thread_id
+                 WHERE fm.folder_id = ?1 ORDER BY t.subject",
+            )
+            .unwrap();
+        let rows = stmt.query_map([folder_id], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    fn folder_listing(conn: &Connection, folder_id: i64) -> Vec<String> {
+        let page = list_threads(
+            conn,
+            &ThreadQuery {
+                scope: ThreadScope::Folder { folder_id },
+                cursor: None,
+                limit: Some(200),
+            },
+        )
+        .unwrap();
+        let mut subjects: Vec<String> = page.rows.into_iter().map(|t| t.subject).collect();
+        subjects.sort();
+        subjects
+    }
+
+    #[test]
+    fn every_field_and_operator_pair_compiles_to_bound_sql() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let fields = [
+            "from",
+            "to",
+            "cc",
+            "recipient",
+            "subject",
+            "body",
+            "mailbox",
+            "domain",
+            "account",
+            "has_attachment",
+            "date",
+            "is_unread",
+            "is_starred",
+        ];
+        let ops = [
+            "is",
+            "contains",
+            "contains_any",
+            "starts_with",
+            "ends_with",
+            "matches",
+            "before",
+            "after",
+            "within_days",
+            "true",
+        ];
+        let mut valid = 0;
+        for field in fields {
+            let allowed = allowed_ops(field).unwrap();
+            for op in ops {
+                let value = match (field, op) {
+                    (_, "contains_any") => serde_json::json!(["SENTINEL'a", "SENTINEL%b"]),
+                    ("date", "within_days") => serde_json::json!(30),
+                    ("date", _) => s("2024-01-31"),
+                    (_, "true") => serde_json::Value::Null,
+                    _ => s("SENTINEL'x*%_"),
+                };
+                let r = rule(field, op, value);
+                let compiled =
+                    compile_rules(std::slice::from_ref(&r), MatchMode::All, 1_700_000_000);
+                if !allowed.contains(&op) {
+                    let err = compiled.err().unwrap_or_else(|| panic!("{field} {op}"));
+                    assert!(err.to_string().contains(op), "{err}");
+                    continue;
+                }
+                valid += 1;
+                for negate in [false, true] {
+                    let mut r = r.clone();
+                    r.negate = negate;
+                    let c = compile_rules(&[r], MatchMode::All, 1_700_000_000)
+                        .unwrap_or_else(|e| panic!("{field} {op}: {e}"))
+                        .unwrap();
+                    assert!(!c.sql.contains("SENTINEL"), "{field} {op}: {}", c.sql);
+                    assert_eq!(
+                        c.sql.matches('?').count(),
+                        c.params.len(),
+                        "{field} {op}: {}",
+                        c.sql
+                    );
+                    // The database is the judge of "valid SQL".
+                    let sql = format!(
+                        "SELECT COUNT(*) FROM mail_thread t
+                         JOIN mail_mailbox b ON b.id = t.mailbox_id
+                         JOIN mail_account a ON a.id = t.account_id WHERE {}",
+                        c.sql
+                    );
+                    conn.query_row(&sql, rusqlite::params_from_iter(c.params), |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .unwrap_or_else(|e| panic!("{field} {op}: {e}\n{sql}"));
+                }
+            }
+        }
+        // 5 text fields x 6, body 2, three scope fields x 2, three flags, date 3.
+        assert_eq!(valid, 5 * 6 + 2 + 3 * 2 + 3 + 3);
+        assert!(allowed_ops("nonsense").is_none());
+        let err = compile_rules(&[rule("nonsense", "is", s("x"))], MatchMode::All, 0).err();
+        assert!(err.unwrap().to_string().contains("nonsense"));
+        assert!(compile_rules(&[rule("from", "is", s("  "))], MatchMode::All, 0).is_err());
+        assert!(compile_rules(&[], MatchMode::All, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn like_wildcards_quotes_and_stars_match_literally() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        let to = |name: &str| format!(r#"[{{"name":"{name}","addr":"p@example.com"}}]"#);
+        let to_literal = to("50%_off*'");
+        let to_wild = to("50xyoff*'");
+        let to_back = to(r"back\\slash");
+        for (subject, name, to_json) in [
+            ("literal", "50%_off*'", "[]"),
+            ("wild", "50xyoff*'", "[]"),
+            ("backslash", r"back\slash", "[]"),
+            ("to-literal", "", to_literal.as_str()),
+            ("to-wild", "", to_wild.as_str()),
+            ("to-back", "", to_back.as_str()),
+        ] {
+            arrive(
+                &conn,
+                mb,
+                &Msg {
+                    subject,
+                    from_name: name,
+                    to: to_json,
+                    ..Msg::default()
+                },
+            );
+        }
+        let find = |field: &str, op: &str, v: &str| {
+            list_rules(&conn, &[rule(field, op, s(v))], MatchMode::All)
+        };
+        for field in ["from", "to"] {
+            let (lit, wild) = if field == "from" {
+                ("literal", "wild")
+            } else {
+                ("to-literal", "to-wild")
+            };
+            // `%` and `_` are wildcards to LIKE: they would also match `wild`.
+            assert_eq!(find(field, "contains", "50%_off*'"), [lit]);
+            assert_eq!(find(field, "starts_with", "50%_"), [lit]);
+            assert_eq!(find(field, "ends_with", "off*'"), [lit, wild]);
+            assert_eq!(find(field, "ends_with", "%_off*'"), [lit]);
+            assert_eq!(find(field, "is", "50%_off*'"), [lit]);
+            assert_eq!(find(field, "contains", "%"), [lit]);
+            assert_eq!(find(field, "contains", "_"), [lit]);
+            // `*` is an operator to GLOB and FTS, not to `contains`.
+            assert_eq!(find(field, "contains", "f*'"), [lit, wild]);
+            assert!(find(field, "contains", "5*").is_empty());
+        }
+        assert_eq!(find("from", "contains", r"\"), ["backslash"]);
+        assert_eq!(find("to", "contains", r"\"), ["to-back"]);
+        // `matches` is GLOB on purpose: here `*` is the user's wildcard.
+        assert_eq!(find("from", "matches", "50*off*'").len(), 2);
+    }
+
+    #[test]
+    fn fts_values_cannot_change_the_query() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        for subject in ["foo bar", "fo", "alpha or beta", "alpha", "50%_off*'"] {
+            arrive(
+                &conn,
+                mb,
+                &Msg {
+                    subject,
+                    ..Msg::default()
+                },
+            );
+        }
+        let find =
+            |v: &str| list_rules(&conn, &[rule("subject", "contains", s(v))], MatchMode::All);
+        // No prefix operator: `fo*` is the word `fo`, not `foo`.
+        assert_eq!(find("fo*"), ["fo"]);
+        // `OR` inside a value is a word, so it is not an alternative.
+        assert_eq!(find("alpha OR beta"), ["alpha or beta"]);
+        // Quote, paren, colon and minus are all just separators.
+        for hostile in [
+            "\"",
+            "a\" OR \"b",
+            "(",
+            ")",
+            "subject:",
+            "-x",
+            "NEAR(",
+            "^a",
+        ] {
+            find(hostile);
+        }
+        // A value with no indexable character matches nothing, without an error.
+        assert!(find("%").is_empty());
+        assert_eq!(find("50%_off*'"), ["50%_off*'"]);
+    }
+
+    #[test]
+    fn negate_and_match_mode_combine_with_the_right_precedence() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        // (from, subject): A alice/invoice, B bob/invoice, C alice/hello,
+        // D bob/hello, E carol/other.
+        for (label, addr, subject_word) in [
+            ("A", "alice@example.com", "invoice"),
+            ("B", "bob@example.com", "invoice"),
+            ("C", "alice@example.com", "hello"),
+            ("D", "bob@example.com", "hello"),
+            ("E", "carol@example.com", "other"),
+        ] {
+            let subject: &'static str = Box::leak(format!("{label} {subject_word}").into());
+            arrive(
+                &conn,
+                mb,
+                &Msg {
+                    subject,
+                    from_addr: addr,
+                    ..Msg::default()
+                },
+            );
+        }
+        let alice = rule("from", "is", s("alice@example.com"));
+        let invoice = rule("subject", "contains", s("invoice"));
+        let letters = |rules: &[Rule], mode| -> String {
+            list_rules(&conn, rules, mode)
+                .iter()
+                .map(|s| s.chars().next().unwrap())
+                .collect()
+        };
+        assert_eq!(
+            letters(&[alice.clone(), invoice.clone()], MatchMode::All),
+            "A"
+        );
+        assert_eq!(
+            letters(&[alice.clone(), invoice.clone()], MatchMode::Any),
+            "ABC"
+        );
+        // NOT (alice OR invoice): both negated under `all`.
+        let both_not = [not(alice.clone()), not(invoice.clone())];
+        assert_eq!(letters(&both_not, MatchMode::All), "DE");
+        // (NOT alice) OR (NOT invoice): the same rules under `any`.
+        assert_eq!(letters(&both_not, MatchMode::Any), "BCDE");
+        // Negating one rule only: alice, but not an invoice.
+        assert_eq!(
+            letters(&[alice.clone(), not(invoice.clone())], MatchMode::All),
+            "C"
+        );
+        // A negated list is NOT (a OR b).
+        let hello_or_other = rule(
+            "subject",
+            "contains_any",
+            serde_json::json!(["hello", "other"]),
+        );
+        assert_eq!(letters(&[not(hello_or_other)], MatchMode::All), "AB");
+    }
+
+    #[test]
+    fn a_negated_rule_means_no_message_of_the_thread_matches() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        let (_, mixed) = arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "mixed",
+                from_addr: "alice@example.com",
+                ..Msg::default()
+            },
+        );
+        let second = Msg {
+            subject: "mixed",
+            from_addr: "bob@example.com",
+            ..Msg::default()
+        };
+        // A reply from bob in the same thread.
+        insert_message(
+            &conn,
+            &NewMessage {
+                mailbox_id: mb,
+                thread_id: mixed,
+                object_id: None,
+                direction: "inbound",
+                message_id_hdr: Some("<reply@t>"),
+                in_reply_to: None,
+                subject: "mixed",
+                subject_key: "mixed",
+                from_name: None,
+                from_addr: second.from_addr,
+                reply_to_addr: None,
+                to_json: "[]",
+                cc_json: "[]",
+                bcc_json: "[]",
+                date_utc: second.date + 10,
+                received_at: second.date + 10,
+                snippet: "",
+                body_text: Some(""),
+                body_html: None,
+                has_attachments: false,
+                size_bytes: 1,
+                spf: None,
+                dkim: None,
+                dmarc: None,
+                headers_json: "[]",
+            },
+        )
+        .unwrap();
+        let r = rule("from", "is", s("alice@example.com"));
+        assert_eq!(
+            list_rules(&conn, std::slice::from_ref(&r), MatchMode::All),
+            ["mixed"]
+        );
+        assert!(list_rules(&conn, &[not(r)], MatchMode::All).is_empty());
+        // The other sender is also "in" the thread.
+        let bob = rule("from", "is", s("bob@example.com"));
+        assert_eq!(list_rules(&conn, &[bob], MatchMode::All), ["mixed"]);
+    }
+
+    #[test]
+    fn a_gone_message_cannot_make_a_thread_match() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        let (msg, thread) = arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "ghost",
+                from_addr: "alice@example.com",
+                body: "zebra",
+                ..Msg::default()
+            },
+        );
+        let rules = [rule("from", "is", s("alice@example.com"))];
+        let by_body = [rule("body", "contains", s("zebra"))];
+        assert_eq!(list_rules(&conn, &rules, MatchMode::All), ["ghost"]);
+        conn.execute("UPDATE mail_message SET state='gone' WHERE id=?1", [msg])
+            .unwrap();
+        // Compare on the compiled condition, not the listing, which would hide
+        // the thread anyway.
+        for r in [&rules, &by_body] {
+            let c = compile_rules(r, MatchMode::All, 0).unwrap().unwrap();
+            let mut p = vec![rusqlite::types::Value::Integer(thread)];
+            p.extend(c.params);
+            let hit: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS (SELECT 1 FROM mail_thread t
+                         JOIN mail_mailbox b ON b.id = t.mailbox_id
+                         JOIN mail_account a ON a.id = t.account_id
+                         WHERE t.id = ? AND {})",
+                        c.sql
+                    ),
+                    rusqlite::params_from_iter(p),
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!hit);
+        }
+    }
+
+    #[test]
+    fn address_scope_flag_and_date_rules_select_the_right_threads() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        seed_boxes(&conn, &[("o@example.com", "o/"), ("p@other.org", "p/")]);
+        let ids: Vec<i64> = ["o@example.com", "p@other.org"]
+            .iter()
+            .map(|a| {
+                conn.query_row("SELECT id FROM mail_mailbox WHERE address = ?1", [a], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+            })
+            .collect();
+        let now = now_millis() / 1000;
+        let day = 86_400;
+        let to_ann = r#"[{"name":"Ann","addr":"ann@x.com"}]"#;
+        let cc_cy = r#"[{"name":"","addr":"cy@x.com"}]"#;
+        arrive(
+            &conn,
+            ids[0],
+            &Msg {
+                subject: "recent",
+                to: to_ann,
+                cc: cc_cy,
+                date: now - 2 * day,
+                ..Msg::default()
+            },
+        );
+        let (_, old) = arrive(
+            &conn,
+            ids[1],
+            &Msg {
+                subject: "old",
+                date: 1_704_067_200,
+                ..Msg::default()
+            },
+        );
+        conn.execute("UPDATE mail_thread SET is_starred = 1 WHERE id = ?1", [old])
+            .unwrap();
+        let find = |r: Rule| list_rules(&conn, &[r], MatchMode::All);
+        assert_eq!(find(rule("to", "is", s("ann@x.com"))), ["recent"]);
+        assert_eq!(find(rule("to", "contains", s("ann"))), ["recent"]);
+        assert!(find(rule("to", "is", s("cy@x.com"))).is_empty());
+        assert_eq!(find(rule("cc", "is", s("cy@x.com"))), ["recent"]);
+        assert_eq!(find(rule("recipient", "is", s("cy@x.com"))), ["recent"]);
+        assert_eq!(find(rule("recipient", "is", s("ann@x.com"))), ["recent"]);
+        assert_eq!(find(rule("mailbox", "is", s(&ids[1].to_string()))), ["old"]);
+        assert_eq!(find(rule("mailbox", "is", s("O@example.com"))), ["recent"]);
+        assert_eq!(find(rule("domain", "is", s("@Other.org"))), ["old"]);
+        assert_eq!(
+            find(rule(
+                "domain",
+                "contains_any",
+                serde_json::json!(["other.org", "example.com"])
+            ))
+            .len(),
+            2
+        );
+        assert_eq!(find(rule("account", "is", s("alpha MAIL"))).len(), 2);
+        assert_eq!(find(rule("is_starred", "true", s(""))), ["old"]);
+        assert_eq!(find(rule("is_unread", "true", s(""))).len(), 2);
+        assert!(find(rule("has_attachment", "true", s(""))).is_empty());
+        assert_eq!(
+            find(rule("date", "within_days", serde_json::json!(7))),
+            ["recent"]
+        );
+        // `after` includes its own midnight and `before` excludes it.
+        assert_eq!(find(rule("date", "after", s("2024-01-01"))).len(), 2);
+        assert!(find(rule("date", "before", s("2024-01-01"))).is_empty());
+        assert_eq!(find(rule("date", "before", s("2024-01-02"))), ["old"]);
+        assert_eq!(find(rule("date", "after", s("1704067201"))), ["recent"]);
+        assert!(compile_rules(&[rule("date", "after", s("soon"))], MatchMode::All, 0).is_err());
+    }
+
+    #[test]
+    fn diacritic_searches_match_in_either_spelling() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "Đơn hàng đã được giao",
+                body: "Hàng đến nơi",
+                ..Msg::default()
+            },
+        );
+        let find = |field: &str, v: &str| {
+            list_rules(&conn, &[rule(field, "contains", s(v))], MatchMode::All).len()
+        };
+        for word in ["Đơn", "đơn", "don", "DON", "được", "duoc", "Đơn hàng"] {
+            assert_eq!(find("subject", word), 1, "subject {word}");
+        }
+        for word in ["đến", "den", "Đến", "hang"] {
+            assert_eq!(find("body", word), 1, "body {word}");
+        }
+        assert_eq!(find("subject", "dơn"), 1);
+        assert_eq!(find("subject", "dan"), 0);
+    }
+
+    #[test]
+    fn a_new_folder_collects_stored_mail_and_later_arrivals() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        let billing = |subject| Msg {
+            subject,
+            from_addr: "pay@billing.test",
+            ..Msg::default()
+        };
+        arrive(&conn, mb, &billing("stored invoice"));
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "chat",
+                ..Msg::default()
+            },
+        );
+        let f = upsert_folder(
+            &conn,
+            &folder("Billing"),
+            &[rule("from", "ends_with", s("@billing.test"))],
+        )
+        .unwrap();
+        assert_eq!(members(&conn, f.id), ["stored invoice"]);
+        assert_eq!((f.thread_count, f.unread_count), (1, 1));
+
+        // Mail that arrives afterwards is filed on arrival.
+        arrive(&conn, mb, &billing("later invoice"));
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "chat 2",
+                ..Msg::default()
+            },
+        );
+        assert_eq!(members(&conn, f.id), ["later invoice", "stored invoice"]);
+        assert_eq!(
+            folder_listing(&conn, f.id),
+            ["later invoice", "stored invoice"]
+        );
+        let listed = list_folders(&conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].thread_count, 2);
+        assert_eq!(listed[0].rules.len(), 1);
+    }
+
+    #[test]
+    fn editing_a_rule_rematerialises_the_members() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        for (subject, addr) in [("from ann", "ann@x.com"), ("from bob", "bob@x.com")] {
+            arrive(
+                &conn,
+                mb,
+                &Msg {
+                    subject,
+                    from_addr: addr,
+                    ..Msg::default()
+                },
+            );
+        }
+        let f = upsert_folder(
+            &conn,
+            &folder("People"),
+            &[rule("from", "is", s("ann@x.com"))],
+        )
+        .unwrap();
+        assert_eq!(members(&conn, f.id), ["from ann"]);
+        let mut edit = folder("People");
+        edit.id = Some(f.id);
+        let f2 = upsert_folder(&conn, &edit, &[rule("from", "is", s("bob@x.com"))]).unwrap();
+        assert_eq!(f2.id, f.id);
+        assert_eq!(members(&conn, f.id), ["from bob"]);
+        assert_eq!(f2.rules.len(), 1);
+
+        // A rejected edit changes neither rules nor members.
+        let bad = upsert_folder(&conn, &edit, &[rule("from", "true", s(""))]);
+        assert!(bad.is_err());
+        assert_eq!(members(&conn, f.id), ["from bob"]);
+        assert_eq!(
+            list_folders(&conn).unwrap()[0].rules[0].value,
+            s("bob@x.com")
+        );
+        // Switching to `any` with a second rule widens it.
+        edit.match_mode = MatchMode::Any;
+        upsert_folder(
+            &conn,
+            &edit,
+            &[
+                rule("from", "is", s("bob@x.com")),
+                rule("from", "is", s("ann@x.com")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(members(&conn, f.id), ["from ann", "from bob"]);
+    }
+
+    #[test]
+    fn contains_any_survives_storage_as_an_array() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "tax form",
+                ..Msg::default()
+            },
+        );
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "receipt",
+                ..Msg::default()
+            },
+        );
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "lunch",
+                ..Msg::default()
+            },
+        );
+        let f = upsert_folder(
+            &conn,
+            &folder("Money"),
+            &[rule(
+                "subject",
+                "contains_any",
+                serde_json::json!(["tax", "receipt"]),
+            )],
+        )
+        .unwrap();
+        assert_eq!(f.rules[0].value, serde_json::json!(["tax", "receipt"]));
+        assert_eq!(members(&conn, f.id), ["receipt", "tax form"]);
+    }
+
+    #[test]
+    fn folder_validation_and_delete() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        let (msg, _) = arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "keep",
+                ..Msg::default()
+            },
+        );
+        let any = [rule("from", "contains", s("example"))];
+        assert!(upsert_folder(&conn, &folder("  "), &any).is_err());
+        assert!(upsert_folder(&conn, &folder("Empty"), &[]).is_err());
+        let f = upsert_folder(&conn, &folder("Inbox2"), &any).unwrap();
+        let clash = upsert_folder(&conn, &folder("inbox2"), &any).unwrap_err();
+        assert!(clash.to_string().contains("Inbox2"), "{clash}");
+        let second = upsert_folder(&conn, &folder("Other"), &any).unwrap();
+        assert_eq!(second.sort_order, f.sort_order + 1);
+        delete_folder(&conn, f.id).unwrap();
+        let left = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            left(&format!(
+                "SELECT COUNT(*) FROM mail_folder_rule WHERE folder_id={}",
+                f.id
+            )),
+            0
+        );
+        assert_eq!(
+            left(&format!(
+                "SELECT COUNT(*) FROM mail_folder_member WHERE folder_id={}",
+                f.id
+            )),
+            0
+        );
+        // The mail itself is untouched.
+        assert_eq!(
+            left(&format!("SELECT COUNT(*) FROM mail_message WHERE id={msg}")),
+            1
+        );
+        assert_eq!(members(&conn, second.id), ["keep"]);
+    }
+
+    #[test]
+    fn membership_never_brings_back_a_hidden_thread() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        let mut threads = Vec::new();
+        for subject in ["shown", "archived", "gone"] {
+            threads.push(arrive(
+                &conn,
+                mb,
+                &Msg {
+                    subject,
+                    ..Msg::default()
+                },
+            ));
+        }
+        let f = upsert_folder(
+            &conn,
+            &folder("All"),
+            &[rule("from", "contains", s("example"))],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mail_message SET state='archived' WHERE id=?1",
+            [threads[1].0],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mail_thread SET state='archived' WHERE id=?1",
+            [threads[1].1],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mail_message SET state='gone' WHERE id=?1",
+            [threads[2].0],
+        )
+        .unwrap();
+        // A re-evaluation (a sync touching the thread) must not change that.
+        for (_, t) in &threads {
+            reevaluate_thread(&conn, *t).unwrap();
+        }
+        assert_eq!(folder_listing(&conn, f.id), ["shown"]);
+        assert_eq!(list_folders(&conn).unwrap()[0].thread_count, 1);
+    }
+
+    #[test]
+    fn a_folder_that_hides_from_the_mailbox_takes_threads_out_of_mailbox_views() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "promo",
+                from_addr: "ads@spam.test",
+                ..Msg::default()
+            },
+        );
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "real",
+                ..Msg::default()
+            },
+        );
+        let mut input = folder("Promos");
+        input.hide_from_mailbox = true;
+        let f =
+            upsert_folder(&conn, &input, &[rule("from", "ends_with", s("@spam.test"))]).unwrap();
+        let listed = |scope| {
+            let mut v: Vec<String> = list_threads(
+                &conn,
+                &ThreadQuery {
+                    scope,
+                    cursor: None,
+                    limit: None,
+                },
+            )
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|t| t.subject)
+            .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(listed(ThreadScope::All), ["real"]);
+        assert_eq!(listed(ThreadScope::Mailbox { mailbox_id: mb }), ["real"]);
+        assert_eq!(unread_by_mailbox(&conn).unwrap()[&mb], 1);
+        assert_eq!(listed(ThreadScope::Folder { folder_id: f.id }), ["promo"]);
+        // Searching still finds it: hiding is for the mailbox views only.
+        assert_eq!(
+            list_rules(
+                &conn,
+                &[rule("subject", "contains", s("promo"))],
+                MatchMode::All
+            ),
+            ["promo"]
+        );
+        // Deleting the folder returns the thread to the mailbox.
+        delete_folder(&conn, f.id).unwrap();
+        assert_eq!(listed(ThreadScope::All), ["promo", "real"]);
+    }
+
+    #[test]
+    fn flag_rules_follow_mark_read_and_star() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        let (_, t) = arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "flagged",
+                ..Msg::default()
+            },
+        );
+        let unread = upsert_folder(
+            &conn,
+            &folder("Unread"),
+            &[rule("is_unread", "true", s(""))],
+        )
+        .unwrap();
+        let starred = upsert_folder(
+            &conn,
+            &folder("Starred"),
+            &[rule("is_starred", "true", s(""))],
+        )
+        .unwrap();
+        assert_eq!(members(&conn, unread.id), ["flagged"]);
+        assert!(members(&conn, starred.id).is_empty());
+        set_threads_read(&conn, &[t], true).unwrap();
+        set_threads_starred(&conn, &[t], true).unwrap();
+        assert!(members(&conn, unread.id).is_empty());
+        assert_eq!(members(&conn, starred.id), ["flagged"]);
+        set_threads_read(&conn, &[t], false).unwrap();
+        assert_eq!(members(&conn, unread.id), ["flagged"]);
+    }
+
+    #[test]
+    fn preview_count_equals_the_rows_the_listing_returns() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        let mut hidden = Vec::new();
+        for i in 0..7 {
+            let subject: &'static str = Box::leak(format!("invoice {i}").into());
+            let (m, t) = arrive(
+                &conn,
+                mb,
+                &Msg {
+                    subject,
+                    date: 1_700_000_000 + i / 2,
+                    ..Msg::default()
+                },
+            );
+            hidden.push((m, t));
+        }
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "other",
+                ..Msg::default()
+            },
+        );
+        // Two matches the listing must not show.
+        conn.execute(
+            "UPDATE mail_message SET state='gone' WHERE id=?1",
+            [hidden[0].0],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mail_message SET state='archived' WHERE id=?1",
+            [hidden[1].0],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mail_thread SET state='archived' WHERE id=?1",
+            [hidden[1].1],
+        )
+        .unwrap();
+        for (rules, mode) in [
+            (
+                vec![rule("subject", "contains", s("invoice"))],
+                MatchMode::All,
+            ),
+            (
+                vec![not(rule("subject", "contains", s("invoice")))],
+                MatchMode::All,
+            ),
+            (
+                vec![
+                    rule("subject", "contains", s("other")),
+                    rule("subject", "contains", s("invoice")),
+                ],
+                MatchMode::Any,
+            ),
+            (vec![], MatchMode::All),
+        ] {
+            let previewed = preview_rules(&conn, &rules, mode).unwrap().count;
+            // Walk every page, two rows at a time.
+            let mut walked = 0;
+            let mut cursor = None;
+            loop {
+                let page = list_threads(
+                    &conn,
+                    &ThreadQuery {
+                        scope: ThreadScope::Rules {
+                            rules: rules.clone(),
+                            match_mode: mode,
+                        },
+                        cursor,
+                        limit: Some(2),
+                    },
+                )
+                .unwrap();
+                walked += page.rows.len() as i64;
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(previewed, walked, "{rules:?}");
+        }
+        let invoices = preview_rules(
+            &conn,
+            &[rule("subject", "contains", s("invoice"))],
+            MatchMode::All,
+        )
+        .unwrap();
+        assert_eq!(invoices.count, 5);
+    }
+
+    #[test]
+    fn rule_json_from_the_webview_deserialises() {
+        let rules: Vec<Rule> = serde_json::from_str(
+            r#"[{"field":"from","op":"contains","value":"x"},
+                {"field":"subject","op":"contains_any","value":["a","b"],"negate":true},
+                {"field":"is_unread","op":"true"}]"#,
+        )
+        .unwrap();
+        assert!(!rules[0].negate && rules[1].negate);
+        let scope: ThreadScope =
+            serde_json::from_str(r#"{"kind":"rules","rules":[{"field":"is_unread","op":"true"}]}"#)
+                .unwrap();
+        assert!(matches!(
+            scope,
+            ThreadScope::Rules {
+                match_mode: MatchMode::All,
+                ..
+            }
+        ));
+        let scope: ThreadScope = serde_json::from_str(r#"{"kind":"folder","folderId":4}"#).unwrap();
+        assert!(matches!(scope, ThreadScope::Folder { folder_id: 4 }));
     }
 }

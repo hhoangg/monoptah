@@ -548,7 +548,7 @@ fn ingest_one(
     };
     let existing = mail_store::message_for_object(conn, item.object_id)?;
     match existing {
-        Some((message_id, _)) if item.reparse => {
+        Some((message_id, old_thread)) if item.reparse => {
             let fallback = item.s3_modified.unwrap_or_else(|| now_millis() / 1000);
             let replaced =
                 mail_thread::replace_message(conn, mailbox.id, message_id, &mail, fallback)?;
@@ -564,6 +564,11 @@ fn ingest_one(
                 )?;
                 counts.failed += 1;
                 return Ok(());
+            }
+            // The message may have moved threads, and both ends changed.
+            mail_store::reevaluate_thread(conn, replaced.thread_id)?;
+            if old_thread != replaced.thread_id {
+                mail_store::reevaluate_thread(conn, old_thread)?;
             }
             counts.reparsed += 1;
         }
@@ -585,6 +590,8 @@ fn ingest_one(
                 // A new message surfaces its thread again. This is not the
                 // re-listed-key case, which never un-archives (spec section 10).
                 mail_store::reactivate_thread(conn, ingested.thread_id)?;
+                // Same transaction as the insert, so a folder never lags the mail.
+                mail_store::reevaluate_thread(conn, ingested.thread_id)?;
                 counts.inserted += 1;
             }
         }
@@ -1534,5 +1541,52 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(ids(c1), vec![a, b]);
         assert_eq!(ids(c3), vec![c]);
+    }
+
+    fn folder_members(f: &Fixture, folder_id: i64) -> i64 {
+        f.scalar(&format!(
+            "SELECT COUNT(*) FROM mail_folder_member WHERE folder_id = {folder_id}"
+        ))
+    }
+
+    #[test]
+    fn a_synced_message_is_filed_into_a_matching_folder_and_follows_a_reparse() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        let rule = |value: &str| mail_store::Rule {
+            field: "subject".into(),
+            op: "contains".into(),
+            value: serde_json::Value::String(value.into()),
+            negate: false,
+        };
+        let folder = {
+            let conn = f.store.lock_conn().unwrap();
+            mail_store::upsert_folder(
+                &conn,
+                &serde_json::from_str(r#"{"name":"Invoices"}"#).unwrap(),
+                &[rule("invoice")],
+            )
+            .unwrap()
+            .id
+        };
+        s3.put("owner/1", "e1", &mime("m1", "Your invoice", "pay"));
+        s3.put("owner/2", "e2", &mime("m2", "Lunch", "noon"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(folder_members(&f, folder), 1);
+
+        // Mail arriving in a later sync is filed too.
+        s3.put("owner/3", "e3", &mime("m3", "Second invoice", "pay"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(folder_members(&f, folder), 2);
+
+        // A re-parse that changes the subject takes the thread out again.
+        s3.put("owner/1", "e1b", &mime("m1", "Never mind", "pay"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(folder_members(&f, folder), 1);
+
+        // And one that now matches joins it.
+        s3.put("owner/2", "e2b", &mime("m2", "Lunch invoice", "noon"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(folder_members(&f, folder), 2);
     }
 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::aws_s3::{S3Api, S3Client, S3ErrorKind};
 use crate::aws_ses::{SesApi, SesClient, SesErrorKind};
@@ -1342,6 +1342,40 @@ pub fn mail_threads(
 }
 
 #[tauri::command(async)]
+pub fn mail_folders(store: State<'_, SessionStore>) -> Result<Vec<mail_store::FolderRow>, String> {
+    let conn = store.lock_conn()?;
+    mail_store::list_folders(&conn).map_err(db)
+}
+
+/// Saves the folder and re-materialises its members from all stored mail.
+#[tauri::command(async)]
+pub fn mail_folder_upsert(
+    store: State<'_, SessionStore>,
+    folder: mail_store::FolderInput,
+    rules: Vec<mail_store::Rule>,
+) -> Result<mail_store::FolderRow, String> {
+    let conn = store.lock_conn()?;
+    mail_store::upsert_folder(&conn, &folder, &rules).map_err(db)
+}
+
+#[tauri::command(async)]
+pub fn mail_folder_delete(store: State<'_, SessionStore>, id: i64) -> Result<(), String> {
+    let conn = store.lock_conn()?;
+    mail_store::delete_folder(&conn, id).map_err(db)
+}
+
+/// The live count in the folder editor, from the same query `mail_threads` runs.
+#[tauri::command(async)]
+pub fn mail_folder_preview(
+    store: State<'_, SessionStore>,
+    rules: Vec<mail_store::Rule>,
+    match_mode: Option<mail_store::MatchMode>,
+) -> Result<mail_store::PreviewCount, String> {
+    let conn = store.lock_conn()?;
+    mail_store::preview_rules(&conn, &rules, match_mode.unwrap_or_default()).map_err(db)
+}
+
+#[tauri::command(async)]
 pub fn mail_thread(store: State<'_, SessionStore>, thread_id: i64) -> Result<ThreadDetail, String> {
     thread_detail(&store, thread_id)
 }
@@ -1356,22 +1390,32 @@ pub async fn mail_message_raw(app: AppHandle, message_id: i64) -> Result<String,
 
 #[tauri::command(async)]
 pub fn mail_mark(
+    app: AppHandle,
     store: State<'_, SessionStore>,
     thread_ids: Vec<i64>,
     read: bool,
 ) -> Result<(), String> {
     let conn = store.lock_conn()?;
-    mail_store::set_threads_read(&conn, &thread_ids, read).map_err(db)
+    mail_store::set_threads_read(&conn, &thread_ids, read).map_err(db)?;
+    drop(conn);
+    // Here rather than in each caller, so a bulk action cannot forget it.
+    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    Ok(())
 }
 
 #[tauri::command(async)]
 pub fn mail_star(
+    app: AppHandle,
     store: State<'_, SessionStore>,
     thread_ids: Vec<i64>,
     starred: bool,
 ) -> Result<(), String> {
     let conn = store.lock_conn()?;
-    mail_store::set_threads_starred(&conn, &thread_ids, starred).map_err(db)
+    mail_store::set_threads_starred(&conn, &thread_ids, starred).map_err(db)?;
+    drop(conn);
+    // Here rather than in each caller, so a bulk action cannot forget it.
+    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    Ok(())
 }
 
 /// Downloads the attachment if needed and returns where it is. Opening it is
