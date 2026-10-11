@@ -612,7 +612,11 @@ export function SourceForm({
         />
       </FieldLabel>
       <FieldLabel text="SES region">
-        <RegionSelect label="SES region" value={sesRegion} onChange={setSesRegion} />
+        <RegionSelect
+          label="SES region"
+          value={sesRegion}
+          onChange={setSesRegion}
+        />
       </FieldLabel>
       <FieldLabel text="Bucket">
         <input
@@ -623,7 +627,11 @@ export function SourceForm({
         />
       </FieldLabel>
       <FieldLabel text="S3 region">
-        <RegionSelect label="S3 region" value={s3Region} onChange={setS3Region} />
+        <RegionSelect
+          label="S3 region"
+          value={s3Region}
+          onChange={setS3Region}
+        />
       </FieldLabel>
       <FieldLabel text="S3 credential">
         <SearchableSelect
