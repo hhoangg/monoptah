@@ -263,5 +263,7 @@ it("offers the Archive view without a badge, and All mail is not selected in it"
   );
   const current = [...container.querySelectorAll("[aria-current='true']")];
   expect(current).toHaveLength(1);
-  expect(current[0].textContent?.startsWith("Archive")).toBe(true);
+  // Exact, not startsWith: a badge here must fail this assertion too, so the
+  // badge rule keeps the two points of coverage it had.
+  expect(current[0].textContent).toBe("Archive");
 });

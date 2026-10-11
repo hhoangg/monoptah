@@ -312,9 +312,33 @@ it("says so when the restore moved nothing, and the message survives the reload"
   expect(notice).not.toBeNull();
   expect(notice!.textContent).toContain("nothing to move");
   // The change event reloads the thread; the notice must outlive that.
-  const reload = vi
+  // The real constant, not the mock's copy of it: if they drift apart, the
+  // component subscribes to a name nothing emits and this fails here.
+  const { MAIL_MESSAGES_CHANGED_EVENT: event } =
+    await vi.importActual<typeof import("../model/mail")>("../model/mail");
+  const subscribed = vi
     .mocked(listen)
-    .mock.calls.find(([name]) => name === "mail://messages-changed")![1];
+    .mock.calls.find(([name]) => name === event);
+  expect(subscribed).toBeDefined();
+  const reload = subscribed![1];
   await act(async () => reload({} as never));
   expect(container.querySelector("[role='status']")).not.toBeNull();
+});
+
+it("clears the nothing-to-move notice when a later restore works", async () => {
+  vi.mocked(mailUnarchive).mockResolvedValueOnce(0);
+  vi.mocked(mailThread).mockResolvedValue(
+    detail([msg(1, { state: "archived" })], true),
+  );
+  await render();
+  const first = headerButton("Move to inbox");
+  expect(first).toBeDefined();
+  await act(async () => first!.click());
+  expect(container.querySelector("[role='status']")).not.toBeNull();
+  // Another window re-archived it, so the button is offered again and this
+  // time the restore moves something. The stale refusal must not outlive it.
+  const again = headerButton("Move to inbox");
+  expect(again).toBeDefined();
+  await act(async () => again!.click());
+  expect(container.querySelector("[role='status']")).toBeNull();
 });
