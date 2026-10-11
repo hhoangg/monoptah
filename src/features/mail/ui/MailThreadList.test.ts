@@ -431,6 +431,16 @@ describe("search box and chips", () => {
     });
   });
 
+  it("says no filter is applied when the first token is already invalid", async () => {
+    await render(all, twoDomains);
+    await typeInto(box(), "is:unre");
+    await pause();
+    expect(calls()).toBe(1);
+    expect(container.querySelector("[role='status']")?.textContent).toContain(
+      "No filter is applied.",
+    );
+  });
+
   it("scopes a filter to the open mailbox and drops back when cleared", async () => {
     await render(oneBox, twoDomains);
     await typeInto(box(), "invoice ");

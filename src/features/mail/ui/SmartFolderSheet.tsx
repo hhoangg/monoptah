@@ -18,8 +18,12 @@ import {
 import {
   FIELD_LABELS,
   RULE_FIELDS,
+  MAX_LIST_VALUES,
+  MAX_RULES,
   SEARCH_DEBOUNCE_MS,
+  defaultOp,
   editorOps,
+  hasClockRelativeRule,
   isFlagField,
   opLabel,
   ruleProblem,
@@ -65,7 +69,7 @@ const INPUT =
 const LABEL = "text-[11px] font-medium text-content/50";
 
 const blankRule = (field: RuleField = "from"): Rule => {
-  const op = editorOps(field)[0]!;
+  const op = defaultOp(field);
   return {
     field,
     op,
@@ -97,11 +101,13 @@ function TokenInput({
   onChange: (values: string[]) => void;
   label: string;
 }) {
+  const full = values.length >= MAX_LIST_VALUES;
   const [draft, setDraft] = useState("");
   const commit = () => {
     const token = draft.trim();
     setDraft("");
-    if (token !== "" && !values.includes(token)) onChange([...values, token]);
+    if (token !== "" && !full && !values.includes(token))
+      onChange([...values, token]);
   };
   return (
     <div className="flex min-h-7 min-w-0 flex-wrap items-center gap-1 rounded-md border border-content/10 px-1.5 py-0.5 focus-within:border-accent/50">
@@ -124,7 +130,13 @@ function TokenInput({
       <input
         aria-label={label}
         value={draft}
-        placeholder={values.length === 0 ? "Type, then Enter" : ""}
+        placeholder={
+          full
+            ? `At most ${MAX_LIST_VALUES} values`
+            : values.length === 0
+              ? "Type, then Enter"
+              : ""
+        }
         onChange={(e) => setDraft(e.target.value)}
         onBlur={commit}
         onKeyDown={(e) => {
@@ -240,6 +252,9 @@ export function SmartFolderSheet({
 
   const rules = useMemo(() => rows.map((r) => wire(r.rule)), [rows]);
   const problems = rules.map(ruleProblem);
+  // A clock-relative folder never hides: its stored members go stale, and an
+  // aged-out thread would be in neither place.
+  const hideBlocked = hasClockRelativeRule(rules);
   const complete = rules.length > 0 && problems.every((p) => p === null);
 
   // The count is the same query the list runs, in the editor's current mode.
@@ -282,7 +297,7 @@ export function SmartFolderSheet({
   const changeField = (rule: Rule, field: RuleField): Rule => {
     if (field === rule.field) return rule;
     const ops = editorOps(field);
-    const op = ops.includes(rule.op) ? rule.op : ops[0]!;
+    const op = ops.includes(rule.op) ? rule.op : defaultOp(field);
     // A value for one kind of field means nothing on another (a date on a
     // sender), so only text-to-text keeps it.
     const keep =
@@ -323,7 +338,7 @@ export function SmartFolderSheet({
           color,
           sortOrder: folder?.sortOrder ?? null,
           matchMode,
-          hideFromMailbox: hide,
+          hideFromMailbox: hide && !hideBlocked,
           countUnread,
         },
         rules,
@@ -353,6 +368,7 @@ export function SmartFolderSheet({
       title={folder ? "Edit smart folder" : "New smart folder"}
       description="Mail that arrives later is filed automatically."
       size="md"
+      width="w-[min(760px,calc(100vw-24px))]"
       fitViewport
       onClose={onClose}
     >
@@ -502,6 +518,12 @@ export function SmartFolderSheet({
           })}
           <div>
             <SecondaryButton
+              disabled={rows.length >= MAX_RULES}
+              title={
+                rows.length >= MAX_RULES
+                  ? `A folder can have at most ${MAX_RULES} conditions`
+                  : undefined
+              }
               onClick={() =>
                 setRows((current) => [...current, ...keyed([blankRule()])])
               }
@@ -533,6 +555,16 @@ export function SmartFolderSheet({
               <div className="text-[12px] font-medium text-content">
                 Hide matches from All mail and mailboxes
               </div>
+              {hideBlocked ? (
+                <p
+                  id="hide-blocked-reason"
+                  className="mt-0.5 text-[11px] leading-relaxed text-content/60"
+                >
+                  Not available with a "within the last (days)" condition. Such
+                  a folder is judged by today's date, so its threads always stay
+                  in their mailbox as well.
+                </p>
+              ) : null}
               <p className="mt-0.5 text-[11px] leading-relaxed text-content/45">
                 On: matching threads leave All mail and their mailbox, and stop
                 counting as unread there. They appear only in this folder, and
@@ -541,8 +573,9 @@ export function SmartFolderSheet({
               </p>
             </div>
             <Toggle
-              label="Hide matches from mailboxes"
-              on={hide}
+              label="Hide matches from All mail and mailboxes"
+              on={hide && !hideBlocked}
+              disabled={hideBlocked}
               onChange={setHide}
             />
           </div>

@@ -298,7 +298,11 @@ export function useMailThreadList(base: ListBase | null) {
     setText: (text: string) => setDraft({ ...draft, text }),
     clearFilters: () => setDraft(EMPTY_DRAFT),
     /** Why the box's current text is not (fully) applied, or null. */
-    queryError: applied.errors[0] ?? null,
+    queryError: applied.errors[0]
+      ? filterRules.length > 0
+        ? applied.errors[0]
+        : `${applied.errors[0]} No filter is applied.`
+      : null,
     filtering: filterRules.length > 0,
     hasInput:
       draft.text.trim() !== "" ||

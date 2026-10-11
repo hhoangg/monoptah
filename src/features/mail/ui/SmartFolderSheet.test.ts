@@ -239,3 +239,69 @@ it("shows the server's reason when saving fails", async () => {
   expect(document.body.textContent).toContain("already exists");
   expect(onSaved).not.toHaveBeenCalled();
 });
+
+const toggle = () =>
+  document.body.querySelector<HTMLButtonElement>(
+    "[role='switch'][aria-label='Hide matches from All mail and mailboxes']",
+  )!;
+
+it("cannot hide matches for a clock-relative folder, and says why", async () => {
+  await open({
+    folder: savedFolder({
+      hideFromMailbox: true,
+      rules: [rule("date", "within_days", "7")],
+    }),
+  });
+  expect(toggle().disabled).toBe(true);
+  expect(toggle().getAttribute("aria-checked")).toBe("false");
+  expect(document.body.textContent).toContain("Not available with a");
+  // A stale flag from before the rule was added must not be saved.
+  await act(async () => button("Save folder").click());
+  expect(vi.mocked(mailFolderUpsert).mock.calls[0]![0].hideFromMailbox).toBe(
+    false,
+  );
+});
+
+it("still hides matches when no rule is clock-relative", async () => {
+  await open({ folder: savedFolder() });
+  expect(toggle().disabled).toBe(false);
+  expect(document.body.textContent).not.toContain("Not available with a");
+  await act(async () => toggle().click());
+  await act(async () => button("Save folder").click());
+  expect(vi.mocked(mailFolderUpsert).mock.calls[0]![0].hideFromMailbox).toBe(
+    true,
+  );
+});
+
+it("opens wide and centred: the width sits on the positioned wrapper", async () => {
+  await open({ folder: savedFolder() });
+  const wrapper =
+    document.body.querySelector("[role='dialog']")!.parentElement!;
+  expect(wrapper.className).toContain("760px");
+  expect(wrapper.className).not.toContain("560px");
+  expect(wrapper.className).toContain("-translate-x-1/2");
+});
+
+it("starts a new condition as contains, so typing a name matches", async () => {
+  await open({ folder: null, initial: null });
+  await typeInto(
+    document.getElementById("smart-folder-name") as HTMLInputElement,
+    "Bobs",
+  );
+  await typeInto(field("From value"), "bob");
+  await act(async () => button("Save folder").click());
+  expect(mailFolderUpsert).toHaveBeenCalledWith(expect.anything(), [
+    rule("from", "contains", "bob"),
+  ]);
+});
+
+it("stops adding conditions at the backend cap", async () => {
+  await open({
+    folder: savedFolder({
+      rules: Array.from({ length: 50 }, (_, i) =>
+        rule("from", "contains", `p${i}`),
+      ),
+    }),
+  });
+  expect(button("Add condition").disabled).toBe(true);
+});

@@ -2,7 +2,12 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  CLOCK_RELATIVE_OPS,
   FIELD_OPS,
+  MAX_LIST_VALUES,
+  MAX_RULES,
+  defaultOp,
+  hasClockRelativeRule,
   MIN_PREFIX_CHARS,
   RULE_FIELDS,
   chipRules,
@@ -285,7 +290,21 @@ describe("operator table", () => {
   }
 
   it("found the table", () => {
-    expect(Object.keys(rust).length).toBe(13);
+    expect(Object.keys(rust).length).toBeGreaterThan(0);
+  });
+
+  it("agrees on the clock-relative operators and the caps", () => {
+    const relative =
+      /const CLOCK_RELATIVE_OPS: &\[&str\] = &\[([^\]]*)\];/.exec(source)!;
+    expect([...relative[1]!.matchAll(/"(\w+)"/g)].map((m) => m[1])).toEqual([
+      ...CLOCK_RELATIVE_OPS,
+    ]);
+    expect(Number(/const MAX_RULES: usize = (\d+);/.exec(source)![1])).toBe(
+      MAX_RULES,
+    );
+    expect(
+      Number(/const MAX_LIST_VALUES: usize = (\d+);/.exec(source)![1]),
+    ).toBe(MAX_LIST_VALUES);
   });
 
   it("matches the backend field by field", () => {
@@ -295,5 +314,32 @@ describe("operator table", () => {
       );
     }
     expect(Object.keys(rust).sort()).toEqual([...RULE_FIELDS].sort());
+  });
+});
+
+describe("new conditions", () => {
+  it("start as contains where the field has it, so typing matches", () => {
+    for (const field of [
+      "from",
+      "to",
+      "cc",
+      "recipient",
+      "subject",
+      "body",
+      "domain",
+      "account",
+    ] as const) {
+      expect(defaultOp(field)).toBe("contains");
+    }
+    expect(defaultOp("mailbox")).toBe("is");
+    expect(defaultOp("date")).toBe("before");
+    expect(defaultOp("is_unread")).toBe("true");
+  });
+
+  it("spots a clock-relative rule", () => {
+    expect(hasClockRelativeRule([rule("date", "within_days", "7")])).toBe(true);
+    expect(hasClockRelativeRule([rule("date", "after", "2025-01-01")])).toBe(
+      false,
+    );
   });
 });

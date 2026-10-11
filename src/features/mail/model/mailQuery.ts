@@ -66,6 +66,28 @@ export const FIELD_OPS: Record<RuleField, readonly RuleOp[]> = {
   date: ["before", "after", "within_days"],
 };
 
+/**
+ * Operators whose answer depends on the clock. Mirrors `CLOCK_RELATIVE_OPS` in
+ * mail_store.rs (a test reads it): a folder with one never hides its threads
+ * from the mailbox views, so the "hide" option cannot apply to it.
+ */
+export const CLOCK_RELATIVE_OPS: readonly RuleOp[] = ["within_days"];
+export const hasClockRelativeRule = (rules: Rule[]) =>
+  rules.some((r) => CLOCK_RELATIVE_OPS.includes(r.op));
+
+/** Backend caps (`MAX_RULES`, `MAX_LIST_VALUES`), stopped at the control. */
+export const MAX_RULES = 50;
+export const MAX_LIST_VALUES = 100;
+
+/**
+ * `is` is an exact, case-insensitive match, so a fresh condition starts at
+ * `contains`: typing a name into `From is ...` would otherwise match nothing.
+ */
+export const defaultOp = (field: RuleField): RuleOp => {
+  const ops = editorOps(field);
+  return ops.includes("contains") ? "contains" : ops[0]!;
+};
+
 export const RULE_FIELDS = Object.keys(FIELD_OPS) as RuleField[];
 
 export const FIELD_LABELS: Record<RuleField, string> = {
