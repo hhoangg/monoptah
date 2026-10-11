@@ -5,6 +5,7 @@ import {
   FolderPlus,
   Internet,
   Inbox,
+  Mail,
   MoreHorizontal,
   Pin,
   PinOff,
@@ -110,6 +111,8 @@ type Props = {
   notesActive?: boolean;
   onOpenAutomations?: () => void;
   automationsActive?: boolean;
+  onOpenMail?: () => void;
+  mailActive?: boolean;
   onTogglePanel?: () => void;
   onSelectProject: (path: string) => void;
   onOpenProject: () => void;
@@ -148,7 +151,9 @@ export function ProjectRail({
   onOpenNotes,
   notesActive = false,
   onOpenAutomations,
+  onOpenMail,
   automationsActive = false,
+  mailActive = false,
   onTogglePanel,
   onSelectProject,
   onOpenProject,
@@ -335,6 +340,7 @@ export function ProjectRail({
     inboxActive ||
     notesActive ||
     automationsActive ||
+    mailActive ||
     !!monos?.activeId;
   const pinnedIds = sections.pinned.map((item) => item.path);
   const projectIds = groupedProjectSections.ungrouped.map((item) => item.path);
@@ -412,6 +418,15 @@ export function ProjectRail({
               active={automationsActive}
               ariaLabel="Automations"
             />
+            {onOpenMail ? (
+              <RailAction
+                label="Mail"
+                icon={Mail}
+                onClick={onOpenMail}
+                active={mailActive}
+                ariaLabel="Mail"
+              />
+            ) : null}
           </div>
 
           <div

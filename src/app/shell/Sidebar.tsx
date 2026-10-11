@@ -23,6 +23,7 @@ import {
   GitPullRequest,
   Inbox,
   ListFilter,
+  Mail,
   PanelLeft,
   Pin,
   Plus,
@@ -322,11 +323,13 @@ type Props = {
   onOpenInboxItem?: (item: LinkedWorkItem, sessionId: string) => void;
   onOpenNotes?: () => void;
   onOpenAutomations?: () => void;
+  onOpenMail?: () => void;
   onGoToFile?: () => void;
   searchActive?: boolean;
   inboxActive?: boolean;
   notesActive?: boolean;
   automationsActive?: boolean;
+  mailActive?: boolean;
   notesEnabled?: boolean;
   onToggleProjectRail?: () => void;
   projectRailOpen?: boolean;
@@ -418,11 +421,13 @@ function SidebarComponent({
   onOpenInboxItem,
   onOpenNotes,
   onOpenAutomations,
+  onOpenMail,
   onGoToFile,
   searchActive = false,
   inboxActive = false,
   notesActive = false,
   automationsActive = false,
+  mailActive = false,
   notesEnabled = true,
   onToggleProjectRail,
   projectRailOpen = true,
@@ -793,6 +798,7 @@ function SidebarComponent({
     inboxActive ||
     notesActive ||
     automationsActive ||
+    mailActive ||
     settingsOpen;
   // A remembered Mono sits underneath these views; select it only while visible.
   const railMonos = monos
@@ -1745,10 +1751,12 @@ function SidebarComponent({
               onOpenNotificationSettings={onOpenNotificationSettings}
               onOpenNotes={notesEnabled ? onOpenNotes : undefined}
               onOpenAutomations={onOpenAutomations}
+              onOpenMail={onOpenMail}
               searchActive={searchActive}
               inboxActive={inboxActive}
               notesActive={notesActive}
               automationsActive={automationsActive}
+              mailActive={mailActive}
               inboxUnseen={inboxUnseen}
             />
           ) : null}
@@ -2268,6 +2276,8 @@ function SidebarComponent({
           notesActive={notesActive}
           onOpenAutomations={onOpenAutomations}
           automationsActive={automationsActive}
+          onOpenMail={onOpenMail}
+          mailActive={mailActive}
           onOpenSettings={onOpenSettings}
           onTogglePanel={onToggleProjectRail}
           onLeaveActive={onGoBack}
@@ -2299,6 +2309,8 @@ function SidebarComponent({
           notesActive={notesActive}
           onOpenAutomations={onOpenAutomations}
           automationsActive={automationsActive}
+          onOpenMail={onOpenMail}
+          mailActive={mailActive}
           onTogglePanel={onToggleProjectRail}
           onSelectProject={onSelectProject}
           onOpenProject={onOpenProject}
@@ -2376,10 +2388,12 @@ function SidebarProjectPicker({
   onOpenNotificationSettings,
   onOpenNotes,
   onOpenAutomations,
+  onOpenMail,
   searchActive = false,
   inboxActive = false,
   notesActive = false,
   automationsActive = false,
+  mailActive = false,
   inboxUnseen = false,
 }: {
   cwd: string;
@@ -2394,10 +2408,12 @@ function SidebarProjectPicker({
   onOpenNotificationSettings?: (projectPath?: string) => void;
   onOpenNotes?: () => void;
   onOpenAutomations?: () => void;
+  onOpenMail?: () => void;
   searchActive?: boolean;
   inboxActive?: boolean;
   notesActive?: boolean;
   automationsActive?: boolean;
+  mailActive?: boolean;
   inboxUnseen?: boolean;
 }) {
   const [inboxMenu, setInboxMenu] = useState<{ x: number; y: number } | null>(
@@ -2472,6 +2488,11 @@ function SidebarProjectPicker({
             <Zap className="size-3.5" strokeWidth={1.75} />
           </IconButton>
         ) : null}
+        {onOpenMail ? (
+          <IconButton label="Mail" active={mailActive} onClick={onOpenMail}>
+            <Mail className="size-3.5" strokeWidth={1.75} />
+          </IconButton>
+        ) : null}
       </div>
       {inboxMenu ? (
         <InboxNotificationMenu
@@ -2510,7 +2531,9 @@ function CompactProjectRail({
   onOpenNotes,
   notesActive,
   onOpenAutomations,
+  onOpenMail,
   automationsActive,
+  mailActive,
   onOpenSettings,
   onTogglePanel,
   onLeaveActive,
@@ -2539,7 +2562,9 @@ function CompactProjectRail({
   onOpenNotes?: () => void;
   notesActive: boolean;
   onOpenAutomations?: () => void;
+  onOpenMail?: () => void;
   automationsActive: boolean;
+  mailActive: boolean;
   onOpenSettings?: () => void;
   onTogglePanel?: () => void;
   onLeaveActive?: () => void;
@@ -2581,6 +2606,7 @@ function CompactProjectRail({
     !inboxActive &&
     !notesActive &&
     !automationsActive &&
+    !mailActive &&
     !monoViewActive;
   const openWorkspaceTab = (nextTab: SidebarTab) => {
     if (!workspaceActive) onLeaveActive?.();
@@ -2713,6 +2739,14 @@ function CompactProjectRail({
           active={automationsActive}
           onClick={action(automationsActive, onOpenAutomations)}
         />
+        {onOpenMail ? (
+          <CompactRailAction
+            label="Mail"
+            icon={Mail}
+            active={mailActive}
+            onClick={action(mailActive, onOpenMail)}
+          />
+        ) : null}
       </div>
       <div className="min-h-2 flex-1" />
       <div className="flex w-full flex-col items-center gap-1 py-1.5">

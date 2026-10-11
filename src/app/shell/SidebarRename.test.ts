@@ -270,6 +270,7 @@ describe.each([false, true])("Mono rail selection (compact: %s)", (compact) => {
     ["Inbox", "inboxActive", "onOpenInbox"],
     ["Notes", "notesActive", "onOpenNotes"],
     ["Automations", "automationsActive", "onOpenAutomations"],
+    ["Mail", "mailActive", "onOpenMail"],
     ["Search", "searchActive", "onSearch"],
   ] as const)("selects only %s while it covers a Mono", async (label, active, open) => {
     const mono = createMono();
