@@ -1089,8 +1089,16 @@ mockup. There is no silent destructive default.
   `DeleteObjects` response) are reported and the corresponding local rows are
   kept.
 - `mail_attachment.local_path` files are removed on either path.
-- "Remember my choice for this session" is session-scoped only, never persisted.
-  A persisted "always hard delete" is a foot-gun that outlives the intent.
+- **There is no "remember my choice", not even session-scoped.** The earlier text
+  allowed a session cache; it is dropped. The control only ever exists to skip the
+  typed gate, and a destructive choice remembered for a session is still a
+  destructive choice made once and applied to mail the user has not looked at.
+  Nothing persists either.
+- **Archive must be reachable or the dialog must not promise it.** `LISTED` is
+  prepended to every scope's SQL and `ThreadScope` has no archived kind, so an
+  archived thread is currently invisible to every list, folder, chip and search —
+  the user can neither restore it nor select it to delete later. Until an Archive
+  view exists, the dialog says plainly that archived mail is not yet browsable.
 
 ---
 
