@@ -6,6 +6,9 @@ import {
   ChevronRight,
   Loader,
   Paperclip,
+  Reply,
+  ReplyAll,
+  Send,
   Star,
 } from "../../../shared/ui/icons";
 import { Modal } from "../../../shared/ui/Modal";
@@ -18,12 +21,14 @@ import {
   mailStar,
   mailThread,
 } from "../model/mail";
+import type { ComposeRequest } from "../model/mailReply";
 import type {
   AttachmentRow,
   MailAddress,
   MessageRow,
   ThreadDetail,
 } from "../model/mailTypes";
+import { preloadMailEditor } from "./ComposeSheet";
 import { DeleteMailDialog } from "./DeleteMailDialog";
 import { MailMessageBody, canTogglePlain } from "./MailMessageBody";
 import { formatMailDate } from "./MailThreadList";
@@ -288,7 +293,17 @@ function MessageCard({
   );
 }
 
-function ThreadBody({ threadId }: { threadId: number }) {
+type ComposeFromThread = (
+  request: Extract<ComposeRequest, { message: MessageRow }>,
+) => void;
+
+function ThreadBody({
+  threadId,
+  onCompose,
+}: {
+  threadId: number;
+  onCompose?: ComposeFromThread;
+}) {
   const [detail, setDetail] = useState<ThreadDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
@@ -366,7 +381,8 @@ function ThreadBody({ threadId }: { threadId: number }) {
   const messages = [...detail.messages].sort(
     (a, b) => a.dateUtc - b.dateUtc || a.id - b.id,
   );
-  const newestId = messages[messages.length - 1]?.id;
+  const newest = messages[messages.length - 1];
+  const newestId = newest?.id;
   const unread = messages.some((m) => !m.isRead);
   const { thread } = detail;
 
@@ -399,6 +415,27 @@ function ThreadBody({ threadId }: { threadId: number }) {
         >
           <Star className="size-4" />
         </button>
+        {onCompose && newest ? (
+          <>
+            {(
+              [
+                ["reply", "Reply", Reply],
+                ["reply_all", "Reply all", ReplyAll],
+                ["forward", "Forward", Send],
+              ] as const
+            ).map(([kind, label, Icon]) => (
+              <SecondaryButton
+                key={kind}
+                onPointerEnter={preloadMailEditor}
+                onFocus={preloadMailEditor}
+                onClick={() => onCompose({ kind, message: newest, thread })}
+              >
+                <Icon className="size-3" />
+                {label}
+              </SecondaryButton>
+            ))}
+          </>
+        ) : null}
         <SecondaryButton
           onClick={() => void run(() => mailMark([thread.id], unread))}
         >
@@ -461,7 +498,13 @@ function ThreadBody({ threadId }: { threadId: number }) {
  * section, so a layout change that remounts the list does not collapse the
  * messages the user opened.
  */
-export function MailThreadRead({ threadId }: { threadId: number | null }) {
+export function MailThreadRead({
+  threadId,
+  onCompose,
+}: {
+  threadId: number | null;
+  onCompose?: ComposeFromThread;
+}) {
   if (threadId === null) {
     return (
       <div className="flex flex-1 items-center justify-center text-[12px] text-content/40">
@@ -471,7 +514,7 @@ export function MailThreadRead({ threadId }: { threadId: number | null }) {
   }
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
-      <ThreadBody key={threadId} threadId={threadId} />
+      <ThreadBody key={threadId} threadId={threadId} onCompose={onCompose} />
     </div>
   );
 }

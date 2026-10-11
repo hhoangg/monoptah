@@ -1,5 +1,6 @@
-import { useState } from "react";
-import { Mail } from "../../../shared/ui/icons";
+import { useRef, useState } from "react";
+import { Mail, MessageSquarePlus } from "../../../shared/ui/icons";
+import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 import { useDragResize } from "../../../shared/hooks/useDragResize";
 import { IS_MAC } from "../../../platform/tauri/platform";
 import { OverlayNav } from "../../../app/shell/TitleBar";
@@ -13,9 +14,11 @@ import {
   useSelectedFolder,
   useSelectedMailbox,
 } from "../model/mailPrefs";
+import type { ComposeRequest } from "../model/mailReply";
 import type { FolderRow, MatchMode, Rule } from "../model/mailTypes";
 import { parseFolderId, useMailFolders } from "../model/useMailFolders";
 import { useMailStatus } from "../model/useMailStatus";
+import { ComposeSheet, preloadMailEditor } from "./ComposeSheet";
 import { MailFolderList, groupMailboxesByDomain } from "./MailFolderList";
 import {
   MailThreadList,
@@ -64,6 +67,13 @@ export function MailView({
   } = useMailFolders();
   const [threadId, setThreadId] = useState<number | null>(null);
   const [sheet, setSheet] = useState<Sheet | null>(null);
+  const [compose, setCompose] = useState<{
+    key: number;
+    request: ComposeRequest;
+  } | null>(null);
+  const composeSeq = useRef(0);
+  const openCompose = (request: ComposeRequest) =>
+    setCompose({ key: ++composeSeq.current, request });
   const mailboxes = status
     ? groupMailboxesByDomain(status.sources).flatMap((g) =>
         g.mailboxes.map((m) => m.mailbox),
@@ -140,6 +150,16 @@ export function MailView({
             strokeWidth={1.75}
           />
           <span className="min-w-0 truncate text-content">Mail</span>
+        </div>
+        <div className="shrink-0 pr-2">
+          <SecondaryButton
+            onPointerEnter={preloadMailEditor}
+            onFocus={preloadMailEditor}
+            onClick={() => openCompose({ kind: "new" })}
+          >
+            <MessageSquarePlus className="size-3" />
+            Compose
+          </SecondaryButton>
         </div>
         {IS_MAC ? null : <WindowControls />}
       </div>
@@ -226,11 +246,19 @@ export function MailView({
               data-mail-pane="reader"
               className="flex min-h-0 min-w-0 flex-1 flex-col"
             >
-              <MailThreadRead threadId={threadId} />
+              <MailThreadRead threadId={threadId} onCompose={openCompose} />
             </section>
           )}
         </div>
       </div>
+      {compose ? (
+        <ComposeSheet
+          // Remount per opening: its fields start from the request.
+          key={compose.key}
+          request={compose.request}
+          onClose={() => setCompose(null)}
+        />
+      ) : null}
       {sheet ? (
         <SmartFolderSheet
           // Remount per opening: its fields start from the folder or filters.
