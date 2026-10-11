@@ -26,7 +26,9 @@ export const SYNC_INTERVAL_DEFAULT_SECONDS = 3600;
 export const SYNC_INTERVAL_MIN_SECONDS = 60;
 export const LIST_WIDTH_DEFAULT = 340;
 
-const eventFor = (name: string) => `monocode:mail-${name}-change`;
+// Derived from the key so the two spellings cannot drift apart.
+const eventFor = (key: string) =>
+  `monocode:mail-${key.replace(/^monocode\.mail\./, "").toLowerCase()}-change`;
 
 function readRaw(key: string): string | null {
   try {
@@ -46,13 +48,12 @@ function writeRaw(key: string, value: string | null) {
 }
 
 function prefStore<T>(
-  name: string,
   key: string,
   fallback: T,
   parse: (raw: string) => T | undefined,
   serialize: (value: T) => string | null,
 ) {
-  const event = eventFor(name);
+  const event = eventFor(key);
   // Holds a value only while storage failed to keep it, so the control still
   // moves for this window when localStorage is unavailable.
   let unsaved: { value: T } | null = null;
@@ -92,18 +93,16 @@ function prefStore<T>(
       window.removeEventListener("storage", onStorage);
     };
   };
-  const use = () => useSyncExternalStore(subscribe, load, () => fallback);
-  return { load, save, subscribe, use, event };
+  const useValue = () => useSyncExternalStore(subscribe, load, () => fallback);
+  return { load, save, subscribe, useValue, event };
 }
 
 function enumPref<T extends string>(
-  name: string,
   key: string,
   values: readonly T[],
   fallback: T,
 ) {
   return prefStore<T>(
-    name,
     key,
     fallback,
     (raw) => values.find((value) => value === raw),
@@ -111,18 +110,16 @@ function enumPref<T extends string>(
   );
 }
 
-const nullableString = (name: string, key: string) =>
+const nullableString = (key: string) =>
   prefStore<string | null>(
-    name,
     key,
     null,
     (raw) => (raw === "" ? undefined : raw),
     (value) => (value === "" ? null : value),
   );
 
-const positiveInt = (name: string, key: string, fallback: number, min = 1) =>
+const positiveInt = (key: string, fallback: number, min = 1) =>
   prefStore<number>(
-    name,
     key,
     fallback,
     (raw) => {
@@ -132,18 +129,11 @@ const positiveInt = (name: string, key: string, fallback: number, min = 1) =>
     (value) => String(Math.max(min, Math.round(value))),
   );
 
-export const selectedMailbox = nullableString(
-  "selectedmailbox",
-  MAIL_PREF_KEYS.selectedMailbox,
-);
-export const selectedFolder = nullableString(
-  "selectedfolder",
-  MAIL_PREF_KEYS.selectedFolder,
-);
+export const selectedMailbox = nullableString(MAIL_PREF_KEYS.selectedMailbox);
+export const selectedFolder = nullableString(MAIL_PREF_KEYS.selectedFolder);
 
 const NO_DOMAINS: string[] = [];
 export const collapsedDomains = prefStore<string[]>(
-  "collapseddomains",
   MAIL_PREF_KEYS.collapsedDomains,
   NO_DOMAINS,
   (raw) => {
@@ -162,41 +152,36 @@ export const collapsedDomains = prefStore<string[]>(
 
 /** App-wide. Must be pushed to Rust with `mailSyncIntervalSet` on every change and at startup. */
 export const syncIntervalSeconds = positiveInt(
-  "syncintervalseconds",
   MAIL_PREF_KEYS.syncIntervalSeconds,
   SYNC_INTERVAL_DEFAULT_SECONDS,
   SYNC_INTERVAL_MIN_SECONDS,
 );
 export const listWidth = positiveInt(
-  "listwidth",
   MAIL_PREF_KEYS.listWidth,
   LIST_WIDTH_DEFAULT,
 );
 export const readingPaneSide = enumPref<ReadingPaneSide>(
-  "readingpaneside",
   MAIL_PREF_KEYS.readingPaneSide,
   ["right", "bottom", "off"],
   "right",
 );
 export const density = enumPref<MailDensity>(
-  "density",
   MAIL_PREF_KEYS.density,
   ["comfortable", "compact"],
   "comfortable",
 );
 /** Mirrors the per-source value in the database; this is the default for new views. */
 export const showImages = enumPref<ShowImages>(
-  "showimages",
   MAIL_PREF_KEYS.showImages,
   ["ask", "always", "never"],
   "ask",
 );
 
-export const useSelectedMailbox = selectedMailbox.use;
-export const useSelectedFolder = selectedFolder.use;
-export const useCollapsedDomains = collapsedDomains.use;
-export const useSyncIntervalSeconds = syncIntervalSeconds.use;
-export const useListWidth = listWidth.use;
-export const useReadingPaneSide = readingPaneSide.use;
-export const useDensity = density.use;
-export const useShowImages = showImages.use;
+export const useSelectedMailbox = selectedMailbox.useValue;
+export const useSelectedFolder = selectedFolder.useValue;
+export const useCollapsedDomains = collapsedDomains.useValue;
+export const useSyncIntervalSeconds = syncIntervalSeconds.useValue;
+export const useListWidth = listWidth.useValue;
+export const useReadingPaneSide = readingPaneSide.useValue;
+export const useDensity = density.useValue;
+export const useShowImages = showImages.useValue;

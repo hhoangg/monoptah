@@ -1,3 +1,4 @@
+/** Extracted from SettingsView so the Mail page renders through the same rows and cannot drift from their styling. */
 import {
   createContext,
   useContext,

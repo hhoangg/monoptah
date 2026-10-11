@@ -60,6 +60,21 @@ describe("mail prefs", () => {
     },
   );
 
+  it("uses the documented event name for each pref", () => {
+    expect(
+      Object.fromEntries(cases.map(([name, store]) => [name, store.event])),
+    ).toEqual({
+      selectedMailbox: "monocode:mail-selectedmailbox-change",
+      selectedFolder: "monocode:mail-selectedfolder-change",
+      collapsedDomains: "monocode:mail-collapseddomains-change",
+      syncIntervalSeconds: "monocode:mail-syncintervalseconds-change",
+      listWidth: "monocode:mail-listwidth-change",
+      readingPaneSide: "monocode:mail-readingpaneside-change",
+      density: "monocode:mail-density-change",
+      showImages: "monocode:mail-showimages-change",
+    });
+  });
+
   it("returns a stable reference until the stored value changes", () => {
     collapsedDomains.save(["a.com"]);
     expect(collapsedDomains.load()).toBe(collapsedDomains.load());

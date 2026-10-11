@@ -232,7 +232,7 @@ export type Page<T> = {
   nextCursor: ThreadCursor | null;
 };
 
-export type MailAddress = { name?: string | null; addr: string };
+export type MailAddress = { name: string | null; addr: string };
 
 export type ThreadRow = {
   id: number;

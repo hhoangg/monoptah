@@ -47,6 +47,49 @@ describe("mail command wrappers", () => {
       "mail_remote_image",
       { messageId: 6, url: "https://x/y.png" },
     ],
+    [
+      () =>
+        mail.mailCredentialUpsert({
+          label: "l",
+          accessKeyId: "a",
+          secretAccessKey: "s",
+          defaultRegion: null,
+        }),
+      "mail_credential_upsert",
+      {
+        input: {
+          label: "l",
+          accessKeyId: "a",
+          secretAccessKey: "s",
+          defaultRegion: null,
+        },
+      },
+    ],
+    [
+      () => mail.mailSourceUpsert({ id: null } as never),
+      "mail_source_upsert",
+      { source: { id: null } },
+    ],
+    [
+      () => mail.mailThreads({ scope: { kind: "all" } }),
+      "mail_threads",
+      { query: { scope: { kind: "all" } } },
+    ],
+    [() => mail.mailMessageRaw(7), "mail_message_raw", { messageId: 7 }],
+    [
+      () => mail.mailAttachmentBytes(8),
+      "mail_attachment_bytes",
+      { attachmentId: 8 },
+    ],
+    [() => mail.mailSourceTest(1), "mail_source_test", { id: 1 }],
+    [
+      () => mail.mailSourceDetectPrefixes(1),
+      "mail_source_detect_prefixes",
+      { id: 1 },
+    ],
+    [() => mail.mailMailboxesDelete(2), "mail_mailboxes_delete", { id: 2 }],
+    [() => mail.mailSourceDelete(2), "mail_source_delete", { id: 2 }],
+    [() => mail.mailIdentities(3), "mail_identities", { accountId: 3 }],
   ])("passes the argument names Rust expects", async (call, command, args) => {
     await call();
     expect(invoke).toHaveBeenCalledWith(command, args);

@@ -4,13 +4,13 @@ import { describe, expect, it } from "vitest";
 
 const root = resolve(__dirname, "../../../..");
 
-function npmrcFiles(dir: string, found: string[] = []): string[] {
+function walk(dir: string, found: string[] = []): string[] {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (["node_modules", ".git", "target", "dist"].includes(entry.name))
       continue;
     const path = join(dir, entry.name);
-    if (entry.isDirectory()) npmrcFiles(path, found);
-    else if (entry.name === ".npmrc") found.push(path);
+    if (entry.isDirectory()) walk(path, found);
+    else found.push(path);
   }
   return found;
 }
@@ -30,7 +30,10 @@ describe("free TipTap only", () => {
   });
 
   it("maps no scope to registry.tiptap.dev in any .npmrc", () => {
-    for (const file of npmrcFiles(root)) {
+    const files = walk(root);
+    // A walker that silently returns nothing would let this pass vacuously.
+    expect(files).toContain(join(root, "package.json"));
+    for (const file of files.filter((f) => f.endsWith(".npmrc"))) {
       expect(readFileSync(file, "utf8"), file).not.toContain(
         "registry.tiptap.dev",
       );
