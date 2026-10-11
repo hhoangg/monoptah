@@ -236,7 +236,7 @@ pub(crate) fn outbox_rearm(store: &SessionStore, id: i64) -> Result<(), String> 
     if mail_store::rearm_outbox(&conn, id).map_err(db)? {
         Ok(())
     } else {
-        Err("Only a message that may have been delivered can be re-armed.".into())
+        Err("Only a message whose delivery is uncertain can be sent again.".into())
     }
 }
 
@@ -822,7 +822,12 @@ pub(crate) fn outbox_send(
     let marked = store
         .lock_conn()
         .and_then(|conn| mail_store::mark_outbox_sent(&conn, id, &ses_message_id).map_err(db));
-    if let Err(error) = marked {
+    let not_recorded = match marked {
+        Ok(true) => None,
+        Ok(false) => Some("the row was no longer being sent".to_string()),
+        Err(error) => Some(error),
+    };
+    if let Some(error) = not_recorded {
         report.bookkeeping_error = Some(format!(
             "The message was sent, but Monoptah could not record it: {error}"
         ));
@@ -2305,6 +2310,28 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("'sent/2024/'"), "{error}");
         assert!(!error.contains("'fine/'"), "{error}");
+    }
+
+    #[test]
+    fn a_row_can_only_become_sent_from_sending() {
+        let w = world();
+        let id = outbox_save(&w.store, draft("owner@byptah.com", "ann@example.org")).unwrap();
+        let conn = w.store.lock_conn().unwrap();
+        for state in ["draft", "failed", "unconfirmed", "sent"] {
+            conn.execute("UPDATE mail_outbox SET state = ?1", [state])
+                .unwrap();
+            assert!(
+                !mail_store::mark_outbox_sent(&conn, id, "x").unwrap(),
+                "{state}"
+            );
+            let now: String = conn
+                .query_row("SELECT state FROM mail_outbox", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(now, state);
+        }
+        conn.execute("UPDATE mail_outbox SET state = 'sending'", [])
+            .unwrap();
+        assert!(mail_store::mark_outbox_sent(&conn, id, "x").unwrap());
     }
 
     fn count_cred(conn: &rusqlite::Connection) -> i64 {

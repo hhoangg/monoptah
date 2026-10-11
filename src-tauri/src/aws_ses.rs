@@ -388,7 +388,9 @@ fn classify(status: u16, error_type: Option<&str>, body: &str, action: &str) -> 
         )
     } else {
         match code.as_str() {
-            "AccessDeniedException" | "AccessDenied" => (
+            // The arms below that mean "SES did not take it" need a status under
+            // 500: a server error proves nothing, whatever its error header says.
+            "AccessDeniedException" | "AccessDenied" if status < 500 => (
                 SesErrorKind::AccessDenied,
                 format!("Access denied. The key pair needs {action}."),
             ),
@@ -397,10 +399,14 @@ fn classify(status: u16, error_type: Option<&str>, body: &str, action: &str) -> 
             | "SignatureDoesNotMatch"
             | "InvalidClientTokenId"
             | "IncompleteSignature"
-            | "MissingAuthenticationToken" => (
-                SesErrorKind::InvalidCredentials,
-                "AWS rejected the access key id or secret.".to_string(),
-            ),
+            | "MissingAuthenticationToken"
+                if status < 500 =>
+            {
+                (
+                    SesErrorKind::InvalidCredentials,
+                    "AWS rejected the access key id or secret.".to_string(),
+                )
+            }
             // SES refused this message and says why in words meant for a person
             // ("Email address is not verified..."), so pass that through.
             "MessageRejected"
@@ -410,7 +416,9 @@ fn classify(status: u16, error_type: Option<&str>, body: &str, action: &str) -> 
             | "NotFoundException"
             | "BadRequestException"
             | "TooManyRequestsException"
-            | "LimitExceededException" => {
+            | "LimitExceededException"
+                if status < 500 =>
+            {
                 (SesErrorKind::Rejected, rejection_text(&code, &aws_message))
             }
             _ if status == 403 => (
@@ -582,6 +590,24 @@ mod tests {
         assert_eq!(
             transport_error(ureq::ErrorKind::Io, false).kind,
             SesErrorKind::Network
+        );
+    }
+
+    #[test]
+    fn a_server_error_is_never_read_as_a_refusal() {
+        for (code, status) in [
+            ("MessageRejected", 500),
+            ("BadRequestException", 503),
+            ("AccessDeniedException", 500),
+            ("InvalidSignatureException", 502),
+        ] {
+            let error = classify(status, Some(code), "{}", "ses:SendEmail");
+            assert_eq!(error.kind, SesErrorKind::Other, "{code} {status}");
+        }
+        // The same codes under 500 keep their meaning.
+        assert_eq!(
+            classify(400, Some("MessageRejected"), "{}", "ses:SendEmail").kind,
+            SesErrorKind::Rejected
         );
     }
 

@@ -3521,14 +3521,13 @@ pub(crate) fn mark_outbox_sent(
     conn: &Connection,
     id: i64,
     ses_message_id: &str,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<bool> {
     let now = now_millis();
-    conn.execute(
+    Ok(conn.execute(
         "UPDATE mail_outbox SET state = 'sent', ses_message_id = ?2, sent_at = ?3,
-           updated_at = ?3, last_error = NULL WHERE id = ?1",
+           updated_at = ?3, last_error = NULL WHERE id = ?1 AND state = 'sending'",
         params![id, ses_message_id, now],
-    )?;
-    Ok(())
+    )? > 0)
 }
 
 pub(crate) fn set_outbox_thread(

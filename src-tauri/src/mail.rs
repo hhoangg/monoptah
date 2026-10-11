@@ -1679,10 +1679,13 @@ pub async fn mail_delete(
 
 #[tauri::command(async)]
 pub fn mail_outbox_save(
+    app: AppHandle,
     store: State<'_, SessionStore>,
     draft: mail_send::OutboxDraft,
 ) -> Result<i64, String> {
-    mail_send::outbox_save(&store, draft)
+    let id = mail_send::outbox_save(&store, draft)?;
+    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    Ok(id)
 }
 
 /// Sends once. A failure is reported and recorded, never retried here. The
@@ -1718,8 +1721,14 @@ pub async fn mail_outbox_check(
 /// `unconfirmed -> draft`, and nothing else. The caller must have asked the
 /// person "I checked the recipient, send again" first.
 #[tauri::command(async)]
-pub fn mail_outbox_rearm(store: State<'_, SessionStore>, id: i64) -> Result<(), String> {
-    mail_send::outbox_rearm(&store, id)
+pub fn mail_outbox_rearm(
+    app: AppHandle,
+    store: State<'_, SessionStore>,
+    id: i64,
+) -> Result<(), String> {
+    mail_send::outbox_rearm(&store, id)?;
+    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    Ok(())
 }
 
 #[tauri::command(async)]
