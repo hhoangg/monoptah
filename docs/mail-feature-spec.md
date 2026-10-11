@@ -746,8 +746,13 @@ with escaped text and `<br>`, else empty.
   `src=""` with the original kept in `data-mono-src`, and a counter is returned
   alongside the HTML. That is what drives the "3 remote images blocked" banner.
   "Show images" asks Rust to fetch each one and hand back bytes, exactly as
-  `fetch_inbox_media` already does for the Inbox, so the sender never sees the
-  user's IP and no remote URL is ever in a webview fetch.
+  `fetch_inbox_media` already does for the Inbox. **This does not hide the
+  user's IP** — Rust runs on the user's machine, so the moment they choose to
+  load remote images the sender learns their address and roughly when the mail
+  was read. What fetching in Rust actually buys: no cookies, no `Referer`, no
+  webview cache or storage touched, no access to the app origin, and a guard
+  that refuses `127.0.0.1`, RFC1918, `169.254.169.254` and `*.local`, which a
+  webview fetch would happily reach. Say that in the UI, not the IP claim.
 - **`cid:` inline images**: resolved at render time against
   `mail_attachment.content_id` and swapped for a blob URL.
 
@@ -764,15 +769,28 @@ Render into:
   sandbox="allow-same-origin"
   srcdoc="<meta http-equiv='Content-Security-Policy'
             content=&quot;default-src 'none'; img-src data: blob:;
-                     style-src 'unsafe-inline'; font-src data:&quot;>…">
+                     style-src 'unsafe-inline'&quot;>…">
 ```
+
+`font-src` is deliberately absent. `<style>` and `<link>` are stripped with
+their contents in layer 1 and a `style` **attribute** cannot hold an at-rule, so
+`@font-face` is unreachable and the frame can make no font request. If that
+strip ever regressed, `style-src 'unsafe-inline'` would make `@font-face`
+reachable — and then `default-src 'none'` is the fallback you want standing
+there, not a permissive `font-src`.
 
 - `sandbox` **without** `allow-scripts` — the email cannot run JavaScript even
   though scripts were already stripped. Defence in depth.
-- `allow-same-origin` **is** included, and only for one reason: it lets the host
-  read `contentDocument.body.scrollHeight` to size the iframe to its content.
-  Without `allow-scripts` this grants the email nothing, because nothing in it
-  can execute to use the same-origin privilege.
+- `allow-same-origin` **is** included, for exactly two reasons, and both must be
+  named or a later cleanup will delete one as unexplained: it lets the host read
+  `contentDocument.body.scrollHeight` to size the iframe to its content, and it
+  lets the host intercept link clicks inside the frame so they open through
+  `tauri-plugin-opener` rather than navigating it. Without `allow-scripts` this
+  grants the email nothing, because nothing in it can execute to use the
+  same-origin privilege. The two flags are one decision: with both present the
+  sandbox is fully escapable, and since the app CSP now carries
+  `frame-src 'self'`, that would be a path to a same-origin frame able to call
+  `invoke`. The §14 test asserting no `allow-scripts` is what holds this up.
 - The inner CSP is a second wall: `default-src 'none'` means even a sanitiser
   bug that leaves a `<script src>` or a tracking pixel in place results in a
   blocked request, not a leak.
