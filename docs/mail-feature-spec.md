@@ -358,6 +358,8 @@ CREATE TABLE IF NOT EXISTS mail_object (
   last_seen_at INTEGER NOT NULL,             -- bumped every sync it is listed
   state        TEXT NOT NULL,                -- pending | parsed | gone | error
   parse_error  TEXT,
+  parse_attempts INTEGER NOT NULL DEFAULT 0, -- §5 step 4 caps retries at 3
+
   UNIQUE (mailbox_id, s3_key)
 );
 CREATE INDEX IF NOT EXISTS mail_object_state ON mail_object(state, mailbox_id);
@@ -586,9 +588,13 @@ Per mailbox:
    normal path).
 3. For every `mail_object` row in this mailbox whose `last_seen_at < sync_start`
    and `state != 'gone'`: set `state='gone'`, and set the linked
-   `mail_message.state='archived'`. **Never delete the row** — the user's read
-   state, thread links and folder membership are the only copy. A thread whose
-   every message is `archived` gets `mail_thread.state='archived'`.
+   `mail_message.state='gone'` too — **not** `'archived'`. The two must stay
+   distinguishable, because §10's no-resurrect rule is precisely "a re-listed key
+   must not undo what the *user* archived", and collapsing them into one state
+   makes that rule unimplementable. Listing hides both. **Never delete the row** —
+   the user's read state, thread links and folder membership are the only copy.
+   A thread whose every message is `gone` or `archived` gets
+   `mail_thread.state='archived'`.
 4. For each `state='pending'` object, in batches: `GetObject`, parse (§6/§7),
    insert the message, link the thread, update FTS, re-evaluate smart folders,
    then `state='parsed'`. A parse failure sets `state='error'` with
