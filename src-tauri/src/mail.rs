@@ -1418,6 +1418,221 @@ pub fn mail_star(
     Ok(())
 }
 
+// ── archive and delete ─────────────────────────────────────────────
+
+/// What a hard delete did. A key whose delete S3 did not confirm keeps its
+/// message, so `kept > 0` means some of what the user asked for is still there.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteReport {
+    /// Messages removed locally, and from S3 where they had an object.
+    pub removed: usize,
+    /// Messages kept because S3 did not confirm the delete.
+    pub kept: usize,
+    /// Threads left with no message, and so removed.
+    pub threads_removed: usize,
+    /// Distinct S3 messages. A failed batch attributes its error to keys it
+    /// never sent, so these describe the failure, not which key caused it.
+    pub errors: Vec<String>,
+}
+
+const MAX_REPORTED_ERRORS: usize = 3;
+
+/// Local only: no client is built and S3 is never called.
+pub(crate) fn archive_threads(
+    store: &SessionStore,
+    root: &Path,
+    thread_ids: &[i64],
+) -> Result<(), String> {
+    let conn = store.lock_conn()?;
+    let messages = mail_store::message_ids_in_threads(&conn, thread_ids).map_err(db)?;
+    mail_store::archive_threads(&conn, thread_ids, now_millis()).map_err(db)?;
+    drop(conn);
+    // The files are a cache of the S3 object: they are fetched again on demand.
+    remove_attachment_dirs(root, &messages);
+    Ok(())
+}
+
+pub(crate) fn delete_threads(
+    store: &SessionStore,
+    clients: &dyn AwsClients,
+    sync: &SyncService,
+    root: &Path,
+    thread_ids: &[i64],
+    hard: bool,
+) -> Result<DeleteReport, String> {
+    if hard {
+        hard_delete_threads(store, clients, sync, root, thread_ids)
+    } else {
+        archive_threads(store, root, thread_ids).map(|()| DeleteReport::default())
+    }
+}
+
+/// Deletes every object behind the threads from S3, then removes the local
+/// rows of the messages S3 confirmed. Never the other way round: a local row
+/// removed first and an S3 delete that then fails leaves mail that is still
+/// stored but that the user can no longer see.
+pub(crate) fn hard_delete_threads(
+    store: &SessionStore,
+    clients: &dyn AwsClients,
+    sync: &SyncService,
+    root: &Path,
+    thread_ids: &[i64],
+) -> Result<DeleteReport, String> {
+    let mut by_account: std::collections::BTreeMap<i64, Vec<i64>> = Default::default();
+    let accounts = {
+        let conn = store.lock_conn()?;
+        mail_store::thread_accounts(&conn, thread_ids).map_err(db)?
+    };
+    for (thread, account) in accounts {
+        by_account.entry(account).or_default().push(thread);
+    }
+    let mut report = DeleteReport::default();
+    for (account_id, threads) in by_account {
+        let account = {
+            let conn = store.lock_conn()?;
+            mail_store::get_account(&conn, account_id).map_err(db)?
+        };
+        let Some(account) = account else { continue };
+        let part = sync.exclusive(&account, || {
+            hard_delete_in_account(store, clients, root, &account, &threads)
+        })?;
+        report.removed += part.removed;
+        report.kept += part.kept;
+        report.threads_removed += part.threads_removed;
+        for error in part.errors {
+            if report.errors.len() < MAX_REPORTED_ERRORS && !report.errors.contains(&error) {
+                report.errors.push(error);
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn hard_delete_in_account(
+    store: &SessionStore,
+    clients: &dyn AwsClients,
+    root: &Path,
+    account: &MailAccount,
+    threads: &[i64],
+) -> Result<DeleteReport, String> {
+    let rows = {
+        let conn = store.lock_conn()?;
+        mail_store::thread_message_objects(&conn, threads).map_err(db)?
+    };
+    let mut keys: Vec<String> = rows.iter().filter_map(|r| r.s3_key.clone()).collect();
+    keys.sort();
+    keys.dedup();
+
+    // The only trusted answer is an outcome with no error. A key with no
+    // outcome at all counts as not deleted.
+    let mut deleted: std::collections::HashSet<String> = Default::default();
+    let mut errors: Vec<String> = Vec::new();
+    if !keys.is_empty() {
+        match clients.s3(account) {
+            Err(message) => errors.push(message),
+            Ok(s3) => {
+                for outcome in s3.delete_objects(&keys) {
+                    match outcome.error {
+                        None => {
+                            deleted.insert(outcome.key);
+                        }
+                        Some(error) => {
+                            if !errors.contains(&error.message) {
+                                errors.push(error.message);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let key_failed = |row: &mail_store::ThreadMessageObject| {
+        row.s3_key.as_ref().is_some_and(|k| !deleted.contains(k))
+    };
+    // A message with no S3 object (a sent copy) has only its local row. It goes
+    // only if the rest of its thread went too, so a failed delete never leaves
+    // a thread with its local-only half silently removed.
+    let thread_failed: std::collections::HashSet<i64> = rows
+        .iter()
+        .filter(|r| key_failed(r))
+        .map(|r| r.thread_id)
+        .collect();
+
+    let mut report = DeleteReport::default();
+    let mut removed_ids = Vec::new();
+    let mut touched: Vec<i64> = Vec::new();
+    {
+        let conn = store.lock_conn()?;
+        let tx = conn.unchecked_transaction().map_err(db)?;
+        for row in &rows {
+            let removable = match &row.s3_key {
+                Some(key) => deleted.contains(key),
+                None => !thread_failed.contains(&row.thread_id),
+            };
+            if !removable {
+                report.kept += 1;
+                continue;
+            }
+            mail_store::remove_message(&tx, row.message_id).map_err(db)?;
+            if let Some(object_id) = row.object_id {
+                mail_store::tombstone_object(&tx, object_id).map_err(db)?;
+            }
+            removed_ids.push(row.message_id);
+            report.removed += 1;
+            if !touched.contains(&row.thread_id) {
+                touched.push(row.thread_id);
+            }
+        }
+        for thread_id in touched {
+            if mail_store::delete_thread_if_empty(&tx, thread_id).map_err(db)? {
+                report.threads_removed += 1;
+                continue;
+            }
+            // What is left is counted, filed and, if the sync had already
+            // marked every remaining message `gone`, taken out of the inbox.
+            crate::mail_thread::refresh_thread(&tx, thread_id).map_err(db)?;
+            mail_store::reevaluate_thread(&tx, thread_id).map_err(db)?;
+            mail_store::archive_thread_if_inactive(&tx, thread_id, now_millis()).map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+    }
+    remove_attachment_dirs(root, &removed_ids);
+    report.errors = errors;
+    Ok(report)
+}
+
+#[tauri::command(async)]
+pub fn mail_archive(
+    app: AppHandle,
+    store: State<'_, SessionStore>,
+    thread_ids: Vec<i64>,
+) -> Result<(), String> {
+    archive_threads(&store, &attachments_root(&app)?, &thread_ids)?;
+    // Here rather than in the caller, like mail_mark.
+    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    Ok(())
+}
+
+/// `hard: false` is `mail_archive`. `hard: true` deletes on S3 first; the
+/// result says what S3 refused, and the webview must show it.
+#[tauri::command]
+pub async fn mail_delete(
+    app: AppHandle,
+    thread_ids: Vec<i64>,
+    hard: bool,
+) -> Result<DeleteReport, String> {
+    let root = attachments_root(&app)?;
+    let report = blocking(app.clone(), move |store, mail| {
+        delete_threads(store, &*mail.clients, &mail.sync, &root, &thread_ids, hard)
+    })
+    .await;
+    // Also after an error: part of the work may have been committed.
+    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    report
+}
+
 /// Downloads the attachment if needed and returns where it is. Opening it is
 /// the webview's call, through the same default-app path other files use.
 #[tauri::command]
@@ -1502,9 +1717,13 @@ mod tests {
         }
     }
 
+    type CallLog = Arc<Mutex<Vec<String>>>;
+
     struct FakeS3 {
         list: Result<ObjectPage, S3Error>,
         objects: HashMap<String, Vec<u8>>,
+        calls: CallLog,
+        delete_fail: Vec<String>,
     }
 
     impl S3Api for FakeS3 {
@@ -1532,8 +1751,21 @@ mod tests {
         fn put_object(&self, _: &str, _: &[u8], _: &str) -> Result<(), S3Error> {
             Ok(())
         }
-        fn delete_objects(&self, _: &[String]) -> Vec<DeleteOutcome> {
-            Vec::new()
+        fn delete_objects(&self, keys: &[String]) -> Vec<DeleteOutcome> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("delete:{}", keys.join(",")));
+            keys.iter()
+                .map(|key| DeleteOutcome {
+                    key: key.clone(),
+                    error: self.delete_fail.contains(key).then(|| S3Error {
+                        kind: S3ErrorKind::Other,
+                        code: Some("InvalidRequest".into()),
+                        message: "S3 rejected the delete request.".into(),
+                    }),
+                })
+                .collect()
         }
     }
 
@@ -1569,6 +1801,9 @@ mod tests {
         ses_denied: bool,
         no_key: bool,
         refreshes: Mutex<Vec<i64>>,
+        /// Every S3 client built and every S3 call made, in order.
+        calls: CallLog,
+        delete_fail: Vec<String>,
     }
 
     impl Default for FakeClients {
@@ -1584,6 +1819,8 @@ mod tests {
                 ses_denied: false,
                 no_key: false,
                 refreshes: Mutex::new(Vec::new()),
+                calls: CallLog::default(),
+                delete_fail: Vec::new(),
             }
         }
     }
@@ -1593,9 +1830,12 @@ mod tests {
             if self.no_key {
                 return Err("The AWS key for this source is missing.".into());
             }
+            self.calls.lock().unwrap().push("client".into());
             Ok(Box::new(FakeS3 {
                 list: self.list.clone(),
                 objects: self.objects.clone(),
+                calls: self.calls.clone(),
+                delete_fail: self.delete_fail.clone(),
             }))
         }
         fn ses(&self, account: &MailAccount) -> Result<Box<dyn SesApi + Send>, String> {
@@ -2229,6 +2469,327 @@ mod tests {
         );
         remove_attachment_dirs(&root, &[message]);
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn reply_mail(subject: &str, id: &str, parent: &str) -> Vec<u8> {
+        format!(
+            "From: Bob <bob@example.org>\r\nTo: owner@byptah.com\r\nSubject: {subject}\r\n\
+             Message-ID: <{id}@example.org>\r\nIn-Reply-To: <{parent}@example.org>\r\n\
+             Date: Tue, 01 Oct 2024 11:00:00 +0000\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\nreply\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn count(store: &SessionStore, sql: &str) -> i64 {
+        store
+            .lock_conn()
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn temp_root() -> PathBuf {
+        std::env::temp_dir().join(format!("monoptah-mail-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn a_partial_s3_failure_keeps_the_failed_message_and_reports_it() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (_, t1) = ingest(
+            &store,
+            mailbox.id,
+            &raw_mail("Hi", "a1", "first"),
+            "owner/a1",
+        );
+        let (reply, same) = {
+            let raw = reply_mail("Re: Hi", "a2", "a1");
+            ingest(&store, mailbox.id, &raw, "owner/a2")
+        };
+        assert_eq!(t1, same);
+        let (_, t2) = ingest(
+            &store,
+            mailbox.id,
+            &raw_mail("Other", "b1", "x"),
+            "owner/b1",
+        );
+        let clients = FakeClients {
+            delete_fail: vec!["owner/a2".into()],
+            ..Default::default()
+        };
+        let report = delete_threads(
+            &store,
+            &clients,
+            &SyncService::default(),
+            &temp_root(),
+            &[t1, t2],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            report,
+            DeleteReport {
+                removed: 2,
+                kept: 1,
+                threads_removed: 1,
+                errors: vec!["S3 rejected the delete request.".into()],
+            }
+        );
+        // The thread survives with the message S3 did not delete, and its row
+        // and ledger entry are untouched.
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM mail_message"), 1);
+        assert_eq!(
+            count(
+                &store,
+                &format!("SELECT id FROM mail_message WHERE id = {reply}")
+            ),
+            reply
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM mail_thread"), 1);
+        assert_eq!(
+            count(
+                &store,
+                &format!("SELECT message_count FROM mail_thread WHERE id = {t1}")
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail_object WHERE s3_key = 'owner/a2' AND state = 'pending'"
+            ),
+            1
+        );
+        // A deleted key keeps a ledger row the next listing recognises.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail_object WHERE s3_key = 'owner/a1' AND state = 'deleted'"
+            ),
+            1
+        );
+        // The index follows the rows: nothing of the deleted messages is left.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail_message_fts WHERE mail_message_fts MATCH 'first OR x'"
+            ),
+            0
+        );
+        // One batch, every key of both threads, and nothing else.
+        assert_eq!(
+            *clients.calls.lock().unwrap(),
+            vec!["client", "delete:owner/a1,owner/a2,owner/b1"]
+        );
+    }
+
+    #[test]
+    fn archive_makes_no_s3_call_and_builds_no_client() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (_, thread) = ingest(
+            &store,
+            mailbox.id,
+            &raw_mail("Hi", "a1", "first"),
+            "owner/a1",
+        );
+        let clients = FakeClients::default();
+        let report = delete_threads(
+            &store,
+            &clients,
+            &SyncService::default(),
+            &temp_root(),
+            &[thread],
+            false,
+        )
+        .unwrap();
+        assert_eq!(report, DeleteReport::default());
+        assert!(clients.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail_message WHERE state = 'archived'"
+            ),
+            1
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM mail_thread WHERE state = 'archived' AND archived_at IS NOT NULL"), 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail_object WHERE state = 'pending'"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn archive_moves_only_active_messages_and_keeps_the_first_archive_time() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (_, thread) = ingest(
+            &store,
+            mailbox.id,
+            &raw_mail("Hi", "a1", "first"),
+            "owner/a1",
+        );
+        let (gone, _) = ingest(
+            &store,
+            mailbox.id,
+            &reply_mail("Re: Hi", "a2", "a1"),
+            "owner/a2",
+        );
+        store
+            .lock_conn()
+            .unwrap()
+            .execute(
+                "UPDATE mail_message SET state = 'gone' WHERE id = ?1",
+                [gone],
+            )
+            .unwrap();
+        archive_threads(&store, &temp_root(), &[thread]).unwrap();
+        // A `gone` message stays `gone`: a revive still has to find it.
+        assert_eq!(
+            count(
+                &store,
+                &format!("SELECT state = 'gone' FROM mail_message WHERE id = {gone}")
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail_message WHERE state = 'archived'"
+            ),
+            1
+        );
+        let first = count(&store, "SELECT archived_at FROM mail_thread");
+        store
+            .lock_conn()
+            .unwrap()
+            .execute("UPDATE mail_thread SET archived_at = 7", [])
+            .unwrap();
+        archive_threads(&store, &temp_root(), &[thread]).unwrap();
+        assert_ne!(first, 7);
+        assert_eq!(count(&store, "SELECT archived_at FROM mail_thread"), 7);
+    }
+
+    #[test]
+    fn a_missing_key_keeps_everything_and_says_why() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (_, thread) = ingest(
+            &store,
+            mailbox.id,
+            &raw_mail("Hi", "a1", "first"),
+            "owner/a1",
+        );
+        let clients = FakeClients {
+            no_key: true,
+            ..Default::default()
+        };
+        let report = delete_threads(
+            &store,
+            &clients,
+            &SyncService::default(),
+            &temp_root(),
+            &[thread],
+            true,
+        )
+        .unwrap();
+        assert_eq!((report.removed, report.kept), (0, 1));
+        assert_eq!(
+            report.errors,
+            vec!["The AWS key for this source is missing."]
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM mail_message"), 1);
+    }
+
+    #[test]
+    fn a_message_with_no_s3_object_goes_only_when_its_thread_did() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (_, thread) = ingest(
+            &store,
+            mailbox.id,
+            &raw_mail("Hi", "a1", "first"),
+            "owner/a1",
+        );
+        // A sent copy: threaded with the rest but backed by no object.
+        {
+            let conn = store.lock_conn().unwrap();
+            let sent = mail_store::insert_object(
+                &conn,
+                mailbox.id,
+                &ListedObject {
+                    s3_key: "owner/tmp",
+                    etag: "e",
+                    size_bytes: 1,
+                    s3_modified: Some(1),
+                },
+                1,
+            )
+            .unwrap();
+            let mail = parse_mail(&reply_mail("Re: Hi", "a2", "a1")).unwrap();
+            let done = ingest_message(&conn, mailbox.id, "outbound", Some(sent), &mail, 1).unwrap();
+            conn.execute(
+                "UPDATE mail_message SET object_id = NULL WHERE id = ?1",
+                [done.message_id],
+            )
+            .unwrap();
+        }
+        let failing = FakeClients {
+            delete_fail: vec!["owner/a1".into()],
+            ..Default::default()
+        };
+        let sync = SyncService::default();
+        let report =
+            delete_threads(&store, &failing, &sync, &temp_root(), &[thread], true).unwrap();
+        assert_eq!((report.removed, report.kept), (0, 2));
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM mail_message"), 2);
+        let report = delete_threads(
+            &store,
+            &FakeClients::default(),
+            &sync,
+            &temp_root(),
+            &[thread],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            (report.removed, report.kept, report.threads_removed),
+            (2, 0, 1)
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM mail_message"), 0);
+    }
+
+    #[test]
+    fn a_hard_delete_removes_downloaded_attachments_only_for_deleted_messages() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (keep, t1) = ingest(&store, mailbox.id, &raw_mail("Keep", "k1", "x"), "owner/k1");
+        let (drop, t2) = ingest(&store, mailbox.id, &raw_mail("Drop", "d1", "y"), "owner/d1");
+        let root = temp_root();
+        for id in [keep, drop] {
+            std::fs::create_dir_all(root.join(id.to_string())).unwrap();
+            std::fs::write(root.join(id.to_string()).join("0-f"), b"x").unwrap();
+        }
+        let clients = FakeClients {
+            delete_fail: vec!["owner/k1".into()],
+            ..Default::default()
+        };
+        delete_threads(
+            &store,
+            &clients,
+            &SyncService::default(),
+            &root,
+            &[t1, t2],
+            true,
+        )
+        .unwrap();
+        assert!(root.join(keep.to_string()).exists());
+        assert!(!root.join(drop.to_string()).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

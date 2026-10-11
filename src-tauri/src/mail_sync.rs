@@ -157,6 +157,15 @@ impl SyncService {
         self.run(store, factory, events, Scope::Due { now_ms })
     }
 
+    /// Runs `work` while no sync of this source's S3 key can run. A hard delete
+    /// needs it: a sync that already fetched an object would otherwise insert
+    /// the message again after the delete removed it.
+    pub(crate) fn exclusive<R>(&self, account: &MailAccount, work: impl FnOnce() -> R) -> R {
+        let lock = self.lock_for(lock_key(account));
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        work()
+    }
+
     fn lock_for(&self, credential_id: i64) -> Arc<Mutex<()>> {
         let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
         locks.entry(credential_id).or_default().clone()
@@ -501,6 +510,11 @@ fn reconcile_ledger(
                     work.push(job(row.id, has_message, row.parse_attempts));
                 }
             }
+            "deleted" => {
+                // The user deleted it on S3. Listed again means the listing is
+                // behind or the delete did not take; either way it stays gone.
+                mail_store::touch_object(conn, row.id, &entry, sync_start, "deleted")?;
+            }
             "parsed" => {
                 mail_store::touch_object(conn, row.id, &entry, sync_start, "parsed")?;
                 if changed {
@@ -659,6 +673,11 @@ mod tests {
         list_error: Mutex<Option<S3Error>>,
         page_size: usize,
         rendezvous: Option<Arc<Rendezvous>>,
+        /// Keys whose delete S3 refuses.
+        delete_fail: Mutex<Vec<String>>,
+        /// A delete is accepted but the listing still shows the key, as a
+        /// store with a lagging listing would.
+        stale_listing: std::sync::atomic::AtomicBool,
     }
 
     impl MockS3 {
@@ -670,6 +689,8 @@ mod tests {
                 list_error: Mutex::new(None),
                 page_size: 1000,
                 rendezvous: None,
+                delete_fail: Mutex::new(Vec::new()),
+                stale_listing: Default::default(),
             })
         }
 
@@ -746,8 +767,41 @@ mod tests {
             unreachable!("sync never writes")
         }
 
-        fn delete_objects(&self, _: &[String]) -> Vec<DeleteOutcome> {
-            unreachable!("sync never deletes")
+        fn delete_objects(&self, keys: &[String]) -> Vec<DeleteOutcome> {
+            let m = &self.0;
+            let failing = m.delete_fail.lock().unwrap().clone();
+            keys.iter()
+                .map(|key| {
+                    m.log
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}:delete:{key}", m.label));
+                    let refused = failing.contains(key);
+                    if !refused && !m.stale_listing.load(Ordering::SeqCst) {
+                        m.objects.lock().unwrap().remove(key);
+                    }
+                    DeleteOutcome {
+                        key: key.clone(),
+                        error: refused.then(|| S3Error {
+                            kind: S3ErrorKind::Other,
+                            code: None,
+                            message: "refused".into(),
+                        }),
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// The command layer's seam, over the same mock the sync reads.
+    struct DeleteClients(Arc<MockS3>);
+
+    impl crate::mail::AwsClients for DeleteClients {
+        fn s3(&self, _: &MailAccount) -> Result<Box<dyn S3Api + Send>, String> {
+            Ok(Box::new(MockClient(self.0.clone())))
+        }
+        fn ses(&self, _: &MailAccount) -> Result<Box<dyn crate::aws_ses::SesApi + Send>, String> {
+            Err("not used".into())
         }
     }
 
@@ -990,6 +1044,118 @@ mod tests {
         assert_eq!(f.text("SELECT state FROM mail_message"), "archived");
         assert_eq!(f.text("SELECT state FROM mail_thread"), "archived");
         assert_eq!(f.text("SELECT state FROM mail_object"), "parsed");
+    }
+
+    fn thread_of(f: &Fixture) -> i64 {
+        f.scalar("SELECT id FROM mail_thread")
+    }
+
+    fn hard_delete(f: &Fixture, s3: &Arc<MockS3>, threads: &[i64]) -> crate::mail::DeleteReport {
+        crate::mail::hard_delete_threads(
+            &f.store,
+            &DeleteClients(s3.clone()),
+            &f.service,
+            &std::env::temp_dir(),
+            threads,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_hard_deleted_object_is_not_inserted_again_by_the_next_sync() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        f.sync(&[(account, &s3)]);
+        let report = hard_delete(&f, &s3, &[thread_of(&f)]);
+        assert_eq!((report.removed, report.kept), (1, 0));
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_message"), 0);
+        assert_eq!(fts_hits(&f, "first"), 0);
+        let again = f.sync(&[(account, &s3)]);
+        assert_eq!((again[0].inserted, again[0].archived), (0, 0));
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_message"), 0);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_thread"), 0);
+    }
+
+    #[test]
+    fn a_lagging_listing_cannot_bring_a_hard_deleted_message_back() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        f.sync(&[(account, &s3)]);
+        s3.stale_listing.store(true, Ordering::SeqCst);
+        hard_delete(&f, &s3, &[thread_of(&f)]);
+        // The key is still listed, with the same etag.
+        let again = f.sync(&[(account, &s3)]);
+        assert_eq!(again[0].inserted, 0);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_message"), 0);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_thread"), 0);
+    }
+
+    #[test]
+    fn a_failed_delete_is_not_duplicated_or_lost_by_the_next_sync() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        f.sync(&[(account, &s3)]);
+        s3.delete_fail.lock().unwrap().push("owner/1".into());
+        let report = hard_delete(&f, &s3, &[thread_of(&f)]);
+        assert_eq!((report.removed, report.kept), (0, 1));
+        let again = f.sync(&[(account, &s3)]);
+        assert_eq!(again[0].inserted, 0);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_message"), 1);
+        assert_eq!(f.text("SELECT state FROM mail_message"), "active");
+        assert_eq!(f.text("SELECT state FROM mail_thread"), "active");
+    }
+
+    #[test]
+    fn archive_through_the_command_layer_survives_every_relisting() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        f.sync(&[(account, &s3)]);
+        crate::mail::archive_threads(&f.store, &std::env::temp_dir(), &[thread_of(&f)]).unwrap();
+        // Still listed, then vanished, then listed again.
+        f.sync(&[(account, &s3)]);
+        assert_eq!(f.text("SELECT state FROM mail_message"), "archived");
+        s3.remove("owner/1");
+        f.sync(&[(account, &s3)]);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(f.text("SELECT state FROM mail_message"), "archived");
+        assert_eq!(f.text("SELECT state FROM mail_thread"), "archived");
+        assert!(!s3
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains(":delete:")));
+    }
+
+    #[test]
+    fn a_hard_delete_waits_for_a_running_sync_of_the_same_key() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        f.sync(&[(account, &s3)]);
+        let source = {
+            let conn = f.store.lock_conn().unwrap();
+            mail_store::get_account(&conn, account).unwrap().unwrap()
+        };
+        let mark = s3.log.lock().unwrap().len();
+        std::thread::scope(|scope| {
+            f.service.exclusive(&source, || {
+                let sync = scope.spawn(|| f.sync(&[(account, &s3)]));
+                std::thread::sleep(Duration::from_millis(200));
+                assert_eq!(
+                    s3.log.lock().unwrap().len(),
+                    mark,
+                    "sync ran inside the lock"
+                );
+                drop(sync);
+            });
+        });
+        assert!(s3.log.lock().unwrap().len() > mark);
     }
 
     #[test]

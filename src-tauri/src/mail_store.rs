@@ -1331,7 +1331,7 @@ pub(crate) struct MailObjectRow {
     pub id: i64,
     pub s3_key: String,
     pub etag: Option<String>,
-    /// `pending | parsed | gone | error`
+    /// `pending | parsed | gone | error | deleted`
     pub state: String,
     pub parse_attempts: i64,
 }
@@ -1446,7 +1446,7 @@ pub(crate) fn mark_vanished_objects(
     let tx = conn;
     let vanished = tx.execute(
         "UPDATE mail_object SET state = 'gone'
-         WHERE mailbox_id = ?1 AND last_seen_at < ?2 AND state != 'gone'",
+         WHERE mailbox_id = ?1 AND last_seen_at < ?2 AND state NOT IN ('gone', 'deleted')",
         params![mailbox_id, sync_start],
     )?;
     if vanished > 0 {
@@ -1590,6 +1590,126 @@ pub(crate) fn archive_thread_if_inactive(
          WHERE id = ?1 AND state = 'active'
            AND NOT EXISTS (SELECT 1 FROM mail_message WHERE thread_id = ?1 AND state = 'active')",
         params![thread_id, archived_at],
+    )?;
+    Ok(())
+}
+
+/// The user archives whole threads (spec section 10). Only `active` messages
+/// move: a `gone` one stays `gone` so that a revive still finds it, and the
+/// aggregates are untouched because `archived` messages still count. A thread
+/// that is already archived keeps its original `archived_at`.
+pub(crate) fn archive_threads(
+    conn: &Connection,
+    thread_ids: &[i64],
+    archived_at: i64,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for id in thread_ids {
+        tx.execute(
+            "UPDATE mail_message SET state = 'archived'
+             WHERE thread_id = ?1 AND state = 'active'",
+            params![id],
+        )?;
+        tx.execute(
+            "UPDATE mail_thread SET state = 'archived', archived_at = ?2
+             WHERE id = ?1 AND state = 'active'",
+            params![id, archived_at],
+        )?;
+        // The caller removes the files, so a path left here would claim a
+        // download that no longer exists.
+        tx.execute(
+            "UPDATE mail_attachment SET local_path = NULL
+             WHERE message_id IN (SELECT id FROM mail_message WHERE thread_id = ?1)",
+            params![id],
+        )?;
+        reevaluate_thread(&tx, *id)?;
+    }
+    tx.commit()
+}
+
+pub(crate) fn message_ids_in_threads(
+    conn: &Connection,
+    thread_ids: &[i64],
+) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM mail_message WHERE thread_id = ?1")?;
+    let mut ids = Vec::new();
+    for thread_id in thread_ids {
+        let rows = stmt.query_map(params![thread_id], |row| row.get::<_, i64>(0))?;
+        for row in rows {
+            ids.push(row?);
+        }
+    }
+    Ok(ids)
+}
+
+/// A message of a thread and the S3 object behind it, if any.
+#[derive(Debug, Clone)]
+pub(crate) struct ThreadMessageObject {
+    pub message_id: i64,
+    pub thread_id: i64,
+    pub object_id: Option<i64>,
+    pub s3_key: Option<String>,
+}
+
+/// `(thread id, account id)` for each id that exists.
+pub(crate) fn thread_accounts(
+    conn: &Connection,
+    thread_ids: &[i64],
+) -> rusqlite::Result<Vec<(i64, i64)>> {
+    let mut out = Vec::new();
+    for id in thread_ids {
+        let account: Option<i64> = conn
+            .query_row(
+                "SELECT account_id FROM mail_thread WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(account) = account {
+            out.push((*id, account));
+        }
+    }
+    Ok(out)
+}
+
+/// Every message of the threads, whatever its state: a hard delete removes the
+/// whole conversation, including what the sync had marked `gone`.
+pub(crate) fn thread_message_objects(
+    conn: &Connection,
+    thread_ids: &[i64],
+) -> rusqlite::Result<Vec<ThreadMessageObject>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.thread_id, o.id, o.s3_key FROM mail_message m
+         LEFT JOIN mail_object o ON o.id = m.object_id
+         WHERE m.thread_id = ?1 ORDER BY m.id",
+    )?;
+    let mut out = Vec::new();
+    for thread_id in thread_ids {
+        let rows = stmt.query_map(params![thread_id], |row| {
+            Ok(ThreadMessageObject {
+                message_id: row.get(0)?,
+                thread_id: row.get(1)?,
+                object_id: row.get(2)?,
+                s3_key: row.get(3)?,
+            })
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+/// Marks the ledger row of an object S3 confirmed deleted as `deleted`. The
+/// row stays so a listing that still shows the key finds a known object and
+/// leaves it alone. Any other state would be wrong: `gone` with no message is
+/// what the sync re-ingests, and `parsed` is flipped to `gone` by the next
+/// sync, which would also report a vanished object nobody lost.
+pub(crate) fn tombstone_object(conn: &Connection, object_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_object SET state = 'deleted', parse_error = NULL, parse_attempts = 0
+         WHERE id = ?1",
+        params![object_id],
     )?;
     Ok(())
 }
