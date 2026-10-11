@@ -26,6 +26,12 @@ export type ComposeInput = {
   draftId: string;
   /** Already sanitised by ammonia (Task 3); appended as-is, never re-processed. */
   quotedHtml?: string | null;
+  /**
+   * The same original as plain text, `> `-prefixed by the caller (see
+   * mailQuote). Appended as-is, never derived from quotedHtml: flattening
+   * sanitised HTML here would make this module a second sanitiser.
+   */
+  quotedText?: string | null;
 };
 
 export type InlineImage = {
@@ -389,7 +395,9 @@ export function serializeCompose(input: ComposeInput): ComposeOutput {
 
   return {
     html,
-    text: blocksText(top).join("\n\n"),
+    text: [blocksText(top).join("\n\n"), input.quotedText ?? ""]
+      .filter((part) => part.trim() !== "")
+      .join("\n\n"),
     inlineImages: [...ctx.images.values()],
   };
 }

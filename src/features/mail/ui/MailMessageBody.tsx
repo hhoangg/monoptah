@@ -3,6 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { Loader } from "../../../shared/ui/icons";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 import { mailAttachmentBytes, mailRemoteImage } from "../model/mail";
+import { CSS_URL, cidKey, cidReferences } from "../model/mailCid";
 import type { ImagePolicy, MessageRow } from "../model/mailTypes";
 
 /**
@@ -29,21 +30,9 @@ const FRAME_STYLE =
   "img{max-width:100%;height:auto}";
 
 const ABSOLUTE_HTTP = /^https?:\/\//i;
-const STYLE_URL = /url\(\s*(['"]?)(.*?)\1\s*\)/gi;
 
 const parse = (html: string) =>
   new DOMParser().parseFromString(html, "text/html");
-
-/** Matches a `cid:` reference to `Content-ID`, which is stored without `<>`. */
-export function cidKey(raw: string): string {
-  let value = raw.trim().replace(/^<|>$/g, "");
-  try {
-    value = decodeURIComponent(value);
-  } catch {
-    // keep the undecoded form
-  }
-  return value.toLowerCase();
-}
 
 /**
  * Absolute http(s) URLs the sanitiser blocked. A relative or protocol-relative
@@ -65,22 +54,6 @@ export function loadableImageCount(html: string): number {
     if (ABSOLUTE_HTTP.test(img.getAttribute("data-mono-src") ?? "")) n += 1;
   }
   return n;
-}
-
-/** `cid:` references appear on `img src` and inside `style` url(...). */
-export function cidReferences(html: string): string[] {
-  const keys = new Set<string>();
-  const doc = parse(html);
-  for (const img of doc.querySelectorAll("img[src]")) {
-    const src = img.getAttribute("src") ?? "";
-    if (/^cid:/i.test(src)) keys.add(cidKey(src.slice(4)));
-  }
-  for (const el of doc.querySelectorAll("[style]")) {
-    for (const m of (el.getAttribute("style") ?? "").matchAll(STYLE_URL)) {
-      if (/^cid:/i.test(m[2])) keys.add(cidKey(m[2].slice(4)));
-    }
-  }
-  return [...keys];
 }
 
 /**
@@ -120,7 +93,7 @@ export function buildFrameDocument(
   }
   for (const el of doc.querySelectorAll("[style]")) {
     const style = (el.getAttribute("style") ?? "").replace(
-      STYLE_URL,
+      CSS_URL,
       (whole, _quote, value: string) => {
         if (/^cid:/i.test(value)) {
           const resolved = cid.get(cidKey(value.slice(4)));

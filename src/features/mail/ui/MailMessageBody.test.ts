@@ -8,10 +8,10 @@ import {
   MailMessageBody,
   canTogglePlain,
   buildFrameDocument,
-  cidReferences,
   linkifyText,
   remoteImageUrls,
 } from "./MailMessageBody";
+import { cidReferences } from "../model/mailCid";
 import { mailAttachmentBytes, mailRemoteImage } from "../model/mail";
 import type { MessageRow } from "../model/mailTypes";
 

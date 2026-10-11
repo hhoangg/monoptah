@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from "vitest";
-import { cidReferences } from "../ui/MailMessageBody";
+import { cidReferences } from "./mailCid";
 import { contentIdFor, serializeCompose, type TipTapNode } from "./mailCompose";
 
 const t = (text: string, marks?: TipTapNode["marks"]): TipTapNode => ({
@@ -129,6 +129,28 @@ describe("mailCompose html", () => {
     const { html } = run(doc(p(t("reply"))), quoted);
     expect(html).toContain(quoted);
     expect(html.indexOf("reply")).toBeLessThan(html.indexOf(quoted));
+  });
+
+  it("appends the quoted text unchanged after the body, in the text part only", () => {
+    const quotedText = "A wrote:\n> raw & <odd>\n>\n>  spaced";
+    const out = serializeCompose({
+      bodyJson: doc(p(t("reply"))),
+      draftId: "d1",
+      quotedHtml: "<p>html copy</p>",
+      quotedText,
+    });
+    expect(out.text).toBe(`reply\n\n${quotedText}`);
+    expect(out.html).not.toContain("A wrote:");
+    expect(out.html).toContain("<p>html copy</p>");
+  });
+
+  it("sends the quoted text alone when the reply body is empty", () => {
+    const out = serializeCompose({
+      bodyJson: doc({ type: "paragraph" }),
+      draftId: "d1",
+      quotedText: "A wrote:\n> hi",
+    });
+    expect(out.text).toBe("A wrote:\n> hi");
   });
 });
 
