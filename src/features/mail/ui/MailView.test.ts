@@ -5,7 +5,14 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { MailView } from "./MailView";
 import { MAIL_PREF_KEYS, readingPaneSide } from "../model/mailPrefs";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(async (cmd: string) =>
+    cmd === "mail_threads" ? { rows: [], nextCursor: null } : null,
+  ),
+}));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async () => () => undefined),
+}));
 vi.mock("../../../app/shell/WindowControls", () => ({
   WindowControls: () => null,
 }));

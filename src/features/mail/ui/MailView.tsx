@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Mail } from "../../../shared/ui/icons";
 import { useDragResize } from "../../../shared/hooks/useDragResize";
 import { IS_MAC } from "../../../platform/tauri/platform";
@@ -6,8 +7,19 @@ import { WindowControls } from "../../../app/shell/WindowControls";
 import {
   LIST_WIDTH_DEFAULT,
   listWidth,
+  selectedFolder,
+  selectedMailbox,
   useReadingPaneSide,
+  useSelectedFolder,
+  useSelectedMailbox,
 } from "../model/mailPrefs";
+import type { ThreadScope } from "../model/mailTypes";
+import {
+  MailFolderList,
+  groupMailboxesByDomain,
+  useMailStatus,
+} from "./MailFolderList";
+import { MailThreadList, useMailThreadList } from "./MailThreadList";
 
 type Props = {
   besideRail?: boolean;
@@ -34,6 +46,29 @@ export function MailView({
   onToggleSidebar,
 }: Props) {
   const side = useReadingPaneSide();
+  const { status, error, refresh } = useMailStatus();
+  const mailboxPref = useSelectedMailbox();
+  const folderId = useSelectedFolder();
+  const [threadId, setThreadId] = useState<number | null>(null);
+  const mailboxes = status
+    ? groupMailboxesByDomain(status.sources).flatMap((g) =>
+        g.mailboxes.map((m) => m.mailbox),
+      )
+    : [];
+  // A saved id can outlive its mailbox; fall back to all mail rather than
+  // querying a scope that no longer exists.
+  const mailboxId =
+    mailboxPref !== null && mailboxes.some((m) => String(m.id) === mailboxPref)
+      ? Number(mailboxPref)
+      : null;
+  const scope: ThreadScope =
+    mailboxId === null ? { kind: "all" } : { kind: "mailbox", mailboxId };
+  const list = useMailThreadList(scope, folderId !== null);
+  const pick = (mailbox: string | null, folder: string | null) => {
+    selectedMailbox.save(mailbox);
+    selectedFolder.save(folder);
+    setThreadId(null);
+  };
   const resize = useDragResize({
     min: LIST_MIN_WIDTH,
     max: () =>
@@ -85,7 +120,18 @@ export function MailView({
           data-mail-pane="folders"
           style={{ width: FOLDER_COLUMN_WIDTH }}
           className="flex shrink-0 flex-col border-r border-stroke"
-        />
+        >
+          <MailFolderList
+            status={status}
+            error={error}
+            mailboxId={mailboxId}
+            folderId={folderId}
+            onSelectAll={() => pick(null, null)}
+            onSelectMailbox={(id) => pick(String(id), null)}
+            onSelectFolder={(id) => pick(null, id)}
+            onSynced={() => void refresh()}
+          />
+        </aside>
         <div
           className={`flex min-h-0 min-w-0 flex-1 ${
             side === "bottom" ? "flex-col" : ""
@@ -118,6 +164,14 @@ export function MailView({
                 onDoubleClick={resize.onDoubleClick}
               />
             ) : null}
+            <MailThreadList
+              list={list}
+              scope={scope}
+              mailboxes={mailboxes}
+              selectedId={threadId}
+              onSelect={(thread) => setThreadId(thread.id)}
+              folderSelected={folderId !== null}
+            />
           </section>
           {side === "off" ? null : (
             <section
