@@ -1301,7 +1301,9 @@ monocode.mail.syncIntervalSeconds // app-wide, applies to every source
 monocode.mail.listWidth
 monocode.mail.readingPaneSide     // right | bottom | off
 monocode.mail.density             // comfortable | compact
-monocode.mail.showImages          // ask | always | never  (mirrors the DB)
+// No showImages pref. The image policy lives in mail_account.image_policy and
+// Rust enforces it, so a localStorage mirror would be a second source of truth
+// that the enforcement point ignores. The settings control writes the DB.
 ```
 
 Events, following the existing `monocode:<thing>change` convention:
