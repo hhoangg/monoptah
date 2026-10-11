@@ -381,3 +381,105 @@ export type ThreadDetail = {
   imagePolicy: ImagePolicy;
   messages: MessageRow[];
 };
+
+// ── sending ────────────────────────────────────────────────────────
+
+export type OutboxKind = "new" | "reply" | "reply_all" | "forward";
+
+/**
+ * A file to attach. `cid` set makes it an inline image referenced from the
+ * body as `cid:<cid>`; it is the `contentId` mailCompose produced, without
+ * angle brackets.
+ */
+export type OutboxAttachment = {
+  path: string;
+  filename: string;
+  mime: string;
+  cid?: string | null;
+};
+
+/**
+ * Threading headers are not part of a draft: Rust derives In-Reply-To and
+ * References from `replyToMessageId`.
+ */
+export type OutboxDraft = {
+  /** Set to rewrite a draft or a failed send. */
+  id?: number | null;
+  kind: OutboxKind;
+  fromAddr: string;
+  replyToMessageId?: number | null;
+  to: MailAddress[];
+  cc: MailAddress[];
+  bcc: MailAddress[];
+  subject: string;
+  /** The TipTap document, the draft's source of truth. */
+  bodyJson: unknown;
+  /** From serializeCompose, which needs this draft's id: save, serialize, save. */
+  bodyText?: string | null;
+  bodyHtml?: string | null;
+  quotedHtml?: string | null;
+  attachments: OutboxAttachment[];
+};
+
+export type OutboxState = "draft" | "queued" | "sending" | "sent" | "failed";
+
+export type OutboxRow = Omit<OutboxDraft, "id" | "replyToMessageId"> & {
+  id: number;
+  accountId: number;
+  mailboxId: number | null;
+  threadId: number | null;
+  replyToMessageId: number | null;
+  inReplyTo: string | null;
+  references: string[];
+  state: OutboxState;
+  attempts: number;
+  lastError: string | null;
+  sesMessageId: string | null;
+  /** Epoch milliseconds. */
+  createdAt: number;
+  /** Epoch milliseconds. */
+  updatedAt: number;
+  /** Epoch milliseconds. */
+  sentAt: number | null;
+};
+
+export type SendableMailbox = MailMailbox & {
+  accountLabel: string;
+  sesRegion: string;
+  /** This source's configured default From address. */
+  isDefault: boolean;
+};
+
+/**
+ * Something SES would refuse, found before sending. `sendingDisabled` means
+ * AWS verified the identity but switched sending off for the account: it is
+ * not a DNS or verification problem and the copy must not say so.
+ */
+export type SendProblem = {
+  kind:
+    | "identityNotVerified"
+    | "identityPending"
+    | "sendingDisabled"
+    | "sendingPaused"
+    | "sandboxRecipients";
+  message: string;
+  addresses: string[];
+};
+
+export type SendReport = {
+  outboxId: number;
+  sesMessageId: string;
+  /** The stored message, once it is in its thread. */
+  messageId: number | null;
+  threadId: number | null;
+  /**
+   * `stored: false` means the copy is on this computer only, `reason` says
+   * why. The message was sent either way.
+   */
+  archive: { stored: boolean; reason: string | null };
+  /**
+   * Set when the message was sent but recording it locally failed. Show it as
+   * a warning; never offer a retry.
+   */
+  bookkeepingError: string | null;
+};

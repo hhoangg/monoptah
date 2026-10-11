@@ -10,8 +10,13 @@ import type {
   MailStatus,
   MailboxInput,
   MatchMode,
+  OutboxDraft,
+  OutboxRow,
   Page,
   Rule,
+  SendProblem,
+  SendReport,
+  SendableMailbox,
   SourceRow,
   SyncReport,
   SyncScope,
@@ -117,3 +122,28 @@ export const mailFolderDelete = (id: number) =>
 /** The mode changes the count, so pass the one the list will use. */
 export const mailFolderPreview = (rules: Rule[], matchMode: MatchMode) =>
   invoke<{ count: number }>("mail_folder_preview", { rules, matchMode });
+
+/** Creates a draft, or rewrites the one in `draft.id`. Returns its id. */
+export const mailOutboxSave = (draft: OutboxDraft) =>
+  invoke<number>("mail_outbox_save", { draft });
+
+/**
+ * Sends once and never retries. A rejection is recorded on the row and thrown;
+ * a send that succeeded resolves even when the sent/ copy or the local record
+ * failed, and says so in the report.
+ */
+export const mailOutboxSend = (id: number) =>
+  invoke<SendReport>("mail_outbox_send", { id });
+
+/** Problems SES would reject the message for, without sending it. */
+export const mailOutboxCheck = (id: number) =>
+  invoke<SendProblem[]>("mail_outbox_check", { id });
+
+export const mailOutboxList = () => invoke<OutboxRow[]>("mail_outbox_list");
+
+export const mailOutboxDelete = (id: number) =>
+  invoke<void>("mail_outbox_delete", { id });
+
+/** The From picker: verified mailboxes of enabled sources. */
+export const mailSendableMailboxes = () =>
+  invoke<SendableMailbox[]>("mail_sendable_mailboxes");

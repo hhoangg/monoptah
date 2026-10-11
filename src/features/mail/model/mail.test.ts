@@ -81,6 +81,14 @@ describe("mail command wrappers", () => {
       "mail_attachment_bytes",
       { attachmentId: 8 },
     ],
+    [
+      () => mail.mailOutboxSave({ kind: "new" } as never),
+      "mail_outbox_save",
+      { draft: { kind: "new" } },
+    ],
+    [() => mail.mailOutboxSend(5), "mail_outbox_send", { id: 5 }],
+    [() => mail.mailOutboxCheck(5), "mail_outbox_check", { id: 5 }],
+    [() => mail.mailOutboxDelete(5), "mail_outbox_delete", { id: 5 }],
     [() => mail.mailSourceTest(1), "mail_source_test", { id: 1 }],
     [
       () => mail.mailSourceDetectPrefixes(1),
@@ -110,4 +118,11 @@ describe("mail command wrappers", () => {
 it("lists folders without arguments", async () => {
   await mail.mailFolders();
   expect(invoke).toHaveBeenCalledWith("mail_folders");
+});
+
+it("lists the outbox and the From picker without arguments", async () => {
+  await mail.mailOutboxList();
+  await mail.mailSendableMailboxes();
+  expect(invoke).toHaveBeenCalledWith("mail_outbox_list");
+  expect(invoke).toHaveBeenCalledWith("mail_sendable_mailboxes");
 });
