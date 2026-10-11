@@ -1659,7 +1659,8 @@ pub(crate) fn unread_by_mailbox(
 ) -> rusqlite::Result<std::collections::HashMap<i64, i64>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT t.mailbox_id, SUM(t.unread_count) FROM mail_thread t
-             WHERE t.state = 'active' AND {NOT_FILED_AWAY} GROUP BY t.mailbox_id"
+             WHERE t.state = 'active' AND {} GROUP BY t.mailbox_id",
+        not_filed_away()
     ))?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     rows.collect()
@@ -1776,15 +1777,29 @@ fn thread_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
 const LISTED: &str = "t.state = 'active'
            AND EXISTS (SELECT 1 FROM mail_message m WHERE m.thread_id = t.id AND m.state = 'active')";
 
+/// Operators whose answer depends on the clock. The one list for both places
+/// that must treat such a rule specially: [`time_relative_folder`] and
+/// [`not_filed_away`]. A new relative operator goes here and nowhere else.
+const CLOCK_RELATIVE_OPS: &[&str] = &["within_days"];
+
 /// Threads in a folder that behaves like a real folder leave the mailbox views.
 /// A clock-relative folder never hides: its member rows go stale while its own
 /// view stays true, and a thread aged out of the folder would then be in
-/// neither place.
-const NOT_FILED_AWAY: &str = "NOT EXISTS (SELECT 1 FROM mail_folder_member fm
+/// neither place. Built from [`CLOCK_RELATIVE_OPS`], static literals only.
+fn not_filed_away() -> String {
+    let relative: Vec<String> = CLOCK_RELATIVE_OPS
+        .iter()
+        .map(|o| format!("'{o}'"))
+        .collect();
+    format!(
+        "NOT EXISTS (SELECT 1 FROM mail_folder_member fm
              JOIN mail_folder f ON f.id = fm.folder_id
              WHERE fm.thread_id = t.id AND f.hide_from_mailbox = 1
                AND NOT EXISTS (SELECT 1 FROM mail_folder_rule r
-                               WHERE r.folder_id = f.id AND r.op = 'within_days'))";
+                               WHERE r.folder_id = f.id AND r.op IN ({})))",
+        relative.join(", ")
+    )
+}
 
 /// A SQL condition on `t`, `b` and `a` plus its parameters.
 fn scope_filter(
@@ -1793,9 +1808,12 @@ fn scope_filter(
     now: i64,
 ) -> rusqlite::Result<(String, Vec<rusqlite::types::Value>)> {
     Ok(match scope {
-        ThreadScope::All => (format!("a.enabled = 1 AND {NOT_FILED_AWAY}"), Vec::new()),
+        ThreadScope::All => (
+            format!("a.enabled = 1 AND {}", not_filed_away()),
+            Vec::new(),
+        ),
         ThreadScope::Mailbox { mailbox_id } => (
-            format!("t.mailbox_id = ? AND {NOT_FILED_AWAY}"),
+            format!("t.mailbox_id = ? AND {}", not_filed_away()),
             vec![(*mailbox_id).into()],
         ),
         ThreadScope::Folder { folder_id } => match time_relative_folder(conn, *folder_id)? {
@@ -2896,9 +2914,7 @@ fn time_relative_folder(
     let rules = folder_rules(conn, folder_id)?;
     Ok(rules
         .iter()
-        // Every clock-relative operator must be listed here; `within_days` is
-        // the only one today (`before` and `after` are fixed instants).
-        .any(|r| r.op == "within_days")
+        .any(|r| CLOCK_RELATIVE_OPS.contains(&r.op.as_str()))
         .then(|| (rules, folder_match_mode(&mode))))
 }
 
@@ -3634,24 +3650,23 @@ mod tests {
         let store = SessionStore::open_in_memory().unwrap();
         let conn = store.lock_conn().unwrap();
         let fields: Vec<&str> = FIELD_OPS.iter().map(|(f, _)| *f).collect();
-        let ops = [
-            "is",
-            "contains",
-            "contains_any",
-            "contains_prefix",
-            "starts_with",
-            "ends_with",
-            "matches",
-            "before",
-            "after",
-            "within_days",
-            "true",
-        ];
+        // Every operator any field admits, so a new one is exercised by default.
+        let mut ops: Vec<&str> = Vec::new();
+        for (_, field_ops) in FIELD_OPS {
+            for op in *field_ops {
+                if !ops.contains(op) {
+                    ops.push(op);
+                }
+            }
+        }
+        for relative in CLOCK_RELATIVE_OPS {
+            assert!(ops.contains(relative), "{relative} is not an operator");
+        }
         let mut valid = 0;
         assert_eq!(fields.len(), 13);
         for field in fields {
             let allowed = allowed_ops(field).unwrap();
-            for op in ops {
+            for op in ops.clone() {
                 let value = match (field, op) {
                     (_, "contains_any") => serde_json::json!(["SENTINEL'a", "SENTINEL%b"]),
                     ("date", "within_days") => serde_json::json!(30),
