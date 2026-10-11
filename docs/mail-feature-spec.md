@@ -1085,7 +1085,7 @@ exists.
 | Region / credential / rule-field dropdowns | `SearchableSelect.tsx` | Has a `variant` of `field \| transparent \| row \| panel \| pill`. |
 | Mailbox colour, smart-folder colour | `ColorPickerPopover.tsx` (`ColorPickerPopover`, `ColorSwatchRow`) | Already exactly the swatch row in the mockup. |
 | `date` rule values | `DateTimePicker.tsx` | Plus its `toLocalDateTime` / `parseLocalDateTime` helpers. |
-| Resizable folder / list panes | `useDragResize` (`src/shared/hooks/useDragResize.ts`) | What `InboxView`, `Sidebar`, `NotesView` already use. Writes width straight to the DOM. |
+| Resizable thread-list pane | `useDragResize` (`src/shared/hooks/useDragResize.ts`) | What `InboxView`, `Sidebar`, `NotesView` already use. Writes width straight to the DOM. The **folder column is fixed at 232px**, as the mockup pins it, so `monocode.mail.listWidth` is the only width key and there is no folder-width key to add. |
 | Search-match highlighting in the thread list | `MatchText.tsx` | |
 | Lazy-loading `MailView` and the composer | `lazySurface.tsx` | |
 
