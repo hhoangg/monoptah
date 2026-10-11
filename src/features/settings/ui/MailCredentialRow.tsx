@@ -13,38 +13,82 @@ export const FIELD_CLASS =
 export const PILL_CLASS =
   "rounded-full border border-content/10 bg-content/5 px-1.5 text-[10px] text-content/70";
 
+// Commercial AWS regions. Goes stale whenever AWS opens one, which is why the
+// picker also offers "Custom region…" (gov, China and newer regions).
 const KNOWN_REGIONS = [
-  "us-east-1",
-  "us-east-2",
-  "us-west-1",
-  "us-west-2",
-  "ca-central-1",
-  "sa-east-1",
-  "eu-west-1",
-  "eu-west-2",
-  "eu-west-3",
-  "eu-central-1",
-  "eu-north-1",
-  "eu-south-1",
-  "ap-south-1",
-  "ap-southeast-1",
-  "ap-southeast-2",
-  "ap-northeast-1",
-  "ap-northeast-2",
-  "ap-northeast-3",
-  "ap-east-1",
-  "me-south-1",
+  "us-east-1", "us-east-2", "us-west-1", "us-west-2",
   "af-south-1",
+  "ap-east-1", "ap-east-2",
+  "ap-south-1", "ap-south-2",
+  "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4",
+  "ap-southeast-5", "ap-southeast-6", "ap-southeast-7",
+  "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+  "ca-central-1", "ca-west-1",
+  "eu-central-1", "eu-central-2",
+  "eu-west-1", "eu-west-2", "eu-west-3",
+  "eu-north-1", "eu-south-1", "eu-south-2",
+  "il-central-1",
+  "me-south-1", "me-central-1",
+  "mx-central-1",
+  "sa-east-1",
 ];
 
-/** Appends the stored value when unknown, so an install on a region not listed here keeps working. */
-export function regionOptions(current: string, withNone = false) {
+const CUSTOM_REGION = "__custom__";
+
+/**
+ * A dropdown stops typos in the common case; "Custom region…" reveals a text
+ * field so a region missing from the list is still enterable for a new source.
+ * Rust shape-checks whatever arrives. A stored unknown value is listed too.
+ */
+export function RegionSelect({
+  label,
+  value,
+  onChange,
+  allowNone = false,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  allowNone?: boolean;
+}) {
+  const [custom, setCustom] = useState(false);
   const regions =
-    current && !KNOWN_REGIONS.includes(current)
-      ? [...KNOWN_REGIONS, current]
+    value && !KNOWN_REGIONS.includes(value)
+      ? [...KNOWN_REGIONS, value]
       : KNOWN_REGIONS;
-  const options = regions.map((region) => ({ value: region, label: region }));
-  return withNone ? [{ value: "", label: "No default" }, ...options] : options;
+  const options = [
+    ...(allowNone ? [{ value: "", label: "No default" }] : []),
+    ...regions.map((region) => ({ value: region, label: region })),
+    { value: CUSTOM_REGION, label: "Custom region…" },
+  ];
+  return (
+    <div className="flex flex-col gap-1">
+      <SearchableSelect
+        label={label}
+        value={custom ? CUSTOM_REGION : value}
+        options={options}
+        onChange={(next) => {
+          if (next === CUSTOM_REGION) {
+            setCustom(true);
+            return;
+          }
+          setCustom(false);
+          onChange(next);
+        }}
+        searchPlaceholder="Search regions…"
+      />
+      {custom ? (
+        <input
+          aria-label={`${label} (custom)`}
+          className={FIELD_CLASS}
+          placeholder="e.g. us-gov-west-1"
+          spellCheck={false}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      ) : null}
+    </div>
+  );
 }
 
 /** Tauri rejects with the Rust `String`, not an `Error`. */
@@ -131,12 +175,11 @@ export function CredentialEditor({
         onChange={(event) => setSecret(event.target.value)}
       />
       <div className="w-40">
-        <SearchableSelect
+        <RegionSelect
           label="Default region"
           value={region}
-          options={regionOptions(region, true)}
           onChange={setRegion}
-          searchPlaceholder="Search regions…"
+          allowNone
         />
       </div>
       <SecondaryButton

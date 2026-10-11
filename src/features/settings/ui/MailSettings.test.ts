@@ -333,6 +333,7 @@ it("does not blame verification on a receive-only mailbox whose identity has sen
 it("keeps colour and display name when an existing address is re-added", async () => {
   sources[0].mailboxes[0].color = "#abc";
   sources[0].mailboxes[0].displayName = "Boss";
+  sources[0].mailboxes[0].sortOrder = 7;
   await render();
   vi.mocked(invoke).mockImplementation(async () => []);
   await setValue(
@@ -356,6 +357,7 @@ it("keeps colour and display name when an existing address is re-added", async (
         displayName: "Boss",
         color: "#abc",
         s3Prefix: "owner2/",
+        sortOrder: 7,
       }),
     ],
   });
@@ -374,4 +376,25 @@ it("offers regions as a dropdown that keeps an unknown stored region", async () 
   )!;
   expect(trigger.tagName).toBe("BUTTON");
   expect(trigger.textContent).toContain("xx-custom-1");
+});
+
+it("lets a new source use a region outside the list through Custom region", async () => {
+  await render();
+  await act(async () =>
+    [...container.querySelectorAll("button")]
+      .find((b) => b.textContent === "Add source")!
+      .click(),
+  );
+  const form = container.querySelector<HTMLFormElement>('form[aria-label="Add source"]')!;
+  await act(async () =>
+    form.querySelector<HTMLElement>('[aria-label^="S3 region"]')!.click(),
+  );
+  const options = [...document.querySelectorAll<HTMLElement>('[role="option"]')];
+  expect(options.some((o) => o.textContent === "ca-west-1")).toBe(true);
+  await act(async () =>
+    options.find((o) => o.textContent === "Custom region…")!.click(),
+  );
+  const field = form.querySelector<HTMLInputElement>('[aria-label="S3 region (custom)"]')!;
+  await setValue(field, "us-gov-west-1");
+  expect(field.value).toBe("us-gov-west-1");
 });

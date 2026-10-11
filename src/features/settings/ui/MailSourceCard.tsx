@@ -27,7 +27,7 @@ import {
   errorMessage,
   FIELD_CLASS,
   PILL_CLASS,
-  regionOptions,
+  RegionSelect,
 } from "./MailCredentialRow";
 
 const SAME_AS_SES = "";
@@ -612,13 +612,7 @@ export function SourceForm({
         />
       </FieldLabel>
       <FieldLabel text="SES region">
-        <SearchableSelect
-          label="SES region"
-          value={sesRegion}
-          options={regionOptions(sesRegion)}
-          onChange={setSesRegion}
-          searchPlaceholder="Search regions…"
-        />
+        <RegionSelect label="SES region" value={sesRegion} onChange={setSesRegion} />
       </FieldLabel>
       <FieldLabel text="Bucket">
         <input
@@ -629,13 +623,7 @@ export function SourceForm({
         />
       </FieldLabel>
       <FieldLabel text="S3 region">
-        <SearchableSelect
-          label="S3 region"
-          value={s3Region}
-          options={regionOptions(s3Region)}
-          onChange={setS3Region}
-          searchPlaceholder="Search regions…"
-        />
+        <RegionSelect label="S3 region" value={s3Region} onChange={setS3Region} />
       </FieldLabel>
       <FieldLabel text="S3 credential">
         <SearchableSelect
