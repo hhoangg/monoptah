@@ -327,14 +327,21 @@ pub(crate) fn credential_delete(
     secrets: &dyn SecretStore,
     id: i64,
 ) -> Result<(), String> {
-    let deleted = {
+    // Refuse first, while nothing has been touched: a credential still in use
+    // keeps its secret.
+    let exists = {
         let conn = store.lock_conn()?;
-        mail_store::delete_credential(&conn, id).map_err(db)?
+        mail_store::check_credential_unused(&conn, id).map_err(db)?
     };
-    if !deleted {
+    if !exists {
         return Err("That credential no longer exists.".into());
     }
-    secrets.remove(id)
+    // Secret before row: if the keychain fails the row survives, so the UI can
+    // retry. The other order leaves a secret nothing points at.
+    secrets.remove(id)?;
+    let conn = store.lock_conn()?;
+    mail_store::delete_credential(&conn, id).map_err(db)?;
+    Ok(())
 }
 
 // ── sources and mailboxes ──────────────────────────────────────────
@@ -873,8 +880,11 @@ pub enum SyncScope {
     Mailbox { id: i64 },
 }
 
-/// A mailbox scope syncs the source that owns it: the sync service works per
-/// source, and one extra prefix listing is cheap next to a second code path.
+/// `Mailbox` is wider than it sounds: it syncs the whole source that owns the
+/// mailbox, because the sync service works per source. Pressing sync on
+/// `owner@` therefore also rewrites the sync state, last-sync time and error
+/// badge of `support@` and every other mailbox in that source. A per-mailbox
+/// control must not promise otherwise.
 fn scope_account(store: &SessionStore, scope: SyncScope) -> Result<Option<i64>, String> {
     match scope {
         SyncScope::All => Ok(None),
@@ -1293,6 +1303,8 @@ pub fn mail_mailboxes_delete(
     Ok(())
 }
 
+/// Syncs one source or all of them. A `mailbox` scope syncs that mailbox's whole
+/// source (see [`scope_account`]); the reports are per source.
 #[tauri::command]
 pub async fn mail_sync_now(app: AppHandle, scope: SyncScope) -> Result<Vec<SyncReport>, String> {
     blocking(app.clone(), move |store, mail| {
@@ -1416,6 +1428,7 @@ mod tests {
     struct MemSecrets {
         map: Mutex<HashMap<i64, (String, String)>>,
         fail: AtomicBool,
+        fail_remove: AtomicBool,
     }
 
     impl SecretStore for MemSecrets {
@@ -1436,6 +1449,9 @@ mod tests {
             }))
         }
         fn remove(&self, id: i64) -> Result<(), String> {
+            if self.fail_remove.load(Ordering::SeqCst) {
+                return Err("keychain unavailable".into());
+            }
             self.map.lock().unwrap().remove(&id);
             Ok(())
         }
@@ -1730,6 +1746,102 @@ mod tests {
         source_delete(&store, source.account.id).unwrap();
         credential_delete(&store, &secrets, id).unwrap();
         assert!(secrets.get(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_secret_removal_keeps_the_credential_row() {
+        let (store, secrets) = setup();
+        let cred = credential(&store, &secrets, "spare");
+        secrets.fail_remove.store(true, Ordering::SeqCst);
+        assert!(credential_delete(&store, &secrets, cred.id).is_err());
+        let conn = store.lock_conn().unwrap();
+        assert!(mail_store::get_credential(&conn, cred.id)
+            .unwrap()
+            .is_some());
+        drop(conn);
+        secrets.fail_remove.store(false, Ordering::SeqCst);
+        credential_delete(&store, &secrets, cred.id).unwrap();
+        assert!(secrets.get(cred.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_used_credential_keeps_its_secret_when_delete_is_refused() {
+        let (store, secrets) = setup();
+        let (source, _) = one_source(&store, &secrets);
+        let id = source.account.credential_id;
+        assert!(credential_delete(&store, &secrets, id).is_err());
+        assert!(secrets.get(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unread_gone_message_leaves_no_badge() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (read_one, thread) =
+            ingest(&store, mailbox.id, &raw_mail("Hi", "g1", "one"), "owner/g1");
+        let raw = raw_mail("Re: Hi", "g2", "two");
+        let raw = String::from_utf8(raw)
+            .unwrap()
+            .replace("Subject:", "In-Reply-To: <g1@example.org>\r\nSubject:");
+        let (gone_one, thread2) = ingest(&store, mailbox.id, raw.as_bytes(), "owner/g2");
+        assert_eq!(thread, thread2);
+        {
+            let conn = store.lock_conn().unwrap();
+            conn.execute(
+                "UPDATE mail_message SET is_read = 1 WHERE id = ?1",
+                [read_one],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE mail_message SET state = 'gone' WHERE id = ?1",
+                [gone_one],
+            )
+            .unwrap();
+            // Opening the thread marks what it shows as read.
+            mail_store::set_threads_read(&conn, &[thread], true).unwrap();
+        }
+        let detail = thread_detail(&store, thread).unwrap();
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.thread.unread_count, 0);
+
+        // The recompute path agrees: the gone row is not counted.
+        let conn = store.lock_conn().unwrap();
+        conn.execute(
+            "UPDATE mail_message SET is_read = 0 WHERE id = ?1",
+            [gone_one],
+        )
+        .unwrap();
+        let rows = mail_store::thread_message_rows(&conn, thread).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows.iter().all(|r| r.is_read));
+    }
+
+    #[test]
+    fn mailbox_scope_resolves_to_the_owning_source() {
+        let (store, secrets) = setup();
+        let (source, mailbox) = one_source(&store, &secrets);
+        let other_cred = credential(&store, &secrets, "second");
+        let other = source_upsert(
+            &store,
+            account_input(other_cred.id, "acme", "eu-west-1", "acme-mail"),
+        )
+        .unwrap();
+        assert_eq!(scope_account(&store, SyncScope::All).unwrap(), None);
+        assert_eq!(
+            scope_account(
+                &store,
+                SyncScope::Source {
+                    id: other.account.id
+                }
+            )
+            .unwrap(),
+            Some(other.account.id)
+        );
+        assert_eq!(
+            scope_account(&store, SyncScope::Mailbox { id: mailbox.id }).unwrap(),
+            Some(source.account.id)
+        );
+        assert!(scope_account(&store, SyncScope::Mailbox { id: 9999 }).is_err());
     }
 
     #[test]

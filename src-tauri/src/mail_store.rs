@@ -395,6 +395,13 @@ pub(crate) fn list_credentials(conn: &Connection) -> rusqlite::Result<Vec<MailCr
 /// The check is explicit so the message is useful; `ON DELETE RESTRICT` backs
 /// it up.
 pub(crate) fn delete_credential(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    check_credential_unused(conn, id)?;
+    Ok(conn.execute("DELETE FROM mail_credential WHERE id = ?1", params![id])? > 0)
+}
+
+/// Whether the credential exists, erroring (naming the holders) if a source
+/// still uses it. Lets a caller refuse before it touches anything else.
+pub(crate) fn check_credential_unused(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare(
         "SELECT label FROM mail_account
          WHERE credential_id = ?1 OR s3_credential_id = ?1 ORDER BY label",
@@ -408,7 +415,11 @@ pub(crate) fn delete_credential(conn: &Connection, id: i64) -> rusqlite::Result<
             holders.join(", ")
         )));
     }
-    Ok(conn.execute("DELETE FROM mail_credential WHERE id = ?1", params![id])? > 0)
+    conn.query_row(
+        "SELECT COUNT(*) FROM mail_credential WHERE id = ?1",
+        params![id],
+        |row| Ok(row.get::<_, i64>(0)? > 0),
+    )
 }
 
 // ── accounts (sources) ─────────────────────────────────────────────
@@ -770,7 +781,8 @@ pub struct MailIdentity {
     pub identity: String,
     /// `domain` or `email`.
     pub kind: String,
-    /// `verified`, `pending` or `failed`.
+    /// `verified`, `pending`, `failed`, or `sending_disabled` (AWS verified it but
+    /// turned sending off, which is not a verification problem).
     pub status: String,
 }
 
@@ -1231,7 +1243,10 @@ pub(crate) fn insert_attachments(
     Ok(())
 }
 
-/// Messages of a thread, oldest first.
+/// Messages of a thread, oldest first. `gone` ones are left out: they are not
+/// shown, so they must not count, or an unread badge could outlive every
+/// message that can be opened to clear it. `archived` stays in, because
+/// archiving is a whole-thread state (spec section 10).
 pub(crate) fn thread_message_rows(
     conn: &Connection,
     thread_id: i64,
@@ -1239,7 +1254,7 @@ pub(crate) fn thread_message_rows(
     let mut stmt = conn.prepare(
         "SELECT subject, subject_key, from_name, from_addr, reply_to_addr, to_json,
                 cc_json, date_utc, is_read, has_attachments
-         FROM mail_message WHERE thread_id = ?1 ORDER BY date_utc, id",
+         FROM mail_message WHERE thread_id = ?1 AND state != 'gone' ORDER BY date_utc, id",
     )?;
     let rows = stmt.query_map(params![thread_id], |row| {
         Ok(ThreadMessageRow {
@@ -1962,7 +1977,8 @@ pub(crate) fn set_threads_read(
         )?;
         tx.execute(
             "UPDATE mail_thread SET unread_count =
-               (SELECT COUNT(*) FROM mail_message WHERE thread_id = ?1 AND is_read = 0)
+               (SELECT COUNT(*) FROM mail_message
+                WHERE thread_id = ?1 AND is_read = 0 AND state != 'gone')
              WHERE id = ?1",
             params![id],
         )?;

@@ -183,11 +183,11 @@ fn parse_identities(body: &[u8]) -> Result<(Vec<MailIdentity>, Option<String>), 
                 Some("EMAIL_ADDRESS") => "email",
                 _ => "domain",
             };
-            let verified = item.get("VerificationStatus").and_then(|v| v.as_str())
-                == Some("SUCCESS")
-                && item.get("SendingEnabled").and_then(|v| v.as_bool()) != Some(false);
+            let sending_off = item.get("SendingEnabled").and_then(|v| v.as_bool()) == Some(false);
             let status = match item.get("VerificationStatus").and_then(|v| v.as_str()) {
-                _ if verified => "verified",
+                // Not sendable either way, but the fix is in AWS, not in DNS.
+                Some("SUCCESS") if sending_off => "sending_disabled",
+                Some("SUCCESS") => "verified",
                 Some("PENDING" | "NOT_STARTED" | "TEMPORARY_FAILURE") => "pending",
                 _ => "failed",
             };
@@ -298,7 +298,7 @@ mod tests {
                 ("Byptah.com", "domain", "verified"),
                 ("a@x.com", "email", "pending"),
                 ("old.com", "domain", "failed"),
-                ("off.com", "domain", "failed"),
+                ("off.com", "domain", "sending_disabled"),
             ]
         );
         assert_eq!(next.as_deref(), Some("t1"));
