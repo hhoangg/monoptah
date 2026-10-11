@@ -984,8 +984,13 @@ than letting SES reject it after the fact.
 
 ### 8.3 Build
 
-`mail-builder` produces `multipart/mixed( multipart/alternative(text/plain,
-text/html), attachment* )`. Headers set explicitly: `From`, `To`, `Cc`, `Bcc`
+`mail-builder` produces
+`multipart/mixed( multipart/alternative( text/plain,
+multipart/related( text/html, inline-image* ) ), attachment* )`. The `related`
+wrapper is what binds a `cid:` reference to its bytes; without it an inline image
+is just an attachment the client will not place. Each wrapper is omitted when it
+would hold a single child, so a plain message stays a plain message. Headers set
+explicitly: `From`, `To`, `Cc`, `Bcc`
 (stripped from the MIME, passed only in `Destination`), `Subject`, `Date`,
 `Message-ID`, `In-Reply-To`, `References`, `MIME-Version`.
 
@@ -994,7 +999,17 @@ not an API failure. Base64 inflates by 4/3, so the check is on the encoded size.
 
 ### 8.4 After a successful send
 
-Three writes, one transaction:
+Three writes, and deliberately **not** one transaction. Step 1 commits on its own
+the moment SES accepts; steps 2 and 3 follow outside it. The reason is the rule
+that outranks atomicity here: **once SES has accepted, the caller must never see
+an error**, because a double-sent email cannot be recalled. So a failure in step 2
+or 3 is reported inside a successful `SendReport` as a bookkeeping error, never as
+`Err`, and nothing in the UI may offer a retry. Wrapping all three would make a
+failed `PutObject` roll back the record of a send that really happened.
+
+A send whose outcome is genuinely **unknown** — the connection dropped after the
+request body went out — is a third state, not a failure. It must be surfaced as
+such, because the retry affordance is the thing that turns it into a duplicate.
 
 1. `mail_outbox.state='sent'`, `ses_message_id`, `sent_at`.
 2. `mail_message` row with `direction='outbound'`, threaded by §6, FTS updated,
@@ -1370,6 +1385,12 @@ mail_folder_delete(id)
 mail_folder_preview(rules) -> PreviewCount                 // the live count in the editor
 
 mail_outbox_save(draft) -> i64
+mail_outbox_check(id) -> Vec<SendProblem>   // sandbox and sending_disabled, so
+                                            // §8.2's "block Send with the
+                                            // reason" has a surface that does
+                                            // not send. Shares find_problems
+                                            // with the send path, so the
+                                            // warning and the block cannot drift.
 mail_outbox_send(id) -> SendReport
 mail_outbox_list() / mail_outbox_delete(id)
 mail_identities(account_id: Option<i64>) -> Vec<Identity>
