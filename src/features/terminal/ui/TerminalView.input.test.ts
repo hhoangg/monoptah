@@ -9,7 +9,13 @@ const pty = vi.hoisted(() => ({
   resizePty: vi.fn(async () => {}),
   writePty: vi.fn(async () => {}),
   subscribePty: vi.fn(() => () => {}),
-  getPtyStatus: vi.fn(async () => ({ foreground: null })),
+  holdPtyBridge: vi.fn(() => () => {}),
+  // Rejects like the backend does for a PTY that is not running.
+  getPtyStatus: vi.fn(
+    async (_id?: string): Promise<{ foreground: string | null }> => {
+      throw new Error("Terminal is not running");
+    },
+  ),
 }));
 vi.mock("../../../platform/tauri/pty", () => pty);
 vi.mock("../model/terminalLayout", () => ({

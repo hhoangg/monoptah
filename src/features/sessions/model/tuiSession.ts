@@ -187,6 +187,8 @@ export type TuiExit = {
   error?: string;
   /** Exited within `TUI_EARLY_EXIT_MS` of launch. */
   early: boolean;
+  /** The CLI said it could not find the conversation it was asked to resume. */
+  noConversation?: boolean;
 };
 
 /**
@@ -215,6 +217,12 @@ export function tuiExitNotice(
   }
   const message =
     exit.code == null ? "Process exited" : `Process exited (code ${exit.code})`;
+  if (exit.noConversation && !exit.early) {
+    return {
+      message,
+      hint: `${label} could not find the saved conversation. Start a new one to continue.`,
+    };
+  }
   if (!exit.early) return { message };
   return {
     message,
@@ -260,7 +268,12 @@ export function canStartFreshAfter(
   exit: TuiExit,
   resumed: boolean,
 ): boolean {
-  return !exit.error && exit.early && resumed && TUI_CAPS[harness].resume;
+  return (
+    !exit.error &&
+    (exit.early || !!exit.noConversation) &&
+    resumed &&
+    TUI_CAPS[harness].resume
+  );
 }
 
 /**

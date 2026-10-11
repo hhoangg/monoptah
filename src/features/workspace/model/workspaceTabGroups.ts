@@ -2,6 +2,7 @@ import {
   closeLeaf,
   focusedFileTab,
   firstLeafId,
+  isTerminalTab,
   leaf,
   leafIds,
   placeLayout,
@@ -18,6 +19,7 @@ import {
   sessionWorkCwd,
   type Session,
 } from "../../sessions/model/session";
+import { isTuiSession, tuiPtyId } from "../../sessions/model/tuiSession";
 
 export function workspaceTabCwd(
   tab: WorkspaceTab,
@@ -101,13 +103,18 @@ export function findOpenSessionTab(
   return tabs.find((tab) => leafIds(tab.layout).includes(sessionId));
 }
 
-/** Show another session in the focused pane without changing the active tab. */
+/**
+ * Show another session in the focused pane without changing the active tab.
+ * `movedPtyIds` names the processes whose views remount because their pane
+ * lands in another tab's tree; the caller hands them off before committing.
+ */
 export function switchSessionInTab(
   tabs: readonly WorkspaceTab[],
   activeTabId: string,
   currentSessionId: string,
   targetSessionId: string,
-): WorkspaceTab[] | null {
+  sessions: readonly Session[],
+): { tabs: WorkspaceTab[]; movedPtyIds: string[] } | null {
   const activeTab = tabs.find((tab) => tab.id === activeTabId);
   if (!activeTab || activeTab.diffFocused) return null;
   if (activeTab.focusedId !== currentSessionId) return null;
@@ -118,14 +125,26 @@ export function switchSessionInTab(
     leafIds(tab.layout).includes(targetSessionId),
   );
   if (targetTab?.id === activeTabId) {
-    return tabs.map((tab) =>
-      tab.id === activeTabId
-        ? { ...tab, focusedId: targetSessionId, diffFocused: false }
-        : tab,
-    );
+    return {
+      tabs: tabs.map((tab) =>
+        tab.id === activeTabId
+          ? { ...tab, focusedId: targetSessionId, diffFocused: false }
+          : tab,
+      ),
+      movedPtyIds: [],
+    };
   }
 
-  return tabs.map((tab) => {
+  // With a target tab the two sessions trade places, so each lands in the
+  // other tab's tree. Without one the focused session is evicted from every
+  // tab, not moved: its view must kill the process, so nothing is reported.
+  const movedPtyIds = targetTab
+    ? [
+        ...ptyIdsOfPanes(activeTab, [currentSessionId], sessions),
+        ...ptyIdsOfPanes(targetTab, [targetSessionId], sessions),
+      ]
+    : [];
+  const next = tabs.map((tab) => {
     if (tab.id === activeTabId) {
       return {
         ...tab,
@@ -144,6 +163,7 @@ export function switchSessionInTab(
     }
     return tab;
   });
+  return { tabs: next, movedPtyIds };
 }
 
 /** Add a chat beside a file-only tab so an add-to-chat request has a target. */
@@ -243,6 +263,64 @@ export function planWorkspaceTabClose({
   return { action: "keep" };
 }
 
+export type SessionPaneClosePlan =
+  | { action: "none" }
+  /** The pane was one of several: keep the tab with the remaining layout. */
+  | {
+      action: "remove-pane";
+      tabId: string;
+      layout: WorkspaceTab["layout"];
+      focusedId: string;
+    }
+  /** The pane was the tab's last: drop the tab. */
+  | { action: "close-tab"; tabId: string }
+  /** The pane was the last of the last tab: reset the tab to a blank session. */
+  | { action: "clear-tab"; tabId: string };
+
+/**
+ * Plan closing one session's pane in whichever tab owns it, active or not.
+ * The session itself is never touched; it stays parked in the history list.
+ * Returns "none" when no tab holds the session, so a repeat is a no-op.
+ */
+export function planSessionPaneClose({
+  tabs,
+  sessions,
+  sessionId,
+  scope,
+  worktreeOf,
+}: {
+  tabs: WorkspaceTab[];
+  sessions: Session[];
+  sessionId: string;
+  scope: WorkspaceTabCloseScope;
+  worktreeOf?: (tab: WorkspaceTab) => string | null;
+}): SessionPaneClosePlan {
+  if (!sessions.some((session) => session.id === sessionId)) {
+    return { action: "none" };
+  }
+  const tab = tabs.find((entry) => leafIds(entry.layout).includes(sessionId));
+  if (!tab) return { action: "none" };
+  const next = closeLeaf(tab, sessionId);
+  if (next) {
+    return {
+      action: "remove-pane",
+      tabId: tab.id,
+      layout: next.layout,
+      focusedId: next.focusedId,
+    };
+  }
+  const plan = planWorkspaceTabClose({
+    tabs,
+    sessions,
+    closingTabId: tab.id,
+    scope,
+    worktreeOf,
+  });
+  return plan.action === "keep"
+    ? { action: "clear-tab", tabId: tab.id }
+    : { action: "close-tab", tabId: tab.id };
+}
+
 /**
  * Drop a session onto a pane edge in the tab that owns `targetId`.
  * Already-open chats move; a blank target is replaced; a chat open
@@ -270,12 +348,24 @@ export function applyPlaceSessionOnPane({
   tabs: WorkspaceTab[];
   sessions: Session[];
   activeTabId: string;
+  /** PTYs whose views remount because their pane left another tab. */
+  movedPtyIds: string[];
 } | null {
   if (sessionId === targetId) return null;
   const targetIndex = tabs.findIndex((tab) =>
     leafIds(tab.layout).includes(targetId),
   );
   if (targetIndex < 0) return null;
+
+  // Only a session coming from another tab remounts; one already in the
+  // target tab keeps its view (leaves are keyed by id).
+  const sourceTab = tabs.find(
+    (tab, index) =>
+      index !== targetIndex && leafIds(tab.layout).includes(sessionId),
+  );
+  const movedPtyIds = sourceTab
+    ? ptyIdsOfPanes(sourceTab, [sessionId], sessions)
+    : [];
 
   let nextSessions = replaceTarget
     ? sessions.filter((session) => session.id !== targetId)
@@ -328,7 +418,12 @@ export function applyPlaceSessionOnPane({
     };
   }
 
-  return { tabs: nextTabs, sessions: nextSessions, activeTabId: targetTabId };
+  return {
+    tabs: nextTabs,
+    sessions: nextSessions,
+    activeTabId: targetTabId,
+    movedPtyIds,
+  };
 }
 
 /**
@@ -354,6 +449,8 @@ export function applyPlaceTabOnPane({
   sessions: Session[];
   activeTabId: string;
   focusedId: string;
+  /** PTYs whose views remount because their pane joined the target's tree. */
+  movedPtyIds: string[];
 } | null {
   const source = tabs.find((tab) => tab.id === sourceTabId);
   const target = tabs.find((tab) => leafIds(tab.layout).includes(targetId));
@@ -388,6 +485,8 @@ export function applyPlaceTabOnPane({
     sessions: nextSessions,
     activeTabId: target.id,
     focusedId: source.focusedId,
+    // Every pane of the source tab joins the target tab's tree.
+    movedPtyIds: ptyIdsOfPanes(source, leafIds(source.layout), sessions),
   };
 }
 
@@ -397,12 +496,14 @@ export function applyPlaceTabOnPane({
  */
 export function applyDetachPaneToTab({
   tabs,
+  sessions,
   paneId,
   targetTabId,
   position,
   createTabId = () => crypto.randomUUID(),
 }: {
   tabs: WorkspaceTab[];
+  sessions: readonly Session[];
   paneId: string;
   targetTabId: string;
   position: "before" | "after";
@@ -411,6 +512,8 @@ export function applyDetachPaneToTab({
   tabs: WorkspaceTab[];
   activeTabId: string;
   focusedId: string;
+  /** PTYs whose views remount because the pane lands in a new tab's tree. */
+  movedPtyIds: string[];
 } | null {
   const sourceIndex = tabs.findIndex((tab) =>
     leafIds(tab.layout).includes(paneId),
@@ -460,7 +563,37 @@ export function applyDetachPaneToTab({
   };
   const nextTabs = withoutDetached.slice();
   nextTabs.splice(insertAt, 0, detached);
-  return { tabs: nextTabs, activeTabId: detached.id, focusedId: paneId };
+  return {
+    tabs: nextTabs,
+    activeTabId: detached.id,
+    focusedId: paneId,
+    movedPtyIds: ptyIdsOfPanes(source, [paneId], sessions),
+  };
+}
+
+/**
+ * PTY ids behind these leaves of `tab`: a terminal-surface session's PTY, and
+ * every terminal file in a surface pane. Chats and editors have none.
+ */
+export function ptyIdsOfPanes(
+  tab: WorkspaceTab,
+  paneIds: readonly string[],
+  sessions: readonly Session[],
+): string[] {
+  const ids: string[] = [];
+  for (const paneId of paneIds) {
+    if (isTuiSession(sessions.find((s) => s.id === paneId))) {
+      ids.push(tuiPtyId(paneId));
+    }
+    const surfaces = [...tab.editorPanes, ...(tab.terminalPanes ?? [])];
+    for (const pane of surfaces) {
+      if (pane.id !== paneId) continue;
+      for (const file of pane.files) {
+        if (isTerminalTab(file)) ids.push(file.id);
+      }
+    }
+  }
+  return ids;
 }
 
 export function isGroupableProject(

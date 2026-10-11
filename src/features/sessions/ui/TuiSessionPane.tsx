@@ -1,10 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { buildTuiLaunch } from "../../../integrations/harness/core/tuiLaunch";
 import { resolveTuiBinary } from "../../../integrations/harness/core/tuiBinary";
-import type { PtyLaunch } from "../../../platform/tauri/pty";
+import { type PtyLaunch } from "../../../platform/tauri/pty";
+import { claimPtyArrival } from "../../terminal/model/ptyHandoff";
+import { MOD } from "../../../platform/tauri/platform";
 import { prettyCwd } from "../../../shared/lib/paths";
-import { FolderTree } from "../../../shared/ui/icons";
+import { FolderTree, GripVertical, X } from "../../../shared/ui/icons";
 import { lazySurface } from "../../../shared/ui/lazySurface";
 import {
   providerAccountExists,
@@ -43,9 +51,34 @@ const TerminalView = lazySurface(async () => {
  */
 const autoTitles = new Map<string, string>();
 
+/**
+ * How each session's CLI was last launched. A pane that moves to another tab
+ * attaches to the running process instead of launching, so the early-exit
+ * window must keep counting from the real launch, and the resume affordances
+ * must keep reflecting how it started, not what the remount can see.
+ */
+const launchedAt = new Map<
+  string,
+  { at: number; reusedId: boolean; claimed: boolean }
+>();
+
+/**
+ * The exit each session's pane last settled on, until it is launched again. A
+ * pane moved after its process ended has nothing to attach to; it shows this
+ * instead, so the real code, notice and restart options survive the move.
+ */
+const settledExits = new Map<string, TuiExit>();
+
 type Prepared = {
   attempt: number;
-  launch: PtyLaunch;
+  /**
+   * Attach to the process the pane's previous view left running; no launch is
+   * built and nothing is spawned. Set only for a pane that was just moved.
+   */
+  attach?: boolean;
+  launch?: PtyLaunch;
+  /** The process had already exited; nothing to mount, only the exit to show. */
+  settled?: boolean;
   /** The launch used an id saved earlier, by resuming or by claiming it. */
   reusedId: boolean;
   /** This launch is the automatic retry that claims a never-used saved id. */
@@ -65,6 +98,14 @@ type Props = {
   onTitleChange: (sessionId: string, title: string) => void;
   /** Reports each launch outcome: started, or settled on an exit. */
   onLaunchEvent?: (sessionId: string, event: TuiLaunchEvent) => void;
+  inSplit?: boolean;
+  onPaneDragStart?: (event: ReactPointerEvent<HTMLElement>) => void;
+  onClose?: (sessionId: string) => void;
+  /**
+   * The process ran for a while and exited cleanly, so the pane has nothing
+   * left to show. The session itself is kept.
+   */
+  onExitClose?: (sessionId: string) => void;
 };
 
 /** A provider's own interactive CLI in a PTY, in place of the chat transcript. */
@@ -76,6 +117,10 @@ export function TuiSessionPane({
   onSessionChange,
   onTitleChange,
   onLaunchEvent,
+  inSplit = false,
+  onPaneDragStart,
+  onClose,
+  onExitClose,
 }: Props) {
   const sessionRef = useRef(session);
   sessionRef.current = session;
@@ -85,11 +130,17 @@ export function TuiSessionPane({
   onTitleChangeRef.current = onTitleChange;
   const onLaunchEventRef = useRef(onLaunchEvent);
   onLaunchEventRef.current = onLaunchEvent;
+  const onExitCloseRef = useRef(onExitClose);
+  onExitCloseRef.current = onExitClose;
 
   const [attempt, setAttempt] = useState(0);
   const [prepared, setPrepared] = useState<Prepared | null>(null);
   const [exit, setExit] = useState<TuiExit | null>(null);
   const startedAt = useRef(0);
+  // Whether this pane was just moved. Claimed once per session id and kept
+  // across a StrictMode replay of the effect, which would otherwise find the
+  // record already consumed and launch over the running process.
+  const arrival = useRef<{ id: string; attach: boolean } | null>(null);
   const preparedRef = useRef(prepared);
   preparedRef.current = prepared;
   // Set to relaunch once under `--session-id` after a resume found nothing.
@@ -113,6 +164,42 @@ export function TuiSessionPane({
     setExit(null);
     void (async () => {
       const current = sessionRef.current;
+      if (arrival.current?.id !== current.id) {
+        arrival.current = {
+          id: current.id,
+          attach: claimPtyArrival(tuiPtyId(current.id)),
+        };
+      }
+      // A pane moved from another tab finds its CLI still running. Attaching
+      // sends it nothing, so no launch is built and no saved id is touched.
+      // Only the first attempt attaches: a restart means the process is gone.
+      if (arrival.current.attach && attempt === 0) {
+        const launched = launchedAt.get(current.id);
+        const settled = settledExits.get(current.id);
+        if (settled) {
+          // The process ended before the move, so there is nothing to attach
+          // to: a view asked to would report a lost process in place of how
+          // it really ended.
+          setPrepared({
+            attempt,
+            settled: true,
+            reusedId: launched?.reusedId ?? !!current.providerSessionId,
+            claimed: launched?.claimed ?? false,
+          });
+          setExit(settled);
+          return;
+        }
+        // Without a record, count from now: a quick exit then keeps the pane
+        // and its notice instead of closing it unseen.
+        startedAt.current = launched?.at ?? Date.now();
+        setPrepared({
+          attempt,
+          attach: true,
+          reusedId: launched?.reusedId ?? !!current.providerSessionId,
+          claimed: launched?.claimed ?? false,
+        });
+        return;
+      }
       const provider = supportsProviderAccounts(current.harness)
         ? current.harness
         : undefined;
@@ -178,9 +265,16 @@ export function TuiSessionPane({
       if (cancelled) return;
       const providerAccount = tuiProviderAccount(current.harness, accountId);
       startedAt.current = Date.now();
+      settledExits.delete(current.id);
+      const reusedId = !!current.providerSessionId && !newId;
+      launchedAt.set(current.id, {
+        at: startedAt.current,
+        reusedId,
+        claimed: !!claim,
+      });
       setPrepared({
         attempt,
-        reusedId: !!current.providerSessionId && !newId,
+        reusedId,
         claimed: !!claim,
         launch: {
           program: built.program,
@@ -219,9 +313,22 @@ export function TuiSessionPane({
         setAttempt((count) => count + 1);
         return;
       }
-      const exit: TuiExit = { code: result.code, error: result.error, early };
+      const noConversation = isNoConversationOutput(result.output);
+      const exit: TuiExit = {
+        code: result.code,
+        error: result.error,
+        early,
+        ...(noConversation ? { noConversation } : {}),
+      };
       setExit(exit);
+      settledExits.set(sessionRef.current.id, exit);
       onLaunchEventRef.current?.(sessionRef.current.id, { kind: "exit", exit });
+      // A failed or early exit keeps the pane so its notice can be read, and so
+      // does a late "no conversation" (print mode exits 0 for it). The close
+      // lands after the launch event so an automation run settles first.
+      if (result.code === 0 && !result.error && !early && !noConversation) {
+        onExitCloseRef.current?.(sessionRef.current.id);
+      }
     },
     [],
   );
@@ -261,7 +368,26 @@ export function TuiSessionPane({
       className="flex h-full min-h-0 min-w-0 flex-1 flex-col"
       onMouseDown={() => onFocus(session.id)}
     >
-      <div className="flex h-8 shrink-0 items-center gap-2 border-b border-stroke px-3 text-[12px] text-content/55">
+      <div
+        className={`flex h-8 shrink-0 items-center gap-2 border-b border-stroke px-3 text-[12px] text-content/55 ${
+          inSplit && onPaneDragStart
+            ? "cursor-grab touch-none select-none active:cursor-grabbing"
+            : ""
+        }`}
+        onPointerDown={(event) => {
+          if (event.button !== 0 || !inSplit || !onPaneDragStart) return;
+          if ((event.target as HTMLElement | null)?.closest("[data-no-drag]")) {
+            return;
+          }
+          onPaneDragStart(event);
+        }}
+      >
+        {inSplit && onPaneDragStart ? (
+          <GripVertical
+            className="size-3.5 shrink-0 text-content/35"
+            strokeWidth={1.75}
+          />
+        ) : null}
         <HarnessIcon harness={session.harness} className="size-3.5 shrink-0" />
         <span className="shrink-0">{label} terminal</span>
         <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-content/40">
@@ -271,6 +397,7 @@ export function TuiSessionPane({
           <button
             type="button"
             disabled
+            data-no-drag
             title="Not available in terminal sessions. A terminal session runs in the current checkout. Use a chat session to start in a new worktree."
             aria-label="New worktree is not available in terminal sessions"
             className="flex h-6 shrink-0 items-center gap-1.5 rounded-md px-1.5 text-content/55 disabled:opacity-40"
@@ -279,16 +406,35 @@ export function TuiSessionPane({
             <span>New worktree unavailable</span>
           </button>
         )}
+        {inSplit && onClose ? (
+          <button
+            type="button"
+            title={`Close Pane (${MOD}W)`}
+            aria-label="Close pane"
+            data-no-drag
+            className="grid size-5 shrink-0 place-items-center rounded text-content/50 hover:bg-content/10 hover:text-content"
+            onPointerDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onClose(session.id);
+            }}
+          >
+            <X className="size-3" strokeWidth={1.75} />
+          </button>
+        ) : null}
       </div>
       <div className="relative min-h-0 min-w-0 flex-1">
-        {prepared ? (
+        {prepared && !prepared.settled ? (
           <TerminalView
             key={prepared.attempt}
             id={tuiPtyId(session.id)}
             cwd={tuiLaunchCwd(session)}
             active={visible && focused && !exit}
             launch={prepared.launch}
+            attach={!!prepared.attach}
             onExit={onExit}
+            captureExitOutput
             onTitleChange={onTitle}
             onSpawn={onSpawn}
           />

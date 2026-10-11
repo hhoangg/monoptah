@@ -199,6 +199,7 @@ type Shared = {
   ) => Promise<void>;
   onTuiTitleChange: (sessionId: string, title: string) => void;
   onTuiLaunchEvent?: (sessionId: string, event: TuiLaunchEvent) => void;
+  onTuiExitClose?: (sessionId: string) => void;
   transcriptPool?: TranscriptPool;
 };
 
@@ -289,6 +290,7 @@ function PaneTreeComponent({
   onTuiSessionChange,
   onTuiTitleChange,
   onTuiLaunchEvent,
+  onTuiExitClose,
   transcriptPool,
 }: Props) {
   const treeRef = useRef<HTMLDivElement>(null);
@@ -516,6 +518,10 @@ function PaneTreeComponent({
                   onSessionChange={onTuiSessionChange}
                   onTitleChange={onTuiTitleChange}
                   onLaunchEvent={onTuiLaunchEvent}
+                  onExitClose={onTuiExitClose}
+                  inSplit={inSplit}
+                  onPaneDragStart={onPaneDragStart}
+                  onClose={onClose}
                 />
               ) : session ? (
                 <SessionPane

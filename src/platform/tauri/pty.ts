@@ -13,6 +13,8 @@ const dataHandlers = new Map<string, DataHandler>();
 const exitHandlers = new Map<string, ExitHandler>();
 const dataBuffer = new Map<string, Uint8Array[]>();
 const dataBufferBytes = new Map<string, number>();
+/** Exit that landed while no view was subscribed, replayed after the data. */
+const exitBuffer = new Map<string, number | null>();
 /** PTYs this window opened. Global `pty-data` still fires for every terminal
  * in the process; decoding those in a window that never mounted them was
  * megabytes of base64 work and a 256KB replay buffer per stranger id. */
@@ -103,7 +105,9 @@ function ensureBridge() {
     }),
     listen<ExitPayload>("pty-exit", (event) => {
       const { id, code } = event.payload;
-      exitHandlers.get(id)?.(code);
+      const handler = exitHandlers.get(id);
+      if (handler) handler(code);
+      else if (openedPtys.has(id)) exitBuffer.set(id, code);
     }),
   ]);
 }
@@ -130,6 +134,22 @@ function release() {
 }
 
 /**
+ * Keeps the event bridge up without listening for a PTY. Hold it across a gap
+ * where one view has unsubscribed and the next has not yet subscribed, so the
+ * listeners are not torn down and the output in between is still buffered.
+ * Call the returned function once to let go.
+ */
+export function holdPtyBridge(): () => void {
+  retain();
+  let held = true;
+  return () => {
+    if (!held) return;
+    held = false;
+    release();
+  };
+}
+
+/**
  * A program to run in the PTY instead of the login shell. Mirrors the Rust
  * `PtyLaunch`; `providerAccount` scopes it to a provider account profile the
  * same way `spawnChild` does. `binaryProvider` and `binaryPath` let the backend
@@ -150,6 +170,8 @@ export async function spawnPty(
   rows: number,
   launch?: PtyLaunch,
 ): Promise<void> {
+  // An exit buffered for an earlier process of this id is not this one's.
+  exitBuffer.delete(id);
   await invoke("pty_spawn", { id, cwd, cols, rows, launch });
 }
 
@@ -176,6 +198,7 @@ export async function killPty(id: string): Promise<void> {
   exitHandlers.delete(id);
   openedPtys.delete(id);
   clearBuffered(id);
+  exitBuffer.delete(id);
   await invoke("pty_kill", { id }).catch(() => undefined);
 }
 
@@ -185,6 +208,7 @@ export async function killAllPtys(): Promise<void> {
   openedPtys.clear();
   dataBuffer.clear();
   dataBufferBytes.clear();
+  exitBuffer.clear();
   await invoke("pty_kill_all").catch(() => undefined);
 }
 
@@ -201,6 +225,11 @@ export function subscribePty(
   if (queued) {
     clearBuffered(id);
     for (const chunk of queued) onData(chunk);
+  }
+  if (exitBuffer.has(id)) {
+    const code = exitBuffer.get(id) ?? null;
+    exitBuffer.delete(id);
+    onExit(code);
   }
   return () => {
     if (dataHandlers.get(id) === onData) dataHandlers.delete(id);
