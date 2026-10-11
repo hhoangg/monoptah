@@ -13,7 +13,7 @@
 //!
 //! Bookkeeping timestamps (`created_at`, `updated_at`, `refreshed_at`) are epoch
 //! milliseconds like the rest of the database; `date_utc` stays in seconds.
-// The Tauri command layer that calls these functions arrives in a later task.
+// Folder, outbox and delete helpers are consumed by later mail commands.
 #![allow(dead_code)]
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -27,7 +27,8 @@ const MASK_VISIBLE_SUFFIX: usize = 4;
 
 pub(crate) fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
     create_tables(conn)?;
-    ensure_object_attempts(conn)
+    ensure_object_attempts(conn)?;
+    ensure_identities_refreshed_at(conn)
 }
 
 fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
@@ -257,20 +258,42 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// For databases created before `parse_attempts` was in the DDL.
-fn ensure_object_attempts(conn: &Connection) -> rusqlite::Result<()> {
+/// `CREATE TABLE IF NOT EXISTS` never adds a column to a table that already
+/// exists, so a column added to the DDL after a dev build needs this as well.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
     let present: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('mail_object') WHERE name = 'parse_attempts'",
-        [],
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
         |row| row.get(0),
     )?;
     if present == 0 {
         conn.execute(
-            "ALTER TABLE mail_object ADD COLUMN parse_attempts INTEGER NOT NULL DEFAULT 0",
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
             [],
         )?;
     }
     Ok(())
+}
+
+/// For databases created before `parse_attempts` was in the DDL.
+fn ensure_object_attempts(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(
+        conn,
+        "mail_object",
+        "parse_attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+}
+
+/// For databases created before `identities_refreshed_at` was in the DDL.
+/// NULL is the right backfill: those databases never fetched identities.
+fn ensure_identities_refreshed_at(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "mail_account", "identities_refreshed_at", "INTEGER")
 }
 
 /// A user-facing error carried through `rusqlite::Error` so callers keep a
@@ -455,10 +478,36 @@ fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailAccount> {
     })
 }
 
+/// Forgets the cached SES identities of a source and what they decided. They
+/// belong to one (credential, SES region) pair, so after either changes they
+/// describe a different account; `is_sendable` returns to its pre-refresh
+/// default until the next refresh.
+fn clear_identities(conn: &Connection, account_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM mail_identity WHERE account_id = ?1",
+        params![account_id],
+    )?;
+    conn.execute(
+        "UPDATE mail_account SET identities_refreshed_at = NULL WHERE id = ?1",
+        params![account_id],
+    )?;
+    conn.execute(
+        "UPDATE mail_mailbox SET is_sendable = 1 WHERE account_id = ?1",
+        params![account_id],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn upsert_account(conn: &Connection, input: &AccountInput) -> rusqlite::Result<i64> {
     let now = now_millis();
     if let Some(id) = input.id {
-        let changed = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let previous: (i64, String) = tx.query_row(
+            "SELECT credential_id, ses_region FROM mail_account WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        tx.execute(
             "UPDATE mail_account SET provider = ?1, credential_id = ?2, s3_credential_id = ?3,
                label = ?4, ses_region = ?5, bucket = ?6, s3_region = ?7, default_from = ?8,
                attach_policy = ?9, image_policy = ?10, enabled = ?11, sort_order = ?12,
@@ -481,9 +530,10 @@ pub(crate) fn upsert_account(conn: &Connection, input: &AccountInput) -> rusqlit
                 id
             ],
         )?;
-        if changed == 0 {
-            return Err(rusqlite::Error::QueryReturnedNoRows);
+        if previous != (input.credential_id, input.ses_region.clone()) {
+            clear_identities(&tx, id)?;
         }
+        tx.commit()?;
         return Ok(id);
     }
     conn.query_row(
@@ -529,9 +579,38 @@ pub(crate) fn list_accounts(conn: &Connection) -> rusqlite::Result<Vec<MailAccou
     rows.collect()
 }
 
+/// Ids of every message stored under a source, for cleaning up what lives
+/// outside SQLite (attachment files) after the rows are gone.
+pub(crate) fn message_ids_in_account(
+    conn: &Connection,
+    account_id: i64,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id FROM mail_message m JOIN mail_mailbox b ON b.id = m.mailbox_id
+         WHERE b.account_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![account_id], |row| row.get(0))?;
+    rows.collect()
+}
+
+pub(crate) fn message_ids_in_mailbox(
+    conn: &Connection,
+    mailbox_id: i64,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM mail_message WHERE mailbox_id = ?1")?;
+    let rows = stmt.query_map(params![mailbox_id], |row| row.get(0))?;
+    rows.collect()
+}
+
 /// Deletes a source. Its mailboxes, identities, threads, messages and outbox
-/// rows go with it (cascade).
+/// rows go with it (cascade). Messages are removed one by one first, because
+/// the contentless FTS table has no triggers and a cascade would orphan its
+/// rows. Run it inside a transaction: a failure part way must not leave a
+/// source with half its messages.
 pub(crate) fn delete_account(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    for message_id in message_ids_in_account(conn, id)? {
+        remove_message(conn, message_id)?;
+    }
     Ok(conn.execute("DELETE FROM mail_account WHERE id = ?1", params![id])? > 0)
 }
 
@@ -599,6 +678,20 @@ pub(crate) fn upsert_mailboxes(
                 )));
             }
         }
+        let prefix_holder: Option<String> = tx
+            .query_row(
+                "SELECT address FROM mail_mailbox
+                 WHERE account_id = ?1 AND s3_prefix = ?2 AND address != ?3",
+                params![account_id, mailbox.s3_prefix, address],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(holder) = prefix_holder {
+            return Err(user_error(format!(
+                "prefix '{}' is already used by {holder}",
+                mailbox.s3_prefix
+            )));
+        }
         tx.execute(
             "INSERT INTO mail_mailbox
                (account_id, address, domain, s3_prefix, display_name, color, sort_order)
@@ -660,7 +753,12 @@ pub(crate) fn list_mailboxes(
     rows.collect()
 }
 
+/// Same contract as [`delete_account`]: messages go through `remove_message`
+/// first, and the caller supplies the transaction.
 pub(crate) fn delete_mailbox(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    for message_id in message_ids_in_mailbox(conn, id)? {
+        remove_message(conn, message_id)?;
+    }
     Ok(conn.execute("DELETE FROM mail_mailbox WHERE id = ?1", params![id])? > 0)
 }
 
@@ -1480,6 +1578,474 @@ pub(crate) fn delete_thread_if_empty(conn: &Connection, thread_id: i64) -> rusql
     )? > 0)
 }
 
+// ── lookups for the command layer ──────────────────────────────────
+
+pub(crate) fn get_credential(
+    conn: &Connection,
+    id: i64,
+) -> rusqlite::Result<Option<MailCredential>> {
+    Ok(list_credentials(conn)?.into_iter().find(|c| c.id == id))
+}
+
+pub(crate) fn get_account(conn: &Connection, id: i64) -> rusqlite::Result<Option<MailAccount>> {
+    conn.query_row(
+        &format!("SELECT {ACCOUNT_COLUMNS} FROM mail_account WHERE id = ?1"),
+        params![id],
+        account_from_row,
+    )
+    .optional()
+}
+
+/// `(id, label)` of the source that already has this exact combination, other
+/// than `except`. The UNIQUE constraint would say so too, but not usefully.
+pub(crate) fn find_account_by_key(
+    conn: &Connection,
+    credential_id: i64,
+    ses_region: &str,
+    bucket: &str,
+    s3_region: &str,
+    except: Option<i64>,
+) -> rusqlite::Result<Option<(i64, String)>> {
+    conn.query_row(
+        "SELECT id, label FROM mail_account
+         WHERE credential_id = ?1 AND ses_region = ?2 AND bucket = ?3 AND s3_region = ?4
+           AND (?5 IS NULL OR id != ?5)",
+        params![credential_id, ses_region, bucket, s3_region, except],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+/// Epoch milliseconds, or `None` when identities were never fetched.
+pub(crate) fn identities_refreshed_at(
+    conn: &Connection,
+    account_id: i64,
+) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT identities_refreshed_at FROM mail_account WHERE id = ?1",
+        params![account_id],
+        |row| row.get(0),
+    )
+}
+
+/// Unread messages per mailbox, counting only threads that are listed.
+pub(crate) fn unread_by_mailbox(
+    conn: &Connection,
+) -> rusqlite::Result<std::collections::HashMap<i64, i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT mailbox_id, SUM(unread_count) FROM mail_thread
+         WHERE state = 'active' GROUP BY mailbox_id",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
+// ── thread listing and reading ─────────────────────────────────────
+
+const DEFAULT_PAGE: u32 = 50;
+const MAX_PAGE: u32 = 200;
+
+/// Which threads a listing covers. Smart folders and ad-hoc rules join as
+/// further variants; each only has to say how it narrows [`scope_filter`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ThreadScope {
+    /// Every enabled source.
+    All,
+    #[serde(rename_all = "camelCase")]
+    Mailbox { mailbox_id: i64 },
+}
+
+/// Position after the last row of the previous page. Threads sort by
+/// `(last_message_at, id)` descending, so this is a keyset, not an offset: a
+/// sync that lands between two pages cannot shift rows across the boundary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadCursor {
+    pub last_message_at: i64,
+    pub id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadQuery {
+    pub scope: ThreadScope,
+    pub cursor: Option<ThreadCursor>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Page<T> {
+    pub rows: Vec<T>,
+    pub next_cursor: Option<ThreadCursor>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRow {
+    pub id: i64,
+    pub account_id: i64,
+    pub mailbox_id: i64,
+    pub mailbox_address: String,
+    pub domain: String,
+    pub subject: String,
+    pub snippet: String,
+    pub participants: serde_json::Value,
+    /// Epoch seconds.
+    pub first_message_at: i64,
+    /// Epoch seconds.
+    pub last_message_at: i64,
+    pub message_count: i64,
+    pub unread_count: i64,
+    pub has_attachments: bool,
+    pub is_starred: bool,
+}
+
+const THREAD_SELECT: &str = "SELECT t.id, t.account_id, t.mailbox_id, b.address, b.domain,
+       t.subject,
+       COALESCE((SELECT m.snippet FROM mail_message m
+                 WHERE m.thread_id = t.id AND m.state = 'active'
+                 ORDER BY m.date_utc DESC, m.id DESC LIMIT 1), ''),
+       t.participants_json, t.first_message_at, t.last_message_at, t.message_count,
+       t.unread_count, t.has_attachments, t.is_starred
+     FROM mail_thread t
+     JOIN mail_mailbox b ON b.id = t.mailbox_id
+     JOIN mail_account a ON a.id = t.account_id";
+
+fn thread_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
+    let participants: String = row.get(7)?;
+    Ok(ThreadRow {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        mailbox_id: row.get(2)?,
+        mailbox_address: row.get(3)?,
+        domain: row.get(4)?,
+        subject: row.get(5)?,
+        snippet: row.get(6)?,
+        participants: serde_json::from_str(&participants)
+            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+        first_message_at: row.get(8)?,
+        last_message_at: row.get(9)?,
+        message_count: row.get(10)?,
+        unread_count: row.get(11)?,
+        has_attachments: row.get::<_, i64>(12)? != 0,
+        is_starred: row.get::<_, i64>(13)? != 0,
+    })
+}
+
+/// A SQL condition on `t`, `b` and `a` plus its parameters.
+fn scope_filter(scope: &ThreadScope) -> (&'static str, Vec<rusqlite::types::Value>) {
+    match scope {
+        ThreadScope::All => ("a.enabled = 1", Vec::new()),
+        ThreadScope::Mailbox { mailbox_id } => ("t.mailbox_id = ?", vec![(*mailbox_id).into()]),
+    }
+}
+
+/// One page of listed threads, newest first. A thread is listed while it has an
+/// `active` message: `gone` (vanished from S3) and `archived` (the user's
+/// choice) both drop out, and they stay two states so a sync can still tell
+/// them apart (spec section 10).
+pub(crate) fn list_threads(
+    conn: &Connection,
+    query: &ThreadQuery,
+) -> rusqlite::Result<Page<ThreadRow>> {
+    use rusqlite::types::Value;
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
+    let (scope_sql, mut values) = scope_filter(&query.scope);
+    let mut sql = format!(
+        "{THREAD_SELECT} WHERE t.state = 'active'
+           AND EXISTS (SELECT 1 FROM mail_message m WHERE m.thread_id = t.id AND m.state = 'active')
+           AND {scope_sql}"
+    );
+    if let Some(cursor) = query.cursor {
+        sql.push_str(" AND (t.last_message_at < ? OR (t.last_message_at = ? AND t.id < ?))");
+        values.push(Value::from(cursor.last_message_at));
+        values.push(Value::from(cursor.last_message_at));
+        values.push(Value::from(cursor.id));
+    }
+    sql.push_str(" ORDER BY t.last_message_at DESC, t.id DESC LIMIT ?");
+    // One extra row says whether another page exists.
+    values.push(Value::from(i64::from(limit) + 1));
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows: Vec<ThreadRow> = stmt
+        .query_map(rusqlite::params_from_iter(values), thread_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    let next_cursor = if rows.len() > limit as usize {
+        rows.truncate(limit as usize);
+        rows.last().map(|t| ThreadCursor {
+            last_message_at: t.last_message_at,
+            id: t.id,
+        })
+    } else {
+        None
+    };
+    Ok(Page { rows, next_cursor })
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentRow {
+    pub id: i64,
+    pub message_id: i64,
+    pub part_index: i64,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: i64,
+    pub content_id: Option<String>,
+    pub is_inline: bool,
+    /// Whether the bytes are already on disk. The path itself stays in Rust.
+    pub downloaded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageRow {
+    pub id: i64,
+    pub direction: String,
+    pub message_id_hdr: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub subject: String,
+    pub from_name: Option<String>,
+    pub from_addr: String,
+    pub reply_to_addr: Option<String>,
+    pub to: serde_json::Value,
+    pub cc: serde_json::Value,
+    /// Only outgoing mail carries a Bcc list.
+    pub bcc: serde_json::Value,
+    /// Epoch seconds.
+    pub date_utc: i64,
+    pub snippet: String,
+    pub body_text: Option<String>,
+    /// Already sanitised; remote images are in `data-mono-src`.
+    pub body_html: Option<String>,
+    pub remote_images_blocked: usize,
+    pub has_attachments: bool,
+    pub size_bytes: Option<i64>,
+    pub spf: Option<String>,
+    pub dkim: Option<String>,
+    pub dmarc: Option<String>,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub state: String,
+    pub attachments: Vec<AttachmentRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadDetail {
+    pub thread: ThreadRow,
+    /// `ask | always | never`, from the thread's source.
+    pub image_policy: String,
+    pub messages: Vec<MessageRow>,
+}
+
+fn json_or_empty(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+}
+
+fn attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentRow> {
+    Ok(AttachmentRow {
+        id: row.get(0)?,
+        message_id: row.get(1)?,
+        part_index: row.get(2)?,
+        filename: row.get(3)?,
+        mime_type: row.get(4)?,
+        size_bytes: row.get(5)?,
+        content_id: row.get(6)?,
+        is_inline: row.get::<_, i64>(7)? != 0,
+        downloaded: row.get::<_, Option<String>>(8)?.is_some(),
+    })
+}
+
+const ATTACHMENT_SELECT: &str = "SELECT id, message_id, part_index, filename, mime_type,
+       size_bytes, content_id, is_inline, local_path FROM mail_attachment";
+
+/// A thread with its messages and their attachment metadata. Messages that
+/// vanished from S3 (`gone`) are left out; ones the user archived are not,
+/// because opening a thread is an explicit act and listing is where archive
+/// hides things.
+pub(crate) fn thread_detail(
+    conn: &Connection,
+    thread_id: i64,
+) -> rusqlite::Result<Option<ThreadDetail>> {
+    let thread = conn
+        .query_row(
+            &format!("{THREAD_SELECT} WHERE t.id = ?1"),
+            params![thread_id],
+            thread_from_row,
+        )
+        .optional()?;
+    let Some(thread) = thread else {
+        return Ok(None);
+    };
+    let image_policy: String = conn.query_row(
+        "SELECT image_policy FROM mail_account WHERE id = ?1",
+        params![thread.account_id],
+        |row| row.get(0),
+    )?;
+    let mut attachments: std::collections::HashMap<i64, Vec<AttachmentRow>> =
+        std::collections::HashMap::new();
+    {
+        let mut stmt = conn.prepare(&format!(
+            "{ATTACHMENT_SELECT} WHERE message_id IN
+               (SELECT id FROM mail_message WHERE thread_id = ?1) ORDER BY part_index"
+        ))?;
+        for row in stmt.query_map(params![thread_id], attachment_from_row)? {
+            let row = row?;
+            attachments.entry(row.message_id).or_default().push(row);
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, direction, message_id_hdr, in_reply_to, subject, from_name, from_addr,
+                reply_to_addr, to_json, cc_json, bcc_json, date_utc, snippet, body_text,
+                body_html, has_attachments, size_bytes, spf, dkim, dmarc, is_read,
+                is_starred, state
+         FROM mail_message WHERE thread_id = ?1 AND state != 'gone' ORDER BY date_utc, id",
+    )?;
+    let messages = stmt
+        .query_map(params![thread_id], |row| {
+            let id: i64 = row.get(0)?;
+            let body_html: Option<String> = row.get(14)?;
+            Ok(MessageRow {
+                id,
+                direction: row.get(1)?,
+                message_id_hdr: row.get(2)?,
+                in_reply_to: row.get(3)?,
+                subject: row.get(4)?,
+                from_name: row.get(5)?,
+                from_addr: row.get(6)?,
+                reply_to_addr: row.get(7)?,
+                to: json_or_empty(&row.get::<_, String>(8)?),
+                cc: json_or_empty(&row.get::<_, String>(9)?),
+                bcc: json_or_empty(&row.get::<_, String>(10)?),
+                date_utc: row.get(11)?,
+                snippet: row.get(12)?,
+                body_text: row.get(13)?,
+                remote_images_blocked: body_html
+                    .as_deref()
+                    .map_or(0, |h| h.matches(BLOCKED_IMAGE_ATTR).count()),
+                body_html,
+                has_attachments: row.get::<_, i64>(15)? != 0,
+                size_bytes: row.get(16)?,
+                spf: row.get(17)?,
+                dkim: row.get(18)?,
+                dmarc: row.get(19)?,
+                is_read: row.get::<_, i64>(20)? != 0,
+                is_starred: row.get::<_, i64>(21)? != 0,
+                state: row.get(22)?,
+                attachments: attachments.remove(&id).unwrap_or_default(),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(ThreadDetail {
+        thread,
+        image_policy,
+        messages,
+    }))
+}
+
+/// The attribute `mail_mime` puts the blocked remote URL in.
+pub(crate) const BLOCKED_IMAGE_ATTR: &str = "data-mono-src=\"";
+
+/// Marks every message of the threads read or unread and recounts the thread.
+pub(crate) fn set_threads_read(
+    conn: &Connection,
+    thread_ids: &[i64],
+    read: bool,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for id in thread_ids {
+        tx.execute(
+            "UPDATE mail_message SET is_read = ?2 WHERE thread_id = ?1",
+            params![id, read],
+        )?;
+        tx.execute(
+            "UPDATE mail_thread SET unread_count =
+               (SELECT COUNT(*) FROM mail_message WHERE thread_id = ?1 AND is_read = 0)
+             WHERE id = ?1",
+            params![id],
+        )?;
+    }
+    tx.commit()
+}
+
+pub(crate) fn set_threads_starred(
+    conn: &Connection,
+    thread_ids: &[i64],
+    starred: bool,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for id in thread_ids {
+        tx.execute(
+            "UPDATE mail_message SET is_starred = ?2 WHERE thread_id = ?1",
+            params![id, starred],
+        )?;
+        tx.execute(
+            "UPDATE mail_thread SET is_starred = ?2 WHERE id = ?1",
+            params![id, starred],
+        )?;
+    }
+    tx.commit()
+}
+
+/// Where a message's raw MIME lives.
+pub(crate) struct MessageLocation {
+    pub message_id: i64,
+    pub account_id: i64,
+    /// `None` for mail with no S3 object, such as a draft's sent copy.
+    pub s3_key: Option<String>,
+    pub body_html: Option<String>,
+}
+
+pub(crate) fn message_location(
+    conn: &Connection,
+    message_id: i64,
+) -> rusqlite::Result<Option<MessageLocation>> {
+    conn.query_row(
+        "SELECT m.id, b.account_id, o.s3_key, m.body_html
+         FROM mail_message m
+         JOIN mail_mailbox b ON b.id = m.mailbox_id
+         LEFT JOIN mail_object o ON o.id = m.object_id
+         WHERE m.id = ?1",
+        params![message_id],
+        |row| {
+            Ok(MessageLocation {
+                message_id: row.get(0)?,
+                account_id: row.get(1)?,
+                s3_key: row.get(2)?,
+                body_html: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// An attachment and the path it was saved to, if it was.
+pub(crate) fn get_attachment(
+    conn: &Connection,
+    attachment_id: i64,
+) -> rusqlite::Result<Option<(AttachmentRow, Option<String>)>> {
+    conn.query_row(
+        &format!("{ATTACHMENT_SELECT} WHERE id = ?1"),
+        params![attachment_id],
+        |row| Ok((attachment_from_row(row)?, row.get(8)?)),
+    )
+    .optional()
+}
+
+pub(crate) fn set_attachment_path(
+    conn: &Connection,
+    attachment_id: i64,
+    path: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_attachment SET local_path = ?2 WHERE id = ?1",
+        params![attachment_id, path],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1541,6 +2107,47 @@ mod tests {
         assert!(before > 0);
         ensure_tables(&conn).unwrap();
         assert_eq!(table_count(&conn), before);
+    }
+
+    #[test]
+    fn ensure_tables_adds_identities_refreshed_at_to_an_older_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        // mail_account as the first dev builds created it, before the column.
+        conn.execute_batch(
+            "CREATE TABLE mail_credential (id INTEGER PRIMARY KEY, provider TEXT NOT NULL,
+               label TEXT NOT NULL, access_key_masked TEXT NOT NULL, default_region TEXT,
+               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE (provider, label));
+             CREATE TABLE mail_account (id INTEGER PRIMARY KEY, provider TEXT NOT NULL,
+               credential_id INTEGER NOT NULL REFERENCES mail_credential(id) ON DELETE RESTRICT,
+               s3_credential_id INTEGER REFERENCES mail_credential(id) ON DELETE RESTRICT,
+               label TEXT NOT NULL, ses_region TEXT NOT NULL, bucket TEXT NOT NULL,
+               s3_region TEXT NOT NULL, default_from TEXT,
+               attach_policy TEXT NOT NULL DEFAULT 'on_demand',
+               image_policy TEXT NOT NULL DEFAULT 'ask', enabled INTEGER NOT NULL DEFAULT 1,
+               sort_order INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               UNIQUE (credential_id, ses_region, bucket, s3_region));",
+        )
+        .unwrap();
+        ensure_tables(&conn).unwrap();
+        ensure_tables(&conn).unwrap();
+        let cred = upsert_credential(&conn, &credential("a")).unwrap();
+        let id = upsert_account(&conn, &account(cred, "A", "bucket-a")).unwrap();
+        upsert_mailboxes(&conn, id, &[mailbox("o@example.com", "o/")]).unwrap();
+        replace_identities(&conn, id, &[]).unwrap();
+        assert!(identities_refreshed_at(&conn, id).unwrap().is_some());
+    }
+
+    #[test]
+    fn two_addresses_cannot_share_a_prefix_within_a_source() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let cred = upsert_credential(&conn, &credential("a")).unwrap();
+        let id = upsert_account(&conn, &account(cred, "A", "bucket-a")).unwrap();
+        upsert_mailboxes(&conn, id, &[mailbox("o@example.com", "o/")]).unwrap();
+        let error = upsert_mailboxes(&conn, id, &[mailbox("p@example.com", "o/")]).unwrap_err();
+        assert!(error.to_string().contains("o@example.com"), "{error}");
     }
 
     #[test]
