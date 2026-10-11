@@ -221,7 +221,7 @@ fn subject_fallback(
 /// Stores a parsed message in the thread it belongs to, creating or merging
 /// threads as needed. `fallback_date` (epoch seconds, e.g. the S3 object time)
 /// stands in when the message carries neither a usable `Date` nor `Received`.
-/// Opens its own transaction, so do not call it inside another one.
+/// Runs on the caller's transaction, so a page of messages commits as one.
 pub(crate) fn ingest_message(
     conn: &Connection,
     mailbox_id: i64,
@@ -242,9 +242,8 @@ pub(crate) fn ingest_message(
         }
     }
 
-    let tx = conn.unchecked_transaction()?;
-    let account_id = mail_store::mailbox_account_id(&tx, mailbox_id)?;
-    let own = mail_store::account_mailbox_addresses(&tx, account_id)?;
+    let account_id = mail_store::mailbox_account_id(conn, mailbox_id)?;
+    let own = mail_store::account_mailbox_addresses(conn, account_id)?;
 
     let date_utc = mail.date_utc.or(mail.received_at).unwrap_or(fallback_date);
     let received_at = mail.received_at.unwrap_or(date_utc);
@@ -270,21 +269,21 @@ pub(crate) fn ingest_message(
         &own,
     );
 
-    let linked = mail_store::threads_for_refs(&tx, mailbox_id, mail.message_id.as_deref(), &refs)?;
+    let linked = mail_store::threads_for_refs(conn, mailbox_id, mail.message_id.as_deref(), &refs)?;
     let thread_id = match linked.split_first() {
         Some((&survivor, losers)) => {
-            merge_threads(&tx, survivor, losers, &own)?;
+            merge_threads(conn, survivor, losers, &own)?;
             survivor
         }
-        None => match subject_fallback(&tx, mailbox_id, &key, date_utc, &people)? {
+        None => match subject_fallback(conn, mailbox_id, &key, date_utc, &people)? {
             Some(id) => id,
-            None => mail_store::insert_thread(&tx, mailbox_id, &mail.subject, &key, date_utc)?,
+            None => mail_store::insert_thread(conn, mailbox_id, &mail.subject, &key, date_utc)?,
         },
     };
 
     let from = mail.from.as_ref();
     let message_id = mail_store::insert_message(
-        &tx,
+        conn,
         &NewMessage {
             mailbox_id,
             thread_id,
@@ -313,7 +312,7 @@ pub(crate) fn ingest_message(
             headers_json: &mail.headers_json,
         },
     )?;
-    mail_store::insert_message_refs(&tx, message_id, &refs)?;
+    mail_store::insert_message_refs(conn, message_id, &refs)?;
     let attachments: Vec<NewAttachment> = mail
         .attachments
         .iter()
@@ -326,14 +325,47 @@ pub(crate) fn ingest_message(
             is_inline: a.is_inline,
         })
         .collect();
-    mail_store::insert_attachments(&tx, message_id, &attachments)?;
-    recompute_thread(&tx, thread_id, &own)?;
-    tx.commit()?;
+    mail_store::insert_attachments(conn, message_id, &attachments)?;
+    recompute_thread(conn, thread_id, &own)?;
     Ok(Ingested {
         message_id,
         thread_id,
         duplicate: false,
     })
+}
+
+/// Re-parse of a changed object: the message is removed and ingested again, so
+/// the envelope and the thread follow the new content. The read flag, star and
+/// state the user set carry over. Deleting first is what lets threading see the
+/// message as new instead of as its own duplicate.
+pub(crate) fn replace_message(
+    conn: &Connection,
+    mailbox_id: i64,
+    message_id: i64,
+    mail: &ParsedMail,
+    fallback_date: i64,
+) -> rusqlite::Result<Ingested> {
+    let removed = mail_store::remove_message(conn, message_id)?;
+    let ingested = ingest_message(
+        conn,
+        mailbox_id,
+        &removed.direction,
+        removed.object_id,
+        mail,
+        fallback_date,
+    )?;
+    let account_id = mail_store::mailbox_account_id(conn, mailbox_id)?;
+    let own = mail_store::account_mailbox_addresses(conn, account_id)?;
+    if !ingested.duplicate {
+        mail_store::restore_message_flags(conn, ingested.message_id, &removed)?;
+        recompute_thread(conn, ingested.thread_id, &own)?;
+    }
+    if ingested.thread_id != removed.thread_id
+        && !mail_store::delete_thread_if_empty(conn, removed.thread_id)?
+    {
+        recompute_thread(conn, removed.thread_id, &own)?;
+    }
+    Ok(ingested)
 }
 
 #[cfg(test)]

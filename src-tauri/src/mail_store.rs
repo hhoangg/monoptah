@@ -1021,7 +1021,64 @@ pub(crate) fn insert_message(conn: &Connection, m: &NewMessage) -> rusqlite::Res
             m.headers_json,
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    let people = fts_people(m.from_name, m.from_addr, m.to_json, m.cc_json);
+    fts_insert(conn, id, m.subject, m.body_text.unwrap_or(""), &people)?;
+    Ok(id)
+}
+
+/// `Name <addr>` of from, to and cc, the text the `people` FTS column holds.
+fn fts_people(from_name: Option<&str>, from_addr: &str, to_json: &str, cc_json: &str) -> String {
+    let mut out = Vec::new();
+    let mut push = |name: Option<&str>, addr: &str| {
+        out.push(match name {
+            Some(n) if !n.is_empty() => format!("{n} <{addr}>"),
+            _ => addr.to_string(),
+        });
+    };
+    if !from_addr.is_empty() {
+        push(from_name, from_addr);
+    }
+    for json in [to_json, cc_json] {
+        let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
+        for p in &list {
+            if let Some(addr) = p["addr"].as_str() {
+                push(p["name"].as_str(), addr);
+            }
+        }
+    }
+    out.join(", ")
+}
+
+// The FTS table is contentless: no triggers, the rowid is the message id, and
+// a row can only be removed by replaying the values it was inserted with.
+fn fts_insert(
+    conn: &Connection,
+    id: i64,
+    subject: &str,
+    body: &str,
+    people: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO mail_message_fts(rowid, subject, body, people) VALUES (?1, ?2, ?3, ?4)",
+        params![id, subject, body, people],
+    )?;
+    Ok(())
+}
+
+fn fts_delete(
+    conn: &Connection,
+    id: i64,
+    subject: &str,
+    body: &str,
+    people: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO mail_message_fts(mail_message_fts, rowid, subject, body, people)
+         VALUES ('delete', ?1, ?2, ?3, ?4)",
+        params![id, subject, body, people],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn insert_message_refs(
@@ -1254,7 +1311,7 @@ pub(crate) fn mark_vanished_objects(
     sync_start: i64,
     archived_at: i64,
 ) -> rusqlite::Result<usize> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = conn;
     let vanished = tx.execute(
         "UPDATE mail_object SET state = 'gone'
          WHERE mailbox_id = ?1 AND last_seen_at < ?2 AND state != 'gone'",
@@ -1286,7 +1343,6 @@ pub(crate) fn mark_vanished_objects(
             )?;
         }
     }
-    tx.commit()?;
     Ok(vanished)
 }
 
@@ -1295,7 +1351,7 @@ pub(crate) fn mark_vanished_objects(
 /// the thread comes back only if the sync was what removed it, that is when no
 /// message in it is `archived`.
 pub(crate) fn revive_gone_message(conn: &Connection, object_id: i64) -> rusqlite::Result<()> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = conn;
     let thread: Option<i64> = tx
         .query_row(
             "SELECT thread_id FROM mail_message WHERE object_id = ?1 AND state = 'gone'",
@@ -1316,7 +1372,7 @@ pub(crate) fn revive_gone_message(conn: &Connection, object_id: i64) -> rusqlite
             params![thread_id],
         )?;
     }
-    tx.commit()
+    Ok(())
 }
 
 /// A genuinely new message surfaces its thread again, as Gmail does. This is
@@ -1330,51 +1386,67 @@ pub(crate) fn reactivate_thread(conn: &Connection, thread_id: i64) -> rusqlite::
     Ok(())
 }
 
-/// Body-side columns re-derived from a changed object. Envelope, thread, read
-/// and star state stay, since threading was decided from them.
-pub(crate) struct RefreshedBody<'a> {
-    pub snippet: &'a str,
-    pub body_text: Option<&'a str>,
-    pub body_html: Option<&'a str>,
-    pub has_attachments: bool,
-    pub size_bytes: i64,
-    pub spf: Option<&'a str>,
-    pub dkim: Option<&'a str>,
-    pub dmarc: Option<&'a str>,
-    pub headers_json: &'a str,
+/// What survives when a message is replaced by a re-parse of its object.
+pub(crate) struct RemovedMessage {
+    pub thread_id: i64,
+    pub object_id: Option<i64>,
+    pub direction: String,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub state: String,
 }
 
-pub(crate) fn refresh_message_body(
+/// Deletes a message and its FTS row, returning what the user had set on it.
+pub(crate) fn remove_message(conn: &Connection, id: i64) -> rusqlite::Result<RemovedMessage> {
+    let (removed, subject, body, people) = conn.query_row(
+        "SELECT thread_id, object_id, direction, is_read, is_starred, state,
+                subject, body_text, from_name, from_addr, to_json, cc_json
+         FROM mail_message WHERE id = ?1",
+        params![id],
+        |row| {
+            let from_name: Option<String> = row.get(8)?;
+            let from_addr: String = row.get(9)?;
+            let to_json: String = row.get(10)?;
+            let cc_json: String = row.get(11)?;
+            Ok((
+                RemovedMessage {
+                    thread_id: row.get(0)?,
+                    object_id: row.get(1)?,
+                    direction: row.get(2)?,
+                    is_read: row.get(3)?,
+                    is_starred: row.get(4)?,
+                    state: row.get(5)?,
+                },
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                fts_people(from_name.as_deref(), &from_addr, &to_json, &cc_json),
+            ))
+        },
+    )?;
+    fts_delete(conn, id, &subject, body.as_deref().unwrap_or(""), &people)?;
+    conn.execute("DELETE FROM mail_message WHERE id = ?1", params![id])?;
+    Ok(removed)
+}
+
+pub(crate) fn restore_message_flags(
     conn: &Connection,
-    message_id: i64,
-    b: &RefreshedBody,
-    attachments: &[NewAttachment],
+    id: i64,
+    removed: &RemovedMessage,
 ) -> rusqlite::Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "UPDATE mail_message SET snippet = ?2, body_text = ?3, body_html = ?4,
-           has_attachments = ?5, size_bytes = ?6, spf = ?7, dkim = ?8, dmarc = ?9,
-           headers_json = ?10
-         WHERE id = ?1",
-        params![
-            message_id,
-            b.snippet,
-            b.body_text,
-            b.body_html,
-            b.has_attachments,
-            b.size_bytes,
-            b.spf,
-            b.dkim,
-            b.dmarc,
-            b.headers_json
-        ],
+    conn.execute(
+        "UPDATE mail_message SET is_read = ?2, is_starred = ?3, state = ?4 WHERE id = ?1",
+        params![id, removed.is_read, removed.is_starred, removed.state],
     )?;
-    tx.execute(
-        "DELETE FROM mail_attachment WHERE message_id = ?1",
-        params![message_id],
-    )?;
-    insert_attachments(&tx, message_id, attachments)?;
-    tx.commit()
+    Ok(())
+}
+
+/// Deletes the thread if it holds no message. Returns whether it did.
+pub(crate) fn delete_thread_if_empty(conn: &Connection, thread_id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM mail_thread WHERE id = ?1
+           AND NOT EXISTS (SELECT 1 FROM mail_message WHERE thread_id = ?1)",
+        params![thread_id],
+    )? > 0)
 }
 
 #[cfg(test)]

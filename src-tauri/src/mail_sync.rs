@@ -15,9 +15,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::aws_s3::{ObjectInfo, S3Api, S3ErrorKind};
 use crate::mail_mime::parse_mail;
-use crate::mail_store::{
-    self, ListedObject, MailAccount, MailMailbox, NewAttachment, RefreshedBody,
-};
+use crate::mail_store::{self, ListedObject, MailAccount, MailMailbox};
 use crate::mail_thread;
 use crate::session_store::{now_millis, SessionStore};
 
@@ -29,6 +27,7 @@ const DEFAULT_INTERVAL_SECS: u64 = 3600;
 const MIN_INTERVAL_SECS: u64 = 60;
 const TICK: Duration = Duration::from_secs(60);
 const MAX_PARSE_ATTEMPTS: i64 = 3;
+const PAGE_SIZE: usize = 50;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -404,30 +403,41 @@ fn sync_mailbox(
     counts.seen = listed.len();
 
     let db = |e: rusqlite::Error| e.to_string();
-    let (work, revived) = {
+    let (work, revived, archived) = {
         let conn = store.lock_conn()?;
-        reconcile_ledger(&conn, mailbox.id, &listed, sync_start).map_err(db)?
+        let tx = conn.unchecked_transaction().map_err(db)?;
+        let (work, revived) = reconcile_ledger(&tx, mailbox.id, &listed, sync_start).map_err(db)?;
+        let archived = mail_store::mark_vanished_objects(&tx, mailbox.id, sync_start, now_millis())
+            .map_err(db)?;
+        tx.commit().map_err(db)?;
+        (work, revived, archived)
     };
     counts.revived = revived;
-    counts.archived = {
-        let conn = store.lock_conn()?;
-        mail_store::mark_vanished_objects(&conn, mailbox.id, sync_start, now_millis())
-            .map_err(db)?
-    };
+    counts.archived = archived;
 
     let total = work.len();
-    for (index, item) in work.iter().enumerate() {
-        emit("running", index, total, None);
-        let raw = match s3.get_object(&item.key) {
-            Ok(raw) => raw,
-            Err(e) if is_fatal(e.kind) => return Err(e.message),
-            Err(_) => {
-                counts.failed += 1;
-                continue;
+    for (page_index, page) in work.chunks(PAGE_SIZE).enumerate() {
+        let mut fetched = Vec::with_capacity(page.len());
+        for (i, item) in page.iter().enumerate() {
+            emit("running", page_index * PAGE_SIZE + i, total, None);
+            match s3.get_object(&item.key) {
+                Ok(raw) => fetched.push((item, raw)),
+                Err(e) if is_fatal(e.kind) => return Err(e.message),
+                Err(_) => counts.failed += 1,
             }
-        };
+        }
+        // One page commits as one unit, so a crash leaves no half-threaded
+        // message. Counts join the total only once the commit has happened.
+        let mut page_counts = Counts::default();
         let conn = store.lock_conn()?;
-        ingest_one(&conn, mailbox, item, &raw, counts).map_err(db)?;
+        let tx = conn.unchecked_transaction().map_err(db)?;
+        for (item, raw) in &fetched {
+            ingest_one(&tx, mailbox, item, raw, &mut page_counts).map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        counts.inserted += page_counts.inserted;
+        counts.reparsed += page_counts.reparsed;
+        counts.failed += page_counts.failed;
     }
     emit("done", total, total, None);
     Ok(())
@@ -529,38 +539,9 @@ fn ingest_one(
     };
     let existing = mail_store::message_for_object(conn, item.object_id)?;
     match existing {
-        Some((message_id, thread_id)) if item.reparse => {
-            let attachments: Vec<NewAttachment> = mail
-                .attachments
-                .iter()
-                .map(|a| NewAttachment {
-                    part_index: a.part_index as i64,
-                    filename: &a.filename,
-                    mime_type: &a.mime_type,
-                    size_bytes: a.size_bytes as i64,
-                    content_id: a.content_id.as_deref(),
-                    is_inline: a.is_inline,
-                })
-                .collect();
-            mail_store::refresh_message_body(
-                conn,
-                message_id,
-                &RefreshedBody {
-                    snippet: &mail.snippet,
-                    body_text: mail.body_text.as_deref(),
-                    body_html: mail.body_html.as_deref(),
-                    has_attachments: mail.has_attachments(),
-                    size_bytes: mail.size_bytes as i64,
-                    spf: mail.spf.as_deref(),
-                    dkim: mail.dkim.as_deref(),
-                    dmarc: mail.dmarc.as_deref(),
-                    headers_json: &mail.headers_json,
-                },
-                &attachments,
-            )?;
-            // No losers: this only refreshes the thread's aggregates.
-            let own = mail_store::account_mailbox_addresses(conn, mailbox.account_id)?;
-            mail_thread::merge_threads(conn, thread_id, &[], &own)?;
+        Some((message_id, _)) if item.reparse => {
+            let fallback = item.s3_modified.unwrap_or_else(|| now_millis() / 1000);
+            mail_thread::replace_message(conn, mailbox.id, message_id, &mail, fallback)?;
             counts.reparsed += 1;
         }
         // Crash between ingest and the state update: the message is there.
@@ -1250,5 +1231,89 @@ mod tests {
         assert_eq!(f.service.sync_due(&f.store, &factory, &ev, later).len(), 1);
         f.service.set_interval_secs(1);
         assert_eq!(f.service.interval_secs(), MIN_INTERVAL_SECS);
+    }
+
+    fn fts_hits(f: &Fixture, term: &str) -> i64 {
+        f.scalar(&format!(
+            "SELECT COUNT(*) FROM mail_message_fts WHERE mail_message_fts MATCH '{term}'"
+        ))
+    }
+
+    #[test]
+    fn ingested_message_is_searchable_and_follows_etag_changes() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        let raw = mime("m1", "Đơn hàng", "xin chao Hoàng zebra")
+            .replace("Bob <bob@example.com>", "Hoàng Nguyen <hn@example.com>");
+        s3.put("owner/1", "e1", &raw);
+        f.sync(&[(account, &s3)]);
+        assert_eq!(fts_hits(&f, "hoang"), 1);
+        assert_eq!(fts_hits(&f, "zebra"), 1);
+        assert_eq!(fts_hits(&f, "hang"), 1);
+        s3.put("owner/1", "e2", &raw.replace("zebra", "walrus"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(fts_hits(&f, "zebra"), 0);
+        assert_eq!(fts_hits(&f, "walrus"), 1);
+        assert_eq!(fts_hits(&f, "hoang"), 1);
+    }
+
+    #[test]
+    fn message_without_message_id_is_not_ingested_twice() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        let raw = "From: a@example.com\r\nTo: owner@acme.test\r\nSubject: x\r\n\
+                   Date: Fri, 01 Mar 2024 09:00:00 +0000\r\n\r\nbody\r\n";
+        s3.put("owner/1", "e1", raw);
+        f.sync(&[(account, &s3)]);
+        f.sync(&[(account, &s3)]);
+        s3.remove("owner/1");
+        f.sync(&[(account, &s3)]);
+        s3.put("owner/1", "e1", raw);
+        f.sync(&[(account, &s3)]);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_message"), 1);
+    }
+
+    #[test]
+    fn etag_change_overwrites_envelope_and_rethreads() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Original", "root"));
+        s3.put("owner/2", "e2", &mime("m2", "Unrelated topic", "alone"));
+        f.sync(&[(account, &s3)]);
+        f.store
+            .lock_conn()
+            .unwrap()
+            .execute(
+                "UPDATE mail_message SET is_starred=1 WHERE message_id_hdr='m2@example.com'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_thread"), 2);
+        let rewritten = mime("m2", "Re: Original", "alone")
+            .replace("bob@example.com", "carol@example.com")
+            .replace("Subject:", "In-Reply-To: <m1@example.com>\r\nSubject:");
+        s3.put("owner/2", "e3", &rewritten);
+        let reports = f.sync(&[(account, &s3)]);
+        assert_eq!((reports[0].reparsed, reports[0].inserted), (1, 0));
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_message"), 2);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_thread"), 1);
+        assert_eq!(
+            f.text("SELECT from_addr FROM mail_message WHERE message_id_hdr='m2@example.com'"),
+            "carol@example.com"
+        );
+        assert_eq!(
+            f.text("SELECT subject FROM mail_message WHERE message_id_hdr='m2@example.com'"),
+            "Re: Original"
+        );
+        assert_eq!(
+            f.scalar("SELECT is_starred FROM mail_message WHERE message_id_hdr='m2@example.com'"),
+            1
+        );
+        assert_eq!(f.scalar("SELECT message_count FROM mail_thread"), 2);
+        assert_eq!(fts_hits(&f, "carol"), 1);
+        assert_eq!(
+            f.text("SELECT state FROM mail_object WHERE s3_key='owner/2'"),
+            "parsed"
+        );
     }
 }
