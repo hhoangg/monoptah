@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   AlertCircle,
+  Archive,
   ChevronDown,
   ChevronRight,
   ListFilter,
@@ -100,12 +101,15 @@ type Props = {
   /** Selected mailbox id; null with no folder means "All mail". */
   mailboxId: number | null;
   folderId: number | null;
+  /** The Archive view is open; it is neither a mailbox nor a smart folder. */
+  archiveSelected?: boolean;
   /** Null while the folders load. */
   smartFolders?: SmartFolderEntry[] | null;
   foldersError?: string | null;
   onSelectAll: () => void;
   onSelectMailbox: (id: number) => void;
   onSelectFolder: (id: number) => void;
+  onSelectArchive?: () => void;
   /** Opens an empty folder editor. */
   onNewFolder?: () => void;
   onSynced?: () => void;
@@ -116,18 +120,21 @@ export function MailFolderList({
   error = null,
   mailboxId,
   folderId,
+  archiveSelected = false,
   smartFolders = [],
   foldersError = null,
   onSelectAll,
   onSelectMailbox,
   onSelectFolder,
+  onSelectArchive,
   onNewFolder,
   onSynced,
 }: Props) {
   const collapsed = useCollapsedDomains();
   const [syncing, setSyncing] = useState(false);
   const groups = status ? groupMailboxesByDomain(status.sources) : [];
-  const allSelected = mailboxId === null && folderId === null;
+  const allSelected =
+    mailboxId === null && folderId === null && !archiveSelected;
 
   const toggle = (domain: string) =>
     collapsedDomains.save(
@@ -301,6 +308,20 @@ export function MailFolderList({
             </button>
           );
         })}
+
+        {onSelectArchive ? (
+          // No unread badge, on purpose: the inbox counts leave archived mail
+          // out, and a number here would be one the rail does not agree with.
+          <button
+            type="button"
+            aria-current={archiveSelected ? "true" : undefined}
+            onClick={onSelectArchive}
+            className={`${NODE} mt-3 ${archiveSelected ? "bg-content/10 text-content" : "text-content/80"}`}
+          >
+            <Archive className="size-3.5 shrink-0" strokeWidth={1.75} />
+            <span className="min-w-0 flex-1 truncate">Archive</span>
+          </button>
+        ) : null}
       </div>
       <div className="flex shrink-0 items-center gap-2 border-t border-stroke px-3 py-2 text-[11px] text-content/50">
         <span className="min-w-0 flex-1 truncate">

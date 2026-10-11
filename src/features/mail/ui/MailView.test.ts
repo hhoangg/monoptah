@@ -136,3 +136,10 @@ it("treats a damaged folder pref as no folder, not as NaN", async () => {
   expect(JSON.stringify(threadScopes())).not.toContain("null");
   expect(threadScopes().at(-1)).toEqual({ kind: "all" });
 });
+
+it("lists the Archive view by its own scope, never as a folder id", async () => {
+  withFolders([7]);
+  localStorage.setItem(MAIL_PREF_KEYS.selectedFolder, "archived");
+  await act(async () => render());
+  expect(threadScopes()).toEqual([{ kind: "archived" }]);
+});

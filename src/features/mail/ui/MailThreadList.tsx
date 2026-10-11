@@ -104,7 +104,8 @@ const CHIP =
 export type ListBase =
   | { kind: "all" }
   | { kind: "mailbox"; mailboxId: number; address: string }
-  | { kind: "folder"; folderId: number };
+  | { kind: "folder"; folderId: number }
+  | { kind: "archived" };
 
 function useDebounced<T>(value: T, ms: number): T {
   const [settled, setSettled] = useState(value);
@@ -177,6 +178,9 @@ export function useMailThreadList(base: ListBase | null) {
   let serverScope: ThreadScope | null = null;
   if (base?.kind === "folder") {
     serverScope = { kind: "folder", folderId: base.folderId };
+  } else if (base?.kind === "archived") {
+    // No filters on top: a rules scope lists only inbox mail.
+    serverScope = { kind: "archived" };
   } else if (base && filterRules.length > 0) {
     serverScope = {
       kind: "rules",
@@ -361,6 +365,7 @@ export function MailThreadList({
     saveMatchMode,
   } = list;
   const inFolder = scope.kind === "folder";
+  const inArchive = scope.kind === "archived";
   const density = useDensity();
   const [open, setOpen] = useState<ChipField | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -418,6 +423,13 @@ export function MailThreadList({
               Edit folder
             </button>
           ) : null}
+        </div>
+      ) : inArchive ? (
+        <div className="shrink-0 border-b border-stroke px-3 py-2">
+          <p className="text-[11px] text-content/50">
+            Mail you archived. Open a thread to read it or move it back to the
+            inbox.
+          </p>
         </div>
       ) : (
         <div className="shrink-0 border-b border-stroke px-3 py-2">
@@ -608,9 +620,11 @@ export function MailThreadList({
           <p className="px-3 py-2 text-[12px] text-content/50">
             {inFolder
               ? "Nothing in this folder yet. Matching mail that arrives will show up here."
-              : filtering
-                ? "No threads match."
-                : "No mail here yet."}
+              : inArchive
+                ? "Nothing archived."
+                : filtering
+                  ? "No threads match."
+                  : "No mail here yet."}
           </p>
         ) : null}
       </div>

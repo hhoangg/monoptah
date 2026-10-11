@@ -216,6 +216,8 @@ export type ThreadScope =
   | { kind: "mailbox"; mailboxId: number }
   /** A smart folder's members. */
   | { kind: "folder"; folderId: number }
+  /** What the user archived. Not a smart folder: nothing is stored for it. */
+  | { kind: "archived" }
   /** Filter chips or the search box, not saved. Empty rules list everything. */
   | { kind: "rules"; rules: Rule[]; matchMode: MatchMode };
 

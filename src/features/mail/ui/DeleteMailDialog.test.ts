@@ -176,11 +176,11 @@ it("says the mail is gone but cached files remain, instead of closing quietly", 
   expect(document.body.textContent).toContain("2 messages");
 });
 
-it("does not promise an archive view or a restore", async () => {
+it("points at the Archive view and does not call archiving one-way", async () => {
   await render();
   const text = document.body.textContent ?? "";
-  expect(text).toContain("not yet browsable");
-  expect(text).not.toMatch(/Reversible|Archive folder/);
+  expect(text).toContain("stays under Archive");
+  expect(text).not.toContain("not yet browsable");
 });
 
 it("shows the error when the command itself fails, and does not close", async () => {

@@ -236,3 +236,30 @@ it("says folders are loading, then empty, then shows an error", () => {
     "boom",
   );
 });
+
+it("offers the Archive view without a badge, and All mail is not selected in it", () => {
+  const onSelectArchive = vi.fn();
+  const props = {
+    status,
+    mailboxId: null,
+    folderId: null,
+    onSelectAll: vi.fn(),
+    onSelectMailbox: vi.fn(),
+    onSelectFolder: vi.fn(),
+    onSelectArchive,
+  };
+  act(() => root.render(createElement(MailFolderList, props)));
+  const archive = [...container.querySelectorAll("button")].find(
+    (b) => b.textContent === "Archive",
+  )!;
+  expect(archive.querySelector("span.rounded-full")).toBeNull();
+  act(() => archive.click());
+  expect(onSelectArchive).toHaveBeenCalledOnce();
+  act(() =>
+    root.render(
+      createElement(MailFolderList, { ...props, archiveSelected: true }),
+    ),
+  );
+  const current = [...container.querySelectorAll("[aria-current='true']")];
+  expect(current.map((b) => b.textContent)).toEqual(["Archive"]);
+});

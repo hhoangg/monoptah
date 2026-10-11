@@ -17,7 +17,11 @@ import {
 import type { ComposeRequest } from "../model/mailReply";
 import type { FolderRow, MatchMode, Rule } from "../model/mailTypes";
 import { useMailOutbox } from "../model/mailOutbox";
-import { parseFolderId, useMailFolders } from "../model/useMailFolders";
+import {
+  ARCHIVE_PREF,
+  parseFolderId,
+  useMailFolders,
+} from "../model/useMailFolders";
 import { useMailStatus } from "../model/useMailStatus";
 import { ComposeSheet, preloadMailEditor } from "./ComposeSheet";
 import { MailFolderList, groupMailboxesByDomain } from "./MailFolderList";
@@ -98,16 +102,19 @@ export function MailView({
     prefFolderId !== null && folders?.some((f) => f.id === prefFolderId)
       ? prefFolderId
       : null;
+  const archived = folderPref === ARCHIVE_PREF;
   const folderPending =
     prefFolderId !== null && folders === null && foldersError === null;
   const mailboxAddress = mailboxes.find((m) => m.id === mailboxId)?.address;
   const scope: ListBase | null = folderPending
     ? null
-    : folderId !== null
-      ? { kind: "folder", folderId }
-      : mailboxId !== null && mailboxAddress
-        ? { kind: "mailbox", mailboxId, address: mailboxAddress }
-        : { kind: "all" };
+    : archived
+      ? { kind: "archived" }
+      : folderId !== null
+        ? { kind: "folder", folderId }
+        : mailboxId !== null && mailboxAddress
+          ? { kind: "mailbox", mailboxId, address: mailboxAddress }
+          : { kind: "all" };
   const list = useMailThreadList(scope);
   const pick = (mailbox: string | null, folder: string | null) => {
     selectedMailbox.save(mailbox);
@@ -196,6 +203,7 @@ export function MailView({
             error={error}
             mailboxId={mailboxId}
             folderId={folderId}
+            archiveSelected={archived}
             smartFolders={
               folders?.map((f) => ({
                 id: f.id,
@@ -211,6 +219,7 @@ export function MailView({
             onSelectAll={() => pick(null, null)}
             onSelectMailbox={(id) => pick(String(id), null)}
             onSelectFolder={(id) => pick(null, String(id))}
+            onSelectArchive={() => pick(null, ARCHIVE_PREF)}
             onSynced={() => void refresh()}
           />
         </aside>

@@ -4,6 +4,13 @@ import { MAIL_MESSAGES_CHANGED_EVENT, mailFolders } from "./mail";
 import type { FolderRow } from "./mailTypes";
 
 /**
+ * The Archive view is selected through the folder pref, as this reserved word.
+ * It is not a folder id, so `parseFolderId` rejects it and nothing is stored in
+ * the folder table for it.
+ */
+export const ARCHIVE_PREF = "archived";
+
+/**
  * The selected folder is persisted as text next to the mailbox pref. This is
  * the one place text becomes an id, and anything that is not a plain positive
  * integer is no folder at all, so a damaged pref can never become `NaN`.

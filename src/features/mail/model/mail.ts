@@ -101,6 +101,13 @@ export const mailMark = (threadIds: number[], read: boolean) =>
 export const mailStar = (threadIds: number[], starred: boolean) =>
   invoke<void>("mail_star", { threadIds, starred });
 
+/**
+ * Puts archived threads back in the inbox, messages included. Archiving is
+ * `mailDelete(ids, false)`.
+ */
+export const mailUnarchive = (threadIds: number[]) =>
+  invoke<void>("mail_unarchive", { threadIds });
+
 /** Downloads if needed and returns the local path. */
 export const mailAttachmentOpen = (attachmentId: number) =>
   invoke<string>("mail_attachment_open", { attachmentId });

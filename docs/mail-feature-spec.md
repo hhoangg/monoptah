@@ -1095,7 +1095,7 @@ mockup. There is no silent destructive default.
   messages, `mail_thread.state='archived'`, `archived_at` set. S3 untouched.
   The next sync still lists those objects, so step 3 of §5 must not resurrect
   them: a `gone` object archives a message, but an already-`archived` message is
-  never set back to `active` by a sync. Reversible from the Archive folder.
+  never set back to `active` by a sync. Reversible from the Archive view.
 - **Delete on S3 as well** — requires typing `delete`. Issues `DeleteObjects` for
   every `mail_object.s3_key` in the thread, then deletes the local rows
   (cascade clears refs, attachments, folder membership, FTS). The dialog states
@@ -1109,11 +1109,23 @@ mockup. There is no silent destructive default.
   typed gate, and a destructive choice remembered for a session is still a
   destructive choice made once and applied to mail the user has not looked at.
   Nothing persists either.
-- **Archive must be reachable or the dialog must not promise it.** `LISTED` is
-  prepended to every scope's SQL and `ThreadScope` has no archived kind, so an
-  archived thread is currently invisible to every list, folder, chip and search —
-  the user can neither restore it nor select it to delete later. Until an Archive
-  view exists, the dialog says plainly that archived mail is not yet browsable.
+- **The Archive view.** The folder list ends with an Archive entry. It is the
+  `archived` scope of the one thread listing, so cursor paging, source scoping and
+  the unread aggregates are the inbox's own; it is not a smart folder and nothing
+  is stored for it. It lists a thread only if the thread is `archived` **and** one
+  of its messages is `archived`: that second test is what keeps out a thread the
+  sync archived because every message went `gone`, which is not the user's choice
+  and has nothing to restore.
+- **Unarchive** (`mail_unarchive`, "Move to inbox" in the reader) writes both
+  tables, as archiving did: each `archived` message back to `active`, then the
+  thread. Moving only the thread would list as an empty thread. A thread without
+  an `archived` message is refused, so a restore can never produce a thread with
+  an unread count and nothing to open.
+- **Unread badges.** Archived mail counts toward no badge: not the mailbox, the
+  domain, the All mail total, and the Archive entry shows none. Archiving is
+  dismissing, and a badge must always be clearable by opening something listed
+  under it. Opening an archived thread still marks it read, and unarchiving
+  brings back whatever unread is left.
 
 ---
 
@@ -1369,11 +1381,12 @@ mail_sync_interval_set(secs)       // Rust cannot read localStorage, so the
                                    // and on every settings change. Without it
                                    // the interval stays at the 3600 default
                                    // whatever the user sets.
-mail_threads(query: ThreadQuery) -> Page<ThreadRow>        // mailbox|folder|rules, cursor
+mail_threads(query: ThreadQuery) -> Page<ThreadRow>        // mailbox|folder|archived|rules, cursor
 mail_thread(thread_id) -> ThreadDetail                     // messages + attachments
 mail_message_raw(message_id) -> String                     // re-fetch from S3
 mail_mark(thread_ids, read: bool) / mail_star(...)
 mail_archive(thread_ids)
+mail_unarchive(thread_ids)                                 // archived -> inbox, messages too
 mail_delete(thread_ids, hard: bool) -> DeleteReport
 mail_attachment_open(attachment_id) -> PathBuf             // downloads if needed
 mail_attachment_bytes(attachment_id) -> Vec<u8>            // for inline images

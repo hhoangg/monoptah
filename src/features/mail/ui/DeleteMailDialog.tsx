@@ -154,8 +154,8 @@ export function DeleteMailDialog({
               </span>
               <span className="text-[11.5px] leading-snug text-content/50">
                 Removes the {noun} from your mailboxes and keeps the S3 objects.
-                Archived mail is not yet browsable in Monoptah, so it cannot be
-                brought back from here.
+                It stays under Archive in the folder list, where you can read it
+                or move it back to the inbox.
               </span>
             </span>
           </label>

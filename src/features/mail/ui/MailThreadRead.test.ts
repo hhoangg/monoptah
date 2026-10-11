@@ -4,7 +4,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { RAW_PREVIEW_CHARS, MailThreadRead } from "./MailThreadRead";
 import { listen } from "@tauri-apps/api/event";
-import { mailMark, mailMessageRaw, mailStar, mailThread } from "../model/mail";
+import {
+  mailMark,
+  mailMessageRaw,
+  mailStar,
+  mailThread,
+  mailUnarchive,
+} from "../model/mail";
 import type { MessageRow, ThreadDetail } from "../model/mailTypes";
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -21,6 +27,7 @@ vi.mock("../model/mail", () => ({
   mailMessageRaw: vi.fn(),
   mailMark: vi.fn(async () => undefined),
   mailStar: vi.fn(async () => undefined),
+  mailUnarchive: vi.fn(async () => undefined),
   mailAttachmentOpen: vi.fn(),
   mailAttachmentBytes: vi.fn(),
   mailRemoteImage: vi.fn(),
@@ -89,6 +96,7 @@ beforeEach(() => {
   vi.mocked(mailThread).mockReset();
   vi.mocked(mailMark).mockClear();
   vi.mocked(mailStar).mockClear();
+  vi.mocked(mailUnarchive).mockClear();
 });
 
 afterEach(() => {
@@ -239,4 +247,26 @@ it("opens the delete dialog from the header, with nothing sent yet", async () =>
   await act(async () => button.click());
   expect(document.body.textContent).toContain("Archive locally");
   expect(document.body.textContent).toContain("Delete on S3 as well");
+});
+
+const headerButton = (label: string) =>
+  [...container.querySelectorAll("button")].find(
+    (b) => b.textContent === label,
+  ) as HTMLButtonElement | undefined;
+
+it("offers Move to inbox on an archived thread and sends the thread id", async () => {
+  vi.mocked(mailThread).mockResolvedValue(
+    detail([msg(1, { state: "archived" }), msg(2, { state: "archived" })]),
+  );
+  await render();
+  await act(async () => headerButton("Move to inbox")!.click());
+  expect(mailUnarchive).toHaveBeenCalledWith([5]);
+});
+
+it("does not offer Move to inbox once a new message made the thread active again", async () => {
+  vi.mocked(mailThread).mockResolvedValue(
+    detail([msg(1, { state: "archived" }), msg(2)]),
+  );
+  await render();
+  expect(headerButton("Move to inbox")).toBeUndefined();
 });
