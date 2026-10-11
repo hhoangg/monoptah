@@ -2,11 +2,8 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import {
-  MailFolderList,
-  domainOf,
-  groupMailboxesByDomain,
-} from "./MailFolderList";
+import { MailFolderList, groupMailboxesByDomain } from "./MailFolderList";
+import { domainOf } from "../model/mailDomain";
 import { MAIL_PREF_KEYS } from "../model/mailPrefs";
 import type {
   MailStatus,

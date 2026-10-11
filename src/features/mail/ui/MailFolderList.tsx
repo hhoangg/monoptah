@@ -17,8 +17,8 @@ import type {
 } from "../model/mailTypes";
 import { collapsedDomains, useCollapsedDomains } from "../model/mailPrefs";
 
-// Re-exported so existing importers keep one entry point.
-export { domainOf } from "../model/mailDomain";
+// Seam: MailView imports this from here. Delete once MailView (or Task 13)
+// imports it from the model.
 export { useMailStatus } from "../model/useMailStatus";
 
 /** A saved filter. Task 12 supplies these; until then the list is empty. */

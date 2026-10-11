@@ -90,7 +90,7 @@ function Harness({
   listKey: string;
   extra: Record<string, unknown>;
 }): ReactNode {
-  const list = useMailThreadList(scope, false);
+  const list = useMailThreadList(scope, extra.folderSelected === true);
   return createElement(MailThreadList, {
     key: listKey,
     list,
@@ -275,38 +275,137 @@ it("keeps the window across a background reload of the same scope", async () => 
   expect(rowCount()).toBe(64);
 });
 
-it("keeps loading pages while a filter hides every loaded row", async () => {
-  const cursor = { lastMessageAt: 1, id: 32 };
-  const page = (from: number) =>
-    Array.from({ length: 32 }, (_, i) => thread(from + i));
+const setFilter = async (label: string, value: string) => {
+  const chip = [...container.querySelectorAll("button")].find(
+    (b) => b.textContent === label,
+  )!;
+  await act(async () => chip.click());
+  const field = container.querySelector<HTMLInputElement>("input")!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )!.set!.call(field, value);
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+};
+
+// Reports only when observe() is called, in a later task, like a browser. An
+// observer that is never re-created therefore never reports again.
+const useReportOnObserve = () => {
+  class OnObserve {
+    private live = true;
+    constructor(private cb: (e: { isIntersecting: boolean }[]) => void) {}
+    observe() {
+      setTimeout(() => {
+        if (this.live) this.cb([{ isIntersecting: true }]);
+      }, 0);
+    }
+    disconnect() {
+      this.live = false;
+    }
+  }
+  vi.stubGlobal("IntersectionObserver", OnObserve);
+};
+const settle = async () => {
+  for (let i = 0; i < 6; i++)
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    });
+};
+const miss = (from: number) =>
+  Array.from({ length: 32 }, (_, i) => thread(from + i));
+
+it("keeps paging while a filter hides every row of the fetched pages", async () => {
+  const cursor = { lastMessageAt: 1, id: 1 };
   vi.mocked(mailThreads)
-    .mockResolvedValueOnce({ rows: page(1), nextCursor: cursor })
+    .mockResolvedValueOnce({ rows: miss(1), nextCursor: cursor })
+    .mockResolvedValueOnce({ rows: miss(100), nextCursor: cursor })
     .mockResolvedValueOnce({
-      rows: [thread(200, { subject: "Needle" })],
+      rows: [thread(900, { subject: "Needle" })],
       nextCursor: null,
     });
   await render(all, twoDomains);
-  const input = async () => {
-    const chips = [...container.querySelectorAll("button")];
-    await act(async () =>
-      chips.find((b) => b.textContent === "Content")!.click(),
-    );
-    return container.querySelector<HTMLInputElement>("input")!;
-  };
-  const field = await input();
-  await act(async () => {
-    const set = Object.getOwnPropertyDescriptor(
-      HTMLInputElement.prototype,
-      "value",
-    )!.set!;
-    set.call(field, "needle");
-    field.dispatchEvent(new Event("input", { bubbles: true }));
-  });
-  expect(rowCount()).toBe(0);
-  expect(intersect).not.toBeNull();
-  await act(async () => intersect!());
+  // Observer turns automatic only now, so nothing pages before the filter.
+  useReportOnObserve();
+  await setFilter("Content", "needle");
+  await settle();
+  expect(mailThreads).toHaveBeenCalledTimes(3);
   expect(rowCount()).toBe(1);
+});
+
+it("pauses automatic paging when a filter matches nothing, until Load more", async () => {
+  const cursor = { lastMessageAt: 1, id: 1 };
+  let next = 1;
+  vi.mocked(mailThreads).mockImplementation(async () => ({
+    rows: miss((next += 100)),
+    nextCursor: cursor,
+  }));
+  await render(all, twoDomains);
+  const before = vi.mocked(mailThreads).mock.calls.length;
+  // Observer turns automatic only now, so nothing pages before the filter.
+  useReportOnObserve();
+  await setFilter("Content", "nothing-matches");
+  await settle();
+  // MAX_IDLE_PAGES follow-on fetches, then it waits for a press.
+  expect(mailThreads).toHaveBeenCalledTimes(before + 3);
+  const more = [...container.querySelectorAll("button")].find(
+    (b) => b.textContent === "Load more",
+  )!;
+  await act(async () => more.click());
+  await settle();
+  // Each press buys another MAX_IDLE_PAGES, then it waits again.
+  expect(mailThreads).toHaveBeenCalledTimes(before + 6);
+});
+
+it("shows the partial-filter note only while more pages exist", async () => {
+  vi.mocked(mailThreads).mockResolvedValueOnce({
+    rows: [thread(1)],
+    nextCursor: null,
+  });
+  await render(all, twoDomains);
+  await setFilter("Content", "subject");
+  expect(container.textContent).not.toContain("loaded so far");
+  expect(rowCount()).toBe(1);
+});
+
+it("shows the partial-filter note when the server has more", async () => {
+  vi.mocked(mailThreads).mockResolvedValueOnce({
+    rows: [thread(1)],
+    nextCursor: { lastMessageAt: 1, id: 1 },
+  });
+  await render(all, twoDomains);
+  await setFilter("Content", "subject");
   expect(container.textContent).toContain("loaded so far");
+});
+
+it("drops an in-flight page when a smart folder is selected", async () => {
+  const cursor = { lastMessageAt: 1, id: 32 };
+  let resolveOld!: (v: { rows: ThreadRow[]; nextCursor: null }) => void;
+  vi.mocked(mailThreads)
+    .mockResolvedValueOnce({ rows: miss(1), nextCursor: cursor })
+    .mockImplementationOnce(
+      () => new Promise((resolve) => (resolveOld = resolve)),
+    );
+  await render(all, twoDomains);
+  await act(async () => intersect!());
+  await render(all, twoDomains, { folderSelected: true });
+  await act(async () => resolveOld({ rows: [thread(900)], nextCursor: null }));
+  expect(rowCount()).toBe(0);
+});
+
+it("resets the window on a scope change even when the first fetch fails", async () => {
+  const rows = Array.from({ length: 70 }, (_, i) => thread(i + 1));
+  vi.mocked(mailThreads)
+    .mockResolvedValueOnce({ rows, nextCursor: null })
+    .mockRejectedValueOnce(new Error("boom"))
+    .mockResolvedValue({ rows, nextCursor: null });
+  await render(all, twoDomains);
+  await act(async () => intersect!());
+  expect(rowCount()).toBe(64);
+  await render(oneBox, twoDomains);
+  // The fetch failed, yet the window no longer carries the old scope's size.
+  expect(rowCount()).toBe(32);
 });
 
 it("exposes rows as list items holding buttons", async () => {
@@ -316,6 +415,10 @@ it("exposes rows as list items holding buttons", async () => {
   });
   await render(all, oneDomain);
   expect(
-    container.querySelector("ul > li > button[data-thread-id]"),
+    container.querySelector(
+      "ul[role='list'][aria-label='Threads'] > li > button[data-thread-id]",
+    ),
   ).not.toBeNull();
+  // role="listitem" on the button would hide that it is clickable.
+  expect(container.querySelector("button[role]")).toBeNull();
 });

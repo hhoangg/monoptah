@@ -16,6 +16,13 @@ import { domainOf } from "../model/mailDomain";
 /** Rows fetched per backend page; the DOM window grows in LIST_PAGE_SIZE steps. */
 const FETCH_LIMIT = 100;
 
+/**
+ * Consecutive fetched pages that add no row matching the active filter before
+ * paging pauses for a "Load more" press. Without it a filter matching nothing
+ * would pull the whole mailbox with no user gesture.
+ */
+const MAX_IDLE_PAGES = 3;
+
 const DAY_MS = 86_400_000;
 const FILTER_FIELDS = ["from", "to", "content"] as const;
 type FilterField = (typeof FILTER_FIELDS)[number];
@@ -74,6 +81,9 @@ export function participantsLabel(row: ThreadRow): string {
   return (others.length > 0 ? others : row.participants).map(nameOf).join(", ");
 }
 
+const anyActive = (filters: ThreadFilters) =>
+  FILTER_FIELDS.some((f) => filters[f].trim() !== "");
+
 export function filterThreads(rows: ThreadRow[], filters: ThreadFilters) {
   const f = {
     from: filters.from.trim().toLowerCase(),
@@ -116,6 +126,14 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
   const [limit, setLimit] = useState(LIST_PAGE_SIZE);
   const [filters, setFilters] = useState<ThreadFilters>(NO_FILTERS);
   const [reloadKey, setReloadKey] = useState(0);
+  const [idlePages, setIdlePagesState] = useState(0);
+  const idleRef = useRef(0);
+  const setIdlePages = (n: number) => {
+    idleRef.current = n;
+    setIdlePagesState(n);
+  };
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
   // Survives the list remounting, so a layout change keeps the user's place.
   const scrollTop = useRef(0);
   // Bumped per first-page load so a page fetch begun under an older scope or
@@ -142,6 +160,16 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
   }, []);
 
   useEffect(() => {
+    // Before the folder early return: a page in flight from the previous scope
+    // must not append onto the list cleared below.
+    generation.current += 1;
+    fetchingRef.current = false;
+    setIdlePages(0);
+    // Reset on the scope change itself, so a failed first fetch does not leave
+    // the previous scope's window behind. A background reload keeps it.
+    const scopeChanged = loadedScope.current !== scopeKey;
+    loadedScope.current = scopeKey;
+    if (scopeChanged) setLimit(LIST_PAGE_SIZE);
     if (folderSelected) {
       setRows([]);
       setCursor(null);
@@ -149,10 +177,6 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
       return;
     }
     let stale = false;
-    generation.current += 1;
-    fetchingRef.current = false;
-    const scopeChanged = loadedScope.current !== scopeKey;
-    loadedScope.current = scopeKey;
     setLoading(true);
     mailThreads({ scope, limit: FETCH_LIMIT })
       .then((page) => {
@@ -160,8 +184,6 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
         setRows(page.rows);
         setCursor(page.nextCursor);
         setError(null);
-        // A background reload keeps the window so the list does not jump.
-        if (scopeChanged) setLimit(LIST_PAGE_SIZE);
       })
       .catch((err) => {
         if (!stale) setError(err instanceof Error ? err.message : String(err));
@@ -182,18 +204,26 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
   const pageHasMore = cursor !== null;
   const hasMore = windowHasMore || pageHasMore;
 
-  const grow = () => {
+  const grow = (manual = false) => {
     if (windowHasMore) {
       setLimit((current) => current + LIST_PAGE_SIZE);
       return;
     }
     if (!cursor || fetchingRef.current) return;
+    if (!manual && idleRef.current >= MAX_IDLE_PAGES) return;
+    if (manual) setIdlePages(0);
     fetchingRef.current = true;
     const after = cursor;
     const mine = generation.current;
     mailThreads({ scope, cursor: after, limit: FETCH_LIMIT })
       .then((page) => {
         if (mine !== generation.current) return;
+        setIdlePages(
+          filterThreads(page.rows, filtersRef.current).length > 0 ||
+            !anyActive(filtersRef.current)
+            ? 0
+            : idleRef.current + 1,
+        );
         setRows((current) => [...current, ...page.rows]);
         setCursor(page.nextCursor);
         setLimit((current) => current + LIST_PAGE_SIZE);
@@ -207,7 +237,11 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
       });
   };
 
+  const paused = pageHasMore && idlePages >= MAX_IDLE_PAGES;
   return {
+    moreOnServer: pageHasMore,
+    paused,
+    loadMore: () => grow(true),
     rows,
     filtered,
     shown,
@@ -215,7 +249,10 @@ export function useMailThreadList(scope: ThreadScope, folderSelected: boolean) {
     loading,
     error,
     filters,
-    setFilters,
+    setFilters: (next: ThreadFilters) => {
+      setIdlePages(0);
+      setFilters(next);
+    },
     grow,
     scrollTop,
   };
@@ -251,6 +288,9 @@ export function MailThreadList({
     error,
     filters,
     setFilters,
+    moreOnServer,
+    paused,
+    loadMore,
   } = list;
   const density = useDensity();
   const [open, setOpen] = useState<FilterField | null>(null);
@@ -348,12 +388,9 @@ export function MailThreadList({
         </button>
       </div>
 
-      <div
-        ref={scrollRef}
-        aria-label="Threads"
-        className="min-h-0 flex-1 overflow-y-auto"
-      >
-        <ul className="m-0 list-none p-0">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
+        {/* role restored: list-style none strips list semantics in WebKit */}
+        <ul role="list" aria-label="Threads" className="m-0 list-none p-0">
           {filtered.slice(0, shown).map((row) => {
             const unread = row.unreadCount > 0;
             const selected = row.id === selectedId;
@@ -442,11 +479,22 @@ export function MailThreadList({
             );
           })}
         </ul>
-        {anyFilter ? (
+        {anyFilter && moreOnServer ? (
           <p className="px-3 py-1 text-[11px] text-content/45">
             Filtering the {rows.length} threads loaded so far, not the whole
             mailbox.
           </p>
+        ) : null}
+        {paused ? (
+          <div className="px-3 py-2">
+            <button
+              type="button"
+              onClick={loadMore}
+              className="rounded-md border border-content/10 px-2.5 py-1 text-[12px] text-content/70 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-accent"
+            >
+              Load more
+            </button>
+          </div>
         ) : null}
         {hasMore ? (
           <div ref={sentinelRef} aria-hidden className="h-px" />
