@@ -2,6 +2,7 @@ import { Terminal } from "@xterm/xterm";
 import { useEffect, useRef } from "react";
 import {
   getPtyStatus,
+  holdPtyBridge,
   killPty,
   resizePty,
   spawnPty,
@@ -9,6 +10,12 @@ import {
   writePty,
   type PtyLaunch,
 } from "../../../platform/tauri/pty";
+import {
+  claimPtyArrival,
+  consumePtyHandoff,
+  takeArrivedExit,
+  type PtyHandoffExit,
+} from "../model/ptyHandoff";
 import { isOscColorQuery, oscColorReply } from "../model/terminalChrome";
 import {
   isMacTerminalClearShortcut,
@@ -35,6 +42,14 @@ type Props = {
   active: boolean;
   /** Runs this program instead of the login shell. Read once per spawn. */
   launch?: PtyLaunch;
+  /**
+   * This pane was handed off from another view and its process is still
+   * running: attach to it and never spawn. Left unset, the view takes the
+   * answer from the handoff record for its id. A caller that mounts the view
+   * later than it mounts itself (after async work) decides at its own mount
+   * and passes the answer here.
+   */
+  attach?: boolean;
   onMetaChange?: (patch: TerminalMetaPatch) => void;
   /** Reports the process ending, or failing to start (`error`, no code). */
   onExit?: (exit: {
@@ -43,6 +58,8 @@ type Props = {
     /** Last output the process wrote, for telling why it stopped. */
     output?: string;
   }) => void;
+  /** Collects the output tail for `onExit`. Off by default: it decodes every chunk. */
+  captureExitOutput?: boolean;
   /** Window title the program sets (OSC 0/2). Shells are left alone unless set. */
   onTitleChange?: (title: string) => void;
   /** Called once the process has actually been spawned. */
@@ -141,6 +158,13 @@ function terminalFont(): string {
  */
 const stoppingPtys = new Map<string, Promise<void>>();
 
+/**
+ * Longest a handed-off view's pending start may hold the next view back. The
+ * wait covers a spawn that is a few milliseconds from landing; a start that
+ * never settles (an IPC that never answers) must not leave the pane blank.
+ */
+const HANDOFF_WAIT_MS = 5000;
+
 /** Enough to hold a CLI's one-line failure message. */
 const OUTPUT_TAIL_CHARS = 4000;
 
@@ -167,8 +191,10 @@ export function TerminalView({
   cwd,
   active,
   launch,
+  attach: attachProp,
   onMetaChange,
   onExit,
+  captureExitOutput,
   onTitleChange,
   onSpawn,
 }: Props) {
@@ -181,6 +207,8 @@ export function TerminalView({
   onMetaChangeRef.current = onMetaChange;
   const onExitRef = useRef(onExit);
   onExitRef.current = onExit;
+  const captureExitOutputRef = useRef(captureExitOutput);
+  captureExitOutputRef.current = captureExitOutput;
   const onSpawnRef = useRef(onSpawn);
   onSpawnRef.current = onSpawn;
   const onTitleChangeRef = useRef(onTitleChange);
@@ -189,6 +217,16 @@ export function TerminalView({
   // restart the process; it is read when the spawn happens.
   const launchRef = useRef(launch);
   launchRef.current = launch;
+  const attachPropRef = useRef(attachProp);
+  attachPropRef.current = attachProp;
+  // Decided once per id and kept across a StrictMode replay of the effect: the
+  // handoff record is consumed by the first run, and the replay must not read
+  // its absence as "spawn".
+  const intentRef = useRef<{
+    id: string;
+    attach: boolean;
+    exit: PtyHandoffExit | undefined;
+  } | null>(null);
   const runningProcessRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -212,6 +250,15 @@ export function TerminalView({
     term.open(host);
     termRef.current = term;
     let closed = false;
+    if (intentRef.current?.id !== id) {
+      intentRef.current = {
+        id,
+        attach: attachPropRef.current ?? claimPtyArrival(id),
+        exit: takeArrivedExit(id),
+      };
+    }
+    const attach = intentRef.current.attach;
+    const arrivedExit = intentRef.current.exit;
 
     const onCopy = (event: ClipboardEvent) => {
       const text = term.getSelection();
@@ -278,20 +325,35 @@ export function TerminalView({
       : null;
 
     let oscBuffer = "";
-    // Kept only for a view that asked to hear about the exit, so shells and
-    // file-pane terminals do not decode every chunk twice.
+    // Kept only for a view that opted in with `captureExitOutput`, so shells
+    // and file-pane terminals do not decode every chunk twice.
     let outputTail = "";
     const outputDecoder = new TextDecoder();
 
     let unsubscribe = () => {};
     let didStart = false;
-    const start = () => {
+    let didSpawn = false;
+    let exitSeen = false;
+    // The exit this view told its owner about, handed on if the pane moves so
+    // the next view shows it instead of failing to reattach to a dead process.
+    let reported: PtyHandoffExit | null = null;
+    // Set when the cleanup left the process running for the next view.
+    let handedOff = false;
+    // Settles once the terminal has been fitted to its pane (or closed), so an
+    // attach can ask the program to repaint at the size it will keep.
+    let fitDone = () => {};
+    const fitted = new Promise<void>((resolve) => {
+      fitDone = resolve;
+    });
+    const start = async () => {
       if (closed) return;
+      // Subscribing first keeps the event bridge held across a handoff, and
+      // buffers anything the process says while the rest of start runs.
       unsubscribe = subscribePty(
         id,
         (data) => {
           if (closed) return;
-          if (onExitRef.current) {
+          if (captureExitOutputRef.current) {
             outputTail = (
               outputTail + outputDecoder.decode(data, { stream: true })
             ).slice(-OUTPUT_TAIL_CHARS);
@@ -313,30 +375,100 @@ export function TerminalView({
         },
         (code) => {
           if (closed) return;
+          exitSeen = true;
+          reported = { code: code ?? null };
           const status = code == null ? "" : ` (${code})`;
           term.writeln(`\r\n[process exited${status}]`);
-          onExitRef.current?.({ code: code ?? null, output: outputTail });
+          onExitRef.current?.({
+            code: code ?? null,
+            ...(captureExitOutputRef.current ? { output: outputTail } : {}),
+          });
         },
       );
       didStart = true;
+      if (attach && arrivedExit) {
+        // The process had already ended when the pane moved, and the view that
+        // left reported how. Say the same again: the process is not "lost", and
+        // the owner keeps the real code and its restart affordances.
+        exitSeen = true;
+        reported = arrivedExit;
+        if (arrivedExit.error) {
+          term.writeln(`\x1b[31m${arrivedExit.error}\x1b[0m`);
+        } else {
+          const status =
+            arrivedExit.code == null ? "" : ` (${arrivedExit.code})`;
+          term.writeln(`\r\n[process exited${status}]`);
+        }
+        onExitRef.current?.({
+          code: arrivedExit.code,
+          ...(arrivedExit.error ? { error: arrivedExit.error } : {}),
+        });
+        return;
+      }
+      if (attach) {
+        // This pane was moved and its process is still running. Spawning
+        // would kill it, so a pane that meant to attach never spawns: if the
+        // process is gone, or cannot be confirmed, it says so instead.
+        try {
+          await getPtyStatus(id);
+        } catch (error) {
+          // The exit notice has already told the user what happened.
+          if (exitSeen) return;
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `Could not reattach to the running terminal (${reason}). Restart it to continue.`,
+          );
+        }
+        if (closed) return;
+        // Replay cannot rebuild a full-screen program's display; a resize
+        // signals it to repaint into this fresh terminal. The kernel only
+        // signals when the size changes, and the fitted size can equal the
+        // old one, so step off it and back, from the real size.
+        await fitted;
+        if (closed) return;
+        try {
+          await resizePty(id, term.cols, Math.max(2, term.rows - 1));
+          await resizePty(id, term.cols, term.rows);
+        } catch {
+          // A failed repaint nudge must not fail the pane: the process is
+          // fine. Let the next fit send the size again.
+          lastCols = 0;
+          lastRows = 0;
+          schedule();
+        }
+        return;
+      }
       const launchNow = launchRef.current;
-      return launchNow
+      await (launchNow
         ? spawnPty(id, cwd, term.cols, term.rows, launchNow)
-        : spawnPty(id, cwd, term.cols, term.rows);
+        : spawnPty(id, cwd, term.cols, term.rows));
+      didSpawn = true;
     };
 
+    // `start` always runs behind a `.then`, never synchronously. That is what
+    // makes a StrictMode replay safe after a handoff: the replay's cleanup runs
+    // before this view's `start` does, so `closed` is already true, `didStart`
+    // never gets set, and the stop path below kills nothing. If `start` ever
+    // ran inline, that cleanup would kill the process just handed over.
     const starting = (stoppingPtys.get(id) ?? Promise.resolve())
       .then(start)
       .then(() => {
-        if (closed) return;
+        if (closed) {
+          // A pane moved while its spawn was in flight still started: the next
+          // view attaches and reports nothing, so the start is reported here.
+          if (handedOff && didSpawn) onSpawnRef.current?.();
+          return;
+        }
         spawned.current = true;
-        onSpawnRef.current?.();
+        // Nothing was launched when attaching, so there is no start to report.
+        if (didSpawn) onSpawnRef.current?.();
       })
       .catch((error) => {
         spawned.current = false;
         if (!closed) {
           const message =
             error instanceof Error ? error.message : String(error);
+          reported = { code: null, error: message };
           term.writeln(`\x1b[31m${message}\x1b[0m`);
           onExitRef.current?.({ code: null, error: message });
         }
@@ -402,6 +534,7 @@ export function TerminalView({
       const next = fitTerminal(term, host, fitMode());
       if (!next) return;
       const { cols, rows } = next;
+      fitDone();
       if (cols === lastCols && rows === lastRows) return;
       lastCols = cols;
       lastRows = rows;
@@ -433,6 +566,7 @@ export function TerminalView({
 
     return () => {
       closed = true;
+      fitDone();
       cancelAnimationFrame(frame);
       if (raf) cancelAnimationFrame(raf);
       observer.disconnect();
@@ -448,10 +582,44 @@ export function TerminalView({
       renderSub.dispose();
       bufferSub.dispose();
       titleSub?.dispose();
+      if (consumePtyHandoff(id, reported ?? undefined)) {
+        handedOff = true;
+        // The pane is moving, not closing: leave the process running for the
+        // view that mounts next and never kill it. That view still waits for
+        // a spawn this one has in flight, or it would see no process yet and
+        // spawn a second one over the first. Output buffers meanwhile and
+        // replays on its subscribe.
+        //
+        // Two things keep that wait from outliving its purpose. The event
+        // bridge is held until it ends, so dropping this view's subscription
+        // cannot arm its teardown and lose the output the next view replays.
+        // And the wait is bounded, so a start that never settles delays the
+        // next view instead of blocking it for good.
+        const releaseBridge = holdPtyBridge();
+        const parked = new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, HANDOFF_WAIT_MS);
+          const settle = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          starting.then(settle, settle);
+        }).finally(() => {
+          releaseBridge();
+          if (stoppingPtys.get(id) === parked) stoppingPtys.delete(id);
+        });
+        stoppingPtys.set(id, parked);
+        unsubscribe();
+        term.dispose();
+        termRef.current = null;
+        spawned.current = false;
+        return;
+      }
       const stopping = starting
         .catch(() => undefined)
         .then(() => {
           unsubscribe();
+          // `didStart` stays false when this view closed before `start` ran
+          // (see the note on `starting`), so such a view never kills.
           return didStart ? killPty(id) : undefined;
         })
         .finally(() => {

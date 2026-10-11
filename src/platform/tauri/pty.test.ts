@@ -2,7 +2,24 @@ import { describe, expect, it, vi } from "vitest";
 
 const core = vi.hoisted(() => ({ invoke: vi.fn(async () => undefined) }));
 vi.mock("@tauri-apps/api/core", () => core);
-import { decodePtyChunk, spawnPty, trimReplay } from "./pty";
+const events = vi.hoisted(() => ({
+  handlers: new Map<string, (event: { payload: unknown }) => void>(),
+}));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(
+    async (name: string, handler: (event: { payload: unknown }) => void) => {
+      events.handlers.set(name, handler);
+      return () => {};
+    },
+  ),
+}));
+import {
+  decodePtyChunk,
+  killPty,
+  spawnPty,
+  subscribePty,
+  trimReplay,
+} from "./pty";
 
 const KB = 1024;
 
@@ -86,5 +103,57 @@ describe("spawnPty", () => {
       rows: 24,
       launch,
     });
+  });
+});
+
+describe("an exit while no view is subscribed", () => {
+  const emit = (name: string, payload: unknown) =>
+    events.handlers.get(name)!({ payload });
+
+  it("is replayed to the next subscriber after the queued output", () => {
+    subscribePty("gap", () => {}, () => {})();
+    emit("pty-data", { id: "gap", data: "aGk=" });
+    emit("pty-exit", { id: "gap", code: 3 });
+
+    const seen: string[] = [];
+    const stop = subscribePty(
+      "gap",
+      (data) => seen.push(`data ${data.byteLength}`),
+      (code) => seen.push(`exit ${code}`),
+    );
+    expect(seen).toEqual(["data 2", "exit 3"]);
+    stop();
+
+    // Delivered once, not on every later subscribe.
+    const again: string[] = [];
+    subscribePty("gap", () => {}, (code) => again.push(`exit ${code}`))();
+    expect(again).toEqual([]);
+  });
+
+  it("is not buffered for a PTY this window never opened", () => {
+    subscribePty("other", () => {}, () => {})();
+    emit("pty-exit", { id: "stranger", code: 1 });
+    const seen: unknown[] = [];
+    subscribePty("stranger", () => {}, (code) => seen.push(code))();
+    // The subscribe itself opens the id, but nothing was queued for it.
+    expect(seen).toEqual([]);
+  });
+
+  it("is dropped with the PTY it belonged to", async () => {
+    subscribePty("dead", () => {}, () => {})();
+    emit("pty-exit", { id: "dead", code: 1 });
+    await killPty("dead");
+    const seen: unknown[] = [];
+    subscribePty("dead", () => {}, (code) => seen.push(code))();
+    expect(seen).toEqual([]);
+  });
+
+  it("does not leak into a fresh process spawned under the same id", async () => {
+    subscribePty("again", () => {}, () => {})();
+    emit("pty-exit", { id: "again", code: 1 });
+    await spawnPty("again", "/tmp", 80, 24);
+    const seen: unknown[] = [];
+    subscribePty("again", () => {}, (code) => seen.push(code))();
+    expect(seen).toEqual([]);
   });
 });

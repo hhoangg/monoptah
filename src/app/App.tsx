@@ -262,6 +262,10 @@ import {
   confirmCloseTerminals,
 } from "../features/terminal/model/terminalClose";
 import {
+  markPtyHandoff,
+  settlePtyHandoffs,
+} from "../features/terminal/model/ptyHandoff";
+import {
   listRunningTerminals,
   newTerminalCwd,
   terminalTabLabel,
@@ -416,6 +420,7 @@ import {
   applyPlaceSessionOnPane,
   filterTabsForProject,
   findOpenSessionTab,
+  planSessionPaneClose,
   planWorkspaceTabClose,
   switchSessionInTab,
   workspaceTabCwd,
@@ -1389,6 +1394,12 @@ function Workspace({
   const usageResetLookups = useRef(new WeakSet<UsageLimit>());
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
+  // A pane handoff lives for the commit that moves it. This runs after every
+  // child's unmount cleanup and mount effect for that commit, so whatever is
+  // still unclaimed here was never going to be.
+  useEffect(() => {
+    settlePtyHandoffs();
+  }, [tabs]);
   const dirtyFilesRef = useRef(dirtyFiles);
   dirtyFilesRef.current = dirtyFiles;
   const projectTerminalsRef = useRef(projectTerminals);
@@ -3673,7 +3684,7 @@ function Workspace({
   }, []);
 
   const onClearTabSession = useCallback(
-    (id: string) => {
+    (id: string, options?: { chatReplacement?: boolean }) => {
       const tab = tabs.find((entry) => entry.id === id);
       if (!tab || isBlankWorkspaceTab(tab, sessionsRef.current)) return;
 
@@ -3706,6 +3717,9 @@ function Workspace({
         const focus = worktreeFocus(oldSession.cwd);
         const session = {
           ...newContinuationSession(oldSession),
+          // A TUI that exited must not come back as another TUI: the pane
+          // would spawn the CLI again. The tab shows a blank chat instead.
+          ...(options?.chatReplacement ? { surface: "chat" as const } : {}),
           ...(workspace && !sameProjectPath(workspace, oldSession.cwd)
             ? {
                 worktreeCwd: workspace,
@@ -3743,7 +3757,10 @@ function Workspace({
               : entry,
           ),
         );
-        setComposerFocused(true);
+        // A background tab clearing itself must not pull the keyboard along.
+        if (!options?.chatReplacement || activeTabIdRef.current === id) {
+          setComposerFocused(true);
+        }
         void refreshHistory(sidebarCwd);
       };
 
@@ -3913,6 +3930,60 @@ function Workspace({
       setComposerFocused(true);
     })();
   }, [onCloseTab, onCloseTabs, onClearTabSession, projectCwd, tabCloseScope]);
+
+  /** Closes a TUI session's pane after its process exited, in any tab. The
+   * session stays parked and in the history list. */
+  const onTuiExitClose = useCallback(
+    (sessionId: string) => {
+      const plan = planSessionPaneClose({
+        tabs: tabsRef.current,
+        sessions: sessionsRef.current,
+        sessionId,
+        scope: tabCloseScope,
+        worktreeOf: tabWorktreeOf,
+      });
+      if (plan.action === "none") return;
+      if (plan.action === "clear-tab") {
+        onClearTabSession(plan.tabId, { chatReplacement: true });
+        return;
+      }
+      if (plan.action === "close-tab") {
+        onCloseTab(plan.tabId);
+        return;
+      }
+      persistSession(sessionsRef.current.find((s) => s.id === sessionId));
+      const wasFocused =
+        tabsRef.current.find((t) => t.id === plan.tabId)?.focusedId ===
+        sessionId;
+      // Also written to the ref, like the other callers that hand a plain
+      // array to setTabs: a session switch computed from the ref in the same
+      // batch must see this pane gone, or its array would bring it back.
+      const nextTabs = tabsRef.current.map((t) =>
+        t.id === plan.tabId
+          ? { ...t, layout: plan.layout, focusedId: plan.focusedId }
+          : t,
+      );
+      tabsRef.current = nextTabs;
+      setTabs(nextTabs);
+      if (
+        plan.tabId === activeTabIdRef.current &&
+        wasFocused
+      ) {
+        setComposerFocused(
+          sessionsRef.current.some((s) => s.id === plan.focusedId),
+        );
+      }
+      void refreshHistory(sidebarCwd);
+    },
+    [
+      onClearTabSession,
+      onCloseTab,
+      persistSession,
+      refreshHistory,
+      sidebarCwd,
+      tabCloseScope,
+    ],
+  );
 
   const onClosePane = useCallback(
     (sessionId?: string) => {
@@ -4379,12 +4450,14 @@ function Workspace({
     (paneId: string, targetTabId: string, position: "before" | "after") => {
       const result = applyDetachPaneToTab({
         tabs: tabsRef.current,
+        sessions: sessionsRef.current,
         paneId,
         targetTabId,
         position,
       });
       if (!result) return;
 
+      markPtyHandoff(result.movedPtyIds);
       tabsRef.current = result.tabs;
       setTabs(result.tabs);
       setProjectTerminalFocused(false);
@@ -5070,6 +5143,7 @@ function Workspace({
       });
       if (!result) return;
 
+      markPtyHandoff(result.movedPtyIds);
       sessionsRef.current = result.sessions;
       tabsRef.current = result.tabs;
       setSessions(result.sessions);
@@ -5105,6 +5179,7 @@ function Workspace({
         lastPersisted.current.delete(blankTarget.id);
         void forgetHarnessSession(blankTarget.harness, blankTarget.id);
       }
+      markPtyHandoff(result.movedPtyIds);
       sessionsRef.current = result.sessions;
       tabsRef.current = result.tabs;
       setSessions(result.sessions);
@@ -12119,10 +12194,20 @@ function Workspace({
           (tab) => tab.id === activeTabId,
         );
         if (currentTab?.focusedId !== focusedId) return;
-        setTabs(
-          (prev) =>
-            switchSessionInTab(prev, activeTabId, focusedId, next) ?? prev,
+        // Computed from the ref, not inside a state updater: the mark must be
+        // set before the commit, and an updater can run during render.
+        const switched = switchSessionInTab(
+          tabsRef.current,
+          activeTabId,
+          focusedId,
+          next,
+          sessionsRef.current,
         );
+        if (switched) {
+          markPtyHandoff(switched.movedPtyIds);
+          tabsRef.current = switched.tabs;
+          setTabs(switched.tabs);
+        }
         setComposerFocused(true);
         const linkedUpdate = linkedSessionUpdatesRef.current.get(next);
         if (linkedUpdate) revealLinkedSessionUpdate(next, linkedUpdate);
@@ -13206,6 +13291,7 @@ function Workspace({
                                     onTuiSessionChange={onTuiSessionChange}
                                     onTuiTitleChange={onTuiTitleChange}
                                     onTuiLaunchEvent={onTuiLaunchEvent}
+                                    onTuiExitClose={onTuiExitClose}
                                   />
                                 </div>
                               </div>

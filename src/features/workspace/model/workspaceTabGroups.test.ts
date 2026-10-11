@@ -17,7 +17,9 @@ import {
   findOpenSessionTab,
   findTabForProject,
   openAddToChatSessionPane,
+  planSessionPaneClose,
   planWorkspaceTabClose,
+  ptyIdsOfPanes,
   replaceGroupInTabOrder,
   switchSessionInTab,
   workspaceTabProject,
@@ -41,6 +43,10 @@ function session(id: string, cwd: string): Session {
 
 function tab(id: string, sessionId: string): WorkspaceTab {
   return { ...newTab(sessionId), id };
+}
+
+function tuiSession(id: string): Session {
+  return { ...session(id, "/repo"), surface: "tui" };
 }
 
 describe("focusedWorkspaceTabCwd", () => {
@@ -146,7 +152,13 @@ describe("switchSessionInTab", () => {
       ...tab("current-tab", "current"),
       layout: splitPane(newTab("current").layout, "current", "right", "other"),
     };
-    const [next] = switchSessionInTab([split], split.id, "current", "target")!;
+    const [next] = switchSessionInTab(
+      [split],
+      split.id,
+      "current",
+      "target",
+      [],
+    )!.tabs;
     expect(next.id).toBe(split.id);
     expect(leafIds(next.layout)).toEqual(["target", "other"]);
     expect(next.focusedId).toBe("target");
@@ -157,7 +169,16 @@ describe("switchSessionInTab", () => {
       ...tab("current-tab", "current"),
       layout: splitPane(newTab("current").layout, "current", "right", "target"),
     };
-    const [next] = switchSessionInTab([split], split.id, "current", "target")!;
+    const switched = switchSessionInTab(
+      [split],
+      split.id,
+      "current",
+      "target",
+      [tuiSession("current"), tuiSession("target")],
+    )!;
+    const [next] = switched.tabs;
+    // Nothing leaves its tab, so no view remounts.
+    expect(switched.movedPtyIds).toEqual([]);
     expect(leafIds(next.layout)).toEqual(["current", "target"]);
     expect(next.focusedId).toBe("target");
   });
@@ -170,7 +191,8 @@ describe("switchSessionInTab", () => {
       current.id,
       "current",
       "target",
-    )!;
+      [],
+    )!.tabs;
     expect(next.map((entry) => entry.id)).toEqual(["current-tab", "other-tab"]);
     expect(next.map((entry) => leafIds(entry.layout))).toEqual([
       ["target"],
@@ -179,10 +201,52 @@ describe("switchSessionInTab", () => {
     expect(next.map((entry) => entry.focusedId)).toEqual(["target", "current"]);
   });
 
+  it("reports the terminal sessions on both sides of a cross-tab swap", () => {
+    const current = tab("current-tab", "current");
+    const other = tab("other-tab", "target");
+    const switched = switchSessionInTab(
+      [current, other],
+      current.id,
+      "current",
+      "target",
+      [tuiSession("current"), tuiSession("target")],
+    )!;
+    // Both leaves land in the other tab's tree and remount.
+    expect(switched.movedPtyIds).toEqual(["tui:current", "tui:target"]);
+  });
+
+  it("reports only the terminal side of a cross-tab swap with a chat", () => {
+    const current = tab("current-tab", "current");
+    const other = tab("other-tab", "target");
+    const switched = switchSessionInTab(
+      [current, other],
+      current.id,
+      "current",
+      "target",
+      [session("current", "/repo"), tuiSession("target")],
+    )!;
+    expect(switched.movedPtyIds).toEqual(["tui:target"]);
+  });
+
+  it("reports nothing when the focused terminal is evicted, not moved", () => {
+    // The target is open in no tab, so the focused session lands nowhere: its
+    // process must be killed by the unmounting view, never handed off.
+    const current = tab("current-tab", "current");
+    const switched = switchSessionInTab(
+      [current],
+      current.id,
+      "current",
+      "target",
+      [tuiSession("current"), tuiSession("target")],
+    )!;
+    expect(leafIds(switched.tabs[0].layout)).toEqual(["target"]);
+    expect(switched.movedPtyIds).toEqual([]);
+  });
+
   it("ignores a switch after the focused session has changed", () => {
     const current = tab("current-tab", "new-focus");
     expect(
-      switchSessionInTab([current], current.id, "old-focus", "target"),
+      switchSessionInTab([current], current.id, "old-focus", "target", []),
     ).toBeNull();
   });
 });
@@ -441,6 +505,41 @@ describe("applyPlaceSessionOnPane", () => {
     });
     expect(next?.tabs.map((entry) => entry.id)).toEqual(["tm1"]);
     expect(leafIds(next!.tabs[0]!.layout)).toEqual(["m2", "m1"]);
+    expect(next?.movedPtyIds).toEqual([]);
+  });
+
+  it("reports the terminal session it relocates from another tab", () => {
+    const withTui = [...sessions, tuiSession("t1")];
+    const next = applyPlaceSessionOnPane({
+      tabs: [tab("tm1", "m1"), tab("tt1", "t1")],
+      sessions: withTui,
+      sessionId: "t1",
+      targetId: "m1",
+      edge: "right",
+      replaceTarget: false,
+      scope: "workspace",
+      createReplacement: replacementFrom,
+    });
+    expect(next?.movedPtyIds).toEqual(["tui:t1"]);
+  });
+
+  it("reports nothing for a terminal session already in the target tab", () => {
+    const withTui = [...sessions, tuiSession("t1")];
+    const grouped: WorkspaceTab = {
+      ...tab("tm1", "m1"),
+      layout: splitPane(newTab("m1").layout, "m1", "right", "t1"),
+    };
+    const next = applyPlaceSessionOnPane({
+      tabs: [grouped],
+      sessions: withTui,
+      sessionId: "t1",
+      targetId: "m1",
+      edge: "left",
+      replaceTarget: false,
+      scope: "workspace",
+      createReplacement: replacementFrom,
+    });
+    expect(next?.movedPtyIds).toEqual([]);
   });
 
   it("keeps the last tab of a project and fills it with a replacement", () => {
@@ -481,6 +580,25 @@ describe("applyPlaceTabOnPane", () => {
     expect(next?.tabs.map((entry) => entry.id)).toEqual(["target-tab"]);
     expect(leafIds(next!.tabs[0]!.layout)).toEqual(["source", "target"]);
     expect(next?.tabs[0]?.focusedId).toBe("source");
+  });
+
+  it("reports every terminal of the dragged tab, and none of the target's", () => {
+    const file = newTerminalFile("/projects/monocode");
+    const pane = { id: "term", files: [file], activeFileId: file.id };
+    const source: WorkspaceTab = {
+      ...tab("source-tab", "source"),
+      layout: splitPane(newTab("source").layout, "source", "down", pane.id),
+      terminalPanes: [pane],
+    };
+    const next = applyPlaceTabOnPane({
+      tabs: [tab("target-tab", "target"), source],
+      sessions: [tuiSession("target"), tuiSession("source")],
+      sourceTabId: source.id,
+      targetId: "target",
+      edge: "right",
+      replaceTarget: false,
+    });
+    expect(next?.movedPtyIds).toEqual(["tui:source", file.id]);
   });
 
   it("keeps every pane and the nested layout of the dragged tab", () => {
@@ -547,6 +665,7 @@ describe("applyDetachPaneToTab", () => {
     const target = tab("target-tab", "third");
     const next = applyDetachPaneToTab({
       tabs: [source, target],
+      sessions: [session("first", "/repo"), session("second", "/repo")],
       paneId: "second",
       targetTabId: target.id,
       position: "before",
@@ -562,6 +681,23 @@ describe("applyDetachPaneToTab", () => {
     ]);
     expect(leafIds(next!.tabs[0]!.layout)).toEqual(["first"]);
     expect(leafIds(next!.tabs[1]!.layout)).toEqual(["second"]);
+    expect(next?.movedPtyIds).toEqual([]);
+  });
+
+  it("reports the terminal session it detaches", () => {
+    const source: WorkspaceTab = {
+      ...tab("source-tab", "first"),
+      layout: splitPane(newTab("first").layout, "first", "right", "second"),
+    };
+    const next = applyDetachPaneToTab({
+      tabs: [source, tab("target-tab", "third")],
+      sessions: [tuiSession("first"), tuiSession("second")],
+      paneId: "second",
+      targetTabId: "target-tab",
+      position: "after",
+    });
+    // Only the pane that leaves the split, not the one that stays.
+    expect(next?.movedPtyIds).toEqual(["tui:second"]);
   });
 
   it.each(["editor", "terminal"] as const)(
@@ -580,6 +716,7 @@ describe("applyDetachPaneToTab", () => {
       };
       const next = applyDetachPaneToTab({
         tabs: [source, tab("target-tab", "other")],
+        sessions: [],
         paneId: pane.id,
         targetTabId: "target-tab",
         position: "after",
@@ -599,6 +736,7 @@ describe("applyDetachPaneToTab", () => {
       expect(next?.tabs[2]?.terminalPanes).toEqual(
         kind === "terminal" ? [pane] : [],
       );
+      expect(next?.movedPtyIds).toEqual(kind === "terminal" ? [file.id] : []);
     },
   );
 
@@ -606,6 +744,7 @@ describe("applyDetachPaneToTab", () => {
     expect(
       applyDetachPaneToTab({
         tabs: [tab("source-tab", "only")],
+        sessions: [],
         paneId: "only",
         targetTabId: "source-tab",
         position: "after",
@@ -698,5 +837,177 @@ describe("workspaceTabWorktree", () => {
         worktreeOf,
       }),
     ).toEqual({ action: "keep" });
+  });
+});
+
+describe("planSessionPaneClose", () => {
+  const sessions = [
+    session("a", "/repo"),
+    session("b", "/repo"),
+    session("c", "/repo"),
+  ];
+
+  it("closes a pane in a tab that is not the active one", () => {
+    const split: WorkspaceTab = {
+      ...tab("t2", "b"),
+      layout: splitPane(newTab("b").layout, "b", "right", "c"),
+    };
+    const tabs = [tab("t1", "a"), split];
+    const plan = planSessionPaneClose({
+      tabs,
+      sessions,
+      sessionId: "c",
+      scope: "workspace",
+    });
+    expect(plan).toMatchObject({ action: "remove-pane", tabId: "t2" });
+    if (plan.action !== "remove-pane") throw new Error("Expected remove-pane");
+    expect(leafIds(plan.layout)).toEqual(["b"]);
+    // The plan never touches the sessions, so nothing is archived.
+    expect(sessions.map((s) => s.id)).toEqual(["a", "b", "c"]);
+  });
+
+  it("drops a background tab when its last pane closes", () => {
+    const plan = planSessionPaneClose({
+      tabs: [tab("t1", "a"), tab("t2", "b")],
+      sessions,
+      sessionId: "b",
+      scope: "workspace",
+    });
+    expect(plan).toEqual({ action: "close-tab", tabId: "t2" });
+  });
+
+  it("resets the only tab to a blank session instead of closing it", () => {
+    const plan = planSessionPaneClose({
+      tabs: [tab("t1", "a")],
+      sessions,
+      sessionId: "a",
+      scope: "workspace",
+    });
+    expect(plan).toEqual({ action: "clear-tab", tabId: "t1" });
+  });
+
+  describe("project scope, as the app runs it", () => {
+    const tuiSession = (id: string, cwd: string): Session => ({
+      ...session(id, cwd),
+      surface: "tui",
+    });
+    const worktreeOf = (entry: WorkspaceTab) =>
+      leafIds(entry.layout).includes("wt")
+        ? "/repo-wt"
+        : leafIds(entry.layout).includes("wt2")
+          ? "/repo-wt2"
+          : null;
+
+    it("clears the only tab when a late TUI exit leaves nothing else", () => {
+      const all = [tuiSession("a", "/repo")];
+      const plan = planSessionPaneClose({
+        tabs: [tab("t1", "a")],
+        sessions: all,
+        sessionId: "a",
+        scope: "project",
+        worktreeOf,
+      });
+      expect(plan).toEqual({ action: "clear-tab", tabId: "t1" });
+      // Planning never edits the sessions, so no replacement is spawned here;
+      // the app builds a blank chat for a clear-tab plan.
+      expect(all).toHaveLength(1);
+      expect(all[0].surface).toBe("tui");
+    });
+
+    it("closes a tab that has a same-project sibling", () => {
+      const plan = planSessionPaneClose({
+        tabs: [tab("t1", "a"), tab("t2", "b")],
+        sessions,
+        sessionId: "b",
+        scope: "project",
+        worktreeOf,
+      });
+      expect(plan).toEqual({ action: "close-tab", tabId: "t2" });
+    });
+
+    it("clears a background tab whose project has no other tab", () => {
+      const other = [session("a", "/repo"), tuiSession("b", "/other")];
+      const plan = planSessionPaneClose({
+        tabs: [tab("t1", "a"), tab("t2", "b")],
+        sessions: other,
+        sessionId: "b",
+        scope: "project",
+        worktreeOf,
+      });
+      expect(plan).toEqual({ action: "clear-tab", tabId: "t2" });
+    });
+
+    it("clears a worktree tab when the only sibling is in another worktree", () => {
+      const all = [session("wt2", "/repo"), tuiSession("wt", "/repo")];
+      const plan = planSessionPaneClose({
+        tabs: [tab("t1", "wt2"), tab("t2", "wt")],
+        sessions: all,
+        sessionId: "wt",
+        scope: "project",
+        worktreeOf,
+      });
+      expect(plan).toEqual({ action: "clear-tab", tabId: "t2" });
+    });
+  });
+
+  it("does nothing when no tab holds the session, or the session is gone", () => {
+    const tabs = [tab("t1", "a")];
+    expect(
+      planSessionPaneClose({ tabs, sessions, sessionId: "c", scope: "workspace" }),
+    ).toEqual({ action: "none" });
+    expect(
+      planSessionPaneClose({
+        tabs,
+        sessions: [],
+        sessionId: "a",
+        scope: "workspace",
+      }),
+    ).toEqual({ action: "none" });
+  });
+});
+
+describe("ptyIdsOfPanes", () => {
+  const tui = { ...session("tui", "/repo"), surface: "tui" as const };
+
+  it("names the PTY of a terminal session and of every terminal file moved", () => {
+    const first = newTerminalFile("/repo");
+    const second = newTerminalFile("/repo");
+    const pane = { id: "term", files: [first, second], activeFileId: first.id };
+    const grouped: WorkspaceTab = {
+      ...tab("t1", "tui"),
+      layout: splitPane(newTab("tui").layout, "tui", "right", "term"),
+      terminalPanes: [pane],
+    };
+    expect(
+      ptyIdsOfPanes(grouped, ["tui", "term"], [tui, session("chat", "/repo")]),
+    ).toEqual(["tui:tui", first.id, second.id]);
+  });
+
+  it("names the terminal files of a pane kept in editorPanes", () => {
+    // A terminal can sit in an editor pane, as the project dock's does.
+    const file = newTerminalFile("/repo");
+    const grouped: WorkspaceTab = {
+      ...tab("t1", "chat"),
+      editorPanes: [{ id: "dock", files: [file], activeFileId: file.id }],
+    };
+    expect(ptyIdsOfPanes(grouped, ["dock"], [])).toEqual([file.id]);
+  });
+
+  it("ignores editor files that are not terminals", () => {
+    const doc = newFileTab("/repo/readme.md", "/repo");
+    const grouped: WorkspaceTab = {
+      ...tab("t1", "chat"),
+      editorPanes: [{ id: "editor", files: [doc], activeFileId: doc.id }],
+    };
+    expect(ptyIdsOfPanes(grouped, ["editor"], [])).toEqual([]);
+  });
+
+  it("names nothing for a chat and only the panes asked for", () => {
+    const file = newTerminalFile("/repo");
+    const grouped: WorkspaceTab = {
+      ...tab("t1", "chat"),
+      terminalPanes: [{ id: "term", files: [file], activeFileId: file.id }],
+    };
+    expect(ptyIdsOfPanes(grouped, ["chat"], [session("chat", "/repo")])).toEqual([]);
   });
 });

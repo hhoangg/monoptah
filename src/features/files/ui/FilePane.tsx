@@ -1,6 +1,6 @@
 import { lazySurface } from "../../../shared/ui/lazySurface";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { memo, useSyncExternalStore } from "react";
+import { memo, useRef, useSyncExternalStore } from "react";
 import {
   MarkdownViewShell,
   useMarkdownMode,
@@ -114,6 +114,8 @@ function FilePaneComponent({
     loadDiffViewer,
     loadDiffViewer,
   );
+  // Terminals whose exit already closed them, so a repeat event cannot close twice.
+  const exitClosed = useRef(new Set<string>());
   const activeFile = pane.files.find((file) => file.id === pane.activeFileId);
   const sessionReview =
     activeFile && isSessionChangesTab(activeFile) ? activeFile : undefined;
@@ -211,6 +213,12 @@ function FilePaneComponent({
                   onMetaChange={(patch) =>
                     onTerminalMetaChange?.(file.id, patch)
                   }
+                  onExit={(exit) => {
+                    // A spawn failure keeps the pane so its error stays readable.
+                    if (exit.error || exitClosed.current.has(file.id)) return;
+                    exitClosed.current.add(file.id);
+                    onCloseFile(pane.id, file.id);
+                  }}
                 />
               ) : isImagePath(file.path) || isVideoPath(file.path) ? (
                 <BinaryFileView

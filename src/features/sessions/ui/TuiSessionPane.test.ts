@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { act, createElement } from "react";
+import { act, createElement, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 
@@ -13,14 +13,23 @@ const pty = vi.hoisted(() => ({
     (_id: string, _onData: unknown, _onExit: (code: number | null) => void) =>
       () => {},
   ),
-  getPtyStatus: vi.fn(async () => ({ foreground: null })),
+  holdPtyBridge: vi.fn(() => () => {}),
+  // Rejects like the backend does for a PTY that is not running.
+  getPtyStatus: vi.fn(
+    async (_id?: string): Promise<{ foreground: string | null }> => {
+      throw new Error("Terminal is not running");
+    },
+  ),
 }));
 vi.mock("../../../platform/tauri/pty", () => pty);
 const xterm = vi.hoisted(() => ({
   titleListeners: [] as ((title: string) => void)[],
 }));
+const layout = vi.hoisted(() => ({
+  fitTerminal: vi.fn((): { cols: number; rows: number } | null => null),
+}));
 vi.mock("../../terminal/model/terminalLayout", () => ({
-  fitTerminal: () => null,
+  fitTerminal: layout.fitTerminal,
   applyTerminalChrome: () => {},
 }));
 vi.mock("@xterm/xterm", () => ({
@@ -73,6 +82,11 @@ vi.mock("../../providers/model/providerAccounts", async (importOriginal) => ({
 
 import { newSession, type Session } from "../model/session";
 import type { TuiLaunchEvent, TuiSessionPatch } from "../model/tuiSession";
+import {
+  consumePtyHandoff,
+  markPtyHandoff,
+  settlePtyHandoffs,
+} from "../../terminal/model/ptyHandoff";
 import { TuiSessionPane } from "./TuiSessionPane";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -108,6 +122,9 @@ afterEach(async () => {
   });
   host.remove();
   ops.length = 0;
+  settlePtyHandoffs();
+  layout.fitTerminal.mockReset();
+  pty.getPtyStatus.mockReset();
   xterm.titleListeners.length = 0;
   accounts.selected = "default";
   accounts.exists = true;
@@ -153,6 +170,7 @@ function mount(session: Session, handlers: Handlers = {}) {
   );
   const onTitleChange = vi.fn(handlers.onTitleChange ?? (() => {}));
   const onLaunchEvent = vi.fn(handlers.onLaunchEvent ?? (() => {}));
+  const onExitClose = vi.fn();
   const render = (current: Session) =>
     root.render(
       createElement(TuiSessionPane, {
@@ -163,9 +181,10 @@ function mount(session: Session, handlers: Handlers = {}) {
         onSessionChange,
         onTitleChange,
         onLaunchEvent,
+        onExitClose,
       }),
     );
-  return { render, onSessionChange, onTitleChange, onLaunchEvent };
+  return { render, onSessionChange, onTitleChange, onLaunchEvent, onExitClose };
 }
 
 function spawnArgs(call = 0) {
@@ -339,14 +358,14 @@ it("shows a readable bar when the CLI exits right away", async () => {
   expect(button("Restart")).toBeDefined();
 });
 
-it("shows only the code for an exit well after launch", async () => {
+it("shows only the code for a late exit with a failure code", async () => {
   const session = tui("codex");
   const { render } = mount(session);
   await act(async () => render(session));
   await settle();
   now += 60_000;
-  await reportExit(0);
-  expect(bar()?.textContent).toContain("Process exited (code 0)");
+  await reportExit(2);
+  expect(bar()?.textContent).toContain("Process exited (code 2)");
   expect(bar()?.textContent).not.toContain("interactive mode");
 });
 
@@ -375,7 +394,7 @@ it("restarts Claude into the same conversation", async () => {
   };
   await act(async () => render(saved));
   now += 60_000;
-  await reportExit(0);
+  await reportExit(2);
   await act(async () => {
     button("Restart")?.click();
   });
@@ -421,7 +440,7 @@ it("offers a fresh conversation when resuming fails at once", async () => {
   expect(launch.args).not.toContain("--resume");
 });
 
-it("does not offer a fresh start after a normal late exit", async () => {
+it("does not offer a fresh start after a late exit with a failure code", async () => {
   const session = tui("claude", {
     providerSessionId: "saved",
     providerAccountId: "default",
@@ -430,8 +449,72 @@ it("does not offer a fresh start after a normal late exit", async () => {
   await act(async () => render(session));
   await settle();
   now += 60_000;
-  await reportExit(0);
+  await reportExit(2);
   expect(button("Start new conversation")).toBeUndefined();
+});
+
+it("closes the pane after a clean exit well after launch", async () => {
+  const session = tui("claude");
+  const { render, onLaunchEvent, onExitClose } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 60_000;
+  await reportExit(0);
+  expect(onExitClose).toHaveBeenCalledTimes(1);
+  expect(onExitClose).toHaveBeenCalledWith(session.id);
+  // The exit is still reported, and before the close.
+  const kinds = onLaunchEvent.mock.calls.map(([, event]) => event.kind);
+  expect(kinds).toEqual(["started", "exit"]);
+  expect(onLaunchEvent.mock.invocationCallOrder.at(-1)).toBeLessThan(
+    onExitClose.mock.invocationCallOrder[0],
+  );
+});
+
+it("keeps the pane open for a clean exit right after launch", async () => {
+  const session = tui("codex");
+  const { render, onExitClose } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 200;
+  await reportExit(0);
+  expect(onExitClose).not.toHaveBeenCalled();
+  expect(bar()?.textContent).toContain("Process exited (code 0)");
+});
+
+it("keeps the pane open for a late exit with a failure code", async () => {
+  const session = tui("codex");
+  const { render, onExitClose } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 60_000;
+  await reportExit(1);
+  expect(onExitClose).not.toHaveBeenCalled();
+  expect(bar()?.textContent).toContain("Process exited (code 1)");
+});
+
+it("keeps the pane open when the process could not start", async () => {
+  pty.spawnPty.mockRejectedValueOnce(new Error("Failed to start codex: nope"));
+  const session = tui("codex");
+  const { render, onExitClose } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  expect(onExitClose).not.toHaveBeenCalled();
+  expect(bar()?.textContent).toContain("Failed to start codex: nope");
+});
+
+it("does not close the pane while retrying a --resume that found nothing", async () => {
+  const session = tui("claude", {
+    providerSessionId: "saved-id",
+    providerAccountId: "default",
+  });
+  const { render, onExitClose } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 100;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(2);
+  expect(onExitClose).not.toHaveBeenCalled();
 });
 
 it("titles a placeholder tab from the terminal title", async () => {
@@ -633,4 +716,344 @@ it("does not claim a first launch that was not resuming", async () => {
   await settle();
   expect(pty.spawnPty).toHaveBeenCalledTimes(1);
   expect(bar()).not.toBeNull();
+});
+
+function mountSplit(inSplit: boolean) {
+  const onPaneDragStart = vi.fn();
+  const onClose = vi.fn();
+  const session = tui();
+  const render = () =>
+    root.render(
+      createElement(TuiSessionPane, {
+        session,
+        visible: true,
+        focused: true,
+        onFocus: () => {},
+        onSessionChange: async () => {},
+        onTitleChange: () => {},
+        inSplit,
+        onPaneDragStart,
+        onClose,
+      }),
+    );
+  return { render, onPaneDragStart, onClose, session };
+}
+
+const closeButton = () =>
+  host.querySelector<HTMLButtonElement>('button[aria-label="Close pane"]');
+const header = () =>
+  host.querySelector<HTMLElement>("[data-tui-pane] > div:first-child")!;
+const press = (target: Element) =>
+  act(() => {
+    target.dispatchEvent(
+      new PointerEvent("pointerdown", { bubbles: true, button: 0 }),
+    );
+  });
+
+it("shows the drag handle and close button only in a split", async () => {
+  const alone = mountSplit(false);
+  await act(async () => alone.render());
+  await settle();
+  expect(closeButton()).toBeNull();
+  expect(header().className).not.toContain("cursor-grab");
+  press(header());
+  expect(alone.onPaneDragStart).not.toHaveBeenCalled();
+
+  const split = mountSplit(true);
+  await act(async () => split.render());
+  await settle();
+  expect(closeButton()).not.toBeNull();
+  expect(header().className).toContain("cursor-grab");
+  press(header());
+  expect(split.onPaneDragStart).toHaveBeenCalledTimes(1);
+  await act(async () => closeButton()!.click());
+  expect(split.onClose).toHaveBeenCalledExactlyOnceWith(split.session.id);
+});
+
+it("does not start a pane drag from a data-no-drag control", async () => {
+  const split = mountSplit(true);
+  await act(async () => split.render());
+  await settle();
+  press(closeButton()!);
+  press(button("New worktree unavailable")!);
+  expect(split.onPaneDragStart).not.toHaveBeenCalled();
+});
+
+it("keeps the pane and offers a fresh start when --resume finds no conversation late", async () => {
+  const session = resuming();
+  const { render, onExitClose } = mount(session);
+  await act(async () => render(session));
+  await settle();
+  now += 60_000;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+
+  expect(onExitClose).not.toHaveBeenCalled();
+  // A slow start does not retry: only the prompt exit claims the saved id.
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  expect(bar()?.textContent).toContain("could not find the saved conversation");
+  expect(button("Start new conversation")).toBeDefined();
+  expect(button("Restart")).toBeDefined();
+});
+
+const alive = async () => ({ foreground: null });
+
+/** Lets the first animation frame run, where the terminal is first fitted. */
+async function nextFrame() {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  });
+}
+
+/**
+ * Launches the pane, then moves it the way a detach does: the departure is
+ * marked, the old view unmounts, and the caller renders the new one.
+ */
+async function launchThenMove(session: Session) {
+  const handlers = mount(session);
+  layout.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
+  await act(async () => handlers.render(session));
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  markPtyHandoff([`tui:${session.id}`]);
+  await act(async () => root.render(null));
+  expect(pty.killPty).not.toHaveBeenCalled();
+  return handlers;
+}
+
+it("attaches after a move without relaunching and keeps the real launch time", async () => {
+  const session = tui("claude", { id: "moved-session" });
+  const { render, onSessionChange, onLaunchEvent, onExitClose } =
+    await launchThenMove(session);
+  expect(ops).toEqual(["resolve claude", "persist"]);
+  expect(onLaunchEvent).toHaveBeenCalledWith(session.id, { kind: "started" });
+
+  // The pane moves to another tab long after the launch: same session, new view.
+  now += 60_000;
+  pty.getPtyStatus.mockImplementationOnce(alive);
+  await act(async () => render(session));
+  await settle();
+  await nextFrame();
+
+  // Nothing is launched or sent: no new binary lookup, saved id or spawn.
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  expect(ops).toEqual(["resolve claude", "persist"]);
+  expect(onSessionChange).toHaveBeenCalledTimes(1);
+  expect(onLaunchEvent).toHaveBeenCalledTimes(1);
+  expect(pty.resizePty).toHaveBeenCalled();
+
+  // A clean exit a second after the attach is not an early exit.
+  now += 1_000;
+  await reportExit(0);
+  await settle();
+  expect(onExitClose).toHaveBeenCalledExactlyOnceWith(session.id);
+});
+
+it("still counts a quick exit after a move as early when the launch was recent", async () => {
+  const session = tui("claude", { id: "quick-session" });
+  const { render, onExitClose } = await launchThenMove(session);
+  now += 1_000;
+  pty.getPtyStatus.mockImplementationOnce(alive);
+  await act(async () => render(session));
+  await settle();
+  await nextFrame();
+
+  now += 1_000;
+  await reportExit(0);
+  await settle();
+  expect(onExitClose).not.toHaveBeenCalled();
+});
+
+it("does not attach to a live process the pane was not handed (regression guard)", async () => {
+  // A second window, a reload or a restore finds the same ids; the process is
+  // alive but belongs to another view, so this pane launches as it always did.
+  pty.getPtyStatus.mockImplementation(alive);
+  const session = tui("claude", { id: "foreign-session" });
+  const { render } = mount(session);
+  layout.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
+  await act(async () => render(session));
+  await settle();
+  await nextFrame();
+
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  expect(ops).toEqual(["resolve claude", "persist"]);
+  expect(pty.resizePty).not.toHaveBeenCalledWith(`tui:${session.id}`, 80, 23);
+});
+
+it("does not launch anything when the process is gone by the time the pane attaches", async () => {
+  const session = tui("claude", { id: "raced-session" });
+  const { render, onLaunchEvent } = await launchThenMove(session);
+  // The default status check rejects: the process died in between.
+  await act(async () => render(session));
+  await settle();
+  await nextFrame();
+
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  expect(ops).toEqual(["resolve claude", "persist"]);
+  expect(bar()?.textContent).toContain("Could not reattach");
+  expect(button("Restart")).toBeDefined();
+  expect(onLaunchEvent).toHaveBeenLastCalledWith(
+    session.id,
+    expect.objectContaining({ kind: "exit" }),
+  );
+});
+
+it("launches again on Restart after a failed attach", async () => {
+  const session = tui("claude", { id: "restart-session" });
+  const { render } = await launchThenMove(session);
+  await act(async () => render(session));
+  await settle();
+  await nextFrame();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    button("Restart")?.click();
+  });
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(2);
+});
+
+it("keeps offering a fresh conversation after the pane was moved", async () => {
+  const session = resuming();
+  const { render } = await launchThenMove(session);
+  pty.getPtyStatus.mockImplementationOnce(alive);
+  await act(async () => render(session));
+  await settle();
+  await nextFrame();
+
+  now += 60_000;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+  expect(button("Start new conversation")).toBeDefined();
+});
+
+it("does not offer a fresh conversation after a move when the launch minted a new id", async () => {
+  const session = tui("claude", { id: "minted-session" });
+  const { render } = await launchThenMove(session);
+  pty.getPtyStatus.mockImplementationOnce(alive);
+  await act(async () => render(session));
+  await settle();
+  await nextFrame();
+
+  now += 60_000;
+  await reportExit(0, NO_CONVERSATION);
+  await settle();
+  expect(button("Start new conversation")).toBeUndefined();
+});
+
+it("keeps the pane when an attach has no launch record and the process exits at once", async () => {
+  const session = tui("claude", { id: "no-record-session" });
+  markPtyHandoff([`tui:${session.id}`]);
+  consumePtyHandoff(`tui:${session.id}`);
+  const { render, onExitClose } = mount(session);
+  layout.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
+  pty.getPtyStatus.mockImplementationOnce(alive);
+  await act(async () => render(session));
+  await settle();
+  await nextFrame();
+
+  expect(pty.spawnPty).not.toHaveBeenCalled();
+  now += 1_000;
+  await reportExit(0);
+  await settle();
+  expect(onExitClose).not.toHaveBeenCalled();
+  expect(bar()).not.toBeNull();
+});
+
+it("attaches rather than launches when StrictMode replays the effect after a move", async () => {
+  const session = tui("claude", { id: "strict-session" });
+  await launchThenMove(session);
+  pty.getPtyStatus.mockImplementation(alive);
+  const strictRender = () =>
+    root.render(
+      createElement(
+        StrictMode,
+        null,
+        createElement(TuiSessionPane, {
+          session,
+          visible: true,
+          focused: true,
+          onFocus: () => {},
+          onSessionChange: async () => {},
+          onTitleChange: () => {},
+        }),
+      ),
+    );
+  await act(async () => strictRender());
+  await settle();
+  await nextFrame();
+
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  expect(pty.killPty).not.toHaveBeenCalled();
+  expect(pty.getPtyStatus).toHaveBeenCalledWith(`tui:${session.id}`);
+});
+
+it("keeps the real exit notice and its buttons when an exited pane is moved", async () => {
+  const session = tui("claude", {
+    id: "exited-moved",
+    providerSessionId: "saved-id",
+    providerAccountId: "default",
+  });
+  const { render, onLaunchEvent } = mount(session);
+  layout.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
+  await act(async () => render(session));
+  await settle();
+  now += 60_000;
+  await reportExit(1, NO_CONVERSATION);
+  await settle();
+  const before = bar()?.textContent;
+  expect(before).toContain("Process exited (code 1)");
+  expect(button("Start new conversation")).toBeDefined();
+  onLaunchEvent.mockClear();
+
+  // Moved to another tab after it ended: the process is gone, nothing to attach.
+  markPtyHandoff([`tui:${session.id}`]);
+  await act(async () => root.render(null));
+  await act(async () => render(session));
+  await settle();
+  await nextFrame();
+
+  expect(pty.getPtyStatus).not.toHaveBeenCalled();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(1);
+  expect(bar()?.textContent).toBe(before);
+  expect(bar()?.textContent).not.toContain("Could not reattach");
+  expect(button("Start new conversation")).toBeDefined();
+  expect(button("Restart")).toBeDefined();
+  // The exit was already reported once; moving does not report it again.
+  expect(onLaunchEvent).not.toHaveBeenCalled();
+
+  // Restart still launches, since the process really is gone.
+  await act(async () => {
+    button("Restart")?.click();
+  });
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(2);
+});
+
+it("does not carry an old exit into a pane that was launched again", async () => {
+  const session = tui("claude", { id: "relaunched-moved" });
+  const { render } = mount(session);
+  layout.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
+  await act(async () => render(session));
+  await settle();
+  now += 60_000;
+  await reportExit(1);
+  await settle();
+  await act(async () => {
+    button("Restart")?.click();
+  });
+  await settle();
+  expect(pty.spawnPty).toHaveBeenCalledTimes(2);
+  expect(bar()).toBeNull();
+
+  // It is alive again, so a move attaches; the earlier exit is history.
+  markPtyHandoff([`tui:${session.id}`]);
+  await act(async () => root.render(null));
+  pty.getPtyStatus.mockImplementationOnce(alive);
+  await act(async () => render(session));
+  await settle();
+  await nextFrame();
+  expect(pty.getPtyStatus).toHaveBeenCalledWith(`tui:${session.id}`);
+  expect(pty.spawnPty).toHaveBeenCalledTimes(2);
+  expect(bar()).toBeNull();
 });
