@@ -508,6 +508,30 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     keywords: "email show hide rail aws ses",
   },
   {
+    id: "mail-credentials",
+    section: "mail",
+    label: "AWS credentials",
+    keywords: "access key secret iam keychain rotate ses s3 account",
+  },
+  {
+    id: "mail-sources",
+    section: "mail",
+    label: "Mail sources",
+    keywords: "bucket region mailbox prefix domain ses s3 iam policy test sync",
+  },
+  {
+    id: "mail-sync-interval",
+    section: "mail",
+    label: "Sync interval",
+    keywords: "mail refresh poll frequency hour minutes",
+  },
+  {
+    id: "mail-show-images",
+    section: "mail",
+    label: "Load remote images",
+    keywords: "mail email block tracking pixels ask always never",
+  },
+  {
     id: "show-archived",
     section: "archive",
     label: "Show archived in the sidebar",
