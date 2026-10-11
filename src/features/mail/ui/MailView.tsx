@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Mail, MessageSquarePlus } from "../../../shared/ui/icons";
+import { Mail, MessageSquarePlus, Send } from "../../../shared/ui/icons";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 import { useDragResize } from "../../../shared/hooks/useDragResize";
 import { IS_MAC } from "../../../platform/tauri/platform";
@@ -16,6 +16,7 @@ import {
 } from "../model/mailPrefs";
 import type { ComposeRequest } from "../model/mailReply";
 import type { FolderRow, MatchMode, Rule } from "../model/mailTypes";
+import { useMailOutbox } from "../model/mailOutbox";
 import { parseFolderId, useMailFolders } from "../model/useMailFolders";
 import { useMailStatus } from "../model/useMailStatus";
 import { ComposeSheet, preloadMailEditor } from "./ComposeSheet";
@@ -26,6 +27,7 @@ import {
   type ListBase,
 } from "./MailThreadList";
 import { MailThreadRead } from "./MailThreadRead";
+import { OutboxSheet } from "./OutboxSheet";
 import { SmartFolderSheet } from "./SmartFolderSheet";
 
 type Sheet =
@@ -71,6 +73,10 @@ export function MailView({
     key: number;
     request: ComposeRequest;
   } | null>(null);
+  const outbox = useMailOutbox();
+  const [outboxOpen, setOutboxOpen] = useState(false);
+  const unconfirmed =
+    outbox.rows?.filter((r) => r.state === "unconfirmed").length ?? 0;
   const composeSeq = useRef(0);
   const openCompose = (request: ComposeRequest) =>
     setCompose({ key: ++composeSeq.current, request });
@@ -151,7 +157,22 @@ export function MailView({
           />
           <span className="min-w-0 truncate text-content">Mail</span>
         </div>
-        <div className="shrink-0 pr-2">
+        <div className="flex shrink-0 items-center gap-1.5 pr-2">
+          <SecondaryButton
+            danger={unconfirmed > 0}
+            aria-label={
+              unconfirmed > 0 ? `Outbox, ${unconfirmed} to check` : "Outbox"
+            }
+            onClick={() => setOutboxOpen(true)}
+          >
+            <Send className="size-3" />
+            Outbox
+            {outbox.rows && outbox.rows.length > 0 ? (
+              <span className="tabular-nums text-content/50">
+                {outbox.rows.length}
+              </span>
+            ) : null}
+          </SecondaryButton>
           <SecondaryButton
             onPointerEnter={preloadMailEditor}
             onFocus={preloadMailEditor}
@@ -256,7 +277,23 @@ export function MailView({
           // Remount per opening: its fields start from the request.
           key={compose.key}
           request={compose.request}
-          onClose={() => setCompose(null)}
+          onClose={() => {
+            setCompose(null);
+            // A save emits nothing, so this is when the list learns of it.
+            void outbox.reload();
+          }}
+        />
+      ) : null}
+      {outboxOpen ? (
+        <OutboxSheet
+          rows={outbox.rows}
+          error={outbox.error}
+          onChanged={() => void outbox.reload()}
+          onClose={() => setOutboxOpen(false)}
+          onOpen={(row) => {
+            setOutboxOpen(false);
+            openCompose({ kind: "draft", row });
+          }}
         />
       ) : null}
       {sheet ? (

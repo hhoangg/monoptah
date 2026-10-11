@@ -29,6 +29,8 @@ import type {
 /** Rust → webview events. */
 export const MAIL_SYNC_STATE_EVENT = "mail://sync-state";
 export const MAIL_MESSAGES_CHANGED_EVENT = "mail://messages-changed";
+/** Not emitted by a save: only sending, re-arming and deleting a row. */
+export const MAIL_OUTBOX_CHANGED_EVENT = "mail://outbox-changed";
 
 export const mailStatus = () => invoke<MailStatus>("mail_status");
 

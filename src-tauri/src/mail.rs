@@ -1677,6 +1677,12 @@ pub async fn mail_delete(
     report
 }
 
+/// Only the outbox list listens. Emitted when a row is sent, re-armed or
+/// deleted, never from `mail_outbox_save`: the composer saves on a timer, and
+/// nothing the composer owns listens here, so no save can come back as a
+/// reload of itself.
+pub(crate) const OUTBOX_CHANGED_EVENT: &str = "mail://outbox-changed";
+
 #[tauri::command(async)]
 pub fn mail_outbox_save(
     app: AppHandle,
@@ -1712,6 +1718,7 @@ pub async fn mail_outbox_send(
     .await;
     // Also after an error: the row's state changed either way.
     let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    let _ = app.emit(OUTBOX_CHANGED_EVENT, ());
     report
 }
 
@@ -1737,6 +1744,7 @@ pub fn mail_outbox_rearm(
 ) -> Result<(), String> {
     mail_send::outbox_rearm(&store, id)?;
     let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    let _ = app.emit(OUTBOX_CHANGED_EVENT, ());
     Ok(())
 }
 
@@ -1754,7 +1762,10 @@ pub fn mail_outbox_delete(
     id: i64,
 ) -> Result<(), String> {
     let staging = mail_send::staging_dir(&attachments_root(&app)?);
-    mail_send::outbox_delete_releasing(&store, &staging, id)
+    let result = mail_send::outbox_delete_releasing(&store, &staging, id);
+    // Also after a refusal: the list may be showing a row that already moved on.
+    let _ = app.emit(OUTBOX_CHANGED_EVENT, ());
+    result
 }
 
 /// Gives a pasted or dropped file a path for a mail draft. Not
