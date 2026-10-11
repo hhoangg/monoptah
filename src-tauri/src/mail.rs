@@ -1013,10 +1013,16 @@ pub(crate) fn ensure_attachment(
     Ok(path)
 }
 
-fn remove_attachment_dirs(root: &Path, message_ids: &[i64]) {
-    for id in message_ids {
-        let _ = std::fs::remove_dir_all(root.join(id.to_string()));
-    }
+/// Returns how many message folders could not be removed. A folder that is
+/// already absent is not a failure.
+fn remove_attachment_dirs(root: &Path, message_ids: &[i64]) -> usize {
+    message_ids
+        .iter()
+        .filter(|id| {
+            std::fs::remove_dir_all(root.join(id.to_string()))
+                .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
+        })
+        .count()
 }
 
 fn attachments_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1431,6 +1437,9 @@ pub struct DeleteReport {
     pub kept: usize,
     /// Threads left with no message, and so removed.
     pub threads_removed: usize,
+    /// Message folders of cached attachments that could not be removed. The
+    /// mail is gone but these files are not, and no row points at them now.
+    pub files_left: usize,
     /// Distinct S3 messages. A failed batch attributes its error to keys it
     /// never sent, so these describe the failure, not which key caused it.
     pub errors: Vec<String>,
@@ -1448,8 +1457,9 @@ pub(crate) fn archive_threads(
     let messages = mail_store::message_ids_in_threads(&conn, thread_ids).map_err(db)?;
     mail_store::archive_threads(&conn, thread_ids, now_millis()).map_err(db)?;
     drop(conn);
-    // The files are a cache of the S3 object: they are fetched again on demand.
-    remove_attachment_dirs(root, &messages);
+    // The files are a cache of the S3 object and the mail is still stored, so a
+    // folder that stays behind is only clutter here.
+    let _ = remove_attachment_dirs(root, &messages);
     Ok(())
 }
 
@@ -1500,6 +1510,7 @@ pub(crate) fn hard_delete_threads(
         report.removed += part.removed;
         report.kept += part.kept;
         report.threads_removed += part.threads_removed;
+        report.files_left += part.files_left;
         for error in part.errors {
             if report.errors.len() < MAX_REPORTED_ERRORS && !report.errors.contains(&error) {
                 report.errors.push(error);
@@ -1598,7 +1609,7 @@ fn hard_delete_in_account(
         }
         tx.commit().map_err(db)?;
     }
-    remove_attachment_dirs(root, &removed_ids);
+    report.files_left = remove_attachment_dirs(root, &removed_ids);
     report.errors = errors;
     Ok(report)
 }
@@ -1756,16 +1767,25 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("delete:{}", keys.join(",")));
-            keys.iter()
-                .map(|key| DeleteOutcome {
-                    key: key.clone(),
-                    error: self.delete_fail.contains(key).then(|| S3Error {
-                        kind: S3ErrorKind::Other,
-                        code: Some("InvalidRequest".into()),
-                        message: "S3 rejected the delete request.".into(),
-                    }),
+            // Through the real response parser, so the text that reaches the
+            // report is the text `classify` makes of S3's error code.
+            let body: String = keys
+                .iter()
+                .map(|key| {
+                    if self.delete_fail.contains(key) {
+                        format!(
+                            "<Error><Key>{key}</Key><Code>MissingContentMD5</Code>\
+                             <Message>Missing required header</Message></Error>"
+                        )
+                    } else {
+                        format!("<Deleted><Key>{key}</Key></Deleted>")
+                    }
                 })
-                .collect()
+                .collect();
+            crate::aws_s3::parse_delete_result(
+                &format!("<DeleteResult>{body}</DeleteResult>"),
+                keys,
+            )
         }
     }
 
@@ -2534,7 +2554,8 @@ mod tests {
                 removed: 2,
                 kept: 1,
                 threads_removed: 1,
-                errors: vec!["S3 rejected the delete request.".into()],
+                files_left: 0,
+                errors: vec!["S3 returned an error (MissingContentMD5).".into()],
             }
         );
         // The thread survives with the message S3 did not delete, and its row
@@ -2762,6 +2783,36 @@ mod tests {
             (2, 0, 1)
         );
         assert_eq!(count(&store, "SELECT COUNT(*) FROM mail_message"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_folder_that_cannot_be_removed_is_reported_not_swallowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (message, thread) =
+            ingest(&store, mailbox.id, &raw_mail("Drop", "d1", "y"), "owner/d1");
+        let root = temp_root();
+        let inner = root.join(message.to_string()).join("sub");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("0-f"), b"x").unwrap();
+        // A read-only folder cannot lose its entries.
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let report = delete_threads(
+            &store,
+            &FakeClients::default(),
+            &SyncService::default(),
+            &root,
+            &[thread],
+            true,
+        )
+        .unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The mail is gone, and the report says the file is not.
+        assert_eq!((report.removed, report.kept, report.files_left), (1, 0, 1));
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM mail_message"), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

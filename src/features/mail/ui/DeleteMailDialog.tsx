@@ -9,6 +9,8 @@ export type DeleteReport = {
   removed: number;
   kept: number;
   threadsRemoved: number;
+  /** Cached attachment folders that could not be removed. */
+  filesLeft: number;
   errors: string[];
 };
 
@@ -60,7 +62,7 @@ export function DeleteMailDialog({
       const report = await mailDelete(threadIds, hard);
       onDone(report, hard);
       // Anything S3 refused stays in the mailbox. Say so instead of closing.
-      if (report.kept > 0 || report.errors.length > 0) {
+      if (report.kept > 0 || report.errors.length > 0 || report.filesLeft > 0) {
         setPartial(report);
         setBusy(false);
       } else {
@@ -74,16 +76,36 @@ export function DeleteMailDialog({
 
   if (partial) {
     return (
-      <Modal title="Some mail was not deleted" size="sm" onClose={onClose}>
+      <Modal
+        title={
+          partial.kept > 0
+            ? "Some mail was not deleted"
+            : "Deleted, with files left behind"
+        }
+        size="sm"
+        onClose={onClose}
+      >
         <div className="flex flex-col gap-2 px-4 py-3 text-[12px] text-content/70">
           <p role="alert">
-            {partial.removed} deleted. {partial.kept} could not be deleted from
-            S3, so {partial.kept === 1 ? "it is" : "they are"} still in your
-            mailbox.
+            {partial.removed} deleted.
+            {partial.kept > 0
+              ? ` ${partial.kept} could not be deleted from S3, so ${
+                  partial.kept === 1 ? "it is" : "they are"
+                } still in your mailbox.`
+              : ""}
           </p>
+          {partial.filesLeft > 0 ? (
+            <p>
+              The mail is gone, but downloaded attachment files for{" "}
+              {partial.filesLeft}{" "}
+              {partial.filesLeft === 1 ? "message" : "messages"} could not be
+              removed from this computer.
+            </p>
+          ) : null}
           {partial.errors.map((e) => (
-            // S3's own words. A failed batch can blame keys it never sent, so
-            // this says what went wrong, not which message caused it.
+            // S3's error code in Monoptah's words. A failed batch can blame
+            // keys it never sent, so this says what went wrong, not which
+            // message caused it.
             <p key={e} className="text-red-400">
               {e}
             </p>
@@ -131,9 +153,9 @@ export function DeleteMailDialog({
                 Archive locally
               </span>
               <span className="text-[11.5px] leading-snug text-content/50">
-                Hides it from the mailbox and keeps the S3 objects. Reversible
-                from the Archive folder, and a later sync will not bring it
-                back.
+                Removes the {noun} from your mailboxes and keeps the S3 objects.
+                Archived mail is not yet browsable in Monoptah, so it cannot be
+                brought back from here.
               </span>
             </span>
           </label>
@@ -158,11 +180,12 @@ export function DeleteMailDialog({
                 Delete on S3 as well
               </span>
               <span className="text-[11.5px] leading-snug text-content/50">
-                Removes the {messageCount === 1 ? "message" : "messages"} from
-                your S3 bucket and from Monoptah ({messageCount} in this {noun}
-                ). This cannot be undone: the S3 object is the only copy of the
-                original message unless versioning is turned on for the bucket,
-                which Monoptah cannot check.
+                Deletes the S3 object of each message that has one, and removes
+                the messages from Monoptah ({messageCount} in this {noun}). A
+                message sent from Monoptah has no S3 object and is only removed
+                here. This cannot be undone: the S3 object is the only copy of
+                the original message unless versioning is turned on for the
+                bucket, which Monoptah cannot check.
               </span>
             </span>
           </label>

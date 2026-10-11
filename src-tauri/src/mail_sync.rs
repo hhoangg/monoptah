@@ -1101,6 +1101,8 @@ mod tests {
         s3.delete_fail.lock().unwrap().push("owner/1".into());
         let report = hard_delete(&f, &s3, &[thread_of(&f)]);
         assert_eq!((report.removed, report.kept), (0, 1));
+        // A failed key is never tombstoned.
+        assert_eq!(f.text("SELECT state FROM mail_object"), "parsed");
         let again = f.sync(&[(account, &s3)]);
         assert_eq!(again[0].inserted, 0);
         assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_message"), 1);

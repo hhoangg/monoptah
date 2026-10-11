@@ -465,7 +465,7 @@ fn parse_list_objects(xml: &str) -> ObjectPage {
     }
 }
 
-fn parse_delete_result(xml: &str, requested: &[String]) -> Vec<DeleteOutcome> {
+pub(crate) fn parse_delete_result(xml: &str, requested: &[String]) -> Vec<DeleteOutcome> {
     let deleted: Vec<String> = blocks(xml, "Deleted")
         .into_iter()
         .filter_map(|b| first(b, "Key"))

@@ -11,6 +11,7 @@ const clean: DeleteReport = {
   removed: 4,
   kept: 0,
   threadsRemoved: 1,
+  filesLeft: 0,
   errors: [],
 };
 
@@ -146,7 +147,9 @@ it("stays open and shows what S3 refused when part of the delete failed", async 
     removed: 3,
     kept: 1,
     threadsRemoved: 0,
-    errors: ["S3 rejected the delete request."],
+    filesLeft: 0,
+    // What the Rust side makes of S3's MissingContentMD5 code.
+    errors: ["S3 returned an error (MissingContentMD5)."],
   } satisfies DeleteReport);
   await render();
   await act(async () => radio(1).click());
@@ -155,8 +158,29 @@ it("stays open and shows what S3 refused when part of the delete failed", async 
   expect(onClose).not.toHaveBeenCalled();
   expect(document.body.textContent).toContain("1 could not be deleted");
   expect(document.body.textContent).toContain(
-    "S3 rejected the delete request.",
+    "S3 returned an error (MissingContentMD5).",
   );
+});
+
+it("says the mail is gone but cached files remain, instead of closing quietly", async () => {
+  vi.mocked(invoke).mockResolvedValue({
+    ...clean,
+    filesLeft: 2,
+  } satisfies DeleteReport);
+  await render();
+  await act(async () => radio(1).click());
+  await type("delete");
+  await act(async () => confirm().click());
+  expect(onClose).not.toHaveBeenCalled();
+  expect(document.body.textContent).toContain("The mail is gone");
+  expect(document.body.textContent).toContain("2 messages");
+});
+
+it("does not promise an archive view or a restore", async () => {
+  await render();
+  const text = document.body.textContent ?? "";
+  expect(text).toContain("not yet browsable");
+  expect(text).not.toMatch(/Reversible|Archive folder/);
 });
 
 it("shows the error when the command itself fails, and does not close", async () => {
