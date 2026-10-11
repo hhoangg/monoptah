@@ -1308,6 +1308,13 @@ mail_mailboxes_upsert(account_id, rows)           // rejects a duplicate address
 mail_mailboxes_delete(id)
 
 mail_sync_now(scope: SyncScope) -> Vec<SyncReport>  // all | source(id) | mailbox(id)
+                                   // mailbox(id) syncs that mailbox's whole
+                                   // source: the scheduler works per source.
+mail_sync_interval_set(secs)       // Rust cannot read localStorage, so the
+                                   // webview MUST push the interval at startup
+                                   // and on every settings change. Without it
+                                   // the interval stays at the 3600 default
+                                   // whatever the user sets.
 mail_threads(query: ThreadQuery) -> Page<ThreadRow>        // mailbox|folder|rules, cursor
 mail_thread(thread_id) -> ThreadDetail                     // messages + attachments
 mail_message_raw(message_id) -> String                     // re-fetch from S3
