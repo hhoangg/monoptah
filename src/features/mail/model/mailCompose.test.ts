@@ -245,6 +245,29 @@ describe("mailCompose hardening", () => {
     expect(html).not.toMatch(/<li[^>]*><p/);
   });
 
+  it("renders list item content, including multiple blocks and nested lists", () => {
+    const { html } = run(
+      doc({
+        type: "bulletList",
+        content: [
+          li(p(t("lone"))),
+          li(p(t("first")), p(t("second"))),
+          li(p(t("parent")), {
+            type: "orderedList",
+            content: [li(p(t("child")))],
+          }),
+        ],
+      }),
+    );
+    expect(html).toMatch(/<li[^>]*>lone<\/li>/);
+    expect(html).toMatch(
+      /<li[^>]*><p[^>]*>first<\/p><p[^>]*>second<\/p><\/li>/,
+    );
+    expect(html).toMatch(
+      /<li[^>]*><p[^>]*>parent<\/p><ol[^>]*><li[^>]*>child<\/li><\/ol><\/li>/,
+    );
+  });
+
   it("ignores a monoAtt attribute: only data-mono-att names an attachment", () => {
     const out = run(doc({ type: "image", attrs: { alt: "a", monoAtt: "5" } }));
     expect(out.inlineImages).toEqual([]);
@@ -256,6 +279,20 @@ describe("mailCompose images", () => {
     expect(contentIdFor("d", "A")).not.toBe(contentIdFor("d", "a"));
     expect(contentIdFor("d1", "1")).not.toBe(contentIdFor("d2", "1"));
     expect(contentIdFor("d", "A")).toBe(contentIdFor("d", "A").toLowerCase());
+  });
+
+  it("keeps cids injective where hex escapes could run together", () => {
+    // Variable-width hex made " 0" and U+0200 both come out as "_200".
+    expect(contentIdFor("d", " 0")).not.toBe(contentIdFor("d", "\u0200"));
+    expect(contentIdFor("d", "att 7")).not.toBe(contentIdFor("d", "att\u0207"));
+  });
+
+  it("treats an empty attachment id as no attachment", () => {
+    const out = run(
+      doc({ type: "image", attrs: { alt: "a", "data-mono-att": "" } }),
+    );
+    expect(out.inlineImages).toEqual([]);
+    expect(out.html).not.toContain("cid:");
   });
 
   it("cannot match a cid already inside the quoted original", () => {

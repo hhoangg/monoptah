@@ -94,9 +94,13 @@ const open = (tag: string, extra = "") =>
 
 const escapeId = (id: string) =>
   // Uppercase is escaped, not folded: the reader lowercases cids, so folding
-  // would make "A" and "a" the same cid. "_" escapes itself, keeping this
-  // injective, and "." (the joiner below) is never emitted by it.
-  id.replace(/[^a-z0-9-]/g, (c) => `_${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  // would make "A" and "a" the same cid. Every escape is "_" plus exactly four
+  // hex digits (one UTF-16 unit), and "_" itself is escaped, so decoding is
+  // unambiguous and this is injective; "." (the joiner below) is never emitted.
+  id.replace(
+    /[^a-z0-9-]/g,
+    (c) => `_${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
 
 /**
  * The draft id salts the cid so a stale `cid:` inside the appended quoted
@@ -115,7 +119,9 @@ const BAD_CHARS =
 
 function clean(n: TipTapNode): TipTapNode {
   const str = (v: unknown) =>
-    typeof v === "string" ? v.replace(BAD_CHARS, (m) => (m.length === 2 ? m : "")) : v;
+    typeof v === "string"
+      ? v.replace(BAD_CHARS, (m) => (m.length === 2 ? m : ""))
+      : v;
   return {
     ...n,
     ...(n.text !== undefined ? { text: str(n.text) as string } : {}),
