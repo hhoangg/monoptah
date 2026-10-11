@@ -50,6 +50,10 @@ pub(crate) struct SesAccount {
 
 /// The seam the command layer mocks, so its tests never touch the network.
 pub(crate) trait SesApi {
+    // Identity `status` values: `verified`, `pending`, `failed`, and
+    // `sending_disabled`. The last means AWS verified the identity but has
+    // turned sending off for it, so it is not sendable and the fix is in the
+    // AWS console, not in DNS. Settings copy must say that, not "failed".
     fn list_identities(&self) -> Result<Vec<MailIdentity>, SesError>;
     fn get_account(&self) -> Result<SesAccount, SesError>;
 }

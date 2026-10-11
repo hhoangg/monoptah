@@ -1001,6 +1001,24 @@ mod tests {
     }
 
     #[test]
+    fn a_vanished_message_leaves_no_unread_badge_and_a_revived_one_restores_it() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(f.scalar("SELECT unread_count FROM mail_thread"), 1);
+        // Nothing but the sync runs: no mark-read, no second sync, no reparse.
+        s3.remove("owner/1");
+        f.sync(&[(account, &s3)]);
+        assert_eq!(f.scalar("SELECT unread_count FROM mail_thread"), 0);
+        assert_eq!(f.scalar("SELECT message_count FROM mail_thread"), 0);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(f.scalar("SELECT unread_count FROM mail_thread"), 1);
+        assert_eq!(f.scalar("SELECT message_count FROM mail_thread"), 1);
+    }
+
+    #[test]
     fn new_message_surfaces_archived_thread() {
         let f = Fixture::new();
         let (account, _, s3) = one_source(&f);

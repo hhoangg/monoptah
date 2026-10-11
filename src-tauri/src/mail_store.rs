@@ -1462,6 +1462,9 @@ pub(crate) fn mark_vanished_objects(
             params![mailbox_id],
         )?;
         for thread_id in threads {
+            // The badge must be right the moment the sync ends, not after the
+            // next unrelated recompute.
+            crate::mail_thread::refresh_thread(tx, thread_id)?;
             tx.execute(
                 "UPDATE mail_thread SET state = 'archived', archived_at = ?2
                  WHERE id = ?1 AND state = 'active'
@@ -1493,6 +1496,7 @@ pub(crate) fn revive_gone_message(conn: &Connection, object_id: i64) -> rusqlite
             "UPDATE mail_message SET state = 'active' WHERE object_id = ?1 AND state = 'gone'",
             params![object_id],
         )?;
+        crate::mail_thread::refresh_thread(tx, thread_id)?;
         tx.execute(
             "UPDATE mail_thread SET state = 'active', archived_at = NULL
              WHERE id = ?1 AND state = 'archived'

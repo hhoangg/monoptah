@@ -138,6 +138,12 @@ fn counterparties(
 fn recompute_thread(conn: &Connection, thread_id: i64, own: &[String]) -> rusqlite::Result<()> {
     let rows = mail_store::thread_message_rows(conn, thread_id)?;
     let Some(first) = rows.first() else {
+        // Every message is `gone`: nothing is shown, so nothing is counted. The
+        // rest is left for the recompute that follows a revive.
+        conn.execute(
+            "UPDATE mail_thread SET message_count = 0, unread_count = 0 WHERE id = ?1",
+            [thread_id],
+        )?;
         return Ok(());
     };
     let mut participants: Vec<Person> = Vec::new();
@@ -174,6 +180,19 @@ fn recompute_thread(conn: &Connection, thread_id: i64, own: &[String]) -> rusqli
             has_attachments: rows.iter().any(|r| r.has_attachments),
         },
     )
+}
+
+/// Recomputes one thread's aggregates on the caller's handle (and so inside the
+/// caller's transaction). For state changes that happen outside ingest, such as
+/// a message going `gone` or coming back.
+pub(crate) fn refresh_thread(conn: &Connection, thread_id: i64) -> rusqlite::Result<()> {
+    let account_id: i64 = conn.query_row(
+        "SELECT account_id FROM mail_thread WHERE id = ?1",
+        [thread_id],
+        |row| row.get(0),
+    )?;
+    let own = mail_store::account_mailbox_addresses(conn, account_id)?;
+    recompute_thread(conn, thread_id, &own)
 }
 
 /// Folds `losers` into `survivor` and refreshes its aggregates. Safe to repeat:
