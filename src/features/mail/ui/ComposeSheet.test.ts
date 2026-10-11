@@ -728,8 +728,10 @@ const pdf = (cid: string | null = null, path = "/tmp/a.pdf") => ({
 });
 
 const noFiles = () =>
-  vi.mocked(invoke).mockImplementation((async (cmd: string) =>
-    cmd === "inspect_paths" ? [] : null) as never);
+  vi
+    .mocked(invoke)
+    .mockImplementation((async (cmd: string) =>
+      cmd === "inspect_paths" ? [] : null) as never);
 
 it("deleting a missing inline image from the body lets Send through", async () => {
   noFiles();

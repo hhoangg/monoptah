@@ -798,8 +798,8 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
     const editor = editorRef.current;
     if (!editor) return;
     const { pending: files, quote: q } = latest.current;
-    const ids = compose(files, q, editor.getJSON() as TipTapNode, "0").attached
-      .map((p) => p.id)
+    const ids = compose(files, q, editor.getJSON() as TipTapNode, "0")
+      .attached.map((p) => p.id)
       .sort();
     setAttachedIds((prev) =>
       prev && prev.length === ids.length && prev.every((x, i) => x === ids[i])
