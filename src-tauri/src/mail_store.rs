@@ -94,11 +94,12 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
           s3_key       TEXT NOT NULL,
           etag         TEXT,
           size_bytes   INTEGER,
-          s3_modified  INTEGER,
-          first_seen_at INTEGER NOT NULL,
-          last_seen_at INTEGER NOT NULL,
+          s3_modified  INTEGER,                -- epoch SECONDS (S3 last-modified)
+          first_seen_at INTEGER NOT NULL,      -- epoch MILLISECONDS
+          last_seen_at INTEGER NOT NULL,       -- epoch MILLISECONDS
           state        TEXT NOT NULL,
           parse_error  TEXT,
+          parse_attempts INTEGER NOT NULL DEFAULT 0,
           UNIQUE (mailbox_id, s3_key)
         );
         CREATE INDEX IF NOT EXISTS mail_object_state ON mail_object(state, mailbox_id);
@@ -256,8 +257,7 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// Spec section 5 retries an unreadable object at most three times, which needs
-/// a counter the section 4 DDL does not carry.
+/// For databases created before `parse_attempts` was in the DDL.
 fn ensure_object_attempts(conn: &Connection) -> rusqlite::Result<()> {
     let present: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('mail_object') WHERE name = 'parse_attempts'",
@@ -1057,6 +1057,14 @@ fn fts_people(from_name: Option<&str>, from_addr: &str, to_json: &str, cc_json: 
     out.join(", ")
 }
 
+/// The one place text is folded for the index. `remove_diacritics 2` cannot
+/// reach the stroke letters (they have no decomposition), and the insert, the
+/// `'delete'` replay and every MATCH query must fold identically or the replay
+/// stops matching what was indexed.
+pub(crate) fn fold_fts(text: &str) -> String {
+    text.replace('Đ', "D").replace('đ', "d")
+}
+
 // The FTS table is contentless: no triggers, the rowid is the message id, and
 // a row can only be removed by replaying the values it was inserted with.
 fn fts_insert(
@@ -1068,7 +1076,7 @@ fn fts_insert(
 ) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO mail_message_fts(rowid, subject, body, people) VALUES (?1, ?2, ?3, ?4)",
-        params![id, subject, body, people],
+        params![id, fold_fts(subject), fold_fts(body), fold_fts(people)],
     )?;
     Ok(())
 }
@@ -1083,7 +1091,7 @@ fn fts_delete(
     conn.execute(
         "INSERT INTO mail_message_fts(mail_message_fts, rowid, subject, body, people)
          VALUES ('delete', ?1, ?2, ?3, ?4)",
-        params![id, subject, body, people],
+        params![id, fold_fts(subject), fold_fts(body), fold_fts(people)],
     )?;
     Ok(())
 }
@@ -1357,7 +1365,8 @@ pub(crate) fn mark_vanished_objects(
 /// again. A message the user archived is not `gone`, so it is left alone, and
 /// the thread comes back only if the sync was what removed it, that is when no
 /// message in it is `archived`.
-pub(crate) fn revive_gone_message(conn: &Connection, object_id: i64) -> rusqlite::Result<()> {
+/// Returns whether anything was revived.
+pub(crate) fn revive_gone_message(conn: &Connection, object_id: i64) -> rusqlite::Result<bool> {
     let tx = conn;
     let thread: Option<i64> = tx
         .query_row(
@@ -1379,7 +1388,7 @@ pub(crate) fn revive_gone_message(conn: &Connection, object_id: i64) -> rusqlite
             params![thread_id],
         )?;
     }
-    Ok(())
+    Ok(thread.is_some())
 }
 
 /// A genuinely new message surfaces its thread again, as Gmail does. This is
@@ -1443,6 +1452,21 @@ pub(crate) fn restore_message_flags(
     conn.execute(
         "UPDATE mail_message SET is_read = ?2, is_starred = ?3, state = ?4 WHERE id = ?1",
         params![id, removed.is_read, removed.is_starred, removed.state],
+    )?;
+    Ok(())
+}
+
+/// Archives the thread if none of its messages is `active`.
+pub(crate) fn archive_thread_if_inactive(
+    conn: &Connection,
+    thread_id: i64,
+    archived_at: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_thread SET state = 'archived', archived_at = ?2
+         WHERE id = ?1 AND state = 'active'
+           AND NOT EXISTS (SELECT 1 FROM mail_message WHERE thread_id = ?1 AND state = 'active')",
+        params![thread_id, archived_at],
     )?;
     Ok(())
 }

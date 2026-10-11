@@ -483,8 +483,9 @@ fn reconcile_ledger(
         match row.state.as_str() {
             "gone" => {
                 // The user's `archived` is never touched here, only `gone`.
-                mail_store::revive_gone_message(conn, row.id)?;
-                revived += 1;
+                if mail_store::revive_gone_message(conn, row.id)? {
+                    revived += 1;
+                }
                 let state = if has_message { "parsed" } else { "pending" };
                 mail_store::touch_object(conn, row.id, &entry, sync_start, state)?;
                 if changed || !has_message {
@@ -541,7 +542,21 @@ fn ingest_one(
     match existing {
         Some((message_id, _)) if item.reparse => {
             let fallback = item.s3_modified.unwrap_or_else(|| now_millis() / 1000);
-            mail_thread::replace_message(conn, mailbox.id, message_id, &mail, fallback)?;
+            let replaced =
+                mail_thread::replace_message(conn, mailbox.id, message_id, &mail, fallback)?;
+            if replaced.duplicate {
+                // Leave a visible mark rather than a silent `parsed`.
+                let note = "Message-ID is already used by another message.";
+                mail_store::set_object_outcome(
+                    conn,
+                    item.object_id,
+                    "error",
+                    Some(note),
+                    item.attempts + 1,
+                )?;
+                counts.failed += 1;
+                return Ok(());
+            }
             counts.reparsed += 1;
         }
         // Crash between ingest and the state update: the message is there.
@@ -845,6 +860,14 @@ mod tests {
         }
     }
 
+    /// One source's calls all precede the other's: they ran one after another.
+    fn assert_contiguous(log: &[String]) {
+        let first = log[0].chars().next().unwrap();
+        let split = log.iter().position(|l| !l.starts_with(first)).unwrap();
+        assert!(log[..split].iter().all(|l| l.starts_with(first)));
+        assert!(log[split..].iter().all(|l| !l.starts_with(first)));
+    }
+
     fn one_source(f: &Fixture) -> (i64, i64, Arc<MockS3>) {
         let cred = f.credential("main");
         let (account, mailbox) = f.source(cred, "acme");
@@ -1077,10 +1100,7 @@ mod tests {
         }
         f.sync(&[(a, &ma), (b, &mb)]);
         let log = f.log.lock().unwrap().clone();
-        let first = log[0].chars().next().unwrap();
-        let split = log.iter().position(|l| !l.starts_with(first)).unwrap();
-        assert!(log[..split].iter().all(|l| l.starts_with(first)));
-        assert!(log[split..].iter().all(|l| !l.starts_with(first)));
+        assert_contiguous(&log);
         assert_eq!(log.len(), 8);
     }
 
@@ -1120,16 +1140,18 @@ mod tests {
             .unwrap()
             .execute("UPDATE mail_account SET s3_credential_id = ?1", [s3key])
             .unwrap();
-        let rendezvous = Rendezvous::new(2);
-        let make = |label: &str| {
-            Arc::new(MockS3 {
-                rendezvous: Some(rendezvous.clone()),
-                ..Arc::try_unwrap(MockS3::new(label, &f.log)).ok().unwrap()
-            })
-        };
-        let (ma, mb) = (make("A"), make("B"));
+        let (ma, mb) = (MockS3::new("A", &f.log), MockS3::new("B", &f.log));
+        for (m, n) in [(&ma, "a"), (&mb, "b")] {
+            for i in 0..3 {
+                m.put(
+                    &format!("owner/{i}"),
+                    "e",
+                    &mime(&format!("{n}{i}"), "S", "b"),
+                );
+            }
+        }
         f.sync(&[(a, &ma), (b, &mb)]);
-        assert!(!rendezvous.met(), "same S3 key must serialise");
+        assert_contiguous(&f.log.lock().unwrap());
     }
 
     #[test]
@@ -1235,7 +1257,8 @@ mod tests {
 
     fn fts_hits(f: &Fixture, term: &str) -> i64 {
         f.scalar(&format!(
-            "SELECT COUNT(*) FROM mail_message_fts WHERE mail_message_fts MATCH '{term}'"
+            "SELECT COUNT(*) FROM mail_message_fts WHERE mail_message_fts MATCH '{}'",
+            mail_store::fold_fts(term)
         ))
     }
 
@@ -1250,6 +1273,8 @@ mod tests {
         assert_eq!(fts_hits(&f, "hoang"), 1);
         assert_eq!(fts_hits(&f, "zebra"), 1);
         assert_eq!(fts_hits(&f, "hang"), 1);
+        assert_eq!(fts_hits(&f, "don"), 1);
+        assert_eq!(fts_hits(&f, "Đơn"), 1);
         s3.put("owner/1", "e2", &raw.replace("zebra", "walrus"));
         f.sync(&[(account, &s3)]);
         assert_eq!(fts_hits(&f, "zebra"), 0);
@@ -1314,6 +1339,89 @@ mod tests {
         assert_eq!(
             f.text("SELECT state FROM mail_object WHERE s3_key='owner/2'"),
             "parsed"
+        );
+    }
+
+    #[test]
+    fn rethreaded_user_archived_message_keeps_its_thread_archived() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Original", "root"));
+        s3.put("owner/2", "e2", &mime("m2", "Unrelated", "alone"));
+        f.sync(&[(account, &s3)]);
+        {
+            let conn = f.store.lock_conn().unwrap();
+            conn.execute(
+                "UPDATE mail_message SET state='archived' WHERE message_id_hdr='m2@example.com'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE mail_thread SET state='archived' WHERE subject='Unrelated'",
+                [],
+            )
+            .unwrap();
+        }
+        // Moves m2 into a brand new thread (different subject, no refs).
+        s3.put("owner/2", "e3", &mime("m2", "Brand new subject", "alone"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(
+            f.text("SELECT state FROM mail_thread WHERE subject='Brand new subject'"),
+            "archived"
+        );
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_thread"), 2);
+    }
+
+    #[test]
+    fn reparse_colliding_with_another_message_id_is_flagged_not_lost() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "One", "a"));
+        s3.put("owner/2", "e2", &mime("m2", "Two", "b"));
+        f.sync(&[(account, &s3)]);
+        s3.put("owner/2", "e3", &mime("m1", "Two", "b"));
+        let reports = f.sync(&[(account, &s3)]);
+        assert_eq!((reports[0].failed, reports[0].reparsed), (1, 0));
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_message"), 2);
+        assert_eq!(
+            f.text("SELECT state FROM mail_object WHERE s3_key='owner/2'"),
+            "error"
+        );
+    }
+
+    #[test]
+    fn user_archived_message_relisted_emits_no_change_event() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        f.sync(&[(account, &s3)]);
+        f.store
+            .lock_conn()
+            .unwrap()
+            .execute("UPDATE mail_message SET state='archived'", [])
+            .unwrap();
+        s3.remove("owner/1");
+        f.sync(&[(account, &s3)]);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        let factory = MockFactory(HashMap::from([(account, s3.clone())]));
+        let events = Recorder::default();
+        f.service.sync_now(&f.store, &factory, &events, None);
+        assert!(!events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_with("changed")));
+    }
+
+    #[test]
+    fn fresh_schema_has_parse_attempts() {
+        let f = Fixture::new();
+        assert_eq!(
+            f.scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('mail_object') WHERE name='parse_attempts'"
+            ),
+            1
         );
     }
 }

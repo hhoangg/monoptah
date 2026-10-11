@@ -1,6 +1,6 @@
 //! Thread grouping: References first, subject fallback behind three guards
 //! (spec section 6). Threads never cross mailboxes.
-// Not wired up until the sync task consumes it.
+// Some helpers are only used by the sync task and the tests.
 #![allow(dead_code)]
 
 use std::collections::HashSet;
@@ -336,7 +336,8 @@ pub(crate) fn ingest_message(
 
 /// Re-parse of a changed object: the message is removed and ingested again, so
 /// the envelope and the thread follow the new content. The read flag, star and
-/// state the user set carry over. Deleting first is what lets threading see the
+/// state the user set carry over. A `Message-ID` already used by another
+/// message returns `duplicate` and changes nothing. Deleting first is what lets threading see the
 /// message as new instead of as its own duplicate.
 pub(crate) fn replace_message(
     conn: &Connection,
@@ -345,6 +346,20 @@ pub(crate) fn replace_message(
     mail: &ParsedMail,
     fallback_date: i64,
 ) -> rusqlite::Result<Ingested> {
+    // Checked before the delete: a collision with another message must leave
+    // this one in place, not lose it.
+    if let Some(hdr) = mail.message_id.as_deref() {
+        if let Some((other, thread_id)) = mail_store::find_message_by_header(conn, mailbox_id, hdr)?
+        {
+            if other != message_id {
+                return Ok(Ingested {
+                    message_id: other,
+                    thread_id,
+                    duplicate: true,
+                });
+            }
+        }
+    }
     let removed = mail_store::remove_message(conn, message_id)?;
     let ingested = ingest_message(
         conn,
@@ -358,6 +373,13 @@ pub(crate) fn replace_message(
     let own = mail_store::account_mailbox_addresses(conn, account_id)?;
     if !ingested.duplicate {
         mail_store::restore_message_flags(conn, ingested.message_id, &removed)?;
+        // A new thread starts `active`; a restored archived/gone message must
+        // not leave it showing in the inbox.
+        mail_store::archive_thread_if_inactive(
+            conn,
+            ingested.thread_id,
+            crate::session_store::now_millis(),
+        )?;
         recompute_thread(conn, ingested.thread_id, &own)?;
     }
     if ingested.thread_id != removed.thread_id
