@@ -19,6 +19,11 @@ const MASK_VISIBLE_PREFIX: usize = 4;
 const MASK_VISIBLE_SUFFIX: usize = 4;
 
 pub(crate) fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
+    create_tables(conn)?;
+    ensure_object_attempts(conn)
+}
+
+fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS mail_credential (
@@ -242,6 +247,23 @@ pub(crate) fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
         );
         "#,
     )
+}
+
+/// Spec section 5 retries an unreadable object at most three times, which needs
+/// a counter the section 4 DDL does not carry.
+fn ensure_object_attempts(conn: &Connection) -> rusqlite::Result<()> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('mail_object') WHERE name = 'parse_attempts'",
+        [],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        conn.execute(
+            "ALTER TABLE mail_object ADD COLUMN parse_attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// A user-facing error carried through `rusqlite::Error` so callers keep a
@@ -1114,6 +1136,245 @@ pub(crate) fn absorb_thread(conn: &Connection, survivor: i64, loser: i64) -> rus
     )?;
     conn.execute("DELETE FROM mail_thread WHERE id = ?1", params![loser])?;
     Ok(())
+}
+
+// ── sync ledger ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MailObjectRow {
+    pub id: i64,
+    pub s3_key: String,
+    pub etag: Option<String>,
+    /// `pending | parsed | gone | error`
+    pub state: String,
+    pub parse_attempts: i64,
+}
+
+/// What a listing says about one key. `s3_modified` is epoch seconds.
+pub(crate) struct ListedObject<'a> {
+    pub s3_key: &'a str,
+    pub etag: &'a str,
+    pub size_bytes: i64,
+    pub s3_modified: Option<i64>,
+}
+
+pub(crate) fn list_objects(
+    conn: &Connection,
+    mailbox_id: i64,
+) -> rusqlite::Result<Vec<MailObjectRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, s3_key, etag, state, parse_attempts FROM mail_object WHERE mailbox_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![mailbox_id], |row| {
+        Ok(MailObjectRow {
+            id: row.get(0)?,
+            s3_key: row.get(1)?,
+            etag: row.get(2)?,
+            state: row.get(3)?,
+            parse_attempts: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Inserts a `pending` object. `seen_at` is epoch milliseconds.
+pub(crate) fn insert_object(
+    conn: &Connection,
+    mailbox_id: i64,
+    o: &ListedObject,
+    seen_at: i64,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "INSERT INTO mail_object
+           (mailbox_id, s3_key, etag, size_bytes, s3_modified, first_seen_at, last_seen_at, state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 'pending')
+         RETURNING id",
+        params![
+            mailbox_id,
+            o.s3_key,
+            o.etag,
+            o.size_bytes,
+            o.s3_modified,
+            seen_at
+        ],
+        |row| row.get(0),
+    )
+}
+
+/// Records that the listing saw this object again, and moves it to `state`.
+pub(crate) fn touch_object(
+    conn: &Connection,
+    id: i64,
+    o: &ListedObject,
+    seen_at: i64,
+    state: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_object SET etag = ?2, size_bytes = ?3, s3_modified = ?4,
+           last_seen_at = ?5, state = ?6 WHERE id = ?1",
+        params![id, o.etag, o.size_bytes, o.s3_modified, seen_at, state],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn set_object_outcome(
+    conn: &Connection,
+    id: i64,
+    state: &str,
+    parse_error: Option<&str>,
+    parse_attempts: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_object SET state = ?2, parse_error = ?3, parse_attempts = ?4 WHERE id = ?1",
+        params![id, state, parse_error, parse_attempts],
+    )?;
+    Ok(())
+}
+
+/// `(message id, thread id)` of the message parsed from this object.
+pub(crate) fn message_for_object(
+    conn: &Connection,
+    object_id: i64,
+) -> rusqlite::Result<Option<(i64, i64)>> {
+    conn.query_row(
+        "SELECT id, thread_id FROM mail_message WHERE object_id = ?1",
+        params![object_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+/// Marks every non-`gone` object of the mailbox not listed since `sync_start`
+/// as `gone`. Their `active` messages become `gone` (never `archived`: that
+/// word is the user's, spec section 10), and a thread left with no `active`
+/// message leaves the inbox. Nothing is deleted. Returns the object count.
+pub(crate) fn mark_vanished_objects(
+    conn: &Connection,
+    mailbox_id: i64,
+    sync_start: i64,
+    archived_at: i64,
+) -> rusqlite::Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let vanished = tx.execute(
+        "UPDATE mail_object SET state = 'gone'
+         WHERE mailbox_id = ?1 AND last_seen_at < ?2 AND state != 'gone'",
+        params![mailbox_id, sync_start],
+    )?;
+    if vanished > 0 {
+        let threads: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT m.thread_id FROM mail_message m
+                 JOIN mail_object o ON o.id = m.object_id
+                 WHERE o.mailbox_id = ?1 AND o.state = 'gone' AND m.state = 'active'",
+            )?;
+            let rows = stmt.query_map(params![mailbox_id], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        tx.execute(
+            "UPDATE mail_message SET state = 'gone'
+             WHERE state = 'active' AND object_id IN
+               (SELECT id FROM mail_object WHERE mailbox_id = ?1 AND state = 'gone')",
+            params![mailbox_id],
+        )?;
+        for thread_id in threads {
+            tx.execute(
+                "UPDATE mail_thread SET state = 'archived', archived_at = ?2
+                 WHERE id = ?1 AND state = 'active'
+                   AND NOT EXISTS (SELECT 1 FROM mail_message
+                                   WHERE thread_id = ?1 AND state = 'active')",
+                params![thread_id, archived_at],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(vanished)
+}
+
+/// An object that had vanished is listed again: its `gone` message is active
+/// again. A message the user archived is not `gone`, so it is left alone, and
+/// the thread comes back only if the sync was what removed it, that is when no
+/// message in it is `archived`.
+pub(crate) fn revive_gone_message(conn: &Connection, object_id: i64) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let thread: Option<i64> = tx
+        .query_row(
+            "SELECT thread_id FROM mail_message WHERE object_id = ?1 AND state = 'gone'",
+            params![object_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(thread_id) = thread {
+        tx.execute(
+            "UPDATE mail_message SET state = 'active' WHERE object_id = ?1 AND state = 'gone'",
+            params![object_id],
+        )?;
+        tx.execute(
+            "UPDATE mail_thread SET state = 'active', archived_at = NULL
+             WHERE id = ?1 AND state = 'archived'
+               AND NOT EXISTS (SELECT 1 FROM mail_message
+                               WHERE thread_id = ?1 AND state = 'archived')",
+            params![thread_id],
+        )?;
+    }
+    tx.commit()
+}
+
+/// A genuinely new message surfaces its thread again, as Gmail does. This is
+/// not the re-listed-key case of spec section 10.
+pub(crate) fn reactivate_thread(conn: &Connection, thread_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_thread SET state = 'active', archived_at = NULL
+         WHERE id = ?1 AND state = 'archived'",
+        params![thread_id],
+    )?;
+    Ok(())
+}
+
+/// Body-side columns re-derived from a changed object. Envelope, thread, read
+/// and star state stay, since threading was decided from them.
+pub(crate) struct RefreshedBody<'a> {
+    pub snippet: &'a str,
+    pub body_text: Option<&'a str>,
+    pub body_html: Option<&'a str>,
+    pub has_attachments: bool,
+    pub size_bytes: i64,
+    pub spf: Option<&'a str>,
+    pub dkim: Option<&'a str>,
+    pub dmarc: Option<&'a str>,
+    pub headers_json: &'a str,
+}
+
+pub(crate) fn refresh_message_body(
+    conn: &Connection,
+    message_id: i64,
+    b: &RefreshedBody,
+    attachments: &[NewAttachment],
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE mail_message SET snippet = ?2, body_text = ?3, body_html = ?4,
+           has_attachments = ?5, size_bytes = ?6, spf = ?7, dkim = ?8, dmarc = ?9,
+           headers_json = ?10
+         WHERE id = ?1",
+        params![
+            message_id,
+            b.snippet,
+            b.body_text,
+            b.body_html,
+            b.has_attachments,
+            b.size_bytes,
+            b.spf,
+            b.dkim,
+            b.dmarc,
+            b.headers_json
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM mail_attachment WHERE message_id = ?1",
+        params![message_id],
+    )?;
+    insert_attachments(&tx, message_id, attachments)?;
+    tx.commit()
 }
 
 #[cfg(test)]
