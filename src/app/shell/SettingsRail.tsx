@@ -8,6 +8,7 @@ import {
   Globe,
   Internet,
   Keyboard,
+  Mail,
   MessageSquare,
   Palette,
   SlidersHorizontal,
@@ -31,6 +32,7 @@ const SECTION_ICONS: Record<SettingsSectionId, IconComponent> = {
   skills: Sparkles,
   monos: Ghost,
   inbox: Inbox,
+  mail: Mail,
   worktrees: FolderTree,
   archive: Archive,
 };

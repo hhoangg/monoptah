@@ -28,6 +28,7 @@ export type SettingsSectionId =
   | "skills"
   | "monos"
   | "inbox"
+  | "mail"
   | "worktrees"
   | "archive";
 
@@ -133,6 +134,14 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
       "Manage Inbox services and notification preferences for each project.",
     keywords:
       "github gitlab linear jira clickup atlassian azure devops connect token integration",
+  },
+  {
+    id: "mail",
+    group: "workspace",
+    label: "Mail",
+    description:
+      "Read and send mail for your own domains through AWS S3 and SES.",
+    keywords: "email aws ses s3 bucket domain mailbox smtp inbox credentials",
   },
   {
     id: "archive",
@@ -493,6 +502,12 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     keywords: "api key issues teams connect",
   },
   {
+    id: "mail-enabled",
+    section: "mail",
+    label: "Enable Mail",
+    keywords: "email show hide rail aws ses",
+  },
+  {
     id: "show-archived",
     section: "archive",
     label: "Show archived in the sidebar",
@@ -808,6 +823,33 @@ export function subscribeNotesEnabled(onStoreChange: () => void) {
   window.addEventListener(NOTES_ENABLED_CHANGE_EVENT, onStoreChange);
   return () =>
     window.removeEventListener(NOTES_ENABLED_CHANGE_EVENT, onStoreChange);
+}
+
+const MAIL_ENABLED_KEY = "monocode.mail.enabled";
+
+// Off until the user sets up a source, so a fresh install shows no empty Mail.
+export const MAIL_ENABLED_DEFAULT = false;
+
+/** Fired on `window` when the Mail UI setting flips. */
+export const MAIL_ENABLED_CHANGE_EVENT = "monocode:mail-enabled-change";
+
+export function loadMailEnabled(): boolean {
+  return readFlag(MAIL_ENABLED_KEY) ?? MAIL_ENABLED_DEFAULT;
+}
+
+export function saveMailEnabled(value: boolean) {
+  writeFlag(MAIL_ENABLED_KEY, value);
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent<boolean>(MAIL_ENABLED_CHANGE_EVENT, { detail: value }),
+  );
+}
+
+export function subscribeMailEnabled(onStoreChange: () => void) {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(MAIL_ENABLED_CHANGE_EVENT, onStoreChange);
+  return () =>
+    window.removeEventListener(MAIL_ENABLED_CHANGE_EVENT, onStoreChange);
 }
 
 const MONOS_ENABLED_KEY = "monocode.monosEnabled";

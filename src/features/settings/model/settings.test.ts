@@ -612,6 +612,7 @@ describe("settings navigation", () => {
       "skills",
       "monos",
       "inbox",
+      "mail",
       "archive",
       "worktrees",
     ]);
