@@ -374,6 +374,18 @@ pub(crate) fn outbox_save_releasing(
     dir: &std::path::Path,
     draft: OutboxDraft,
 ) -> Result<i64, String> {
+    save_releasing(store, dir, draft, || {})
+}
+
+/// `between_read_and_save` runs after the first state read and before the save,
+/// the window the second read exists for. Production passes nothing; it is a
+/// parameter so a test can move the row into that window deterministically.
+fn save_releasing(
+    store: &SessionStore,
+    dir: &std::path::Path,
+    draft: OutboxDraft,
+    between_read_and_save: impl FnOnce(),
+) -> Result<i64, String> {
     let before = match draft.id {
         Some(id) => {
             let conn = store.lock_conn()?;
@@ -381,9 +393,14 @@ pub(crate) fn outbox_save_releasing(
         }
         None => None,
     };
+    between_read_and_save();
     let id = outbox_save(store, draft)?;
     // Read again after the save: a send can have gone unconfirmed between the
     // first read and the save, and `unconfirmed` keeps its state through a save.
+    // This covers a send that CLAIMED before the save. One that loaded before
+    // the save but claims after it is stopped in `prepare`, which refuses to
+    // claim a list that changed under it; no state read here could, since the
+    // decision below is taken before that claim happens.
     let after_protected = {
         let conn = store.lock_conn()?;
         mail_store::get_outbox(&conn, id)
@@ -951,6 +968,18 @@ fn prepare(store: &SessionStore, clients: &dyn AwsClients, id: i64) -> Result<Pr
     let s3 = clients.s3(&loaded.account);
     {
         let conn = store.lock_conn()?;
+        // The bytes were read from the attachment list `load` captured. If a
+        // save changed that list since, claiming now would send files the row
+        // no longer lists, and a save that dropped one has already released it:
+        // an `unconfirmed` row would then be the only record of a message whose
+        // attachment is gone. Checked under the same lock as the claim so no
+        // save can slip between them; after the claim, saves are refused.
+        let current = mail_store::get_outbox(&conn, id).map_err(db)?;
+        if current.is_some_and(|row| row.attachments != loaded.row.attachments) {
+            return Err("This message was edited while it was being prepared. \
+                        Review it and send again."
+                .into());
+        }
         if !mail_store::claim_outbox_for_send(&conn, id).map_err(db)? {
             return Err("This message was already sent or is being sent.".into());
         }
@@ -1191,6 +1220,8 @@ mod tests {
         paused: AtomicBool,
         ses_error: Mutex<Option<SesError>>,
         on_send: Mutex<Option<Box<dyn Fn() + Send>>>,
+        /// Runs on every SES client request a send makes, so a test can pick the moment.
+        on_ses: Mutex<Option<Box<dyn Fn() + Send>>>,
         identities: Mutex<HashMap<i64, Vec<MailIdentity>>>,
     }
 
@@ -1313,6 +1344,9 @@ mod tests {
             }))
         }
         fn ses(&self, account: &MailAccount) -> Result<Box<dyn SesApi + Send>, String> {
+            if let Some(hook) = self.on_ses.lock().unwrap().as_ref() {
+                hook();
+            }
             Ok(Box::new(FakeSes {
                 fake: self.clone(),
                 account_id: account.id,
@@ -2751,6 +2785,54 @@ mod tests {
             assert!(!std::path::Path::new(&a.path).exists(), "{state} delete");
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn a_save_that_drops_a_file_between_load_and_claim_stops_the_send() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        let (a, b) = (staged(&dir, "a.png"), staged(&dir, "b.png"));
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![a.clone(), b.clone()];
+        let id = outbox_save_releasing(&w.store, &dir, d.clone()).unwrap();
+        // The send has read both files; now the person drops b and the save
+        // releases it, before the send claims the row.
+        let (store, dir2) = (w.store.clone(), dir.clone());
+        d.id = Some(id);
+        d.attachments = vec![a.clone()];
+        // `find_problems` asks for a client first, before the bytes are read;
+        // only the second ask comes after `build_message`, which is the window.
+        let asks = std::sync::atomic::AtomicUsize::new(0);
+        *w.fake.on_ses.lock().unwrap() = Some(Box::new(move || {
+            if asks.fetch_add(1, Ordering::SeqCst) == 1 {
+                outbox_save_releasing(&store, &dir2, d.clone()).unwrap();
+            }
+        }));
+        let err = outbox_send(&w.store, &w.fake, id).unwrap_err();
+        assert!(w.fake.log.lock().unwrap().sends.is_empty(), "{err:?}");
+        assert!(err.retry_safe);
+        // Nothing went out, so the row stays editable, not `unconfirmed`.
+        assert_eq!(outbox_list(&w.store).unwrap()[0].state, "draft");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_save_after_a_send_went_unconfirmed_keeps_the_file_it_drops() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        let (a, b) = (staged(&dir, "a.png"), staged(&dir, "b.png"));
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![a.clone(), b.clone()];
+        let id = outbox_save_releasing(&w.store, &dir, d.clone()).unwrap();
+        d.id = Some(id);
+        d.attachments = vec![a.clone()];
+        // The first read sees a draft; the send then fails ambiguously before
+        // the save lands.
+        save_releasing(&w.store, &dir, d, || set_state(&w, "unconfirmed")).unwrap();
+        assert!(std::path::Path::new(&b.path).exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn count_cred(conn: &rusqlite::Connection) -> i64 {
