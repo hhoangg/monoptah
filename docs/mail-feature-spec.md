@@ -1110,17 +1110,35 @@ mockup. There is no silent destructive default.
   destructive choice made once and applied to mail the user has not looked at.
   Nothing persists either.
 - **The Archive view.** The folder list ends with an Archive entry. It is the
-  `archived` scope of the one thread listing, so cursor paging, source scoping and
-  the unread aggregates are the inbox's own; it is not a smart folder and nothing
-  is stored for it. It lists a thread only if the thread is `archived` **and** one
-  of its messages is `archived`: that second test is what keeps out a thread the
-  sync archived because every message went `gone`, which is not the user's choice
-  and has nothing to restore.
+  `archived` scope of the one thread listing, so cursor paging and the unread
+  aggregates are the inbox's own; it is not a smart folder and nothing is stored
+  for it. It lists a thread only if the thread is `archived` **and** one of its
+  messages is `archived`: that second test is what keeps out a thread the sync
+  archived because every message went `gone`, which is not the user's choice and
+  has nothing to restore.
+- **Source scoping is not the inbox's.** The Archive scope filters only on
+  `a.enabled = 1` (a disabled source's archive is not shown), has no per-mailbox
+  variant, and deliberately does **not** apply the filed-away test the mailbox
+  views use. That test hides a thread that sits in a `hide_from_mailbox` folder.
+  Archiving takes such a thread out of its folder view too, so if the Archive
+  applied the test as well it would vanish from every list the moment it was
+  archived, with nowhere left to restore it from.
+- **Archived mail is not searchable.** Search and the filter chips are a Rules
+  scope, which resolves to the inbox's visibility test and so never sees an
+  archived thread. The Archive view therefore replaces the filter bar with a
+  static note instead of a search box that would silently search something else.
 - **Unarchive** (`mail_unarchive`, "Move to inbox" in the reader) writes both
   tables, as archiving did: each `archived` message back to `active`, then the
   thread. Moving only the thread would list as an empty thread. A thread without
   an `archived` message is refused, so a restore can never produce a thread with
-  an unread count and nothing to open.
+  an unread count and nothing to open. The command returns how many threads moved,
+  and the reader says so when it is 0 instead of looking as though it worked.
+- **"Move to inbox" follows the backend.** `mail_thread` returns `restorable`, the
+  same test `mail_unarchive` applies, and the reader shows the button from it. It
+  is not derived from the messages' states: a vanished reply listed again leaves
+  an `archived` thread holding an `active` message (reachable only from the
+  Archive, so it must be restorable), while a new message leaves an `active`
+  thread holding older `archived` ones (not restorable).
 - **Unread badges.** Archived mail counts toward no badge: not the mailbox, the
   domain, the All mail total, and the Archive entry shows none. Archiving is
   dismissing, and a badge must always be clearable by opening something listed
@@ -1382,11 +1400,11 @@ mail_sync_interval_set(secs)       // Rust cannot read localStorage, so the
                                    // the interval stays at the 3600 default
                                    // whatever the user sets.
 mail_threads(query: ThreadQuery) -> Page<ThreadRow>        // mailbox|folder|archived|rules, cursor
-mail_thread(thread_id) -> ThreadDetail                     // messages + attachments
+mail_thread(thread_id) -> ThreadDetail                     // messages + attachments + restorable
 mail_message_raw(message_id) -> String                     // re-fetch from S3
 mail_mark(thread_ids, read: bool) / mail_star(...)
 mail_archive(thread_ids)
-mail_unarchive(thread_ids)                                 // archived -> inbox, messages too
+mail_unarchive(thread_ids) -> usize                        // archived -> inbox, messages too; count moved
 mail_delete(thread_ids, hard: bool) -> DeleteReport
 mail_attachment_open(attachment_id) -> PathBuf             // downloads if needed
 mail_attachment_bytes(attachment_id) -> Vec<u8>            // for inline images
