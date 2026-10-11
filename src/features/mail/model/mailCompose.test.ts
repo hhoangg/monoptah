@@ -22,7 +22,7 @@ const doc = (...content: TipTapNode[]): TipTapNode => ({
 });
 const link = (href: string) => [{ type: "link", attrs: { href } }];
 const run = (d: TipTapNode, quotedHtml?: string) =>
-  serializeCompose({ bodyJson: d, quotedHtml });
+  serializeCompose({ bodyJson: d, draftId: "d1", quotedHtml });
 
 /** Every element tag in the output, with its style attribute. */
 function elements(html: string) {
@@ -198,16 +198,81 @@ describe("mailCompose text", () => {
   });
 });
 
+const img = (id: string): TipTapNode => ({
+  type: "image",
+  attrs: { src: "blob:abc", alt: "pic", "data-mono-att": id },
+});
+
+describe("mailCompose hardening", () => {
+  it("escapes attribute and code-block sites individually", () => {
+    const out = run(
+      doc(
+        p(t("x", link('https://e.com/" onmouseover="x'))),
+        {
+          type: "image",
+          attrs: { alt: '" onerror="x', "data-mono-att": "1" },
+        },
+        { type: "image", attrs: { alt: '<i onerror="x">' } },
+        { type: "codeBlock", content: [t("</pre><script>")] },
+        { type: "<x onload=1>" },
+      ),
+    );
+    expect(out.html).toContain("&quot; onmouseover=&quot;x");
+    expect(out.html).toContain('alt="&quot; onerror=&quot;x"');
+    expect(out.html).toContain("[image: &lt;i onerror=&quot;x&quot;&gt;]");
+    expect(out.html).toContain("&lt;/pre&gt;&lt;script&gt;");
+    expect(out.html).toContain("[&lt;x onload=1&gt;]");
+    expect(out.html).not.toContain("<script");
+    expect(elements(out.html).some((e) => e.hasAttribute("onerror"))).toBe(
+      false,
+    );
+    expect(elements(out.html).some((e) => e.hasAttribute("onmouseover"))).toBe(
+      false,
+    );
+  });
+
+  it("strips NUL, C0 controls and lone surrogates but keeps tab and newline", () => {
+    const { html, text } = run(doc(p(t("a\u0000b\u0007c\ud800d\te"))));
+    expect(html).toContain("abcd\te");
+    expect(text).toBe("abcd\te");
+    expect(run(doc(p(t("ok 😀")))).text).toBe("ok 😀");
+  });
+
+  it("does not double the gap inside a list item", () => {
+    const { html } = run(
+      doc({ type: "bulletList", content: [li(p(t("one")))] }),
+    );
+    expect(html).not.toMatch(/<li[^>]*><p/);
+  });
+
+  it("ignores a monoAtt attribute: only data-mono-att names an attachment", () => {
+    const out = run(doc({ type: "image", attrs: { alt: "a", monoAtt: "5" } }));
+    expect(out.inlineImages).toEqual([]);
+  });
+});
+
 describe("mailCompose images", () => {
-  const img = (id: string): TipTapNode => ({
-    type: "image",
-    attrs: { src: "blob:abc", alt: "pic", "data-mono-att": id },
+  it("keeps cids distinct across ids differing only by case and across drafts", () => {
+    expect(contentIdFor("d", "A")).not.toBe(contentIdFor("d", "a"));
+    expect(contentIdFor("d1", "1")).not.toBe(contentIdFor("d2", "1"));
+    expect(contentIdFor("d", "A")).toBe(contentIdFor("d", "A").toLowerCase());
+  });
+
+  it("cannot match a cid already inside the quoted original", () => {
+    const quoted = '<img src="cid:mono-1@monoptah.local">';
+    const out = run(doc(img("1")), quoted);
+    expect(cidReferences(out.html)).toHaveLength(2);
+    expect(out.html.split(out.inlineImages[0].contentId)).toHaveLength(2);
   });
 
   it("turns an inline image into a cid reference plus a matching attachment", () => {
     const out = run(doc(img("att 7")));
     expect(out.inlineImages).toEqual([
-      { attachmentId: "att 7", contentId: contentIdFor("att 7"), alt: "pic" },
+      {
+        attachmentId: "att 7",
+        contentId: contentIdFor("d1", "att 7"),
+        alt: "pic",
+      },
     ]);
     expect(out.html).toContain(`src="cid:${out.inlineImages[0].contentId}"`);
     expect(out.html).not.toContain("blob:");
@@ -238,6 +303,7 @@ describe("mailCompose bcc", () => {
   it("never puts Bcc in the body, even when the draft row carries it", () => {
     const draft = {
       bodyJson: doc(p(t("hello"))),
+      draftId: "d1",
       quotedHtml: null,
       to: ["to@example.com"],
       cc: ["cc@example.com"],
