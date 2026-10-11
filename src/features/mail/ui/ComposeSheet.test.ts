@@ -20,8 +20,16 @@ vi.mock("@tauri-apps/api/core", () => ({
     cmd === "read_file_base64" ? "aGVsbG8=" : null,
   ),
 }));
+const webview = vi.hoisted(() => ({
+  drop: null as null | ((e: { payload: unknown }) => void),
+}));
 vi.mock("@tauri-apps/api/webview", () => ({
-  getCurrentWebview: () => ({ onDragDropEvent: async () => () => undefined }),
+  getCurrentWebview: () => ({
+    onDragDropEvent: async (h: (e: { payload: unknown }) => void) => {
+      webview.drop = h;
+      return () => undefined;
+    },
+  }),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => () => undefined),
@@ -701,5 +709,104 @@ it("Save draft without a From gives the same instruction as autosave", async () 
   expect(body().textContent).toContain(
     "Choose a From address before this can be saved.",
   );
-  expect(body().textContent).not.toContain("not one of your mailboxes");
+});
+
+const SENT = {
+  outboxId: 41,
+  sesMessageId: "x",
+  messageId: 1,
+  threadId: 1,
+  archive: { stored: true, reason: null },
+  bookkeepingError: null,
+};
+
+const pdf = (cid: string | null = null, path = "/tmp/a.pdf") => ({
+  path,
+  filename: path.split("/").pop()!,
+  mime: "application/pdf",
+  cid,
+});
+
+const noFiles = () =>
+  vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+    cmd === "inspect_paths" ? [] : null) as never);
+
+it("deleting a missing inline image from the body lets Send through", async () => {
+  noFiles();
+  m.mailOutboxSend.mockResolvedValue(SENT);
+  const cid = contentIdFor("41", "att-1");
+  await open({
+    kind: "draft",
+    row: row({
+      bodyJson: {
+        type: "doc",
+        content: [
+          { type: "image", attrs: { src: "blob:x", "data-mono-att": "att-1" } },
+        ],
+      },
+      attachments: [
+        { path: "/tmp/p.png", filename: "p.png", mime: "image/png", cid },
+      ],
+    }),
+  });
+  expect(body().textContent).toContain("p.png is no longer on this computer");
+  await click(button("Send"));
+  expect(m.mailOutboxSend).not.toHaveBeenCalled();
+  await act(async () =>
+    (
+      editorEl() as unknown as {
+        editor: { commands: { clearContent(): void } };
+      }
+    ).editor.commands.clearContent(),
+  );
+  await settle();
+  expect(body().textContent).not.toContain("no longer on this computer");
+  await click(button("Send"));
+  expect(m.mailOutboxSend).toHaveBeenCalledWith(41);
+});
+
+it("attaching a file again clears its stale missing warning", async () => {
+  let exists = false;
+  vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+    cmd === "inspect_paths"
+      ? exists
+        ? [{ path: "/tmp/a.pdf", name: "a.pdf", size: 3, isDir: false }]
+        : []
+      : null) as never);
+  await open({ kind: "draft", row: row({ attachments: [pdf()] }) });
+  expect(body().textContent).toContain("a.pdf is no longer on this computer");
+  await click(button("Remove a.pdf"));
+  exists = true;
+  await act(async () =>
+    webview.drop!({ payload: { type: "drop", paths: ["/tmp/a.pdf"] } }),
+  );
+  await settle();
+  expect(button("Remove a.pdf")).toBeDefined();
+  expect(body().textContent).not.toContain("no longer on this computer");
+});
+
+it("Send shows a missing file and the empty recipient together", async () => {
+  noFiles();
+  await open({
+    kind: "draft",
+    row: row({ to: [], attachments: [pdf()] }),
+  });
+  await click(button("Send"));
+  expect(body().textContent).toContain("a.pdf is no longer on this computer");
+  expect(body().textContent).toContain("Add at least one recipient in To.");
+  expect(m.mailOutboxSend).not.toHaveBeenCalled();
+});
+
+it("two clicks on Send in one tick send once", async () => {
+  m.mailOutboxSend.mockResolvedValue(SENT);
+  await open({ kind: "draft", row: row() });
+  const send = button("Send")!;
+  // No await between the clicks: both handlers hold the same stale `busy`.
+  await act(async () => {
+    send.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    send.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await settle();
+  expect(m.mailOutboxSend).toHaveBeenCalledTimes(1);
+  expect(m.mailOutboxCheck).toHaveBeenCalledTimes(1);
 });

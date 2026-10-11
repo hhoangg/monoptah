@@ -455,6 +455,9 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [report, setReport] = useState<SendReport | null>(null);
   const [missingPaths, setMissingPaths] = useState<string[]>([]);
+  // Ids of the staged files the message would carry now; null until the body
+  // is first edited, when everything loaded with the draft still counts.
+  const [attachedIds, setAttachedIds] = useState<string[] | null>(null);
   const [fromNote, setFromNote] = useState<string | null>(null);
   const mode = sendMode(rowState);
 
@@ -466,6 +469,9 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
   const dirty = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const queue = useRef<Promise<unknown>>(Promise.resolve());
+  // `busy` is the value of the render that made the handler, so two clicks in
+  // one tick both read it as null; only a ref is seen by the second click.
+  const sending = useRef(false);
   const forceClose = useRef(false);
   const alive = useRef(true);
   // While a second close would discard, the note must keep saying so.
@@ -609,20 +615,14 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
         id = await mailOutboxSave({ ...draft, id: null, attachments: plain });
         idRef.current = id;
       }
-      const out = serializeCompose({
-        bodyJson: doc,
-        draftId: String(id),
-        quotedHtml: s.quote?.html ?? null,
-        quotedText: s.quote?.text ?? null,
-      });
-      const inline = out.inlineImages.flatMap((img) => {
-        const p = s.pending.find((x) => x.id === img.attachmentId);
-        return p ? [toAttachment(p, img.contentId)] : [];
-      });
+      const { out, inline } = compose(s.pending, s.quote, doc, String(id));
       await mailOutboxSave({
         ...draft,
         id,
-        attachments: [...plain, ...inline],
+        attachments: [
+          ...plain,
+          ...inline.map(({ p, cid }) => toAttachment(p, cid)),
+        ],
         bodyHtml: out.html,
         bodyText: out.text,
       });
@@ -739,6 +739,11 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
       }
       if (!alive.current) return;
       setPending((prev) => [...prev, ...staged]);
+      // They were just read, so an older "missing" verdict on the same path is
+      // stale and would claim a present file is gone.
+      setMissingPaths((prev) =>
+        prev.filter((x) => !staged.some((p) => p.path === x)),
+      );
       latest.current.pending = [...latest.current.pending, ...staged];
       for (const p of staged) if (p.inline) insertImage(p);
       if (staged.length) touch();
@@ -788,6 +793,20 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
     // addFiles reads refs and stable setters only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const syncAttached = () => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const { pending: files, quote: q } = latest.current;
+    const ids = compose(files, q, editor.getJSON() as TipTapNode, "0").attached
+      .map((p) => p.id)
+      .sort();
+    setAttachedIds((prev) =>
+      prev && prev.length === ids.length && prev.every((x, i) => x === ids[i])
+        ? prev
+        : ids,
+    );
+  };
 
   const removePending = (id: string) => {
     setPending((prev) => prev.filter((p) => p.id !== id));
@@ -841,22 +860,42 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
   const send = async () => {
     // Cmd+Enter reaches here with the editor still mounted, so the row's state
     // is enforced here and not only by hiding the button.
-    if (busy || mode.kind !== "send") return;
+    if (sending.current || busy || mode.kind !== "send") return;
+    sending.current = true;
+    try {
+      await sendOnce();
+    } finally {
+      sending.current = false;
+    }
+  };
+
+  const sendOnce = async () => {
     setProblems([]);
     setNotice(null);
-    const why = blocked();
-    if (why) return setNotice(why);
-    const settled = settleTexts();
-    if (settled.invalid) {
-      return setNotice(
-        `"${settled.invalid.token}" is not a valid email address.`,
-      );
-    }
-    const gone = await missingFiles(latest.current.pending);
+    const editor = editorRef.current;
+    const s = latest.current;
+    // Only what the message would carry can block it: an inline image deleted
+    // from the body is no longer part of it.
+    const { attached } = compose(
+      s.pending,
+      s.quote,
+      editor ? (editor.getJSON() as TipTapNode) : { type: "doc" },
+      String(idRef.current ?? 0),
+    );
+    const gone = await missingFiles(attached);
     setMissingPaths(gone);
-    if (gone.length) return;
-    if (settled.recipients.to.length === 0)
-      return setNotice("Add at least one recipient in To.");
+    const settled = settleTexts();
+    // Everything that blocks is shown at once, not one problem per attempt.
+    const reasons = [
+      blocked(),
+      settled.invalid
+        ? `"${settled.invalid.token}" is not a valid email address.`
+        : settled.recipients.to.length === 0
+          ? "Add at least one recipient in To."
+          : null,
+    ].filter((r): r is string => r !== null);
+    if (reasons.length) setNotice(reasons.join(" "));
+    if (reasons.length || gone.length) return;
     setBusy("send");
     let id = idRef.current;
     try {
@@ -941,8 +980,13 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
 
   // ----- render -----
 
-  // Only files still attached count, so removing one clears its warning.
-  const missing = pending.filter((p) => missingPaths.includes(p.path));
+  // Only files the message still carries count: removing one, or deleting an
+  // inline image from the body, clears its warning.
+  const missing = pending.filter(
+    (p) =>
+      missingPaths.includes(p.path) &&
+      (!p.inline || attachedIds === null || attachedIds.includes(p.id)),
+  );
   const entry = groups
     ?.flatMap((g) => g.entries)
     .find((e) => e.address.toLowerCase() === from.toLowerCase());
@@ -1019,7 +1063,10 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
 
           <LazyMailEditor
             content={init.doc}
-            onChange={touch}
+            onChange={() => {
+              touch();
+              syncAttached();
+            }}
             onSend={() => void send()}
             onFiles={onFiles}
             onImage={() => void pick(true)}
@@ -1321,6 +1368,32 @@ async function originalOf(row: OutboxRow) {
   } catch {
     return null;
   }
+}
+
+/**
+ * The one place that decides which staged files a message carries: every plain
+ * attachment, plus the inline images the body still references. `persist` sends
+ * exactly this and Send's missing-file check blocks on exactly this, so the two
+ * cannot disagree about whether a file is part of the message.
+ */
+function compose(
+  pending: Pending[],
+  quote: Quote | null,
+  doc: TipTapNode,
+  draftId: string,
+) {
+  const out = serializeCompose({
+    bodyJson: doc,
+    draftId,
+    quotedHtml: quote?.html ?? null,
+    quotedText: quote?.text ?? null,
+  });
+  const inline = out.inlineImages.flatMap((img) => {
+    const p = pending.find((x) => x.id === img.attachmentId);
+    return p ? [{ p, cid: img.contentId }] : [];
+  });
+  const plain = pending.filter((p) => !p.inline);
+  return { out, inline, attached: [...plain, ...inline.map((i) => i.p)] };
 }
 
 /**
