@@ -103,10 +103,11 @@ export const mailStar = (threadIds: number[], starred: boolean) =>
 
 /**
  * Puts archived threads back in the inbox, messages included. Archiving is
- * `mailDelete(ids, false)`.
+ * `mailDelete(ids, false)`. Resolves to how many moved: 0 means the backend
+ * refused, which is not the same as done.
  */
 export const mailUnarchive = (threadIds: number[]) =>
-  invoke<void>("mail_unarchive", { threadIds });
+  invoke<number>("mail_unarchive", { threadIds });
 
 /** Downloads if needed and returns the local path. */
 export const mailAttachmentOpen = (attachmentId: number) =>

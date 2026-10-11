@@ -27,7 +27,7 @@ vi.mock("../model/mail", () => ({
   mailMessageRaw: vi.fn(),
   mailMark: vi.fn(async () => undefined),
   mailStar: vi.fn(async () => undefined),
-  mailUnarchive: vi.fn(async () => undefined),
+  mailUnarchive: vi.fn(async () => 1),
   mailAttachmentOpen: vi.fn(),
   mailAttachmentBytes: vi.fn(),
   mailRemoteImage: vi.fn(),
@@ -62,7 +62,7 @@ const msg = (id: number, over: Partial<MessageRow> = {}): MessageRow => ({
   ...over,
 });
 
-const detail = (messages: MessageRow[]): ThreadDetail => ({
+const detail = (messages: MessageRow[], restorable = false): ThreadDetail => ({
   thread: {
     id: 5,
     accountId: 1,
@@ -80,6 +80,7 @@ const detail = (messages: MessageRow[]): ThreadDetail => ({
     isStarred: false,
   },
   imagePolicy: "ask",
+  restorable,
   messages,
 });
 
@@ -256,17 +257,64 @@ const headerButton = (label: string) =>
 
 it("offers Move to inbox on an archived thread and sends the thread id", async () => {
   vi.mocked(mailThread).mockResolvedValue(
-    detail([msg(1, { state: "archived" }), msg(2, { state: "archived" })]),
+    detail(
+      [msg(1, { state: "archived" }), msg(2, { state: "archived" })],
+      true,
+    ),
   );
   await render();
-  await act(async () => headerButton("Move to inbox")!.click());
+  const move = headerButton("Move to inbox");
+  expect(move).toBeDefined();
+  await act(async () => move!.click());
   expect(mailUnarchive).toHaveBeenCalledWith([5]);
+});
+
+it("offers Move to inbox on an archived thread whose message was revived, and restores it", async () => {
+  // thread=archived with one active and one archived message: the Archive is
+  // the only list that shows it, so this button is the only way out.
+  vi.mocked(mailThread).mockResolvedValue(
+    detail([msg(1, { state: "archived" }), msg(2)], true),
+  );
+  await render();
+  const move = headerButton("Move to inbox");
+  expect(move).toBeDefined();
+  await act(async () => move!.click());
+  expect(mailUnarchive).toHaveBeenCalledWith([5]);
+  expect(container.querySelector("[role='status']")).toBeNull();
 });
 
 it("does not offer Move to inbox once a new message made the thread active again", async () => {
   vi.mocked(mailThread).mockResolvedValue(
-    detail([msg(1, { state: "archived" }), msg(2)]),
+    detail([msg(1, { state: "archived" }), msg(2)], false),
   );
   await render();
   expect(headerButton("Move to inbox")).toBeUndefined();
+});
+
+it("follows the backend, not the message states, when deciding to offer Move to inbox", async () => {
+  vi.mocked(mailThread).mockResolvedValue(
+    detail([msg(1, { state: "archived" })], false),
+  );
+  await render();
+  expect(headerButton("Move to inbox")).toBeUndefined();
+});
+
+it("says so when the restore moved nothing, and the message survives the reload", async () => {
+  vi.mocked(mailUnarchive).mockResolvedValueOnce(0);
+  vi.mocked(mailThread).mockResolvedValue(
+    detail([msg(1, { state: "archived" })], true),
+  );
+  await render();
+  const move = headerButton("Move to inbox");
+  expect(move).toBeDefined();
+  await act(async () => move!.click());
+  const notice = container.querySelector("[role='status']");
+  expect(notice).not.toBeNull();
+  expect(notice!.textContent).toContain("nothing to move");
+  // The change event reloads the thread; the notice must outlive that.
+  const reload = vi
+    .mocked(listen)
+    .mock.calls.find(([name]) => name === "mail://messages-changed")![1];
+  await act(async () => reload({} as never));
+  expect(container.querySelector("[role='status']")).not.toBeNull();
 });

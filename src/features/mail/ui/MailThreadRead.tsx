@@ -308,6 +308,7 @@ function ThreadBody({
   const [detail, setDetail] = useState<ThreadDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [notice, setNotice] = useState<string | null>(null);
   // Only the user's changes from the default (newest open, rest closed) are kept.
   const [flipped, setFlipped] = useState<ReadonlySet<number>>(new Set());
   const [, bump] = useState(0);
@@ -385,10 +386,6 @@ function ThreadBody({
   const newest = messages[messages.length - 1];
   const newestId = newest?.id;
   const unread = messages.some((m) => !m.isRead);
-  // A thread that took a new message is active again and keeps its older
-  // archived messages, so "every message" is what says the thread is archived.
-  const archived =
-    messages.length > 0 && messages.every((m) => m.state === "archived");
   const { thread } = detail;
 
   const run = async (action: () => Promise<void>) => {
@@ -446,9 +443,21 @@ function ThreadBody({
         >
           {unread ? "Mark as read" : "Mark as unread"}
         </SecondaryButton>
-        {archived ? (
+        {detail.restorable ? (
           <SecondaryButton
-            onClick={() => void run(() => mailUnarchive([thread.id]))}
+            onClick={() =>
+              void run(async () => {
+                setNotice(null);
+                const moved = await mailUnarchive([thread.id]);
+                // Kept apart from `error`: the reload this triggers clears
+                // `error`, and this is the one message that must outlive it.
+                if (moved === 0) {
+                  setNotice(
+                    "This conversation is no longer archived, so there was nothing to move.",
+                  );
+                }
+              })
+            }
           >
             Move to inbox
           </SecondaryButton>
@@ -470,6 +479,11 @@ function ThreadBody({
             }
           }}
         />
+      ) : null}
+      {notice ? (
+        <p role="status" className="px-4 py-2 text-[12px] text-content/60">
+          {notice}
+        </p>
       ) : null}
       {error ? (
         <p className="px-4 py-2 text-[12px] text-red-400">{error}</p>

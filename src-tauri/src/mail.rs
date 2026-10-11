@@ -1659,19 +1659,21 @@ pub fn mail_archive(
     Ok(())
 }
 
-/// Undoes `mail_archive`. Local only, like it.
+/// Undoes `mail_archive`. Local only, like it. Returns how many threads moved,
+/// so a refused restore is not mistaken for a done one.
 #[tauri::command(async)]
 pub fn mail_unarchive(
     app: AppHandle,
     store: State<'_, SessionStore>,
     thread_ids: Vec<i64>,
-) -> Result<(), String> {
-    {
+) -> Result<usize, String> {
+    let moved = {
         let conn = store.lock_conn()?;
-        mail_store::unarchive_threads(&conn, &thread_ids).map_err(db)?;
-    }
+        mail_store::unarchive_threads(&conn, &thread_ids).map_err(db)?
+    };
+    // Also on 0: the caller's view was stale, and a reload corrects it.
     let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
-    Ok(())
+    Ok(moved)
 }
 
 /// `hard: false` is `mail_archive`. `hard: true` deletes on S3 first; the
@@ -2805,6 +2807,109 @@ mod tests {
             .query_row("SELECT state FROM mail_thread", [], |row| row.get(0))
             .unwrap();
         assert_eq!(state, "archived");
+    }
+
+    /// archived thread, messages [archived, active]: a vanished reply listed
+    /// again under a thread the user archived. Reached through the real
+    /// vanish, archive and revive steps.
+    fn archived_thread_with_a_revived_message(store: &SessionStore, mailbox_id: i64) -> i64 {
+        let (_, thread) = ingest(store, mailbox_id, &raw_mail("Plan", "a1", "x"), "owner/a1");
+        ingest(
+            store,
+            mailbox_id,
+            &reply_mail("Re: Plan", "a2", "a1"),
+            "owner/a2",
+        );
+        let conn = store.lock_conn().unwrap();
+        conn.execute(
+            "UPDATE mail_object SET last_seen_at = 200 WHERE s3_key = 'owner/a1'",
+            [],
+        )
+        .unwrap();
+        mail_store::mark_vanished_objects(&conn, mailbox_id, 100, 5).unwrap();
+        mail_store::archive_threads(&conn, &[thread], 5).unwrap();
+        let object: i64 = conn
+            .query_row(
+                "SELECT id FROM mail_object WHERE s3_key = 'owner/a2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(mail_store::revive_gone_message(&conn, object).unwrap());
+        thread
+    }
+
+    #[test]
+    fn an_archived_thread_with_a_revived_message_is_restorable_and_restores() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let thread = archived_thread_with_a_revived_message(&store, mailbox.id);
+        let detail = thread_detail(&store, thread).unwrap();
+        let mut states: Vec<_> = detail.messages.iter().map(|m| m.state.as_str()).collect();
+        states.sort();
+        assert_eq!(states, ["active", "archived"]);
+        assert!(detail.restorable);
+        let conn = store.lock_conn().unwrap();
+        // Only the Archive lists it, which is why it must be restorable.
+        assert!(list_ids(&conn, ThreadScope::All, None, None).0.is_empty());
+        assert_eq!(
+            list_ids(&conn, ThreadScope::Archived, None, None).0,
+            [thread]
+        );
+        assert_eq!(mail_store::unarchive_threads(&conn, &[thread]).unwrap(), 1);
+        assert_eq!(list_ids(&conn, ThreadScope::All, None, None).0, [thread]);
+    }
+
+    #[test]
+    fn an_active_thread_with_older_archived_messages_is_not_restorable() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (_, thread) = ingest(&store, mailbox.id, &raw_mail("Plan", "a1", "x"), "owner/a1");
+        {
+            let conn = store.lock_conn().unwrap();
+            mail_store::archive_threads(&conn, &[thread], 5).unwrap();
+        }
+        // A genuinely new message reactivates the thread and keeps the old one;
+        // the sync does the reactivation right after ingesting.
+        let (_, same) = ingest(
+            &store,
+            mailbox.id,
+            &reply_mail("Re: Plan", "a2", "a1"),
+            "owner/a2",
+        );
+        assert_eq!(same, thread);
+        mail_store::reactivate_thread(&store.lock_conn().unwrap(), thread).unwrap();
+        let detail = thread_detail(&store, thread).unwrap();
+        let mut states: Vec<_> = detail.messages.iter().map(|m| m.state.as_str()).collect();
+        states.sort();
+        assert_eq!(states, ["active", "archived"]);
+        assert!(!detail.restorable);
+        let conn = store.lock_conn().unwrap();
+        assert_eq!(mail_store::unarchive_threads(&conn, &[thread]).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_disabled_source_s_archived_mail_is_not_in_the_archive() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (_, thread) = ingest(&store, mailbox.id, &raw_mail("File", "f1", "y"), "owner/f1");
+        let conn = store.lock_conn().unwrap();
+        mail_store::archive_threads(&conn, &[thread], 5).unwrap();
+        assert_eq!(
+            list_ids(&conn, ThreadScope::Archived, None, None).0,
+            [thread]
+        );
+        conn.execute("UPDATE mail_account SET enabled = 0", [])
+            .unwrap();
+        assert!(list_ids(&conn, ThreadScope::Archived, None, None)
+            .0
+            .is_empty());
+        conn.execute("UPDATE mail_account SET enabled = 1", [])
+            .unwrap();
+        assert_eq!(
+            list_ids(&conn, ThreadScope::Archived, None, None).0,
+            [thread]
+        );
     }
 
     #[test]

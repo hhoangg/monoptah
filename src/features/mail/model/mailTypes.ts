@@ -381,6 +381,8 @@ export type MessageRow = {
 export type ThreadDetail = {
   thread: ThreadRow;
   imagePolicy: ImagePolicy;
+  /** Whether "Move to inbox" would work; the backend's own test, not to be re-derived from message states. */
+  restorable: boolean;
   messages: MessageRow[];
 };
 

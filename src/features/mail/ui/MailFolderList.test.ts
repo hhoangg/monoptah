@@ -249,9 +249,10 @@ it("offers the Archive view without a badge, and All mail is not selected in it"
     onSelectArchive,
   };
   act(() => root.render(createElement(MailFolderList, props)));
-  const archive = [...container.querySelectorAll("button")].find(
-    (b) => b.textContent === "Archive",
+  const archive = [...container.querySelectorAll("button")].find((b) =>
+    b.textContent?.startsWith("Archive"),
   )!;
+  expect(archive.textContent).toBe("Archive");
   expect(archive.querySelector("span.rounded-full")).toBeNull();
   act(() => archive.click());
   expect(onSelectArchive).toHaveBeenCalledOnce();
@@ -261,5 +262,6 @@ it("offers the Archive view without a badge, and All mail is not selected in it"
     ),
   );
   const current = [...container.querySelectorAll("[aria-current='true']")];
-  expect(current.map((b) => b.textContent)).toEqual(["Archive"]);
+  expect(current).toHaveLength(1);
+  expect(current[0].textContent?.startsWith("Archive")).toBe(true);
 });

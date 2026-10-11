@@ -1748,24 +1748,31 @@ pub(crate) fn archive_threads(
     tx.commit()
 }
 
+/// Whether [`unarchive_threads`] would move this thread. The one definition,
+/// read by the restore itself and by the reader's "Move to inbox", so the
+/// button cannot offer what the write refuses. Only a thread the user archived
+/// qualifies: `archived` itself and an `archived` message. One the sync
+/// archived (every message `gone`) would come back with nothing to list and an
+/// unread count nobody can clear.
+pub(crate) fn is_restorable(conn: &Connection, thread_id: i64) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM mail_thread t WHERE t.id = ?1 AND t.state = 'archived'
+                          AND EXISTS (SELECT 1 FROM mail_message m
+                                      WHERE m.thread_id = t.id AND m.state = 'archived'))",
+        params![thread_id],
+        |row| row.get(0),
+    )
+}
+
 /// Puts archived threads back in the inbox. Archiving wrote both tables, so
 /// this writes both: `reactivate_thread` alone flips the thread and leaves its
-/// messages `archived`, which lists as an empty thread. Only a thread with an
-/// `archived` message qualifies; one the sync archived (every message `gone`)
-/// would come back with nothing to list and an unread count nobody can clear.
-/// Returns how many threads moved.
+/// messages `archived`, which lists as an empty thread. Returns how many
+/// threads moved; a thread [`is_restorable`] refuses is skipped, not an error.
 pub(crate) fn unarchive_threads(conn: &Connection, thread_ids: &[i64]) -> rusqlite::Result<usize> {
     let tx = conn.unchecked_transaction()?;
     let mut moved = 0;
     for id in thread_ids {
-        let restorable: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM mail_thread t WHERE t.id = ?1 AND t.state = 'archived'
-                              AND EXISTS (SELECT 1 FROM mail_message m
-                                          WHERE m.thread_id = t.id AND m.state = 'archived'))",
-            params![id],
-            |row| row.get(0),
-        )?;
-        if !restorable {
+        if !is_restorable(&tx, *id)? {
             continue;
         }
         tx.execute(
@@ -2246,6 +2253,11 @@ pub struct ThreadDetail {
     pub thread: ThreadRow,
     /// `ask | always | never`, from the thread's source.
     pub image_policy: String,
+    /// Whether "Move to inbox" would work. Derived by the same test the restore
+    /// applies, because the thread's own state is not inferable from its
+    /// messages: a revived message leaves an archived thread with an active one,
+    /// and a new message leaves an active thread with archived ones.
+    pub restorable: bool,
     pub messages: Vec<MessageRow>,
 }
 
@@ -2347,9 +2359,11 @@ pub(crate) fn thread_detail(
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
+    let restorable = is_restorable(conn, thread_id)?;
     Ok(Some(ThreadDetail {
         thread,
         image_policy,
+        restorable,
         messages,
     }))
 }
