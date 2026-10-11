@@ -2679,7 +2679,10 @@ mod tests {
         // A symlinked file is unlinked, and what it points at is left alone.
         std::os::unix::fs::symlink(&victim, dir.join("shortcut.pdf")).unwrap();
         let shortcut = dir.join("shortcut.pdf").to_string_lossy().into_owned();
-        assert_eq!(release_staged(&w.store, &dir, &Releasable(vec![shortcut])), 1);
+        assert_eq!(
+            release_staged(&w.store, &dir, &Releasable(vec![shortcut])),
+            1
+        );
         assert!(!dir.join("shortcut.pdf").exists());
         assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
         std::fs::remove_dir_all(root).unwrap();

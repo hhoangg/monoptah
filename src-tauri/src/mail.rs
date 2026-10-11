@@ -1683,6 +1683,61 @@ pub async fn mail_delete(
 /// reload of itself.
 pub(crate) const OUTBOX_CHANGED_EVENT: &str = "mail://outbox-changed";
 
+/// What the outbox commands tell the rest of the app. A trait, like
+/// `mail_sync::SyncEvents`, so a test can record the emits: an `AppHandle`
+/// cannot be built outside a running app, and without this deleting an emit
+/// would leave every test green.
+pub(crate) trait OutboxEvents: Send + Sync {
+    fn messages_changed(&self);
+    fn outbox_changed(&self);
+}
+
+impl OutboxEvents for mail_sync::TauriEvents {
+    fn messages_changed(&self) {
+        let _ = self.0.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    }
+
+    fn outbox_changed(&self) {
+        let _ = self.0.emit(OUTBOX_CHANGED_EVENT, ());
+    }
+}
+
+/// Runs the send, then announces it. The announcement is unconditional: the
+/// row's state changed whether the send succeeded or failed.
+async fn announce_after_send<T>(
+    events: &dyn OutboxEvents,
+    send: impl std::future::Future<Output = T>,
+) -> T {
+    let report = send.await;
+    events.messages_changed();
+    events.outbox_changed();
+    report
+}
+
+/// Announces only on success: a refused re-arm changed nothing.
+fn rearm_and_announce(
+    events: &dyn OutboxEvents,
+    store: &SessionStore,
+    id: i64,
+) -> Result<(), String> {
+    mail_send::outbox_rearm(store, id)?;
+    events.messages_changed();
+    events.outbox_changed();
+    Ok(())
+}
+
+fn delete_and_announce(
+    events: &dyn OutboxEvents,
+    store: &SessionStore,
+    staging: &std::path::Path,
+    id: i64,
+) -> Result<(), String> {
+    let result = mail_send::outbox_delete_releasing(store, staging, id);
+    // Also after a refusal: the list may be showing a row that already moved on.
+    events.outbox_changed();
+    result
+}
+
 #[tauri::command(async)]
 pub fn mail_outbox_save(
     app: AppHandle,
@@ -1710,16 +1765,16 @@ pub async fn mail_outbox_send(
     app: AppHandle,
     id: i64,
 ) -> Result<mail_send::SendReport, mail_send::SendError> {
-    let report = blocking_with(
-        app.clone(),
-        move |store, mail| mail_send::outbox_send(store, &*mail.clients, id),
-        mail_send::SendError::unknown,
+    let events = mail_sync::TauriEvents(app.clone());
+    announce_after_send(
+        &events,
+        blocking_with(
+            app,
+            move |store, mail| mail_send::outbox_send(store, &*mail.clients, id),
+            mail_send::SendError::unknown,
+        ),
     )
-    .await;
-    // Also after an error: the row's state changed either way.
-    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
-    let _ = app.emit(OUTBOX_CHANGED_EVENT, ());
-    report
+    .await
 }
 
 /// What would make SES refuse this message, found without sending it.
@@ -1742,10 +1797,7 @@ pub fn mail_outbox_rearm(
     store: State<'_, SessionStore>,
     id: i64,
 ) -> Result<(), String> {
-    mail_send::outbox_rearm(&store, id)?;
-    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
-    let _ = app.emit(OUTBOX_CHANGED_EVENT, ());
-    Ok(())
+    rearm_and_announce(&mail_sync::TauriEvents(app), &store, id)
 }
 
 #[tauri::command(async)]
@@ -1762,10 +1814,7 @@ pub fn mail_outbox_delete(
     id: i64,
 ) -> Result<(), String> {
     let staging = mail_send::staging_dir(&attachments_root(&app)?);
-    let result = mail_send::outbox_delete_releasing(&store, &staging, id);
-    // Also after a refusal: the list may be showing a row that already moved on.
-    let _ = app.emit(OUTBOX_CHANGED_EVENT, ());
-    result
+    delete_and_announce(&mail_sync::TauriEvents(app), &store, &staging, id)
 }
 
 /// Gives a pasted or dropped file a path for a mail draft. Not
@@ -2083,6 +2132,97 @@ mod tests {
             SessionStore::open_in_memory().unwrap(),
             MemSecrets::default(),
         )
+    }
+
+    #[derive(Default)]
+    struct Emits(Mutex<Vec<&'static str>>);
+
+    impl OutboxEvents for Emits {
+        fn messages_changed(&self) {
+            self.0.lock().unwrap().push("messages");
+        }
+        fn outbox_changed(&self) {
+            self.0.lock().unwrap().push("outbox");
+        }
+    }
+
+    impl Emits {
+        fn seen(&self) -> Vec<&'static str> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn outbox_row_in(store: &SessionStore, secrets: &MemSecrets, state: &str) -> i64 {
+        let (_, mailbox) = one_source(store, secrets);
+        let id = mail_send::outbox_save(
+            store,
+            mail_send::OutboxDraft {
+                id: None,
+                kind: "new".into(),
+                from_addr: mailbox.address.clone(),
+                reply_to_message_id: None,
+                to: vec![mail_store::Recipient {
+                    name: None,
+                    addr: "ann@example.org".into(),
+                }],
+                cc: vec![],
+                bcc: vec![],
+                subject: "Hello".into(),
+                body_json: None,
+                body_text: Some("hi".into()),
+                body_html: None,
+                quoted_html: None,
+                attachments: vec![],
+            },
+        )
+        .unwrap();
+        store
+            .lock_conn()
+            .unwrap()
+            .execute("UPDATE mail_outbox SET state = ?1", [state])
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn a_send_announces_the_outbox_and_the_mail_whether_it_worked_or_not() {
+        for outcome in [Ok(()), Err("boom")] {
+            let events = Emits::default();
+            let got =
+                tauri::async_runtime::block_on(announce_after_send(&events, async { outcome }));
+            assert_eq!(got, outcome);
+            assert_eq!(events.seen(), ["messages", "outbox"]);
+        }
+    }
+
+    #[test]
+    fn a_rearm_announces_only_when_it_took_effect() {
+        let (store, secrets) = setup();
+        let id = outbox_row_in(&store, &secrets, "unconfirmed");
+        let events = Emits::default();
+        rearm_and_announce(&events, &store, id).unwrap();
+        assert_eq!(events.seen(), ["messages", "outbox"]);
+
+        // It is a draft now, so a second re-arm is refused and says nothing.
+        let quiet = Emits::default();
+        assert!(rearm_and_announce(&quiet, &store, id).is_err());
+        assert!(quiet.seen().is_empty());
+    }
+
+    #[test]
+    fn a_delete_announces_the_outbox_also_when_it_is_refused() {
+        let (store, secrets) = setup();
+        let scratch = std::env::temp_dir().join("mono-mail-emits-unused");
+        let id = outbox_row_in(&store, &secrets, "draft");
+        let events = Emits::default();
+        delete_and_announce(&events, &store, &scratch, id).unwrap();
+        assert_eq!(events.seen(), ["outbox"]);
+
+        let (store, secrets) = setup();
+        let id = outbox_row_in(&store, &secrets, "sending");
+        let refused = Emits::default();
+        assert!(delete_and_announce(&refused, &store, &scratch, id).is_err());
+        assert_eq!(refused.seen(), ["outbox"]);
     }
 
     fn raw_mail(subject: &str, id: &str, body: &str) -> Vec<u8> {
