@@ -407,7 +407,15 @@ CREATE TABLE IF NOT EXISTS mail_message (
   body_html_raw_key TEXT,                    -- NULL; raw stays in S3
   has_attachments INTEGER NOT NULL DEFAULT 0,
   size_bytes      INTEGER,
-  spf             TEXT, dkim TEXT, dmarc TEXT,   -- 'pass' | 'fail' | NULL
+  spf             TEXT, dkim TEXT, dmarc TEXT,   -- verdict as written, or NULL
+                                                 -- 'pass' | 'fail' | 'softfail' |
+                                                 -- 'neutral' | 'permerror' | …;
+                                                 -- 'none' is stored as NULL. Kept
+                                                 -- raw because a softfail badge is
+                                                 -- more honest than calling it fail.
+                                                 -- Only the topmost
+                                                 -- Authentication-Results header is
+                                                 -- read: a lower one is the sender's.
   headers_json    TEXT,                      -- full header list for the raw view
   is_read         INTEGER NOT NULL DEFAULT 0,
   is_starred      INTEGER NOT NULL DEFAULT 0,
