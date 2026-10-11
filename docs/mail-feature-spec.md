@@ -360,6 +360,17 @@ CREATE TABLE IF NOT EXISTS mail_object (
                                              -- s3_modified feeds date_utc, which
                                              -- is seconds. Never compare across.
   state        TEXT NOT NULL,                -- pending | parsed | gone | error
+                                             -- | deleted. `deleted` is a
+                                             -- tombstone for a confirmed hard
+                                             -- delete: `gone` gets re-ingested
+                                             -- on the next listing and `parsed`
+                                             -- gets flipped to `gone`, so
+                                             -- neither can hold the line while
+                                             -- S3's listing is still catching
+                                             -- up. Its cost is that an object
+                                             -- S3 reported deleted but kept
+                                             -- becomes invisible to us while
+                                             -- still sitting in the bucket.
   parse_error  TEXT,
   parse_attempts INTEGER NOT NULL DEFAULT 0, -- §5 step 4 caps retries at 3
 
