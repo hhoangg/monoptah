@@ -1659,6 +1659,21 @@ pub fn mail_archive(
     Ok(())
 }
 
+/// Undoes `mail_archive`. Local only, like it.
+#[tauri::command(async)]
+pub fn mail_unarchive(
+    app: AppHandle,
+    store: State<'_, SessionStore>,
+    thread_ids: Vec<i64>,
+) -> Result<(), String> {
+    {
+        let conn = store.lock_conn()?;
+        mail_store::unarchive_threads(&conn, &thread_ids).map_err(db)?;
+    }
+    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
+    Ok(())
+}
+
 /// `hard: false` is `mail_archive`. `hard: true` deletes on S3 first; the
 /// result says what S3 refused, and the webview must show it.
 #[tauri::command]
@@ -2707,6 +2722,140 @@ mod tests {
             .len(),
             2
         );
+    }
+
+    fn list_ids(
+        conn: &rusqlite::Connection,
+        scope: ThreadScope,
+        limit: Option<u32>,
+        cursor: Option<ThreadCursor>,
+    ) -> (Vec<i64>, Option<ThreadCursor>) {
+        let page = mail_store::list_threads(
+            conn,
+            &ThreadQuery {
+                scope,
+                cursor,
+                limit,
+            },
+        )
+        .unwrap();
+        (page.rows.iter().map(|t| t.id).collect(), page.next_cursor)
+    }
+
+    #[test]
+    fn archived_thread_moves_between_inbox_and_archive_with_its_messages() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (_, kept) = ingest(&store, mailbox.id, &raw_mail("Keep", "k1", "x"), "owner/k1");
+        let (_, filed) = ingest(&store, mailbox.id, &raw_mail("File", "f1", "y"), "owner/f1");
+        let conn = store.lock_conn().unwrap();
+        mail_store::archive_threads(&conn, &[filed], 5).unwrap();
+
+        assert_eq!(list_ids(&conn, ThreadScope::All, None, None).0, [kept]);
+        let (in_archive, _) = list_ids(&conn, ThreadScope::Archived, None, None);
+        assert_eq!(in_archive, [filed]);
+        // The archive row still reads: its snippet comes from an archived message.
+        let page = mail_store::list_threads(
+            &conn,
+            &ThreadQuery {
+                scope: ThreadScope::Archived,
+                cursor: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(page.rows[0].snippet, "y");
+
+        assert_eq!(mail_store::unarchive_threads(&conn, &[filed]).unwrap(), 1);
+        let (in_inbox, _) = list_ids(&conn, ThreadScope::All, None, None);
+        assert!(in_inbox.contains(&filed) && in_inbox.contains(&kept));
+        assert!(list_ids(&conn, ThreadScope::Archived, None, None)
+            .0
+            .is_empty());
+        drop(conn);
+        let detail = thread_detail(&store, filed).unwrap();
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].state, "active");
+        assert_eq!(
+            detail.messages[0].body_text.as_deref().map(str::trim),
+            Some("y")
+        );
+    }
+
+    #[test]
+    fn a_gone_thread_is_in_neither_the_inbox_nor_the_archive_and_cannot_be_restored() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (_, thread) = ingest(&store, mailbox.id, &raw_mail("Gone", "g1", "x"), "owner/g1");
+        let conn = store.lock_conn().unwrap();
+        // What the sync leaves behind when every object vanished.
+        conn.execute(
+            "UPDATE mail_message SET state = 'gone' WHERE thread_id = ?1",
+            [thread],
+        )
+        .unwrap();
+        conn.execute("UPDATE mail_thread SET state = 'archived'", [])
+            .unwrap();
+        assert!(list_ids(&conn, ThreadScope::All, None, None).0.is_empty());
+        assert!(list_ids(&conn, ThreadScope::Archived, None, None)
+            .0
+            .is_empty());
+        assert_eq!(mail_store::unarchive_threads(&conn, &[thread]).unwrap(), 0);
+        let state: String = conn
+            .query_row("SELECT state FROM mail_thread", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "archived");
+    }
+
+    #[test]
+    fn the_archive_pages_by_cursor_without_repeating_or_skipping() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let raw = raw_mail(&format!("S{i}"), &format!("p{i}"), "x");
+            ids.push(ingest(&store, mailbox.id, &raw, &format!("owner/p{i}")).1);
+        }
+        let conn = store.lock_conn().unwrap();
+        mail_store::archive_threads(&conn, &ids, 5).unwrap();
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        // Bounded: a cursor that does not advance must fail, not hang.
+        for _ in 0..ids.len() + 2 {
+            let (page, next) = list_ids(&conn, ThreadScope::Archived, Some(1), cursor);
+            seen.extend(page);
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        assert!(cursor.is_none() || seen.len() <= ids.len());
+        seen.sort();
+        assert_eq!(seen, ids);
+    }
+
+    #[test]
+    fn archived_unread_mail_is_not_in_the_rail_badge_and_comes_back_with_the_thread() {
+        let (store, secrets) = setup();
+        let (_, mailbox) = one_source(&store, &secrets);
+        let (_, thread) = ingest(&store, mailbox.id, &raw_mail("U", "u1", "x"), "owner/u1");
+        let conn = store.lock_conn().unwrap();
+        let badge = |conn: &rusqlite::Connection| {
+            mail_store::unread_by_mailbox(conn)
+                .unwrap()
+                .get(&mailbox.id)
+                .copied()
+                .unwrap_or(0)
+        };
+        assert_eq!(badge(&conn), 1);
+        mail_store::archive_threads(&conn, &[thread], 5).unwrap();
+        assert_eq!(badge(&conn), 0);
+        // Opening it in the archive still clears it for good.
+        mail_store::set_threads_read(&conn, &[thread], true).unwrap();
+        mail_store::unarchive_threads(&conn, &[thread]).unwrap();
+        assert_eq!(badge(&conn), 0);
+        mail_store::set_threads_read(&conn, &[thread], false).unwrap();
+        assert_eq!(badge(&conn), 1);
     }
 
     #[test]

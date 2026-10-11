@@ -373,6 +373,7 @@ pub fn run() {
             mail::mail_mark,
             mail::mail_star,
             mail::mail_archive,
+            mail::mail_unarchive,
             mail::mail_delete,
             mail::mail_attachment_open,
             mail::mail_attachment_bytes,

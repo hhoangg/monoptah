@@ -1748,6 +1748,39 @@ pub(crate) fn archive_threads(
     tx.commit()
 }
 
+/// Puts archived threads back in the inbox. Archiving wrote both tables, so
+/// this writes both: `reactivate_thread` alone flips the thread and leaves its
+/// messages `archived`, which lists as an empty thread. Only a thread with an
+/// `archived` message qualifies; one the sync archived (every message `gone`)
+/// would come back with nothing to list and an unread count nobody can clear.
+/// Returns how many threads moved.
+pub(crate) fn unarchive_threads(conn: &Connection, thread_ids: &[i64]) -> rusqlite::Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let mut moved = 0;
+    for id in thread_ids {
+        let restorable: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM mail_thread t WHERE t.id = ?1 AND t.state = 'archived'
+                              AND EXISTS (SELECT 1 FROM mail_message m
+                                          WHERE m.thread_id = t.id AND m.state = 'archived'))",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if !restorable {
+            continue;
+        }
+        tx.execute(
+            "UPDATE mail_message SET state = 'active'
+             WHERE thread_id = ?1 AND state = 'archived'",
+            params![id],
+        )?;
+        reactivate_thread(&tx, *id)?;
+        reevaluate_thread(&tx, *id)?;
+        moved += 1;
+    }
+    tx.commit()?;
+    Ok(moved)
+}
+
 pub(crate) fn message_ids_in_threads(
     conn: &Connection,
     thread_ids: &[i64],
@@ -1924,6 +1957,9 @@ pub enum ThreadScope {
     /// A smart folder's materialised members.
     #[serde(rename_all = "camelCase")]
     Folder { folder_id: i64 },
+    /// What the user archived, across enabled sources. Not a smart folder: it
+    /// has no rules and nothing is stored for it.
+    Archived,
     /// Filter chips or the search box, not saved. Empty rules list everything.
     #[serde(rename_all = "camelCase")]
     Rules {
@@ -1982,8 +2018,8 @@ pub struct ThreadRow {
 const THREAD_SELECT: &str = "SELECT t.id, t.account_id, t.mailbox_id, b.address, b.domain,
        t.subject,
        COALESCE((SELECT m.snippet FROM mail_message m
-                 WHERE m.thread_id = t.id AND m.state = 'active'
-                 ORDER BY m.date_utc DESC, m.id DESC LIMIT 1), ''),
+                 WHERE m.thread_id = t.id AND m.state != 'gone'
+                 ORDER BY m.state = 'active' DESC, m.date_utc DESC, m.id DESC LIMIT 1), ''),
        t.participants_json, t.first_message_at, t.last_message_at, t.message_count,
        t.unread_count, t.has_attachments, t.is_starred
      FROM mail_thread t
@@ -2017,6 +2053,12 @@ fn thread_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
 /// from reappearing in a folder view.
 const LISTED: &str = "t.state = 'active'
            AND EXISTS (SELECT 1 FROM mail_message m WHERE m.thread_id = t.id AND m.state = 'active')";
+
+/// The Archive view's visibility test. An `archived` message is what tells a
+/// thread the user archived from one the sync archived because every message
+/// went `gone`; only the former may be listed or restored.
+const ARCHIVED_LISTED: &str = "t.state = 'archived'
+           AND EXISTS (SELECT 1 FROM mail_message m WHERE m.thread_id = t.id AND m.state = 'archived')";
 
 /// Operators whose answer depends on the clock. The one list for both places
 /// that must treat such a rule specially: [`time_relative_folder`] and
@@ -2072,6 +2114,7 @@ fn scope_filter(
                 vec![(*folder_id).into()],
             ),
         },
+        ThreadScope::Archived => ("a.enabled = 1".to_string(), Vec::new()),
         ThreadScope::Rules { rules, match_mode } => match compile_rules(rules, *match_mode, now)? {
             Some(c) => (format!("a.enabled = 1 AND {}", c.sql), c.params),
             None => ("a.enabled = 1".to_string(), Vec::new()),
@@ -2085,7 +2128,11 @@ fn listing_conditions(
     now: i64,
 ) -> rusqlite::Result<(String, Vec<rusqlite::types::Value>)> {
     let (scope_sql, values) = scope_filter(conn, scope, now)?;
-    Ok((format!("{LISTED} AND {scope_sql}"), values))
+    let visible = match scope {
+        ThreadScope::Archived => ARCHIVED_LISTED,
+        _ => LISTED,
+    };
+    Ok((format!("{visible} AND {scope_sql}"), values))
 }
 
 /// How many threads a listing of `scope` holds across all its pages.
