@@ -67,8 +67,9 @@ impl SyncEvents for TauriEvents {
         let _ = self.0.emit(SYNC_STATE_EVENT, event);
     }
 
-    fn messages_changed(&self, account_id: i64) {
-        let _ = self.0.emit(MESSAGES_CHANGED_EVENT, account_id);
+    fn messages_changed(&self, _account_id: i64) {
+        // No payload, like the two commands that emit it: nobody reads one.
+        let _ = self.0.emit(MESSAGES_CHANGED_EVENT, ());
     }
 }
 

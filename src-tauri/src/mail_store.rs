@@ -1783,6 +1783,7 @@ const NOT_FILED_AWAY: &str = "NOT EXISTS (SELECT 1 FROM mail_folder_member fm
 
 /// A SQL condition on `t`, `b` and `a` plus its parameters.
 fn scope_filter(
+    conn: &Connection,
     scope: &ThreadScope,
     now: i64,
 ) -> rusqlite::Result<(String, Vec<rusqlite::types::Value>)> {
@@ -1792,12 +1793,21 @@ fn scope_filter(
             format!("t.mailbox_id = ? AND {NOT_FILED_AWAY}"),
             vec![(*mailbox_id).into()],
         ),
-        ThreadScope::Folder { folder_id } => (
-            "a.enabled = 1 AND t.id IN
-               (SELECT thread_id FROM mail_folder_member WHERE folder_id = ?)"
-                .to_string(),
-            vec![(*folder_id).into()],
-        ),
+        ThreadScope::Folder { folder_id } => match time_relative_folder(conn, *folder_id)? {
+            // "Last 7 days" is only true now, so a stored member list would go
+            // stale unseen. Compile the rules instead; the member table stays
+            // the cheap path for every other folder.
+            Some((rules, mode)) => match compile_rules(&rules, mode, now)? {
+                Some(c) => (format!("a.enabled = 1 AND {}", c.sql), c.params),
+                None => ("0".to_string(), Vec::new()),
+            },
+            None => (
+                "a.enabled = 1 AND t.id IN
+                   (SELECT thread_id FROM mail_folder_member WHERE folder_id = ?)"
+                    .to_string(),
+                vec![(*folder_id).into()],
+            ),
+        },
         ThreadScope::Rules { rules, match_mode } => match compile_rules(rules, *match_mode, now)? {
             Some(c) => (format!("a.enabled = 1 AND {}", c.sql), c.params),
             None => ("a.enabled = 1".to_string(), Vec::new()),
@@ -1806,25 +1816,31 @@ fn scope_filter(
 }
 
 fn listing_conditions(
+    conn: &Connection,
     scope: &ThreadScope,
     now: i64,
 ) -> rusqlite::Result<(String, Vec<rusqlite::types::Value>)> {
-    let (scope_sql, values) = scope_filter(scope, now)?;
+    let (scope_sql, values) = scope_filter(conn, scope, now)?;
     Ok((format!("{LISTED} AND {scope_sql}"), values))
 }
 
 /// How many threads a listing of `scope` holds across all its pages.
 pub(crate) fn count_threads(conn: &Connection, scope: &ThreadScope) -> rusqlite::Result<i64> {
-    let (cond, values) = listing_conditions(scope, now_millis() / 1000)?;
+    Ok(scope_totals(conn, scope)?.0)
+}
+
+/// `(threads, unread messages)` of a listing, from the listing's own condition.
+fn scope_totals(conn: &Connection, scope: &ThreadScope) -> rusqlite::Result<(i64, i64)> {
+    let (cond, values) = listing_conditions(conn, scope, now_millis() / 1000)?;
     conn.query_row(
         &format!(
-            "SELECT COUNT(*) FROM mail_thread t
+            "SELECT COUNT(*), COALESCE(SUM(t.unread_count), 0) FROM mail_thread t
              JOIN mail_mailbox b ON b.id = t.mailbox_id
              JOIN mail_account a ON a.id = t.account_id
              WHERE {cond}"
         ),
         rusqlite::params_from_iter(values),
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )
 }
 
@@ -1838,7 +1854,7 @@ pub(crate) fn list_threads(
 ) -> rusqlite::Result<Page<ThreadRow>> {
     use rusqlite::types::Value;
     let limit = query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
-    let (cond, mut values) = listing_conditions(&query.scope, now_millis() / 1000)?;
+    let (cond, mut values) = listing_conditions(conn, &query.scope, now_millis() / 1000)?;
     let mut sql = format!("{THREAD_SELECT} WHERE {cond}");
     if let Some(cursor) = query.cursor {
         sql.push_str(" AND (t.last_message_at < ? OR (t.last_message_at = ? AND t.id < ?))");
@@ -2175,8 +2191,18 @@ const TEXT_OPS: &[&str] = &[
     "ends_with",
     "matches",
 ];
-const FTS_OPS: &[&str] = &["contains", "contains_any"];
+const SUBJECT_OPS: &[&str] = &[
+    "is",
+    "contains",
+    "contains_prefix",
+    "contains_any",
+    "starts_with",
+    "ends_with",
+    "matches",
+];
+const FTS_OPS: &[&str] = &["contains", "contains_prefix", "contains_any"];
 const SCOPE_OPS: &[&str] = &["is", "contains_any"];
+const NAME_OPS: &[&str] = &["is", "contains", "contains_any"];
 const FLAG_OPS: &[&str] = &["true"];
 const DATE_OPS: &[&str] = &["before", "after", "within_days"];
 const MAX_LIST_VALUES: usize = 100;
@@ -2185,9 +2211,11 @@ const MAX_RULES: usize = 50;
 /// Every field and the operators that mean something on it.
 pub(crate) fn allowed_ops(field: &str) -> Option<&'static [&'static str]> {
     Some(match field {
-        "from" | "to" | "cc" | "recipient" | "subject" => TEXT_OPS,
+        "from" | "to" | "cc" | "recipient" => TEXT_OPS,
+        "subject" => SUBJECT_OPS,
         "body" => FTS_OPS,
-        "mailbox" | "domain" | "account" => SCOPE_OPS,
+        "mailbox" => SCOPE_OPS,
+        "domain" | "account" => NAME_OPS,
         "has_attachment" | "is_unread" | "is_starred" => FLAG_OPS,
         "date" => DATE_OPS,
         _ => return None,
@@ -2348,16 +2376,29 @@ fn address_term(
 
 /// FTS5 phrase for `text`: quoted, so `*`, `-`, `:`, `OR` and the like are
 /// words and cannot change the query's shape. Folded like the index.
-fn fts_phrase(text: &str) -> Option<String> {
+/// With `prefix`, the last token also matches as a prefix (`"inv" *`), which
+/// FTS5 does without a `prefix=` option. A one or two character prefix walks a
+/// wide slice of the term index, so the caller must debounce and set a minimum
+/// length before using `contains_prefix` as-you-type.
+fn fts_phrase(text: &str, prefix: bool) -> Option<String> {
     let folded = fold_fts(text);
     if !folded.chars().any(char::is_alphanumeric) {
         return None;
     }
-    Some(format!("\"{}\"", folded.replace('"', "\"\"")))
+    let star = if prefix { " *" } else { "" };
+    Some(format!("\"{}\"{star}", folded.replace('"', "\"\"")))
 }
 
-fn fts_term(column: &str, values: &[String], params: &mut Vec<rusqlite::types::Value>) -> String {
-    let phrases: Vec<String> = values.iter().filter_map(|v| fts_phrase(v)).collect();
+fn fts_term(
+    column: &str,
+    values: &[String],
+    prefix: bool,
+    params: &mut Vec<rusqlite::types::Value>,
+) -> String {
+    let phrases: Vec<String> = values
+        .iter()
+        .filter_map(|v| fts_phrase(v, prefix))
+        .collect();
     if phrases.is_empty() {
         // Nothing the index could hold, so nothing matches.
         return "0".to_string();
@@ -2417,6 +2458,7 @@ fn compile_rule(
     // `contains_any` is `contains` over a list, joined with OR.
     let (op, values) = match op {
         "contains_any" => ("contains", list_value(rule)?),
+        "contains_prefix" => ("contains_prefix", vec![scalar_value(rule)?]),
         "true" | "before" | "after" | "within_days" => ("", Vec::new()),
         _ => (op, vec![scalar_value(rule)?]),
     };
@@ -2446,7 +2488,9 @@ fn compile_rule(
                     .collect(),
             ))
         }
-        "subject" | "body" if op == "contains" => any_message(&fts_term(field, &values, params)),
+        "subject" | "body" if op == "contains" || op == "contains_prefix" => {
+            any_message(&fts_term(field, &values, op == "contains_prefix", params))
+        }
         "subject" => any_message(&or_all(
             values
                 .iter()
@@ -2459,10 +2503,30 @@ fn compile_rule(
                 .map(|v| id_or_name("t.mailbox_id", "mail_mailbox", "address", v, params))
                 .collect(),
         ),
+        "account" if rule.op == "contains" => or_all(
+            values
+                .iter()
+                .map(|v| {
+                    let like = text_term("label", "contains", v, params);
+                    format!("t.account_id IN (SELECT id FROM mail_account WHERE {like})")
+                })
+                .collect(),
+        ),
         "account" => or_all(
             values
                 .iter()
                 .map(|v| id_or_name("t.account_id", "mail_account", "label", v, params))
+                .collect(),
+        ),
+        // `contains_any` stays exact-any, like `mailbox`; only `contains` is a
+        // substring.
+        "domain" if rule.op == "contains" => or_all(
+            values
+                .iter()
+                .map(|v| {
+                    let wanted = v.trim().trim_start_matches('@').to_ascii_lowercase();
+                    text_term("b.domain", "contains", &wanted, params)
+                })
                 .collect(),
         ),
         "domain" => or_all(
@@ -2479,8 +2543,7 @@ fn compile_rule(
         "has_attachment" => "t.has_attachments = 1".to_string(),
         "is_unread" => "t.unread_count > 0".to_string(),
         "is_starred" => "t.is_starred = 1".to_string(),
-        _ => {
-            // date
+        "date" => {
             let raw = scalar_value(rule)?;
             match rule.op.as_str() {
                 "within_days" => {
@@ -2506,6 +2569,7 @@ fn compile_rule(
                 }
             }
         }
+        _ => unreachable!("allowed_ops admitted a field compile_rule has no arm for"),
     };
     Ok(if rule.negate {
         format!("(NOT ({clause}))")
@@ -2666,17 +2730,9 @@ fn load_folder(conn: &Connection, id: i64) -> rusqlite::Result<Option<FolderRow>
         return Ok(None);
     };
     folder.rules = folder_rules(conn, id)?;
-    // Counted like the listing: hidden and vanished threads do not count.
-    let (threads, unread) = conn.query_row(
-        &format!(
-            "SELECT COUNT(*), COALESCE(SUM(t.unread_count), 0) FROM mail_thread t
-             JOIN mail_account a ON a.id = t.account_id
-             WHERE {LISTED} AND a.enabled = 1
-               AND t.id IN (SELECT thread_id FROM mail_folder_member WHERE folder_id = ?1)"
-        ),
-        params![id],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-    )?;
+    // Counted by the listing's own condition, so a sidebar count cannot
+    // disagree with the folder it opens.
+    let (threads, unread) = scope_totals(conn, &ThreadScope::Folder { folder_id: id })?;
     folder.thread_count = threads;
     folder.unread_count = unread;
     Ok(Some(folder))
@@ -2801,6 +2857,28 @@ pub(crate) fn delete_folder(conn: &Connection, id: i64) -> rusqlite::Result<()> 
     // Rules and members go by cascade; no message is touched.
     conn.execute("DELETE FROM mail_folder WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+/// The folder's rules and mode when any of them is relative to the clock.
+fn time_relative_folder(
+    conn: &Connection,
+    folder_id: i64,
+) -> rusqlite::Result<Option<(Vec<Rule>, MatchMode)>> {
+    let mode: Option<String> = conn
+        .query_row(
+            "SELECT match_mode FROM mail_folder WHERE id = ?1",
+            params![folder_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(mode) = mode else {
+        return Ok(None);
+    };
+    let rules = folder_rules(conn, folder_id)?;
+    Ok(rules
+        .iter()
+        .any(|r| r.op == "within_days")
+        .then(|| (rules, folder_match_mode(&mode))))
 }
 
 /// A folder's compiled rules, or `None` when it has none (such a folder holds
@@ -3553,6 +3631,7 @@ mod tests {
             "is",
             "contains",
             "contains_any",
+            "contains_prefix",
             "starts_with",
             "ends_with",
             "matches",
@@ -3608,8 +3687,9 @@ mod tests {
                 }
             }
         }
-        // 5 text fields x 6, body 2, three scope fields x 2, three flags, date 3.
-        assert_eq!(valid, 5 * 6 + 2 + 3 * 2 + 3 + 3);
+        // from/to/cc/recipient 6 each, subject 7, body 3, mailbox 2,
+        // domain and account 3 each, three flags, date 3.
+        assert_eq!(valid, 4 * 6 + 7 + 3 + 2 + 3 + 3 + 3 + 3);
         assert!(allowed_ops("nonsense").is_none());
         let err = compile_rules(&[rule("nonsense", "is", s("x"))], MatchMode::All, 0).err();
         assert!(err.unwrap().to_string().contains("nonsense"));
@@ -3936,6 +4016,11 @@ mod tests {
             2
         );
         assert_eq!(find(rule("account", "is", s("alpha MAIL"))).len(), 2);
+        assert_eq!(find(rule("domain", "contains", s("THER"))), ["old"]);
+        assert_eq!(find(rule("domain", "contains", s("@example"))), ["recent"]);
+        assert!(find(rule("domain", "contains", s("%"))).is_empty());
+        assert_eq!(find(rule("account", "contains", s("lpha"))).len(), 2);
+        assert!(find(rule("account", "contains", s("_"))).is_empty());
         assert_eq!(find(rule("is_starred", "true", s(""))), ["old"]);
         assert_eq!(find(rule("is_unread", "true", s(""))).len(), 2);
         assert!(find(rule("has_attachment", "true", s(""))).is_empty());
@@ -4424,5 +4509,126 @@ mod tests {
         ));
         let scope: ThreadScope = serde_json::from_str(r#"{"kind":"folder","folderId":4}"#).unwrap();
         assert!(matches!(scope, ThreadScope::Folder { folder_id: 4 }));
+    }
+
+    #[test]
+    fn contains_prefix_finds_half_typed_words_and_contains_does_not() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "Đơn hàng invoice",
+                body: "Your invoicing statement",
+                ..Msg::default()
+            },
+        );
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "lunch",
+                ..Msg::default()
+            },
+        );
+        let find = |field: &str, op: &str, v: &str| {
+            list_rules(&conn, &[rule(field, op, s(v))], MatchMode::All).len()
+        };
+        for field in ["subject", "body"] {
+            assert_eq!(find(field, "contains", "invo"), 0, "{field}");
+            let word = if field == "subject" {
+                "invoi"
+            } else {
+                "invoic"
+            };
+            assert_eq!(find(field, "contains_prefix", word), 1, "{field}");
+            assert_eq!(find(field, "contains_prefix", "INVO"), 1, "{field}");
+            assert_eq!(find(field, "contains_prefix", "zzz"), 0, "{field}");
+        }
+        // Folded like the index, and only the last token is a prefix.
+        assert_eq!(find("subject", "contains_prefix", "đơ"), 1);
+        assert_eq!(find("subject", "contains_prefix", "đơn hàng inv"), 1);
+        assert_eq!(find("subject", "contains_prefix", "đ hàng inv"), 0);
+        // Operators inside the value stay words.
+        assert_eq!(find("subject", "contains_prefix", "inv*\" OR x"), 0);
+    }
+
+    #[test]
+    fn a_folder_with_a_relative_date_rule_is_judged_by_the_clock_not_by_stale_members() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        let now = now_millis() / 1000;
+        let day = 86_400;
+        let (m_recent, t_recent) = arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "recent",
+                date: now - day,
+                ..Msg::default()
+            },
+        );
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "old",
+                date: now - 30 * day,
+                ..Msg::default()
+            },
+        );
+        let week = upsert_folder(
+            &conn,
+            &folder("Week"),
+            &[rule("date", "within_days", serde_json::json!(7))],
+        )
+        .unwrap();
+        let plain = upsert_folder(
+            &conn,
+            &folder("Plain"),
+            &[rule("subject", "contains", s("recent"))],
+        )
+        .unwrap();
+        assert_eq!(folder_listing(&conn, week.id), ["recent"]);
+        assert_eq!(members(&conn, week.id), ["recent"]);
+
+        // A month passes: the stored member is now 30 days old, and nothing
+        // has touched the thread, so the member table still lists it.
+        conn.execute(
+            "UPDATE mail_message SET date_utc = ?2 WHERE id = ?1",
+            params![m_recent, now - 30 * day],
+        )
+        .unwrap();
+        assert_eq!(members(&conn, week.id), ["recent"]);
+        assert!(folder_listing(&conn, week.id).is_empty());
+        let row = list_folders(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == week.id)
+            .unwrap();
+        assert_eq!((row.thread_count, row.unread_count), (0, 0));
+        // The same rule typed into the box agrees with the folder.
+        let rules = [rule("date", "within_days", serde_json::json!(7))];
+        assert_eq!(
+            preview_rules(&conn, &rules, MatchMode::All).unwrap().count,
+            0
+        );
+
+        // A folder without a time rule still reads its members.
+        conn.execute(
+            "DELETE FROM mail_folder_member WHERE folder_id = ?1",
+            [plain.id],
+        )
+        .unwrap();
+        assert!(folder_listing(&conn, plain.id).is_empty());
+        conn.execute(
+            "INSERT INTO mail_folder_member VALUES (?1, ?2)",
+            [plain.id, t_recent],
+        )
+        .unwrap();
+        assert_eq!(folder_listing(&conn, plain.id), ["recent"]);
     }
 }
