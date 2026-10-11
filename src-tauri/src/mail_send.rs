@@ -218,20 +218,6 @@ pub(crate) fn outbox_list(store: &SessionStore) -> Result<Vec<OutboxRow>, String
     mail_store::list_outbox(&conn).map_err(db)
 }
 
-/// Test-only: production deletes go through [`outbox_delete_releasing`], which
-/// reads the row state under the same lock as the delete.
-#[cfg(test)]
-pub(crate) fn outbox_delete(store: &SessionStore, id: i64) -> Result<(), String> {
-    let conn = store.lock_conn()?;
-    if mail_store::delete_outbox(&conn, id).map_err(db)? {
-        return Ok(());
-    }
-    if mail_store::get_outbox(&conn, id).map_err(db)?.is_some() {
-        return Err("This message is being sent and cannot be deleted yet.".into());
-    }
-    Ok(())
-}
-
 /// The deliberate step out of `unconfirmed`. A save is not enough, because a
 /// composer saves on a timer.
 pub(crate) fn outbox_rearm(store: &SessionStore, id: i64) -> Result<(), String> {
@@ -284,11 +270,7 @@ fn file_key(path: &std::path::Path) -> Option<String> {
 /// not. A file the person picked from their own disk is outside `dir` and is
 /// never touched. Returns how many were removed; a failure is logged, since
 /// the caller cannot act on it but someone will want to diagnose the leak.
-pub(crate) fn release_staged(
-    store: &SessionStore,
-    dir: &std::path::Path,
-    paths: &[String],
-) -> usize {
+fn release_staged(store: &SessionStore, dir: &std::path::Path, paths: &Releasable) -> usize {
     let Ok(root) = dir.canonicalize() else {
         // Nothing was ever staged here.
         return 0;
@@ -297,7 +279,13 @@ pub(crate) fn release_staged(
     // the `still_used` snapshot would let a row that lists one of these files
     // be saved before the unlink, and that file would then be deleted out from
     // under it: a race traded for a latency win. The unlinks are local
-    // metadata operations on a handful of files, so the hold is short.
+    // metadata operations, so the hold is not free: `outbox_attachment_paths`
+    // has no LIMIT and includes sent rows, and each path costs a `canonicalize`
+    // and a `symlink_metadata`. That is two syscalls per attachment in the
+    // whole outbox, under the app-wide store mutex that every other feature
+    // also takes. Holding it is still right, because `conn` is the single write
+    // connection and the mutex is what serialises every writer against the
+    // unlink; the cost is latency, not correctness.
     let Ok(conn) = store.lock_conn() else {
         return 0;
     };
@@ -310,7 +298,7 @@ pub(crate) fn release_staged(
         .filter_map(|p| file_key(std::path::Path::new(p)))
         .collect();
     let mut removed = 0;
-    for p in paths {
+    for p in &paths.0 {
         let path = std::path::Path::new(p.as_str());
         if path
             .components()
@@ -354,19 +342,27 @@ pub(crate) fn release_staged(
 ///   is then the ONLY copy of the attachment (no S3 archive, no raw source, and
 ///   `ensure_attachment` needs an S3 object). A save of such a row is allowed
 ///   and keeps the edit, so the row can stop listing a file; releasing it then
-///   would destroy the evidence of what was sent. Kept files are not reclaimed
-///   later: they leak, by choice, since a leak is recoverable and a loss is not.
+///   would destroy the evidence of what was sent. Deleting such a row keeps
+///   its WHOLE attachment set the same way, not only the files a save dropped.
+///   Kept files are not reclaimed later: they leak, by choice, since a leak is
+///   recoverable and a loss is not, and a file nothing lists any more cannot be
+///   told apart from one that was never sent.
 ///
-/// Every release call site must take its paths from here, never from the row
-/// directly. The decision sits at the call sites and not in `release_staged`
-/// because that function only sees paths, and by the time it runs the row no
-/// longer lists them, so the state is the one thing it cannot recover.
-fn releasable_paths(row: &OutboxRow) -> Vec<String> {
+/// The state check cannot be skipped because this is the only way to build a
+/// [`Releasable`], and `release_staged` takes nothing else. It has to be a type:
+/// `release_staged` only sees paths, and by the time it runs the row no longer
+/// lists them, so the state is the one thing it cannot recover.
+fn releasable_paths(row: &OutboxRow) -> Releasable {
     if protects_staged_files(&row.state) {
-        return Vec::new();
+        return Releasable(Vec::new());
     }
-    row.attachments.iter().map(|a| a.path.clone()).collect()
+    Releasable(row.attachments.iter().map(|a| a.path.clone()).collect())
 }
+
+/// Staged paths that [`releasable_paths`] cleared for deletion. The field is
+/// private to this module, so no other module can name paths off a row and
+/// release them.
+struct Releasable(Vec<String>);
 
 fn protects_staged_files(state: &str) -> bool {
     matches!(state, "sending" | "unconfirmed")
@@ -400,7 +396,7 @@ pub(crate) fn outbox_save_releasing(
     Ok(id)
 }
 
-/// [`outbox_delete`], then frees the staged files of the deleted row. Rows
+/// deletes the row, then frees the staged files of the deleted row. Rows
 /// that were sent keep theirs until they are deleted: a local-only sent
 /// message has no other copy of its attachments.
 pub(crate) fn outbox_delete_releasing(
@@ -414,11 +410,12 @@ pub(crate) fn outbox_delete_releasing(
         let conn = store.lock_conn()?;
         let row = mail_store::get_outbox(&conn, id).map_err(db)?;
         if mail_store::delete_outbox(&conn, id).map_err(db)? {
-            row.map(|row| releasable_paths(&row)).unwrap_or_default()
+            row.map(|row| releasable_paths(&row))
+                .unwrap_or(Releasable(Vec::new()))
         } else if row.is_some() {
             return Err("This message is being sent and cannot be deleted yet.".into());
         } else {
-            Vec::new()
+            Releasable(Vec::new())
         }
     };
     release_staged(store, dir, &paths);
@@ -1728,7 +1725,9 @@ mod tests {
             .unwrap();
         assert!(outbox_send(&w.store, &w.fake, id).is_err());
         assert!(w.fake.log.lock().unwrap().sends.is_empty());
-        assert!(outbox_delete(&w.store, id).is_err());
+        // The shipping refusal, not a test-only twin of it.
+        assert!(outbox_delete_releasing(&w.store, &scratch(), id).is_err());
+        assert_eq!(outbox_list(&w.store).unwrap().len(), 1);
     }
 
     #[test]
@@ -2362,7 +2361,7 @@ mod tests {
         );
         assert_eq!(row.subject, "Edited");
 
-        outbox_delete(&w.store, id).unwrap();
+        outbox_delete_releasing(&w.store, &scratch(), id).unwrap();
         assert!(outbox_list(&w.store).unwrap().is_empty());
     }
 
@@ -2614,7 +2613,7 @@ mod tests {
         let id = outbox_save_releasing(&w.store, &dir, d).unwrap();
         outbox_delete_releasing(&w.store, &dir, id).unwrap();
         assert!(std::path::Path::new(&own.path).exists());
-        assert_eq!(release_staged(&w.store, &dir, &[sneaky]), 0);
+        assert_eq!(release_staged(&w.store, &dir, &Releasable(vec![sneaky])), 0);
         assert!(std::path::Path::new(&own.path).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2646,7 +2645,7 @@ mod tests {
         // A symlinked file is unlinked, and what it points at is left alone.
         std::os::unix::fs::symlink(&victim, dir.join("shortcut.pdf")).unwrap();
         let shortcut = dir.join("shortcut.pdf").to_string_lossy().into_owned();
-        assert_eq!(release_staged(&w.store, &dir, &[shortcut]), 1);
+        assert_eq!(release_staged(&w.store, &dir, &Releasable(vec![shortcut])), 1);
         assert!(!dir.join("shortcut.pdf").exists());
         assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
         std::fs::remove_dir_all(root).unwrap();
