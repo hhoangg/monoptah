@@ -53,7 +53,8 @@ Out of scope for v1 (named so they are not accidentally designed out):
 │  src-tauri/src/mail.rs           commands, sync loop, thread linking  │
 │  src-tauri/src/mail_store.rs     SQL, schema, queries                 │
 │  src-tauri/src/mail_mime.rs      parse incoming, build outgoing       │
-│  src-tauri/src/mail_aws.rs       S3 + SES calls                       │
+│  src-tauri/src/aws_s3.rs         S3 calls, behind trait S3Api         │
+│  src-tauri/src/aws_ses.rs        SES calls                            │
 │  src-tauri/src/aws_sigv4.rs      request signing (reusable)           │
 │  src-tauri/src/mail_provider.rs  trait MailProvider + AwsProvider     │
 └───────────────────────────────────────────────────────────────────────┘
