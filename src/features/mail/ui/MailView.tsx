@@ -6,7 +6,6 @@ import { WindowControls } from "../../../app/shell/WindowControls";
 import {
   LIST_WIDTH_DEFAULT,
   listWidth,
-  useListWidth,
   useReadingPaneSide,
 } from "../model/mailPrefs";
 
@@ -35,7 +34,6 @@ export function MailView({
   onToggleSidebar,
 }: Props) {
   const side = useReadingPaneSide();
-  const storedWidth = useListWidth();
   const resize = useDragResize({
     min: LIST_MIN_WIDTH,
     max: () =>
@@ -47,7 +45,9 @@ export function MailView({
         ),
       ),
     defaultWidth: LIST_WIDTH_DEFAULT,
-    initial: storedWidth,
+    // Read once: the pane width is set imperatively, so a live subscription
+    // would re-render without moving anything.
+    initial: listWidth.load(),
     onCommit: listWidth.save,
   });
   // Width is a column only beside the reader; below it, or alone, the list
@@ -92,6 +92,9 @@ export function MailView({
           }`}
         >
           <section
+            // Remount on layout change: the drag hook writes an inline width
+            // that nothing clears when the list stops being a column.
+            key={listBeside ? "beside" : "stacked"}
             aria-label="Messages"
             data-mail-pane="threads"
             ref={listBeside ? resize.setPaneRef : undefined}

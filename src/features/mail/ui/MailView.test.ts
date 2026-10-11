@@ -3,7 +3,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { MailView } from "./MailView";
-import { MAIL_PREF_KEYS } from "../model/mailPrefs";
+import { MAIL_PREF_KEYS, readingPaneSide } from "../model/mailPrefs";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("../../../app/shell/WindowControls", () => ({
@@ -56,6 +56,18 @@ it("drops the reading pane when it is off", () => {
   render();
   expect(pane("reader")).toBeNull();
   expect(container.querySelector('[role="separator"]')).toBeNull();
+});
+
+it("clears the list width when the reading pane moves to the bottom", () => {
+  render();
+  expect(pane("threads")!.style.width).not.toBe("");
+  act(() => {
+    localStorage.setItem(MAIL_PREF_KEYS.readingPaneSide, "bottom");
+    readingPaneSide.save("bottom");
+  });
+  expect(pane("threads")!.style.width).toBe("");
+  act(() => readingPaneSide.save("right"));
+  expect(pane("threads")!.style.width).not.toBe("");
 });
 
 it("stacks the reading pane under the list when it is at the bottom", () => {

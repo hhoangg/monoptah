@@ -1529,6 +1529,29 @@ describe("sidebar session reminders", () => {
   });
 });
 
+describe("Mail entry gating", () => {
+  it.each([false, true])(
+    "renders no Mail action without onOpenMail (compact: %s)",
+    async (compact) => {
+      props = {
+        ...props,
+        projectRailOpen: !compact,
+        compactProjectRail: compact,
+        onSelectProject: vi.fn(),
+        onOpenProject: vi.fn(),
+        onOpenMail: undefined,
+      };
+      await act(async () => render());
+      expect(container.querySelector('button[aria-label^="Mail"]')).toBeNull();
+      props = { ...props, onOpenMail: vi.fn() };
+      await act(async () => render());
+      expect(
+        container.querySelector('button[aria-label^="Mail"]'),
+      ).not.toBeNull();
+    },
+  );
+});
+
 describe("collapsed rail Inbox actions", () => {
   it("restores the hidden rail layout when compact mode is disabled", async () => {
     props.projectRailOpen = false;

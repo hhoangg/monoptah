@@ -66,10 +66,7 @@ export const mailSyncNow = (scope: SyncScope) =>
 /**
  * Rust cannot read localStorage, so this push is the only way the interval
  * reaches the scheduler; without it the interval stays at the 3600 default
- * whatever the user sets.
- *
- * TODO(Task 9): call it with `syncIntervalSeconds.load()` from mailPrefs at app startup, and
- * on every change of the pref (including from another window).
+ * whatever the user sets. App pushes it at startup; settings pushes on change.
  */
 export const mailSyncIntervalSet = (secs: number) =>
   invoke<void>("mail_sync_interval_set", { secs });
