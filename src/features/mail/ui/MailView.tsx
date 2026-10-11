@@ -20,6 +20,7 @@ import {
   useMailStatus,
 } from "./MailFolderList";
 import { MailThreadList, useMailThreadList } from "./MailThreadList";
+import { MailThreadRead } from "./MailThreadRead";
 
 type Props = {
   besideRail?: boolean;
@@ -177,9 +178,9 @@ export function MailView({
             <section
               aria-label="Reading pane"
               data-mail-pane="reader"
-              className="flex min-h-0 min-w-0 flex-1 items-center justify-center text-[12px] text-content/40"
+              className="flex min-h-0 min-w-0 flex-1 flex-col"
             >
-              Select a message to read it.
+              <MailThreadRead threadId={threadId} />
             </section>
           )}
         </div>
