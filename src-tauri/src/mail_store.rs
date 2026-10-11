@@ -2125,6 +2125,37 @@ mod tests {
     }
 
     #[test]
+    fn ensure_object_attempts_adds_the_column_to_an_older_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        // mail_object as it was before `parse_attempts`.
+        conn.execute_batch(
+            "CREATE TABLE mail_object (id INTEGER PRIMARY KEY, mailbox_id INTEGER NOT NULL,
+               s3_key TEXT NOT NULL, etag TEXT, size_bytes INTEGER, s3_modified INTEGER,
+               first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+               state TEXT NOT NULL, parse_error TEXT, UNIQUE (mailbox_id, s3_key));
+             INSERT INTO mail_object (mailbox_id, s3_key, first_seen_at, last_seen_at, state)
+             VALUES (1, 'k', 1, 1, 'parsed');",
+        )
+        .unwrap();
+        let columns = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('mail_object') WHERE name='parse_attempts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(columns(&conn), 0);
+        ensure_object_attempts(&conn).unwrap();
+        ensure_object_attempts(&conn).unwrap();
+        assert_eq!(columns(&conn), 1);
+        let attempts: i64 = conn
+            .query_row("SELECT parse_attempts FROM mail_object", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, 0);
+    }
+
+    #[test]
     fn ensure_tables_adds_identities_refreshed_at_to_an_older_database() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();

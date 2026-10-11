@@ -174,10 +174,7 @@ impl SyncService {
         // Oldest first, so one large bucket cannot starve the rest.
         jobs.sort_by_key(|j| (j.staleness, j.account.id));
         // The S3 key is what is contended, so it picks the lock.
-        let mut groups: BTreeMap<i64, Vec<Job>> = BTreeMap::new();
-        for job in jobs {
-            groups.entry(lock_key(&job.account)).or_default().push(job);
-        }
+        let groups = group_by_lock_key(jobs);
         std::thread::scope(|scope| {
             let handles: Vec<_> = groups
                 .into_iter()
@@ -256,6 +253,15 @@ impl SyncService {
 /// the S3 credential decides, not the SES one.
 fn lock_key(account: &MailAccount) -> i64 {
     account.s3_credential_id.unwrap_or(account.credential_id)
+}
+
+/// Jobs that share a lock key end up in one group, run one after another.
+fn group_by_lock_key(jobs: Vec<Job>) -> BTreeMap<i64, Vec<Job>> {
+    let mut groups: BTreeMap<i64, Vec<Job>> = BTreeMap::new();
+    for job in jobs {
+        groups.entry(lock_key(&job.account)).or_default().push(job);
+    }
+    groups
 }
 
 /// One thread for the life of the app. `sync_now` calls from commands share
@@ -1474,5 +1480,41 @@ mod tests {
             f.text("SELECT state FROM mail_thread WHERE subject='Elsewhere'"),
             "active"
         );
+    }
+
+    #[test]
+    fn jobs_group_by_effective_s3_key() {
+        let f = Fixture::new();
+        let (c1, c2, c3) = (
+            f.credential("one"),
+            f.credential("two"),
+            f.credential("three"),
+        );
+        let (a, _) = f.source(c1, "acme");
+        let (b, _) = f.source(c2, "beta");
+        let (c, _) = f.source(c3, "gamma");
+        // a and b use different SES keys but the same S3 key; c is on its own.
+        f.store
+            .lock_conn()
+            .unwrap()
+            .execute(
+                "UPDATE mail_account SET s3_credential_id = ?1 WHERE id IN (?2, ?3)",
+                [c1, a, b],
+            )
+            .unwrap();
+        let jobs: Vec<Job> = mail_store::list_accounts(&f.store.lock_conn().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|account| Job {
+                account,
+                mailboxes: vec![],
+                staleness: 0,
+            })
+            .collect();
+        let groups = group_by_lock_key(jobs);
+        let ids = |key: i64| -> Vec<i64> { groups[&key].iter().map(|j| j.account.id).collect() };
+        assert_eq!(groups.len(), 2);
+        assert_eq!(ids(c1), vec![a, b]);
+        assert_eq!(ids(c3), vec![c]);
     }
 }
