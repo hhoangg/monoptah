@@ -4,14 +4,15 @@
 //! Secrets never enter this module. A credential row carries only a masked
 //! access key id; the key pair itself lives in the OS keychain.
 //!
-//! Timestamps are epoch seconds, matching `mail_message.date_utc`.
+//! Bookkeeping timestamps (`created_at`, `updated_at`, `refreshed_at`) are epoch
+//! milliseconds like the rest of the database; `date_utc` stays in seconds.
 // The Tauri command layer that calls these functions arrives in a later task.
 #![allow(dead_code)]
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+
+use crate::session_store::now_millis;
 
 const MASK_BULLETS: &str = "\u{2022}\u{2022}\u{2022}\u{2022}";
 const MASK_VISIBLE_PREFIX: usize = 4;
@@ -242,13 +243,6 @@ pub(crate) fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// A user-facing error carried through `rusqlite::Error` so callers keep a
 /// single error type. Its `Display` is exactly the message.
 fn user_error(message: String) -> rusqlite::Error {
@@ -303,7 +297,7 @@ pub(crate) fn upsert_credential(
             "access key id must be masked before it is stored".to_string(),
         ));
     }
-    let now = now_secs();
+    let now = now_millis();
     conn.query_row(
         "INSERT INTO mail_credential
            (provider, label, access_key_masked, default_region, created_at, updated_at)
@@ -432,7 +426,7 @@ fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailAccount> {
 }
 
 pub(crate) fn upsert_account(conn: &Connection, input: &AccountInput) -> rusqlite::Result<i64> {
-    let now = now_secs();
+    let now = now_millis();
     if let Some(id) = input.id {
         let changed = conn.execute(
             "UPDATE mail_account SET provider = ?1, credential_id = ?2, s3_credential_id = ?3,
@@ -549,8 +543,8 @@ fn domain_of(address: &str) -> rusqlite::Result<String> {
 
 /// Upserts mailboxes under one source, all or nothing. The address is the key
 /// and is globally unique: if another source already owns it the call fails and
-/// names that source. `is_sendable` is left alone here; it is resolved by
-/// [`replace_identities`].
+/// names that source. `is_sendable` is resolved against the cached identities
+/// when there are any; before the first identity refresh it keeps its default.
 pub(crate) fn upsert_mailboxes(
     conn: &Connection,
     account_id: i64,
@@ -595,6 +589,16 @@ pub(crate) fn upsert_mailboxes(
                 mailbox.sort_order
             ],
         )?;
+    }
+    // Skipped while nothing is cached: an empty cache means "not checked yet",
+    // not "nothing is verified".
+    let has_identities: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM mail_identity WHERE account_id = ?1)",
+        params![account_id],
+        |row| row.get(0),
+    )?;
+    if has_identities {
+        resolve_sendable(&tx, account_id)?;
     }
     tx.commit()
 }
@@ -642,6 +646,21 @@ pub struct MailIdentity {
     pub status: String,
 }
 
+/// Sets `is_sendable` on a source's mailboxes: true when the address, or its
+/// domain, is a verified identity. With no identities cached it clears the flag,
+/// so callers must only rely on it after an identity refresh.
+fn resolve_sendable(conn: &Connection, account_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_mailbox SET is_sendable = EXISTS (
+           SELECT 1 FROM mail_identity i
+           WHERE i.account_id = mail_mailbox.account_id AND i.status = 'verified'
+             AND (i.identity = mail_mailbox.address OR i.identity = mail_mailbox.domain))
+         WHERE account_id = ?1",
+        params![account_id],
+    )?;
+    Ok(())
+}
+
 /// Replaces the cached SES identities of one source, then re-resolves
 /// `is_sendable` for its mailboxes: sendable when the address, or its domain,
 /// is a verified identity.
@@ -650,7 +669,7 @@ pub(crate) fn replace_identities(
     account_id: i64,
     identities: &[MailIdentity],
 ) -> rusqlite::Result<()> {
-    let now = now_secs();
+    let now = now_millis();
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "DELETE FROM mail_identity WHERE account_id = ?1",
@@ -672,14 +691,7 @@ pub(crate) fn replace_identities(
             ],
         )?;
     }
-    tx.execute(
-        "UPDATE mail_mailbox SET is_sendable = EXISTS (
-           SELECT 1 FROM mail_identity i
-           WHERE i.account_id = mail_mailbox.account_id AND i.status = 'verified'
-             AND (i.identity = mail_mailbox.address OR i.identity = mail_mailbox.domain))
-         WHERE account_id = ?1",
-        params![account_id],
-    )?;
+    resolve_sendable(&tx, account_id)?;
     tx.commit()
 }
 
@@ -1032,6 +1044,44 @@ mod tests {
                 .unwrap()
                 .is_sendable
         );
+    }
+
+    #[test]
+    fn new_mailbox_is_resolved_against_cached_identities() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let cred = upsert_credential(&conn, &credential("personal")).unwrap();
+        let a = upsert_account(&conn, &account(cred, "Alpha", "bucket-a")).unwrap();
+
+        // Nothing cached yet: the default is kept.
+        upsert_mailboxes(&conn, a, &[mailbox("early@example.com", "e/")]).unwrap();
+        assert!(list_mailboxes(&conn, Some(a)).unwrap()[0].is_sendable);
+
+        let verified = MailIdentity {
+            identity: "example.com".into(),
+            kind: "domain".into(),
+            status: "verified".into(),
+        };
+        replace_identities(&conn, a, &[verified]).unwrap();
+        upsert_mailboxes(
+            &conn,
+            a,
+            &[
+                mailbox("late@example.com", "l/"),
+                mailbox("stray@unverified.org", "s/"),
+            ],
+        )
+        .unwrap();
+        let boxes = list_mailboxes(&conn, Some(a)).unwrap();
+        let sendable = |addr: &str| {
+            boxes
+                .iter()
+                .find(|m| m.address == addr)
+                .unwrap()
+                .is_sendable
+        };
+        assert!(sendable("late@example.com"));
+        assert!(!sendable("stray@unverified.org"));
     }
 
     #[test]
