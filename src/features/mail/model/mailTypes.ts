@@ -491,7 +491,13 @@ export type SendReport = {
   bookkeepingError: string | null;
 };
 
-/** What `mail_outbox_send` rejects with. */
+/**
+ * What `mail_outbox_send` rejects with. `retrySafe` describes that one call,
+ * not the row: refusing a row that is already `unconfirmed` is
+ * `{ kind: "form", retrySafe: true }` because the call sent nothing. Decide
+ * what to offer from `OutboxRow.state`, never from `retrySafe` alone, or an
+ * `unconfirmed` row gets a Retry button.
+ */
 export type SendError = {
   /** `form` for anything caught before SES was called. */
   kind:

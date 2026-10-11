@@ -1679,17 +1679,24 @@ pub async fn mail_delete(
 
 #[tauri::command(async)]
 pub fn mail_outbox_save(
-    app: AppHandle,
     store: State<'_, SessionStore>,
     draft: mail_send::OutboxDraft,
 ) -> Result<i64, String> {
-    let id = mail_send::outbox_save(&store, draft)?;
-    let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
-    Ok(id)
+    // No MESSAGES_CHANGED_EVENT: a save changes no message or folder, every
+    // listener of that event reloads the mail UI, and a composer saves on a
+    // timer. An outbox list that needs to know wants an event of its own.
+    mail_send::outbox_save(&store, draft)
 }
 
-/// Sends once. A failure is reported and recorded, never retried here. The
-/// error says whether sending again is safe: after `unconfirmed` it is not.
+/// Sends once. A failure is reported and recorded, never retried here.
+///
+/// Contract for whoever builds the UI: decide what to offer from
+/// `OutboxRow.state`, never from `SendError.retry_safe` alone. Refusing a row
+/// that is already `unconfirmed` is a `form` error with `retry_safe: true`
+/// (that call sent nothing), so `if (retrySafe) showRetry()` would put a Retry
+/// button on the one row that may already have been delivered. An
+/// `unconfirmed` row gets "check the recipient first" and an explicit
+/// confirmation before `mail_outbox_rearm`; a save never re-arms it.
 #[tauri::command]
 pub async fn mail_outbox_send(
     app: AppHandle,

@@ -390,6 +390,9 @@ fn classify(status: u16, error_type: Option<&str>, body: &str, action: &str) -> 
         match code.as_str() {
             // The arms below that mean "SES did not take it" need a status under
             // 500: a server error proves nothing, whatever its error header says.
+            // `code` is only read from ureq's `Error::Status`, which ureq raises
+            // for 400 and above; a 3xx comes through the Ok arm with no code.
+            // That is what keeps `< 500` as good as `400..500`.
             "AccessDeniedException" | "AccessDenied" if status < 500 => (
                 SesErrorKind::AccessDenied,
                 format!("Access denied. The key pair needs {action}."),

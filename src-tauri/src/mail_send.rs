@@ -236,7 +236,7 @@ pub(crate) fn outbox_rearm(store: &SessionStore, id: i64) -> Result<(), String> 
     if mail_store::rearm_outbox(&conn, id).map_err(db)? {
         Ok(())
     } else {
-        Err("Only a message whose delivery is uncertain can be sent again.".into())
+        Err("This message is not waiting to be confirmed, so there is nothing to confirm.".into())
     }
 }
 
@@ -650,6 +650,13 @@ fn build_message(loaded: &Loaded) -> Result<Built, String> {
 /// Why a send did not complete. `retry_safe` is the part that matters: after
 /// a connection that dropped with the request out, SES may have delivered, so
 /// a Retry button there sends the email twice.
+///
+/// `retry_safe` describes THIS call only, not the row. Refusing a row that is
+/// already `unconfirmed` is `kind: "form", retry_safe: true`, because that
+/// call sent nothing; a UI written as `if retry_safe { show_retry() }` would
+/// offer Retry on the most dangerous row in the outbox. Decide what to offer
+/// from the row's `state` (`unconfirmed` means "check the recipient first",
+/// then an explicit `mail_outbox_rearm`), and use this only for the message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendError {
