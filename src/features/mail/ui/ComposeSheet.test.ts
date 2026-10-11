@@ -475,3 +475,129 @@ it("From picker: grouped by domain, unsendable entries disabled with their reaso
   await click(byText("owner@byptah.com"));
   expect(onChange).toHaveBeenCalledWith("owner@byptah.com");
 });
+
+const lastSave = () => m.mailOutboxSave.mock.calls.at(-1)![0];
+
+it("Quote inline is off for an original with no plain text, and the quote still goes out", async () => {
+  // A reopened forward: only the sanitised HTML survives on the row.
+  await open({
+    kind: "draft",
+    row: row({
+      kind: "forward",
+      quotedHtml: "<p>FORWARDED-ORIGINAL</p>",
+      replyToMessageId: 7,
+      threadId: null,
+    }),
+  });
+  const inline = button("Quote inline") as HTMLButtonElement;
+  expect(inline.disabled).toBe(true);
+  await click(inline);
+  m.mailOutboxSend.mockRejectedValue("stop here");
+  await click(button("Send"));
+  expect(lastSave().quotedHtml).toBe("<p>FORWARDED-ORIGINAL</p>");
+  expect(lastSave().bodyHtml).toContain("FORWARDED-ORIGINAL");
+  expect(editorEl()!.textContent).toBe("");
+});
+
+it("Quote inline moves the text into the document and stops quoting it twice", async () => {
+  await open({ kind: "reply", message: message(), thread: THREAD });
+  await click(button("Quote inline"));
+  expect(editorEl()!.textContent).toContain(`${RECEIVED} plain`);
+  m.mailOutboxSend.mockRejectedValue("stop here");
+  await click(button("Send"));
+  expect(lastSave().quotedHtml).toBeNull();
+});
+
+const setValue = async (el: HTMLInputElement, value: string) => {
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )!.set!.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+};
+
+it("without a From, autosave says what to do and closing does not silently discard", async () => {
+  m.mailSendableMailboxes.mockResolvedValue([]);
+  await open({ kind: "new" });
+  vi.useFakeTimers();
+  try {
+    await setValue(
+      body().querySelector<HTMLInputElement>("#mail-subject")!,
+      "typed words",
+    );
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(m.mailOutboxSave).not.toHaveBeenCalled();
+  expect(body().textContent).toContain(
+    "Choose a From address before this can be saved.",
+  );
+  expect(body().textContent).not.toContain("not being saved");
+  // Closing warns first; only the second attempt leaves.
+  await click(button("Close"));
+  expect(onClose).not.toHaveBeenCalled();
+  expect(body().textContent).toContain("Close again to discard");
+  await click(button("Close"));
+  expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+it("a refused save re-reads the row, so a sent message stops offering Send", async () => {
+  m.mailOutboxSave.mockRejectedValue(
+    "This message was already sent or is being sent, so it cannot be changed.",
+  );
+  m.mailOutboxList.mockResolvedValue([row({ state: "sent" })]);
+  await open({ kind: "draft", row: row() });
+  expect(button("Send")).toBeDefined();
+  await click(button("Save draft"));
+  expect(button("Send")).toBeUndefined();
+});
+
+it("Cmd+Enter cannot send a row the UI withholds Send from", async () => {
+  await open({ kind: "draft", row: row({ state: "unconfirmed" }) });
+  await act(async () => {
+    for (const mod of [{ metaKey: true }, { ctrlKey: true }]) {
+      editorEl()!.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          bubbles: true,
+          cancelable: true,
+          ...mod,
+        }),
+      );
+    }
+  });
+  await settle();
+  expect(m.mailOutboxSave).not.toHaveBeenCalled();
+  expect(m.mailOutboxCheck).not.toHaveBeenCalled();
+  expect(m.mailOutboxSend).not.toHaveBeenCalled();
+});
+
+it("says when a reopened draft's files are gone, before Send", async () => {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const files = [
+    {
+      path: "/tmp/gone.pdf",
+      filename: "gone.pdf",
+      mime: "application/pdf",
+      cid: null,
+    },
+    {
+      path: "/tmp/here.pdf",
+      filename: "here.pdf",
+      mime: "application/pdf",
+      cid: null,
+    },
+  ];
+  vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+    cmd === "inspect_paths" ? [{ path: "/tmp/here.pdf" }] : null) as never);
+  await open({ kind: "draft", row: row({ attachments: files }) });
+  expect(body().textContent).toContain(
+    "gone.pdf is no longer on this computer",
+  );
+  expect(body().textContent).not.toContain("here.pdf is no longer");
+});

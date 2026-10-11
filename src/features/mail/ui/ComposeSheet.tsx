@@ -76,6 +76,7 @@ const LazyMailEditor = lazySurface<MailEditorProps>(
 export const preloadMailEditor = () => LazyMailEditor.preload();
 
 const AUTOSAVE_MS = 1500;
+const FROM_NOTE = "Choose a From address before this can be saved.";
 
 const TITLE: Record<OutboxKind, string> = {
   new: "New message",
@@ -452,6 +453,8 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [report, setReport] = useState<SendReport | null>(null);
+  const [fromNote, setFromNote] = useState<string | null>(null);
+  const mode = sendMode(rowState);
 
   const editorRef = useRef<Editor | null>(null);
   const setEditor = useCallback((e: Editor | null) => {
@@ -545,6 +548,14 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
       setQuote(next.quote);
       setPending(next.pending);
       setInit(next);
+      if (request.kind === "draft") {
+        const gone = await missingFiles(request.row);
+        if (!stale && gone.length) {
+          setNotice(
+            `${gone.join(", ")} ${gone.length === 1 ? "is" : "are"} no longer on this computer. Remove ${gone.length === 1 ? "it" : "them"} and attach again, or this message cannot be sent.`,
+          );
+        }
+      }
     })().catch((err) => {
       if (!stale) setLoadError(message(err));
     });
@@ -620,6 +631,22 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
     [kind, request],
   );
 
+  const refreshRow = useCallback(
+    async (id: number): Promise<OutboxRow | null> => {
+      try {
+        const row = (await mailOutboxList()).find((r) => r.id === id) ?? null;
+        if (row && alive.current) {
+          setRowState(row.state);
+          setRowError(row.lastError);
+        }
+        return row;
+      } catch {
+        return null;
+      }
+    },
+    [],
+  );
+
   const save = useCallback(
     () =>
       enqueue(async () => {
@@ -635,19 +662,24 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
           // A sending or sent row refuses the save; the person must hear it,
           // or they keep editing text that is not being stored.
           if (alive.current) setSaveError(message(err));
+          // "Already sent" is the row moving under the composer; what may be
+          // offered next comes from the row, not from this refusal.
+          if (idRef.current !== null) void refreshRow(idRef.current);
           throw err;
         }
       }),
-    [enqueue, persist],
+    [enqueue, persist, refreshRow],
   );
 
   const touch = useCallback(() => {
     dirty.current = true;
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(
-      () => void save().catch(() => undefined),
-      AUTOSAVE_MS,
-    );
+    timer.current = setTimeout(() => {
+      // No From means nothing can be stored (Rust rejects an unknown mailbox);
+      // say what to do instead of failing every pause.
+      if (!latest.current.from) return setFromNote(FROM_NOTE);
+      void save().catch(() => undefined);
+    }, AUTOSAVE_MS);
   }, [save]);
 
   // ----- fields -----
@@ -764,7 +796,8 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
 
   const quoteInline = () => {
     const editor = editorRef.current;
-    if (!quote || !editor) return;
+    // An empty original (a reopened forward) would be replaced by nothing.
+    if (!quote || !editor || quote.plain.trim() === "") return;
     const lines = quote.plain.split(/\r\n?|\n/);
     editor
       .chain()
@@ -792,19 +825,6 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
 
   // ----- send -----
 
-  const refreshRow = async (id: number): Promise<OutboxRow | null> => {
-    try {
-      const row = (await mailOutboxList()).find((r) => r.id === id) ?? null;
-      if (row && alive.current) {
-        setRowState(row.state);
-        setRowError(row.lastError);
-      }
-      return row;
-    } catch {
-      return null;
-    }
-  };
-
   const blocked = (): string | null => {
     const s = latest.current;
     const entry = groups
@@ -819,7 +839,9 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
   };
 
   const send = async () => {
-    if (busy) return;
+    // Cmd+Enter reaches here with the editor still mounted, so the row's state
+    // is enforced here and not only by hiding the button.
+    if (busy || mode.kind !== "send") return;
     setProblems([]);
     setNotice(null);
     const why = blocked();
@@ -896,6 +918,12 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
   const requestClose = async () => {
     if (timer.current) clearTimeout(timer.current);
     if (dirty.current && !forceClose.current && !report) {
+      if (!latest.current.from) {
+        // Nothing can be saved without a From; closing now would drop the text.
+        forceClose.current = true;
+        setFromNote(`${FROM_NOTE} Close again to discard it.`);
+        return;
+      }
       try {
         await save();
       } catch {
@@ -909,7 +937,6 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
 
   // ----- render -----
 
-  const mode = sendMode(rowState);
   const entry = groups
     ?.flatMap((g) => g.entries)
     .find((e) => e.address.toLowerCase() === from.toLowerCase());
@@ -942,6 +969,8 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
               value={from}
               onChange={(a) => {
                 setFrom(a);
+                setFromNote(null);
+                forceClose.current = false;
                 touch();
               }}
             />
@@ -1000,7 +1029,15 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
                 <span className="shrink-0 rounded-full border border-content/10 px-1.5 text-[10px]">
                   not editable {"·"} appended on send
                 </span>
-                <SecondaryButton onClick={quoteInline}>
+                <SecondaryButton
+                  onClick={quoteInline}
+                  disabled={quote.plain.trim() === ""}
+                  title={
+                    quote.plain.trim() === ""
+                      ? "The original has no plain text to insert; it is still sent below your message."
+                      : undefined
+                  }
+                >
                   Quote inline
                 </SecondaryButton>
               </div>
@@ -1051,6 +1088,11 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
             </p>
           ) : null}
 
+          {fromNote ? (
+            <p role="alert" className="mt-3 text-[12px] text-amber-400">
+              {fromNote}
+            </p>
+          ) : null}
           {saveError ? (
             <p role="alert" className="mt-3 text-[12px] text-red-400">
               Your latest changes are not being saved: {saveError}
@@ -1264,5 +1306,28 @@ async function originalOf(row: OutboxRow) {
     return detail.messages.find((m) => m.id === row.replyToMessageId) ?? null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Staged and picked files are plain paths, and pasted ones sit in the OS temp
+ * directory, which the system may clear. Say so when the draft opens, not when
+ * Send fails. `inspect_paths` returns only paths that still exist; anything
+ * else it returns (an older host) means "cannot tell", so nothing is claimed.
+ */
+async function missingFiles(row: OutboxRow): Promise<string[]> {
+  if (row.attachments.length === 0) return [];
+  const slash = (p: string) => p.replace(/\\/g, "/");
+  try {
+    const found = await invoke<{ path: string }[] | null>("inspect_paths", {
+      paths: row.attachments.map((a) => a.path),
+    });
+    if (!Array.isArray(found)) return [];
+    const here = new Set(found.map((f) => slash(f.path)));
+    return row.attachments
+      .filter((a) => !here.has(slash(a.path)))
+      .map((a) => a.filename);
+  } catch {
+    return [];
   }
 }

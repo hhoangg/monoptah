@@ -1,6 +1,10 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildQuote,
+  FORWARD_WORDS,
+  REPLY_WORDS,
   defaultFrom,
   parseRecipients,
   prefixedSubject,
@@ -100,6 +104,34 @@ describe("prefixedSubject", () => {
     expect(prefixedSubject("Fwd: Order", "forward")).toBe("Fwd: Order");
     expect(prefixedSubject("FW: Order", "forward")).toBe("FW: Order");
     expect(prefixedSubject("Fwd: Order", "reply")).toBe("Re: Fwd: Order");
+  });
+
+  it("recognises the other languages and counted forms thread grouping strips", () => {
+    expect(prefixedSubject("AW: Order", "reply")).toBe("AW: Order");
+    expect(prefixedSubject("Re[2]: Order", "reply_all")).toBe("Re[2]: Order");
+    expect(prefixedSubject("Trả lời: Order", "reply")).toBe("Trả lời: Order");
+    // Decomposed diacritics (NFD) are the same word.
+    expect(prefixedSubject("Tra\u0309 lo\u031b\u0300i: x", "reply")).toBe(
+      "Trả lời: x".normalize("NFC"),
+    );
+    expect(prefixedSubject("Chuyển tiếp: Order", "forward")).toBe(
+      "Chuyển tiếp: Order",
+    );
+    expect(prefixedSubject("Fw: Order", "forward")).toBe("Fw: Order");
+  });
+
+  it("keeps its prefix words in step with mail_thread.rs", () => {
+    const rust = readFileSync(
+      resolve(__dirname, "../../../../src-tauri/src/mail_thread.rs"),
+      "utf8",
+    );
+    const block = /REPLY_PREFIXES: \[&str; \d+\] = \[([^\]]*)\]/.exec(rust);
+    expect(block).not.toBeNull();
+    const words = [...block![1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    expect(words.length).toBeGreaterThan(5);
+    expect([...REPLY_WORDS, ...FORWARD_WORDS].sort()).toEqual(
+      [...words].sort(),
+    );
   });
 
   it("leaves a new message's subject alone", () => {

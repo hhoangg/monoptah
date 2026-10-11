@@ -29,12 +29,33 @@ export type ComposeRequest =
 
 // ---------- subject ----------
 
-const REPLY_PREFIX = /^\s*re\s*:/i;
-const FORWARD_PREFIX = /^\s*fwd?\s*:/i;
+/**
+ * The prefix words thread grouping strips (`REPLY_PREFIXES` in mail_thread.rs).
+ * Split here only by which composer action they belong to; a test reads the
+ * Rust list and fails when the two drift.
+ */
+export const FORWARD_WORDS = ["fwd", "fw", "chuyển tiếp"];
+export const REPLY_WORDS = [
+  "re",
+  "aw",
+  "sv",
+  "antw",
+  "res",
+  "vs",
+  "tr",
+  "rv",
+  "trả lời",
+];
 
-/** A reply to a reply keeps one prefix, whatever case the other client used. */
+const prefixPattern = (words: string[]) =>
+  new RegExp(`^\\s*(?:${words.join("|")})\\s*(?:\\[\\d+\\])?\\s*:`, "i");
+const REPLY_PREFIX = prefixPattern(REPLY_WORDS);
+const FORWARD_PREFIX = prefixPattern(FORWARD_WORDS);
+
+/** A reply to a reply keeps one prefix, whatever language the other client used. */
 export function prefixedSubject(subject: string, kind: OutboxKind): string {
-  const plain = subject.trim();
+  // Diacritics may arrive decomposed; the Rust side normalises the same way.
+  const plain = subject.trim().normalize("NFC");
   if (kind === "new") return plain;
   const has = kind === "forward" ? FORWARD_PREFIX : REPLY_PREFIX;
   if (has.test(plain)) return plain;
