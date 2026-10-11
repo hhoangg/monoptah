@@ -2,12 +2,16 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountInput,
   CredentialUpsertInput,
+  FolderInput,
+  FolderRow,
   IdentityRow,
   MailCredential,
   MailMailbox,
   MailStatus,
   MailboxInput,
+  MatchMode,
   Page,
+  Rule,
   SourceRow,
   SyncReport,
   SyncScope,
@@ -100,3 +104,16 @@ export const mailAttachmentBytes = (attachmentId: number) =>
 /** Only URLs blocked in that message's sanitised HTML are fetched. */
 export const mailRemoteImage = (messageId: number, url: string) =>
   invoke<ArrayBuffer>("mail_remote_image", { messageId, url });
+
+export const mailFolders = () => invoke<FolderRow[]>("mail_folders");
+
+/** Saves the folder and re-files all stored mail against its rules. */
+export const mailFolderUpsert = (folder: FolderInput, rules: Rule[]) =>
+  invoke<FolderRow>("mail_folder_upsert", { folder, rules });
+
+export const mailFolderDelete = (id: number) =>
+  invoke<void>("mail_folder_delete", { id });
+
+/** The mode changes the count, so pass the one the list will use. */
+export const mailFolderPreview = (rules: Rule[], matchMode: MatchMode) =>
+  invoke<{ count: number }>("mail_folder_preview", { rules, matchMode });

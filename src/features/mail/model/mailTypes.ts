@@ -212,7 +212,86 @@ export type TestReport = {
 // ── threads and messages ───────────────────────────────────────────
 
 export type ThreadScope =
-  { kind: "all" } | { kind: "mailbox"; mailboxId: number };
+  | { kind: "all" }
+  | { kind: "mailbox"; mailboxId: number }
+  /** A smart folder's members. */
+  | { kind: "folder"; folderId: number }
+  /** Filter chips or the search box, not saved. Empty rules list everything. */
+  | { kind: "rules"; rules: Rule[]; matchMode: MatchMode };
+
+// ── rules and smart folders ────────────────────────────────────────
+
+export type MatchMode = "all" | "any";
+
+export type RuleField =
+  | "from"
+  | "to"
+  | "cc"
+  | "recipient"
+  | "subject"
+  | "body"
+  | "mailbox"
+  | "domain"
+  | "account"
+  | "has_attachment"
+  | "is_unread"
+  | "is_starred"
+  | "date";
+
+export type RuleOp =
+  | "is"
+  | "contains"
+  | "contains_prefix"
+  | "contains_any"
+  | "starts_with"
+  | "ends_with"
+  | "matches"
+  | "before"
+  | "after"
+  | "within_days"
+  | "true";
+
+/**
+ * A string, or a list of strings for `contains_any`. A value read back from a
+ * saved folder is always one of those two, whatever was sent (a number comes
+ * back as its decimal text), so never test it with `typeof === "number"`.
+ */
+export type RuleValue = string | number | string[] | null;
+
+/** The one condition type behind the chips, the search box and a saved folder. */
+export type Rule = {
+  field: RuleField;
+  op: RuleOp;
+  value: RuleValue;
+  negate: boolean;
+};
+
+export type FolderInput = {
+  /** Set to edit that folder in place; null creates one. */
+  id: number | null;
+  name: string;
+  color: string | null;
+  /** Null keeps a folder where it is and appends a new one. */
+  sortOrder: number | null;
+  matchMode: MatchMode;
+  hideFromMailbox: boolean;
+  countUnread: boolean;
+};
+
+export type FolderRow = {
+  id: number;
+  name: string;
+  color: string | null;
+  sortOrder: number;
+  matchMode: MatchMode;
+  hideFromMailbox: boolean;
+  countUnread: boolean;
+  rules: Rule[];
+  /** Listed threads in the folder. */
+  threadCount: number;
+  /** Unread messages in those threads. */
+  unreadCount: number;
+};
 
 /** Keyset position after the last row of the previous page. */
 export type ThreadCursor = {
