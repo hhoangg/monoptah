@@ -825,6 +825,43 @@ mod tests {
     }
 
     #[test]
+    fn merge_survives_both_threads_sharing_a_folder_and_moves_outbox_rows() {
+        let e = env();
+        let t1 = put(&e, e.owner, &mail("r1@x", "One", "a@x.com", OWNER, T0)).thread_id;
+        let t2 = put(&e, e.owner, &mail("r2@x", "Two", "b@x.com", OWNER, T0 + 1)).thread_id;
+        let conn = e.store.lock_conn().unwrap();
+        conn.execute(
+            "INSERT INTO mail_folder (name, created_at, updated_at) VALUES ('f', 0, 0)",
+            [],
+        )
+        .unwrap();
+        // Smart folders materialise membership per matching thread, so two
+        // threads in one folder is the usual case; a plain UPDATE would hit
+        // the (folder_id, thread_id) primary key.
+        for t in [t1, t2] {
+            conn.execute(
+                "INSERT INTO mail_folder_member (folder_id, thread_id) VALUES (1, ?1)",
+                [t],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO mail_outbox (account_id, thread_id, kind, from_addr, to_json, created_at, updated_at)
+             VALUES ((SELECT account_id FROM mail_thread WHERE id = ?1), ?2, 'reply', ?3, '[]', 0, 0)",
+            rusqlite::params![t1, t2, OWNER],
+        )
+        .unwrap();
+
+        merge_threads(&conn, t1, &[t2], &[]).unwrap();
+
+        let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(q("SELECT COUNT(*) FROM mail_folder_member"), 1);
+        assert_eq!(q("SELECT thread_id FROM mail_folder_member"), t1);
+        assert_eq!(q("SELECT COUNT(*) FROM mail_thread"), 1);
+        assert_eq!(q("SELECT thread_id FROM mail_outbox"), t1);
+    }
+
+    #[test]
     fn merge_threads_is_idempotent() {
         let e = env();
         let t1 = put(&e, e.owner, &mail("r1@x", "One", "a@x.com", OWNER, T0)).thread_id;

@@ -1,5 +1,12 @@
 //! Mail storage: schema and CRUD for credentials, sources, mailboxes,
-//! identities and sync bookkeeping. No network, MIME or threading here.
+//! identities, sync bookkeeping, and the thread, message, ref and attachment
+//! rows that threading and sync write. No network or MIME parsing here.
+//!
+//! `message_id_hdr` and `ref_hdr` are always bracket-free (`abc@host`, never
+//! `<abc@host>`), as the parser's `trim_id` produces. Any writer, notably
+//! outgoing mail that generates its own `<uuid@domain>`, must strip the angle
+//! brackets before storing; a bracketed id never matches, so replies to it
+//! would silently split into a new thread.
 //!
 //! Secrets never enter this module. A credential row carries only a masked
 //! access key id; the key pair itself lives in the OS keychain.
