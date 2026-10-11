@@ -250,33 +250,91 @@ pub(crate) fn staging_dir(attachments_root: &std::path::Path) -> std::path::Path
     attachments_root.join("drafts")
 }
 
-/// Deletes staged files nothing refers to any more. Only files inside `dir`
-/// are ever touched (a file the person picked from their own disk is not
-/// ours), and a file another outbox row still lists is kept. Returns how many
-/// were removed.
+/// A path with its directory part resolved (so `..`, `.`, doubled slashes and
+/// symlinked directories are gone) and its own name kept, so that a symlink
+/// *file* is something to unlink, not something to follow.
+fn resolved(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let leaf = path.file_name()?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    Some(parent.canonicalize().ok()?.join(leaf))
+}
+
+/// What identifies a file for "is another row using this": its inode where
+/// there is one, since a case-insensitive disk spells one file many ways,
+/// else the resolved path.
+fn file_key(path: &std::path::Path) -> Option<String> {
+    let path = resolved(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            return Some(format!("{}:{}", meta.dev(), meta.ino()));
+        }
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Deletes staged files nothing refers to any more. Containment and "still
+/// listed by another row" are both decided on resolved paths, never on the
+/// strings in the database: a `..`, a symlinked directory inside `dir` or a
+/// second spelling of one file must not make this delete something it should
+/// not. A file the person picked from their own disk is outside `dir` and is
+/// never touched. Returns how many were removed; a failure is logged, since
+/// the caller cannot act on it but someone will want to diagnose the leak.
 pub(crate) fn release_staged(
     store: &SessionStore,
     dir: &std::path::Path,
     paths: &[String],
 ) -> usize {
+    let Ok(root) = dir.canonicalize() else {
+        // Nothing was ever staged here.
+        return 0;
+    };
     let Ok(conn) = store.lock_conn() else {
         return 0;
     };
-    let Ok(still_used) = mail_store::outbox_attachment_paths(&conn) else {
+    // A failed read means we cannot tell what is still used, so delete nothing.
+    let Ok(listed) = mail_store::outbox_attachment_paths(&conn) else {
         return 0;
     };
-    paths
+    let still_used: std::collections::HashSet<String> = listed
         .iter()
-        .filter(|p| {
-            let path = std::path::Path::new(p.as_str());
-            path.starts_with(dir)
-                && !path
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-                && !still_used.contains(p)
-        })
-        .filter(|p| std::fs::remove_file(p).is_ok())
-        .count()
+        .filter_map(|p| file_key(std::path::Path::new(p)))
+        .collect();
+    let mut removed = 0;
+    for p in paths {
+        let path = std::path::Path::new(p.as_str());
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let Some(target) = resolved(path) else {
+            continue;
+        };
+        if !target.starts_with(&root) {
+            continue;
+        }
+        // No identity for the candidate means we cannot rule out that another
+        // row uses it, and a file kept by mistake is a leak while one deleted
+        // by mistake is data loss, so keep it.
+        let Some(key) = file_key(&target) else {
+            continue;
+        };
+        if still_used.contains(&key) {
+            continue;
+        }
+        match std::fs::remove_file(&target) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "mail: could not remove staged attachment {}: {e}",
+                target.display()
+            ),
+        }
+    }
+    removed
 }
 
 fn attachment_paths(row: &OutboxRow) -> Vec<String> {
@@ -2515,6 +2573,75 @@ mod tests {
         assert!(std::path::Path::new(&own.path).exists());
         assert_eq!(release_staged(&w.store, &dir, &[sneaky]), 0);
         assert!(std::path::Path::new(&own.path).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_inside_staging_cannot_be_used_to_delete_outside_it() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim_dir = scratch();
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        let victim = victim_dir.join("report.pdf");
+        std::fs::write(&victim, b"precious").unwrap();
+        std::os::unix::fs::symlink(&victim_dir, dir.join("link")).unwrap();
+        let through_link = format!("{}/link/report.pdf", dir.display());
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![OutboxAttachment {
+            path: through_link,
+            filename: "report.pdf".into(),
+            mime: "application/pdf".into(),
+            cid: None,
+        }];
+        let id = outbox_save_releasing(&w.store, &dir, d).unwrap();
+        outbox_delete_releasing(&w.store, &dir, id).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+
+        // A symlinked file is unlinked, and what it points at is left alone.
+        std::os::unix::fs::symlink(&victim, dir.join("shortcut.pdf")).unwrap();
+        let shortcut = dir.join("shortcut.pdf").to_string_lossy().into_owned();
+        assert_eq!(release_staged(&w.store, &dir, &[shortcut]), 1);
+        assert!(!dir.join("shortcut.pdf").exists());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(victim_dir).unwrap();
+    }
+
+    #[test]
+    fn two_spellings_of_one_file_are_one_file_to_the_keep_guard() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        let file = staged(&dir, "a.png");
+        let leaf = std::path::Path::new(&file.path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let spelled = |path: String| OutboxAttachment {
+            path,
+            ..file.clone()
+        };
+        let mut a = draft("owner@byptah.com", "ann@example.org");
+        a.attachments = vec![file.clone()];
+        outbox_save_releasing(&w.store, &dir, a).unwrap();
+        for variant in [
+            format!("{}/./{leaf}", dir.display()),
+            format!("{}//{leaf}", dir.display()),
+            format!("{}/{}", dir.display(), leaf.to_uppercase()),
+        ] {
+            let mut b = draft("owner@byptah.com", "ann@example.org");
+            b.attachments = vec![spelled(variant)];
+            let b_id = outbox_save_releasing(&w.store, &dir, b).unwrap();
+            outbox_delete_releasing(&w.store, &dir, b_id).unwrap();
+            assert!(
+                std::path::Path::new(&file.path).exists(),
+                "row A lost its file"
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

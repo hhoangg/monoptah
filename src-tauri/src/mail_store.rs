@@ -3476,6 +3476,10 @@ pub(crate) fn outbox_attachment_paths(conn: &Connection) -> rusqlite::Result<Vec
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for json in rows {
+        // A row whose JSON does not parse lists nothing here, the same as
+        // `outbox_from_row` shows it. In a delete path that is fail-open (its
+        // files look unused), accepted because the row is already unreadable
+        // everywhere else and nothing writes it except `serde_json`.
         let list: Vec<OutboxAttachment> = serde_json::from_str(&json?).unwrap_or_default();
         out.extend(list.into_iter().map(|a| a.path));
     }
