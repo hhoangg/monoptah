@@ -1243,7 +1243,8 @@ pub(crate) fn insert_attachments(
     Ok(())
 }
 
-/// Messages of a thread, oldest first. `gone` ones are left out: they are not
+/// Messages of a thread, oldest first. Guarded by the `mail.rs` tests
+/// `marking_*` and by `mail_sync`'s vanished-message badge test. `gone` ones are left out: they are not
 /// shown, so they must not count, or an unread badge could outlive every
 /// message that can be opened to clear it. `archived` stays in, because
 /// archiving is a whole-thread state (spec section 10).
@@ -1433,6 +1434,9 @@ pub(crate) fn message_for_object(
 /// as `gone`. Their `active` messages become `gone` (never `archived`: that
 /// word is the user's, spec section 10), and a thread left with no `active`
 /// message leaves the inbox. Nothing is deleted. Returns the object count.
+/// The badge consequences (aggregates refreshed in the same transaction) are
+/// covered end to end by `mail_sync`'s
+/// `a_vanished_message_leaves_no_unread_badge_and_a_revived_one_restores_it`.
 pub(crate) fn mark_vanished_objects(
     conn: &Connection,
     mailbox_id: i64,
@@ -1975,8 +1979,10 @@ pub(crate) fn set_threads_read(
 ) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
     for id in thread_ids {
+        // A `gone` row keeps its read state: the user cannot see it, so this is
+        // not a write they asked for, and a revive then restores what it was.
         tx.execute(
-            "UPDATE mail_message SET is_read = ?2 WHERE thread_id = ?1",
+            "UPDATE mail_message SET is_read = ?2 WHERE thread_id = ?1 AND state != 'gone'",
             params![id, read],
         )?;
         tx.execute(

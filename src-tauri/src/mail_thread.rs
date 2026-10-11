@@ -182,6 +182,10 @@ fn recompute_thread(conn: &Connection, thread_id: i64, own: &[String]) -> rusqli
     )
 }
 
+/// Covered by `mail_sync`'s
+/// `a_vanished_message_leaves_no_unread_badge_and_a_revived_one_restores_it`,
+/// including the zero-row branch of `recompute_thread`.
+///
 /// Recomputes one thread's aggregates on the caller's handle (and so inside the
 /// caller's transaction). For state changes that happen outside ingest, such as
 /// a message going `gone` or coming back.

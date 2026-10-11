@@ -327,19 +327,20 @@ pub(crate) fn credential_delete(
     secrets: &dyn SecretStore,
     id: i64,
 ) -> Result<(), String> {
-    // Refuse first, while nothing has been touched: a credential still in use
-    // keeps its secret.
-    let exists = {
-        let conn = store.lock_conn()?;
-        mail_store::check_credential_unused(&conn, id).map_err(db)?
-    };
-    if !exists {
+    // One acquisition for check, secret and row. Released between them, a source
+    // saved in the gap would make the row delete refuse after the secret was
+    // already gone, leaving a source that cannot authenticate. The keychain call
+    // can block on a prompt while the lock is held; for a rare, user-initiated
+    // delete that is the price of not stranding a secret. (A tombstone flag
+    // would avoid it but needs a schema change this task does not own.)
+    let conn = store.lock_conn()?;
+    // Refuses a credential in use before anything is touched.
+    if !mail_store::check_credential_unused(&conn, id).map_err(db)? {
         return Err("That credential no longer exists.".into());
     }
     // Secret before row: if the keychain fails the row survives, so the UI can
     // retry. The other order leaves a secret nothing points at.
     secrets.remove(id)?;
-    let conn = store.lock_conn()?;
     mail_store::delete_credential(&conn, id).map_err(db)?;
     Ok(())
 }
@@ -1773,47 +1774,73 @@ mod tests {
         assert!(secrets.get(id).unwrap().is_some());
     }
 
-    #[test]
-    fn an_unread_gone_message_leaves_no_badge() {
-        let (store, secrets) = setup();
-        let (_, mailbox) = one_source(&store, &secrets);
-        let (read_one, thread) =
-            ingest(&store, mailbox.id, &raw_mail("Hi", "g1", "one"), "owner/g1");
-        let raw = raw_mail("Re: Hi", "g2", "two");
-        let raw = String::from_utf8(raw)
+    /// A thread with one visible message and one `gone` one.
+    fn thread_with_a_gone_message(store: &SessionStore, secrets: &MemSecrets) -> (i64, i64, i64) {
+        let (_, mailbox) = one_source(store, secrets);
+        let (visible, thread) = ingest(store, mailbox.id, &raw_mail("Hi", "g1", "one"), "owner/g1");
+        let raw = String::from_utf8(raw_mail("Re: Hi", "g2", "two"))
             .unwrap()
             .replace("Subject:", "In-Reply-To: <g1@example.org>\r\nSubject:");
-        let (gone_one, thread2) = ingest(&store, mailbox.id, raw.as_bytes(), "owner/g2");
+        let (gone, thread2) = ingest(store, mailbox.id, raw.as_bytes(), "owner/g2");
         assert_eq!(thread, thread2);
+        let conn = store.lock_conn().unwrap();
+        conn.execute(
+            "UPDATE mail_message SET state = 'gone' WHERE id = ?1",
+            [gone],
+        )
+        .unwrap();
+        (visible, gone, thread)
+    }
+
+    // Covers `thread_message_rows`' and the recount's `state != 'gone'` filters:
+    // each assertion fails if its filter is removed.
+    #[test]
+    fn marking_read_clears_the_badge_despite_an_unread_gone_message() {
+        let (store, secrets) = setup();
+        let (_, _, thread) = thread_with_a_gone_message(&store, &secrets);
         {
             let conn = store.lock_conn().unwrap();
-            conn.execute(
-                "UPDATE mail_message SET is_read = 1 WHERE id = ?1",
-                [read_one],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE mail_message SET state = 'gone' WHERE id = ?1",
-                [gone_one],
-            )
-            .unwrap();
-            // Opening the thread marks what it shows as read.
             mail_store::set_threads_read(&conn, &[thread], true).unwrap();
+            // set_threads_read leaves the gone row alone, so it is still unread
+            // and only the recount's filter keeps it out of the badge.
+            let gone_unread: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM mail_message WHERE state = 'gone' AND is_read = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(gone_unread, 1);
         }
         let detail = thread_detail(&store, thread).unwrap();
         assert_eq!(detail.messages.len(), 1);
         assert_eq!(detail.thread.unread_count, 0);
+    }
 
-        // The recompute path agrees: the gone row is not counted.
+    #[test]
+    fn marking_unread_counts_only_the_messages_that_can_be_opened() {
+        let (store, secrets) = setup();
+        let (visible, gone, thread) = thread_with_a_gone_message(&store, &secrets);
         let conn = store.lock_conn().unwrap();
         conn.execute(
-            "UPDATE mail_message SET is_read = 0 WHERE id = ?1",
-            [gone_one],
+            "UPDATE mail_message SET is_read = 1 WHERE id = ?1",
+            [visible],
         )
         .unwrap();
+        conn.execute("UPDATE mail_message SET is_read = 0 WHERE id = ?1", [gone])
+            .unwrap();
+        mail_store::set_threads_read(&conn, &[thread], false).unwrap();
+        let unread: i64 = conn
+            .query_row(
+                "SELECT unread_count FROM mail_thread WHERE id = ?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // One visible message, so a badge of 2 would be one nobody can clear.
+        assert_eq!(unread, 1);
         let rows = mail_store::thread_message_rows(&conn, thread).unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(rows.iter().all(|r| r.is_read));
     }
 
     #[test]
