@@ -181,22 +181,7 @@ impl SesClient {
                     .read_to_string(&mut body);
                 Err(classify(status, error_type.as_deref(), &body, action))
             }
-            // Only a failure to connect proves nothing left this machine.
-            Err(ureq::Error::Transport(t))
-                if !body.is_empty()
-                    && !matches!(
-                        t.kind(),
-                        ureq::ErrorKind::Dns
-                            | ureq::ErrorKind::ConnectionFailed
-                            | ureq::ErrorKind::InvalidUrl
-                            | ureq::ErrorKind::UnknownScheme
-                    ) =>
-            {
-                Err(unconfirmed())
-            }
-            Err(_) => Err(network(
-                "Could not reach SES. Check the network connection and the SES region.",
-            )),
+            Err(ureq::Error::Transport(t)) => Err(transport_error(t.kind(), !body.is_empty())),
         }
     }
 
@@ -213,6 +198,23 @@ fn ses_paths(path: &str) -> (String, String) {
     let wire = uri_encode(path, true);
     let canonical = uri_encode(&wire, true);
     (wire, canonical)
+}
+
+/// Only a failure to connect proves nothing left this machine. Any other
+/// transport error on a send happened with the request possibly on the wire.
+fn transport_error(kind: ureq::ErrorKind, is_send: bool) -> SesError {
+    let never_left = matches!(
+        kind,
+        ureq::ErrorKind::Dns
+            | ureq::ErrorKind::ConnectionFailed
+            | ureq::ErrorKind::InvalidUrl
+            | ureq::ErrorKind::UnknownScheme
+    );
+    if is_send && !never_left {
+        unconfirmed()
+    } else {
+        network("Could not reach SES. Check the network connection and the SES region.")
+    }
 }
 
 fn unconfirmed() -> SesError {
@@ -555,6 +557,27 @@ mod tests {
         assert_eq!(
             classify(400, Some("MessageRejected"), "{}", "ses:SendEmail").message,
             "SES refused the message (MessageRejected)."
+        );
+    }
+
+    #[test]
+    fn a_send_cut_off_mid_request_is_unconfirmed_but_a_failed_connect_is_not() {
+        assert_eq!(
+            transport_error(ureq::ErrorKind::Io, true).kind,
+            SesErrorKind::Unconfirmed
+        );
+        assert_eq!(
+            transport_error(ureq::ErrorKind::ConnectionFailed, true).kind,
+            SesErrorKind::Network
+        );
+        assert_eq!(
+            transport_error(ureq::ErrorKind::Dns, true).kind,
+            SesErrorKind::Network
+        );
+        // A read is safe to repeat whatever happened.
+        assert_eq!(
+            transport_error(ureq::ErrorKind::Io, false).kind,
+            SesErrorKind::Network
         );
     }
 }

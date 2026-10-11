@@ -18,9 +18,10 @@ use crate::mail_store::Recipient;
 /// the root, so a longer chain loses its middle.
 pub(crate) const MAX_REFERENCES: usize = 20;
 
-/// SES's raw-message limit. Base64 has already inflated attachments by 4/3 in
-/// the bytes we measure, so this is checked on the finished message.
-pub(crate) const SES_RAW_LIMIT: usize = 40 * 1024 * 1024;
+/// SES's raw-message limit: AWS documents 40 MB, which is 40,000,000 bytes and
+/// not 40 MiB. Base64 has already inflated attachments by 4/3 in the bytes we
+/// measure, so this is checked on the finished message.
+pub(crate) const SES_RAW_LIMIT: usize = 40_000_000;
 
 pub(crate) struct LoadedAttachment {
     pub filename: String,

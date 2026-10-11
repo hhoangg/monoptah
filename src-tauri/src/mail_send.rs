@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::aws_s3::S3ErrorKind;
+use crate::aws_ses::SesErrorKind;
 use crate::mail::{refresh_identities, AwsClients};
 use crate::mail_build::{self, LoadedAttachment, Outgoing, SES_RAW_LIMIT};
 use crate::mail_mime::{parse_mail, MailAddress};
@@ -478,7 +479,7 @@ fn too_big() -> String {
     format!(
         "This message is over the {} MB SES accepts once its attachments are encoded. \
          Remove or shrink an attachment.",
-        SES_RAW_LIMIT / (1024 * 1024)
+        SES_RAW_LIMIT / 1_000_000
     )
 }
 
@@ -547,6 +548,13 @@ fn build_message(loaded: &Loaded) -> Result<Built, String> {
     if row.state == "sending" {
         return Err("This message is already being sent.".into());
     }
+    if row.state == "unconfirmed" {
+        return Err(
+            "SES may already have delivered this message. Check the recipient, then edit and \
+             save it to send it again."
+                .into(),
+        );
+    }
     if !mail_build::valid_address(&row.from_addr) {
         return Err(format!("'{}' is not a valid From address.", row.from_addr));
     }
@@ -574,6 +582,20 @@ fn build_message(loaded: &Loaded) -> Result<Built, String> {
         .filter_map(|a| a.cid.as_ref())
         .map(|c| c.to_ascii_lowercase())
         .collect();
+    // The draft id salts our cids so they cannot equal one inside the quoted
+    // original. That is a convention of the composer, so check the result: a
+    // shared cid makes the recipient's client show the quoted image in place
+    // of ours, and nothing else would fail.
+    if let Some(quoted) = row.quoted_html.as_deref() {
+        let theirs: HashSet<String> = body_cids(quoted, None).into_iter().collect();
+        if let Some(clash) = attached.iter().find(|c| theirs.contains(*c)) {
+            return Err(format!(
+                "An image in this message has the same internal id ({clash}) as one in the \
+                 message being quoted, so the recipient would see the wrong picture. \
+                 Remove the image and add it again."
+            ));
+        }
+    }
     if let Some(missing) = body_cids(html, row.quoted_html.as_deref())
         .into_iter()
         .find(|c| !attached.contains(c))
@@ -613,6 +635,56 @@ fn build_message(loaded: &Loaded) -> Result<Built, String> {
 }
 
 // ── sending ────────────────────────────────────────────────────────
+
+/// Why a send did not complete. `retry_safe` is the part that matters: after
+/// a connection that dropped with the request out, SES may have delivered, so
+/// a Retry button there sends the email twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendError {
+    /// `form` for anything caught before SES was called, else the SES error
+    /// kind (`rejected`, `unconfirmed`, `network`, ...).
+    pub kind: &'static str,
+    pub message: String,
+    /// False when the message may have been delivered. The row is then
+    /// `unconfirmed`, not `failed`, and is not sent again without an edit.
+    pub retry_safe: bool,
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for SendError {
+    fn from(message: String) -> Self {
+        Self {
+            kind: "form",
+            message,
+            retry_safe: true,
+        }
+    }
+}
+
+impl From<&str> for SendError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+/// Only these mean SES certainly did not take the message. `Other` includes
+/// 5xx answers and anything unreadable, which prove nothing.
+fn nothing_was_sent(kind: SesErrorKind) -> bool {
+    matches!(
+        kind,
+        SesErrorKind::Rejected
+            | SesErrorKind::AccessDenied
+            | SesErrorKind::InvalidCredentials
+            | SesErrorKind::ClockSkew
+            | SesErrorKind::Network
+    )
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -655,10 +727,10 @@ pub(crate) fn outbox_send(
     store: &SessionStore,
     clients: &dyn AwsClients,
     id: i64,
-) -> Result<SendReport, String> {
+) -> Result<SendReport, SendError> {
     let loaded = load(store, id)?;
     if let Some(first) = find_problems(store, clients, &loaded)?.into_iter().next() {
-        return Err(first.message);
+        return Err(first.message.into());
     }
     let built = build_message(&loaded)?;
     // Clients before the claim: a missing key is a form error that must leave
@@ -678,11 +750,16 @@ pub(crate) fn outbox_send(
     let ses_message_id = match ses.send_raw(&row.from_addr, &destination, &built.raw) {
         Ok(ses_id) => ses_id,
         Err(error) => {
-            let message = error.message;
+            let retry_safe = nothing_was_sent(error.kind);
             if let Ok(conn) = store.lock_conn() {
-                let _ = mail_store::mark_outbox_failed(&conn, id, &message);
+                let state = if retry_safe { "failed" } else { "unconfirmed" };
+                let _ = mail_store::mark_outbox_failed(&conn, id, &error.message, state);
             }
-            return Err(message);
+            return Err(SendError {
+                kind: crate::mail::ses_kind(error.kind),
+                message: error.message,
+                retry_safe,
+            });
         }
     };
 
@@ -1143,9 +1220,15 @@ mod tests {
         }
     }
 
-    fn send(w: &World, d: OutboxDraft) -> Result<SendReport, String> {
+    fn send(w: &World, d: OutboxDraft) -> Result<SendReport, SendError> {
         let id = outbox_save(&w.store, d)?;
         outbox_send(&w.store, &w.fake, id)
+    }
+
+    impl SendError {
+        fn contains(&self, needle: &str) -> bool {
+            self.message.contains(needle)
+        }
     }
 
     fn count(w: &World, sql: &str) -> i64 {
@@ -1411,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn a_send_cut_off_by_a_quit_comes_back_as_failed_not_as_a_draft() {
+    fn a_send_cut_off_by_a_quit_comes_back_unconfirmed_not_as_a_draft() {
         let w = world();
         let id = outbox_save(&w.store, draft("owner@byptah.com", "ann@example.org")).unwrap();
         let conn = w.store.lock_conn().unwrap();
@@ -1419,8 +1502,13 @@ mod tests {
             .unwrap();
         assert_eq!(mail_store::fail_interrupted_sends(&conn).unwrap(), 1);
         let row = mail_store::get_outbox(&conn, id).unwrap().unwrap();
-        assert_eq!(row.state, "failed");
+        assert_eq!(row.state, "unconfirmed");
         assert!(row.last_error.unwrap().contains("may have been delivered"));
+        drop(conn);
+        // And it is not offered for sending again as it stands.
+        let error = outbox_send(&w.store, &w.fake, id).unwrap_err();
+        assert!(error.message.contains("may already have delivered"));
+        assert!(w.fake.log.lock().unwrap().sends.is_empty());
     }
 
     #[test]
@@ -1447,12 +1535,12 @@ mod tests {
         assert_eq!(w.fake.log.lock().unwrap().sends.len(), 1);
     }
 
-    fn sparse_attachment(dir: &std::path::Path, mib: u64) -> OutboxAttachment {
+    fn sparse_attachment(dir: &std::path::Path, bytes: u64) -> OutboxAttachment {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("big.bin");
         std::fs::File::create(&path)
             .unwrap()
-            .set_len(mib * 1024 * 1024)
+            .set_len(bytes)
             .unwrap();
         OutboxAttachment {
             path: path.to_string_lossy().into_owned(),
@@ -1465,8 +1553,8 @@ mod tests {
     #[test]
     fn an_attachment_that_cannot_fit_is_refused_without_being_read() {
         let dir = std::env::temp_dir().join(format!("mono-send-{}", uuid::Uuid::new_v4()));
-        // 31 MiB is 41 MiB once base64 has inflated it.
-        let error = load_attachments(&[sparse_attachment(&dir, 31)])
+        // 31 MB is 41 MB once base64 has inflated it.
+        let error = load_attachments(&[sparse_attachment(&dir, 31_000_000)])
             .err()
             .expect("refused");
         assert!(error.contains("40 MB"), "{error}");
@@ -1477,10 +1565,10 @@ mod tests {
     fn a_message_over_the_ses_limit_is_a_form_error_before_the_call() {
         let w = world();
         let dir = std::env::temp_dir().join(format!("mono-send-{}", uuid::Uuid::new_v4()));
-        // 30 MiB is exactly 40 MiB by the 4/3 rule, so it passes the early
-        // check; the line breaks base64 adds are what push the message over.
+        // 29.5 MB is 39.3 MB by the 4/3 rule, so it passes the early check;
+        // the line breaks base64 adds are what push the message past 40 MB.
         let mut d = draft("owner@byptah.com", "ann@example.org");
-        d.attachments = vec![sparse_attachment(&dir, 30)];
+        d.attachments = vec![sparse_attachment(&dir, 29_500_000)];
         let id = outbox_save(&w.store, d).unwrap();
         let error = outbox_send(&w.store, &w.fake, id).unwrap_err();
         assert!(error.contains("40 MB"), "{error}");
@@ -1881,21 +1969,41 @@ mod tests {
     }
 
     #[test]
-    fn the_sent_archive_is_not_a_place_to_set_up_a_mailbox() {
+    fn no_prefix_that_overlaps_the_sent_archive_can_be_a_mailbox() {
         let w = world();
-        let error = crate::mail::mailboxes_upsert(
-            &w.store,
-            w.a,
-            vec![MailboxInput {
-                address: "x@byptah.com".into(),
-                s3_prefix: "sent/".into(),
-                display_name: "X".into(),
-                color: None,
-                sort_order: 0,
-            }],
-        )
-        .unwrap_err();
-        assert!(error.contains("reserved"), "{error}");
+        for prefix in ["sent/", "sent", "s", "", "se", "sent/2024/", "sent/x"] {
+            let error = crate::mail::mailboxes_upsert(
+                &w.store,
+                w.a,
+                vec![MailboxInput {
+                    address: "x@byptah.com".into(),
+                    s3_prefix: prefix.into(),
+                    display_name: "X".into(),
+                    color: None,
+                    sort_order: 0,
+                }],
+            )
+            .unwrap_err();
+            assert!(error.contains("reserved"), "{prefix:?}: {error}");
+        }
+        // Neighbours that S3 would not confuse with it are fine.
+        for prefix in ["sentinel/", "owner/", "a/sent/"] {
+            crate::mail::mailboxes_upsert(
+                &w.store,
+                w.a,
+                vec![MailboxInput {
+                    address: format!(
+                        "{}@byptah.com",
+                        prefix.trim_end_matches('/').replace('/', "-")
+                    ),
+                    s3_prefix: prefix.into(),
+                    display_name: "X".into(),
+                    color: None,
+                    sort_order: 0,
+                }],
+            )
+            .unwrap_or_else(|e| panic!("{prefix}: {e}"));
+        }
     }
 
     #[test]
@@ -2018,6 +2126,71 @@ mod tests {
 
         outbox_delete(&w.store, id).unwrap();
         assert!(outbox_list(&w.store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_send_that_may_have_been_delivered_cannot_be_retried_as_it_stands() {
+        for kind in [SesErrorKind::Unconfirmed, SesErrorKind::Other] {
+            let w = world();
+            *w.fake.ses_error.lock().unwrap() = Some(SesError {
+                kind,
+                message: "The connection dropped.".into(),
+            });
+            let id = outbox_save(&w.store, draft("owner@byptah.com", "ann@example.org")).unwrap();
+            let error = outbox_send(&w.store, &w.fake, id).unwrap_err();
+            assert!(!error.retry_safe, "{kind:?}");
+            assert_eq!(text(&w, "SELECT state FROM mail_outbox"), "unconfirmed");
+            // The next click is refused and SES hears nothing more.
+            *w.fake.ses_error.lock().unwrap() = None;
+            let again = outbox_send(&w.store, &w.fake, id).unwrap_err();
+            assert!(again.message.contains("may already have delivered"));
+            assert_eq!(w.fake.log.lock().unwrap().sends.len(), 1);
+            // Editing and saving is the deliberate act that re-arms it.
+            let mut edit = draft("owner@byptah.com", "ann@example.org");
+            edit.id = Some(id);
+            outbox_save(&w.store, edit).unwrap();
+            outbox_send(&w.store, &w.fake, id).unwrap();
+            assert_eq!(w.fake.log.lock().unwrap().sends.len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_refusal_says_it_is_safe_to_retry_and_carries_its_kind() {
+        let w = world();
+        *w.fake.ses_error.lock().unwrap() = Some(SesError {
+            kind: SesErrorKind::Rejected,
+            message: "no".into(),
+        });
+        let id = outbox_save(&w.store, draft("owner@byptah.com", "ann@example.org")).unwrap();
+        let error = outbox_send(&w.store, &w.fake, id).unwrap_err();
+        assert_eq!((error.kind, error.retry_safe), ("rejected", true));
+        assert_eq!(text(&w, "SELECT state FROM mail_outbox"), "failed");
+        let form = outbox_send(&w.store, &w.fake, 9999).unwrap_err();
+        assert_eq!((form.kind, form.retry_safe), ("form", true));
+    }
+
+    #[test]
+    fn an_image_sharing_a_cid_with_the_quoted_original_is_refused() {
+        let w = world();
+        let dir = std::env::temp_dir().join(format!("mono-send-{}", uuid::Uuid::new_v4()));
+        let mut att = sparse_attachment(&dir, 8);
+        // What a composer given the same draft id for every draft would emit.
+        let cid = "mono-new.att1@monoptah.local";
+        att.cid = Some(cid.into());
+        let quoted = format!(r#"<blockquote><img src="cid:{cid}"></blockquote>"#);
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![att];
+        d.body_html = Some(format!(r#"<p><img src="cid:{cid}"></p>{quoted}"#));
+        d.quoted_html = Some(quoted);
+        let id = outbox_save(&w.store, d).unwrap();
+        let error = outbox_send(&w.store, &w.fake, id).unwrap_err();
+        assert!(
+            error.message.contains("same internal id"),
+            "{}",
+            error.message
+        );
+        assert!(w.fake.log.lock().unwrap().sends.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn count_cred(conn: &rusqlite::Connection) -> i64 {

@@ -3438,7 +3438,7 @@ pub(crate) fn update_outbox(conn: &Connection, id: i64, w: &OutboxWrite) -> rusq
            subject = ?11, body_text = ?12, body_html = ?13, body_json = ?14,
            quoted_html = ?15, attachments_json = ?16, in_reply_to = ?17,
            references_json = ?18, state = 'draft', last_error = NULL, updated_at = ?19
-         WHERE id = ?1 AND state IN ('draft', 'queued', 'failed')",
+         WHERE id = ?1 AND state IN ('draft', 'queued', 'failed', 'unconfirmed')",
         params![
             id,
             w.account_id,
@@ -3527,21 +3527,29 @@ pub(crate) fn set_outbox_thread(
     Ok(())
 }
 
-pub(crate) fn mark_outbox_failed(conn: &Connection, id: i64, error: &str) -> rusqlite::Result<()> {
+/// `state` is `failed` when SES certainly did not take the message, and
+/// `unconfirmed` when it may have. The second is not claimable: sending it
+/// again takes an explicit save, so a Retry button cannot double-send.
+pub(crate) fn mark_outbox_failed(
+    conn: &Connection,
+    id: i64,
+    error: &str,
+    state: &str,
+) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE mail_outbox SET state = 'failed', last_error = ?2, updated_at = ?3
+        "UPDATE mail_outbox SET state = ?4, last_error = ?2, updated_at = ?3
          WHERE id = ?1 AND state = 'sending'",
-        params![id, error, now_millis()],
+        params![id, error, now_millis(), state],
     )?;
     Ok(())
 }
 
 /// A row still `sending` at startup was cut off by a quit or a crash, and
-/// nobody knows whether SES took it. It becomes `failed` with that said, so the
+/// nobody knows whether SES took it. It becomes `unconfirmed`, so the
 /// person decides; it is never retried on its own.
 pub(crate) fn fail_interrupted_sends(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute(
-        "UPDATE mail_outbox SET state = 'failed', updated_at = ?1,
+        "UPDATE mail_outbox SET state = 'unconfirmed', updated_at = ?1,
            last_error = 'Monoptah quit while this was being sent. It may have been delivered, so check the recipient before sending it again.'
          WHERE state = 'sending'",
         params![now_millis()],

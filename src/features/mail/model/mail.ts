@@ -128,8 +128,9 @@ export const mailOutboxSave = (draft: OutboxDraft) =>
   invoke<number>("mail_outbox_save", { draft });
 
 /**
- * Sends once and never retries. A rejection is recorded on the row and thrown;
- * a send that succeeded resolves even when the sent/ copy or the local record
+ * Sends once and never retries. A failure is recorded on the row and thrown
+ * as a SendError; when its `retrySafe` is false the message may have been
+ * delivered. A send that succeeded resolves even when the sent/ copy or the local record
  * failed, and says so in the report.
  */
 export const mailOutboxSend = (id: number) =>

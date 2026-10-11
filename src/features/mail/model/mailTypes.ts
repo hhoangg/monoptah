@@ -421,7 +421,13 @@ export type OutboxDraft = {
   attachments: OutboxAttachment[];
 };
 
-export type OutboxState = "draft" | "queued" | "sending" | "sent" | "failed";
+/**
+ * `unconfirmed`: SES may have delivered it (a dropped connection, or a quit
+ * mid-send). Show "Check the recipient first", never Retry; saving an edit
+ * re-arms it.
+ */
+export type OutboxState =
+  "draft" | "queued" | "sending" | "sent" | "failed" | "unconfirmed";
 
 export type OutboxRow = Omit<OutboxDraft, "id" | "replyToMessageId"> & {
   id: number;
@@ -482,4 +488,13 @@ export type SendReport = {
    * a warning; never offer a retry.
    */
   bookkeepingError: string | null;
+};
+
+/** What `mail_outbox_send` rejects with. */
+export type SendError = {
+  /** `form` for anything caught before SES was called. */
+  kind: "form" | "rejected" | "unconfirmed" | "network" | string;
+  message: string;
+  /** False when the message may have been delivered: do not offer Retry. */
+  retrySafe: boolean;
 };

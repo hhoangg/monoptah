@@ -486,9 +486,15 @@ pub(crate) fn mailboxes_upsert(
             row
         })
         .collect();
-    if rows.iter().any(|r| r.s3_prefix == mail_store::SENT_PREFIX) {
+    // S3 `prefix=` is a literal string prefix, so "", "s" and "sent" list the
+    // sent copies too, and "sent/2024/" is inside them. Such a mailbox would
+    // file our own sent mail as unread inbound.
+    if rows.iter().any(|r| {
+        mail_store::SENT_PREFIX.starts_with(r.s3_prefix.as_str())
+            || r.s3_prefix.starts_with(mail_store::SENT_PREFIX)
+    }) {
         return Err(format!(
-            "Prefix '{}' is reserved for the copies of mail you send.",
+            "A prefix cannot be empty, or overlap '{}', which is reserved for the copies of mail you send.",
             mail_store::SENT_PREFIX
         ));
     }
@@ -681,7 +687,7 @@ fn s3_kind(kind: S3ErrorKind) -> &'static str {
     }
 }
 
-fn ses_kind(kind: SesErrorKind) -> &'static str {
+pub(crate) fn ses_kind(kind: SesErrorKind) -> &'static str {
     match kind {
         SesErrorKind::AccessDenied => "accessDenied",
         SesErrorKind::InvalidCredentials => "invalidCredentials",
@@ -1667,13 +1673,21 @@ pub fn mail_outbox_save(
     mail_send::outbox_save(&store, draft)
 }
 
-/// Sends once. A failure is reported and recorded, never retried here.
+/// Sends once. A failure is reported and recorded, never retried here. The
+/// error says whether sending again is safe: after `unconfirmed` it is not.
 #[tauri::command]
-pub async fn mail_outbox_send(app: AppHandle, id: i64) -> Result<mail_send::SendReport, String> {
-    let report = blocking(app.clone(), move |store, mail| {
-        mail_send::outbox_send(store, &*mail.clients, id)
+pub async fn mail_outbox_send(
+    app: AppHandle,
+    id: i64,
+) -> Result<mail_send::SendReport, mail_send::SendError> {
+    let worker = app.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let store = worker.state::<SessionStore>();
+        let mail = worker.state::<MailState>();
+        mail_send::outbox_send(&store, &*mail.clients, id)
     })
-    .await;
+    .await
+    .unwrap_or_else(|e| Err(e.to_string().into()));
     // Also after an error: the row's state changed either way.
     let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
     report
