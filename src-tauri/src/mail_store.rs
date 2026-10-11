@@ -781,6 +781,341 @@ pub(crate) fn set_sync_state(conn: &Connection, state: &MailSyncState) -> rusqli
     Ok(())
 }
 
+// ── threads and messages ───────────────────────────────────────────
+
+pub(crate) struct NewMessage<'a> {
+    pub mailbox_id: i64,
+    pub thread_id: i64,
+    pub object_id: Option<i64>,
+    pub direction: &'a str,
+    pub message_id_hdr: Option<&'a str>,
+    pub in_reply_to: Option<&'a str>,
+    pub subject: &'a str,
+    pub subject_key: &'a str,
+    pub from_name: Option<&'a str>,
+    pub from_addr: &'a str,
+    pub reply_to_addr: Option<&'a str>,
+    pub to_json: &'a str,
+    pub cc_json: &'a str,
+    pub bcc_json: &'a str,
+    /// Epoch seconds.
+    pub date_utc: i64,
+    /// Epoch seconds.
+    pub received_at: i64,
+    pub snippet: &'a str,
+    pub body_text: Option<&'a str>,
+    /// Already sanitised.
+    pub body_html: Option<&'a str>,
+    pub has_attachments: bool,
+    pub size_bytes: i64,
+    pub spf: Option<&'a str>,
+    pub dkim: Option<&'a str>,
+    pub dmarc: Option<&'a str>,
+    pub headers_json: &'a str,
+}
+
+pub(crate) struct NewAttachment<'a> {
+    pub part_index: i64,
+    pub filename: &'a str,
+    pub mime_type: &'a str,
+    pub size_bytes: i64,
+    pub content_id: Option<&'a str>,
+    pub is_inline: bool,
+}
+
+/// One message as the thread aggregates need it.
+pub(crate) struct ThreadMessageRow {
+    pub subject: String,
+    pub subject_key: String,
+    pub from_name: Option<String>,
+    pub from_addr: String,
+    pub reply_to_addr: Option<String>,
+    pub to_json: String,
+    pub cc_json: String,
+    pub date_utc: i64,
+    pub is_read: bool,
+    pub has_attachments: bool,
+}
+
+pub(crate) struct ThreadAggregates {
+    pub subject: String,
+    pub subject_key: String,
+    pub participants_json: String,
+    pub first_message_at: i64,
+    pub last_message_at: i64,
+    pub message_count: i64,
+    pub unread_count: i64,
+    pub has_attachments: bool,
+}
+
+pub(crate) fn mailbox_account_id(conn: &Connection, mailbox_id: i64) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT account_id FROM mail_mailbox WHERE id = ?1",
+        params![mailbox_id],
+        |row| row.get(0),
+    )
+}
+
+/// Addresses of every mailbox under the source, lowercased.
+pub(crate) fn account_mailbox_addresses(
+    conn: &Connection,
+    account_id: i64,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT address FROM mail_mailbox WHERE account_id = ?1")?;
+    let rows = stmt.query_map(params![account_id], |row| row.get::<_, String>(0))?;
+    rows.map(|r| r.map(|a| a.to_ascii_lowercase())).collect()
+}
+
+/// `(message id, thread id)` of a stored message with this `Message-ID`.
+pub(crate) fn find_message_by_header(
+    conn: &Connection,
+    mailbox_id: i64,
+    message_id_hdr: &str,
+) -> rusqlite::Result<Option<(i64, i64)>> {
+    conn.query_row(
+        "SELECT id, thread_id FROM mail_message
+         WHERE mailbox_id = ?1 AND message_id_hdr = ?2",
+        params![mailbox_id, message_id_hdr],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+/// Threads in this mailbox that already hold a message related to the new one,
+/// ascending. A stored message relates when it is one of `refs`, when it
+/// references the new message's own id, or when it references any of `refs`
+/// (siblings whose shared parent has not arrived yet).
+pub(crate) fn threads_for_refs(
+    conn: &Connection,
+    mailbox_id: i64,
+    own_hdr: Option<&str>,
+    refs: &[String],
+) -> rusqlite::Result<Vec<i64>> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut by_hdr = conn.prepare(
+        "SELECT thread_id FROM mail_message WHERE mailbox_id = ?1 AND message_id_hdr = ?2",
+    )?;
+    let mut by_ref = conn.prepare(
+        "SELECT DISTINCT m.thread_id FROM mail_message_ref r
+         JOIN mail_message m ON m.id = r.message_id
+         WHERE m.mailbox_id = ?1 AND r.ref_hdr = ?2",
+    )?;
+    for hdr in refs {
+        for id in by_hdr.query_map(params![mailbox_id, hdr], |row| row.get::<_, i64>(0))? {
+            found.insert(id?);
+        }
+        for id in by_ref.query_map(params![mailbox_id, hdr], |row| row.get::<_, i64>(0))? {
+            found.insert(id?);
+        }
+    }
+    if let Some(own) = own_hdr {
+        for id in by_ref.query_map(params![mailbox_id, own], |row| row.get::<_, i64>(0))? {
+            found.insert(id?);
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
+/// `(thread id, participants_json)` of threads with this key whose last
+/// message is at or after `since`, newest first.
+pub(crate) fn subject_thread_candidates(
+    conn: &Connection,
+    mailbox_id: i64,
+    subject_key: &str,
+    since: i64,
+) -> rusqlite::Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, participants_json FROM mail_thread
+         WHERE mailbox_id = ?1 AND subject_key = ?2 AND last_message_at >= ?3
+         ORDER BY last_message_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map(params![mailbox_id, subject_key, since], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    rows.collect()
+}
+
+/// Creates an empty thread; the caller fills the aggregates after inserting
+/// the first message.
+pub(crate) fn insert_thread(
+    conn: &Connection,
+    mailbox_id: i64,
+    subject: &str,
+    subject_key: &str,
+    first_message_at: i64,
+) -> rusqlite::Result<i64> {
+    let account_id = mailbox_account_id(conn, mailbox_id)?;
+    conn.execute(
+        "INSERT INTO mail_thread
+           (account_id, mailbox_id, subject, subject_key, participants_json,
+            first_message_at, last_message_at)
+         VALUES (?1, ?2, ?3, ?4, '[]', ?5, ?5)",
+        params![
+            account_id,
+            mailbox_id,
+            subject,
+            subject_key,
+            first_message_at
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(crate) fn insert_message(conn: &Connection, m: &NewMessage) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO mail_message
+           (mailbox_id, thread_id, object_id, direction, message_id_hdr, in_reply_to,
+            subject, subject_key, from_name, from_addr, reply_to_addr,
+            to_json, cc_json, bcc_json, date_utc, received_at, snippet,
+            body_text, body_html, has_attachments, size_bytes, spf, dkim, dmarc,
+            headers_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+        params![
+            m.mailbox_id,
+            m.thread_id,
+            m.object_id,
+            m.direction,
+            m.message_id_hdr,
+            m.in_reply_to,
+            m.subject,
+            m.subject_key,
+            m.from_name,
+            m.from_addr,
+            m.reply_to_addr,
+            m.to_json,
+            m.cc_json,
+            m.bcc_json,
+            m.date_utc,
+            m.received_at,
+            m.snippet,
+            m.body_text,
+            m.body_html,
+            m.has_attachments,
+            m.size_bytes,
+            m.spf,
+            m.dkim,
+            m.dmarc,
+            m.headers_json,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(crate) fn insert_message_refs(
+    conn: &Connection,
+    message_id: i64,
+    refs: &[String],
+) -> rusqlite::Result<()> {
+    let mut stmt = conn
+        .prepare("INSERT OR IGNORE INTO mail_message_ref (message_id, ref_hdr) VALUES (?1, ?2)")?;
+    for hdr in refs {
+        stmt.execute(params![message_id, hdr])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn insert_attachments(
+    conn: &Connection,
+    message_id: i64,
+    attachments: &[NewAttachment],
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO mail_attachment
+           (message_id, part_index, filename, mime_type, size_bytes, content_id, is_inline)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for a in attachments {
+        stmt.execute(params![
+            message_id,
+            a.part_index,
+            a.filename,
+            a.mime_type,
+            a.size_bytes,
+            a.content_id,
+            a.is_inline,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Messages of a thread, oldest first.
+pub(crate) fn thread_message_rows(
+    conn: &Connection,
+    thread_id: i64,
+) -> rusqlite::Result<Vec<ThreadMessageRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT subject, subject_key, from_name, from_addr, reply_to_addr, to_json,
+                cc_json, date_utc, is_read, has_attachments
+         FROM mail_message WHERE thread_id = ?1 ORDER BY date_utc, id",
+    )?;
+    let rows = stmt.query_map(params![thread_id], |row| {
+        Ok(ThreadMessageRow {
+            subject: row.get(0)?,
+            subject_key: row.get(1)?,
+            from_name: row.get(2)?,
+            from_addr: row.get(3)?,
+            reply_to_addr: row.get(4)?,
+            to_json: row.get(5)?,
+            cc_json: row.get(6)?,
+            date_utc: row.get(7)?,
+            is_read: row.get(8)?,
+            has_attachments: row.get(9)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub(crate) fn update_thread_aggregates(
+    conn: &Connection,
+    thread_id: i64,
+    a: &ThreadAggregates,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_thread SET subject = ?2, subject_key = ?3, participants_json = ?4,
+           first_message_at = ?5, last_message_at = ?6, message_count = ?7,
+           unread_count = ?8, has_attachments = ?9
+         WHERE id = ?1",
+        params![
+            thread_id,
+            a.subject,
+            a.subject_key,
+            a.participants_json,
+            a.first_message_at,
+            a.last_message_at,
+            a.message_count,
+            a.unread_count,
+            a.has_attachments,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Moves everything hanging off `loser` onto `survivor` and deletes `loser`.
+/// A star on the loser carries over; folder rows the survivor already has are
+/// dropped with the loser by cascade. Aggregates are the caller's to refresh.
+pub(crate) fn absorb_thread(conn: &Connection, survivor: i64, loser: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_message SET thread_id = ?1 WHERE thread_id = ?2",
+        params![survivor, loser],
+    )?;
+    conn.execute(
+        "UPDATE OR IGNORE mail_folder_member SET thread_id = ?1 WHERE thread_id = ?2",
+        params![survivor, loser],
+    )?;
+    conn.execute(
+        "UPDATE mail_outbox SET thread_id = ?1 WHERE thread_id = ?2",
+        params![survivor, loser],
+    )?;
+    conn.execute(
+        "UPDATE mail_thread SET is_starred = 1
+         WHERE id = ?1 AND (SELECT is_starred FROM mail_thread WHERE id = ?2) = 1",
+        params![survivor, loser],
+    )?;
+    conn.execute("DELETE FROM mail_thread WHERE id = ?1", params![loser])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

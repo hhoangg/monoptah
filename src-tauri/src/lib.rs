@@ -31,6 +31,7 @@ mod macos;
 mod macos_background;
 mod mail_mime;
 mod mail_store;
+mod mail_thread;
 mod mcp;
 mod menu;
 mod mono;
