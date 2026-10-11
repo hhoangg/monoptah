@@ -218,6 +218,9 @@ pub(crate) fn outbox_list(store: &SessionStore) -> Result<Vec<OutboxRow>, String
     mail_store::list_outbox(&conn).map_err(db)
 }
 
+/// Test-only: production deletes go through [`outbox_delete_releasing`], which
+/// reads the row state under the same lock as the delete.
+#[cfg(test)]
 pub(crate) fn outbox_delete(store: &SessionStore, id: i64) -> Result<(), String> {
     let conn = store.lock_conn()?;
     if mail_store::delete_outbox(&conn, id).map_err(db)? {
@@ -290,6 +293,11 @@ pub(crate) fn release_staged(
         // Nothing was ever staged here.
         return 0;
     };
+    // The store mutex is held across the unlinks on purpose. Dropping it after
+    // the `still_used` snapshot would let a row that lists one of these files
+    // be saved before the unlink, and that file would then be deleted out from
+    // under it: a race traded for a latency win. The unlinks are local
+    // metadata operations on a handful of files, so the hold is short.
     let Ok(conn) = store.lock_conn() else {
         return 0;
     };
@@ -337,8 +345,31 @@ pub(crate) fn release_staged(
     removed
 }
 
-fn attachment_paths(row: &OutboxRow) -> Vec<String> {
+/// The staged files a row gives up when it is saved over or deleted. Empty for
+/// two states, for DIFFERENT reasons, so do not merge them in a later cleanup:
+///
+/// - `sending`: mid-flight. Save and delete are refused for it anyway; this is
+///   only the backstop for a state that changed under us.
+/// - `unconfirmed`: SES may already have delivered this message. The staged file
+///   is then the ONLY copy of the attachment (no S3 archive, no raw source, and
+///   `ensure_attachment` needs an S3 object). A save of such a row is allowed
+///   and keeps the edit, so the row can stop listing a file; releasing it then
+///   would destroy the evidence of what was sent. Kept files are not reclaimed
+///   later: they leak, by choice, since a leak is recoverable and a loss is not.
+///
+/// Every release call site must take its paths from here, never from the row
+/// directly. The decision sits at the call sites and not in `release_staged`
+/// because that function only sees paths, and by the time it runs the row no
+/// longer lists them, so the state is the one thing it cannot recover.
+fn releasable_paths(row: &OutboxRow) -> Vec<String> {
+    if protects_staged_files(&row.state) {
+        return Vec::new();
+    }
     row.attachments.iter().map(|a| a.path.clone()).collect()
+}
+
+fn protects_staged_files(state: &str) -> bool {
+    matches!(state, "sending" | "unconfirmed")
 }
 
 /// [`outbox_save`], then frees the staged files this save dropped from the draft.
@@ -350,15 +381,22 @@ pub(crate) fn outbox_save_releasing(
     let before = match draft.id {
         Some(id) => {
             let conn = store.lock_conn()?;
-            mail_store::get_outbox(&conn, id)
-                .map_err(db)?
-                .map(|row| attachment_paths(&row))
-                .unwrap_or_default()
+            mail_store::get_outbox(&conn, id).map_err(db)?
         }
-        None => Vec::new(),
+        None => None,
     };
     let id = outbox_save(store, draft)?;
-    release_staged(store, dir, &before);
+    // Read again after the save: a send can have gone unconfirmed between the
+    // first read and the save, and `unconfirmed` keeps its state through a save.
+    let after_protected = {
+        let conn = store.lock_conn()?;
+        mail_store::get_outbox(&conn, id)
+            .map_err(db)?
+            .is_some_and(|row| protects_staged_files(&row.state))
+    };
+    if let Some(row) = before.filter(|_| !after_protected) {
+        release_staged(store, dir, &releasable_paths(&row));
+    }
     Ok(id)
 }
 
@@ -370,14 +408,19 @@ pub(crate) fn outbox_delete_releasing(
     dir: &std::path::Path,
     id: i64,
 ) -> Result<(), String> {
+    // Read and delete under one lock, so the state that decides what is
+    // released is the state the row had when it was deleted.
     let paths = {
         let conn = store.lock_conn()?;
-        mail_store::get_outbox(&conn, id)
-            .map_err(db)?
-            .map(|row| attachment_paths(&row))
-            .unwrap_or_default()
+        let row = mail_store::get_outbox(&conn, id).map_err(db)?;
+        if mail_store::delete_outbox(&conn, id).map_err(db)? {
+            row.map(|row| releasable_paths(&row)).unwrap_or_default()
+        } else if row.is_some() {
+            return Err("This message is being sent and cannot be deleted yet.".into());
+        } else {
+            Vec::new()
+        }
     };
-    outbox_delete(store, id)?;
     release_staged(store, dir, &paths);
     Ok(())
 }
@@ -2628,6 +2671,10 @@ mod tests {
         let mut a = draft("owner@byptah.com", "ann@example.org");
         a.attachments = vec![file.clone()];
         outbox_save_releasing(&w.store, &dir, a).unwrap();
+        // The upper-case variant only exercises the inode mechanism on a
+        // case-insensitive volume (default macOS/Windows). On a case-sensitive
+        // one it names a file that does not exist and degrades to a NotFound
+        // no-op, so a green Linux run is not proof that part works.
         for variant in [
             format!("{}/./{leaf}", dir.display()),
             format!("{}//{leaf}", dir.display()),
@@ -2643,6 +2690,68 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn set_state(w: &World, state: &str) {
+        w.store
+            .lock_conn()
+            .unwrap()
+            .execute("UPDATE mail_outbox SET state = ?1", [state])
+            .unwrap();
+    }
+
+    #[test]
+    fn an_unconfirmed_rows_staged_file_survives_a_save_that_drops_it() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        let file = staged(&dir, "a.png");
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![file.clone()];
+        let id = outbox_save_releasing(&w.store, &dir, d.clone()).unwrap();
+        set_state(&w, "unconfirmed");
+        d.id = Some(id);
+        d.attachments = vec![];
+        outbox_save_releasing(&w.store, &dir, d).unwrap();
+        assert!(std::path::Path::new(&file.path).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unconfirmed_rows_staged_file_survives_deleting_the_row() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        let file = staged(&dir, "a.png");
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![file.clone()];
+        let id = outbox_save_releasing(&w.store, &dir, d).unwrap();
+        set_state(&w, "unconfirmed");
+        outbox_delete_releasing(&w.store, &dir, id).unwrap();
+        assert!(std::path::Path::new(&file.path).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn draft_queued_and_failed_rows_still_release_on_save_and_delete() {
+        for state in ["draft", "queued", "failed"] {
+            let w = world();
+            let root = scratch();
+            let dir = staging_dir(&root);
+            let (a, b) = (staged(&dir, "a.png"), staged(&dir, "b.png"));
+            let mut d = draft("owner@byptah.com", "ann@example.org");
+            d.attachments = vec![a.clone(), b.clone()];
+            let id = outbox_save_releasing(&w.store, &dir, d.clone()).unwrap();
+            set_state(&w, state);
+            d.id = Some(id);
+            d.attachments = vec![a.clone()];
+            outbox_save_releasing(&w.store, &dir, d).unwrap();
+            assert!(!std::path::Path::new(&b.path).exists(), "{state} save");
+            set_state(&w, state);
+            outbox_delete_releasing(&w.store, &dir, id).unwrap();
+            assert!(!std::path::Path::new(&a.path).exists(), "{state} delete");
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     fn count_cred(conn: &rusqlite::Connection) -> i64 {
