@@ -2100,6 +2100,21 @@ mod tests {
     }
 
     #[test]
+    fn ddl_alone_carries_parse_attempts() {
+        // Not `ensure_tables`: its ALTER would add the column regardless.
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('mail_object') WHERE name='parse_attempts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
     fn ensure_tables_is_idempotent() {
         let store = SessionStore::open_in_memory().unwrap();
         let conn = store.lock_conn().unwrap();

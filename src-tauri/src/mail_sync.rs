@@ -176,11 +176,7 @@ impl SyncService {
         // The S3 key is what is contended, so it picks the lock.
         let mut groups: BTreeMap<i64, Vec<Job>> = BTreeMap::new();
         for job in jobs {
-            let credential = job
-                .account
-                .s3_credential_id
-                .unwrap_or(job.account.credential_id);
-            groups.entry(credential).or_default().push(job);
+            groups.entry(lock_key(&job.account)).or_default().push(job);
         }
         std::thread::scope(|scope| {
             let handles: Vec<_> = groups
@@ -254,6 +250,12 @@ impl SyncService {
         }
         Ok(jobs)
     }
+}
+
+/// Sources with the same key share a lock. S3 listing is what is contended, so
+/// the S3 credential decides, not the SES one.
+fn lock_key(account: &MailAccount) -> i64 {
+    account.s3_credential_id.unwrap_or(account.credential_id)
 }
 
 /// One thread for the life of the app. `sync_now` calls from commands share
@@ -1126,7 +1128,23 @@ mod tests {
     }
 
     #[test]
-    fn s3_credential_decides_the_lock_not_the_ses_one() {
+    fn lock_key_is_the_s3_credential_not_the_ses_one() {
+        let f = Fixture::new();
+        let (ses, s3key) = (f.credential("ses"), f.credential("s3"));
+        f.source(ses, "acme");
+        let conn = f.store.lock_conn().unwrap();
+        let plain = mail_store::list_accounts(&conn).unwrap().remove(0);
+        assert_eq!(lock_key(&plain), ses);
+        let split = MailAccount {
+            s3_credential_id: Some(s3key),
+            ..plain
+        };
+        assert_eq!(lock_key(&split), s3key);
+        assert_ne!(lock_key(&split), split.credential_id);
+    }
+
+    #[test]
+    fn sources_with_one_s3_key_serialise_even_with_different_ses_keys() {
         let f = Fixture::new();
         let (ses1, ses2, s3key) = (
             f.credential("ses1"),
@@ -1151,7 +1169,9 @@ mod tests {
             }
         }
         f.sync(&[(a, &ma), (b, &mb)]);
-        assert_contiguous(&f.log.lock().unwrap());
+        let log = f.log.lock().unwrap().clone();
+        assert_contiguous(&log);
+        assert_eq!(log.len(), 8);
     }
 
     #[test]
@@ -1279,6 +1299,16 @@ mod tests {
         f.sync(&[(account, &s3)]);
         assert_eq!(fts_hits(&f, "zebra"), 0);
         assert_eq!(fts_hits(&f, "walrus"), 1);
+        // The replayed delete must have folded `Đ` or this term would linger.
+        assert_eq!(fts_hits(&f, "don"), 1);
+        f.store
+            .lock_conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO mail_message_fts(mail_message_fts) VALUES('integrity-check')",
+                [],
+            )
+            .unwrap();
         assert_eq!(fts_hits(&f, "hoang"), 1);
     }
 
@@ -1415,13 +1445,34 @@ mod tests {
     }
 
     #[test]
-    fn fresh_schema_has_parse_attempts() {
+    fn rethreading_away_the_last_active_message_archives_the_old_thread() {
         let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Topic", "root"));
+        let reply = mime("m2", "Re: Topic", "reply")
+            .replace("Subject:", "In-Reply-To: <m1@example.com>\r\nSubject:");
+        s3.put("owner/2", "e2", &reply);
+        f.sync(&[(account, &s3)]);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_thread"), 1);
+        f.store
+            .lock_conn()
+            .unwrap()
+            .execute(
+                "UPDATE mail_message SET state='archived' WHERE message_id_hdr='m1@example.com'",
+                [],
+            )
+            .unwrap();
+        // m2 is the only active message; it moves to its own thread.
+        s3.put("owner/2", "e3", &mime("m2", "Elsewhere", "reply"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_thread"), 2);
         assert_eq!(
-            f.scalar(
-                "SELECT COUNT(*) FROM pragma_table_info('mail_object') WHERE name='parse_attempts'"
-            ),
-            1
+            f.text("SELECT state FROM mail_thread WHERE subject='Topic'"),
+            "archived"
+        );
+        assert_eq!(
+            f.text("SELECT state FROM mail_thread WHERE subject='Elsewhere'"),
+            "active"
         );
     }
 }

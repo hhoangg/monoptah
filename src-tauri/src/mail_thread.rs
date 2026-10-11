@@ -386,6 +386,12 @@ pub(crate) fn replace_message(
         && !mail_store::delete_thread_if_empty(conn, removed.thread_id)?
     {
         recompute_thread(conn, removed.thread_id, &own)?;
+        // Losing its last active message must not leave it in the inbox.
+        mail_store::archive_thread_if_inactive(
+            conn,
+            removed.thread_id,
+            crate::session_store::now_millis(),
+        )?;
     }
     Ok(ingested)
 }
