@@ -3,6 +3,8 @@ use tauri::Manager;
 mod account_identity;
 mod artifacts;
 mod automations;
+mod aws_s3;
+mod aws_sigv4;
 mod azure_devops;
 mod chat_background;
 mod checkpoint;
