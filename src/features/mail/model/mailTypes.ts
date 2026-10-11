@@ -423,8 +423,9 @@ export type OutboxDraft = {
 
 /**
  * `unconfirmed`: SES may have delivered it (a dropped connection, or a quit
- * mid-send). Show "Check the recipient first", never Retry; saving an edit
- * re-arms it.
+ * mid-send). Show "Check the recipient first", never Retry. Saving does not
+ * change this state (the edit is kept); only `mailOutboxRearm`, behind an
+ * explicit confirmation, does.
  */
 export type OutboxState =
   "draft" | "queued" | "sending" | "sent" | "failed" | "unconfirmed";
@@ -493,7 +494,15 @@ export type SendReport = {
 /** What `mail_outbox_send` rejects with. */
 export type SendError = {
   /** `form` for anything caught before SES was called. */
-  kind: "form" | "rejected" | "unconfirmed" | "network" | string;
+  kind:
+    | "form"
+    | "rejected"
+    | "unconfirmed"
+    | "network"
+    | "accessDenied"
+    | "invalidCredentials"
+    | "clockSkew"
+    | "other";
   message: string;
   /** False when the message may have been delivered: do not offer Retry. */
   retrySafe: boolean;

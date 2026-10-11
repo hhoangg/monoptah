@@ -87,6 +87,7 @@ describe("mail command wrappers", () => {
       { draft: { kind: "new" } },
     ],
     [() => mail.mailOutboxSend(5), "mail_outbox_send", { id: 5 }],
+    [() => mail.mailOutboxRearm(5), "mail_outbox_rearm", { id: 5 }],
     [() => mail.mailOutboxCheck(5), "mail_outbox_check", { id: 5 }],
     [() => mail.mailOutboxDelete(5), "mail_outbox_delete", { id: 5 }],
     [() => mail.mailSourceTest(1), "mail_source_test", { id: 1 }],

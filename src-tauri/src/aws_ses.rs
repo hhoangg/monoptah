@@ -376,7 +376,11 @@ fn classify(status: u16, error_type: Option<&str>, body: &str, action: &str) -> 
         })
         .unwrap_or_default();
     let message_text = aws_message.to_lowercase();
-    let (kind, message) = if message_text.contains("expired") || code == "RequestExpired" {
+    // A 5xx says nothing about the clock, and for a send it must stay
+    // ambiguous (`Other`), not become a "safe to retry" ClockSkew.
+    let (kind, message) = if status < 500
+        && (message_text.contains("expired") || code == "RequestExpired")
+    {
         (
             SesErrorKind::ClockSkew,
             "This computer's clock is more than 5 minutes off AWS time. Fix the system clock and try again."
@@ -578,6 +582,23 @@ mod tests {
         assert_eq!(
             transport_error(ureq::ErrorKind::Io, false).kind,
             SesErrorKind::Network
+        );
+    }
+
+    #[test]
+    fn a_server_error_is_never_read_as_clock_skew() {
+        for status in [500, 503] {
+            let error = classify(
+                status,
+                None,
+                r#"{"message":"Your request expired while the service was restarting"}"#,
+                "ses:SendEmail",
+            );
+            assert_eq!(error.kind, SesErrorKind::Other, "{status}");
+        }
+        assert_eq!(
+            classify(400, Some("RequestExpired"), "{}", "ses:SendEmail").kind,
+            SesErrorKind::ClockSkew
         );
     }
 }

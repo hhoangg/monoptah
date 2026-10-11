@@ -489,12 +489,13 @@ pub(crate) fn mailboxes_upsert(
     // S3 `prefix=` is a literal string prefix, so "", "s" and "sent" list the
     // sent copies too, and "sent/2024/" is inside them. Such a mailbox would
     // file our own sent mail as unread inbound.
-    if rows.iter().any(|r| {
+    if let Some(row) = rows.iter().find(|r| {
         mail_store::SENT_PREFIX.starts_with(r.s3_prefix.as_str())
             || r.s3_prefix.starts_with(mail_store::SENT_PREFIX)
     }) {
         return Err(format!(
-            "A prefix cannot be empty, or overlap '{}', which is reserved for the copies of mail you send.",
+            "Prefix '{}' cannot be used: it is empty or overlaps '{}', which is reserved for the copies of mail you send.",
+            row.s3_prefix,
             mail_store::SENT_PREFIX
         ));
     }
@@ -1230,13 +1231,24 @@ async fn blocking<T: Send + 'static>(
     app: AppHandle,
     work: impl FnOnce(&SessionStore, &MailState) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
+    blocking_with(app, work, |e| e).await
+}
+
+/// [`blocking`] with the caller's own error type. `on_join_error` says what a
+/// panicked or cancelled task means there; for a send it must not mean "safe
+/// to retry".
+async fn blocking_with<T: Send + 'static, E: Send + 'static>(
+    app: AppHandle,
+    work: impl FnOnce(&SessionStore, &MailState) -> Result<T, E> + Send + 'static,
+    on_join_error: fn(String) -> E,
+) -> Result<T, E> {
     tauri::async_runtime::spawn_blocking(move || {
         let store = app.state::<SessionStore>();
         let mail = app.state::<MailState>();
         work(&store, &mail)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| on_join_error(e.to_string()))?
 }
 
 #[tauri::command(async)]
@@ -1680,14 +1692,12 @@ pub async fn mail_outbox_send(
     app: AppHandle,
     id: i64,
 ) -> Result<mail_send::SendReport, mail_send::SendError> {
-    let worker = app.clone();
-    let report = tauri::async_runtime::spawn_blocking(move || {
-        let store = worker.state::<SessionStore>();
-        let mail = worker.state::<MailState>();
-        mail_send::outbox_send(&store, &*mail.clients, id)
-    })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string().into()));
+    let report = blocking_with(
+        app.clone(),
+        move |store, mail| mail_send::outbox_send(store, &*mail.clients, id),
+        mail_send::SendError::unknown,
+    )
+    .await;
     // Also after an error: the row's state changed either way.
     let _ = app.emit(mail_sync::MESSAGES_CHANGED_EVENT, ());
     report
@@ -1703,6 +1713,13 @@ pub async fn mail_outbox_check(
         mail_send::outbox_check(store, &*mail.clients, id)
     })
     .await
+}
+
+/// `unconfirmed -> draft`, and nothing else. The caller must have asked the
+/// person "I checked the recipient, send again" first.
+#[tauri::command(async)]
+pub fn mail_outbox_rearm(store: State<'_, SessionStore>, id: i64) -> Result<(), String> {
+    mail_send::outbox_rearm(&store, id)
 }
 
 #[tauri::command(async)]

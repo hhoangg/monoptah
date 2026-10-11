@@ -229,6 +229,17 @@ pub(crate) fn outbox_delete(store: &SessionStore, id: i64) -> Result<(), String>
     Ok(())
 }
 
+/// The deliberate step out of `unconfirmed`. A save is not enough, because a
+/// composer saves on a timer.
+pub(crate) fn outbox_rearm(store: &SessionStore, id: i64) -> Result<(), String> {
+    let conn = store.lock_conn()?;
+    if mail_store::rearm_outbox(&conn, id).map_err(db)? {
+        Ok(())
+    } else {
+        Err("Only a message that may have been delivered can be re-armed.".into())
+    }
+}
+
 // ── the From picker ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -550,8 +561,8 @@ fn build_message(loaded: &Loaded) -> Result<Built, String> {
     }
     if row.state == "unconfirmed" {
         return Err(
-            "SES may already have delivered this message. Check the recipient, then edit and \
-             save it to send it again."
+            "SES may already have delivered this message. Check the recipient, then confirm \
+             in the outbox that you want to send it again."
                 .into(),
         );
     }
@@ -643,7 +654,7 @@ fn build_message(loaded: &Loaded) -> Result<Built, String> {
 #[serde(rename_all = "camelCase")]
 pub struct SendError {
     /// `form` for anything caught before SES was called, else the SES error
-    /// kind (`rejected`, `unconfirmed`, `network`, ...).
+    /// kind (`rejected`, `unconfirmed`, `network`, ...); `other` when unknown.
     pub kind: &'static str,
     pub message: String,
     /// False when the message may have been delivered. The row is then
@@ -657,19 +668,26 @@ impl std::fmt::Display for SendError {
     }
 }
 
-impl From<String> for SendError {
-    fn from(message: String) -> Self {
+/// Deliberately no `From<String>`: a bare `?` on a string error would pick a
+/// retry-safety for the caller. Before the SES call an error is `form`; after
+/// it nothing may fail at all (see the module comment).
+impl SendError {
+    pub(crate) fn form(message: String) -> Self {
         Self {
             kind: "form",
             message,
             retry_safe: true,
         }
     }
-}
 
-impl From<&str> for SendError {
-    fn from(message: &str) -> Self {
-        message.to_string().into()
+    /// The outcome is not known (a panicked or cancelled task, for one), so
+    /// the message may have been delivered. Fails closed.
+    pub(crate) fn unknown(message: String) -> Self {
+        Self {
+            kind: "other",
+            message,
+            retry_safe: false,
+        }
     }
 }
 
@@ -723,27 +741,50 @@ fn archive_failure(account: &MailAccount, kind: S3ErrorKind, message: &str) -> S
     }
 }
 
-pub(crate) fn outbox_send(
-    store: &SessionStore,
-    clients: &dyn AwsClients,
-    id: i64,
-) -> Result<SendReport, SendError> {
+struct Prepared {
+    loaded: Loaded,
+    built: Built,
+    ses: Box<dyn crate::aws_ses::SesApi + Send>,
+    s3: Result<Box<dyn crate::aws_s3::S3Api + Send>, String>,
+}
+
+/// Everything before the SES call. Every failure here is a form error that
+/// changes nothing; once the row is claimed this function is done.
+fn prepare(store: &SessionStore, clients: &dyn AwsClients, id: i64) -> Result<Prepared, String> {
     let loaded = load(store, id)?;
     if let Some(first) = find_problems(store, clients, &loaded)?.into_iter().next() {
-        return Err(first.message.into());
+        return Err(first.message);
     }
     let built = build_message(&loaded)?;
     // Clients before the claim: a missing key is a form error that must leave
     // the draft a draft.
     let ses = clients.ses(&loaded.account)?;
     let s3 = clients.s3(&loaded.account);
-
     {
         let conn = store.lock_conn()?;
         if !mail_store::claim_outbox_for_send(&conn, id).map_err(db)? {
             return Err("This message was already sent or is being sent.".into());
         }
     }
+    Ok(Prepared {
+        loaded,
+        built,
+        ses,
+        s3,
+    })
+}
+
+pub(crate) fn outbox_send(
+    store: &SessionStore,
+    clients: &dyn AwsClients,
+    id: i64,
+) -> Result<SendReport, SendError> {
+    let Prepared {
+        loaded,
+        built,
+        ses,
+        s3,
+    } = prepare(store, clients, id).map_err(SendError::form)?;
 
     let row = &loaded.row;
     let destination = mail_build::destination(&row.to, &row.cc, &row.bcc);
@@ -1221,7 +1262,7 @@ mod tests {
     }
 
     fn send(w: &World, d: OutboxDraft) -> Result<SendReport, SendError> {
-        let id = outbox_save(&w.store, d)?;
+        let id = outbox_save(&w.store, d).map_err(SendError::form)?;
         outbox_send(&w.store, &w.fake, id)
     }
 
@@ -2145,10 +2186,24 @@ mod tests {
             let again = outbox_send(&w.store, &w.fake, id).unwrap_err();
             assert!(again.message.contains("may already have delivered"));
             assert_eq!(w.fake.log.lock().unwrap().sends.len(), 1);
-            // Editing and saving is the deliberate act that re-arms it.
+            // Saving does not re-arm it, however often a composer does that.
             let mut edit = draft("owner@byptah.com", "ann@example.org");
             edit.id = Some(id);
+            edit.subject = "Edited while unconfirmed".into();
+            outbox_save(&w.store, edit.clone()).unwrap();
             outbox_save(&w.store, edit).unwrap();
+            assert_eq!(text(&w, "SELECT state FROM mail_outbox"), "unconfirmed");
+            assert_eq!(
+                text(&w, "SELECT subject FROM mail_outbox"),
+                "Edited while unconfirmed",
+                "the edit is kept"
+            );
+            assert!(text(&w, "SELECT last_error FROM mail_outbox").contains("dropped"));
+            assert!(outbox_send(&w.store, &w.fake, id).is_err());
+            assert_eq!(w.fake.log.lock().unwrap().sends.len(), 1);
+            // Only the explicit step does.
+            outbox_rearm(&w.store, id).unwrap();
+            assert!(outbox_rearm(&w.store, id).is_err(), "and only from there");
             outbox_send(&w.store, &w.fake, id).unwrap();
             assert_eq!(w.fake.log.lock().unwrap().sends.len(), 2);
         }
@@ -2191,6 +2246,65 @@ mod tests {
         );
         assert!(w.fake.log.lock().unwrap().sends.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_existing_bucket_root_mailbox_does_not_swallow_sent_objects_as_inbound() {
+        let w = world();
+        // Set up before the prefix was refused: it lists every key in the bucket.
+        w.store
+            .lock_conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO mail_mailbox (account_id, address, domain, s3_prefix, display_name)
+                 VALUES (?1, 'root@byptah.com', 'byptah.com', '', 'Root')",
+                [w.a],
+            )
+            .unwrap();
+        send(&w, draft("owner@byptah.com", "ann@example.org")).unwrap();
+        for _ in 0..2 {
+            let reports = sync(&w);
+            assert!(reports.iter().all(|r| r.error.is_none()), "{reports:?}");
+        }
+        assert_eq!(count(&w, "SELECT COUNT(*) FROM mail_message"), 1);
+        assert_eq!(
+            count(
+                &w,
+                "SELECT COUNT(*) FROM mail_message WHERE direction = 'inbound' OR is_read = 0"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &w,
+                "SELECT COUNT(*) FROM mail_thread t JOIN mail_mailbox b ON b.id = t.mailbox_id
+                 WHERE b.address = 'root@byptah.com'"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn a_prefix_error_names_the_row_that_caused_it() {
+        let w = world();
+        let row = |address: &str, prefix: &str| MailboxInput {
+            address: address.into(),
+            s3_prefix: prefix.into(),
+            display_name: "X".into(),
+            color: None,
+            sort_order: 0,
+        };
+        let error = crate::mail::mailboxes_upsert(
+            &w.store,
+            w.a,
+            vec![
+                row("a@byptah.com", "fine/"),
+                row("b@byptah.com", "sent/2024/"),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("'sent/2024/'"), "{error}");
+        assert!(!error.contains("'fine/'"), "{error}");
     }
 
     fn count_cred(conn: &rusqlite::Connection) -> i64 {

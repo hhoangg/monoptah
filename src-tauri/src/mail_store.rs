@@ -3427,9 +3427,13 @@ pub(crate) fn insert_outbox(conn: &Connection, w: &OutboxWrite) -> rusqlite::Res
 }
 
 /// Rewrites a draft or a failed send. A `failed` row goes back to `draft`
-/// (the person edited it, so it is theirs to send again); any other state is
-/// left alone and reported as not updated, because a row being sent or already
-/// sent must not be changed under the send.
+/// (the person edited it, so it is theirs to send again). An `unconfirmed` row
+/// keeps its state and error: its content is saved, so no edit is lost, but a
+/// save is also what a composer does on a timer or on open, and that must
+/// never put a possibly-delivered message back in reach of Send; only
+/// [`rearm_outbox`] does that. Any other state is left alone and reported as
+/// not updated, because a row being sent or already sent must not be changed
+/// under the send.
 pub(crate) fn update_outbox(conn: &Connection, id: i64, w: &OutboxWrite) -> rusqlite::Result<bool> {
     Ok(conn.execute(
         "UPDATE mail_outbox SET
@@ -3437,7 +3441,10 @@ pub(crate) fn update_outbox(conn: &Connection, id: i64, w: &OutboxWrite) -> rusq
            kind = ?6, from_addr = ?7, to_json = ?8, cc_json = ?9, bcc_json = ?10,
            subject = ?11, body_text = ?12, body_html = ?13, body_json = ?14,
            quoted_html = ?15, attachments_json = ?16, in_reply_to = ?17,
-           references_json = ?18, state = 'draft', last_error = NULL, updated_at = ?19
+           references_json = ?18,
+           state = CASE WHEN state = 'unconfirmed' THEN state ELSE 'draft' END,
+           last_error = CASE WHEN state = 'unconfirmed' THEN last_error ELSE NULL END,
+           updated_at = ?19
          WHERE id = ?1 AND state IN ('draft', 'queued', 'failed', 'unconfirmed')",
         params![
             id,
@@ -3460,6 +3467,15 @@ pub(crate) fn update_outbox(conn: &Connection, id: i64, w: &OutboxWrite) -> rusq
             w.references_json,
             now_millis()
         ],
+    )? > 0)
+}
+
+/// The one way out of `unconfirmed`.
+pub(crate) fn rearm_outbox(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE mail_outbox SET state = 'draft', last_error = NULL, updated_at = ?2
+         WHERE id = ?1 AND state = 'unconfirmed'",
+        params![id, now_millis()],
     )? > 0)
 }
 

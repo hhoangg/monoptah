@@ -564,7 +564,10 @@ fn ingest_one(
     // A `sent/` object is mail we sent: another machine's copy, or ours not yet
     // linked. It belongs in the mailbox of the conversation it answers, not in
     // the archive mailbox that merely points at the prefix.
-    let sent_archive = mailbox.is_sent_archive();
+    // Decided by the object key, not the mailbox's prefix: a mailbox whose
+    // prefix merely contains `sent/` (a bucket-root one set up before that was
+    // refused) lists the same objects and must not file them as inbound.
+    let sent_archive = mailbox.is_sent_archive() || item.key.starts_with(mail_store::SENT_PREFIX);
     let (target, direction) = if sent_archive {
         let account_id = mail_store::mailbox_account_id(conn, mailbox.id)?;
         let from_mailbox = match mail.from.as_ref() {

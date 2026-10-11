@@ -136,6 +136,13 @@ export const mailOutboxSave = (draft: OutboxDraft) =>
 export const mailOutboxSend = (id: number) =>
   invoke<SendReport>("mail_outbox_send", { id });
 
+/**
+ * `unconfirmed` -> `draft`, nothing else. Put an explicit "I checked the
+ * recipient, send again" in front of it: a save never does this.
+ */
+export const mailOutboxRearm = (id: number) =>
+  invoke<void>("mail_outbox_rearm", { id });
+
 /** Problems SES would reject the message for, without sending it. */
 export const mailOutboxCheck = (id: number) =>
   invoke<SendProblem[]>("mail_outbox_check", { id });
