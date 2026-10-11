@@ -14,7 +14,8 @@ pub(crate) struct Credentials {
 
 pub(crate) struct SigningRequest<'a> {
     pub method: &'a str,
-    /// Already percent-encoded, as it appears on the wire.
+    /// Already percent-encoded once, as on the wire. That single encoding is the
+    /// S3 exception: every other service, SES included, encodes the path twice.
     pub canonical_uri: &'a str,
     /// Raw (unencoded) name/value pairs; encoded and sorted here.
     pub query: &'a [(&'a str, &'a str)],

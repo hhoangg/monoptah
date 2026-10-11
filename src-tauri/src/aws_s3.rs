@@ -5,6 +5,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use base64::Engine;
+use sha2::Digest;
 
 use crate::aws_sigv4::{
     amz_timestamp, authorization, sha256_hex, uri_encode, Credentials, SigningRequest,
@@ -12,6 +13,7 @@ use crate::aws_sigv4::{
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ERROR_BODY: u64 = 64 * 1024;
+const MAX_BODY: u64 = 256 * 1024 * 1024;
 const DELETE_BATCH: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +27,8 @@ pub(crate) struct ObjectInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjectPage {
     pub objects: Vec<ObjectInfo>,
+    /// Only filled when a delimiter was requested.
+    pub common_prefixes: Vec<String>,
     pub next_token: Option<String>,
 }
 
@@ -68,6 +72,7 @@ pub(crate) trait S3Api {
     fn list_objects_v2(
         &self,
         prefix: &str,
+        delimiter: Option<&str>,
         continuation_token: Option<&str>,
     ) -> Result<ObjectPage, S3Error>;
     fn get_object(&self, key: &str) -> Result<Vec<u8>, S3Error>;
@@ -193,16 +198,18 @@ impl S3Client {
         };
         match result {
             Ok(response) => {
+                let status = response.status();
                 let mut bytes = Vec::new();
                 response
                     .into_reader()
+                    .take(MAX_BODY)
                     .read_to_end(&mut bytes)
                     .map_err(|_| S3Error {
                         kind: S3ErrorKind::Network,
                         code: None,
                         message: "The connection to S3 dropped while reading the response.".into(),
                     })?;
-                Ok(bytes)
+                check_status(status, bytes, action)
             }
             Err(ureq::Error::Status(status, response)) => {
                 let mut body = String::new();
@@ -221,6 +228,19 @@ impl S3Client {
     }
 }
 
+// ureq with redirects(0) hands a 3xx back as Ok, not Err(Status). Without this a
+// wrong-region 301 would read as an empty, healthy bucket.
+fn check_status(status: u16, body: Vec<u8>, action: &str) -> Result<Vec<u8>, S3Error> {
+    if status >= 300 {
+        return Err(error_from_response(
+            status,
+            &String::from_utf8_lossy(&body),
+            action,
+        ));
+    }
+    Ok(body)
+}
+
 fn now_unix() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
@@ -229,11 +249,15 @@ impl S3Api for S3Client {
     fn list_objects_v2(
         &self,
         prefix: &str,
+        delimiter: Option<&str>,
         continuation_token: Option<&str>,
     ) -> Result<ObjectPage, S3Error> {
         let mut query = vec![("list-type", "2")];
         if !prefix.is_empty() {
             query.push(("prefix", prefix));
+        }
+        if let Some(delimiter) = delimiter {
+            query.push(("delimiter", delimiter));
         }
         if let Some(token) = continuation_token {
             query.push(("continuation-token", token));
@@ -266,7 +290,7 @@ impl S3Api for S3Client {
             // so use the SHA-256 checksum header S3 accepts in its place.
             let checksum = base64::engine::general_purpose::STANDARD
                 .encode(sha2::Sha256::digest(body.as_bytes()));
-            let response = self.send(
+            let sent = self.send(
                 "POST",
                 "",
                 &[("delete", "")],
@@ -277,17 +301,26 @@ impl S3Api for S3Client {
                     ("x-amz-sdk-checksum-algorithm", "SHA256"),
                 ],
                 "s3:DeleteObject",
-            )?;
-            outcomes.extend(parse_delete_result(
-                &String::from_utf8_lossy(&response),
-                batch,
-            ));
+            );
+            match sent {
+                Ok(response) => outcomes.extend(parse_delete_result(
+                    &String::from_utf8_lossy(&response),
+                    batch,
+                )),
+                Err(error) => {
+                    // Keep what earlier batches really deleted; fail only the rest.
+                    let done = outcomes.len();
+                    outcomes.extend(keys[done..].iter().map(|key| DeleteOutcome {
+                        key: key.clone(),
+                        error: Some(error.clone()),
+                    }));
+                    break;
+                }
+            }
         }
         Ok(outcomes)
     }
 }
-
-use sha2::Digest;
 
 fn delete_request_body(keys: &[String]) -> String {
     let mut xml = String::from("<Delete><Quiet>false</Quiet>");
@@ -386,8 +419,13 @@ fn parse_list_objects(xml: &str) -> ObjectPage {
     } else {
         None
     };
+    let common_prefixes = blocks(xml, "CommonPrefixes")
+        .into_iter()
+        .filter_map(|b| first(b, "Prefix"))
+        .collect();
     ObjectPage {
         objects,
+        common_prefixes,
         next_token,
     }
 }
@@ -603,9 +641,48 @@ mod tests {
     }
 
     #[test]
-    fn errors_never_carry_the_secret() {
-        let err = classify(Some(403), Some("SignatureDoesNotMatch"), "s3:GetObject");
-        let shown = format!("{err} {err:?}");
-        assert!(!shown.contains("wJalr"));
+    fn redirect_status_is_an_error_not_a_payload() {
+        let body = b"<Error><Code>PermanentRedirect</Code></Error>".to_vec();
+        let err = check_status(301, body, "s3:ListBucket").unwrap_err();
+        assert_eq!(err.code.as_deref(), Some("PermanentRedirect"));
+        assert_eq!(err.kind, S3ErrorKind::Other);
+        assert_eq!(
+            check_status(200, b"ok".to_vec(), "s3:GetObject").unwrap(),
+            b"ok"
+        );
+    }
+
+    #[test]
+    fn secret_never_reaches_the_request() {
+        let p = client("b").prepare("GET", "k", &[("prefix", "p")], &[], &[], "20240102T030405Z");
+        assert!(!p.url.contains("EXAMPLEKEY"));
+        assert!(p
+            .headers
+            .iter()
+            .all(|(k, v)| !k.contains("EXAMPLEKEY") && !v.contains("EXAMPLEKEY")));
+    }
+
+    #[test]
+    fn parses_common_prefixes() {
+        let xml = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+            <Contents><Key>top.txt</Key><Size>1</Size></Contents>\
+            <CommonPrefixes><Prefix>owner/</Prefix></CommonPrefixes>\
+            <CommonPrefixes><Prefix>seller/</Prefix></CommonPrefixes></ListBucketResult>";
+        let page = parse_list_objects(xml);
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.common_prefixes, ["owner/", "seller/"]);
+    }
+
+    #[test]
+    fn list_query_carries_delimiter() {
+        let p = client("b").prepare(
+            "GET",
+            "",
+            &[("list-type", "2"), ("delimiter", "/")],
+            &[],
+            &[],
+            "20240102T030405Z",
+        );
+        assert!(p.url.ends_with("?delimiter=%2F&list-type=2"));
     }
 }
