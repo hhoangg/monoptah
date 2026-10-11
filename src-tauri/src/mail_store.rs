@@ -1777,9 +1777,14 @@ const LISTED: &str = "t.state = 'active'
            AND EXISTS (SELECT 1 FROM mail_message m WHERE m.thread_id = t.id AND m.state = 'active')";
 
 /// Threads in a folder that behaves like a real folder leave the mailbox views.
+/// A clock-relative folder never hides: its member rows go stale while its own
+/// view stays true, and a thread aged out of the folder would then be in
+/// neither place.
 const NOT_FILED_AWAY: &str = "NOT EXISTS (SELECT 1 FROM mail_folder_member fm
              JOIN mail_folder f ON f.id = fm.folder_id
-             WHERE fm.thread_id = t.id AND f.hide_from_mailbox = 1)";
+             WHERE fm.thread_id = t.id AND f.hide_from_mailbox = 1
+               AND NOT EXISTS (SELECT 1 FROM mail_folder_rule r
+                               WHERE r.folder_id = f.id AND r.op = 'within_days'))";
 
 /// A SQL condition on `t`, `b` and `a` plus its parameters.
 fn scope_filter(
@@ -2208,18 +2213,26 @@ const DATE_OPS: &[&str] = &["before", "after", "within_days"];
 const MAX_LIST_VALUES: usize = 100;
 const MAX_RULES: usize = 50;
 
-/// Every field and the operators that mean something on it.
+/// Every field and the operators that mean something on it. One table, so
+/// the lookup and the tests cannot list different fields.
+pub(crate) const FIELD_OPS: &[(&str, &[&str])] = &[
+    ("from", TEXT_OPS),
+    ("to", TEXT_OPS),
+    ("cc", TEXT_OPS),
+    ("recipient", TEXT_OPS),
+    ("subject", SUBJECT_OPS),
+    ("body", FTS_OPS),
+    ("mailbox", SCOPE_OPS),
+    ("domain", NAME_OPS),
+    ("account", NAME_OPS),
+    ("has_attachment", FLAG_OPS),
+    ("is_unread", FLAG_OPS),
+    ("is_starred", FLAG_OPS),
+    ("date", DATE_OPS),
+];
+
 pub(crate) fn allowed_ops(field: &str) -> Option<&'static [&'static str]> {
-    Some(match field {
-        "from" | "to" | "cc" | "recipient" => TEXT_OPS,
-        "subject" => SUBJECT_OPS,
-        "body" => FTS_OPS,
-        "mailbox" => SCOPE_OPS,
-        "domain" | "account" => NAME_OPS,
-        "has_attachment" | "is_unread" | "is_starred" => FLAG_OPS,
-        "date" => DATE_OPS,
-        _ => return None,
-    })
+    FIELD_OPS.iter().find(|(f, _)| *f == field).map(|(_, o)| *o)
 }
 
 /// A `WHERE` fragment over the aliases `t` (thread), `b` (mailbox) and `a`
@@ -2569,7 +2582,13 @@ fn compile_rule(
                 }
             }
         }
-        _ => unreachable!("allowed_ops admitted a field compile_rule has no arm for"),
+        // A field added to `FIELD_OPS` without an arm here: refuse it, never
+        // panic while holding the store lock every feature shares.
+        _ => {
+            return Err(user_error(format!(
+                "\"{field}\" cannot be filtered on yet."
+            )))
+        }
     };
     Ok(if rule.negate {
         format!("(NOT ({clause}))")
@@ -2877,6 +2896,8 @@ fn time_relative_folder(
     let rules = folder_rules(conn, folder_id)?;
     Ok(rules
         .iter()
+        // Every clock-relative operator must be listed here; `within_days` is
+        // the only one today (`before` and `after` are fixed instants).
         .any(|r| r.op == "within_days")
         .then(|| (rules, folder_match_mode(&mode))))
 }
@@ -3612,21 +3633,7 @@ mod tests {
     fn every_field_and_operator_pair_compiles_to_bound_sql() {
         let store = SessionStore::open_in_memory().unwrap();
         let conn = store.lock_conn().unwrap();
-        let fields = [
-            "from",
-            "to",
-            "cc",
-            "recipient",
-            "subject",
-            "body",
-            "mailbox",
-            "domain",
-            "account",
-            "has_attachment",
-            "date",
-            "is_unread",
-            "is_starred",
-        ];
+        let fields: Vec<&str> = FIELD_OPS.iter().map(|(f, _)| *f).collect();
         let ops = [
             "is",
             "contains",
@@ -3641,6 +3648,7 @@ mod tests {
             "true",
         ];
         let mut valid = 0;
+        assert_eq!(fields.len(), 13);
         for field in fields {
             let allowed = allowed_ops(field).unwrap();
             for op in ops {
@@ -4630,5 +4638,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(folder_listing(&conn, plain.id), ["recent"]);
+    }
+
+    #[test]
+    fn a_relative_folder_that_hides_never_strands_a_thread() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        let now = now_millis() / 1000;
+        let day = 86_400;
+        let (msg, _) = arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "triage",
+                date: now - day,
+                ..Msg::default()
+            },
+        );
+        let mut input = folder("Triage");
+        input.hide_from_mailbox = true;
+        let f = upsert_folder(
+            &conn,
+            &input,
+            &[rule("date", "within_days", serde_json::json!(7))],
+        )
+        .unwrap();
+        let listed = |scope| {
+            list_threads(
+                &conn,
+                &ThreadQuery {
+                    scope,
+                    cursor: None,
+                    limit: None,
+                },
+            )
+            .unwrap()
+            .rows
+            .len()
+        };
+        // Fresh: in the folder, and the mailbox view does not hide it.
+        assert_eq!(listed(ThreadScope::Folder { folder_id: f.id }), 1);
+        assert_eq!(listed(ThreadScope::All), 1);
+        // It ages out with the member row left behind.
+        conn.execute(
+            "UPDATE mail_message SET date_utc = ?2 WHERE id = ?1",
+            params![msg, now - 30 * day],
+        )
+        .unwrap();
+        assert_eq!(members(&conn, f.id), ["triage"]);
+        assert_eq!(listed(ThreadScope::Folder { folder_id: f.id }), 0);
+        assert_eq!(listed(ThreadScope::All), 1);
+        assert_eq!(listed(ThreadScope::Mailbox { mailbox_id: mb }), 1);
+        assert_eq!(unread_by_mailbox(&conn).unwrap()[&mb], 1);
     }
 }
