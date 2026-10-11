@@ -24,7 +24,11 @@ import {
   saveMailEnabled,
   subscribeMailEnabled,
 } from "../model/settings";
-import { CredentialEditor, errorMessage, MailCredentialRow } from "./MailCredentialRow";
+import {
+  CredentialEditor,
+  errorMessage,
+  MailCredentialRow,
+} from "./MailCredentialRow";
 import { MailSourceCard, SourceForm } from "./MailSourceCard";
 import { Group, Row, Select, Toggle } from "./primitives";
 
@@ -114,7 +118,10 @@ export function MailSettings() {
   };
   const intervalOptions = INTERVALS.some(([secs]) => secs === interval)
     ? INTERVALS
-    : [...INTERVALS, [interval, `Every ${interval} seconds`] as [number, string]];
+    : [
+        ...INTERVALS,
+        [interval, `Every ${interval} seconds`] as [number, string],
+      ];
 
   return (
     <>
@@ -229,7 +236,10 @@ export function MailSettings() {
             onChange={(value) => changeInterval(Number(value))}
           />
           {intervalError ? (
-            <p role="alert" className="basis-full text-right text-[12px] text-red-400">
+            <p
+              role="alert"
+              className="basis-full text-right text-[12px] text-red-400"
+            >
               {intervalError}
             </p>
           ) : null}

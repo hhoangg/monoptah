@@ -5,12 +5,47 @@ import {
 } from "../../mail/model/mail";
 import type { MailCredential } from "../../mail/model/mailTypes";
 import { Loader, Trash2 } from "../../../shared/ui/icons";
+import { SearchableSelect } from "../../../shared/ui/SearchableSelect";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 
 export const FIELD_CLASS =
   "min-w-0 rounded-md border border-content/10 bg-content/5 px-2 py-1 text-[12px] text-content outline-none placeholder:text-content/30 focus:border-accent/60";
 export const PILL_CLASS =
   "rounded-full border border-content/10 bg-content/5 px-1.5 text-[10px] text-content/70";
+
+const KNOWN_REGIONS = [
+  "us-east-1",
+  "us-east-2",
+  "us-west-1",
+  "us-west-2",
+  "ca-central-1",
+  "sa-east-1",
+  "eu-west-1",
+  "eu-west-2",
+  "eu-west-3",
+  "eu-central-1",
+  "eu-north-1",
+  "eu-south-1",
+  "ap-south-1",
+  "ap-southeast-1",
+  "ap-southeast-2",
+  "ap-northeast-1",
+  "ap-northeast-2",
+  "ap-northeast-3",
+  "ap-east-1",
+  "me-south-1",
+  "af-south-1",
+];
+
+/** Appends the stored value when unknown, so an install on a region not listed here keeps working. */
+export function regionOptions(current: string, withNone = false) {
+  const regions =
+    current && !KNOWN_REGIONS.includes(current)
+      ? [...KNOWN_REGIONS, current]
+      : KNOWN_REGIONS;
+  const options = regions.map((region) => ({ value: region, label: region }));
+  return withNone ? [{ value: "", label: "No default" }, ...options] : options;
+}
 
 /** Tauri rejects with the Rust `String`, not an `Error`. */
 export function errorMessage(error: unknown): string {
@@ -58,7 +93,8 @@ export function CredentialEditor({
     } catch (err) {
       setError(errorMessage(err));
     } finally {
-      setSecret("");
+      // The secret is kept on failure: most rejections (bad key id, label,
+      // region) have nothing to do with it, and AWS never shows it again.
       setBusy(false);
     }
   };
@@ -94,13 +130,15 @@ export function CredentialEditor({
         value={secret}
         onChange={(event) => setSecret(event.target.value)}
       />
-      <input
-        aria-label="Default region"
-        className={`${FIELD_CLASS} w-28`}
-        placeholder="region"
-        value={region}
-        onChange={(event) => setRegion(event.target.value)}
-      />
+      <div className="w-40">
+        <SearchableSelect
+          label="Default region"
+          value={region}
+          options={regionOptions(region, true)}
+          onChange={setRegion}
+          searchPlaceholder="Search regions…"
+        />
+      </div>
       <SecondaryButton
         type="submit"
         disabled={busy || !label.trim() || !accessKeyId.trim() || !secret}
@@ -132,11 +170,13 @@ export function MailCredentialRow({
 }) {
   const [rotating, setRotating] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const remove = async () => {
     setBusy(true);
     setError(null);
+    setConfirming(false);
     try {
       await mailCredentialDelete(credential.id);
       onChanged();
@@ -169,14 +209,28 @@ export function MailCredentialRow({
         <SecondaryButton onClick={() => setRotating((prev) => !prev)}>
           Rotate
         </SecondaryButton>
-        <SecondaryButton
-          danger
-          disabled={busy}
-          aria-label={`Delete credential ${credential.label}`}
-          onClick={remove}
-        >
-          <Trash2 className="size-3.5" />
-        </SecondaryButton>
+        {confirming ? (
+          <>
+            <span className="text-content/50">
+              AWS will not show this secret again.
+            </span>
+            <SecondaryButton onClick={() => setConfirming(false)}>
+              Cancel
+            </SecondaryButton>
+            <SecondaryButton danger disabled={busy} onClick={remove}>
+              Delete key
+            </SecondaryButton>
+          </>
+        ) : (
+          <SecondaryButton
+            danger
+            disabled={busy}
+            aria-label={`Delete credential ${credential.label}`}
+            onClick={() => setConfirming(true)}
+          >
+            <Trash2 className="size-3.5" />
+          </SecondaryButton>
+        )}
       </div>
       {error ? (
         <p role="alert" className="px-4 pb-2.5 text-[12px] text-red-400">

@@ -23,7 +23,12 @@ import { Loader, Trash2 } from "../../../shared/ui/icons";
 import { SearchableSelect } from "../../../shared/ui/SearchableSelect";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 import { Toggle } from "./primitives";
-import { errorMessage, FIELD_CLASS, PILL_CLASS } from "./MailCredentialRow";
+import {
+  errorMessage,
+  FIELD_CLASS,
+  PILL_CLASS,
+  regionOptions,
+} from "./MailCredentialRow";
 
 const SAME_AS_SES = "";
 
@@ -34,7 +39,12 @@ export function iamPolicy(bucket: string): string {
     {
       Version: "2012-10-17",
       Statement: [
-        { Sid: "ListMailBucket", Effect: "Allow", Action: "s3:ListBucket", Resource: arn },
+        {
+          Sid: "ListMailBucket",
+          Effect: "Allow",
+          Action: "s3:ListBucket",
+          Resource: arn,
+        },
         {
           Sid: "ReadWriteMail",
           Effect: "Allow",
@@ -51,7 +61,11 @@ export function iamPolicy(bucket: string): string {
         {
           Sid: "Ses",
           Effect: "Allow",
-          Action: ["ses:SendEmail", "ses:ListEmailIdentities", "ses:GetAccount"],
+          Action: [
+            "ses:SendEmail",
+            "ses:ListEmailIdentities",
+            "ses:GetAccount",
+          ],
           Resource: "*",
         },
       ],
@@ -86,7 +100,8 @@ function groupByDomain(mailboxes: MailMailbox[]): [string, MailMailbox[]][] {
 
 const IDENTITY_HINT: Record<IdentityStatus, string> = {
   verified: "Verified: mail can be sent from this identity.",
-  pending: "Waiting for AWS to verify it. Check the DNS records, then test again.",
+  pending:
+    "Waiting for AWS to verify it. Check the DNS records, then test again.",
   failed: "AWS could not verify it. Check the DNS records for this identity.",
   sending_disabled:
     "AWS verified this identity, but sending is switched off for the whole AWS account in this region. This is not a verification problem and re-verifying will not help. Enable sending in the SES console for this account, then test again.",
@@ -152,6 +167,15 @@ export function MailSourceCard({
   const credential = credentials.find((c) => c.id === source.credentialId);
   const s3Credential = credentials.find((c) => c.id === source.s3CredentialId);
   const lastError = status?.lastError ?? null;
+  // AWS verified these but sending is off account-wide; saying "not verified"
+  // would send the user to DNS for a problem that lives in the SES console.
+  const sendingDisabled = (address: string) =>
+    identities.some(
+      (i) =>
+        i.status === "sending_disabled" &&
+        (i.identity === address.toLowerCase() ||
+          i.identity === domainOf(address)),
+    );
   const domains = groupByDomain(source.mailboxes);
   const mapped = new Set(source.mailboxes.map((m) => m.s3Prefix));
 
@@ -168,7 +192,11 @@ export function MailSourceCard({
 
   const test = () => {
     setBusy("test");
-    return run(async () => setReport(await mailSourceTest(source.id)));
+    return run(async () => {
+      setReport(await mailSourceTest(source.id));
+      // The test replaces the cached identities and re-resolves is_sendable.
+      onChanged();
+    });
   };
   const syncNow = () => {
     setBusy("sync");
@@ -184,14 +212,19 @@ export function MailSourceCard({
   };
   const addMailbox = (event: FormEvent) => {
     event.preventDefault();
+    const existing = source.mailboxes.find(
+      (m) => m.address.toLowerCase() === address.trim().toLowerCase(),
+    );
     return run(async () => {
       await mailMailboxesUpsert(source.id, [
         {
           address: address.trim(),
           s3Prefix: prefix.trim(),
-          displayName: "",
-          color: null,
-          sortOrder: source.mailboxes.length,
+          // Re-adding an address upserts every column, so carry over what the
+          // user may have set rather than overwrite it with empties.
+          displayName: existing?.displayName ?? "",
+          color: existing?.color ?? null,
+          sortOrder: existing?.sortOrder ?? source.mailboxes.length,
         },
       ]);
       setAddress("");
@@ -222,7 +255,9 @@ export function MailSourceCard({
             <span className="font-normal text-content/45">
               {source.bucket} · {source.sesRegion}
             </span>
-            {!source.enabled ? <span className={PILL_CLASS}>paused</span> : null}
+            {!source.enabled ? (
+              <span className={PILL_CLASS}>paused</span>
+            ) : null}
             {lastError ? (
               <span className="rounded-full border border-red-400/40 bg-red-400/10 px-1.5 text-[10px] text-red-400">
                 error
@@ -264,8 +299,8 @@ export function MailSourceCard({
           <p>{lastError}</p>
           <p className="mt-1 text-content/60">
             Key {credential?.label ?? "this source's key"} needs the permissions
-            listed under IAM policy below, on arn:aws:s3:::{source.bucket}. Other
-            sources are not affected.
+            listed under IAM policy below, on arn:aws:s3:::{source.bucket}.
+            Other sources are not affected.
           </p>
         </div>
       ) : null}
@@ -277,7 +312,10 @@ export function MailSourceCard({
       ) : null}
 
       {report ? (
-        <ul className="mt-2.5 space-y-1" aria-label={`Test result for ${source.label}`}>
+        <ul
+          className="mt-2.5 space-y-1"
+          aria-label={`Test result for ${source.label}`}
+        >
           <CheckLine name="S3 read" check={report.s3} />
           <CheckLine name="SES identities" check={report.sesIdentities} />
           <CheckLine name="SES account" check={report.sesAccount} />
@@ -324,7 +362,9 @@ export function MailSourceCard({
           </span>
           <div className="flex-1" />
           <SecondaryButton onClick={detect} disabled={busy !== null}>
-            {busy === "detect" ? <Loader className="size-3 animate-spin" /> : null}
+            {busy === "detect" ? (
+              <Loader className="size-3 animate-spin" />
+            ) : null}
             Detect prefixes
           </SecondaryButton>
         </div>
@@ -341,7 +381,9 @@ export function MailSourceCard({
                   key={mailbox.id}
                   className="flex items-center gap-3 py-1 text-[12px]"
                 >
-                  <span className="w-56 truncate text-content">{mailbox.address}</span>
+                  <span className="w-56 truncate text-content">
+                    {mailbox.address}
+                  </span>
                   <span className="min-w-0 flex-1 truncate font-mono text-content/70">
                     {mailbox.s3Prefix || "(bucket root)"}
                   </span>
@@ -350,7 +392,9 @@ export function MailSourceCard({
                     title={
                       mailbox.isSendable
                         ? "This address or its domain is a verified SES identity."
-                        : "Not sendable: no verified SES identity covers this address in this source's account and region."
+                        : sendingDisabled(mailbox.address)
+                          ? "AWS verified this identity, but sending is switched off for the whole AWS account in this region. Enable sending in the SES console; this is not a verification problem."
+                          : "Not sendable: no verified SES identity covers this address in this source's account and region."
                     }
                   >
                     {mailbox.isSendable ? "can send" : "receive only"}
@@ -370,7 +414,9 @@ export function MailSourceCard({
         {found ? (
           <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[12px]">
             {found.length === 0 ? (
-              <span className="text-content/50">No prefixes found in this bucket.</span>
+              <span className="text-content/50">
+                No prefixes found in this bucket.
+              </span>
             ) : (
               <>
                 <span className="text-content/50">Found:</span>
@@ -428,7 +474,9 @@ export function MailSourceCard({
             {identities.map((identity) => (
               <li key={identity.identity} className="text-[12px]">
                 <span className="text-content">{identity.identity}</span>{" "}
-                <span className={PILL_CLASS}>{IDENTITY_LABEL[identity.status]}</span>
+                <span className={PILL_CLASS}>
+                  {IDENTITY_LABEL[identity.status]}
+                </span>
                 {identity.status !== "verified" ? (
                   <p className="mt-0.5 text-content/50">
                     {IDENTITY_HINT[identity.status]}
@@ -457,8 +505,8 @@ export function MailSourceCard({
         {confirmDelete ? (
           <>
             <span className="text-content/50">
-              Removes this source and its synced mail from this Mac. Nothing in S3
-              is deleted.
+              Removes this source and its synced mail from this Mac. Nothing in
+              S3 is deleted.
             </span>
             <SecondaryButton onClick={() => setConfirmDelete(false)}>
               Cancel
@@ -493,7 +541,9 @@ export function SourceForm({
     String(source?.credentialId ?? credentials[0]?.id ?? ""),
   );
   const [s3CredentialId, setS3CredentialId] = useState(
-    source?.s3CredentialId == null ? SAME_AS_SES : String(source.s3CredentialId),
+    source?.s3CredentialId == null
+      ? SAME_AS_SES
+      : String(source.s3CredentialId),
   );
   const [sesRegion, setSesRegion] = useState(source?.sesRegion ?? "us-east-1");
   const [bucket, setBucket] = useState(source?.bucket ?? "");
@@ -517,7 +567,8 @@ export function SourceForm({
         id: source?.id ?? null,
         provider: source?.provider ?? "aws",
         credentialId: Number(credentialId),
-        s3CredentialId: s3CredentialId === SAME_AS_SES ? null : Number(s3CredentialId),
+        s3CredentialId:
+          s3CredentialId === SAME_AS_SES ? null : Number(s3CredentialId),
         label,
         sesRegion: sesRegion.trim(),
         bucket: bucket.trim(),
@@ -561,11 +612,12 @@ export function SourceForm({
         />
       </FieldLabel>
       <FieldLabel text="SES region">
-        <input
-          aria-label="SES region"
-          className={FIELD_CLASS}
+        <SearchableSelect
+          label="SES region"
           value={sesRegion}
-          onChange={(event) => setSesRegion(event.target.value)}
+          options={regionOptions(sesRegion)}
+          onChange={setSesRegion}
+          searchPlaceholder="Search regions…"
         />
       </FieldLabel>
       <FieldLabel text="Bucket">
@@ -577,11 +629,12 @@ export function SourceForm({
         />
       </FieldLabel>
       <FieldLabel text="S3 region">
-        <input
-          aria-label="S3 region"
-          className={FIELD_CLASS}
+        <SearchableSelect
+          label="S3 region"
           value={s3Region}
-          onChange={(event) => setS3Region(event.target.value)}
+          options={regionOptions(s3Region)}
+          onChange={setS3Region}
+          searchPlaceholder="Search regions…"
         />
       </FieldLabel>
       <FieldLabel text="S3 credential">
@@ -612,7 +665,9 @@ export function SourceForm({
         </p>
       ) : null}
       <div className="col-span-2 flex justify-end gap-2">
-        {onCancel ? <SecondaryButton onClick={onCancel}>Cancel</SecondaryButton> : null}
+        {onCancel ? (
+          <SecondaryButton onClick={onCancel}>Cancel</SecondaryButton>
+        ) : null}
         <SecondaryButton
           type="submit"
           disabled={busy || !label.trim() || !bucket.trim() || !credentialId}

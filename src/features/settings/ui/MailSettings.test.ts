@@ -138,6 +138,13 @@ it("shows how many sources use a credential and surfaces the server's refusal on
     return [];
   });
   await act(async () => byLabel("Delete credential personal").click());
+  // First click only asks: AWS never re-shows a secret.
+  expect(invoke).not.toHaveBeenCalledWith("mail_credential_delete", { id: 1 });
+  await act(async () =>
+    [...container.querySelectorAll("button")]
+      .find((b) => b.textContent === "Delete key")!
+      .click(),
+  );
   const alerts = [...container.querySelectorAll('[role="alert"]')].map(
     (node) => node.textContent,
   );
@@ -192,11 +199,16 @@ it("never fills the secret from server data and clears it after saving", async (
     '[aria-label="AWS secret access key"]',
   )!;
   await setValue(editor.querySelector('[aria-label="Credential label"]')!, "x");
-  await setValue(editor.querySelector('[aria-label="AWS access key id"]')!, "AKIAX");
+  await setValue(
+    editor.querySelector('[aria-label="AWS access key id"]')!,
+    "AKIAX",
+  );
   await setValue(secret, "hunter2");
   expect(secret.value).toBe("hunter2");
   await act(async () => {
-    editor.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    editor.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
   });
   expect(secret.value).toBe("");
   expect(container.textContent).not.toContain("hunter2");
@@ -209,19 +221,157 @@ it("pushes the interval to Rust when it changes", async () => {
       .querySelector<HTMLButtonElement>('[aria-label^="Sync interval"]')!
       .click(),
   );
-  const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(
-    (node) => node.textContent?.includes("Every 5 minutes"),
-  )!;
+  const option = [
+    ...document.querySelectorAll<HTMLElement>('[role="option"]'),
+  ].find((node) => node.textContent?.includes("Every 5 minutes"))!;
   await act(async () => option.click());
   expect(invoke).toHaveBeenCalledWith("mail_sync_interval_set", { secs: 300 });
 });
 
 it("explains sending_disabled as an account setting, not a verification failure", async () => {
   identities = [
-    { accountId: 1, identity: "byptah.com", kind: "domain", status: "sending_disabled" },
+    {
+      accountId: 1,
+      identity: "byptah.com",
+      kind: "domain",
+      status: "sending_disabled",
+    },
   ];
   await render();
   const text = container.querySelector('[data-source-id="1"]')!.textContent!;
   expect(text).toContain("not a verification problem");
   expect(text).not.toContain("could not verify");
+});
+
+it("keeps the secret when a save is rejected", async () => {
+  await render();
+  const form = container
+    .querySelector('input[aria-label="Credential label"]:not([readonly])')!
+    .closest("form")!;
+  const secret = form.querySelector<HTMLInputElement>(
+    '[aria-label="AWS secret access key"]',
+  )!;
+  await setValue(form.querySelector('[aria-label="Credential label"]')!, "x");
+  await setValue(
+    form.querySelector('[aria-label="AWS access key id"]')!,
+    "bad",
+  );
+  await setValue(secret, "hunter2");
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "mail_credential_upsert") throw "Not an access key id.";
+    return [];
+  });
+  await act(async () => {
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+  });
+  expect(form.textContent).toContain("Not an access key id.");
+  expect(secret.value).toBe("hunter2");
+});
+
+it("refetches after Test so identities and sendable pills update", async () => {
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "mail_source_test")
+      return {
+        accountId: 1,
+        label: "byptah-mail",
+        s3: { ok: true, action: "s3:ListBucket", kind: null, message: null },
+        sesIdentities: {
+          ok: true,
+          action: "ses:ListEmailIdentities",
+          kind: null,
+          message: null,
+        },
+        sesAccount: {
+          ok: true,
+          action: "ses:GetAccount",
+          kind: null,
+          message: null,
+        },
+        identityCount: 1,
+        sandbox: false,
+      };
+    if (command === "mail_credentials") return credentials;
+    if (command === "mail_sources") return sources;
+    if (command === "mail_identities") return identities;
+    return { sources: statuses, unreadTotal: 0, syncIntervalSecs: 3600 };
+  });
+  await render();
+  const calls = () =>
+    vi.mocked(invoke).mock.calls.filter(([c]) => c === "mail_identities")
+      .length;
+  const before = calls();
+  await act(async () =>
+    [...container.querySelectorAll('[data-source-id="1"] button')]
+      .find((b) => b.textContent === "Test")!
+      .click(),
+  );
+  expect(calls()).toBe(before + 1);
+});
+
+it("does not blame verification on a receive-only mailbox whose identity has sending disabled", async () => {
+  sources[0].mailboxes[0].isSendable = false;
+  identities = [
+    {
+      accountId: 1,
+      identity: "byptah.com",
+      kind: "domain",
+      status: "sending_disabled",
+    },
+  ];
+  await render();
+  const pill = [
+    ...container.querySelectorAll<HTMLElement>(
+      '[data-source-id="1"] span[title]',
+    ),
+  ].find((n) => n.textContent === "receive only")!;
+  expect(pill.title).toContain("not a verification problem");
+  expect(pill.title).not.toContain("no verified SES identity");
+});
+
+it("keeps colour and display name when an existing address is re-added", async () => {
+  sources[0].mailboxes[0].color = "#abc";
+  sources[0].mailboxes[0].displayName = "Boss";
+  await render();
+  vi.mocked(invoke).mockImplementation(async () => []);
+  await setValue(
+    byLabel<HTMLInputElement>("New mailbox address for byptah-mail"),
+    "owner@byptah.com",
+  );
+  await setValue(
+    byLabel<HTMLInputElement>("New mailbox S3 prefix for byptah-mail"),
+    "owner2/",
+  );
+  const form = byLabel("New mailbox address for byptah-mail").closest("form")!;
+  await act(async () => {
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+  });
+  expect(invoke).toHaveBeenCalledWith("mail_mailboxes_upsert", {
+    accountId: 1,
+    rows: [
+      expect.objectContaining({
+        displayName: "Boss",
+        color: "#abc",
+        s3Prefix: "owner2/",
+      }),
+    ],
+  });
+});
+
+it("offers regions as a dropdown that keeps an unknown stored region", async () => {
+  sources[0].sesRegion = "xx-custom-1";
+  await render();
+  await act(async () =>
+    [...container.querySelectorAll('[data-source-id="1"] button')]
+      .find((b) => b.textContent === "Edit")!
+      .click(),
+  );
+  const trigger = container.querySelector<HTMLElement>(
+    '[aria-label^="SES region"]',
+  )!;
+  expect(trigger.tagName).toBe("BUTTON");
+  expect(trigger.textContent).toContain("xx-custom-1");
 });
