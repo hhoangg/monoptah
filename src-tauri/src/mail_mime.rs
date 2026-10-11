@@ -309,45 +309,73 @@ fn headers_json(msg: &Message) -> String {
     serde_json::to_string(&pairs).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// RFC 8601: only the header added by the trusted boundary means anything, and
+/// that is the topmost one. Any lower header was written by the sender or a
+/// relay, so reading it would let a stranger forge `pass`.
 fn auth_results(msg: &Message) -> (Option<String>, Option<String>, Option<String>) {
+    let Some((_, value)) = msg
+        .headers_raw()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authentication-results"))
+    else {
+        return (None, None, None);
+    };
+    let value = strip_comments(value);
+    let mut tokens = value
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == ';');
+    // Inbound mail only ever arrives through SES, so any other authserv-id
+    // means the header did not come from our boundary.
+    if !tokens
+        .next()
+        .is_some_and(|id| id.eq_ignore_ascii_case(TRUSTED_AUTHSERV_ID))
+    {
+        return (None, None, None);
+    }
     let mut found: [Option<String>; 3] = [None, None, None];
-    for (name, value) in msg.headers_raw() {
-        if !name.eq_ignore_ascii_case("authentication-results") {
-            continue;
-        }
-        // Tokens only count at a boundary, so `header.i=` or text inside a
-        // parenthesised comment cannot pose as a method result.
-        let mut depth = 0usize;
-        for token in value.split(|c: char| c.is_whitespace() || c == ';') {
-            depth += token.matches('(').count();
-            let inside_comment = depth > 0;
-            depth = depth.saturating_sub(token.matches(')').count());
-            if inside_comment {
-                continue;
-            }
-            for (slot, method) in found.iter_mut().zip(["spf=", "dkim=", "dmarc="]) {
-                // `get` because a multibyte character may straddle the cut.
-                let prefix_matches = token
-                    .get(..method.len())
-                    .is_some_and(|p| p.eq_ignore_ascii_case(method));
-                if slot.is_none() && prefix_matches {
-                    let verdict: String = token[method.len()..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphabetic())
-                        .collect::<String>()
-                        .to_ascii_lowercase();
-                    if !verdict.is_empty() && verdict != "none" {
-                        *slot = Some(verdict);
-                    }
+    let mut seen = [false; 3];
+    for token in tokens {
+        for ((slot, seen), method) in found
+            .iter_mut()
+            .zip(&mut seen)
+            .zip(["spf=", "dkim=", "dmarc="])
+        {
+            // `get` because a multibyte character may straddle the cut.
+            let prefix_matches = token
+                .get(..method.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(method));
+            if !*seen && prefix_matches {
+                *seen = true;
+                let verdict: String = token[method.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if !verdict.is_empty() && verdict != "none" {
+                    *slot = Some(verdict);
                 }
             }
-        }
-        if found.iter().all(Option::is_some) {
-            break;
         }
     }
     let [spf, dkim, dmarc] = found;
     (spf, dkim, dmarc)
+}
+
+const TRUSTED_AUTHSERV_ID: &str = "amazonses.com";
+
+/// Removes RFC 5322 comments (nested parentheses), so text inside one cannot
+/// pose as a method result while `spf=pass(note)` still reads as a verdict.
+fn strip_comments(value: &str) -> String {
+    let mut depth = 0usize;
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn snippet_from_text(text: &str) -> String {
@@ -490,10 +518,15 @@ const TABLE_CELL_ATTRS: &[&str] = &[
 ///
 /// Remote `img src` cannot be moved to `data-mono-src` from ammonia's attribute
 /// filter (it can change a value, not add an attribute). The filter instead
-/// swaps the URL for one under a one-off scheme that only this call knows, and
-/// the serialised output is rewritten from that. Anything the sender wrote in
-/// that scheme or in `data-mono-src` is dropped, so the rewrite is the sole
-/// producer of the attribute.
+/// swaps the URL for one under a one-off scheme, and the serialised output is
+/// rewritten from that.
+///
+/// Safety rests on the nonce, not on the allowlist: the scheme embeds a fresh
+/// uuid per call that never appears in the output, so sender content cannot
+/// spell the needle `src="<marker>` (text nodes do not escape `"`). As a second
+/// wall `filter_attribute` drops any sender `img src` that starts with the
+/// marker, and attribute values escape `"`, so an extracted URL cannot break
+/// out of `data-mono-src="..."`. `data-mono-src` is not allowlisted either.
 fn sanitize_html(html: &str) -> (String, usize) {
     let scheme = format!("monoblk-{}", uuid::Uuid::new_v4().simple());
     let marker = format!("{scheme}:");
@@ -536,7 +569,9 @@ fn sanitize_html(html: &str) -> (String, usize) {
             "data",
             scheme.as_str(),
         ]))
-        .url_relative(UrlRelative::Deny)
+        // Relative URLs must reach `filter_attribute`: under Deny ammonia drops them
+        // first, so a `//host/x.gif` image would vanish without being counted.
+        .url_relative(UrlRelative::PassThrough)
         .link_rel(Some("noopener noreferrer nofollow"))
         .filter_style_properties(ALLOWED_STYLE_PROPERTIES.iter().copied().collect())
         .attribute_filter(move |element, attribute, value| {
@@ -548,6 +583,8 @@ fn sanitize_html(html: &str) -> (String, usize) {
     rewrite_blocked_images(&cleaned, &marker)
 }
 
+/// Owns the decision for every URL-bearing attribute, because relative URLs
+/// are passed through by ammonia and `cite` is not checked by it at all.
 fn filter_attribute<'u>(
     marker: &str,
     element: &str,
@@ -555,10 +592,11 @@ fn filter_attribute<'u>(
     value: &'u str,
 ) -> Option<Cow<'u, str>> {
     let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let is_relative = || url::Url::parse(trimmed) == Err(url::ParseError::RelativeUrlWithoutBase);
     match (element, attribute) {
         (_, "style") => filter_style(value).map(Cow::Owned),
         ("img", "src") => {
-            let lower = trimmed.to_ascii_lowercase();
             if lower.starts_with(&marker.to_ascii_lowercase()) {
                 None
             } else if lower.starts_with("cid:")
@@ -567,17 +605,31 @@ fn filter_attribute<'u>(
                 Some(Cow::Borrowed(trimmed))
             } else if lower.starts_with("http://") || lower.starts_with("https://") {
                 Some(Cow::Owned(format!("{marker}{trimmed}")))
+            } else if trimmed.starts_with("//") {
+                Some(Cow::Owned(format!("{marker}https:{trimmed}")))
+            } else if is_relative() {
+                // No base to resolve against, but it is still a remote reference
+                // the sender wrote, so it is blocked and counted like the rest.
+                Some(Cow::Owned(format!("{marker}{trimmed}")))
             } else {
                 None
             }
         }
         ("a", "href") => {
-            let lower = trimmed.to_ascii_lowercase();
             if lower.starts_with("data:") || lower.starts_with(&marker.to_ascii_lowercase()) {
+                None
+            } else if is_relative() {
+                // A relative link in an email has no base and is broken anyway.
                 None
             } else {
                 Some(Cow::Borrowed(value))
             }
+        }
+        (_, "cite") => {
+            let ok = ["http://", "https://", "mailto:"]
+                .iter()
+                .any(|scheme| lower.starts_with(scheme));
+            ok.then_some(Cow::Borrowed(value))
         }
         _ => Some(Cow::Borrowed(value)),
     }
@@ -800,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn references_and_in_reply_to_keep_document_order() {
+    fn in_reply_to_is_first_then_references_without_duplicates() {
         let raw = "From: a@example.com\r\nMessage-ID: <c@x>\r\n\
                    In-Reply-To: <b@x>\r\n\
                    References: <a@x>\r\n <b@x> <z@y>\r\n\r\nhi";
@@ -826,7 +878,7 @@ mod tests {
 
     #[test]
     fn auth_results_ignore_comments_and_none() {
-        let raw = "Authentication-Results: mx; spf=softfail (note: dkim=pass here) \
+        let raw = "Authentication-Results: amazonses.com; spf=softfail (note: dkim=pass here) \
                    smtp.mailfrom=a; dkim=none; dmarc=fail header.from=x\r\n\
                    From: a@example.com\r\n\r\nhi";
         let m = parse_mail(raw.as_bytes()).unwrap();
@@ -834,11 +886,77 @@ mod tests {
         assert_eq!(m.dkim, None);
         assert_eq!(m.dmarc.as_deref(), Some("fail"));
         let raw =
-            "Authentication-Results: mx; héé=1 dké=2 spf=pass\r\nFrom: a@example.com\r\n\r\nhi";
+            "Authentication-Results: amazonses.com; héé=1 dké=2 spf=pass\r\nFrom: a@example.com\r\n\r\nhi";
         assert_eq!(
             parse_mail(raw.as_bytes()).unwrap().spf.as_deref(),
             Some("pass")
         );
+    }
+
+    #[test]
+    fn only_the_topmost_auth_header_counts() {
+        let raw = "Authentication-Results: amazonses.com; spf=pass; dkim=none; dmarc=none\r\n\
+                   Authentication-Results: x; dkim=pass; dmarc=pass; spf=fail\r\n\
+                   From: a@example.com\r\n\r\nhi";
+        let m = parse_mail(raw.as_bytes()).unwrap();
+        assert_eq!(m.spf.as_deref(), Some("pass"));
+        assert_eq!((m.dkim, m.dmarc), (None, None));
+    }
+
+    #[test]
+    fn auth_header_from_another_authserv_is_ignored() {
+        let raw = "Authentication-Results: evil.example; spf=pass; dkim=pass\r\n\
+                   From: a@example.com\r\n\r\nhi";
+        let m = parse_mail(raw.as_bytes()).unwrap();
+        assert_eq!((m.spf, m.dkim, m.dmarc), (None, None, None));
+    }
+
+    #[test]
+    fn auth_verdict_directly_before_a_comment_is_read() {
+        let raw =
+            "Authentication-Results: amazonses.com; spf=pass(ok) dkim=pass (c; dmarc=pass)\r\n\
+                   From: a@example.com\r\n\r\nhi";
+        let m = parse_mail(raw.as_bytes()).unwrap();
+        assert_eq!(m.spf.as_deref(), Some("pass"));
+        assert_eq!(m.dkim.as_deref(), Some("pass"));
+        assert_eq!(m.dmarc, None);
+    }
+
+    #[test]
+    fn sender_written_marker_scheme_is_dropped() {
+        let m = html_mail(r#"<img src="monoblk-00000000000000000000000000000000:http://evil/x">"#);
+        let out = m.body_html.unwrap();
+        assert!(
+            !out.contains("evil") && !out.contains("data-mono-src"),
+            "{out}"
+        );
+        assert_eq!(m.remote_images_blocked, 0);
+        // A text node may carry the needle; with a fresh nonce it cannot match.
+        let m = html_mail(r#"<p>src="monoblk-0:http://evil/x"</p>"#);
+        assert_eq!(m.remote_images_blocked, 0);
+    }
+
+    #[test]
+    fn relative_images_are_blocked_and_counted_but_relative_links_vanish() {
+        let m = html_mail(
+            r#"<img src="//t.example/c.gif"><img src="/rel.png"><a href="/x">l</a><a href="page.html">m</a>"#,
+        );
+        let out = m.body_html.unwrap();
+        assert_eq!(m.remote_images_blocked, 2, "{out}");
+        assert!(
+            out.contains(r#"data-mono-src="https://t.example/c.gif""#),
+            "{out}"
+        );
+        assert!(!out.contains("href"), "{out}");
+    }
+
+    #[test]
+    fn cite_urls_are_scheme_checked() {
+        let out = sanitised(
+            r#"<blockquote cite="javascript:x">a</blockquote><q cite="https://e.com/p">b</q>"#,
+        );
+        assert!(!out.contains("javascript"), "{out}");
+        assert!(out.contains(r#"cite="https://e.com/p""#), "{out}");
     }
 
     #[test]
@@ -975,7 +1093,7 @@ mod tests {
                <img src="data:image/svg+xml,<svg/>"><img src="javascript:x"><img src="/rel.png">"#,
         );
         let out = m.body_html.unwrap();
-        assert_eq!(m.remote_images_blocked, 2, "{out}");
+        assert_eq!(m.remote_images_blocked, 3, "{out}");
         assert!(
             out.contains(r#"src="" data-mono-src="https://t.example/a.png?x=1&amp;y=2""#),
             "{out}"
@@ -987,7 +1105,9 @@ mod tests {
         assert!(out.contains(r#"src="cid:keep@x""#), "{out}");
         assert!(out.contains(r#"src="data:image/png;base64,AAAA""#), "{out}");
         assert!(
-            !out.contains("svg") && !out.contains("javascript") && !out.contains("rel.png"),
+            !out.contains("svg")
+                && !out.contains("javascript")
+                && out.contains(r#"src="" data-mono-src="/rel.png""#),
             "{out}"
         );
         assert!(!out.contains("monoblk"), "{out}");
