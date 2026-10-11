@@ -281,7 +281,8 @@ fn release_staged(store: &SessionStore, dir: &std::path::Path, paths: &Releasabl
     // under it: a race traded for a latency win. The unlinks are local
     // metadata operations, so the hold is not free: `outbox_attachment_paths`
     // has no LIMIT and includes sent rows, and each path costs a `canonicalize`
-    // and a `symlink_metadata`. That is two syscalls per attachment in the
+    // of its parent directory and a `symlink_metadata`. That is two syscalls
+    // per attachment in the
     // whole outbox, under the app-wide store mutex that every other feature
     // also takes. Holding it is still right, because `conn` is the single write
     // connection and the mutex is what serialises every writer against the
@@ -969,11 +970,16 @@ fn prepare(store: &SessionStore, clients: &dyn AwsClients, id: i64) -> Result<Pr
     {
         let conn = store.lock_conn()?;
         // The bytes were read from the attachment list `load` captured. If a
-        // save changed that list since, claiming now would send files the row
-        // no longer lists, and a save that dropped one has already released it:
+        // save changed that list since - including only its order, which means
+        // the body it was serialised from changed - claiming now would send
+        // files the row no longer lists, and a save that dropped one has
+        // already released it:
         // an `unconfirmed` row would then be the only record of a message whose
         // attachment is gone. Checked under the same lock as the claim so no
         // save can slip between them; after the claim, saves are refused.
+        // Attachments only: a save that changed the body or the recipients in
+        // this window still sends the `load`-time bytes while the row keeps the
+        // newer text. That is older than this check and not closed by it.
         let current = mail_store::get_outbox(&conn, id).map_err(db)?;
         if current.is_some_and(|row| row.attachments != loaded.row.attachments) {
             return Err("This message was edited while it was being prepared. \

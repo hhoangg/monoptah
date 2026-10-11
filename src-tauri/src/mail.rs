@@ -2179,7 +2179,10 @@ mod tests {
         store
             .lock_conn()
             .unwrap()
-            .execute("UPDATE mail_outbox SET state = ?1", [state])
+            .execute(
+                "UPDATE mail_outbox SET state = ?1 WHERE id = ?2",
+                rusqlite::params![state, id],
+            )
             .unwrap();
         id
     }
