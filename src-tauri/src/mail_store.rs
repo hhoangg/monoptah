@@ -46,6 +46,7 @@ pub(crate) fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
           image_policy   TEXT NOT NULL DEFAULT 'ask',
           enabled        INTEGER NOT NULL DEFAULT 1,
           sort_order     INTEGER NOT NULL DEFAULT 0,
+          identities_refreshed_at INTEGER,
           created_at     INTEGER NOT NULL,
           updated_at     INTEGER NOT NULL,
           UNIQUE (credential_id, ses_region, bucket, s3_region)
@@ -590,14 +591,14 @@ pub(crate) fn upsert_mailboxes(
             ],
         )?;
     }
-    // Skipped while nothing is cached: an empty cache means "not checked yet",
-    // not "nothing is verified".
-    let has_identities: bool = tx.query_row(
-        "SELECT EXISTS (SELECT 1 FROM mail_identity WHERE account_id = ?1)",
+    // NULL means identities were never fetched, so sendability is unknown. A
+    // fetch that returned zero identities is different: nothing is verified.
+    let refreshed: bool = tx.query_row(
+        "SELECT identities_refreshed_at IS NOT NULL FROM mail_account WHERE id = ?1",
         params![account_id],
         |row| row.get(0),
     )?;
-    if has_identities {
+    if refreshed {
         resolve_sendable(&tx, account_id)?;
     }
     tx.commit()
@@ -647,8 +648,8 @@ pub struct MailIdentity {
 }
 
 /// Sets `is_sendable` on a source's mailboxes: true when the address, or its
-/// domain, is a verified identity. With no identities cached it clears the flag,
-/// so callers must only rely on it after an identity refresh.
+/// domain, is a verified identity. Callers decide whether identities were ever
+/// refreshed (`identities_refreshed_at`); this clears the flag unconditionally.
 fn resolve_sendable(conn: &Connection, account_id: i64) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE mail_mailbox SET is_sendable = EXISTS (
@@ -691,6 +692,10 @@ pub(crate) fn replace_identities(
             ],
         )?;
     }
+    tx.execute(
+        "UPDATE mail_account SET identities_refreshed_at = ?1 WHERE id = ?2",
+        params![now, account_id],
+    )?;
     resolve_sendable(&tx, account_id)?;
     tx.commit()
 }
@@ -1082,6 +1087,21 @@ mod tests {
         };
         assert!(sendable("late@example.com"));
         assert!(!sendable("stray@unverified.org"));
+    }
+
+    #[test]
+    fn empty_identity_refresh_makes_new_mailboxes_unsendable() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let cred = upsert_credential(&conn, &credential("personal")).unwrap();
+        let a = upsert_account(&conn, &account(cred, "Alpha", "bucket-a")).unwrap();
+        upsert_mailboxes(&conn, a, &[mailbox("old@example.com", "o/")]).unwrap();
+
+        replace_identities(&conn, a, &[]).unwrap();
+        upsert_mailboxes(&conn, a, &[mailbox("new@example.com", "n/")]).unwrap();
+        let boxes = list_mailboxes(&conn, Some(a)).unwrap();
+        assert_eq!(boxes.len(), 2);
+        assert!(boxes.iter().all(|m| !m.is_sendable));
     }
 
     #[test]

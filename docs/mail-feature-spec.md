@@ -308,6 +308,8 @@ CREATE TABLE IF NOT EXISTS mail_account (
   image_policy   TEXT NOT NULL DEFAULT 'ask',        -- ask | always | never
   enabled        INTEGER NOT NULL DEFAULT 1,
   sort_order     INTEGER NOT NULL DEFAULT 0,
+  identities_refreshed_at INTEGER,           -- millis; NULL = never refreshed, so
+                                             -- is_sendable is unknown, not false
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,
   UNIQUE (credential_id, ses_region, bucket, s3_region)
