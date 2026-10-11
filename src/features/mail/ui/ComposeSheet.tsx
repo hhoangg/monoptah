@@ -154,7 +154,7 @@ async function stage(
   const path =
     file.path ??
     (file.data
-      ? await invoke<string>("write_attachment", {
+      ? await invoke<string>("mail_stage_attachment", {
           name: file.name,
           data: file.data,
         })

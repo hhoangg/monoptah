@@ -3470,6 +3470,18 @@ pub(crate) fn update_outbox(conn: &Connection, id: i64, w: &OutboxWrite) -> rusq
     )? > 0)
 }
 
+/// Every attachment path any outbox row still points at, sent rows included.
+pub(crate) fn outbox_attachment_paths(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT attachments_json FROM mail_outbox")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for json in rows {
+        let list: Vec<OutboxAttachment> = serde_json::from_str(&json?).unwrap_or_default();
+        out.extend(list.into_iter().map(|a| a.path));
+    }
+    Ok(out)
+}
+
 /// The one way out of `unconfirmed`.
 pub(crate) fn rearm_outbox(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
     Ok(conn.execute(

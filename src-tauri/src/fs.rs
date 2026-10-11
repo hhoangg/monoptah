@@ -5637,6 +5637,17 @@ pub async fn write_attachment(name: String, data: String) -> Result<String, Stri
 }
 
 fn write_attachment_sync(name: &str, data: &str) -> Result<String, String> {
+    write_attachment_into(
+        &std::env::temp_dir().join("monocode-attachments"),
+        name,
+        data,
+    )
+}
+
+/// [`write_attachment`]'s writer with the destination chosen by the caller.
+/// The generic command keeps the temp dir; a mail draft's file must outlive
+/// the OS temp pruning and so is staged elsewhere (see `mail_stage_attachment`).
+pub(crate) fn write_attachment_into(dir: &Path, name: &str, data: &str) -> Result<String, String> {
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
         .map_err(|_| "Attachment data is not valid base64.".to_string())?;
     if bytes.len() as u64 > MAX_ATTACHMENT_EMBED_BYTES {
@@ -5645,8 +5656,7 @@ fn write_attachment_sync(name: &str, data: &str) -> Result<String, String> {
             MAX_ATTACHMENT_EMBED_BYTES / 1024 / 1024
         ));
     }
-    let dir = std::env::temp_dir().join("monocode-attachments");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

@@ -381,6 +381,7 @@ pub fn run() {
             mail::mail_outbox_send,
             mail::mail_outbox_check,
             mail::mail_outbox_rearm,
+            mail::mail_stage_attachment,
             mail::mail_outbox_list,
             mail::mail_outbox_delete,
             mail::mail_sendable_mailboxes,

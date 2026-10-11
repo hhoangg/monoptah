@@ -1679,13 +1679,15 @@ pub async fn mail_delete(
 
 #[tauri::command(async)]
 pub fn mail_outbox_save(
+    app: AppHandle,
     store: State<'_, SessionStore>,
     draft: mail_send::OutboxDraft,
 ) -> Result<i64, String> {
+    let staging = mail_send::staging_dir(&attachments_root(&app)?);
     // No MESSAGES_CHANGED_EVENT: a save changes no message or folder, every
     // listener of that event reloads the mail UI, and a composer saves on a
     // timer. An outbox list that needs to know wants an event of its own.
-    mail_send::outbox_save(&store, draft)
+    mail_send::outbox_save_releasing(&store, &staging, draft)
 }
 
 /// Sends once. A failure is reported and recorded, never retried here.
@@ -1746,8 +1748,30 @@ pub fn mail_outbox_list(
 }
 
 #[tauri::command(async)]
-pub fn mail_outbox_delete(store: State<'_, SessionStore>, id: i64) -> Result<(), String> {
-    mail_send::outbox_delete(&store, id)
+pub fn mail_outbox_delete(
+    app: AppHandle,
+    store: State<'_, SessionStore>,
+    id: i64,
+) -> Result<(), String> {
+    let staging = mail_send::staging_dir(&attachments_root(&app)?);
+    mail_send::outbox_delete_releasing(&store, &staging, id)
+}
+
+/// Gives a pasted or dropped file a path for a mail draft. Not
+/// `write_attachment`: that one writes to `$TMPDIR`, which macOS prunes, and
+/// a draft reopened days later would point at nothing.
+#[tauri::command]
+pub async fn mail_stage_attachment(
+    app: AppHandle,
+    name: String,
+    data: String,
+) -> Result<String, String> {
+    let dir = mail_send::staging_dir(&attachments_root(&app)?);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::fs::write_attachment_into(&dir, &name, &data)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command(async)]

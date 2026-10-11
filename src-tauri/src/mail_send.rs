@@ -240,6 +240,90 @@ pub(crate) fn outbox_rearm(store: &SessionStore, id: i64) -> Result<(), String> 
     }
 }
 
+// ── staged attachment files ────────────────────────────────────────
+
+/// Where a draft's pasted or dropped files live: under the mail attachments
+/// root, which is app data and not `$TMPDIR`, so the OS cannot prune them out
+/// from under a draft. The folder name cannot collide with a message's cache
+/// folder, which is named by its numeric id.
+pub(crate) fn staging_dir(attachments_root: &std::path::Path) -> std::path::PathBuf {
+    attachments_root.join("drafts")
+}
+
+/// Deletes staged files nothing refers to any more. Only files inside `dir`
+/// are ever touched (a file the person picked from their own disk is not
+/// ours), and a file another outbox row still lists is kept. Returns how many
+/// were removed.
+pub(crate) fn release_staged(
+    store: &SessionStore,
+    dir: &std::path::Path,
+    paths: &[String],
+) -> usize {
+    let Ok(conn) = store.lock_conn() else {
+        return 0;
+    };
+    let Ok(still_used) = mail_store::outbox_attachment_paths(&conn) else {
+        return 0;
+    };
+    paths
+        .iter()
+        .filter(|p| {
+            let path = std::path::Path::new(p.as_str());
+            path.starts_with(dir)
+                && !path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                && !still_used.contains(p)
+        })
+        .filter(|p| std::fs::remove_file(p).is_ok())
+        .count()
+}
+
+fn attachment_paths(row: &OutboxRow) -> Vec<String> {
+    row.attachments.iter().map(|a| a.path.clone()).collect()
+}
+
+/// [`outbox_save`], then frees the staged files this save dropped from the draft.
+pub(crate) fn outbox_save_releasing(
+    store: &SessionStore,
+    dir: &std::path::Path,
+    draft: OutboxDraft,
+) -> Result<i64, String> {
+    let before = match draft.id {
+        Some(id) => {
+            let conn = store.lock_conn()?;
+            mail_store::get_outbox(&conn, id)
+                .map_err(db)?
+                .map(|row| attachment_paths(&row))
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    let id = outbox_save(store, draft)?;
+    release_staged(store, dir, &before);
+    Ok(id)
+}
+
+/// [`outbox_delete`], then frees the staged files of the deleted row. Rows
+/// that were sent keep theirs until they are deleted: a local-only sent
+/// message has no other copy of its attachments.
+pub(crate) fn outbox_delete_releasing(
+    store: &SessionStore,
+    dir: &std::path::Path,
+    id: i64,
+) -> Result<(), String> {
+    let paths = {
+        let conn = store.lock_conn()?;
+        mail_store::get_outbox(&conn, id)
+            .map_err(db)?
+            .map(|row| attachment_paths(&row))
+            .unwrap_or_default()
+    };
+    outbox_delete(store, id)?;
+    release_staged(store, dir, &paths);
+    Ok(())
+}
+
 // ── the From picker ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -2339,6 +2423,99 @@ mod tests {
         conn.execute("UPDATE mail_outbox SET state = 'sending'", [])
             .unwrap();
         assert!(mail_store::mark_outbox_sent(&conn, id, "x").unwrap());
+    }
+
+    fn staged(dir: &std::path::Path, name: &str) -> OutboxAttachment {
+        let path = crate::fs::write_attachment_into(dir, name, "aGVsbG8=").unwrap();
+        OutboxAttachment {
+            path,
+            filename: name.into(),
+            mime: "image/png".into(),
+            cid: None,
+        }
+    }
+
+    fn scratch() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("mono-stage-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn a_staged_file_goes_where_it_is_told_and_holds_the_bytes() {
+        let root = scratch();
+        let dir = staging_dir(&root);
+        let file = staged(&dir, "../shot.png");
+        assert!(std::path::Path::new(&file.path).starts_with(&dir));
+        assert_eq!(std::fs::read(&file.path).unwrap(), b"hello");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_files_live_exactly_as_long_as_a_draft_that_lists_them() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        let (keep, drop_on_save) = (staged(&dir, "a.png"), staged(&dir, "b.png"));
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![keep.clone(), drop_on_save.clone()];
+        let id = outbox_save_releasing(&w.store, &dir, d.clone()).unwrap();
+        assert!(std::path::Path::new(&drop_on_save.path).exists());
+
+        // Removing an attachment from the draft frees its file, not the other.
+        d.id = Some(id);
+        d.attachments = vec![keep.clone()];
+        outbox_save_releasing(&w.store, &dir, d).unwrap();
+        assert!(!std::path::Path::new(&drop_on_save.path).exists());
+        assert!(std::path::Path::new(&keep.path).exists());
+
+        // A second draft listing the same file keeps it alive past the first.
+        let mut other = draft("owner@byptah.com", "ann@example.org");
+        other.attachments = vec![keep.clone()];
+        let other_id = outbox_save_releasing(&w.store, &dir, other).unwrap();
+        outbox_delete_releasing(&w.store, &dir, id).unwrap();
+        assert!(std::path::Path::new(&keep.path).exists());
+        outbox_delete_releasing(&w.store, &dir, other_id).unwrap();
+        assert!(!std::path::Path::new(&keep.path).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_sent_message_keeps_its_staged_files_until_its_row_is_deleted() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        let file = staged(&dir, "a.png");
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![file.clone()];
+        let id = outbox_save_releasing(&w.store, &dir, d).unwrap();
+        outbox_send(&w.store, &w.fake, id).unwrap();
+        assert!(std::path::Path::new(&file.path).exists());
+        outbox_delete_releasing(&w.store, &dir, id).unwrap();
+        assert!(!std::path::Path::new(&file.path).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_files_inside_the_staging_dir_are_ever_deleted() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        // A file the person picked from their own disk.
+        let own = staged(&root, "mine.png");
+        std::fs::create_dir_all(&dir).unwrap();
+        let leaf = std::path::Path::new(&own.path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let sneaky = format!("{}/../{leaf}", dir.display());
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![own.clone()];
+        let id = outbox_save_releasing(&w.store, &dir, d).unwrap();
+        outbox_delete_releasing(&w.store, &dir, id).unwrap();
+        assert!(std::path::Path::new(&own.path).exists());
+        assert_eq!(release_staged(&w.store, &dir, &[sneaky]), 0);
+        assert!(std::path::Path::new(&own.path).exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn count_cred(conn: &rusqlite::Connection) -> i64 {
