@@ -2,6 +2,7 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 import * as mail from "../model/mail";
 import { contentIdFor } from "../model/mailCompose";
 import type {
@@ -126,6 +127,8 @@ beforeEach(() => {
   Range.prototype.getBoundingClientRect = () => new DOMRect();
   for (const fn of Object.values(m))
     (fn as ReturnType<typeof vi.fn>).mockReset();
+  vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+    cmd === "read_file_base64" ? "aGVsbG8=" : null) as never);
   m.mailStatus.mockResolvedValue({ sources: [SOURCE] } as never);
   m.mailSendableMailboxes.mockResolvedValue([
     { ...mailbox(1, "owner@byptah.com"), isDefault: true },
@@ -492,6 +495,14 @@ it("Quote inline is off for an original with no plain text, and the quote still 
   const inline = button("Quote inline") as HTMLButtonElement;
   expect(inline.disabled).toBe(true);
   await click(inline);
+  // React drops clicks on a disabled button, so call the handler itself to
+  // exercise the guard inside quoteInline.
+  const props = Object.keys(inline).find((k) => k.startsWith("__reactProps"))!;
+  await act(async () =>
+    (inline as never as Record<string, { onClick: () => void }>)[
+      props
+    ].onClick(),
+  );
   m.mailOutboxSend.mockRejectedValue("stop here");
   await click(button("Send"));
   expect(lastSave().quotedHtml).toBe("<p>FORWARDED-ORIGINAL</p>");
@@ -600,4 +611,95 @@ it("says when a reopened draft's files are gone, before Send", async () => {
     "gone.pdf is no longer on this computer",
   );
   expect(body().textContent).not.toContain("here.pdf is no longer");
+});
+
+it("the missing-file warning survives pressing Send, and Send does not go ahead", async () => {
+  const { invoke } = await import("@tauri-apps/api/core");
+  vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+    cmd === "inspect_paths" ? [] : null) as never);
+  await open({
+    kind: "draft",
+    row: row({
+      attachments: [
+        {
+          path: "/tmp/gone.pdf",
+          filename: "gone.pdf",
+          mime: "application/pdf",
+          cid: null,
+        },
+      ],
+    }),
+  });
+  expect(body().textContent).toContain(
+    "gone.pdf is no longer on this computer",
+  );
+  await click(button("Send"));
+  expect(body().textContent).toContain(
+    "gone.pdf is no longer on this computer",
+  );
+  expect(m.mailOutboxSend).not.toHaveBeenCalled();
+  // Removing the file clears its warning.
+  await click(button("Remove gone.pdf"));
+  expect(body().textContent).not.toContain("no longer on this computer");
+});
+
+it("a file that vanishes while the sheet is open is caught on Send", async () => {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const present = [{ path: "/tmp/a.pdf" }];
+  vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+    cmd === "inspect_paths" ? present : null) as never);
+  await open({
+    kind: "draft",
+    row: row({
+      attachments: [
+        {
+          path: "/tmp/a.pdf",
+          filename: "a.pdf",
+          mime: "application/pdf",
+          cid: null,
+        },
+      ],
+    }),
+  });
+  expect(body().textContent).not.toContain("no longer on this computer");
+  present.length = 0;
+  await click(button("Send"));
+  expect(body().textContent).toContain("a.pdf is no longer on this computer");
+  expect(m.mailOutboxSend).not.toHaveBeenCalled();
+});
+
+it("the discard warning is not weakened by typing again", async () => {
+  m.mailSendableMailboxes.mockResolvedValue([]);
+  await open({ kind: "new" });
+  vi.useFakeTimers();
+  try {
+    const subject = body().querySelector<HTMLInputElement>("#mail-subject")!;
+    await setValue(subject, "one");
+    // Not `click`: its settle() waits on a real timer, which is faked here.
+    await act(async () => {
+      button("Close")!.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+    expect(body().textContent).toContain("Close again to discard");
+    await setValue(subject, "one two");
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(body().textContent).toContain("Close again to discard");
+});
+
+it("Save draft without a From gives the same instruction as autosave", async () => {
+  m.mailSendableMailboxes.mockResolvedValue([]);
+  await open({ kind: "new" });
+  await click(button("Save draft"));
+  expect(m.mailOutboxSave).not.toHaveBeenCalled();
+  expect(body().textContent).toContain(
+    "Choose a From address before this can be saved.",
+  );
+  expect(body().textContent).not.toContain("not one of your mailboxes");
 });

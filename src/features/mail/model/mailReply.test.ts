@@ -118,6 +118,10 @@ describe("prefixedSubject", () => {
       "Chuyển tiếp: Order",
     );
     expect(prefixedSubject("Fw: Order", "forward")).toBe("Fw: Order");
+    // Full-width, as the Rust grouping accepts it.
+    expect(prefixedSubject("\uFF32\uFF25\uFF1A Order", "reply")).toBe(
+      "\uFF32\uFF25\uFF1A Order",
+    );
   });
 
   it("keeps its prefix words in step with mail_thread.rs", () => {

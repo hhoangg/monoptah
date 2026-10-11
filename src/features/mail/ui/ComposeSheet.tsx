@@ -77,6 +77,7 @@ export const preloadMailEditor = () => LazyMailEditor.preload();
 
 const AUTOSAVE_MS = 1500;
 const FROM_NOTE = "Choose a From address before this can be saved.";
+const DISCARD_NOTE = `${FROM_NOTE} Close again to discard it.`;
 
 const TITLE: Record<OutboxKind, string> = {
   new: "New message",
@@ -453,6 +454,7 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
   const [report, setReport] = useState<SendReport | null>(null);
+  const [missingPaths, setMissingPaths] = useState<string[]>([]);
   const [fromNote, setFromNote] = useState<string | null>(null);
   const mode = sendMode(rowState);
 
@@ -466,6 +468,8 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
   const queue = useRef<Promise<unknown>>(Promise.resolve());
   const forceClose = useRef(false);
   const alive = useRef(true);
+  // While a second close would discard, the note must keep saying so.
+  const fromNoteText = () => (forceClose.current ? DISCARD_NOTE : FROM_NOTE);
 
   // Read by the async save closures, which outlive the render that made them.
   const latest = useRef({ from, recipients, subject, quote, pending });
@@ -549,12 +553,8 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
       setPending(next.pending);
       setInit(next);
       if (request.kind === "draft") {
-        const gone = await missingFiles(request.row);
-        if (!stale && gone.length) {
-          setNotice(
-            `${gone.join(", ")} ${gone.length === 1 ? "is" : "are"} no longer on this computer. Remove ${gone.length === 1 ? "it" : "them"} and attach again, or this message cannot be sent.`,
-          );
-        }
+        const gone = await missingFiles(next.pending);
+        if (!stale) setMissingPaths(gone);
       }
     })().catch((err) => {
       if (!stale) setLoadError(message(err));
@@ -677,7 +677,7 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
     timer.current = setTimeout(() => {
       // No From means nothing can be stored (Rust rejects an unknown mailbox);
       // say what to do instead of failing every pause.
-      if (!latest.current.from) return setFromNote(FROM_NOTE);
+      if (!latest.current.from) return setFromNote(fromNoteText());
       void save().catch(() => undefined);
     }, AUTOSAVE_MS);
   }, [save]);
@@ -852,6 +852,9 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
         `"${settled.invalid.token}" is not a valid email address.`,
       );
     }
+    const gone = await missingFiles(latest.current.pending);
+    setMissingPaths(gone);
+    if (gone.length) return;
     if (settled.recipients.to.length === 0)
       return setNotice("Add at least one recipient in To.");
     setBusy("send");
@@ -901,6 +904,7 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
 
   const saveDraft = () => {
     settleTexts();
+    if (!latest.current.from) return setFromNote(fromNoteText());
     void save().catch(() => undefined);
   };
 
@@ -921,7 +925,7 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
       if (!latest.current.from) {
         // Nothing can be saved without a From; closing now would drop the text.
         forceClose.current = true;
-        setFromNote(`${FROM_NOTE} Close again to discard it.`);
+        setFromNote(DISCARD_NOTE);
         return;
       }
       try {
@@ -937,6 +941,8 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
 
   // ----- render -----
 
+  // Only files still attached count, so removing one clears its warning.
+  const missing = pending.filter((p) => missingPaths.includes(p.path));
   const entry = groups
     ?.flatMap((g) => g.entries)
     .find((e) => e.address.toLowerCase() === from.toLowerCase());
@@ -1088,6 +1094,14 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
             </p>
           ) : null}
 
+          {missing.length ? (
+            <p role="alert" className="mt-3 text-[12px] text-amber-400">
+              {missing.map((p) => p.name).join(", ")}{" "}
+              {missing.length === 1 ? "is" : "are"} no longer on this computer.
+              Remove {missing.length === 1 ? "it" : "them"} and attach again, or
+              this message cannot be sent.
+            </p>
+          ) : null}
           {fromNote ? (
             <p role="alert" className="mt-3 text-[12px] text-amber-400">
               {fromNote}
@@ -1310,23 +1324,23 @@ async function originalOf(row: OutboxRow) {
 }
 
 /**
- * Staged and picked files are plain paths, and pasted ones sit in the OS temp
- * directory, which the system may clear. Say so when the draft opens, not when
- * Send fails. `inspect_paths` returns only paths that still exist; anything
- * else it returns (an older host) means "cannot tell", so nothing is claimed.
+ * A draft stores paths, not bytes, so a file can be deleted or renamed between
+ * composing and sending. Checked when a draft opens and again on every Send,
+ * which is when it matters; the result is its own banner so a send attempt
+ * cannot clear it. `inspect_paths` returns only paths that still exist;
+ * anything other than a list (a host without the command) means "cannot tell",
+ * so nothing is claimed and Rust's own file error remains the backstop.
  */
-async function missingFiles(row: OutboxRow): Promise<string[]> {
-  if (row.attachments.length === 0) return [];
+async function missingFiles(files: { path: string }[]): Promise<string[]> {
+  if (files.length === 0) return [];
   const slash = (p: string) => p.replace(/\\/g, "/");
   try {
     const found = await invoke<{ path: string }[] | null>("inspect_paths", {
-      paths: row.attachments.map((a) => a.path),
+      paths: files.map((f) => f.path),
     });
     if (!Array.isArray(found)) return [];
     const here = new Set(found.map((f) => slash(f.path)));
-    return row.attachments
-      .filter((a) => !here.has(slash(a.path)))
-      .map((a) => a.filename);
+    return files.filter((f) => !here.has(slash(f.path))).map((f) => f.path);
   } catch {
     return [];
   }

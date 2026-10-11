@@ -54,11 +54,13 @@ const FORWARD_PREFIX = prefixPattern(FORWARD_WORDS);
 
 /** A reply to a reply keeps one prefix, whatever language the other client used. */
 export function prefixedSubject(subject: string, kind: OutboxKind): string {
-  // Diacritics may arrive decomposed; the Rust side normalises the same way.
+  // Matching is done on NFKC text, as subject_key in mail_thread.rs does (so a
+  // decomposed "Trả lời" or a full-width "ＲＥ：" counts as a prefix), but the
+  // returned subject is only NFC: the person's own characters are not rewritten.
   const plain = subject.trim().normalize("NFC");
   if (kind === "new") return plain;
   const has = kind === "forward" ? FORWARD_PREFIX : REPLY_PREFIX;
-  if (has.test(plain)) return plain;
+  if (has.test(plain.normalize("NFKC"))) return plain;
   return `${kind === "forward" ? "Fwd" : "Re"}: ${plain}`.trimEnd();
 }
 
