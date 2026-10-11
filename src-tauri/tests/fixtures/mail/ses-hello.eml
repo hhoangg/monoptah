@@ -1,0 +1,89 @@
+Return-Path: <hoangxuan2402@gmail.com>
+Received: from mail-ed1-f46.google.com (mail-ed1-f46.google.com [209.85.208.46])
+ by inbound-smtp.us-east-1.amazonaws.com with SMTP id 32r1kn0lh2toqk8qe4jv9ebdpsnb66u3kfv6okg1
+ for owner@byptah.com;
+ Sat, 10 Oct 2026 18:29:07 +0000 (UTC)
+Received-SPF: pass (spfCheck: domain of _spf.google.com designates 209.85.208.46 as permitted sender) client-ip=209.85.208.46; envelope-from=hoangxuan2402@gmail.com; helo=mail-ed1-f46.google.com;
+Authentication-Results: amazonses.com;
+ spf=pass (spfCheck: domain of _spf.google.com designates 209.85.208.46 as permitted sender) client-ip=209.85.208.46; envelope-from=hoangxuan2402@gmail.com; helo=mail-ed1-f46.google.com;
+ dkim=pass header.i=@gmail.com;
+ dmarc=pass header.from=gmail.com;
+X-SES-RECEIPT: AEFBQUFBQUFBQUFGM0tvMklabTZOaStKdXBudWpvM1RubmdJa2F6bDNhRXVDcSt6dVYxZWFUSk1CQTl0bW5iTDN2NndVYnBoOCtTUjdNVGJsQnRXekZxZEJEcEpiUUZlb2pxOXRMWDAydGdPU1JsR2dseGgzampIck5BSVc3clRGeFhOVXhEaUluZjRqZm0wUHJ1YWdSQ0RQV0xPci9YeDZNVnZTNitPWkQyN20zSEE3V3djd1YyVEZpeDZoTEVMRmNDNFNpdGgvem5BVWc2RFNEM0lYYitZNE5ZbnFZL1BjUkdrN056VHE0Rm1HRmV2Tnl4aUZzOXB4enhJWTZFbDMxSjVnWk4zcWE5Y1lCRzY3Uzg4YkFNMG10WlNBZ2lLQ1FORnFkT3ROdDFIOERpeDBnQlVHYUlSTW45RnY5TG81R1JFMmhxc29iWUU9
+X-SES-DKIM-SIGNATURE: a=rsa-sha256; q=dns/txt; b=FmiR5OfZSaS9jlgJ598VMyM4G+DnD+k/MoAgoroQvmFfJd/hjkJ6LTP+uG32mUdnJezOpxanemxtyCPlFvF6OwDQXwcOz2gP6+kWp0QeKqZIg/GCUcQY7JXyZsSijXC0G+YOAgyDHJHPuNvKiIMIXt5fzXb9n3lBWLny4v2cINY=; c=relaxed/simple; s=224i4yxa5dv7c2xz3womw6peuasteono; d=amazonses.com; t=1791656947; v=1; bh=25OAlLLVF9dMPbO1RwMVZssKs6qWoIIn3Yi+w6R6jkg=; h=From:To:Cc:Bcc:Subject:Date:Message-ID:MIME-Version:Content-Type:X-SES-RECEIPT;
+Received: by mail-ed1-f46.google.com with SMTP id 4fb4d7f45d1cf-6b16824c0fcso855014a12.3
+        for <owner@byptah.com>; Sat, 10 Oct 2026 11:29:07 -0700 (PDT)
+ARC-Seal: i=1; a=rsa-sha256; t=1791656946; cv=none;
+        d=google.com; s=arc-20260327;
+        b=Meunzn6/2s8si6Sys6sslHqqOLdWr6x3prhMlNHgOUHfpO4iOQV2X5E/clXbT39WJ7
+         mX0xHke7MmpZqPKRZLnpptrhc1FWvgIT8DLxEuv/3TMtB13xkc268aMK4kOmXyL74VQc
+         fM8QSLlt2rIsPFLxkDzIbLS3zf7QD3t2XlBlH2yS7uSXwtRaAdwi4htEA8bP1kVsWaU1
+         89LMItpwcrb/z32RrW7IwOSVTFHamy8g5JDH57lrN7eGrlyWro/GA2GhaQJL0J7Eys+u
+         HxlsR3ZTZs1IovZ318w3Ahy2WJ5399siJPuKsXfMp3rm50PXxDNmRHxE7yP1upz9j+Vc
+         0siw==
+ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20260327;
+        h=to:subject:message-id:date:from:mime-version:dkim-signature;
+        bh=25OAlLLVF9dMPbO1RwMVZssKs6qWoIIn3Yi+w6R6jkg=;
+        fh=2HHBrTD35Oy67LvHSNGmuMEgVHVpo5U4Gp/8JD82uNo=;
+        b=HVpvxg1eJwcrmvNan8wBaZGbp7YmFHGs0c6axahcWOQAYqJPghq+ymo7m4FxsrUVtx
+         RoAOKe8tQFlQ8e5nM2uOdbVep2FNq1+hiNDsMdY+aBBJIpGY6Yi03pG65rtiCkreWbjZ
+         +i/kIfV6OCopqStN7ndUF4ACwNc8C3J6kZZuc4BYf2GHuTa6pXiM20uVa9zTiNh24yZN
+         9nq1GjADCbA8io+XnbR8FBSM+9MEUPPRKpC/d+32tBRd0a/bcWl/FAsaWSe0z8vjfNoQ
+         MrClgKLQo67WjzMph/kh/jXDWpER2SSFqxJ1LoniR0SKE8wdDWhBlyS5ZEtHlqd5uG9R
+         rtJA==;
+        darn=byptah.com
+ARC-Authentication-Results: i=1; mx.google.com; arc=none
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=gmail.com; s=20251104; t=1791656946; x=1792261746; darn=byptah.com;
+        h=content-type:to:subject:message-id:date:from:mime-version:from:to
+         :cc:subject:date:message-id:reply-to:content-type;
+        bh=25OAlLLVF9dMPbO1RwMVZssKs6qWoIIn3Yi+w6R6jkg=;
+        b=ddeowjgBsxP1d/3RueXlVRv9zeyf5M1ehyeBG78AY8u/6GAb+WU83cdley68AYXAsD
+         1lLiETIRJsM7+1QJZ4G/imMxvG13jgqNolCmiYDFHlHYM0AJf3PH1N3CTdBWHuIvou8u
+         mLm3QzJPvJis/Pe7hEANsvWSE2C9AdEQ7PdNXdEnpbP2eIYmi4BsXKK0wIKBcUyPj+tx
+         UjsI/CCEJTju23wSeupzL71ZUmZECMuOAXIiyLWPXZRScTR6kNVDdyCZoHaNM68Uxcjd
+         26TOkLJvPwY6UYO0UresSZbVq3q04RjSqpeD25fhmA+A7YtJo/po5Y4fzZyXT/rL+bEI
+         WYNg==
+X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=1e100.net; s=20260707; t=1791656946; x=1792261746;
+        h=content-type:to:subject:message-id:date:from:mime-version:x-gm-gg
+         :x-gm-message-state:from:to:cc:subject:date:message-id:reply-to
+         :content-type;
+        bh=25OAlLLVF9dMPbO1RwMVZssKs6qWoIIn3Yi+w6R6jkg=;
+        b=K/OKqc1qJLWpYl3ywSfPhgO4nugYtEVVvaBzc1/pLs/meADtPoQbH45N9z/kMLduFr
+         uDEscMwHqzZXNN1Kcx7UiaSn1aqBXn64flueeFca+uqTxupQDzVtY6DhmaX2xh4QriWq
+         xjrFlFri9vFBFRBDo38RE3BMYAZ02EUjq74LHxkFkwRJxlnNmQ+LJdG69cAyRFx6gAkS
+         +x9pyQZPwelYQOREeUIiHdmVpmaxXry8sPSfhmw7zNY2GjMj/6gaCBeSB/GFnI7yMpeT
+         jn0BMs4haNGVsk3c+ej0OUhHBQfEv1Ld3nxFbckOM8WSvJhqpHEzGX6puWORv4O3x3xn
+         RrLA==
+X-Gm-Message-State: AFq9FYJj0Y0WG2phYx1a+PL28uyf+gUb947mvazUlGVx4kvxvaZFt2hE
+	XV6J7YgIBfYz4Iitg00vkiLjO6ZQA9xXh9ukwjCWQa/jdAGREQbMqaEQUOgn1gC7kqtiYk0PAgi
+	Tplmmz/Z4Q1F9QmkCohU3RNM3Z9rjWBAraQ==
+X-Gm-Gg: AYBFou0Rhe0qo+jaOAKB5enFCe3xk1S99rOvGQekH+qyzgMcRlhhyxMUhDET6RnV3l8
+	4mjO6qRpewJ27/Gc+/Lvv4K2lH4bmQdhfpYoDfwHSly2dsNN/PFjey5K7bUozeeKG/Oo0oJvUF7
+	I3myIcEL0TzzNO2Js06ZX2NTZTOvWExuF2cC4k4EC5TxWYOGy13je9ro0Vw+zCUDpgV6rjqNvua
+	grfptw0gnRvb60INBI/iUhbRlB/rXylOT/NhCLpj4LMsRmxSOZQoM416l//sVKpywOZgyYZUbDL
+	+F8jSuaqSnDUss5Emr0+Qk5R0tGW8mvXp+sIBOfyhqpGVb8Ohh73Nvh6kyFC3UvdgH8c2XlhBQT
+	kNxEgzyZHJAoA
+X-Received: by 2002:a05:6402:915:b0:6ac:6b18:3475 with SMTP id
+ 4fb4d7f45d1cf-6b17c246377mr5513555a12.21.1791655087803; Sat, 10 Oct 2026
+ 10:58:07 -0700 (PDT)
+MIME-Version: 1.0
+From: =?UTF-8?B?SG/DoG5nIFh1w6Ju?= <hoangxuan2402@gmail.com>
+Date: Sun, 11 Oct 2026 00:57:56 +0700
+X-Gm-Features: AclHuK_iFTnaKV6UqCza30G_Hnp7rwHqs1d_yvHrkhPh1ZYUwz1FP1JQCD1Nh2g
+Message-ID: <CAJT68EYO51mq=D-_T3SQT2m3Yh4R6raprw7FwN0+ZsJ7_RCxxg@mail.gmail.com>
+Subject: hello
+To: owner@byptah.com
+Content-Type: multipart/alternative; boundary="000000000000118eac065d8035f4"
+
+--000000000000118eac065d8035f4
+Content-Type: text/plain; charset="UTF-8"
+
+hello
+
+--000000000000118eac065d8035f4
+Content-Type: text/html; charset="UTF-8"
+
+<div dir="ltr">hello</div>
+
+--000000000000118eac065d8035f4--

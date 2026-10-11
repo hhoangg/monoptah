@@ -29,6 +29,7 @@ mod link_preview;
 mod macos;
 #[cfg(target_os = "macos")]
 mod macos_background;
+mod mail_mime;
 mod mail_store;
 mod mcp;
 mod menu;
