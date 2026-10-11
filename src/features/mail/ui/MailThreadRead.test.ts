@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { RAW_PREVIEW_CHARS, MailThreadRead } from "./MailThreadRead";
 import { listen } from "@tauri-apps/api/event";
 import {
+  mailAttachmentOpen,
   mailMark,
   mailMessageRaw,
   mailStar,
@@ -341,4 +342,51 @@ it("clears the nothing-to-move notice when a later restore works", async () => {
   expect(again).toBeDefined();
   await act(async () => again!.click());
   expect(container.querySelector("[role='status']")).toBeNull();
+});
+
+// Tauri rejects with the command's String, not an Error, and for a sent copy
+// the bucket never took it is the only explanation the person gets.
+const SENT_NOT_ARCHIVED = {
+  direction: "outbound" as const,
+  hasAttachments: true,
+  attachments: [
+    {
+      id: 9,
+      messageId: 1,
+      partIndex: 1,
+      filename: "plan.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 1200,
+      contentId: null,
+      isInline: false,
+      downloaded: false,
+    },
+  ],
+};
+
+it("shows why a sent attachment cannot be opened, in the place the person clicked", async () => {
+  vi.mocked(mailThread).mockResolvedValue(detail([msg(1, SENT_NOT_ARCHIVED)]));
+  vi.mocked(mailAttachmentOpen).mockRejectedValue(
+    "Monoptah has no copy of 'plan.pdf'. This sent message was never archived to the bucket.",
+  );
+  await render();
+  const chip = [...container.querySelectorAll("button")].find((b) =>
+    b.textContent?.includes("plan.pdf"),
+  )!;
+  await act(async () => chip.click());
+  expect(mailAttachmentOpen).toHaveBeenCalledWith(9);
+  expect(container.textContent).toContain("never archived to the bucket");
+});
+
+it("shows why a sent message has no source, inside the source dialog", async () => {
+  vi.mocked(mailThread).mockResolvedValue(detail([msg(1, SENT_NOT_ARCHIVED)]));
+  vi.mocked(mailMessageRaw).mockRejectedValue(
+    "There is no source to show. This sent message was never archived to the bucket.",
+  );
+  await render();
+  const open = [...container.querySelectorAll("button")].find((b) =>
+    b.textContent?.includes("View source"),
+  )!;
+  await act(async () => open.click());
+  expect(document.body.textContent).toContain("no source to show");
 });

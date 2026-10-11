@@ -940,9 +940,14 @@ pub(crate) fn raw_message(
         let location = mail_store::message_location(&conn, message_id)
             .map_err(db)?
             .ok_or_else(|| "That message no longer exists.".to_string())?;
-        let key = location
-            .s3_key
-            .ok_or_else(|| "This message has no stored source.".to_string())?;
+        let key = location.s3_key.ok_or_else(|| {
+            if location.direction == "outbound" {
+                "There is no source to show. This sent message was never archived to the bucket (its upload failed when it was sent), and Monoptah keeps no other copy of it."
+            } else {
+                "This message has no stored source."
+            }
+            .to_string()
+        })?;
         let account = mail_store::get_account(&conn, location.account_id)
             .map_err(db)?
             .ok_or_else(|| "That source no longer exists.".to_string())?;
@@ -996,7 +1001,7 @@ pub(crate) fn ensure_attachment(
     root: &Path,
     attachment_id: i64,
 ) -> Result<PathBuf, String> {
-    let (attachment, stored, account, key) = {
+    let (attachment, stored, account, key, direction) = {
         let conn = store.lock_conn()?;
         let (attachment, stored) = mail_store::get_attachment(&conn, attachment_id)
             .map_err(db)?
@@ -1007,14 +1012,28 @@ pub(crate) fn ensure_attachment(
         let account = mail_store::get_account(&conn, location.account_id)
             .map_err(db)?
             .ok_or_else(|| "That source no longer exists.".to_string())?;
-        (attachment, stored, account, location.s3_key)
+        (
+            attachment,
+            stored,
+            account,
+            location.s3_key,
+            location.direction,
+        )
     };
     if let Some(path) = stored.map(PathBuf::from) {
         if path.starts_with(root) && path.is_file() {
             return Ok(path);
         }
     }
-    let key = key.ok_or_else(|| "This message has no stored source.".to_string())?;
+    let Some(key) = key else {
+        // A sent copy the bucket refused: not a cache of anything, so it is
+        // never written to the cache folder (archiving clears that folder).
+        return if direction == "outbound" {
+            mail_send::unarchived_attachment(store, attachment.message_id, &attachment)
+        } else {
+            Err("This message has no stored source.".to_string())
+        };
+    };
     let raw = clients
         .s3(&account)?
         .get_object(&key)

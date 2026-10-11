@@ -529,7 +529,9 @@ CREATE TABLE IF NOT EXISTS mail_outbox (
   ses_message_id TEXT,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL,
-  sent_at       INTEGER
+  sent_at       INTEGER,
+  sent_message_id INTEGER REFERENCES mail_message(id) ON DELETE SET NULL
+                -- set only when the sent copy has no S3 object
 );
 
 -- ── sync bookkeeping ───────────────────────────────────────────────
@@ -1026,6 +1028,24 @@ bucket sees sent mail too, and `sent/` is registered as a mailbox with
 `is_sendable = 0` so the normal sync path parses it. Insert in step 2 is keyed on
 `UNIQUE(mailbox_id, message_id_hdr)`, so when the sync later lists that object
 it updates rather than duplicates.
+
+**A sent copy with no S3 object** (`object_id IS NULL`, `direction='outbound'`)
+has nothing in the bucket to read, so the two reads are answered differently:
+
+- *Attachments* open from the files its outbox row still lists, found through
+  `mail_outbox.sent_message_id`. Those files are the bytes the person attached
+  (a staged copy under `drafts/`, or their own file where they picked it from),
+  and the sent row keeps them until it is deleted. A file is offered only while
+  it exists at the size the message recorded; a same-length edit is not noticed.
+  Nothing is copied into the per-message cache folder, because archiving a
+  thread clears that folder and this is not a cache. When the file is gone,
+  changed, or the outbox row was deleted, the click says which.
+- *View source* says plainly that there is none. The raw MIME is built in
+  memory and only the failed upload would have kept it; rebuilding it from the
+  row would show something that was never sent.
+
+For `sending` and `unconfirmed` rows no message is recorded, and the staged
+files stay the only copy; none of this reads them for deletion.
 
 A send failure leaves `state='failed'` with `last_error`; the thread shows the
 message with a retry affordance. Sends are not retried automatically — a

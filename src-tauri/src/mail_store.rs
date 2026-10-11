@@ -33,7 +33,8 @@ const MASK_VISIBLE_SUFFIX: usize = 4;
 pub(crate) fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
     create_tables(conn)?;
     ensure_object_attempts(conn)?;
-    ensure_identities_refreshed_at(conn)
+    ensure_identities_refreshed_at(conn)?;
+    ensure_outbox_sent_message(conn)
 }
 
 fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
@@ -241,7 +242,8 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
           ses_message_id TEXT,
           created_at    INTEGER NOT NULL,
           updated_at    INTEGER NOT NULL,
-          sent_at       INTEGER
+          sent_at       INTEGER,
+          sent_message_id INTEGER REFERENCES mail_message(id) ON DELETE SET NULL
         );
 
         CREATE TABLE IF NOT EXISTS mail_sync_state (
@@ -299,6 +301,17 @@ fn ensure_object_attempts(conn: &Connection) -> rusqlite::Result<()> {
 /// NULL is the right backfill: those databases never fetched identities.
 fn ensure_identities_refreshed_at(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "mail_account", "identities_refreshed_at", "INTEGER")
+}
+
+/// For databases created before `sent_message_id` was in the DDL. NULL is the
+/// right backfill: nothing recorded which message those rows produced.
+fn ensure_outbox_sent_message(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(
+        conn,
+        "mail_outbox",
+        "sent_message_id",
+        "INTEGER REFERENCES mail_message(id) ON DELETE SET NULL",
+    )
 }
 
 /// A user-facing error carried through `rusqlite::Error` so callers keep a
@@ -2422,7 +2435,10 @@ pub(crate) fn set_threads_starred(
 pub(crate) struct MessageLocation {
     pub message_id: i64,
     pub account_id: i64,
-    /// `None` for mail with no S3 object, such as a draft's sent copy.
+    /// `inbound | outbound`.
+    pub direction: String,
+    /// `None` for mail with no S3 object, such as a sent copy whose upload the
+    /// bucket refused.
     pub s3_key: Option<String>,
     pub body_html: Option<String>,
 }
@@ -2432,7 +2448,7 @@ pub(crate) fn message_location(
     message_id: i64,
 ) -> rusqlite::Result<Option<MessageLocation>> {
     conn.query_row(
-        "SELECT m.id, b.account_id, o.s3_key, m.body_html
+        "SELECT m.id, b.account_id, o.s3_key, m.body_html, m.direction
          FROM mail_message m
          JOIN mail_mailbox b ON b.id = m.mailbox_id
          LEFT JOIN mail_object o ON o.id = m.object_id
@@ -2444,6 +2460,7 @@ pub(crate) fn message_location(
                 account_id: row.get(1)?,
                 s3_key: row.get(2)?,
                 body_html: row.get(3)?,
+                direction: row.get(4)?,
             })
         },
     )
@@ -3605,6 +3622,34 @@ pub(crate) fn mark_outbox_sent(
            updated_at = ?3, last_error = NULL WHERE id = ?1 AND state = 'sending'",
         params![id, ses_message_id, now],
     )? > 0)
+}
+
+/// Which stored message a send produced, written only when the sent copy has
+/// no S3 object. That row's staged or attached files are the only copy of its
+/// attachments, and this is how the reader finds them again.
+pub(crate) fn set_outbox_sent_message(
+    conn: &Connection,
+    id: i64,
+    message_id: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_outbox SET sent_message_id = ?2 WHERE id = ?1",
+        params![id, message_id],
+    )?;
+    Ok(())
+}
+
+/// The outbox row that produced this stored message, if it was linked.
+pub(crate) fn outbox_for_sent_message(
+    conn: &Connection,
+    message_id: i64,
+) -> rusqlite::Result<Option<OutboxRow>> {
+    conn.query_row(
+        &format!("SELECT {OUTBOX_COLUMNS} FROM mail_outbox WHERE sent_message_id = ?1"),
+        params![message_id],
+        outbox_from_row,
+    )
+    .optional()
 }
 
 pub(crate) fn set_outbox_thread(

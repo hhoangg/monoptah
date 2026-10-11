@@ -334,6 +334,56 @@ fn release_staged(store: &SessionStore, dir: &std::path::Path, paths: &Releasabl
     removed
 }
 
+/// The attachment of a sent message that has no S3 object, found where the
+/// send left it: in the files its outbox row still lists. Read-only. The
+/// bytes are the file the person attached, so this offers it only while it is
+/// there at the size the message recorded, and otherwise says which of the
+/// ways it can be gone applies. Size is a check, not proof: a file edited to
+/// the same length is not noticed.
+pub(crate) fn unarchived_attachment(
+    store: &SessionStore,
+    message_id: i64,
+    attachment: &mail_store::AttachmentRow,
+) -> Result<std::path::PathBuf, String> {
+    let name = &attachment.filename;
+    let row = {
+        let conn = store.lock_conn()?;
+        mail_store::outbox_for_sent_message(&conn, message_id).map_err(db)?
+    };
+    let refused =
+        "This sent message was never archived to the bucket: its upload failed when it was sent.";
+    let Some(row) = row else {
+        return Err(format!(
+            "Monoptah has no copy of '{name}'. {refused} The outbox entry that kept its files was deleted."
+        ));
+    };
+    let wanted = attachment.content_id.as_deref();
+    let listed: Vec<&OutboxAttachment> = row
+        .attachments
+        .iter()
+        .filter(|a| match wanted {
+            Some(cid) => a.cid.as_deref().map(|c| c.trim_matches(['<', '>'])) == Some(cid),
+            None => a.cid.as_deref().is_none_or(str::is_empty) && a.filename == *name,
+        })
+        .collect();
+    let mut last = None;
+    for a in &listed {
+        match std::fs::metadata(&a.path) {
+            Ok(meta) if meta.is_file() && meta.len() as i64 == attachment.size_bytes => {
+                return Ok(std::path::PathBuf::from(&a.path));
+            }
+            Ok(meta) if meta.is_file() => {
+                last = Some(format!("has changed since it was sent: {}", a.path))
+            }
+            _ => last = Some(format!("is no longer at {}", a.path)),
+        }
+    }
+    Err(match last {
+        Some(why) => format!("Monoptah has no copy of '{name}'. {refused} The file it was attached from {why}"),
+        None => format!("Monoptah has no copy of '{name}'. {refused} Its outbox entry no longer lists the file."),
+    })
+}
+
 /// The staged files a row gives up when it is saved over or deleted. Empty for
 /// two states, for DIFFERENT reasons, so do not merge them in a later cleanup:
 ///
@@ -1141,6 +1191,12 @@ fn record_local(
         mail_store::reevaluate_thread(&tx, ingested.thread_id).map_err(db)?;
     }
     mail_store::set_outbox_thread(&tx, row.id, ingested.thread_id).map_err(db)?;
+    if !archived {
+        // Nothing but this link leads from the stored message back to the files
+        // it was sent with. An archived copy never needs it, so that path
+        // writes exactly what it wrote before.
+        mail_store::set_outbox_sent_message(&tx, row.id, ingested.message_id).map_err(db)?;
+    }
     tx.commit().map_err(db)?;
     Ok((ingested.message_id, ingested.thread_id))
 }
@@ -2841,6 +2897,169 @@ mod tests {
         // the save lands.
         save_releasing(&w.store, &dir, d, || set_state(&w, "unconfirmed")).unwrap();
         assert!(std::path::Path::new(&b.path).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Sends one message carrying `file`, with the bucket refusing the upload
+    /// when `deny` is set. Returns the stored message and its thread.
+    fn send_with(w: &World, file: &OutboxAttachment, deny: bool) -> (i64, i64) {
+        w.fake.deny_put.store(deny, Ordering::SeqCst);
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![file.clone()];
+        let report = send(w, d).unwrap();
+        (report.message_id.unwrap(), report.thread_id.unwrap())
+    }
+
+    fn attachment_id(w: &World, message_id: i64) -> i64 {
+        count(
+            w,
+            &format!("SELECT id FROM mail_attachment WHERE message_id = {message_id}"),
+        )
+    }
+
+    fn open(
+        w: &World,
+        root: &std::path::Path,
+        message_id: i64,
+    ) -> Result<std::path::PathBuf, String> {
+        crate::mail::ensure_attachment(&w.store, &w.fake, root, attachment_id(w, message_id))
+    }
+
+    fn open_refusal(w: &World, root: &std::path::Path, message_id: i64) -> String {
+        match open(w, root, message_id) {
+            Err(why) => why,
+            Ok(path) => panic!("expected a refusal, got {path:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sent_copy_the_bucket_refused_opens_its_attachment_from_the_file_it_was_sent_with() {
+        let w = world();
+        let root = scratch();
+        let file = staged(&staging_dir(&root), "a.png");
+        let (message, thread) = send_with(&w, &file, true);
+        assert_eq!(
+            open(&w, &root, message),
+            Ok(std::path::PathBuf::from(&file.path))
+        );
+        // Archiving clears the download cache, and this is not a cache.
+        crate::mail::archive_threads(&w.store, &root, &[thread]).unwrap();
+        assert_eq!(
+            open(&w, &root, message),
+            Ok(std::path::PathBuf::from(&file.path))
+        );
+        assert_eq!(std::fs::read(&file.path).unwrap(), b"hello");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refused_sent_copy_says_why_when_its_file_is_gone_changed_or_unlisted() {
+        let w = world();
+        let root = scratch();
+        let file = staged(&staging_dir(&root), "a.png");
+        let (message, _) = send_with(&w, &file, true);
+
+        std::fs::write(&file.path, b"hello, edited").unwrap();
+        let changed = open_refusal(&w, &root, message);
+        assert!(
+            changed.contains("'a.png'") && changed.contains("has changed"),
+            "{changed}"
+        );
+
+        std::fs::remove_file(&file.path).unwrap();
+        let gone = open_refusal(&w, &root, message);
+        assert!(
+            gone.contains("never archived") && gone.contains("is no longer at"),
+            "{gone}"
+        );
+
+        // Deleting the sent row is the user's choice and takes the link with it.
+        let outbox = outbox_list(&w.store).unwrap()[0].id;
+        outbox_delete_releasing(&w.store, &staging_dir(&root), outbox).unwrap();
+        let deleted = open_refusal(&w, &root, message);
+        assert!(
+            deleted.contains("outbox entry") && deleted.contains("deleted"),
+            "{deleted}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_source_of_a_refused_sent_copy_is_declined_in_words_and_an_archived_one_is_unchanged() {
+        let w = world();
+        let root = scratch();
+        let file = staged(&staging_dir(&root), "a.png");
+        let (refused, _) = send_with(&w, &file, true);
+        let reason = crate::mail::raw_message(&w.store, &w.fake, refused).unwrap_err();
+        assert!(
+            reason.contains("never archived") && reason.contains("no other copy"),
+            "{reason}"
+        );
+
+        let (archived, _) = send_with(&w, &file, false);
+        let raw = crate::mail::raw_message(&w.store, &w.fake, archived).unwrap();
+        assert!(raw.contains("Subject: Hello there"), "{raw}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_archived_sent_copy_is_written_as_before_and_read_from_the_bucket() {
+        let w = world();
+        let root = scratch();
+        let file = staged(&staging_dir(&root), "a.png");
+        let (message, _) = send_with(&w, &file, false);
+        assert_eq!(
+            count(
+                &w,
+                "SELECT COUNT(*) FROM mail_outbox WHERE sent_message_id IS NOT NULL"
+            ),
+            0,
+            "the link is for copies with no object"
+        );
+        assert_eq!(
+            count(&w, &format!("SELECT COUNT(*) FROM mail_message WHERE id = {message} AND object_id IS NOT NULL")),
+            1
+        );
+        // Cached from S3 under the message folder, not read from the staged file.
+        let path = open(&w, &root, message).unwrap();
+        assert!(path.starts_with(root.join(message.to_string())), "{path:?}");
+        assert_eq!(std::fs::read(path).unwrap(), b"hello");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unconfirmed_send_keeps_its_only_copy_and_records_no_message() {
+        let w = world();
+        let root = scratch();
+        let file = staged(&staging_dir(&root), "a.png");
+        *w.fake.ses_error.lock().unwrap() = Some(SesError {
+            kind: SesErrorKind::Unconfirmed,
+            message: "The connection dropped.".into(),
+        });
+        w.fake.deny_put.store(true, Ordering::SeqCst);
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = vec![file.clone()];
+        assert!(send(&w, d).is_err());
+        assert_eq!(text(&w, "SELECT state FROM mail_outbox"), "unconfirmed");
+        // No message was recorded, so no read path can reach or reclaim the file.
+        assert_eq!(count(&w, "SELECT COUNT(*) FROM mail_message"), 0);
+        assert_eq!(
+            count(
+                &w,
+                "SELECT COUNT(*) FROM mail_outbox WHERE sent_message_id IS NOT NULL"
+            ),
+            0
+        );
+        assert_eq!(std::fs::read(&file.path).unwrap(), b"hello");
+        // A later send of the same file whose copy the bucket refused: reading
+        // it, then deleting that sent row, must not take the unconfirmed row's
+        // only copy with it.
+        *w.fake.ses_error.lock().unwrap() = None;
+        let (message, _) = send_with(&w, &file, true);
+        assert!(open(&w, &root, message).is_ok());
+        let sent_row = count(&w, "SELECT id FROM mail_outbox WHERE state = 'sent'");
+        outbox_delete_releasing(&w.store, &staging_dir(&root), sent_row).unwrap();
+        assert_eq!(std::fs::read(&file.path).unwrap(), b"hello");
         std::fs::remove_dir_all(root).unwrap();
     }
 
