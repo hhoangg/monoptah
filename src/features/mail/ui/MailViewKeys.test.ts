@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { MailView } from "./MailView";
 import { MAIL_PREF_KEYS } from "../model/mailPrefs";
@@ -339,4 +339,161 @@ it("says so when a key's action fails, instead of doing nothing", async () => {
   expect(container.querySelector("[data-compose]")).toBeNull();
   await press("e");
   expect(alert()?.textContent).toBe("S3 said no");
+});
+
+const pagedThreads = (
+  second: () => Promise<unknown> | unknown = () => ({
+    rows: [row(4), row(5)],
+    nextCursor: null,
+  }),
+) =>
+  vi.mocked(invoke).mockImplementation((async (
+    cmd: string,
+    args?: { query?: { cursor?: unknown } },
+  ) => {
+    if (cmd === "mail_threads") {
+      return args?.query?.cursor
+        ? second()
+        : {
+            rows: [row(1), row(2), row(3)],
+            nextCursor: { lastMessageAt: 1, id: 3 },
+          };
+    }
+    return cmd === "mail_status" ? status : [];
+  }) as never);
+
+it("j on the last loaded row moves onto the next page's first row, with no second key", async () => {
+  pagedThreads();
+  await render();
+  for (let i = 0; i < 3; i++) await press("j");
+  expect(cursorId()).toBe("3");
+  await press("j");
+  expect(cursorId()).toBe("4");
+});
+
+it("drops a pending j when the folder changes before the page lands", async () => {
+  let land!: (page: unknown) => void;
+  pagedThreads(() => new Promise((resolve) => (land = resolve)));
+  await render();
+  for (let i = 0; i < 4; i++) await press("j");
+  expect(cursorId()).toBe("3");
+  await act(async () =>
+    container.querySelector<HTMLElement>("nav button[aria-current]")!.click(),
+  );
+  await act(async () => land({ rows: [row(4), row(5)], nextCursor: null }));
+  expect(cursorId()).toBeNull();
+});
+
+it("e moves off the archived thread even when the cursor is empty and the open thread is the first row", async () => {
+  let listed = [row(1), row(2), row(3)];
+  vi.mocked(invoke).mockImplementation((async (
+    cmd: string,
+    args?: { threadIds?: number[]; hard?: boolean },
+  ) => {
+    if (cmd === "mail_threads") return { rows: listed, nextCursor: null };
+    if (cmd === "mail_delete") {
+      listed = listed.filter((r) => !args!.threadIds!.includes(r.id));
+      return {
+        removed: 1,
+        kept: 0,
+        threadsRemoved: 1,
+        filesLeft: 0,
+        errors: [],
+      };
+    }
+    if (cmd === "mail_thread")
+      return {
+        thread: row(1),
+        imagePolicy: "ask",
+        restorable: false,
+        messages: [],
+      };
+    return cmd === "mail_status" ? status : [];
+  }) as never);
+  await render();
+  await act(async () => rowEl(1).click());
+  await press("j");
+  // Hard-deleting the cursor's thread leaves no cursor but keeps thread 1 open.
+  await press("#", document.body, { shiftKey: true });
+  await act(async () =>
+    document
+      .querySelectorAll<HTMLInputElement>('input[type="radio"]')[1]!
+      .click(),
+  );
+  await act(async () => {
+    const input = document.getElementById("delete-confirm") as HTMLInputElement;
+    Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )!.set!.call(input, "delete");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await act(async () =>
+    document.querySelector<HTMLButtonElement>('button[type="submit"]')!.click(),
+  );
+  expect(cursorId()).toBeNull();
+  expect(openId()).toBe("1");
+  await press("e");
+  expect(calls("mail_delete").at(-1)).toEqual([
+    "mail_delete",
+    { threadIds: [1], hard: false },
+  ]);
+  expect(cursorId()).toBe("3");
+});
+
+describe("an archive that left something behind", () => {
+  const archiveReturning = async (report: object) => {
+    vi.mocked(invoke).mockImplementation((async (cmd: string) => {
+      if (cmd === "mail_threads")
+        return { rows: [row(1), row(2)], nextCursor: null };
+      if (cmd === "mail_delete") return report;
+      return cmd === "mail_status" ? status : [];
+    }) as never);
+    await render();
+    await press("j");
+    await press("e");
+  };
+  const alert = () =>
+    container.querySelector('[data-mail-pane="threads"] [role="alert"]')
+      ?.textContent;
+  const done = { removed: 1, kept: 0, threadsRemoved: 1, errors: [] };
+
+  it("says how many attachment files stayed on this computer", async () => {
+    await archiveReturning({ ...done, filesLeft: 2 });
+    expect(alert()).toBe(
+      "Archived, but downloaded attachment files for 2 messages could not be removed from this computer.",
+    );
+  });
+
+  it("uses the singular for one", async () => {
+    await archiveReturning({ ...done, filesLeft: 1 });
+    expect(alert()).toContain("files for 1 message could not");
+  });
+
+  it("shows the errors the report carries", async () => {
+    await archiveReturning({
+      ...done,
+      filesLeft: 0,
+      errors: ["Disk is read-only."],
+    });
+    expect(alert()).toBe("Disk is read-only.");
+  });
+
+  it("stays quiet when the archive was clean", async () => {
+    await archiveReturning({ ...done, filesLeft: 0 });
+    expect(alert()).toBeUndefined();
+  });
+});
+
+it("an open menu owns the keyboard: e does not archive the mail behind it", async () => {
+  await render();
+  await press("j");
+  const menu = document.createElement("div");
+  menu.setAttribute("role", "menu");
+  document.body.append(menu);
+  await press("e");
+  await press("j");
+  menu.remove();
+  expect(calls("mail_delete")).toHaveLength(0);
+  expect(cursorId()).toBe("1");
 });

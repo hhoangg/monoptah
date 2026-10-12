@@ -55,6 +55,8 @@ it("leaves keys alone while typing, in a dialog or in an editor", () => {
     '<div contenteditable="true"></div>',
     '<div role="dialog"><span></span></div>',
     '<div class="cm-editor"><span></span></div>',
+    '<div role="menu"><button>Item</button></div>',
+    '<div role="listbox"><div role="option"></div></div>',
   ]) {
     document.body.innerHTML = html;
     const target = document.body.firstElementChild!;

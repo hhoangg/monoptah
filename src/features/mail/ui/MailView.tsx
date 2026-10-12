@@ -31,7 +31,11 @@ import {
 } from "../model/useMailFolders";
 import { useMailStatus } from "../model/useMailStatus";
 import { ComposeSheet, preloadMailEditor } from "./ComposeSheet";
-import { DeleteMailDialog, mailDelete } from "./DeleteMailDialog";
+import {
+  DeleteMailDialog,
+  mailDelete,
+  type DeleteReport,
+} from "./DeleteMailDialog";
 import { MailFolderList, groupMailboxesByDomain } from "./MailFolderList";
 import {
   MailThreadList,
@@ -53,6 +57,22 @@ type Props = {
   onClose: () => void;
   onToggleSidebar?: () => void;
 };
+
+const OPEN_SURFACE = '[role="dialog"], [role="menu"], [role="listbox"]';
+
+/** What an archive left behind, in the dialog's words; null when it was clean. */
+function archiveNotice(report: DeleteReport): string | null {
+  const parts: string[] = [];
+  if (report.filesLeft > 0) {
+    parts.push(
+      `Archived, but downloaded attachment files for ${report.filesLeft} ${
+        report.filesLeft === 1 ? "message" : "messages"
+      } could not be removed from this computer.`,
+    );
+  }
+  parts.push(...report.errors);
+  return parts.length > 0 ? parts.join(" ") : null;
+}
 
 const errorText = (err: unknown) =>
   err instanceof Error ? err.message : String(err);
@@ -89,6 +109,12 @@ export function MailView({
   const [deleteRow, setDeleteRow] = useState<ThreadRow | null>(null);
   const [keyError, setKeyError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  // `j` on the last loaded row asks for more rows and waits for them.
+  const pendingMove = useRef<{
+    afterId: number;
+    count: number;
+    scope: string;
+  } | null>(null);
   const [sheet, setSheet] = useState<Sheet | null>(null);
   const [compose, setCompose] = useState<{
     key: number;
@@ -133,11 +159,13 @@ export function MailView({
           ? { kind: "mailbox", mailboxId, address: mailboxAddress }
           : { kind: "all" };
   const list = useMailThreadList(scope);
+  const scopeKey = JSON.stringify(scope);
   const pick = (mailbox: string | null, folder: string | null) => {
     selectedMailbox.save(mailbox);
     selectedFolder.save(folder);
     setThreadId(null);
     setCursorId(null);
+    pendingMove.current = null;
   };
   const resize = useDragResize({
     min: LIST_MIN_WIDTH,
@@ -163,9 +191,10 @@ export function MailView({
   const readerOnly = side === "off" && threadId !== null;
 
   const onKey = (event: KeyboardEvent) => {
-    // A dialog anywhere (the composer, a delete confirmation, the message
-    // source) owns the keyboard, even when focus has slipped to the body.
-    if (document.querySelector('[role="dialog"]')) return;
+    // A dialog or an open menu anywhere (the composer, a delete confirmation,
+    // the rail's context menu) owns the keyboard, even when focus has slipped
+    // to the body: `e` must not archive the mail behind it.
+    if (document.querySelector(OPEN_SURFACE)) return;
     const action = mailKeyAction(event);
     if (action) runKey(action, event);
   };
@@ -176,16 +205,25 @@ export function MailView({
       rows[at] ?? rows.find((candidate) => candidate.id === threadId) ?? null;
     const targetId = row?.id ?? threadId;
     const handled = () => event.preventDefault();
+    // Any key is a newer intent than a move still waiting on a page.
+    pendingMove.current = null;
 
     if (action === "next" || action === "prev") {
       if (readerOnly || rows.length === 0) return;
       const to = at === -1 ? 0 : at + (action === "next" ? 1 : -1);
       if (to < 0) return;
-      // Past the loaded rows this fetches the next page; the key then needs
-      // pressing again once it lands.
+      // Past the loaded rows this fetches the next page, and the move waits
+      // for it (see the pendingMove effect).
       if (to >= list.shown) list.grow();
       const next = rows[to];
       if (next) setCursorId(next.id);
+      else if (action === "next" && at >= 0 && list.hasMore) {
+        pendingMove.current = {
+          afterId: rows[at]!.id,
+          count: rows.length,
+          scope: scopeKey,
+        };
+      }
       handled();
     } else if (action === "open") {
       if (!row) return;
@@ -221,9 +259,16 @@ export function MailView({
       if (targetId === null || scope?.kind === "archived") return;
       handled();
       setKeyError(null);
-      const neighbour = rows[at + 1] ?? rows[at - 1] ?? null;
+      // From the target, not the cursor: with no cursor the target is the open
+      // thread, and `at` of -1 would pick the first row, possibly that thread.
+      const index = rows.findIndex((r) => r.id === targetId);
+      const neighbour =
+        index < 0 ? null : (rows[index + 1] ?? rows[index - 1] ?? null);
       mailDelete([targetId], false)
-        .then(() => {
+        .then((report) => {
+          // An archive can leave attachment files behind; say so, as the
+          // dialog does, rather than looking clean.
+          setKeyError(archiveNotice(report));
           setCursorId(neighbour?.id ?? null);
           if (threadId === targetId) setThreadId(null);
           list.reload();
@@ -235,6 +280,22 @@ export function MailView({
       setDeleteRow(row);
     }
   };
+  // Applies a `j` that ran off the loaded rows once the grown rows land.
+  useEffect(() => {
+    const pending = pendingMove.current;
+    if (!pending) return;
+    // Dropped if the scope changed, or the fetch failed, or the rows shrank.
+    if (pending.scope !== scopeKey || list.error !== null) {
+      pendingMove.current = null;
+      return;
+    }
+    if (list.rows.length <= pending.count) return;
+    pendingMove.current = null;
+    const from = list.rows.findIndex((r) => r.id === pending.afterId);
+    const next = from < 0 ? undefined : list.rows[from + 1];
+    if (next) setCursorId(next.id);
+  }, [list.rows, list.error, scopeKey]);
+
   // Re-bound through a ref so the one listener always sees this render's list
   // and selection without being torn down on every keystroke.
   const onKeyRef = useRef(onKey);

@@ -27,9 +27,9 @@ const KEYS: Record<string, MailKeyAction> = {
   Escape: "back",
 };
 
-/** Text entry, and surfaces that own the keyboard while they are open. */
+/** Text entry, and surfaces (dialogs, open menus and pickers) that own the keyboard while open. */
 const OWNS_KEYS =
-  'input, textarea, select, [contenteditable]:not([contenteditable="false"]), .cm-editor, [role="dialog"], iframe';
+  'input, textarea, select, [contenteditable]:not([contenteditable="false"]), .cm-editor, [role="dialog"], [role="menu"], [role="listbox"], iframe';
 
 /** What Enter already does when it is focused, so it must not be taken. */
 const ACTIVATES =
