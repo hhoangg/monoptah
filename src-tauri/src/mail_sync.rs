@@ -26,7 +26,8 @@ const DEFAULT_INTERVAL_SECS: u64 = 3600;
 /// Stops a bad setting from turning the loop into a hot spin.
 const MIN_INTERVAL_SECS: u64 = 60;
 const TICK: Duration = Duration::from_secs(60);
-const MAX_PARSE_ATTEMPTS: i64 = 3;
+/// Shared with `mail_status`, which counts what has been given up on.
+pub(crate) const MAX_PARSE_ATTEMPTS: i64 = 3;
 const PAGE_SIZE: usize = 50;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1312,6 +1313,31 @@ mod tests {
         // A changed object starts over.
         s3.put("owner/1", "e2", &mime("m1", "Fixed", "ok"));
         assert_eq!(f.sync(&[(account, &s3)])[0].inserted, 1);
+    }
+
+    #[test]
+    fn status_counts_an_unreadable_object_only_once_it_is_given_up_on() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", "not an email at all");
+        let unreadable = |f: &Fixture| {
+            let status = crate::mail::status(&f.store, 3600).unwrap();
+            (
+                status.sources[0].mailboxes[0].unreadable,
+                status.unreadable_total,
+            )
+        };
+        for attempt in 1..MAX_PARSE_ATTEMPTS {
+            f.sync(&[(account, &s3)]);
+            // Still being retried, so not yet something to tell the user.
+            assert_eq!(unreadable(&f), (0, 0), "after attempt {attempt}");
+        }
+        f.sync(&[(account, &s3)]);
+        assert_eq!(unreadable(&f), (1, 1));
+        // A changed object starts over, so it stops counting while retried.
+        s3.put("owner/1", "e2", "still not an email");
+        f.sync(&[(account, &s3)]);
+        assert_eq!(unreadable(&f), (0, 0));
     }
 
     #[test]

@@ -1960,6 +1960,20 @@ pub(crate) fn unread_by_mailbox(
     rows.collect()
 }
 
+/// Objects per mailbox that failed to parse `max_attempts` times. Below that
+/// the sync is still retrying them, so they are not yet worth telling anyone.
+pub(crate) fn unreadable_by_mailbox(
+    conn: &Connection,
+    max_attempts: i64,
+) -> rusqlite::Result<std::collections::HashMap<i64, i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT mailbox_id, COUNT(*) FROM mail_object
+             WHERE state = 'error' AND parse_attempts >= ?1 GROUP BY mailbox_id",
+    )?;
+    let rows = stmt.query_map([max_attempts], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
 // ── thread listing and reading ─────────────────────────────────────
 
 const DEFAULT_PAGE: u32 = 50;

@@ -820,6 +820,8 @@ pub struct MailboxStatus {
     #[serde(flatten)]
     pub mailbox: MailMailbox,
     pub unread: i64,
+    /// Objects the sync gave up parsing. They stay in the bucket untouched.
+    pub unreadable: i64,
     pub sync: Option<MailSyncState>,
 }
 
@@ -846,6 +848,8 @@ pub struct MailStatus {
     pub sources: Vec<SourceStatus>,
     /// Over enabled sources only.
     pub unread_total: i64,
+    /// Over enabled sources only, like `unread_total`.
+    pub unreadable_total: i64,
     pub sync_interval_secs: u64,
 }
 
@@ -853,14 +857,18 @@ pub(crate) fn status(store: &SessionStore, sync_interval_secs: u64) -> Result<Ma
     let conn = store.lock_conn()?;
     let credentials = mail_store::list_credentials(&conn).map_err(db)?;
     let unread = mail_store::unread_by_mailbox(&conn).map_err(db)?;
+    let unreadable =
+        mail_store::unreadable_by_mailbox(&conn, mail_sync::MAX_PARSE_ATTEMPTS).map_err(db)?;
     let find = |id: i64| credentials.iter().find(|c| c.id == id).cloned();
     let mut sources = Vec::new();
     let mut unread_total = 0;
+    let mut unreadable_total = 0;
     for account in mail_store::list_accounts(&conn).map_err(db)? {
         let mut mailboxes = Vec::new();
         for mailbox in mail_store::list_user_mailboxes(&conn, Some(account.id)).map_err(db)? {
             mailboxes.push(MailboxStatus {
                 unread: unread.get(&mailbox.id).copied().unwrap_or(0),
+                unreadable: unreadable.get(&mailbox.id).copied().unwrap_or(0),
                 sync: mail_store::get_sync_state(&conn, mailbox.id).map_err(db)?,
                 mailbox,
             });
@@ -868,6 +876,7 @@ pub(crate) fn status(store: &SessionStore, sync_interval_secs: u64) -> Result<Ma
         let source_unread: i64 = mailboxes.iter().map(|m| m.unread).sum();
         if account.enabled {
             unread_total += source_unread;
+            unreadable_total += mailboxes.iter().map(|m| m.unreadable).sum::<i64>();
         }
         sources.push(SourceStatus {
             credential: find(account.credential_id),
@@ -889,6 +898,7 @@ pub(crate) fn status(store: &SessionStore, sync_interval_secs: u64) -> Result<Ma
     Ok(MailStatus {
         sources,
         unread_total,
+        unreadable_total,
         sync_interval_secs,
     })
 }
@@ -2372,6 +2382,59 @@ mod tests {
         assert_eq!(after.unread_total, 1);
         // The source still reports its own count; only the total skips it.
         assert_eq!(after.sources.iter().map(|s| s.unread).sum::<i64>(), 2);
+    }
+
+    #[test]
+    fn the_unreadable_total_leaves_out_a_disabled_source() {
+        let (store, secrets) = setup();
+        let (_, first) = one_source(&store, &secrets);
+        let cred = credential(&store, &secrets, "second");
+        let second = source_upsert(
+            &store,
+            account_input(cred.id, "acme (us-east-1)", "us-east-1", "acme-mail"),
+        )
+        .unwrap();
+        let boxes = mailboxes_upsert(
+            &store,
+            second.account.id,
+            vec![mailbox_input("hello@acme.com", "hello/")],
+        )
+        .unwrap();
+        {
+            let conn = store.lock_conn().unwrap();
+            for (mailbox, key) in [(first.id, "owner/x"), (boxes[0].id, "hello/x")] {
+                let id = mail_store::insert_object(
+                    &conn,
+                    mailbox,
+                    &ListedObject {
+                        s3_key: key,
+                        etag: "e",
+                        size_bytes: 1,
+                        s3_modified: Some(1),
+                    },
+                    1,
+                )
+                .unwrap();
+                mail_store::set_object_outcome(
+                    &conn,
+                    id,
+                    "error",
+                    Some("bad"),
+                    mail_sync::MAX_PARSE_ATTEMPTS,
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(status(&store, 3600).unwrap().unreadable_total, 2);
+
+        let mut off = account_input(cred.id, "acme (us-east-1)", "us-east-1", "acme-mail");
+        off.id = Some(second.account.id);
+        off.enabled = false;
+        source_upsert(&store, off).unwrap();
+        let after = status(&store, 3600).unwrap();
+        assert_eq!(after.unreadable_total, 1);
+        // The mailbox still reports its own count; only the total skips it.
+        assert_eq!(after.sources[1].mailboxes[0].unreadable, 1);
     }
 
     #[test]

@@ -139,6 +139,8 @@ export type MailSyncState = {
 
 export type MailboxStatus = MailMailbox & {
   unread: number;
+  /** Messages the sync gave up parsing; they stay in the bucket untouched. */
+  unreadable: number;
   sync: MailSyncState | null;
 };
 
@@ -159,6 +161,8 @@ export type MailStatus = {
   sources: SourceStatus[];
   /** Over enabled sources only. */
   unreadTotal: number;
+  /** Over enabled sources only, like `unreadTotal`. */
+  unreadableTotal: number;
   syncIntervalSecs: number;
 };
 

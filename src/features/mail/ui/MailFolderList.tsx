@@ -18,6 +18,7 @@ import type {
   SourceStatus,
 } from "../model/mailTypes";
 import { collapsedDomains, useCollapsedDomains } from "../model/mailPrefs";
+import { SETUP_COPY, sourceSetup } from "./MailNotices";
 
 /** A saved filter, as the folder column shows it. */
 export type SmartFolderEntry = {
@@ -133,6 +134,11 @@ export function MailFolderList({
   const collapsed = useCollapsedDomains();
   const [syncing, setSyncing] = useState(false);
   const groups = status ? groupMailboxesByDomain(status.sources) : [];
+  const setup = sourceSetup(status ?? null);
+  // From the groups, which leave out disabled sources.
+  const unreadable = groups
+    .flatMap((g) => g.mailboxes)
+    .filter(({ mailbox }) => mailbox.unreadable > 0);
   const allSelected =
     mailboxId === null && folderId === null && !archiveSelected;
 
@@ -182,9 +188,10 @@ export function MailFolderList({
             Loading
           </p>
         ) : null}
-        {status && groups.length === 0 ? (
+        {setup ? (
+          // The same words as the list pane, so the two never disagree.
           <p className="px-2 py-2 text-[12px] text-content/50">
-            No mailboxes yet. Add a source in Settings.
+            {SETUP_COPY[setup].title}. {SETUP_COPY[setup].hint}
           </p>
         ) : null}
 
@@ -323,25 +330,39 @@ export function MailFolderList({
           </button>
         ) : null}
       </div>
-      <div className="flex shrink-0 items-center gap-2 border-t border-stroke px-3 py-2 text-[11px] text-content/50">
-        <span className="min-w-0 flex-1 truncate">
-          {status && status.sources.length > 0
-            ? "Mail syncs in the background"
-            : "No sources"}
-        </span>
-        <button
-          type="button"
-          title="Syncs every source"
-          aria-label="Sync all sources"
-          disabled={syncing}
-          onClick={() => void syncAll()}
-          className="rounded-md p-1 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50"
-        >
-          <RefreshCw
-            className={`size-3.5 ${syncing ? "animate-spin" : ""}`}
-            strokeWidth={1.75}
-          />
-        </button>
+      <div className="flex shrink-0 flex-col gap-1 border-t border-stroke px-3 py-2 text-[11px] text-content/50">
+        {status && status.unreadableTotal > 0
+          ? unreadable.map(({ mailbox }) => (
+              <p key={mailbox.id} role="status" className="text-amber-400/90">
+                {mailbox.address}: {mailbox.unreadable}{" "}
+                {mailbox.unreadable === 1 ? "message" : "messages"} could not be
+                read. {mailbox.unreadable === 1 ? "It is" : "They are"} left in
+                the bucket untouched.
+              </p>
+            ))
+          : null}
+        <div className="flex items-center gap-2">
+          <span className="min-w-0 flex-1 truncate">
+            {!status
+              ? ""
+              : setup === null
+                ? "Mail syncs in the background"
+                : "Nothing is syncing"}
+          </span>
+          <button
+            type="button"
+            title="Syncs every source"
+            aria-label="Sync all sources"
+            disabled={syncing}
+            onClick={() => void syncAll()}
+            className="rounded-md p-1 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50"
+          >
+            <RefreshCw
+              className={`size-3.5 ${syncing ? "animate-spin" : ""}`}
+              strokeWidth={1.75}
+            />
+          </button>
+        </div>
       </div>
     </nav>
   );

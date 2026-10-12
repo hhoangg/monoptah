@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MailFolderList, groupMailboxesByDomain } from "./MailFolderList";
 import { domainOf } from "../model/mailDomain";
 import { MAIL_PREF_KEYS } from "../model/mailPrefs";
@@ -21,6 +21,7 @@ const mailbox = (
   accountId: number,
   address: string,
   unread = 0,
+  unreadable = 0,
 ): MailboxStatus => ({
   id,
   accountId,
@@ -32,6 +33,7 @@ const mailbox = (
   sortOrder: id,
   isSendable: true,
   unread,
+  unreadable,
   sync: null,
 });
 
@@ -68,6 +70,7 @@ const sources = [
 const status = {
   sources,
   unreadTotal: 12,
+  unreadableTotal: 0,
   syncIntervalSecs: 3600,
 } as MailStatus;
 
@@ -266,4 +269,104 @@ it("offers the Archive view without a badge, and All mail is not selected in it"
   // Exact, not startsWith: a badge here must fail this assertion too, so the
   // badge rule keeps the two points of coverage it had.
   expect(current[0].textContent).toBe("Archive");
+});
+
+const renderStatus = (next: MailStatus) =>
+  act(() =>
+    root.render(
+      createElement(MailFolderList, {
+        status: next,
+        mailboxId: null,
+        folderId: null,
+        onSelectAll: vi.fn(),
+        onSelectMailbox: vi.fn(),
+        onSelectFolder: vi.fn(),
+      }),
+    ),
+  );
+const footer = () =>
+  container.querySelector<HTMLElement>("nav > div:last-child")!.textContent;
+const statusLines = () =>
+  [...container.querySelectorAll("nav > div:last-child [role='status']")].map(
+    (p) => p.textContent,
+  );
+
+describe("messages the sync could not read", () => {
+  const withUnreadable = (counts: [number, number]) =>
+    ({
+      sources: [
+        source(1, "Main", [
+          mailbox(1, 1, "owner@a.com", 0, counts[0]),
+          mailbox(2, 1, "seller@a.com", 0, counts[1]),
+        ]),
+        // Switched off: its 9 must appear nowhere.
+        {
+          ...source(2, "Off", [mailbox(3, 2, "x@b.com", 0, 9)]),
+          enabled: false,
+        },
+      ],
+      unreadTotal: 0,
+      unreadableTotal: counts[0] + counts[1],
+      syncIntervalSecs: 3600,
+    }) as unknown as MailStatus;
+
+  it("says, per mailbox, how many could not be read and that they are untouched", () => {
+    renderStatus(withUnreadable([3, 0]));
+    expect(statusLines()).toEqual([
+      "owner@a.com: 3 messages could not be read. They are left in the bucket untouched.",
+    ]);
+  });
+
+  it("uses the singular for one", () => {
+    renderStatus(withUnreadable([1, 2]));
+    expect(statusLines()).toEqual([
+      "owner@a.com: 1 message could not be read. It is left in the bucket untouched.",
+      "seller@a.com: 2 messages could not be read. They are left in the bucket untouched.",
+    ]);
+  });
+
+  it("says nothing when nothing was given up on, and never for a disabled source", () => {
+    renderStatus(withUnreadable([0, 0]));
+    expect(statusLines()).toEqual([]);
+    expect(footer()).not.toContain("x@b.com");
+  });
+});
+
+describe("setup states, in the list pane's words", () => {
+  const empty = (sourcesList: unknown[]) =>
+    ({
+      sources: sourcesList,
+      unreadTotal: 0,
+      unreadableTotal: 0,
+      syncIntervalSecs: 3600,
+    }) as unknown as MailStatus;
+
+  it.each([
+    ["no source", [], "No mail source yet. Add an AWS source in Settings"],
+    [
+      "every source off",
+      [{ ...source(1, "Main", [mailbox(1, 1, "o@a.com")]), enabled: false }],
+      "Every mail source is turned off. Turn one on in Settings",
+    ],
+    [
+      "sources without mailboxes",
+      [source(1, "Main", [])],
+      "Your sources have no mailboxes. Add a mailbox to a source in Settings",
+    ],
+  ])("%s", (_name, list, expected) => {
+    renderStatus(empty(list));
+    expect(container.textContent).toContain(expected);
+    expect(container.textContent).not.toContain("No mailboxes yet");
+  });
+
+  it("shows no setup line once there is a mailbox", () => {
+    renderStatus(empty([source(1, "Main", [mailbox(1, 1, "o@a.com")])]));
+    expect(container.textContent).not.toContain("No mail source yet");
+    expect(footer()).toContain("Mail syncs in the background");
+  });
+
+  it("does not claim a background sync when nothing is on", () => {
+    renderStatus(empty([source(1, "Main", [])]));
+    expect(footer()).toContain("Nothing is syncing");
+  });
 });
