@@ -258,6 +258,15 @@ it("# asks first; it never deletes on the keypress", async () => {
   expect(calls("mail_delete")).toHaveLength(0);
 });
 
+it("# in the Archive offers only the delete, not an Archive that does nothing", async () => {
+  localStorage.setItem(MAIL_PREF_KEYS.selectedFolder, "archived");
+  await render();
+  await press("j");
+  await press("#", document.body, { shiftKey: true });
+  expect(document.body.textContent).toContain("already archived");
+  expect(document.body.textContent).not.toContain("Archive locally");
+});
+
 it("ignores every key while a dialog is open", async () => {
   await render();
   await press("j");

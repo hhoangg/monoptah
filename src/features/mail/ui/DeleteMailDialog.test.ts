@@ -38,7 +38,7 @@ afterEach(() => {
   container.remove();
 });
 
-const render = async (messageCount = 4) => {
+const render = async (messageCount = 4, alreadyArchived = false) => {
   await act(async () => {
     root.render(
       createElement(DeleteMailDialog, {
@@ -46,6 +46,7 @@ const render = async (messageCount = 4) => {
         subject: "Order #1182",
         messageCount,
         mailbox: "owner@a.com",
+        alreadyArchived,
         onClose,
         onDone,
       }),
@@ -224,4 +225,23 @@ it("announces the files-left sentence, not only the count deleted", async () => 
   expect(alerts[0]!.textContent).toContain(
     "could not be removed from this computer",
   );
+});
+
+it("on an archived thread offers only the delete, still behind the typed word", async () => {
+  await render(4, true);
+  expect(document.body.textContent).not.toContain("Archive locally");
+  expect(document.body.textContent).toContain("already archived");
+  expect(radio(0).checked).toBe(true);
+  expect(document.body.querySelectorAll('input[type="radio"]')).toHaveLength(1);
+  expect(confirm().textContent).toContain("Delete from S3");
+  expect(confirm().disabled).toBe(true);
+  // Enter in the form must not delete before the word is typed.
+  await submit();
+  expect(invoke).not.toHaveBeenCalled();
+  await type("delete");
+  await act(async () => confirm().click());
+  expect(invoke).toHaveBeenCalledWith("mail_delete", {
+    threadIds: [5],
+    hard: true,
+  });
 });

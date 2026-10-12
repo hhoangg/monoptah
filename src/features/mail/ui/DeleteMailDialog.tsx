@@ -32,6 +32,7 @@ export function DeleteMailDialog({
   subject,
   messageCount,
   mailbox,
+  alreadyArchived = false,
   onClose,
   onDone,
 }: {
@@ -39,12 +40,18 @@ export function DeleteMailDialog({
   subject: string;
   messageCount: number;
   mailbox: string;
+  /** Opened from the Archive view, where archiving again would do nothing. */
+  alreadyArchived?: boolean;
   onClose: () => void;
   /** Called when the work finished, so the caller can drop what it shows. */
   onDone: (report: DeleteReport, hard: boolean) => void;
 }) {
   // Archive is the default and a plain Enter cannot reach the other choice.
-  const [choice, setChoice] = useState<Choice>("archive");
+  // On an archived thread Archive is a no-op, so the only choice left is the
+  // delete, which still waits for the typed word: Enter alone cannot confirm it.
+  const [choice, setChoice] = useState<Choice>(
+    alreadyArchived ? "hard" : "archive",
+  );
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -137,33 +144,41 @@ export function DeleteMailDialog({
           void submit();
         }}
       >
+        {alreadyArchived ? (
+          <p className="text-[11.5px] leading-snug text-content/60">
+            {threadIds.length === 1 ? "This thread is" : "These threads are"}{" "}
+            already archived, so deleting is the only thing left to do here.
+          </p>
+        ) : null}
         <div role="radiogroup" aria-label="What to do" className="contents">
-          <label
-            className={`flex cursor-pointer gap-2.5 rounded-lg border p-2.5 ${
-              !hard
-                ? "border-accent/40 bg-accent/10"
-                : "border-content/10 hover:bg-content/5"
-            }`}
-          >
-            <input
-              type="radio"
-              name="delete-choice"
-              checked={!hard}
-              onChange={() => setChoice("archive")}
-              className="mt-0.5"
-            />
-            <span className="flex flex-col gap-1">
-              <span className="flex items-center gap-1.5 text-[12px] font-semibold text-content">
-                <Archive className="size-3.5" />
-                Archive locally
+          {alreadyArchived ? null : (
+            <label
+              className={`flex cursor-pointer gap-2.5 rounded-lg border p-2.5 ${
+                !hard
+                  ? "border-accent/40 bg-accent/10"
+                  : "border-content/10 hover:bg-content/5"
+              }`}
+            >
+              <input
+                type="radio"
+                name="delete-choice"
+                checked={!hard}
+                onChange={() => setChoice("archive")}
+                className="mt-0.5"
+              />
+              <span className="flex flex-col gap-1">
+                <span className="flex items-center gap-1.5 text-[12px] font-semibold text-content">
+                  <Archive className="size-3.5" />
+                  Archive locally
+                </span>
+                <span className="text-[11.5px] leading-snug text-content/50">
+                  Removes the {noun} from your mailboxes and keeps the S3
+                  objects. It stays under Archive in the folder list, where you
+                  can read it or move it back to the inbox.
+                </span>
               </span>
-              <span className="text-[11.5px] leading-snug text-content/50">
-                Removes the {noun} from your mailboxes and keeps the S3 objects.
-                It stays under Archive in the folder list, where you can read it
-                or move it back to the inbox.
-              </span>
-            </span>
-          </label>
+            </label>
+          )}
 
           <label
             className={`flex cursor-pointer gap-2.5 rounded-lg border p-2.5 ${

@@ -705,7 +705,9 @@ fn domain_of(address: &str) -> rusqlite::Result<String> {
 /// Upserts mailboxes under one source, all or nothing. The address is the key
 /// and is globally unique: if another source already owns it the call fails and
 /// names that source. `is_sendable` is resolved against the cached identities
-/// when there are any; before the first identity refresh it keeps its default.
+/// once the source has had a refresh, even one that found none (then nothing is
+/// verified and nothing is sendable); before the first refresh it keeps its
+/// default.
 pub(crate) fn upsert_mailboxes(
     conn: &Connection,
     account_id: i64,
@@ -3068,6 +3070,7 @@ pub(crate) fn compile_rules(
 // ── folders ────────────────────────────────────────────────────────
 
 const MAX_FOLDER_NAME: usize = 80;
+const RESERVED_FOLDER_NAME: &str = "Archive";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3218,6 +3221,14 @@ pub(crate) fn upsert_folder(
     if name.chars().count() > MAX_FOLDER_NAME {
         return Err(user_error(format!(
             "A folder name can be at most {MAX_FOLDER_NAME} characters."
+        )));
+    }
+    // The Archive entry in the folder list is a view of every archived thread,
+    // not a folder. A smart folder with the same name would sit beside it and
+    // read as the same thing while holding something else.
+    if name.to_lowercase() == RESERVED_FOLDER_NAME.to_lowercase() {
+        return Err(user_error(format!(
+            "\"{RESERVED_FOLDER_NAME}\" is the name of the Archive view. Choose another name."
         )));
     }
     if rules.is_empty() {
@@ -4910,6 +4921,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(members.rows.len(), 1);
+    }
+
+    #[test]
+    fn a_smart_folder_cannot_take_the_archive_views_name() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let rules = [rule("subject", "contains", s("x"))];
+        for name in ["Archive", "archive", "  ARCHIVE ", "ArChIvE"] {
+            let err = upsert_folder(&conn, &folder(name), &rules)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Archive view"), "{name}: {err}");
+        }
+        // Renaming an existing folder to it is refused the same way.
+        let kept = upsert_folder(&conn, &folder("Invoices"), &rules).unwrap();
+        let mut rename = folder("archive");
+        rename.id = Some(kept.id);
+        assert!(upsert_folder(&conn, &rename, &rules).is_err());
+        // Only the whole name is reserved.
+        upsert_folder(&conn, &folder("Archive 2023"), &rules).unwrap();
+        upsert_folder(&conn, &folder("Old archive"), &rules).unwrap();
     }
 
     #[test]

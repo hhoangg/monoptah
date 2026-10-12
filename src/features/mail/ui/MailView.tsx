@@ -510,6 +510,7 @@ export function MailView({
           subject={deleteRow.subject}
           messageCount={deleteRow.messageCount}
           mailbox={deleteRow.mailboxAddress}
+          alreadyArchived={archived}
           onClose={() => setDeleteRow(null)}
           onDone={(report, hard) => {
             list.reload();
