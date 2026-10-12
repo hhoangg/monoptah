@@ -266,6 +266,11 @@ impl SyncService {
                     continue;
                 }
             }
+            // A source made before `sent/` came with it has no such mailbox, and
+            // the only other thing that adds one is sending. Without this, a
+            // second machine or a reinstall never sees mail sent from elsewhere.
+            // Idempotent; a failure must not stop the source's inbound mail.
+            let _ = mail_store::ensure_sent_mailbox(&conn, account.id);
             let mut mailboxes = Vec::new();
             let mut staleness = i64::MAX;
             for mailbox in
@@ -1479,7 +1484,8 @@ mod tests {
         f.sync(&[(a, &ma), (b, &mb)]);
         let log = f.log.lock().unwrap().clone();
         assert_contiguous(&log);
-        assert_eq!(log.len(), 8);
+        // Per source: a listing of owner/ and of sent/, and three fetches.
+        assert_eq!(log.len(), 10);
     }
 
     #[test]
@@ -1547,7 +1553,8 @@ mod tests {
         f.sync(&[(a, &ma), (b, &mb)]);
         let log = f.log.lock().unwrap().clone();
         assert_contiguous(&log);
-        assert_eq!(log.len(), 8);
+        // Per source: a listing of owner/ and of sent/, and three fetches.
+        assert_eq!(log.len(), 10);
     }
 
     #[test]
@@ -1919,6 +1926,47 @@ mod tests {
         assert_eq!(
             f.text("SELECT direction FROM mail_message WHERE message_id_hdr='s1@example.com'"),
             "outbound"
+        );
+    }
+
+    #[test]
+    fn an_existing_source_gets_sent_registered_when_it_is_next_synced() {
+        let f = Fixture::new();
+        let cred = f.credential("main");
+        // `source` writes the account row directly, as an install made before
+        // `source_upsert` registered `sent/` has it.
+        let (account, _) = f.source(cred, "acme");
+        let (idle, _) = f.source(cred, "idle");
+        f.store
+            .lock_conn()
+            .unwrap()
+            .execute("UPDATE mail_account SET enabled = 0 WHERE id = ?1", [idle])
+            .unwrap();
+        let count =
+            |f: &Fixture| f.scalar("SELECT COUNT(*) FROM mail_mailbox WHERE s3_prefix = 'sent/'");
+        assert_eq!(count(&f), 0);
+
+        let s3 = MockS3::new("a", &f.log);
+        let sent = mime("s1", "Sent from elsewhere", "hi").replace(
+            "From: Bob <bob@example.com>",
+            "From: Owner <owner@acme.test>",
+        );
+        s3.put("sent/1.eml", "e1", &sent);
+        let reports = f.sync(&[(account, &s3)]);
+        assert_eq!(reports[0].error, None);
+        assert_eq!(reports[0].inserted, 1);
+        assert_eq!(
+            f.text("SELECT direction FROM mail_message WHERE message_id_hdr='s1@example.com'"),
+            "outbound"
+        );
+        // Once, however many syncs; and a source that is off is left as it was.
+        f.sync(&[(account, &s3)]);
+        assert_eq!(count(&f), 1);
+        assert_eq!(
+            f.scalar(&format!(
+                "SELECT COUNT(*) FROM mail_mailbox WHERE account_id = {idle} AND s3_prefix = 'sent/'"
+            )),
+            0
         );
     }
 
