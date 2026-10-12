@@ -2,6 +2,8 @@
 import { describe, expect, it } from "vitest";
 import { cidReferences } from "./mailCid";
 import { contentIdFor, serializeCompose, type TipTapNode } from "./mailCompose";
+import { buildQuote } from "./mailReply";
+import type { MessageRow } from "./mailTypes";
 
 const t = (text: string, marks?: TipTapNode["marks"]): TipTapNode => ({
   type: "text",
@@ -391,5 +393,62 @@ describe("mailCompose draft reopen", () => {
     const a = run(doc(p(t("one")))).html;
     const b = run(doc(p(t("two")))).html;
     expect(a).not.toBe(b);
+  });
+});
+
+describe("a quoted original that goes out", () => {
+  const original = (bodyHtml: string) =>
+    ({
+      id: 1,
+      subject: "Order",
+      fromName: "Ann",
+      fromAddr: "ann@example.org",
+      to: [{ name: null, addr: "owner@byptah.com" }],
+      dateUtc: 1_700_000_000,
+      bodyText: "Hi",
+      bodyHtml,
+    }) as unknown as MessageRow;
+  const sent = (kind: "reply" | "forward", bodyHtml: string) => {
+    const quote = buildQuote(kind, original(bodyHtml), () => "DATE")!;
+    return serializeCompose({
+      bodyJson: { type: "doc", content: [] },
+      draftId: "d1",
+      quotedHtml: quote.html,
+    }).html;
+  };
+
+  it("gets its blocked remote images back as real sources", () => {
+    // What Rust stores for a remote image the user has not loaded.
+    const html = sent(
+      "forward",
+      '<p>Hi</p><img src="" data-mono-src="https://cdn.example.com/logo.png" alt="Logo">',
+    );
+    expect(html).toContain('src="https://cdn.example.com/logo.png"');
+    expect(html).not.toContain("data-mono-src");
+    expect(html).not.toContain('src=""');
+  });
+
+  it("does not send cid: images that nothing re-attaches", () => {
+    const html = sent(
+      "reply",
+      '<p>Hi</p><img src="cid:sig@x" alt="Ann\'s signature"><img src="cid:px@x" alt=""><img src="cid:bare@x">',
+    );
+    expect(html).not.toContain("cid:");
+    expect(html).not.toContain("<img");
+    expect(html).toContain("Ann's signature");
+  });
+
+  it("drops a relative image reference instead of sending a dead one", () => {
+    const html = sent(
+      "reply",
+      '<img src="" data-mono-src="/rel.png" alt="Rel"><img src="" data-mono-src="//evil.test/x.png">',
+    );
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("evil.test");
+  });
+
+  it("leaves inline data: images alone", () => {
+    const html = sent("reply", '<img src="data:image/png;base64,AAAA">');
+    expect(html).toContain('src="data:image/png;base64,AAAA"');
   });
 });

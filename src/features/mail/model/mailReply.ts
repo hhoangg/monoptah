@@ -5,7 +5,7 @@
  * test that does not mount an editor.
  */
 import { domainOf } from "./mailDomain";
-import { buildTextQuote } from "./mailQuote";
+import { buildTextQuote, quotableHtml } from "./mailQuote";
 import type {
   IdentityRow,
   MailAddress,
@@ -260,7 +260,7 @@ export function defaultFrom(
 export type Quote = {
   /** One line under the editor, e.g. "On <date>, Ann wrote:". */
   attribution: string;
-  /** Sanitised by Rust already; appended to the message untouched. */
+  /** Sanitised by Rust, then made sendable by `quotableHtml`; appended untouched. */
   html: string;
   /** Plain-text twin for the text part. */
   text: string;
@@ -291,9 +291,9 @@ export function buildQuote(
 ): Quote | null {
   if (kind === "new") return null;
   const date = formatDate(message.dateUtc);
-  const body =
-    message.bodyHtml ??
-    `<div style="white-space:pre-wrap">${esc(plainOf(message))}</div>`;
+  const body = message.bodyHtml
+    ? quotableHtml(message.bodyHtml)
+    : `<div style="white-space:pre-wrap">${esc(plainOf(message))}</div>`;
   const plain = plainOf(message);
   const preview = plain.replace(/\s+/g, " ").slice(0, 160);
   if (kind === "forward") {
