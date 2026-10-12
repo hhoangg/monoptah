@@ -40,7 +40,8 @@ const CHIP_LABEL: Record<ChipField, string> = {
 const CHIP_HINT: Record<ChipField, string> = {
   from: "The sender's name or address contains this",
   to: "A To recipient's name or address contains this",
-  content: "The message body contains this phrase",
+  content:
+    "The subject, body, or a sender or recipient name contains this phrase",
 };
 
 /**

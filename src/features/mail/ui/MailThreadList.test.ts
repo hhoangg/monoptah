@@ -352,7 +352,7 @@ describe("search box and chips", () => {
     expect(calls()).toBe(2);
     expect(lastScope()).toEqual({
       kind: "rules",
-      rules: [rule("body", "contains_prefix", "invo")],
+      rules: [rule("text", "contains_prefix", "invo")],
       matchMode: "all",
     });
   });
@@ -365,7 +365,7 @@ describe("search box and chips", () => {
       kind: "rules",
       rules: [
         rule("from", "contains", "bob"),
-        rule("body", "contains_prefix", "inv"),
+        rule("text", "contains_prefix", "inv"),
       ],
       matchMode: "all",
     });
@@ -373,7 +373,7 @@ describe("search box and chips", () => {
     await pause();
     expect(lastScope()).toEqual({
       kind: "rules",
-      rules: [rule("from", "contains", "bob"), rule("body", "contains", "in")],
+      rules: [rule("from", "contains", "bob"), rule("text", "contains", "in")],
       matchMode: "all",
     });
   });
@@ -393,7 +393,7 @@ describe("search box and chips", () => {
     await pause();
     expect(lastScope()).toEqual({
       kind: "rules",
-      rules: [rule("body", "contains", "invoice")],
+      rules: [rule("text", "contains", "invoice")],
       matchMode: "all",
     });
   });
@@ -427,7 +427,7 @@ describe("search box and chips", () => {
     await pause();
     expect(lastScope()).toEqual({
       kind: "rules",
-      rules: [rule("body", "contains", "invoice"), rule("is_starred", "true")],
+      rules: [rule("text", "contains", "invoice"), rule("is_starred", "true")],
       matchMode: "all",
     });
   });
@@ -451,7 +451,7 @@ describe("search box and chips", () => {
       kind: "rules",
       rules: [
         rule("mailbox", "is", "owner@a.com"),
-        rule("body", "contains", "invoice"),
+        rule("text", "contains", "invoice"),
       ],
       matchMode: "all",
     });
@@ -492,7 +492,7 @@ describe("search box and chips", () => {
     )!;
     await act(async () => save.click());
     expect(onSaveAsFolder).toHaveBeenCalledWith(
-      [rule("from", "contains", "bob"), rule("body", "contains", "invo")],
+      [rule("from", "contains", "bob"), rule("text", "contains", "invo")],
       "all",
     );
   });

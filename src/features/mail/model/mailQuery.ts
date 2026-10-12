@@ -57,6 +57,7 @@ export const FIELD_OPS: Record<RuleField, readonly RuleOp[]> = {
     "matches",
   ],
   body: ["contains", "contains_prefix", "contains_any"],
+  text: ["contains", "contains_prefix", "contains_any"],
   mailbox: ["is", "contains_any"],
   domain: ["is", "contains", "contains_any"],
   account: ["is", "contains", "contains_any"],
@@ -97,6 +98,7 @@ export const FIELD_LABELS: Record<RuleField, string> = {
   recipient: "To or Cc",
   subject: "Subject",
   body: "Body",
+  text: "Subject, body or people",
   mailbox: "Mailbox",
   domain: "Domain",
   account: "Source",
@@ -114,7 +116,7 @@ const FLAG_FIELDS: readonly RuleField[] = [
 export const isFlagField = (field: RuleField) => FLAG_FIELDS.includes(field);
 
 /** Fields whose `contains` is a full-text match rather than a substring. */
-const FTS_FIELDS: readonly RuleField[] = ["subject", "body"];
+const FTS_FIELDS: readonly RuleField[] = ["subject", "body", "text"];
 const isFts = (field: RuleField, op: RuleOp) =>
   FTS_FIELDS.includes(field) && (op === "contains" || op === "contains_prefix");
 
@@ -286,7 +288,7 @@ export type Built = { rule: Rule } | { error: string };
 
 /**
  * The one place a key and a value become a rule. `key` null is a bare word,
- * which searches the body. `prefix` turns a full-text `contains` into
+ * which searches subject, body and people (`text`); `body:` is body only. `prefix` turns a full-text `contains` into
  * `contains_prefix`; only the search box's last token asks for it.
  */
 export function buildRule(
@@ -298,18 +300,18 @@ export function buildRule(
   const rule = (field: RuleField, op: RuleOp, v: string): Built => ({
     rule: { field, op, value: v, negate },
   });
-  const word = (field: "from" | "to" | "cc" | "subject" | "body") => {
-    if ((field === "subject" || field === "body") && !hasIndexableText(value)) {
+  const word = (field: "from" | "to" | "cc" | "subject" | "body" | "text") => {
+    const fts = field === "subject" || field === "body" || field === "text";
+    if (fts && !hasIndexableText(value)) {
       return { error: `Search for a word, not only symbols: ${value}` };
     }
     const op: RuleOp =
-      prefix && !negate && (field === "subject" || field === "body")
-        ? "contains_prefix"
-        : "contains";
+      prefix && !negate && fts ? "contains_prefix" : "contains";
     return rule(field, op, value);
   };
   switch (key) {
     case null:
+      return word("text");
     case "body":
       return word("body");
     case "from":
@@ -351,10 +353,10 @@ export function chipRules(chips: ChipFilters): {
 } {
   const rules: Rule[] = [];
   const errors: string[] = [];
-  const entries: [SearchKey, string][] = [
+  const entries: [SearchKey | null, string][] = [
     ["from", chips.from],
     ["to", chips.to],
-    ["body", chips.content],
+    [null, chips.content],
   ];
   for (const [key, raw] of entries) {
     const value = raw.trim();
@@ -484,7 +486,8 @@ function serialiseRule(rule: Rule): string | null {
   if (op === "contains" || op === "contains_prefix") {
     if (field === "from" || field === "to" || field === "cc") out = text(field);
     else if (field === "subject") out = text("subject");
-    else if (field === "body") out = text(null);
+    else if (field === "body") out = text("body");
+    else if (field === "text") out = text(null);
   } else if (op === "true") {
     if (field === "has_attachment") out = "has:attachment";
     else if (field === "is_unread") out = "is:unread";

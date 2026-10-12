@@ -236,6 +236,7 @@ export type RuleField =
   | "recipient"
   | "subject"
   | "body"
+  | "text"
   | "mailbox"
   | "domain"
   | "account"

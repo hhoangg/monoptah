@@ -31,10 +31,32 @@ const MASK_VISIBLE_PREFIX: usize = 4;
 const MASK_VISIBLE_SUFFIX: usize = 4;
 
 pub(crate) fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
+    register_functions(conn)?;
     create_tables(conn)?;
     ensure_object_attempts(conn)?;
     ensure_identities_refreshed_at(conn)?;
     ensure_outbox_sent_message(conn)
+}
+
+/// `mail_fold(text)`: lower case with accents removed, for `from:` / `to:`
+/// matching. The index folds through FTS5's own `remove_diacritics`; LIKE has
+/// nothing like it, so the same fold is given to SQL as a function. A function
+/// lives on its connection, so this runs wherever the tables are ensured.
+fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "mail_fold",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            Ok(match ctx.get_raw(0) {
+                rusqlite::types::ValueRef::Text(bytes) => {
+                    Some(fold_name(&String::from_utf8_lossy(bytes)))
+                }
+                _ => None,
+            })
+        },
+    )
 }
 
 fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
@@ -1294,6 +1316,17 @@ fn fts_people(from_name: Option<&str>, from_addr: &str, to_json: &str, cc_json: 
 /// stops matching what was indexed.
 pub(crate) fn fold_fts(text: &str) -> String {
     text.replace('Đ', "D").replace('đ', "d")
+}
+
+/// Case and accents removed, so `hoang` finds `Hoàng`. Matches what the
+/// index does (`remove_diacritics 2`) plus the stroke letters it cannot reach.
+pub(crate) fn fold_name(text: &str) -> String {
+    use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
+    fold_fts(text)
+        .nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .collect::<String>()
+        .to_lowercase()
 }
 
 // The FTS table is contentless: no triggers, the rowid is the message id, and
@@ -2585,6 +2618,9 @@ pub(crate) const FIELD_OPS: &[(&str, &[&str])] = &[
     ("recipient", TEXT_OPS),
     ("subject", SUBJECT_OPS),
     ("body", FTS_OPS),
+    // Subject, body and participants. A bare word in the search box is this;
+    // `body` stays body-only so a saved folder keeps what it was built to find.
+    ("text", FTS_OPS),
     ("mailbox", SCOPE_OPS),
     ("domain", NAME_OPS),
     ("account", NAME_OPS),
@@ -2724,6 +2760,21 @@ fn text_term(
     sql
 }
 
+/// `text_term` for a person: accents and case do not matter, as they do not in
+/// the index. `from:hoang` finds `Hoàng` like a bare `hoang` does. `matches` is
+/// a case-sensitive glob by design and is left alone.
+fn name_term(
+    expr: &str,
+    op: &str,
+    value: &str,
+    params: &mut Vec<rusqlite::types::Value>,
+) -> String {
+    if op == "matches" {
+        return text_term(expr, op, value, params);
+    }
+    text_term(&format!("mail_fold({expr})"), op, &fold_name(value), params)
+}
+
 /// An address list column (`to_json`, `cc_json`) is `[{name,addr}]`; searching
 /// the JSON text would match its punctuation and keys, so each entry is read.
 fn address_term(
@@ -2732,13 +2783,13 @@ fn address_term(
     value: &str,
     params: &mut Vec<rusqlite::types::Value>,
 ) -> String {
-    let addr = text_term(
+    let addr = name_term(
         "COALESCE(json_extract(j.value, '$.addr'), '')",
         op,
         value,
         params,
     );
-    let name = text_term(
+    let name = name_term(
         "COALESCE(json_extract(j.value, '$.name'), '')",
         op,
         value,
@@ -2844,8 +2895,8 @@ fn compile_rule(
             values
                 .iter()
                 .map(|v| {
-                    let a = text_term("m.from_addr", op, v, params);
-                    let n = text_term("COALESCE(m.from_name, '')", op, v, params);
+                    let a = name_term("m.from_addr", op, v, params);
+                    let n = name_term("COALESCE(m.from_name, '')", op, v, params);
                     format!("({a} OR {n})")
                 })
                 .collect(),
@@ -2864,8 +2915,14 @@ fn compile_rule(
                     .collect(),
             ))
         }
-        "subject" | "body" if op == "contains" || op == "contains_prefix" => {
-            any_message(&fts_term(field, &values, op == "contains_prefix", params))
+        "subject" | "body" | "text" if op == "contains" || op == "contains_prefix" => {
+            // FTS5 column filter: one MATCH over several columns.
+            let columns = if field == "text" {
+                "{subject body people}"
+            } else {
+                field
+            };
+            any_message(&fts_term(columns, &values, op == "contains_prefix", params))
         }
         "subject" => any_message(&or_all(
             values
@@ -4348,7 +4405,7 @@ mod tests {
             assert!(ops.contains(relative), "{relative} is not an operator");
         }
         let mut valid = 0;
-        assert_eq!(fields.len(), 13);
+        assert_eq!(fields.len(), 14);
         for field in fields {
             let allowed = allowed_ops(field).unwrap();
             for op in &ops {
@@ -4396,9 +4453,9 @@ mod tests {
                 }
             }
         }
-        // from/to/cc/recipient 6 each, subject 7, body 3, mailbox 2,
+        // from/to/cc/recipient 6 each, subject 7, body 3, text 3, mailbox 2,
         // domain and account 3 each, three flags, date 3.
-        assert_eq!(valid, 4 * 6 + 7 + 3 + 2 + 3 + 3 + 3 + 3);
+        assert_eq!(valid, 4 * 6 + 7 + 3 + 3 + 2 + 3 + 3 + 3 + 3);
         assert!(allowed_ops("nonsense").is_none());
         let err = compile_rules(&[rule("nonsense", "is", s("x"))], MatchMode::All, 0).err();
         assert!(err.unwrap().to_string().contains("nonsense"));
@@ -4770,6 +4827,116 @@ mod tests {
         }
         assert_eq!(find("subject", "dơn"), 1);
         assert_eq!(find("subject", "dan"), 0);
+    }
+
+    #[test]
+    fn a_bare_word_searches_subject_body_and_people_and_body_stays_body() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "Quarterly zebra report",
+                body: "numbers inside",
+                from_name: "Hoàng Xuân",
+                from_addr: "hx@vn.example",
+                to: r#"[{"name":"Đặng Lê","addr":"dl@vn.example"}]"#,
+                cc: r#"[{"name":null,"addr":"ops@team.example"}]"#,
+                ..Msg::default()
+            },
+        );
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "unrelated",
+                body: "the zebra is only in the body here",
+                ..Msg::default()
+            },
+        );
+        let text = |v: &str, op: &str| list_rules(&conn, &[rule("text", op, s(v))], MatchMode::All);
+        // A word only in the subject, one only in the body, one only in a name.
+        assert_eq!(text("quarterly", "contains"), ["Quarterly zebra report"]);
+        assert_eq!(text("inside", "contains"), ["Quarterly zebra report"]);
+        assert_eq!(text("zebra", "contains").len(), 2);
+        assert_eq!(text("hoang", "contains"), ["Quarterly zebra report"]);
+        assert_eq!(text("HOÀNG", "contains"), ["Quarterly zebra report"]);
+        assert_eq!(text("dang", "contains"), ["Quarterly zebra report"]);
+        assert_eq!(text("ops", "contains"), ["Quarterly zebra report"]);
+        assert_eq!(text("vn.example", "contains"), ["Quarterly zebra report"]);
+        assert_eq!(text("hoa", "contains_prefix"), ["Quarterly zebra report"]);
+        assert!(text("hoa", "contains").is_empty());
+        // Negation means no message of the thread matches anywhere.
+        let mut not = rule("text", "contains", s("hoang"));
+        not.negate = true;
+        assert_eq!(list_rules(&conn, &[not], MatchMode::All), ["unrelated"]);
+
+        // A saved `body` rule keeps meaning body only: the word in a subject or
+        // a name must not start matching it.
+        let body = |v: &str| list_rules(&conn, &[rule("body", "contains", s(v))], MatchMode::All);
+        assert!(body("quarterly").is_empty());
+        assert!(body("hoang").is_empty());
+        assert_eq!(body("inside"), ["Quarterly zebra report"]);
+
+        // Smart folders compile the same rule.
+        let f = upsert_folder(
+            &conn,
+            &folder("People"),
+            &[rule("text", "contains", s("hoang"))],
+        )
+        .unwrap();
+        let members = list_threads(
+            &conn,
+            &ThreadQuery {
+                scope: ThreadScope::Folder { folder_id: f.id },
+                cursor: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(members.rows.len(), 1);
+    }
+
+    #[test]
+    fn from_and_to_ignore_accents_and_case_like_the_index() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let mb = seed_boxes(&conn, &[("o@example.com", "o/")])[0];
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "named",
+                from_name: "Hoàng Xuân",
+                from_addr: "hx@vn.example",
+                to: r#"[{"name":"Đặng Lê","addr":"dl@vn.example"}]"#,
+                ..Msg::default()
+            },
+        );
+        arrive(
+            &conn,
+            mb,
+            &Msg {
+                subject: "other",
+                ..Msg::default()
+            },
+        );
+        let find = |field: &str, op: &str, v: &str| {
+            list_rules(&conn, &[rule(field, op, s(v))], MatchMode::All)
+        };
+        assert_eq!(find("from", "contains", "hoang"), ["named"]);
+        assert_eq!(find("from", "contains", "XUAN"), ["named"]);
+        assert_eq!(find("from", "contains", "Hoàng"), ["named"]);
+        assert_eq!(find("from", "starts_with", "hoang x"), ["named"]);
+        assert_eq!(find("from", "is", "hoang xuan"), ["named"]);
+        assert_eq!(find("to", "contains", "dang le"), ["named"]);
+        assert_eq!(find("recipient", "contains", "đặng"), ["named"]);
+        assert_eq!(find("from", "contains", "hx@vn.example"), ["named"]);
+        // Still a substring test, and `%` is not a wildcard in it.
+        assert!(find("from", "contains", "hoanx").is_empty());
+        assert!(find("from", "contains", "%").is_empty());
     }
 
     #[test]

@@ -31,11 +31,12 @@ const rule = (
 
 describe("round trip", () => {
   // Canonical spellings only: keys lowercase, one space, quotes only where a
-  // value needs them. `body:x` is read but written back as a bare word.
+  // value needs them. A bare word is `text` (subject, body and people).
   it.each([
     "from:bob",
     "from:bob to:ann cc:lee",
     "subject:invoice",
+    "body:invoice",
     "invoice",
     '"order refund"',
     'subject:"order refund"',
@@ -60,7 +61,7 @@ describe("round trip", () => {
   it("serialise then parse returns the same rules", () => {
     const rules = [
       rule("from", "contains", "bob smith"),
-      rule("body", "contains", "-odd"),
+      rule("text", "contains", "-odd"),
       rule("subject", "contains", "from:x", true),
       rule("date", "after", "2025-03-04"),
       rule("is_unread", "true"),
@@ -173,10 +174,41 @@ describe("a bare wildcard", () => {
   });
 });
 
+describe("what a bare word searches", () => {
+  it("is subject, body and people; body: stays body only", () => {
+    expect(parseQuery("hoang").rules).toEqual([
+      rule("text", "contains", "hoang"),
+    ]);
+    expect(parseQuery("body:hoang").rules).toEqual([
+      rule("body", "contains", "hoang"),
+    ]);
+    expect(parseQuery("-hoang").rules).toEqual([
+      rule("text", "contains", "hoang", true),
+    ]);
+  });
+
+  it("writes a saved body rule back as body:, so the box shows what it does", () => {
+    expect(serialiseRules([rule("body", "contains", "invoice")])).toBe(
+      "body:invoice",
+    );
+    expect(serialiseRules([rule("text", "contains", "invoice")])).toBe(
+      "invoice",
+    );
+  });
+
+  it("prefix-matches the last word on every full-text field", () => {
+    const typed = parseQuery("hoa", { prefixLast: true }).rules;
+    expect(typed).toEqual([rule("text", "contains_prefix", "hoa")]);
+    expect(parseQuery("body:hoa", { prefixLast: true }).rules).toEqual([
+      rule("body", "contains_prefix", "hoa"),
+    ]);
+  });
+});
+
 describe("parsing", () => {
   it("treats an unknown key as a plain word", () => {
     expect(parseQuery("foo:bar").rules).toEqual([
-      rule("body", "contains", "foo:bar"),
+      rule("text", "contains", "foo:bar"),
     ]);
   });
 
@@ -188,7 +220,7 @@ describe("parsing", () => {
 
   it("skips a key with no value yet", () => {
     expect(parseQuery("from: invoice")).toEqual({
-      rules: [rule("body", "contains", "invoice")],
+      rules: [rule("text", "contains", "invoice")],
       errors: [],
     });
     expect(parseQuery('from:""').rules).toEqual([]);
@@ -210,13 +242,13 @@ describe("parsing", () => {
 
   it("reads an unterminated quote as the phrase so far", () => {
     expect(parseQuery('"order ref').rules).toEqual([
-      rule("body", "contains", "order ref"),
+      rule("text", "contains", "order ref"),
     ]);
   });
 
   it("ignores a lone dash", () => {
     expect(parseQuery("- invoice").rules).toEqual([
-      rule("body", "contains", "invoice"),
+      rule("text", "contains", "invoice"),
     ]);
   });
 
