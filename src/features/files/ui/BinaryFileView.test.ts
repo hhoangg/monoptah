@@ -211,6 +211,7 @@ describe("BinaryFileView video playback", () => {
       },
     );
     await renderViewer("/repo/clip.mp4", true, true);
+    await act(() => new Promise((resolve) => setTimeout(resolve)));
     expect(container.querySelector("video")?.src).toBe("blob:image-preview");
     expect(removed).toEqual([]);
     expect(loadedSources).toEqual([]);
