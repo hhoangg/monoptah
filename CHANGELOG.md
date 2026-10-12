@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-12
+
+### Added
+
+- **Mail**, an email client over your own AWS account. It reads incoming mail from the S3 bucket where Amazon SES stores receipts and sends through SES. Mail is **off by default**; turn it on in Settings → Mail, then add an IAM access key and a source (region, bucket and one prefix per mailbox). Keys are kept in the system keychain, never in the app's database.
+- The Mail view lists mailboxes grouped by domain, conversations threaded across sent and received mail, a reading pane on the right, below or off, and comfortable or compact density. A badge on the rail counts unread mail across enabled sources.
+- Messages render in a sandboxed frame with scripts removed and **remote images blocked** until you choose Show images; images are then fetched by the app without cookies or referrer, and private network addresses are refused. Attachments open from a local cache and are marked as downloaded from the internet, so the system checks them before they run.
+- A **composer** with rich text, inline images and attachments, reply, reply all and forward. Drafts are saved; the **Outbox** lists drafts, failed sends and messages whose delivery could not be confirmed, so nothing is sent twice by accident.
+- **Search** with filter chips (`from:`, `to:`, `subject:`, `is:unread`, dates, attachments) that ignores accents, so `hoang` finds Hoàng, and **smart folders** saved from any search.
+- **Archive** and **delete**: archiving is local and reversible from the Archive view; deleting from S3 needs the word typed to confirm and only removes what S3 confirms it deleted.
+- Keyboard shortcuts in Mail: `j`/`k` move, `Enter` opens, `r` reply, `a` reply all, `e` archive, `#` delete, `/` search.
+
+### Changed
+
+- Settings controls (`Group`, `Row`, `Toggle`, `Segmented`, `Slider`, `Select`) moved to a shared `primitives.tsx`, unchanged apart from an optional description link on `Toggle`.
+- The app's content security policy allows frames of its own origin (`frame-src 'self'`), which the sandboxed mail reader needs; the reader itself runs no scripts.
+
 ## [0.17.0] - 2026-10-12
 
 Carries the upstream MonoCode 0.13.0 changes below.
