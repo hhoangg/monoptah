@@ -587,3 +587,27 @@ describe("a smart folder", () => {
     expect(rowCount()).toBe(0);
   });
 });
+
+describe("density", () => {
+  const withDensity = async (value: string | null) => {
+    if (value) localStorage.setItem("monocode.mail.density", value);
+    vi.mocked(mailThreads).mockResolvedValue({
+      rows: [thread(1)],
+      nextCursor: null,
+    });
+    await render(all, twoDomains);
+  };
+
+  it("shows each row's snippet when comfortable", async () => {
+    await withDensity(null);
+    expect(container.textContent).toContain("Snippet 1");
+  });
+
+  it("drops the snippet and tightens the row when compact", async () => {
+    await withDensity("compact");
+    expect(container.textContent).not.toContain("Snippet 1");
+    const classes = container.querySelector("[data-thread-id]")!.className;
+    expect(classes).toContain("py-1 ");
+    expect(classes).not.toContain("py-2");
+  });
+});

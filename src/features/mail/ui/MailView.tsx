@@ -1,5 +1,10 @@
-import { useRef, useState } from "react";
-import { Mail, MessageSquarePlus, Send } from "../../../shared/ui/icons";
+import { useEffect, useRef, useState } from "react";
+import {
+  ChevronLeft,
+  Mail,
+  MessageSquarePlus,
+  Send,
+} from "../../../shared/ui/icons";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 import { useDragResize } from "../../../shared/hooks/useDragResize";
 import { IS_MAC } from "../../../platform/tauri/platform";
@@ -14,8 +19,10 @@ import {
   useSelectedFolder,
   useSelectedMailbox,
 } from "../model/mailPrefs";
+import { mailThread } from "../model/mail";
+import { mailKeyAction, type MailKeyAction } from "../model/mailKeys";
 import type { ComposeRequest } from "../model/mailReply";
-import type { FolderRow, MatchMode, Rule } from "../model/mailTypes";
+import type { FolderRow, MatchMode, Rule, ThreadRow } from "../model/mailTypes";
 import { useMailOutbox } from "../model/mailOutbox";
 import {
   ARCHIVE_PREF,
@@ -24,13 +31,15 @@ import {
 } from "../model/useMailFolders";
 import { useMailStatus } from "../model/useMailStatus";
 import { ComposeSheet, preloadMailEditor } from "./ComposeSheet";
+import { DeleteMailDialog, mailDelete } from "./DeleteMailDialog";
 import { MailFolderList, groupMailboxesByDomain } from "./MailFolderList";
 import {
   MailThreadList,
   useMailThreadList,
   type ListBase,
 } from "./MailThreadList";
-import { MailThreadRead } from "./MailThreadRead";
+import { MailSourceErrors, sourceSetup } from "./MailNotices";
+import { MailThreadRead, sortedMessages } from "./MailThreadRead";
 import { OutboxSheet } from "./OutboxSheet";
 import { SmartFolderSheet } from "./SmartFolderSheet";
 
@@ -44,6 +53,9 @@ type Props = {
   onClose: () => void;
   onToggleSidebar?: () => void;
 };
+
+const errorText = (err: unknown) =>
+  err instanceof Error ? err.message : String(err);
 
 const LIST_MIN_WIDTH = 280;
 const LIST_MAX_WIDTH = 640;
@@ -72,6 +84,11 @@ export function MailView({
     refresh: refreshFolders,
   } = useMailFolders();
   const [threadId, setThreadId] = useState<number | null>(null);
+  // The keyboard's row: j/k move it, Enter opens it. Clicking sets both.
+  const [cursorId, setCursorId] = useState<number | null>(null);
+  const [deleteRow, setDeleteRow] = useState<ThreadRow | null>(null);
+  const [keyError, setKeyError] = useState<string | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
   const [sheet, setSheet] = useState<Sheet | null>(null);
   const [compose, setCompose] = useState<{
     key: number;
@@ -120,6 +137,7 @@ export function MailView({
     selectedMailbox.save(mailbox);
     selectedFolder.save(folder);
     setThreadId(null);
+    setCursorId(null);
   };
   const resize = useDragResize({
     min: LIST_MIN_WIDTH,
@@ -140,9 +158,106 @@ export function MailView({
   // Width is a column only beside the reader; below it, or alone, the list
   // spans the row and a fixed width would leave a gap.
   const listBeside = side === "right";
+  // With no reading pane an opened thread takes the list's place: otherwise
+  // Enter, or a click, would open something nowhere.
+  const readerOnly = side === "off" && threadId !== null;
+
+  const onKey = (event: KeyboardEvent) => {
+    // A dialog anywhere (the composer, a delete confirmation, the message
+    // source) owns the keyboard, even when focus has slipped to the body.
+    if (document.querySelector('[role="dialog"]')) return;
+    const action = mailKeyAction(event);
+    if (action) runKey(action, event);
+  };
+  const runKey = (action: MailKeyAction, event: KeyboardEvent) => {
+    const rows = list.rows;
+    const at = rows.findIndex((row) => row.id === cursorId);
+    const row =
+      rows[at] ?? rows.find((candidate) => candidate.id === threadId) ?? null;
+    const targetId = row?.id ?? threadId;
+    const handled = () => event.preventDefault();
+
+    if (action === "next" || action === "prev") {
+      if (readerOnly || rows.length === 0) return;
+      const to = at === -1 ? 0 : at + (action === "next" ? 1 : -1);
+      if (to < 0) return;
+      // Past the loaded rows this fetches the next page; the key then needs
+      // pressing again once it lands.
+      if (to >= list.shown) list.grow();
+      const next = rows[to];
+      if (next) setCursorId(next.id);
+      handled();
+    } else if (action === "open") {
+      if (!row) return;
+      setThreadId(row.id);
+      handled();
+    } else if (action === "back") {
+      if (!readerOnly) return;
+      setThreadId(null);
+      handled();
+    } else if (action === "search") {
+      const box = rootRef.current?.querySelector<HTMLInputElement>(
+        'input[type="search"]',
+      );
+      // The Archive and smart folders have no search box; leave "/" alone.
+      if (!box) return;
+      box.focus();
+      box.select();
+      handled();
+    } else if (action === "reply" || action === "reply_all") {
+      if (targetId === null) return;
+      handled();
+      setKeyError(null);
+      mailThread(targetId)
+        .then((detail) => {
+          const sorted = sortedMessages(detail.messages);
+          const message = sorted[sorted.length - 1];
+          if (message) {
+            openCompose({ kind: action, message, thread: detail.thread });
+          }
+        })
+        .catch((err) => setKeyError(errorText(err)));
+    } else if (action === "archive") {
+      if (targetId === null || scope?.kind === "archived") return;
+      handled();
+      setKeyError(null);
+      const neighbour = rows[at + 1] ?? rows[at - 1] ?? null;
+      mailDelete([targetId], false)
+        .then(() => {
+          setCursorId(neighbour?.id ?? null);
+          if (threadId === targetId) setThreadId(null);
+          list.reload();
+        })
+        .catch((err) => setKeyError(errorText(err)));
+    } else if (action === "delete") {
+      if (!row) return;
+      handled();
+      setDeleteRow(row);
+    }
+  };
+  // Re-bound through a ref so the one listener always sees this render's list
+  // and selection without being torn down on every keystroke.
+  const onKeyRef = useRef(onKey);
+  onKeyRef.current = onKey;
+  useEffect(() => {
+    // Mounted only while Mail is the open view, which is what scopes these
+    // keys: the app mounts no MailView under any other view.
+    const listener = (event: KeyboardEvent) => onKeyRef.current(event);
+    window.addEventListener("keydown", listener);
+    return () => window.removeEventListener("keydown", listener);
+  }, []);
+
+  // j/k move real focus, so Tab, Enter and a screen reader follow the cursor.
+  useEffect(() => {
+    if (cursorId === null || readerOnly) return;
+    rootRef.current
+      ?.querySelector<HTMLElement>(`[data-thread-id="${cursorId}"]`)
+      ?.focus();
+  }, [cursorId, readerOnly]);
 
   return (
     <div
+      ref={rootRef}
       role="region"
       aria-label="Mail"
       data-app-mail
@@ -228,54 +343,78 @@ export function MailView({
             side === "bottom" ? "flex-col" : ""
           }`}
         >
-          <section
-            // Remount on layout change: the drag hook writes an inline width
-            // that nothing clears when the list stops being a column.
-            key={listBeside ? "beside" : "stacked"}
-            aria-label="Messages"
-            data-mail-pane="threads"
-            ref={listBeside ? resize.setPaneRef : undefined}
-            className={`relative flex min-h-0 flex-col ${
-              listBeside
-                ? "shrink-0 border-r border-stroke"
-                : side === "bottom"
-                  ? "h-2/5 shrink-0 border-b border-stroke"
-                  : "min-w-0 flex-1"
-            }`}
-          >
-            {listBeside ? (
-              <div
-                role="separator"
-                aria-orientation="vertical"
-                aria-label="Resize message list"
-                className={`absolute inset-y-0 -right-px z-10 w-1.5 cursor-col-resize touch-none ${
-                  resize.dragging ? "bg-content/15" : "hover:bg-content/10"
-                }`}
-                onPointerDown={resize.onPointerDown}
-                onDoubleClick={resize.onDoubleClick}
+          {readerOnly ? null : (
+            <section
+              // Remount on layout change: the drag hook writes an inline width
+              // that nothing clears when the list stops being a column.
+              key={listBeside ? "beside" : "stacked"}
+              aria-label="Messages"
+              data-mail-pane="threads"
+              ref={listBeside ? resize.setPaneRef : undefined}
+              className={`relative flex min-h-0 flex-col ${
+                listBeside
+                  ? "shrink-0 border-r border-stroke"
+                  : side === "bottom"
+                    ? "h-2/5 shrink-0 border-b border-stroke"
+                    : "min-w-0 flex-1"
+              }`}
+            >
+              {listBeside ? (
+                <div
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="Resize message list"
+                  className={`absolute inset-y-0 -right-px z-10 w-1.5 cursor-col-resize touch-none ${
+                    resize.dragging ? "bg-content/15" : "hover:bg-content/10"
+                  }`}
+                  onPointerDown={resize.onPointerDown}
+                  onDoubleClick={resize.onDoubleClick}
+                />
+              ) : null}
+              <MailSourceErrors status={status} />
+              {keyError ? (
+                <p
+                  role="alert"
+                  className="shrink-0 border-b border-stroke px-3 py-2 text-[12px] text-red-400/90"
+                >
+                  {keyError}
+                </p>
+              ) : null}
+              <MailThreadList
+                list={list}
+                scope={scope ?? { kind: "all" }}
+                mailboxes={mailboxes}
+                selectedId={threadId}
+                cursorId={cursorId}
+                setup={sourceSetup(status)}
+                onSelect={(thread) => {
+                  setThreadId(thread.id);
+                  setCursorId(thread.id);
+                }}
+                onSaveAsFolder={(rules, matchMode) =>
+                  setSheet({ kind: "new", rules, matchMode })
+                }
+                onEditFolder={() => {
+                  const folder = folders?.find((f) => f.id === folderId);
+                  if (folder) setSheet({ kind: "edit", folder });
+                }}
               />
-            ) : null}
-            <MailThreadList
-              list={list}
-              scope={scope ?? { kind: "all" }}
-              mailboxes={mailboxes}
-              selectedId={threadId}
-              onSelect={(thread) => setThreadId(thread.id)}
-              onSaveAsFolder={(rules, matchMode) =>
-                setSheet({ kind: "new", rules, matchMode })
-              }
-              onEditFolder={() => {
-                const folder = folders?.find((f) => f.id === folderId);
-                if (folder) setSheet({ kind: "edit", folder });
-              }}
-            />
-          </section>
-          {side === "off" ? null : (
+            </section>
+          )}
+          {side === "off" && !readerOnly ? null : (
             <section
               aria-label="Reading pane"
               data-mail-pane="reader"
               className="flex min-h-0 min-w-0 flex-1 flex-col"
             >
+              {readerOnly ? (
+                <div className="flex shrink-0 items-center border-b border-stroke px-3 py-1.5">
+                  <SecondaryButton onClick={() => setThreadId(null)}>
+                    <ChevronLeft className="size-3" />
+                    Messages
+                  </SecondaryButton>
+                </div>
+              ) : null}
               <MailThreadRead threadId={threadId} onCompose={openCompose} />
             </section>
           )}
@@ -290,6 +429,24 @@ export function MailView({
             setCompose(null);
             // A save emits nothing, so this is when the list learns of it.
             void outbox.reload();
+          }}
+        />
+      ) : null}
+      {deleteRow ? (
+        <DeleteMailDialog
+          threadIds={[deleteRow.id]}
+          subject={deleteRow.subject}
+          messageCount={deleteRow.messageCount}
+          mailbox={deleteRow.mailboxAddress}
+          onClose={() => setDeleteRow(null)}
+          onDone={(report, hard) => {
+            list.reload();
+            // Gone for good only when S3 confirmed every message; a partial
+            // delete leaves the thread there to be read and retried.
+            if (hard && report.kept === 0 && report.errors.length === 0) {
+              if (threadId === deleteRow.id) setThreadId(null);
+              setCursorId(null);
+            }
           }}
         />
       ) : null}

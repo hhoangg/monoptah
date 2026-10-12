@@ -4,6 +4,7 @@ import { LIST_PAGE_SIZE, listWindowSize } from "../../../shared/lib/listWindow";
 import { Loader, Paperclip, Pencil, Star } from "../../../shared/ui/icons";
 import { MAIL_MESSAGES_CHANGED_EVENT, mailThreads } from "../model/mail";
 import { useDensity } from "../model/mailPrefs";
+import { asSentence } from "../model/mailText";
 import {
   NO_CHIPS,
   QUERY_MATCH_MODE,
@@ -23,6 +24,7 @@ import type {
   ThreadScope,
 } from "../model/mailTypes";
 import { domainOf } from "../model/mailDomain";
+import { SETUP_COPY, type SourceSetup } from "./MailNotices";
 
 /** Rows fetched per backend page; the DOM window grows in LIST_PAGE_SIZE steps. */
 const FETCH_LIMIT = 100;
@@ -106,9 +108,6 @@ export type ListBase =
   | { kind: "mailbox"; mailboxId: number; address: string }
   | { kind: "folder"; folderId: number }
   | { kind: "archived" };
-
-/** Parse errors carry no final punctuation, so a second sentence would run on. */
-const asSentence = (text: string) => (/[.!?]$/.test(text) ? text : `${text}.`);
 
 function useDebounced<T>(value: T, ms: number): T {
   const [settled, setSettled] = useState(value);
@@ -329,10 +328,14 @@ export type MailThreadListState = ReturnType<typeof useMailThreadList>;
 
 type Props = {
   list: MailThreadListState;
-  scope: ThreadScope;
+  scope: ThreadScope | ListBase;
   /** Every mailbox in view of the scope; decides whether the domain chip shows. */
   mailboxes: Pick<MailMailbox, "address">[];
   selectedId: number | null;
+  /** The keyboard's row. It moves with j/k and is not the open thread until Enter. */
+  cursorId?: number | null;
+  /** Set when the setup, not the mailbox, is why nothing is listed. */
+  setup?: SourceSetup | null;
   onSelect: (thread: ThreadRow) => void;
   /** Opens the folder editor with the current filters as its rules. */
   onSaveAsFolder?: (rules: Rule[], matchMode: MatchMode) => void;
@@ -345,6 +348,8 @@ export function MailThreadList({
   scope,
   mailboxes,
   selectedId,
+  cursorId = null,
+  setup = null,
   onSelect,
   onSaveAsFolder,
   onEditFolder,
@@ -520,16 +525,20 @@ export function MailThreadList({
           {rows.slice(0, shown).map((row) => {
             const unread = row.unreadCount > 0;
             const selected = row.id === selectedId;
+            const cursor = row.id === cursorId;
             return (
               <li key={row.id}>
                 <button
                   type="button"
                   data-thread-id={row.id}
+                  data-cursor={cursor ? "true" : undefined}
                   aria-current={selected ? "true" : undefined}
                   onClick={() => onSelect(row)}
                   className={`flex w-full min-w-0 items-start gap-2 border-b border-content/5 px-3 text-left hover:bg-content/5 focus-visible:outline-2 focus-visible:outline-accent ${
                     compact ? "py-1" : "py-2"
-                  } ${selected ? "bg-content/10" : ""}`}
+                  } ${selected ? "bg-content/10" : ""} ${
+                    cursor ? "ring-1 ring-inset ring-accent/50" : ""
+                  }`}
                 >
                   <span
                     aria-label={unread ? "Unread" : undefined}
@@ -620,15 +629,28 @@ export function MailThreadList({
           </p>
         ) : null}
         {!loading && !error && rows.length === 0 ? (
-          <p className="px-3 py-2 text-[12px] text-content/50">
-            {inFolder
-              ? "Nothing in this folder yet. Matching mail that arrives will show up here."
-              : inArchive
-                ? "Nothing archived."
-                : filtering
-                  ? "No threads match."
-                  : "No mail here yet."}
-          </p>
+          <div className="px-3 py-2 text-[12px] text-content/50">
+            {setup && !filtering ? (
+              <>
+                <p className="font-medium text-content/70">
+                  {SETUP_COPY[setup].title}
+                </p>
+                <p className="mt-0.5">{SETUP_COPY[setup].hint}</p>
+              </>
+            ) : (
+              <p>
+                {inFolder
+                  ? "Nothing in this folder yet. Matching mail that arrives will show up here."
+                  : inArchive
+                    ? "Nothing archived."
+                    : filtering
+                      ? "No threads match."
+                      : scope.kind === "mailbox" && "address" in scope
+                        ? `Nothing in ${scope.address} yet. New mail appears after the next sync.`
+                        : "No mail yet. New mail appears after the next sync."}
+              </p>
+            )}
+          </div>
         ) : null}
       </div>
     </div>

@@ -45,6 +45,10 @@ const addressOf = (p: MailAddress) =>
   p.name ? `${p.name} <${p.addr}>` : p.addr;
 const senderOf = (m: MessageRow) => m.fromName?.trim() || m.fromAddr;
 
+/** Oldest first, as a conversation reads. The array order is not relied on. */
+export const sortedMessages = (messages: readonly MessageRow[]) =>
+  [...messages].sort((a, b) => a.dateUtc - b.dateUtc || a.id - b.id);
+
 /** `dateUtc` is epoch seconds. */
 const fullDate = (seconds: number) => new Date(seconds * 1000).toLocaleString();
 
@@ -369,7 +373,24 @@ function ThreadBody({
     );
   }
   if (error && !detail) {
-    return <p className="px-4 py-3 text-[12px] text-red-400">{error}</p>;
+    return (
+      <div
+        role="alert"
+        className="flex flex-col items-start gap-2 px-4 py-3 text-[12px]"
+      >
+        <p className="text-red-400">
+          Could not open this conversation: {error}
+        </p>
+        <SecondaryButton
+          onClick={() => {
+            setError(null);
+            setReloadKey((k) => k + 1);
+          }}
+        >
+          Try again
+        </SecondaryButton>
+      </div>
+    );
   }
   if (!detail) {
     return (
@@ -379,10 +400,7 @@ function ThreadBody({
     );
   }
 
-  // Oldest first, as a conversation reads. The array order is not relied on.
-  const messages = [...detail.messages].sort(
-    (a, b) => a.dateUtc - b.dateUtc || a.id - b.id,
-  );
+  const messages = sortedMessages(detail.messages);
   const newest = messages[messages.length - 1];
   const newestId = newest?.id;
   const unread = messages.some((m) => !m.isRead);

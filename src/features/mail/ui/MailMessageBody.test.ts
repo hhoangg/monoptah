@@ -238,7 +238,8 @@ it("falls back to text for HTML-less mail and says so when empty", async () => {
   expect(frame()).toBeNull();
   expect(container.textContent).toContain("hello text");
   await render(message({ bodyHtml: null, bodyText: null }));
-  expect(container.textContent).toContain("no content");
+  expect(container.textContent).toContain("no readable content");
+  expect(container.textContent).toContain("View source");
 });
 
 it("renders plain text as text, not markup", async () => {

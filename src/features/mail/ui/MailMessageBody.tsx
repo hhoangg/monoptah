@@ -411,7 +411,8 @@ export function MailMessageBody({
           <PlainTextBody text={message.bodyText} />
         ) : (
           <p className="px-3 py-2 text-[12px] text-content/50">
-            This message has no content.
+            This message has no readable content. If it should have some, View
+            source shows what was stored.
           </p>
         )
       ) : (

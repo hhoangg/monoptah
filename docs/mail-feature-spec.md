@@ -1141,6 +1141,9 @@ mockup. There is no silent destructive default.
   `DeleteObjects` response) are reported and the corresponding local rows are
   kept.
 - `mail_attachment.local_path` files are removed on either path.
+- **Keyboard.** `e` archives the cursor's thread without the dialog, because the
+  Archive view undoes it and nothing is lost. `#` always opens the dialog; no key
+  deletes on S3.
 - **There is no "remember my choice", not even session-scoped.** The earlier text
   allowed a session cache; it is dropped. The control only ever exists to skip the
   typed gate, and a destructive choice remembered for a session is still a
