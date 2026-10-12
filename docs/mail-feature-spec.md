@@ -1038,8 +1038,25 @@ has nothing in the bucket to read, so the two reads are answered differently:
   and the sent row keeps them until it is deleted. A file is offered only while
   it exists at the size the message recorded; a same-length edit is not noticed.
   Nothing is copied into the per-message cache folder, because archiving a
-  thread clears that folder and this is not a cache. When the file is gone,
-  changed, or the outbox row was deleted, the click says which.
+  thread clears that folder and this is not a cache. The click refuses, and
+  says which, in four cases: the outbox row was deleted; the file is no longer
+  at its path; the file is there at a different size; or the row no longer lists
+  the file (also the answer when the listed files cannot be matched to the
+  stored ones).
+- *Which file is which* is decided by position, never by name or size, since two
+  attachments can share both. `build` writes the inline parts, then the files,
+  each in list order, and the parser numbers them in that order; so the message's
+  attachment rows by `part_index` pair up with the outbox list partitioned the
+  same way. Every pair is checked (the content id for an inline part, the name
+  as `mail_build::safe_filename` rewrote it for a file), and any disagreement
+  refuses rather than guesses. Positional matching was chosen over refusing on
+  ambiguity so a person with two same-named files can still open both.
+- *Containment is not enforced.* The path comes from the row and is returned
+  without a `starts_with(root)` test, because a picked file legitimately lives
+  anywhere on the person's disk. A tampered row can therefore make the app
+  reveal any path, and since `mail_attachment_bytes` reads that same path into
+  the webview for inline images, it can also make the app read any file the
+  user can. Accepted as a limit of a local database the user already controls.
 - *View source* says plainly that there is none. The raw MIME is built in
   memory and only the failed upload would have kept it; rebuilding it from the
   row would show something that was never sent.

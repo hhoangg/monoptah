@@ -340,15 +340,26 @@ fn release_staged(store: &SessionStore, dir: &std::path::Path, paths: &Releasabl
 /// there at the size the message recorded, and otherwise says which of the
 /// ways it can be gone applies. Size is a check, not proof: a file edited to
 /// the same length is not noticed.
+///
+/// Which listed file an attachment is comes from its position, never from its
+/// name or size: two files can share both, and a name-and-size match would
+/// then open the wrong one. `build` writes the inline parts and then the
+/// files, each in list order, and the parser numbers them in that order, so
+/// the stored rows sorted by `part_index` line up with the list partitioned
+/// the same way. That is an assumption about two pieces of code, so every pair
+/// is checked and a single disagreement refuses rather than guesses.
 pub(crate) fn unarchived_attachment(
     store: &SessionStore,
     message_id: i64,
     attachment: &mail_store::AttachmentRow,
 ) -> Result<std::path::PathBuf, String> {
     let name = &attachment.filename;
-    let row = {
+    let (row, stored) = {
         let conn = store.lock_conn()?;
-        mail_store::outbox_for_sent_message(&conn, message_id).map_err(db)?
+        (
+            mail_store::outbox_for_sent_message(&conn, message_id).map_err(db)?,
+            mail_store::attachments_of_message(&conn, message_id).map_err(db)?,
+        )
     };
     let refused =
         "This sent message was never archived to the bucket: its upload failed when it was sent.";
@@ -357,31 +368,48 @@ pub(crate) fn unarchived_attachment(
             "Monoptah has no copy of '{name}'. {refused} The outbox entry that kept its files was deleted."
         ));
     };
-    let wanted = attachment.content_id.as_deref();
-    let listed: Vec<&OutboxAttachment> = row
+    let unlisted = format!(
+        "Monoptah has no copy of '{name}'. {refused} Its outbox entry no longer lists the file."
+    );
+    // Must partition exactly as `mail_build::build` does, or the orders diverge.
+    let is_inline = |a: &&OutboxAttachment| a.cid.is_some();
+    let sent_order: Vec<&OutboxAttachment> = row
         .attachments
         .iter()
-        .filter(|a| match wanted {
-            Some(cid) => a.cid.as_deref().map(|c| c.trim_matches(['<', '>'])) == Some(cid),
-            None => a.cid.as_deref().is_none_or(str::is_empty) && a.filename == *name,
-        })
+        .filter(is_inline)
+        .chain(row.attachments.iter().filter(|a| !is_inline(a)))
         .collect();
-    let mut last = None;
-    for a in &listed {
-        match std::fs::metadata(&a.path) {
-            Ok(meta) if meta.is_file() && meta.len() as i64 == attachment.size_bytes => {
-                return Ok(std::path::PathBuf::from(&a.path));
-            }
-            Ok(meta) if meta.is_file() => {
-                last = Some(format!("has changed since it was sent: {}", a.path))
-            }
-            _ => last = Some(format!("is no longer at {}", a.path)),
+    if sent_order.len() != stored.len() {
+        return Err(unlisted);
+    }
+    for (listed, kept) in sent_order.iter().zip(&stored) {
+        let agrees = if is_inline(listed) {
+            listed.cid.as_deref().map(|c| c.trim_matches(['<', '>'])) == kept.content_id.as_deref()
+        } else {
+            kept.content_id.is_none()
+                && kept.filename == mail_build::safe_filename(&listed.filename)
+        };
+        if !agrees {
+            return Err(unlisted);
         }
     }
-    Err(match last {
-        Some(why) => format!("Monoptah has no copy of '{name}'. {refused} The file it was attached from {why}"),
-        None => format!("Monoptah has no copy of '{name}'. {refused} Its outbox entry no longer lists the file."),
-    })
+    let Some(at) = stored.iter().position(|s| s.id == attachment.id) else {
+        return Err(unlisted);
+    };
+    let listed = sent_order[at];
+    match std::fs::metadata(&listed.path) {
+        Ok(meta) if meta.is_file() && meta.len() as i64 == attachment.size_bytes => {
+            Ok(std::path::PathBuf::from(&listed.path))
+        }
+        Ok(meta) if meta.is_file() => Err(format!(
+            "Monoptah has no copy of '{name}'. {refused} The file it was attached from has changed since it was sent: {}",
+            listed.path
+        )),
+        _ => Err(format!(
+            "Monoptah has no copy of '{name}'. {refused} The file it was attached from is no longer at {}",
+            listed.path
+        )),
+    }
 }
 
 /// The staged files a row gives up when it is saved over or deleted. Empty for
@@ -2984,13 +3012,155 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn staged_with(
+        dir: &std::path::Path,
+        name: &str,
+        base64: &str,
+        cid: Option<&str>,
+    ) -> OutboxAttachment {
+        let mut file = staged(dir, name);
+        file.path = crate::fs::write_attachment_into(dir, name, base64).unwrap();
+        file.cid = cid.map(str::to_string);
+        file
+    }
+
+    /// Sends the files together with the bucket refusing the copy, then opens
+    /// every stored attachment. Each result is paired with the stored row.
+    fn open_all(
+        w: &World,
+        root: &std::path::Path,
+        files: &[OutboxAttachment],
+    ) -> Vec<(
+        mail_store::AttachmentRow,
+        Result<std::path::PathBuf, String>,
+    )> {
+        w.fake.deny_put.store(true, Ordering::SeqCst);
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = files.to_vec();
+        let message = send(w, d).unwrap().message_id.unwrap();
+        let rows = {
+            let conn = w.store.lock_conn().unwrap();
+            mail_store::attachments_of_message(&conn, message).unwrap()
+        };
+        assert_eq!(rows.len(), files.len(), "every attachment was stored");
+        rows.into_iter()
+            .map(|r| {
+                let opened = crate::mail::ensure_attachment(&w.store, &w.fake, root, r.id);
+                (r, opened)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_files_sharing_a_name_and_a_length_each_open_their_own() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        // "hello" and "world" are both five bytes, so size cannot tell them apart.
+        let first = staged_with(&dir, "a.png", "aGVsbG8=", None);
+        let second = staged_with(&dir, "a.png", "d29ybGQ=", None);
+        assert_ne!(first.path, second.path);
+        let opened = open_all(&w, &root, &[first.clone(), second.clone()]);
+        assert_eq!(
+            opened[0].1,
+            Ok(std::path::PathBuf::from(&first.path)),
+            "first chip"
+        );
+        assert_eq!(
+            opened[1].1,
+            Ok(std::path::PathBuf::from(&second.path)),
+            "second chip"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_deleted_file_is_never_answered_with_its_equal_length_neighbour() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        let first = staged_with(&dir, "a.png", "aGVsbG8=", None);
+        let second = staged_with(&dir, "a.png", "d29ybGQ=", None);
+        let files = [first.clone(), second.clone()];
+        w.fake.deny_put.store(true, Ordering::SeqCst);
+        let mut d = draft("owner@byptah.com", "ann@example.org");
+        d.attachments = files.to_vec();
+        let message = send(&w, d).unwrap().message_id.unwrap();
+        std::fs::remove_file(&first.path).unwrap();
+        let rows = {
+            let conn = w.store.lock_conn().unwrap();
+            mail_store::attachments_of_message(&conn, message).unwrap()
+        };
+        let one = crate::mail::ensure_attachment(&w.store, &w.fake, &root, rows[0].id);
+        assert!(
+            one.as_ref().is_err_and(|why| why.contains("no longer at")),
+            "first chip must say its file is gone, got {one:?}"
+        );
+        let two = crate::mail::ensure_attachment(&w.store, &w.fake, &root, rows[1].id);
+        assert_eq!(
+            two,
+            Ok(std::path::PathBuf::from(&second.path)),
+            "second chip"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn position_survives_inline_images_files_and_a_shared_cid_mixed_in_one_message() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        // Listed order interleaves the two partitions; the message holds the
+        // inline parts first. Equal lengths and repeated names throughout.
+        let files = [
+            staged_with(&dir, "a.png", "aGVsbG8=", None),
+            staged_with(&dir, "a.png", "d29ybGQ=", Some("one@x")),
+            staged_with(&dir, "b.png", "MTIzNDU=", None),
+            staged_with(&dir, "a.png", "YWJjZGU=", Some("two@x")),
+            staged_with(&dir, "a.png", "ZmdoaWo=", None),
+        ];
+        let opened = open_all(&w, &root, &files);
+        assert_eq!(opened.len(), 5);
+        // Inline first (list order), then files (list order).
+        let expected = [1usize, 3, 0, 2, 4];
+        for ((row, got), want) in opened.iter().zip(expected) {
+            assert_eq!(
+                got,
+                &Ok(std::path::PathBuf::from(&files[want].path)),
+                "stored attachment {} (cid {:?}) should be listed file {want}",
+                row.part_index,
+                row.content_id
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_filename_the_build_rewrites_still_finds_its_file() {
+        let w = world();
+        let root = scratch();
+        let dir = staging_dir(&root);
+        let mut file = staged_with(&dir, "env", "aGVsbG8=", None);
+        file.filename = ".env".into();
+        let opened = open_all(&w, &root, &[file.clone()]);
+        assert_eq!(
+            opened[0].0.filename, "env",
+            "the stored name is the rewritten one"
+        );
+        assert_eq!(opened[0].1, Ok(std::path::PathBuf::from(&file.path)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn the_source_of_a_refused_sent_copy_is_declined_in_words_and_an_archived_one_is_unchanged() {
         let w = world();
         let root = scratch();
         let file = staged(&staging_dir(&root), "a.png");
         let (refused, _) = send_with(&w, &file, true);
-        let reason = crate::mail::raw_message(&w.store, &w.fake, refused).unwrap_err();
+        let reason = match crate::mail::raw_message(&w.store, &w.fake, refused) {
+            Err(reason) => reason,
+            Ok(raw) => panic!("a refused copy must have no source, got {raw:?}"),
+        };
         assert!(
             reason.contains("never archived") && reason.contains("no other copy"),
             "{reason}"
@@ -3050,7 +3220,11 @@ mod tests {
             ),
             0
         );
-        assert_eq!(std::fs::read(&file.path).unwrap(), b"hello");
+        assert_eq!(
+            std::fs::read(&file.path).ok().as_deref(),
+            Some(&b"hello"[..]),
+            "the unconfirmed row's staged file is its only copy"
+        );
         // A later send of the same file whose copy the bucket refused: reading
         // it, then deleting that sent row, must not take the unconfirmed row's
         // only copy with it.
@@ -3059,7 +3233,11 @@ mod tests {
         assert!(open(&w, &root, message).is_ok());
         let sent_row = count(&w, "SELECT id FROM mail_outbox WHERE state = 'sent'");
         outbox_delete_releasing(&w.store, &staging_dir(&root), sent_row).unwrap();
-        assert_eq!(std::fs::read(&file.path).unwrap(), b"hello");
+        assert_eq!(
+            std::fs::read(&file.path).ok().as_deref(),
+            Some(&b"hello"[..]),
+            "deleting the sent row must not take the unconfirmed row's only copy"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

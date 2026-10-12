@@ -2467,6 +2467,18 @@ pub(crate) fn message_location(
     .optional()
 }
 
+/// Every attachment row of one message, in the order the parser numbered them.
+pub(crate) fn attachments_of_message(
+    conn: &Connection,
+    message_id: i64,
+) -> rusqlite::Result<Vec<AttachmentRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "{ATTACHMENT_SELECT} WHERE message_id = ?1 ORDER BY part_index"
+    ))?;
+    let rows = stmt.query_map(params![message_id], attachment_from_row)?;
+    rows.collect()
+}
+
 /// An attachment and the path it was saved to, if it was.
 pub(crate) fn get_attachment(
     conn: &Connection,
