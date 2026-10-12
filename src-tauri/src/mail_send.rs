@@ -259,8 +259,25 @@ fn file_key(path: &std::path::Path) -> Option<String> {
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
             return Some(format!("{}:{}", meta.dev(), meta.ino()));
         }
+        Some(path.to_string_lossy().into_owned())
     }
-    Some(path.to_string_lossy().into_owned())
+    #[cfg(not(unix))]
+    {
+        // No stable file id on Windows. Resolving the file itself asks the
+        // volume for its real name (case, 8.3 short names); a symlink is kept
+        // as its own path so it is never confused with its target. Folding
+        // case then over-matches on the rare case-sensitive directory, and a
+        // false match only keeps a file, whereas a miss deletes one in use.
+        let is_link = std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let real = if is_link {
+            path
+        } else {
+            path.canonicalize().unwrap_or(path)
+        };
+        Some(real.to_string_lossy().to_lowercase())
+    }
 }
 
 /// Deletes staged files nothing refers to any more. Containment and "still
