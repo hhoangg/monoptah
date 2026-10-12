@@ -218,17 +218,21 @@ export function Toggle({
   on,
   onChange,
   disabled = false,
+  describedBy,
 }: {
   label: string;
   on: boolean;
   onChange: (on: boolean) => void;
   disabled?: boolean;
+  /** Id of text that explains the state, e.g. why the switch is disabled. */
+  describedBy?: string;
 }) {
   return (
     <button
       type="button"
       role="switch"
       aria-label={label}
+      aria-describedby={describedBy}
       aria-checked={on}
       disabled={disabled}
       onClick={() => {

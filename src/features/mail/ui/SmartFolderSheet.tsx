@@ -103,53 +103,63 @@ function TokenInput({
 }) {
   const full = values.length >= MAX_LIST_VALUES;
   const [draft, setDraft] = useState("");
+  const token = draft.trim();
+  const refused = full && token !== "";
   const commit = () => {
-    const token = draft.trim();
+    // Kept, not cleared: a token the list has no room for would otherwise
+    // vanish with nothing said.
+    if (refused) return;
     setDraft("");
-    if (token !== "" && !full && !values.includes(token))
-      onChange([...values, token]);
+    if (token !== "" && !values.includes(token)) onChange([...values, token]);
   };
   return (
-    <div className="flex min-h-7 min-w-0 flex-wrap items-center gap-1 rounded-md border border-content/10 px-1.5 py-0.5 focus-within:border-accent/50">
-      {values.map((value) => (
-        <span
-          key={value}
-          className="flex items-center gap-1 rounded-full border border-content/10 bg-content/5 px-1.5 text-[11px] text-content/80"
-        >
-          {value}
-          <button
-            type="button"
-            aria-label={`Remove ${value}`}
-            onClick={() => onChange(values.filter((v) => v !== value))}
-            className="text-content/50 hover:text-content"
+    <>
+      <div className="flex min-h-7 min-w-0 flex-wrap items-center gap-1 rounded-md border border-content/10 px-1.5 py-0.5 focus-within:border-accent/50">
+        {values.map((value) => (
+          <span
+            key={value}
+            className="flex items-center gap-1 rounded-full border border-content/10 bg-content/5 px-1.5 text-[11px] text-content/80"
           >
-            <X className="size-2.5" strokeWidth={2} />
-          </button>
-        </span>
-      ))}
-      <input
-        aria-label={label}
-        value={draft}
-        placeholder={
-          full
-            ? `At most ${MAX_LIST_VALUES} values`
-            : values.length === 0
-              ? "Type, then Enter"
-              : ""
-        }
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === ",") {
-            e.preventDefault();
-            commit();
-          } else if (e.key === "Backspace" && draft === "") {
-            onChange(values.slice(0, -1));
+            {value}
+            <button
+              type="button"
+              aria-label={`Remove ${value}`}
+              onClick={() => onChange(values.filter((v) => v !== value))}
+              className="text-content/50 hover:text-content"
+            >
+              <X className="size-2.5" strokeWidth={2} />
+            </button>
+          </span>
+        ))}
+        <input
+          aria-label={label}
+          value={draft}
+          placeholder={
+            full
+              ? `At most ${MAX_LIST_VALUES} values`
+              : values.length === 0
+                ? "Type, then Enter"
+                : ""
           }
-        }}
-        className="h-5 min-w-16 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/35"
-      />
-    </div>
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === ",") {
+              e.preventDefault();
+              commit();
+            } else if (e.key === "Backspace" && draft === "") {
+              onChange(values.slice(0, -1));
+            }
+          }}
+          className="h-5 min-w-16 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/35"
+        />
+      </div>
+      {refused ? (
+        <p role="status" className="text-[11px] text-red-400/90">
+          At most {MAX_LIST_VALUES} values. Remove one to add this.
+        </p>
+      ) : null}
+    </>
   );
 }
 
@@ -576,6 +586,7 @@ export function SmartFolderSheet({
               label="Hide matches from All mail and mailboxes"
               on={hide && !hideBlocked}
               disabled={hideBlocked}
+              describedBy={hideBlocked ? "hide-blocked-reason" : undefined}
               onChange={setHide}
             />
           </div>

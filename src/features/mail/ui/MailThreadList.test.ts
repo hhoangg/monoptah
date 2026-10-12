@@ -419,8 +419,9 @@ describe("search box and chips", () => {
     await typeInto(box(), "invoice is:unre");
     await pause();
     expect(calls()).toBe(2);
-    expect(container.querySelector("[role='status']")?.textContent).toContain(
-      "is:unre",
+    // Exact, so a missing full stop cannot hide inside a substring match.
+    expect(container.querySelector("[role='status']")?.textContent).toBe(
+      "Unknown filter is:unre.",
     );
     await typeInto(box(), "invoice is:starred");
     await pause();
@@ -436,8 +437,9 @@ describe("search box and chips", () => {
     await typeInto(box(), "is:unre");
     await pause();
     expect(calls()).toBe(1);
-    expect(container.querySelector("[role='status']")?.textContent).toContain(
-      "No filter is applied.",
+    // The two sentences must not run together: "is:unre No filter...".
+    expect(container.querySelector("[role='status']")?.textContent).toBe(
+      "Unknown filter is:unre. No filter is applied.",
     );
   });
 

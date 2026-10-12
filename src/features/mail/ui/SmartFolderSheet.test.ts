@@ -305,3 +305,61 @@ it("stops adding conditions at the backend cap", async () => {
   });
   expect(button("Add condition").disabled).toBe(true);
 });
+
+it("ties the disabled switch to the reason it is disabled", async () => {
+  await open({
+    folder: savedFolder({
+      hideFromMailbox: true,
+      rules: [rule("date", "within_days", "7")],
+    }),
+  });
+  const id = toggle().getAttribute("aria-describedby");
+  expect(id).toBe("hide-blocked-reason");
+  expect(document.getElementById(id!)?.textContent).toContain(
+    "Not available with a",
+  );
+});
+
+it("does not describe the switch by a reason that is not shown", async () => {
+  await open({ folder: savedFolder() });
+  expect(toggle().hasAttribute("aria-describedby")).toBe(false);
+});
+
+const hundred = Array.from({ length: 100 }, (_, i) => `v${i}@x.com`);
+const pressEnter = (el: HTMLInputElement) =>
+  act(async () => {
+    el.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+    );
+  });
+
+it("keeps the token it could not add once the list is full, and says so", async () => {
+  await open({
+    folder: savedFolder({ rules: [rule("from", "contains_any", hundred)] }),
+  });
+  const input = field("From value");
+  await typeInto(input, "extra@x.com");
+  await pressEnter(input);
+  expect(input.value).toBe("extra@x.com");
+  expect(document.body.textContent).toContain("At most 100 values");
+  expect(
+    document.body.querySelectorAll(
+      "[aria-label^='Remove '][aria-label$='@x.com']",
+    ),
+  ).toHaveLength(100);
+});
+
+it("still clears the draft after adding below the limit", async () => {
+  await open({
+    folder: savedFolder({ rules: [rule("from", "contains_any", ["a@x.com"])] }),
+  });
+  const input = field("From value");
+  await typeInto(input, "b@x.com");
+  await pressEnter(input);
+  expect(input.value).toBe("");
+  expect(
+    document.body.querySelectorAll(
+      "[aria-label^='Remove '][aria-label$='@x.com']",
+    ),
+  ).toHaveLength(2);
+});

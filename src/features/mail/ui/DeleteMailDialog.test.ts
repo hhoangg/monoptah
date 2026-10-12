@@ -38,13 +38,13 @@ afterEach(() => {
   container.remove();
 });
 
-const render = async () => {
+const render = async (messageCount = 4) => {
   await act(async () => {
     root.render(
       createElement(DeleteMailDialog, {
         threadIds: [5],
         subject: "Order #1182",
-        messageCount: 4,
+        messageCount,
         mailbox: "owner@a.com",
         onClose,
         onDone,
@@ -192,4 +192,36 @@ it("shows the error when the command itself fails, and does not close", async ()
   expect(onClose).not.toHaveBeenCalled();
   expect(onDone).not.toHaveBeenCalled();
   expect(document.body.textContent).toContain("MissingContentMD5");
+});
+
+it("says 'message', not 'messages', for a one-message thread", async () => {
+  await render(1);
+  const text = document.body.textContent ?? "";
+  expect(text).toContain(
+    "removes the message from Monoptah (1 in this thread)",
+  );
+  expect(text).not.toContain("the messages from Monoptah (1");
+});
+
+it("keeps 'messages' for a longer thread", async () => {
+  await render(4);
+  expect(document.body.textContent).toContain(
+    "removes the messages from Monoptah (4 in this thread)",
+  );
+});
+
+it("announces the files-left sentence, not only the count deleted", async () => {
+  vi.mocked(invoke).mockResolvedValue({
+    ...clean,
+    filesLeft: 2,
+  } satisfies DeleteReport);
+  await render();
+  await act(async () => radio(1).click());
+  await type("delete");
+  await act(async () => confirm().click());
+  const alerts = document.body.querySelectorAll('[role="alert"]');
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]!.textContent).toContain(
+    "could not be removed from this computer",
+  );
 });

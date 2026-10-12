@@ -337,7 +337,7 @@ export function buildRule(
     case "before":
       return isIsoDate(value)
         ? rule("date", key, value)
-        : { error: `Use a date like 2025-01-31 for ${key}:` };
+        : { error: `Use a date like 2025-01-31 for ${key}:${value}` };
   }
 }
 

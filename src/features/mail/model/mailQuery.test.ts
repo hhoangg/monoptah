@@ -202,6 +202,12 @@ describe("parsing", () => {
     expect(parseQuery("before:yesterday").errors).toHaveLength(1);
   });
 
+  it("names the bad date, so the sentence it ends does not read 'before:.'", () => {
+    expect(parseQuery("before:yesterday").errors[0]).toBe(
+      "Use a date like 2025-01-31 for before:yesterday",
+    );
+  });
+
   it("reads an unterminated quote as the phrase so far", () => {
     expect(parseQuery('"order ref').rules).toEqual([
       rule("body", "contains", "order ref"),

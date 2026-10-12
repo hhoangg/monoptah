@@ -107,6 +107,9 @@ export type ListBase =
   | { kind: "folder"; folderId: number }
   | { kind: "archived" };
 
+/** Parse errors carry no final punctuation, so a second sentence would run on. */
+const asSentence = (text: string) => (/[.!?]$/.test(text) ? text : `${text}.`);
+
 function useDebounced<T>(value: T, ms: number): T {
   const [settled, setSettled] = useState(value);
   useEffect(() => {
@@ -304,8 +307,8 @@ export function useMailThreadList(base: ListBase | null) {
     /** Why the box's current text is not (fully) applied, or null. */
     queryError: applied.errors[0]
       ? filterRules.length > 0
-        ? applied.errors[0]
-        : `${applied.errors[0]} No filter is applied.`
+        ? asSentence(applied.errors[0])
+        : `${asSentence(applied.errors[0])} No filter is applied.`
       : null,
     filtering: filterRules.length > 0,
     hasInput:

@@ -85,8 +85,13 @@ export function DeleteMailDialog({
         size="sm"
         onClose={onClose}
       >
-        <div className="flex flex-col gap-2 px-4 py-3 text-[12px] text-content/70">
-          <p role="alert">
+        {/* The alert is the whole body: its files-left sentence is the part a
+            screen-reader user cannot see go wrong. */}
+        <div
+          role="alert"
+          className="flex flex-col gap-2 px-4 py-3 text-[12px] text-content/70"
+        >
+          <p>
             {partial.removed} deleted.
             {partial.kept > 0
               ? ` ${partial.kept} could not be deleted from S3, so ${
@@ -181,11 +186,12 @@ export function DeleteMailDialog({
               </span>
               <span className="text-[11.5px] leading-snug text-content/50">
                 Deletes the S3 object of each message that has one, and removes
-                the messages from Monoptah ({messageCount} in this {noun}). A
-                message sent from Monoptah has no S3 object and is only removed
-                here. This cannot be undone: the S3 object is the only copy of
-                the original message unless versioning is turned on for the
-                bucket, which Monoptah cannot check.
+                the {messageCount === 1 ? "message" : "messages"} from Monoptah
+                ({messageCount} in this {noun}). A message sent from Monoptah
+                has no S3 object and is only removed here. This cannot be
+                undone: the S3 object is the only copy of the original message
+                unless versioning is turned on for the bucket, which Monoptah
+                cannot check.
               </span>
             </span>
           </label>
