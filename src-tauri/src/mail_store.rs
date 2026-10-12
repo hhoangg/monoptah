@@ -1584,6 +1584,19 @@ pub(crate) fn set_object_outcome(
     Ok(())
 }
 
+/// Written before a parse starts, so a parse that never returns still counts.
+pub(crate) fn record_parse_attempt(
+    conn: &Connection,
+    id: i64,
+    parse_attempts: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mail_object SET parse_attempts = ?2 WHERE id = ?1",
+        params![id, parse_attempts],
+    )?;
+    Ok(())
+}
+
 /// `(message id, thread id)` of the message parsed from this object.
 pub(crate) fn message_for_object(
     conn: &Connection,

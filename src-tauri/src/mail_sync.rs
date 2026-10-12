@@ -483,10 +483,22 @@ fn sync_mailbox(
         // Parsing is CPU-bound and the input is a stranger's bytes, so it runs
         // before the app-wide store lock is taken: a slow message may delay
         // this sync but never sessions, notes or chat.
-        let parsed: Vec<(&Work, Result<ParsedMail, String>)> = fetched
-            .iter()
-            .map(|(item, raw)| (*item, parse_for_sync(store, raw)))
-            .collect();
+        let mut parsed: Vec<(&Work, Result<ParsedMail, String>)> =
+            Vec::with_capacity(fetched.len());
+        for (item, raw) in &fetched {
+            // The attempt is written first, in its own short lock. A parse that
+            // never returns (ammonia or the MIME parser stuck on hostile input)
+            // would otherwise leave `parse_attempts` untouched, and the object
+            // would be tried again at every launch for ever. Per object, not
+            // per page, so a page-mate is not charged for another's hang. A
+            // success resets it, so a good parse is never counted unreadable.
+            {
+                let conn = store.lock_conn()?;
+                mail_store::record_parse_attempt(&conn, item.object_id, item.attempts + 1)
+                    .map_err(db)?;
+            }
+            parsed.push((*item, parse_for_sync(store, raw)));
+        }
         // One page commits as one unit, so a crash leaves no half-threaded
         // message. Counts join the total only once the commit has happened.
         let mut page_counts = Counts::default();
@@ -541,6 +553,8 @@ fn reconcile_ledger(
         };
         let changed = row.etag.as_deref() != Some(o.etag.as_str());
         let has_message = mail_store::message_for_object(conn, row.id)?.is_some();
+        // New content has not failed anything yet.
+        let attempts = if changed { 0 } else { row.parse_attempts };
         match row.state.as_str() {
             "gone" => {
                 // The user's `archived` is never touched here, only `gone`.
@@ -550,7 +564,7 @@ fn reconcile_ledger(
                 let state = if has_message { "parsed" } else { "pending" };
                 mail_store::touch_object(conn, row.id, &entry, sync_start, state)?;
                 if changed || !has_message {
-                    work.push(job(row.id, has_message, row.parse_attempts));
+                    push_or_give_up(conn, &mut work, job(row.id, has_message, attempts))?;
                 }
             }
             "deleted" => {
@@ -575,11 +589,30 @@ fn reconcile_ledger(
             }
             _ => {
                 mail_store::touch_object(conn, row.id, &entry, sync_start, "pending")?;
-                work.push(job(row.id, has_message, row.parse_attempts));
+                push_or_give_up(conn, &mut work, job(row.id, has_message, attempts))?;
             }
         }
     }
     Ok((work, revived))
+}
+
+/// An object that is not yet parsed and has used up its attempts without ever
+/// finishing one: the parse never returned, so nothing set it to `error`. It is
+/// marked unreadable now, which is what the footer counts, and left alone. A
+/// changed object resets the count elsewhere, so new content is tried again.
+fn push_or_give_up(conn: &Connection, work: &mut Vec<Work>, item: Work) -> rusqlite::Result<()> {
+    if item.attempts >= MAX_PARSE_ATTEMPTS && !item.reparse {
+        let note = "Reading this message did not finish.";
+        return mail_store::set_object_outcome(
+            conn,
+            item.object_id,
+            "error",
+            Some(note),
+            item.attempts,
+        );
+    }
+    work.push(item);
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -1701,6 +1734,137 @@ mod tests {
             f.scalar("SELECT parse_attempts FROM mail_object WHERE state='error'"),
             1
         );
+    }
+
+    /// A parse that never returns, as a panic: the process is gone either way,
+    /// and what is left is only what was written before it started.
+    fn sync_and_die_in_the_parser(f: &Fixture, mailbox: &MailMailbox, s3: &Arc<MockS3>) {
+        PARSE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_| panic!("parser never returned")));
+        });
+        let client = MockClient(s3.clone());
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sync_mailbox(
+                &f.store,
+                &client,
+                mailbox,
+                &Recorder::default(),
+                &mut Counts::default(),
+            );
+        }));
+        PARSE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(died.is_err());
+    }
+
+    #[test]
+    fn a_parse_that_never_returns_still_counts_toward_giving_up() {
+        let f = Fixture::new();
+        let (account, mailbox, s3) = one_source(&f);
+        s3.put("owner/1", "e1", "stands in for the message that hangs");
+        s3.put("owner/2", "e2", &mime("m2", "Fine", "no trouble"));
+        let mailbox = {
+            let conn = f.store.lock_conn().unwrap();
+            mail_store::list_mailboxes(&conn, Some(account))
+                .unwrap()
+                .into_iter()
+                .find(|m| m.id == mailbox)
+                .unwrap()
+        };
+        let attempts = |f: &Fixture| {
+            f.scalar("SELECT parse_attempts FROM mail_object WHERE s3_key = 'owner/1'")
+        };
+        // The attempt is on disk while the parse is still running.
+        let seen = std::rc::Rc::new(std::cell::Cell::new(-1));
+        let during = seen.clone();
+        PARSE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |store| {
+                let conn = store.lock_conn().unwrap();
+                let n: i64 = conn
+                    .query_row(
+                        "SELECT parse_attempts FROM mail_object WHERE s3_key = 'owner/1'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                during.set(n);
+                drop(conn);
+                panic!("parser never returned");
+            }));
+        });
+        let client = MockClient(s3.clone());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sync_mailbox(
+                &f.store,
+                &client,
+                &mailbox,
+                &Recorder::default(),
+                &mut Counts::default(),
+            );
+        }));
+        PARSE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(seen.get(), 1, "the attempt was not written before parsing");
+        assert_eq!(attempts(&f), 1);
+
+        // Each launch dies in the same place and uses one more attempt.
+        for launch in 2..=MAX_PARSE_ATTEMPTS {
+            sync_and_die_in_the_parser(&f, &mailbox, &s3);
+            assert_eq!(attempts(&f), launch);
+        }
+        // Out of attempts: the next launch does not parse it at all, and says so.
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = calls.clone();
+        PARSE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| counted.set(counted.get() + 1)));
+        });
+        let mut counts = Counts::default();
+        sync_mailbox(
+            &f.store,
+            &client,
+            &mailbox,
+            &Recorder::default(),
+            &mut counts,
+        )
+        .unwrap();
+        PARSE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(calls.get(), 1, "only the readable message was parsed");
+        assert_eq!(counts.inserted, 1);
+        let status = crate::mail::status(&f.store, 3600).unwrap();
+        assert_eq!(status.unreadable_total, 1);
+        // A later sync leaves it alone too.
+        assert_eq!(f.sync(&[(account, &s3)])[0].failed, 0);
+        assert_eq!(attempts(&f), MAX_PARSE_ATTEMPTS);
+        // New content for the same key is tried afresh.
+        s3.put("owner/1", "e3", &mime("m1", "Fixed", "now readable"));
+        assert_eq!(f.sync(&[(account, &s3)])[0].inserted, 1);
+        assert_eq!(attempts(&f), 0);
+        assert_eq!(
+            crate::mail::status(&f.store, 3600)
+                .unwrap()
+                .unreadable_total,
+            0
+        );
+    }
+
+    #[test]
+    fn a_parse_that_returns_is_not_counted_unreadable() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Fine", "no trouble"));
+        for _ in 0..(MAX_PARSE_ATTEMPTS + 1) {
+            f.sync(&[(account, &s3)]);
+            s3.put("owner/1", "e1", &mime("m1", "Fine", "no trouble"));
+        }
+        assert_eq!(f.scalar("SELECT parse_attempts FROM mail_object"), 0);
+        assert_eq!(
+            crate::mail::status(&f.store, 3600)
+                .unwrap()
+                .unreadable_total,
+            0
+        );
+        // The attempt written first is reset by the success, not left behind.
+        s3.put("owner/1", "e2", &mime("m1", "Fine", "edited"));
+        f.sync(&[(account, &s3)]);
+        assert_eq!(f.scalar("SELECT parse_attempts FROM mail_object"), 0);
     }
 
     #[test]
