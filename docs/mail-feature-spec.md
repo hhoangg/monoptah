@@ -127,7 +127,7 @@ npm install @tiptap/react @tiptap/pm @tiptap/starter-kit @tiptap/extension-image
 | `@tiptap/starter-kit` | In v3 this bundles **Link** and **Underline** (both new in v3), plus Bold, Italic, Strike, Code, Blockquote, BulletList, OrderedList, ListItem, ListKeymap, CodeBlock, HardBreak, Heading, HorizontalRule, Paragraph, Text, Document, Dropcursor, Gapcursor, **Undo/Redo** and TrailingNode. Every button in the composer toolbar is covered by it — no separate extension packages, and no history extension to wire up. |
 | `@tiptap/extension-image` | The one thing StarterKit does not carry: inline images pasted or dropped into a draft, which become `cid:` parts on send. |
 
-All current at `3.31.x`, all MIT. They are pinned to the same minor with `~3.31.4` in `package.json`: TipTap's packages
+All current at `3.31.x`, all MIT. Pin them to the same minor (`~3.31.4` in `package.json`): TipTap's packages
 peer-depend on each other at an *exact* version, so a mixed set fails to
 resolve. React 19 is in `@tiptap/react`'s peer range
 (`^17.0.0 || ^18.0.0 || ^19.0.0`).
@@ -856,8 +856,7 @@ suspicious, and it is what the keyboard-driven reader will mostly use.
 
 A "View raw source" action re-fetches the object from S3 and shows it in a plain
 `<pre>` — no new dependency, and it makes the sample
-`Received:`/`DKIM-Signature` wall inspectable. A CodeMirror viewer would add
-highlighting nobody needs for RFC 822 and a second editor surface to size.
+`Received:`/`DKIM-Signature` wall inspectable.
 
 ---
 
