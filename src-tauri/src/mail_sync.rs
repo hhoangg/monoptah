@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -85,6 +85,9 @@ pub(crate) trait ClientFactory: Send + Sync {
 pub(crate) struct SyncService {
     locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     interval_secs: AtomicU64,
+    /// The webview owns the Mail on/off setting. Starts false and stays false
+    /// until the webview says otherwise: see `set_enabled`.
+    enabled: AtomicBool,
 }
 
 enum Scope {
@@ -122,6 +125,7 @@ impl Default for SyncService {
         Self {
             locks: Mutex::new(HashMap::new()),
             interval_secs: AtomicU64::new(DEFAULT_INTERVAL_SECS),
+            enabled: AtomicBool::new(false),
         }
     }
 }
@@ -136,6 +140,26 @@ impl SyncService {
             secs.clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS),
             Ordering::Relaxed,
         );
+    }
+
+    /// Switches the background work (the due-sync scheduler and the daily
+    /// identity refresh) on or off.
+    ///
+    /// The default is OFF and the webview pushes the stored value at startup.
+    /// The loops sleep a minute before their first look, so the push normally
+    /// lands first; and if it is late or never comes, an off user's buckets are
+    /// still never read. The opposite default would leave exactly that window.
+    /// A user turning Mail on waits at most one scheduler tick for the first
+    /// sync, which is cheap next to ever reading an off user's bucket.
+    ///
+    /// Commands the user starts themselves (`sync_now`, source test) are not
+    /// background work and are not gated: Mail off hides their buttons.
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
     }
 
     pub(crate) fn interval_secs(&self) -> u64 {
@@ -161,6 +185,9 @@ impl SyncService {
         events: &dyn SyncEvents,
         now_ms: i64,
     ) -> Vec<SyncReport> {
+        if !self.enabled() {
+            return Vec::new();
+        }
         self.run(store, factory, events, Scope::Due { now_ms })
     }
 
@@ -938,9 +965,13 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            // The service starts off in production; these tests are about what
+            // a running sync does, so they start from Mail on.
+            let service = SyncService::default();
+            service.set_enabled(true);
             Self {
                 store: SessionStore::open_in_memory().unwrap(),
-                service: SyncService::default(),
+                service,
                 log: Log::default(),
             }
         }
@@ -1585,6 +1616,31 @@ mod tests {
         assert_eq!(f.service.sync_due(&f.store, &factory, &ev, later).len(), 1);
         f.service.set_interval_secs(1);
         assert_eq!(f.service.interval_secs(), MIN_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn a_due_sync_reads_no_bucket_while_mail_is_off() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        let factory = MockFactory(HashMap::from([(account, s3.clone())]));
+        let ev = Recorder::default();
+        let now = now_millis();
+
+        // A service nobody has told anything starts off: nothing is due to it.
+        let fresh = SyncService::default();
+        assert!(!fresh.enabled());
+        assert!(fresh.sync_due(&f.store, &factory, &ev, now).is_empty());
+
+        f.service.set_enabled(false);
+        assert!(f.service.sync_due(&f.store, &factory, &ev, now).is_empty());
+        assert!(f.log.lock().unwrap().is_empty(), "S3 was called while off");
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM mail_message"), 0);
+
+        // Turning it back on picks the mailbox up at the next tick.
+        f.service.set_enabled(true);
+        assert_eq!(f.service.sync_due(&f.store, &factory, &ev, now).len(), 1);
+        assert!(!f.log.lock().unwrap().is_empty());
     }
 
     #[test]

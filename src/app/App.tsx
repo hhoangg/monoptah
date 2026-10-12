@@ -756,7 +756,10 @@ import {
   type SettingsSectionId,
   type FollowUpBehavior,
 } from "../features/settings/model/settings";
-import { mailSyncIntervalSet } from "../features/mail/model/mail";
+import {
+  mailSetEnabled,
+  mailSyncIntervalSet,
+} from "../features/mail/model/mail";
 import { syncIntervalSeconds } from "../features/mail/model/mailPrefs";
 import { useMailUnread } from "../features/mail/model/useMailUnread";
 import {
@@ -1590,7 +1593,15 @@ function Workspace({
 
   // Rust cannot read localStorage; without this push the scheduler keeps its
   // 3600s default whatever the user chose. Settings pushes on later changes.
+  //
+  // The enabled flag goes first and on mount only. Rust starts with Mail off
+  // and its loops wait a minute before their first look, so this push lands
+  // before any bucket would be read; if it never lands, Mail stays off, which
+  // is the safe side. Later changes are pushed by `saveMailEnabled`.
   useEffect(() => {
+    mailSetEnabled(loadMailEnabled()).catch((error: unknown) =>
+      console.warn("mail enabled push failed", error),
+    );
     mailSyncIntervalSet(syncIntervalSeconds.load()).catch((error: unknown) =>
       console.warn("mail sync interval push failed", error),
     );
@@ -2713,11 +2724,7 @@ function Workspace({
 
       // A terminal session's saved conversation belongs to its account, so a
       // switch opens a clean session instead of re-pointing the running one.
-      if (
-        active.blocks.length === 0 &&
-        !active.busy &&
-        !isTuiSession(active)
-      ) {
+      if (active.blocks.length === 0 && !active.busy && !isTuiSession(active)) {
         setSessions((current) =>
           current.map((session) =>
             session.id === active.id
@@ -8483,8 +8490,7 @@ function Workspace({
   // never report again, so it is a cancelled run.
   useEffect(() => {
     for (const sessionId of [...tuiAutomationRuns.current.keys()]) {
-      if (sessionsRef.current.some((entry) => entry.id === sessionId))
-        continue;
+      if (sessionsRef.current.some((entry) => entry.id === sessionId)) continue;
       settleTuiRun(
         sessionId,
         "cancelled",

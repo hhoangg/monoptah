@@ -14,6 +14,7 @@ import {
   shortcutTokens,
 } from "../../quick-composer/model/quickComposerShortcut";
 import { readFlag, writeFlag } from "./storageFlags";
+import { mailSetEnabled } from "../../mail/model/mail";
 
 const SECTION_KEY = "monocode.settingsSection";
 
@@ -873,12 +874,19 @@ export function loadMailEnabled(): boolean {
   return readFlag(MAIL_ENABLED_KEY) ?? MAIL_ENABLED_DEFAULT;
 }
 
-export function saveMailEnabled(value: boolean) {
+/**
+ * Rejects when Rust could not be told. The flag is already saved by then, so a
+ * caller that shows the failure matters most when turning Mail off: the sync
+ * would keep running behind a switch that reads off.
+ */
+export function saveMailEnabled(value: boolean): Promise<void> {
   writeFlag(MAIL_ENABLED_KEY, value);
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(
-    new CustomEvent<boolean>(MAIL_ENABLED_CHANGE_EVENT, { detail: value }),
-  );
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(
+      new CustomEvent<boolean>(MAIL_ENABLED_CHANGE_EVENT, { detail: value }),
+    );
+  }
+  return mailSetEnabled(value);
 }
 
 export function subscribeMailEnabled(onStoreChange: () => void) {

@@ -25,6 +25,7 @@ describe("mail command wrappers", () => {
       "mail_sync_interval_set",
       { secs: 900 },
     ],
+    [() => mail.mailSetEnabled(false), "mail_set_enabled", { enabled: false }],
     [() => mail.mailIdentities(), "mail_identities", { accountId: null }],
     [() => mail.mailThread(9), "mail_thread", { threadId: 9 }],
     [

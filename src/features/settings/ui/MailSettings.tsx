@@ -87,6 +87,7 @@ export function MailSettings() {
   });
   const [loadError, setLoadError] = useState<string | null>(null);
   const [intervalError, setIntervalError] = useState<string | null>(null);
+  const [enabledError, setEnabledError] = useState<string | null>(null);
   const [addingSource, setAddingSource] = useState(false);
   const [version, setVersion] = useState(0);
   const refresh = useCallback(() => setVersion((v) => v + 1), []);
@@ -157,6 +158,17 @@ export function MailSettings() {
     refresh();
   };
 
+  const changeEnabled = (value: boolean) => {
+    setEnabledError(null);
+    saveMailEnabled(value).catch((err) =>
+      setEnabledError(
+        value
+          ? errorMessage(err)
+          : `Mail is hidden, but Monoptah could not stop the background sync: ${errorMessage(err)}`,
+      ),
+    );
+  };
+
   const changeInterval = (secs: number) => {
     syncIntervalSeconds.save(secs);
     setIntervalError(null);
@@ -181,7 +193,15 @@ export function MailSettings() {
           label="Enable Mail"
           description="Show Mail in the sidebar. Off removes it and stops the background sync."
         >
-          <Toggle label="Enable Mail" on={enabled} onChange={saveMailEnabled} />
+          <Toggle label="Enable Mail" on={enabled} onChange={changeEnabled} />
+          {enabledError ? (
+            <p
+              role="alert"
+              className="basis-full text-right text-[12px] text-red-400"
+            >
+              {enabledError}
+            </p>
+          ) : null}
         </Row>
       </Group>
 

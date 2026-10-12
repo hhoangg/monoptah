@@ -95,6 +95,7 @@ beforeEach(() => {
       case "mail_status":
         return { sources: statuses, unreadTotal: 0, syncIntervalSecs: 3600 };
       case "mail_sync_interval_set":
+      case "mail_set_enabled":
         return undefined;
       default:
         throw new Error(`Unexpected command: ${String(command)}`);
@@ -226,6 +227,37 @@ it("pushes the interval to Rust when it changes", async () => {
   ].find((node) => node.textContent?.includes("Every 5 minutes"))!;
   await act(async () => option.click());
   expect(invoke).toHaveBeenCalledWith("mail_sync_interval_set", { secs: 300 });
+});
+
+const toggle = () => byLabel<HTMLButtonElement>("Enable Mail");
+
+it("tells Rust when Mail is switched on and off", async () => {
+  await render();
+  await act(async () => toggle().click());
+  expect(invoke).toHaveBeenLastCalledWith("mail_set_enabled", {
+    enabled: true,
+  });
+  expect(localStorage.getItem("monocode.mail.enabled")).toBe("1");
+  await act(async () => toggle().click());
+  expect(invoke).toHaveBeenLastCalledWith("mail_set_enabled", {
+    enabled: false,
+  });
+});
+
+it("says so when Rust could not be told that Mail is off", async () => {
+  await render();
+  await act(async () => toggle().click());
+  const refuse = vi.mocked(invoke).getMockImplementation()!;
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "mail_set_enabled") throw "state is locked";
+    return refuse(command, args);
+  });
+  await act(async () => toggle().click());
+  const text = [...container.querySelectorAll('[role="alert"]')]
+    .map((node) => node.textContent)
+    .join("\n");
+  expect(text).toContain("could not stop the background sync");
+  expect(text).toContain("state is locked");
 });
 
 it("explains sending_disabled as an account setting, not a verification failure", async () => {

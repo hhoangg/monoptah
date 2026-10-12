@@ -362,6 +362,7 @@ pub fn run() {
             mail::mail_mailboxes_delete,
             mail::mail_sync_now,
             mail::mail_sync_interval_set,
+            mail::mail_set_enabled,
             mail::mail_identities,
             mail::mail_threads,
             mail::mail_folders,

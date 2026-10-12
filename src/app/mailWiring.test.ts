@@ -66,3 +66,10 @@ it("feeds the rail's unread badge, and only while Mail is enabled", () => {
   expect(app).toContain("useMailUnread(mailEnabled)");
   expect(app).toContain("mailUnread={mailUnread}");
 });
+
+it("pushes the stored enabled flag to Rust once, at startup", () => {
+  // Rust starts with Mail off; without this push an enabled user would never sync.
+  expect(app).toMatch(
+    /useEffect\(\(\) => \{\s*mailSetEnabled\(loadMailEnabled\(\)\)[\s\S]*?\}, \[\]\);/,
+  );
+});

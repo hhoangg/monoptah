@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+import { invoke } from "@tauri-apps/api/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   collapsedDomains,
@@ -16,6 +17,10 @@ import {
   MAIL_ENABLED_CHANGE_EVENT,
   saveMailEnabled,
 } from "../../settings/model/settings";
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(async () => undefined),
+}));
 
 const cases = [
   ["selectedMailbox", selectedMailbox, null, "42"],
@@ -96,5 +101,6 @@ describe("mail prefs", () => {
     expect(loadMailEnabled()).toBe(true);
     expect(localStorage.getItem("monocode.mail.enabled")).toBe("1");
     expect(MAIL_ENABLED_CHANGE_EVENT).toBe("monocode:mail-enabled-change");
+    expect(invoke).toHaveBeenCalledWith("mail_set_enabled", { enabled: true });
   });
 });

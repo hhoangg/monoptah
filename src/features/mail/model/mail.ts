@@ -82,6 +82,14 @@ export const mailSyncNow = (scope: SyncScope) =>
 export const mailSyncIntervalSet = (secs: number) =>
   invoke<void>("mail_sync_interval_set", { secs });
 
+/**
+ * Rust cannot read localStorage either, so whether Mail is on reaches the
+ * background sync and the identity refresh only through this push. Rust starts
+ * off; App pushes the stored value at startup, `saveMailEnabled` on change.
+ */
+export const mailSetEnabled = (enabled: boolean) =>
+  invoke<void>("mail_set_enabled", { enabled });
+
 export const mailIdentities = (accountId?: number | null) =>
   invoke<IdentityRow[]>("mail_identities", { accountId: accountId ?? null });
 

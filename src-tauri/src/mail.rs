@@ -212,19 +212,19 @@ pub fn init(app: &AppHandle) {
             let _ = mail_store::fail_interrupted_sends(&conn);
         }
     }
-    mail_sync::spawn_scheduler(app.clone(), sync, live.clone());
-    spawn_identity_refresh(app.clone(), live);
+    mail_sync::spawn_scheduler(app.clone(), sync.clone(), live.clone());
+    spawn_identity_refresh(app.clone(), sync, live);
 }
 
 /// The sync scheduler's loop is closed over `sync_due`, so identities get their
 /// own slow loop instead of a hook in it. Sources refresh once a day; the tick
 /// only finds out which are due.
-fn spawn_identity_refresh(app: AppHandle, clients: Arc<dyn AwsClients>) {
+fn spawn_identity_refresh(app: AppHandle, sync: Arc<SyncService>, clients: Arc<dyn AwsClients>) {
     std::thread::spawn(move || {
         std::thread::sleep(IDENTITY_FIRST_DELAY);
         loop {
             let store = app.state::<SessionStore>();
-            refresh_due_identities(&store, &*clients, now_millis());
+            refresh_identities_while_enabled(&sync, &store, &*clients, now_millis());
             std::thread::sleep(IDENTITY_TICK);
         }
     });
@@ -647,6 +647,19 @@ pub(crate) fn refresh_identities(
         .map_err(|e| e.message)?;
     store_identities(store, account, &fetched)?;
     Ok(fetched.len())
+}
+
+/// The loop's body: nothing at all, not even a database read, while Mail is off.
+pub(crate) fn refresh_identities_while_enabled(
+    sync: &SyncService,
+    store: &SessionStore,
+    clients: &dyn AwsClients,
+    now_ms: i64,
+) -> Vec<(i64, Result<usize, String>)> {
+    if !sync.enabled() {
+        return Vec::new();
+    }
+    refresh_due_identities(store, clients, now_ms)
 }
 
 /// Refreshes every enabled source whose identities are older than a day, or
@@ -1520,6 +1533,13 @@ pub async fn mail_sync_now(app: AppHandle, scope: SyncScope) -> Result<Vec<SyncR
 #[tauri::command]
 pub fn mail_sync_interval_set(mail: State<'_, MailState>, secs: u64) {
     mail.sync.set_interval_secs(secs);
+}
+
+/// Whether Mail is on, which the webview owns (`monocode.mail.enabled`). Off
+/// stops the scheduled sync and the identity refresh; Rust starts off.
+#[tauri::command]
+pub fn mail_set_enabled(mail: State<'_, MailState>, enabled: bool) {
+    mail.sync.set_enabled(enabled);
 }
 
 #[tauri::command(async)]
@@ -2804,6 +2824,36 @@ mod tests {
         assert_eq!(clients.refreshes.lock().unwrap().len(), before);
         refresh_due_identities(&store, &clients, start + DAY_MS + 1_000);
         assert_eq!(clients.refreshes.lock().unwrap().len(), before + 2);
+    }
+
+    #[test]
+    fn identities_are_not_refreshed_while_mail_is_off() {
+        let (store, secrets) = setup();
+        let cred = credential(&store, &secrets, "personal");
+        let a =
+            source_upsert(&store, account_input(cred.id, "A", "us-east-1", "bucket-a")).unwrap();
+        mailboxes_upsert(
+            &store,
+            a.account.id,
+            vec![mailbox_input("owner@byptah.com", "owner/")],
+        )
+        .unwrap();
+        let clients = FakeClients::default();
+        let sync = SyncService::default();
+        let now = now_millis();
+
+        // Off is the state before the webview has said anything.
+        assert!(refresh_identities_while_enabled(&sync, &store, &clients, now).is_empty());
+        assert!(clients.refreshes.lock().unwrap().is_empty());
+
+        sync.set_enabled(true);
+        let results = refresh_identities_while_enabled(&sync, &store, &clients, now);
+        assert_eq!(results.len(), 1);
+        assert_eq!(clients.refreshes.lock().unwrap().len(), 1);
+
+        sync.set_enabled(false);
+        refresh_identities_while_enabled(&sync, &store, &clients, now + 2 * DAY_MS);
+        assert_eq!(clients.refreshes.lock().unwrap().len(), 1);
     }
 
     #[test]
