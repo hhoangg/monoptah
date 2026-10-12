@@ -5,6 +5,7 @@ import {
   FolderPlus,
   Internet,
   Inbox,
+  Mail,
   MoreHorizontal,
   Pin,
   PinOff,
@@ -110,6 +111,10 @@ type Props = {
   notesActive?: boolean;
   onOpenAutomations?: () => void;
   automationsActive?: boolean;
+  onOpenMail?: () => void;
+  mailActive?: boolean;
+  /** Unread mail over enabled sources; 0 draws no badge. */
+  mailUnread?: number;
   onTogglePanel?: () => void;
   onSelectProject: (path: string) => void;
   onOpenProject: () => void;
@@ -148,7 +153,10 @@ export function ProjectRail({
   onOpenNotes,
   notesActive = false,
   onOpenAutomations,
+  onOpenMail,
   automationsActive = false,
+  mailActive = false,
+  mailUnread = 0,
   onTogglePanel,
   onSelectProject,
   onOpenProject,
@@ -335,6 +343,7 @@ export function ProjectRail({
     inboxActive ||
     notesActive ||
     automationsActive ||
+    mailActive ||
     !!monos?.activeId;
   const pinnedIds = sections.pinned.map((item) => item.path);
   const projectIds = groupedProjectSections.ungrouped.map((item) => item.path);
@@ -412,6 +421,18 @@ export function ProjectRail({
               active={automationsActive}
               ariaLabel="Automations"
             />
+            {onOpenMail ? (
+              <RailAction
+                label="Mail"
+                icon={Mail}
+                onClick={onOpenMail}
+                active={mailActive}
+                badge={mailUnread > 0 ? mailUnread : undefined}
+                ariaLabel={
+                  mailUnread > 0 ? `Mail, ${mailUnread} unread` : "Mail"
+                }
+              />
+            ) : null}
           </div>
 
           <div

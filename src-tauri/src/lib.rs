@@ -3,6 +3,9 @@ use tauri::Manager;
 mod account_identity;
 mod artifacts;
 mod automations;
+mod aws_s3;
+mod aws_ses;
+mod aws_sigv4;
 mod azure_devops;
 mod chat_background;
 mod checkpoint;
@@ -27,6 +30,13 @@ mod link_preview;
 mod macos;
 #[cfg(target_os = "macos")]
 mod macos_background;
+mod mail;
+mod mail_build;
+mod mail_mime;
+mod mail_send;
+mod mail_store;
+mod mail_sync;
+mod mail_thread;
 mod mcp;
 mod menu;
 mod mono;
@@ -270,6 +280,7 @@ pub fn run() {
             tui_hook::init(app.handle())?;
             reminders::init(app.handle());
             checkpoint::init(app.handle())?;
+            mail::init(app.handle());
             menu::install(app.handle())?;
             // Puts the hold gate in front of the Quit item's ⌘Q on macOS, and
             // does nothing anywhere else.
@@ -341,6 +352,44 @@ pub fn run() {
             automations::automations_claim_due,
             automations::automations_claim_event,
             automations::automation_run_update,
+            mail::mail_status,
+            mail::mail_credentials,
+            mail::mail_credential_upsert,
+            mail::mail_credential_delete,
+            mail::mail_sources,
+            mail::mail_source_upsert,
+            mail::mail_source_delete,
+            mail::mail_source_test,
+            mail::mail_source_detect_prefixes,
+            mail::mail_mailboxes_upsert,
+            mail::mail_mailboxes_delete,
+            mail::mail_sync_now,
+            mail::mail_sync_interval_set,
+            mail::mail_set_enabled,
+            mail::mail_identities,
+            mail::mail_threads,
+            mail::mail_folders,
+            mail::mail_folder_upsert,
+            mail::mail_folder_delete,
+            mail::mail_folder_preview,
+            mail::mail_thread,
+            mail::mail_message_raw,
+            mail::mail_mark,
+            mail::mail_star,
+            mail::mail_archive,
+            mail::mail_unarchive,
+            mail::mail_delete,
+            mail::mail_attachment_open,
+            mail::mail_attachment_bytes,
+            mail::mail_remote_image,
+            mail::mail_outbox_save,
+            mail::mail_outbox_send,
+            mail::mail_outbox_check,
+            mail::mail_outbox_rearm,
+            mail::mail_stage_attachment,
+            mail::mail_outbox_list,
+            mail::mail_outbox_delete,
+            mail::mail_sendable_mailboxes,
             external_editor::list_external_editors,
             external_editor::open_in_external_editor,
             fs::resolve_project_location,

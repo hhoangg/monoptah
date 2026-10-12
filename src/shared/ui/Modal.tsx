@@ -28,6 +28,11 @@ type Props = {
   size?: ModalSize;
   /** Keeps the accessible title while letting focused content own the visual hierarchy. */
   minimalHeader?: boolean;
+  /**
+   * Replaces the size's width on the positioned wrapper. A width class in
+   * `className` lands on the inner panel and leaves it off-centre.
+   */
+  width?: string;
   /** Extra classes on the panel (fixed height, etc). */
   className?: string;
   /** Keep taller dialogs inside the viewport, scrolling their content. */
@@ -41,6 +46,7 @@ export function ModalPanel({
   description,
   size = "md",
   minimalHeader = false,
+  width,
   className,
   fitViewport = false,
   children,
@@ -80,7 +86,7 @@ export function ModalPanel({
       className={
         popupHost
           ? "relative z-[1] w-full"
-          : `absolute z-[1] left-1/2 ${fitViewport ? "top-1/2 -translate-y-1/2" : TOP[size]} ${WIDTH[size]} -translate-x-1/2`
+          : `absolute z-[1] left-1/2 ${fitViewport ? "top-1/2 -translate-y-1/2" : TOP[size]} ${width ?? WIDTH[size]} -translate-x-1/2`
       }
     >
       <div

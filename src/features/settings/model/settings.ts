@@ -14,6 +14,7 @@ import {
   shortcutTokens,
 } from "../../quick-composer/model/quickComposerShortcut";
 import { readFlag, writeFlag } from "./storageFlags";
+import { mailSetEnabled } from "../../mail/model/mail";
 
 const SECTION_KEY = "monocode.settingsSection";
 
@@ -28,6 +29,7 @@ export type SettingsSectionId =
   | "skills"
   | "monos"
   | "inbox"
+  | "mail"
   | "worktrees"
   | "archive";
 
@@ -133,6 +135,14 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
       "Manage Inbox services and notification preferences for each project.",
     keywords:
       "github gitlab linear jira clickup atlassian azure devops connect token integration",
+  },
+  {
+    id: "mail",
+    group: "workspace",
+    label: "Mail",
+    description:
+      "Read and send mail for your own domains through AWS S3 and SES.",
+    keywords: "email aws ses s3 bucket domain mailbox smtp inbox credentials",
   },
   {
     id: "archive",
@@ -493,6 +503,48 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     keywords: "api key issues teams connect",
   },
   {
+    id: "mail-enabled",
+    section: "mail",
+    label: "Enable Mail",
+    keywords: "email show hide rail aws ses",
+  },
+  {
+    id: "mail-credentials",
+    section: "mail",
+    label: "AWS credentials",
+    keywords: "access key secret iam keychain rotate ses s3 account",
+  },
+  {
+    id: "mail-sources",
+    section: "mail",
+    label: "Mail sources",
+    keywords: "bucket region mailbox prefix domain ses s3 iam policy test sync",
+  },
+  {
+    id: "mail-sync-interval",
+    section: "mail",
+    label: "Sync interval",
+    keywords: "mail refresh poll frequency hour minutes",
+  },
+  {
+    id: "mail-show-images",
+    section: "mail",
+    label: "Load remote images",
+    keywords: "mail email block tracking pixels ask always never",
+  },
+  {
+    id: "mail-density",
+    section: "mail",
+    label: "List density",
+    keywords: "mail compact comfortable rows preview snippet",
+  },
+  {
+    id: "mail-reading-pane",
+    section: "mail",
+    label: "Reading pane",
+    keywords: "mail preview right bottom off layout split",
+  },
+  {
     id: "show-archived",
     section: "archive",
     label: "Show archived in the sidebar",
@@ -808,6 +860,40 @@ export function subscribeNotesEnabled(onStoreChange: () => void) {
   window.addEventListener(NOTES_ENABLED_CHANGE_EVENT, onStoreChange);
   return () =>
     window.removeEventListener(NOTES_ENABLED_CHANGE_EVENT, onStoreChange);
+}
+
+const MAIL_ENABLED_KEY = "monocode.mail.enabled";
+
+// Off until the user sets up a source, so a fresh install shows no empty Mail.
+export const MAIL_ENABLED_DEFAULT = false;
+
+/** Fired on `window` when the Mail UI setting flips. */
+export const MAIL_ENABLED_CHANGE_EVENT = "monocode:mail-enabled-change";
+
+export function loadMailEnabled(): boolean {
+  return readFlag(MAIL_ENABLED_KEY) ?? MAIL_ENABLED_DEFAULT;
+}
+
+/**
+ * Rejects when Rust could not be told. The flag is already saved by then, so a
+ * caller that shows the failure matters most when turning Mail off: the sync
+ * would keep running behind a switch that reads off.
+ */
+export function saveMailEnabled(value: boolean): Promise<void> {
+  writeFlag(MAIL_ENABLED_KEY, value);
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(
+      new CustomEvent<boolean>(MAIL_ENABLED_CHANGE_EVENT, { detail: value }),
+    );
+  }
+  return mailSetEnabled(value);
+}
+
+export function subscribeMailEnabled(onStoreChange: () => void) {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(MAIL_ENABLED_CHANGE_EVENT, onStoreChange);
+  return () =>
+    window.removeEventListener(MAIL_ENABLED_CHANGE_EVENT, onStoreChange);
 }
 
 const MONOS_ENABLED_KEY = "monocode.monosEnabled";

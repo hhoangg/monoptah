@@ -270,6 +270,7 @@ describe.each([false, true])("Mono rail selection (compact: %s)", (compact) => {
     ["Inbox", "inboxActive", "onOpenInbox"],
     ["Notes", "notesActive", "onOpenNotes"],
     ["Automations", "automationsActive", "onOpenAutomations"],
+    ["Mail", "mailActive", "onOpenMail"],
     ["Search", "searchActive", "onSearch"],
   ] as const)("selects only %s while it covers a Mono", async (label, active, open) => {
     const mono = createMono();
@@ -1525,6 +1526,70 @@ describe("sidebar session reminders", () => {
         '[data-pinned-sessions] [data-session-card="session-1"]',
       ),
     ).toBe(card());
+  });
+});
+
+describe("Mail entry gating", () => {
+  it.each([false, true])(
+    "renders no Mail action without onOpenMail (compact: %s)",
+    async (compact) => {
+      props = {
+        ...props,
+        projectRailOpen: !compact,
+        compactProjectRail: compact,
+        onSelectProject: vi.fn(),
+        onOpenProject: vi.fn(),
+        onOpenMail: undefined,
+      };
+      await act(async () => render());
+      expect(container.querySelector('button[aria-label^="Mail"]')).toBeNull();
+      props = { ...props, onOpenMail: vi.fn() };
+      await act(async () => render());
+      expect(
+        container.querySelector('button[aria-label^="Mail"]'),
+      ).not.toBeNull();
+    },
+  );
+});
+
+describe("Mail unread badge", () => {
+  const layouts = [
+    ["full rail", { projectRailOpen: true, compactProjectRail: false }],
+    ["compact rail", { projectRailOpen: false, compactProjectRail: true }],
+    ["project picker", { projectRailOpen: false, compactProjectRail: false }],
+  ] as const;
+  const mailButton = () =>
+    container.querySelector<HTMLElement>('button[aria-label^="Mail"]');
+
+  describe.each(layouts)("%s", (_name, layout) => {
+    const withUnread = async (mailUnread: number) => {
+      props = {
+        ...props,
+        ...layout,
+        onSelectProject: vi.fn(),
+        onOpenProject: vi.fn(),
+        onOpenMail: vi.fn(),
+        mailUnread,
+      };
+      await act(async () => render());
+    };
+
+    it("shows the count and names it for assistive tech", async () => {
+      await withUnread(7);
+      expect(mailButton()?.getAttribute("aria-label")).toBe("Mail, 7 unread");
+      expect(mailButton()?.textContent).toContain("7");
+    });
+
+    it("draws no badge for zero unread", async () => {
+      await withUnread(0);
+      expect(mailButton()?.getAttribute("aria-label")).toBe("Mail");
+      expect(mailButton()?.textContent).not.toMatch(/\d/);
+    });
+
+    it("caps a large count", async () => {
+      await withUnread(120);
+      expect(mailButton()?.textContent).toContain("99+");
+    });
   });
 });
 

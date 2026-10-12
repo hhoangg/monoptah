@@ -65,6 +65,12 @@ impl SessionStore {
         })
     }
 
+    /// For tests that must show a long operation runs without holding the lock.
+    #[cfg(test)]
+    pub(crate) fn conn_is_free(&self) -> bool {
+        self.conn.try_lock().is_ok()
+    }
+
     pub(crate) fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
         self.conn
             .lock()
@@ -1003,6 +1009,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     crate::automations::ensure_tables(conn)?;
     ensure_orchestration_history(conn)?;
     crate::mono_transcript::ensure_tables(conn)?;
+    crate::mail_store::ensure_tables(conn)?;
     Ok(())
 }
 

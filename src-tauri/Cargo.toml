@@ -22,13 +22,17 @@ open = "5.4.1"
 serde.workspace = true
 serde_json.workspace = true
 toml = "0.9.12"
+mail-parser = "0.11"
+mail-builder = "0.4"
+ammonia = "4"
 sha2 = "0.10"
+hmac = "0.12"
 zstd = "0.13"
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 tauri-plugin-dialog = "2"
-rusqlite = { version = "0.40.2", features = ["bundled", "hooks"], default-features = false }
+rusqlite = { version = "0.40.2", features = ["bundled", "functions", "hooks"], default-features = false }
 ureq = { version = "2.12.1", default-features = false, features = ["tls", "gzip"] }
 url = "2.5"
 time = { version = "0.3", features = ["parsing"] }
