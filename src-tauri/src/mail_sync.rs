@@ -561,9 +561,12 @@ fn parse_for_sync(_store: &SessionStore, raw: &[u8]) -> Result<ParsedMail, Strin
 }
 
 #[cfg(test)]
+type ParseHook = Box<dyn Fn(&SessionStore)>;
+
+#[cfg(test)]
 thread_local! {
     /// Lets a test observe the moment of parsing, to check the store lock is free.
-    static PARSE_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&SessionStore)>>> =
+    static PARSE_HOOK: std::cell::RefCell<Option<ParseHook>> =
         const { std::cell::RefCell::new(None) };
 }
 

@@ -567,8 +567,8 @@ fn html_exceeds_caps(html: &str) -> bool {
             .position(|&b| b.is_ascii_whitespace() || b == b'/' || b == b'>')
             .unwrap_or(bytes.len() - name_start);
         let name_end = name_start + name_len;
-        // Tag names are ASCII up to the delimiters above; a multibyte name
-        // would not be a delimiter-free ASCII slice, so skip it.
+        // The delimiters are ASCII, so both ends are char boundaries; `get`
+        // only spares an unwrap.
         let Some(name) = html.get(name_start..name_end) else {
             continue;
         };
