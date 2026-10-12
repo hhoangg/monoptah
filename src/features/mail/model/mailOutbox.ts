@@ -111,6 +111,9 @@ export function visibleOutbox(rows: OutboxRow[]): OutboxRow[] {
  * The outbox rows, reloaded when one is sent, re-armed or deleted. It does not
  * listen to the messages event, and a save emits neither, so the composer's
  * autosave cannot reach it; the caller reloads when the composer closes.
+ * That covers this window only: a draft saved by the composer in another
+ * window leaves this list stale until its next reload (`mailOutboxSave` has no
+ * caller outside the composer, so that is the only other way a row appears).
  */
 export function useMailOutbox() {
   const [rows, setRows] = useState<OutboxRow[] | null>(null);

@@ -742,7 +742,7 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
       // They were just read, so an older "missing" verdict on the same path is
       // stale and would claim a present file is gone.
       setMissingPaths((prev) =>
-        prev.filter((x) => !staged.some((p) => p.path === x)),
+        prev.filter((x) => !staged.some((p) => slash(p.path) === slash(x))),
       );
       latest.current.pending = [...latest.current.pending, ...staged];
       for (const p of staged) if (p.inline) insertImage(p);
@@ -794,11 +794,9 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const syncAttached = () => {
-    const editor = editorRef.current;
-    if (!editor) return;
+  const syncAttached = (doc: TipTapNode) => {
     const { pending: files, quote: q } = latest.current;
-    const ids = compose(files, q, editor.getJSON() as TipTapNode, "0")
+    const ids = compose(files, q, doc, "0")
       .attached.map((p) => p.id)
       .sort();
     setAttachedIds((prev) =>
@@ -1063,9 +1061,9 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
 
           <LazyMailEditor
             content={init.doc}
-            onChange={() => {
+            onChange={(doc) => {
               touch();
-              syncAttached();
+              syncAttached(doc);
             }}
             onSend={() => void send()}
             onFiles={onFiles}
@@ -1144,9 +1142,8 @@ export function ComposeSheet({ request, onClose, onSent }: Props) {
           {missing.length ? (
             <p role="alert" className="mt-3 text-[12px] text-amber-400">
               {missing.map((p) => p.name).join(", ")}{" "}
-              {missing.length === 1 ? "is" : "are"} no longer on this computer.
-              Remove {missing.length === 1 ? "it" : "them"} and attach again, or
-              this message cannot be sent.
+              {missing.length === 1 ? "is" : "are"} no longer on this computer.{" "}
+              {missingAdvice(missing)}, or this message cannot be sent.
             </p>
           ) : null}
           {fromNote ? (
@@ -1371,6 +1368,23 @@ async function originalOf(row: OutboxRow) {
 }
 
 /**
+ * An attached file has a chip with Remove; an inline image has neither, so the
+ * way out for it is deleting the image from the body.
+ */
+function missingAdvice(missing: Pending[]): string {
+  const files = missing.filter((p) => !p.inline).length;
+  const images = missing.length - files;
+  const them = files === 1 ? "it" : "them";
+  const image = images === 1 ? "image" : "images";
+  if (images === 0) return `Remove ${them} and attach again`;
+  if (files === 0) return `Delete the ${image} from the message`;
+  return `Remove the missing files and attach them again, and delete the ${image} from the message`;
+}
+
+/** Windows paths come back with either separator; compare them alike. */
+const slash = (p: string) => p.replace(/\\/g, "/");
+
+/**
  * The one place that decides which staged files a message carries: every plain
  * attachment, plus the inline images the body still references. `persist` sends
  * exactly this and Send's missing-file check blocks on exactly this, so the two
@@ -1406,7 +1420,6 @@ function compose(
  */
 async function missingFiles(files: { path: string }[]): Promise<string[]> {
   if (files.length === 0) return [];
-  const slash = (p: string) => p.replace(/\\/g, "/");
   try {
     const found = await invoke<{ path: string }[] | null>("inspect_paths", {
       paths: files.map((f) => f.path),

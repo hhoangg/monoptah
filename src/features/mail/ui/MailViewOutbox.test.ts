@@ -39,6 +39,7 @@ const unconfirmed = {
 let container: HTMLDivElement;
 let root: Root;
 let listCalls: number;
+let outboxRows: OutboxRow[];
 
 beforeEach(async () => {
   (
@@ -47,11 +48,12 @@ beforeEach(async () => {
   localStorage.clear();
   composer.requests = [];
   listCalls = 0;
+  outboxRows = [unconfirmed];
   vi.mocked(invoke).mockImplementation((async (cmd: string) => {
     if (cmd === "mail_threads") return { rows: [], nextCursor: null };
     if (cmd === "mail_outbox_list") {
       listCalls += 1;
-      return [unconfirmed];
+      return outboxRows;
     }
     return null;
   }) as typeof invoke);
@@ -81,7 +83,7 @@ const press = async (match: RegExp) => {
 
 it("flags unconfirmed mail on the Outbox button before it is opened", () => {
   const b = document.body.querySelector("button[aria-label^='Outbox']")!;
-  expect(b.getAttribute("aria-label")).toBe("Outbox, 1 to check");
+  expect(b.getAttribute("aria-label")).toBe("Outbox, 1 message, 1 to check");
 });
 
 it("opens a row in the existing draft entry point and reloads when the composer closes", async () => {
@@ -92,4 +94,36 @@ it("opens a row in the existing draft entry point and reloads when the composer 
   // A save emits nothing; closing is how the list finds out.
   await act(async () => composer.close!());
   expect(listCalls).toBe(before + 1);
+});
+
+it("carries both the total and the to-check count, visibly and to a screen reader", async () => {
+  const draft = (id: number) =>
+    ({ ...unconfirmed, id, state: "draft" }) as OutboxRow;
+  outboxRows = [unconfirmed, draft(4), draft(5), draft(6)];
+  await act(async () => {
+    root.unmount();
+    root = createRoot(container);
+    root.render(
+      createElement(MailView, { besideRail: true, onClose: vi.fn() }),
+    );
+  });
+  const b = document.body.querySelector("button[aria-label^='Outbox']")!;
+  expect(b.getAttribute("aria-label")).toBe("Outbox, 4 messages, 1 to check");
+  // What a sighted user reads must say the same two things.
+  expect(b.textContent).toContain("4");
+  expect(b.textContent).toContain("1 to check");
+});
+
+it("names only the total when nothing needs checking", async () => {
+  outboxRows = [{ ...unconfirmed, state: "draft" } as OutboxRow];
+  await act(async () => {
+    root.unmount();
+    root = createRoot(container);
+    root.render(
+      createElement(MailView, { besideRail: true, onClose: vi.fn() }),
+    );
+  });
+  const b = document.body.querySelector("button[aria-label^='Outbox']")!;
+  expect(b.getAttribute("aria-label")).toBe("Outbox, 1 message");
+  expect(b.textContent).not.toContain("to check");
 });

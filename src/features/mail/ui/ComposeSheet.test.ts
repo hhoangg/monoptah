@@ -812,3 +812,83 @@ it("two clicks on Send in one tick send once", async () => {
   expect(m.mailOutboxSend).toHaveBeenCalledTimes(1);
   expect(m.mailOutboxCheck).toHaveBeenCalledTimes(1);
 });
+
+const inlineDoc = {
+  type: "doc",
+  content: [
+    { type: "image", attrs: { src: "blob:x", "data-mono-att": "att-1" } },
+  ],
+};
+const inlineImage = () => ({
+  path: "/tmp/p.png",
+  filename: "p.png",
+  mime: "image/png",
+  cid: contentIdFor("41", "att-1"),
+});
+
+it("tells an attached file to be removed and attached again", async () => {
+  noFiles();
+  await open({ kind: "draft", row: row({ attachments: [pdf()] }) });
+  const alert = body().querySelector('[role="alert"]')!.textContent;
+  expect(alert).toBe(
+    "a.pdf is no longer on this computer. Remove it and attach again, or this message cannot be sent.",
+  );
+});
+
+it("tells an inline image to be deleted from the message, not removed", async () => {
+  noFiles();
+  await open({
+    kind: "draft",
+    row: row({ bodyJson: inlineDoc, attachments: [inlineImage()] }),
+  });
+  const alert = body().querySelector('[role="alert"]')!.textContent;
+  expect(alert).toBe(
+    "p.png is no longer on this computer. Delete the image from the message, or this message cannot be sent.",
+  );
+  // There is no Remove button for it; the copy must not point at one.
+  expect(alert).not.toContain("Remove");
+});
+
+it("says both when a file and an inline image are missing", async () => {
+  noFiles();
+  await open({
+    kind: "draft",
+    row: row({
+      bodyJson: inlineDoc,
+      attachments: [pdf(), inlineImage()],
+    }),
+  });
+  const alert = body().querySelector('[role="alert"]')!.textContent;
+  expect(alert).toContain("Remove the missing files and attach them again");
+  expect(alert).toContain("delete the image from the message");
+});
+
+it("clears a missing warning when the same Windows file is attached with the other separator", async () => {
+  let exists = false;
+  vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+    cmd === "inspect_paths"
+      ? exists
+        ? [{ path: "C:/mail/a.pdf", name: "a.pdf", size: 3, isDir: false }]
+        : []
+      : null) as never);
+  await open({
+    kind: "draft",
+    row: row({
+      attachments: [
+        {
+          path: "C:\\mail\\a.pdf",
+          filename: "a.pdf",
+          mime: "application/pdf",
+          cid: null,
+        },
+      ],
+    }),
+  });
+  expect(body().textContent).toContain("a.pdf is no longer on this computer");
+  exists = true;
+  await act(async () =>
+    webview.drop!({ payload: { type: "drop", paths: ["C:/mail/a.pdf"] } }),
+  );
+  await settle();
+  expect(body().textContent).not.toContain("no longer on this computer");
+});

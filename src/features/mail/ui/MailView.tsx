@@ -58,6 +58,14 @@ type Props = {
   onToggleSidebar?: () => void;
 };
 
+/** Both facts the button shows, so a screen reader hears what a sighted user sees. */
+const outboxLabel = (total: number, unconfirmed: number) =>
+  total === 0
+    ? "Outbox"
+    : `Outbox, ${total} ${total === 1 ? "message" : "messages"}${
+        unconfirmed > 0 ? `, ${unconfirmed} to check` : ""
+      }`;
+
 const OPEN_SURFACE = '[role="dialog"], [role="menu"], [role="listbox"]';
 
 /** What an archive left behind, in the dialog's words; null when it was clean. */
@@ -124,6 +132,7 @@ export function MailView({
   const [outboxOpen, setOutboxOpen] = useState(false);
   const unconfirmed =
     outbox.rows?.filter((r) => r.state === "unconfirmed").length ?? 0;
+  const total = outbox.rows?.length ?? 0;
   const composeSeq = useRef(0);
   const openCompose = (request: ComposeRequest) =>
     setCompose({ key: ++composeSeq.current, request });
@@ -343,17 +352,16 @@ export function MailView({
         <div className="flex shrink-0 items-center gap-1.5 pr-2">
           <SecondaryButton
             danger={unconfirmed > 0}
-            aria-label={
-              unconfirmed > 0 ? `Outbox, ${unconfirmed} to check` : "Outbox"
-            }
+            aria-label={outboxLabel(total, unconfirmed)}
             onClick={() => setOutboxOpen(true)}
           >
             <Send className="size-3" />
             Outbox
-            {outbox.rows && outbox.rows.length > 0 ? (
-              <span className="tabular-nums text-content/50">
-                {outbox.rows.length}
-              </span>
+            {total > 0 ? (
+              <span className="tabular-nums text-content/50">{total}</span>
+            ) : null}
+            {unconfirmed > 0 ? (
+              <span className="tabular-nums">{unconfirmed} to check</span>
             ) : null}
           </SecondaryButton>
           <SecondaryButton
@@ -488,7 +496,9 @@ export function MailView({
           request={compose.request}
           onClose={() => {
             setCompose(null);
-            // A save emits nothing, so this is when the list learns of it.
+            // A save emits nothing, so this is when the list learns of it. A
+            // draft saved by the composer in another window is not seen until
+            // the next reload.
             void outbox.reload();
           }}
         />
