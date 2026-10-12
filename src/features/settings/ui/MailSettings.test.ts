@@ -446,3 +446,38 @@ it("says the image policy is set per source when sources differ", async () => {
     ),
   ).not.toBeNull();
 });
+
+const choose = (group: string, option: string) =>
+  act(async () => {
+    [
+      ...container.querySelectorAll<HTMLElement>(
+        `[role="radiogroup"][aria-label="${group}"] [role="radio"]`,
+      ),
+    ]
+      .find((r) => r.textContent === option)!
+      .click();
+  });
+const checked = (group: string) =>
+  container.querySelector(
+    `[role="radiogroup"][aria-label="${group}"] [aria-checked="true"]`,
+  )?.textContent;
+
+it("offers list density and reading pane position, saved to the documented keys", async () => {
+  await render();
+  expect(checked("List density")).toBe("Comfortable");
+  expect(checked("Reading pane")).toBe("Right");
+  await choose("List density", "Compact");
+  await choose("Reading pane", "Off");
+  expect(localStorage.getItem("monocode.mail.density")).toBe("compact");
+  expect(localStorage.getItem("monocode.mail.readingPaneSide")).toBe("off");
+  expect(checked("List density")).toBe("Compact");
+  expect(checked("Reading pane")).toBe("Off");
+});
+
+it("starts from what was saved", async () => {
+  localStorage.setItem("monocode.mail.density", "compact");
+  localStorage.setItem("monocode.mail.readingPaneSide", "bottom");
+  await render();
+  expect(checked("List density")).toBe("Compact");
+  expect(checked("Reading pane")).toBe("Bottom");
+});

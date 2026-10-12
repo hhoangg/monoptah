@@ -8,8 +8,12 @@ import {
   mailSyncIntervalSet,
 } from "../../mail/model/mail";
 import {
+  density,
+  readingPaneSide,
   syncIntervalSeconds,
   SYNC_INTERVAL_MIN_SECONDS,
+  type MailDensity,
+  type ReadingPaneSide,
 } from "../../mail/model/mailPrefs";
 import type {
   ImagePolicy,
@@ -30,7 +34,7 @@ import {
   MailCredentialRow,
 } from "./MailCredentialRow";
 import { MailSourceCard, SourceForm } from "./MailSourceCard";
-import { Group, Row, Select, Toggle } from "./primitives";
+import { Group, Row, Segmented, Select, Toggle } from "./primitives";
 
 const INTERVALS: [number, string][] = [
   [60, "Every minute"],
@@ -48,6 +52,17 @@ const IMAGE_OPTIONS: { value: ImagePolicy; label: string }[] = [
   { value: "never", label: "Never load" },
 ];
 
+const DENSITY_OPTIONS: { value: MailDensity; label: string }[] = [
+  { value: "comfortable", label: "Comfortable" },
+  { value: "compact", label: "Compact" },
+];
+
+const PANE_OPTIONS: { value: ReadingPaneSide; label: string }[] = [
+  { value: "right", label: "Right" },
+  { value: "bottom", label: "Bottom" },
+  { value: "off", label: "Off" },
+];
+
 type Loaded = {
   credentials: MailCredential[];
   sources: SourceRow[];
@@ -62,6 +77,8 @@ export function MailSettings() {
     () => false,
   );
   const interval = syncIntervalSeconds.useValue();
+  const rowDensity = density.useValue();
+  const paneSide = readingPaneSide.useValue();
   const [data, setData] = useState<Loaded>({
     credentials: [],
     sources: [],
@@ -305,6 +322,36 @@ export function MailSettings() {
               {imagesError}
             </p>
           ) : null}
+        </Row>
+      </Group>
+
+      <Group
+        title="Layout"
+        description="How the Mail view is laid out. Saved on this computer."
+      >
+        <Row
+          id="mail-density"
+          label="List density"
+          description="Compact hides the message preview and tightens each row."
+        >
+          <Segmented<MailDensity>
+            label="List density"
+            value={rowDensity}
+            options={DENSITY_OPTIONS}
+            onChange={density.save}
+          />
+        </Row>
+        <Row
+          id="mail-reading-pane"
+          label="Reading pane"
+          description="Where a message opens. Off opens it in place of the list."
+        >
+          <Segmented<ReadingPaneSide>
+            label="Reading pane"
+            value={paneSide}
+            options={PANE_OPTIONS}
+            onChange={readingPaneSide.save}
+          />
         </Row>
       </Group>
     </>

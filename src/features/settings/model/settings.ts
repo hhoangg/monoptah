@@ -532,6 +532,18 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     keywords: "mail email block tracking pixels ask always never",
   },
   {
+    id: "mail-density",
+    section: "mail",
+    label: "List density",
+    keywords: "mail compact comfortable rows preview snippet",
+  },
+  {
+    id: "mail-reading-pane",
+    section: "mail",
+    label: "Reading pane",
+    keywords: "mail preview right bottom off layout split",
+  },
+  {
     id: "show-archived",
     section: "archive",
     label: "Show archived in the sidebar",
