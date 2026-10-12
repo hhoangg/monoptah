@@ -330,6 +330,8 @@ type Props = {
   notesActive?: boolean;
   automationsActive?: boolean;
   mailActive?: boolean;
+  /** Unread mail over enabled sources; 0 draws no badge. */
+  mailUnread?: number;
   notesEnabled?: boolean;
   onToggleProjectRail?: () => void;
   projectRailOpen?: boolean;
@@ -428,6 +430,7 @@ function SidebarComponent({
   notesActive = false,
   automationsActive = false,
   mailActive = false,
+  mailUnread = 0,
   notesEnabled = true,
   onToggleProjectRail,
   projectRailOpen = true,
@@ -1757,6 +1760,7 @@ function SidebarComponent({
               notesActive={notesActive}
               automationsActive={automationsActive}
               mailActive={mailActive}
+              mailUnread={mailUnread}
               inboxUnseen={inboxUnseen}
             />
           ) : null}
@@ -2278,6 +2282,7 @@ function SidebarComponent({
           automationsActive={automationsActive}
           onOpenMail={onOpenMail}
           mailActive={mailActive}
+          mailUnread={mailUnread}
           onOpenSettings={onOpenSettings}
           onTogglePanel={onToggleProjectRail}
           onLeaveActive={onGoBack}
@@ -2311,6 +2316,7 @@ function SidebarComponent({
           automationsActive={automationsActive}
           onOpenMail={onOpenMail}
           mailActive={mailActive}
+          mailUnread={mailUnread}
           onTogglePanel={onToggleProjectRail}
           onSelectProject={onSelectProject}
           onOpenProject={onOpenProject}
@@ -2394,6 +2400,7 @@ function SidebarProjectPicker({
   notesActive = false,
   automationsActive = false,
   mailActive = false,
+  mailUnread = 0,
   inboxUnseen = false,
 }: {
   cwd: string;
@@ -2414,6 +2421,7 @@ function SidebarProjectPicker({
   notesActive?: boolean;
   automationsActive?: boolean;
   mailActive?: boolean;
+  mailUnread?: number;
   inboxUnseen?: boolean;
 }) {
   const [inboxMenu, setInboxMenu] = useState<{ x: number; y: number } | null>(
@@ -2489,8 +2497,22 @@ function SidebarProjectPicker({
           </IconButton>
         ) : null}
         {onOpenMail ? (
-          <IconButton label="Mail" active={mailActive} onClick={onOpenMail}>
-            <Mail className="size-3.5" strokeWidth={1.75} />
+          <IconButton
+            label={mailLabel(mailUnread)}
+            active={mailActive}
+            onClick={onOpenMail}
+          >
+            <span className="relative">
+              <Mail className="size-3.5" strokeWidth={1.75} />
+              {mailUnread > 0 ? (
+                <span
+                  aria-hidden
+                  className="absolute -right-1.5 -top-1.5 grid min-w-3.5 place-items-center rounded-full bg-accent px-0.5 text-[9px] font-semibold leading-3.5 text-white tabular-nums"
+                >
+                  {mailUnread > 99 ? "99+" : mailUnread}
+                </span>
+              ) : null}
+            </span>
           </IconButton>
         ) : null}
       </div>
@@ -2534,6 +2556,7 @@ function CompactProjectRail({
   onOpenMail,
   automationsActive,
   mailActive,
+  mailUnread,
   onOpenSettings,
   onTogglePanel,
   onLeaveActive,
@@ -2565,6 +2588,7 @@ function CompactProjectRail({
   onOpenMail?: () => void;
   automationsActive: boolean;
   mailActive: boolean;
+  mailUnread: number;
   onOpenSettings?: () => void;
   onTogglePanel?: () => void;
   onLeaveActive?: () => void;
@@ -2741,9 +2765,10 @@ function CompactProjectRail({
         />
         {onOpenMail ? (
           <CompactRailAction
-            label="Mail"
+            label={mailLabel(mailUnread)}
             icon={Mail}
             active={mailActive}
+            count={mailUnread}
             onClick={action(mailActive, onOpenMail)}
           />
         ) : null}
@@ -2824,6 +2849,7 @@ function CompactRailAction({
   tab = false,
   active = false,
   dot = false,
+  count = 0,
   onClick,
   onOpenContextMenu,
 }: {
@@ -2832,6 +2858,8 @@ function CompactRailAction({
   tab?: boolean;
   active?: boolean;
   dot?: boolean;
+  /** An unread count drawn on the icon; 0 draws nothing. */
+  count?: number;
   onClick?: () => void;
   onOpenContextMenu?: (x: number, y: number) => void;
 }) {
@@ -2887,9 +2915,21 @@ function CompactRailAction({
           className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-accent"
         />
       ) : null}
+      {count > 0 ? (
+        <span
+          aria-hidden
+          className="absolute right-0 top-0 grid min-w-3.5 place-items-center rounded-full bg-accent px-0.5 text-[9px] font-semibold leading-3.5 text-white tabular-nums"
+        >
+          {count > 99 ? "99+" : count}
+        </span>
+      ) : null}
     </button>
   );
 }
+
+/** The count is in the name too: the drawn badge is hidden from assistive tech. */
+const mailLabel = (unread: number) =>
+  unread > 0 ? `Mail, ${unread} unread` : "Mail";
 
 function WorkspaceTitleActions({
   onSearch,

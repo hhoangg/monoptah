@@ -2340,6 +2340,41 @@ mod tests {
     }
 
     #[test]
+    fn the_rail_unread_total_leaves_out_a_disabled_source() {
+        let (store, secrets) = setup();
+        let (_, first) = one_source(&store, &secrets);
+        ingest(&store, first.id, &raw_mail("Hi", "a1", "hello"), "owner/a1");
+        let cred = credential(&store, &secrets, "second");
+        let second = source_upsert(
+            &store,
+            account_input(cred.id, "acme (us-east-1)", "us-east-1", "acme-mail"),
+        )
+        .unwrap();
+        let boxes = mailboxes_upsert(
+            &store,
+            second.account.id,
+            vec![mailbox_input("hello@acme.com", "hello/")],
+        )
+        .unwrap();
+        ingest(
+            &store,
+            boxes[0].id,
+            &raw_mail("Yo", "b1", "hey"),
+            "hello/b1",
+        );
+        assert_eq!(status(&store, 3600).unwrap().unread_total, 2);
+
+        let mut off = account_input(cred.id, "acme (us-east-1)", "us-east-1", "acme-mail");
+        off.id = Some(second.account.id);
+        off.enabled = false;
+        source_upsert(&store, off).unwrap();
+        let after = status(&store, 3600).unwrap();
+        assert_eq!(after.unread_total, 1);
+        // The source still reports its own count; only the total skips it.
+        assert_eq!(after.sources.iter().map(|s| s.unread).sum::<i64>(), 2);
+    }
+
+    #[test]
     fn credential_validation_never_echoes_input() {
         let (store, secrets) = setup();
         let mut bad = keys("x", KEY_ID);

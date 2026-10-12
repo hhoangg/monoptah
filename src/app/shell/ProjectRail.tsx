@@ -113,6 +113,8 @@ type Props = {
   automationsActive?: boolean;
   onOpenMail?: () => void;
   mailActive?: boolean;
+  /** Unread mail over enabled sources; 0 draws no badge. */
+  mailUnread?: number;
   onTogglePanel?: () => void;
   onSelectProject: (path: string) => void;
   onOpenProject: () => void;
@@ -154,6 +156,7 @@ export function ProjectRail({
   onOpenMail,
   automationsActive = false,
   mailActive = false,
+  mailUnread = 0,
   onTogglePanel,
   onSelectProject,
   onOpenProject,
@@ -424,7 +427,10 @@ export function ProjectRail({
                 icon={Mail}
                 onClick={onOpenMail}
                 active={mailActive}
-                ariaLabel="Mail"
+                badge={mailUnread > 0 ? mailUnread : undefined}
+                ariaLabel={
+                  mailUnread > 0 ? `Mail, ${mailUnread} unread` : "Mail"
+                }
               />
             ) : null}
           </div>

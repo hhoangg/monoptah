@@ -61,3 +61,8 @@ it("every opener of another view closes Mail", () => {
 it("mounts MailView only while open", () => {
   expect(app).toMatch(/\{mailViewOpen \? \(\s*<MailView/);
 });
+
+it("feeds the rail's unread badge, and only while Mail is enabled", () => {
+  expect(app).toContain("useMailUnread(mailEnabled)");
+  expect(app).toContain("mailUnread={mailUnread}");
+});

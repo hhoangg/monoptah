@@ -758,6 +758,7 @@ import {
 } from "../features/settings/model/settings";
 import { mailSyncIntervalSet } from "../features/mail/model/mail";
 import { syncIntervalSeconds } from "../features/mail/model/mailPrefs";
+import { useMailUnread } from "../features/mail/model/useMailUnread";
 import {
   handleEditorFindKey,
   openFindInActiveEditor,
@@ -1297,6 +1298,7 @@ function Workspace({
     loadMailEnabled,
     () => false,
   );
+  const mailUnread = useMailUnread(mailEnabled);
   const liveAgentsEnabled = useSyncExternalStore(
     subscribeLiveAgentsEnabled,
     loadLiveAgentsEnabled,
@@ -13100,6 +13102,7 @@ function Workspace({
               notesActive={notesViewOpen}
               automationsActive={automationsViewOpen}
               mailActive={mailViewOpen}
+              mailUnread={mailUnread}
               notesEnabled={notesEnabled}
               projectRailOpen={projectRailOpen}
               compactProjectRail={compactProjectRail}
