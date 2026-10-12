@@ -103,6 +103,7 @@ pub(crate) fn parse_mail(raw: &[u8]) -> Result<ParsedMail, String> {
 
     let (body_text, html_source) = pick_bodies(&msg);
     let (body_html, remote_images_blocked) = match html_source {
+        Some(html) if html_exceeds_caps(&html) => (Some(oversized_html_fallback(&body_text)), 0),
         Some(html) => {
             let (clean, blocked) = sanitize_html(&html);
             (Some(clean), blocked)
@@ -513,6 +514,103 @@ const TABLE_CELL_ATTRS: &[&str] = &[
     "width", "height", "align", "valign", "bgcolor", "colspan", "rowspan", "border",
 ];
 
+/// What the reader sees instead of HTML that was refused before sanitising.
+const OVERSIZED_HTML_NOTICE: &str =
+    "This message's HTML was too large or too deeply nested to display safely; use View source.";
+
+/// html5ever's tree builder is quadratic in nesting depth (measured with
+/// ammonia 4.2: 100k nested divs took ~15 s, 1M would take about 26 minutes),
+/// so one hostile mail would pin a sync thread for that long. Both caps sit far
+/// above any real mail: 512 is the DOM depth browsers themselves flatten at,
+/// and real newsletters and long reply chains nest a few dozen levels (at 512
+/// the parser spends well under a millisecond); 2 MiB is about twenty times the
+/// 102 KB at which Gmail clips a message, and flat HTML of that size is linear
+/// (a second or two in a debug build).
+const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
+const MAX_HTML_DEPTH: usize = 512;
+
+/// Elements that never have content, so they never nest.
+const VOID_TAGS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// Elements the HTML parser closes by itself when the next sibling starts, and
+/// that senders habitually leave open. Counting them would flag a long, sloppy
+/// but harmless list; each one nests only through an element that is counted.
+const IMPLIED_END_TAGS: &[&str] = &[
+    "html", "head", "body", "p", "li", "dt", "dd", "tr", "td", "th", "thead", "tbody", "tfoot",
+    "colgroup", "option", "optgroup", "rt", "rp",
+];
+
+/// A cheap tag scan, not a parse. It errs towards over-counting (no comment,
+/// quote or raw-text awareness, so markup inside those still counts), because
+/// the only costly mistake is reading a deep document as shallow. An end tag
+/// pops only when it matches the innermost open element: popping further, as a
+/// browser does, would let `<div></x>` repeated hide a growing stack.
+fn html_exceeds_caps(html: &str) -> bool {
+    if html.len() > MAX_HTML_BYTES {
+        return true;
+    }
+    let bytes = html.as_bytes();
+    let mut stack: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while let Some(offset) = bytes[i..].iter().position(|&b| b == b'<') {
+        i += offset + 1;
+        let closing = bytes.get(i) == Some(&b'/');
+        let name_start = if closing { i + 1 } else { i };
+        if !bytes.get(name_start).is_some_and(u8::is_ascii_alphabetic) {
+            continue;
+        }
+        let name_len = bytes[name_start..]
+            .iter()
+            .position(|&b| b.is_ascii_whitespace() || b == b'/' || b == b'>')
+            .unwrap_or(bytes.len() - name_start);
+        let name_end = name_start + name_len;
+        // Tag names are ASCII up to the delimiters above; a multibyte name
+        // would not be a delimiter-free ASCII slice, so skip it.
+        let Some(name) = html.get(name_start..name_end) else {
+            continue;
+        };
+        i = name_end;
+        let counted = !VOID_TAGS.iter().any(|t| name.eq_ignore_ascii_case(t))
+            && !IMPLIED_END_TAGS
+                .iter()
+                .any(|t| name.eq_ignore_ascii_case(t));
+        if !counted {
+            continue;
+        }
+        if closing {
+            if stack
+                .last()
+                .is_some_and(|top| top.eq_ignore_ascii_case(name))
+            {
+                stack.pop();
+            }
+        } else {
+            stack.push(name);
+            if stack.len() > MAX_HTML_DEPTH {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The notice, then the message's text part when there is one. The text is
+/// escaped here rather than sanitised: it is the cheap path that cannot nest.
+fn oversized_html_fallback(text: &Option<String>) -> String {
+    let mut out = format!("<p><em>{OVERSIZED_HTML_NOTICE}</em></p>");
+    if let Some(text) = text {
+        let mut end = text.len().min(MAX_HTML_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&plain_to_html(&text[..end]));
+    }
+    out
+}
+
 /// Sanitises untrusted email HTML. Returns the HTML and the number of remote
 /// images that were blocked.
 ///
@@ -793,6 +891,72 @@ mod tests {
 
     fn sanitised(body: &str) -> String {
         html_mail(body).body_html.unwrap_or_default()
+    }
+
+    fn alternative_mail(text: &str, html: &str) -> ParsedMail {
+        let raw = format!(
+            "From: a@example.com\r\nTo: b@example.com\r\nSubject: t\r\n\
+             Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+             --b\r\nContent-Type: text/plain\r\n\r\n{text}\r\n\
+             --b\r\nContent-Type: text/html\r\n\r\n{html}\r\n--b--\r\n"
+        );
+        parse_mail(raw.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn deeply_nested_html_falls_back_to_text_without_running_the_sanitiser() {
+        let html = "<div>".repeat(200_000);
+        let start = std::time::Instant::now();
+        let m = alternative_mail("the plain part", &html);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            start.elapsed()
+        );
+        let shown = m.body_html.unwrap();
+        assert!(shown.contains(OVERSIZED_HTML_NOTICE));
+        assert!(shown.contains("the plain part"));
+        assert_eq!(m.body_text.as_deref(), Some("the plain part"));
+    }
+
+    #[test]
+    fn deeply_nested_html_only_mail_keeps_a_notice_body() {
+        let m = html_mail(&"<div><span>".repeat(100_000));
+        assert_eq!(
+            m.body_html.as_deref(),
+            Some(format!("<p><em>{OVERSIZED_HTML_NOTICE}</em></p>").as_str())
+        );
+    }
+
+    #[test]
+    fn oversized_flat_html_falls_back() {
+        let m = html_mail(&format!("<p>{}</p>", "x".repeat(MAX_HTML_BYTES)));
+        assert!(m.body_html.unwrap().contains(OVERSIZED_HTML_NOTICE));
+    }
+
+    #[test]
+    fn mismatched_end_tags_cannot_hide_depth() {
+        assert!(html_exceeds_caps(&"<div></x>".repeat(MAX_HTML_DEPTH + 1)));
+    }
+
+    #[test]
+    fn ordinary_html_is_unchanged_by_the_caps() {
+        // Sloppy but real: unclosed paragraphs and list items, nested tables,
+        // void tags, a long reply chain.
+        let sloppy = format!(
+            "{}<ul>{}</ul>{}<br><img src=\"cid:a\"><table><tr><td><table><tr><td>x</table></table>",
+            "<p>para".repeat(2_000),
+            "<li>item".repeat(2_000),
+            "<blockquote><div>reply ".repeat(100) + &"</div></blockquote>".repeat(100),
+        );
+        assert!(!html_exceeds_caps(&sloppy));
+        let body = "<p>Hello <b>world</b></p><table><tr><td>cell</td></tr></table>";
+        assert_eq!(
+            sanitised(body),
+            "<p>Hello <b>world</b></p><table><tbody><tr><td>cell</td></tr></tbody></table>"
+        );
+        assert!(!sanitised(body).contains(OVERSIZED_HTML_NOTICE));
+        assert!(!html_exceeds_caps(&"<div>".repeat(MAX_HTML_DEPTH)));
     }
 
     #[test]

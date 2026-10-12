@@ -14,7 +14,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::aws_s3::{ObjectInfo, S3Api, S3ErrorKind};
-use crate::mail_mime::parse_mail;
+use crate::mail_mime::{parse_mail, ParsedMail};
 use crate::mail_store::{self, ListedObject, MailAccount, MailMailbox};
 use crate::mail_thread;
 use crate::session_store::{now_millis, SessionStore};
@@ -25,6 +25,8 @@ pub(crate) const MESSAGES_CHANGED_EVENT: &str = "mail://messages-changed";
 const DEFAULT_INTERVAL_SECS: u64 = 3600;
 /// Stops a bad setting from turning the loop into a hot spin.
 const MIN_INTERVAL_SECS: u64 = 60;
+/// A year; longer is indistinguishable from "never" for a mailbox poll.
+const MAX_INTERVAL_SECS: u64 = 365 * 24 * 3600;
 const TICK: Duration = Duration::from_secs(60);
 /// Shared with `mail_status`, which counts what has been given up on.
 pub(crate) const MAX_PARSE_ATTEMPTS: i64 = 3;
@@ -128,8 +130,12 @@ impl SyncService {
     /// The webview owns the setting (`monocode.mail.syncIntervalSeconds`); the
     /// command layer pushes it here.
     pub(crate) fn set_interval_secs(&self, secs: u64) {
-        self.interval_secs
-            .store(secs.max(MIN_INTERVAL_SECS), Ordering::Relaxed);
+        // The cap keeps `secs * 1000` far inside i64, where it is used while
+        // the store lock is held: an overflow panic there would poison it.
+        self.interval_secs.store(
+            secs.clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS),
+            Ordering::Relaxed,
+        );
     }
 
     pub(crate) fn interval_secs(&self) -> u64 {
@@ -220,7 +226,9 @@ impl SyncService {
 
     fn plan(&self, store: &SessionStore, scope: &Scope) -> Result<Vec<Job>, String> {
         let conn = store.lock_conn()?;
-        let interval_ms = self.interval_secs() as i64 * 1000;
+        let interval_ms = i64::try_from(self.interval_secs())
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
         let mut jobs = Vec::new();
         for account in mail_store::list_accounts(&conn).map_err(|e| e.to_string())? {
             if !account.enabled {
@@ -445,13 +453,20 @@ fn sync_mailbox(
                 Err(_) => counts.failed += 1,
             }
         }
+        // Parsing is CPU-bound and the input is a stranger's bytes, so it runs
+        // before the app-wide store lock is taken: a slow message may delay
+        // this sync but never sessions, notes or chat.
+        let parsed: Vec<(&Work, Result<ParsedMail, String>)> = fetched
+            .iter()
+            .map(|(item, raw)| (*item, parse_for_sync(store, raw)))
+            .collect();
         // One page commits as one unit, so a crash leaves no half-threaded
         // message. Counts join the total only once the commit has happened.
         let mut page_counts = Counts::default();
         let conn = store.lock_conn()?;
         let tx = conn.unchecked_transaction().map_err(db)?;
-        for (item, raw) in &fetched {
-            ingest_one(&tx, mailbox, item, raw, &mut page_counts).map_err(db)?;
+        for (item, mail) in parsed {
+            ingest_one(&tx, mailbox, item, mail, &mut page_counts).map_err(db)?;
         }
         tx.commit().map_err(db)?;
         counts.inserted += page_counts.inserted;
@@ -540,14 +555,36 @@ fn reconcile_ledger(
     Ok((work, revived))
 }
 
+#[cfg(not(test))]
+fn parse_for_sync(_store: &SessionStore, raw: &[u8]) -> Result<ParsedMail, String> {
+    parse_mail(raw)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a test observe the moment of parsing, to check the store lock is free.
+    static PARSE_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&SessionStore)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn parse_for_sync(store: &SessionStore, raw: &[u8]) -> Result<ParsedMail, String> {
+    PARSE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(store);
+        }
+    });
+    parse_mail(raw)
+}
+
 fn ingest_one(
     conn: &Connection,
     mailbox: &MailMailbox,
     item: &Work,
-    raw: &[u8],
+    parsed: Result<ParsedMail, String>,
     counts: &mut Counts,
 ) -> rusqlite::Result<()> {
-    let mail = match parse_mail(raw) {
+    let mail = match parsed {
         Ok(mail) => mail,
         Err(message) => {
             let attempts = item.attempts + 1;
@@ -1545,6 +1582,119 @@ mod tests {
         assert_eq!(f.service.sync_due(&f.store, &factory, &ev, later).len(), 1);
         f.service.set_interval_secs(1);
         assert_eq!(f.service.interval_secs(), MIN_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn an_absurd_interval_is_clamped_and_cannot_overflow_the_planner() {
+        let f = Fixture::new();
+        let (account, _, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        let factory = MockFactory(HashMap::from([(account, s3.clone())]));
+        let ev = Recorder::default();
+        f.service.set_interval_secs(u64::MAX);
+        assert_eq!(f.service.interval_secs(), MAX_INTERVAL_SECS);
+        // A raw store of the unclamped value must not panic under the lock either.
+        f.service.interval_secs.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(
+            f.service
+                .sync_due(&f.store, &factory, &ev, now_millis())
+                .len(),
+            1
+        );
+        assert!(f.store.lock_conn().is_ok(), "the store lock was poisoned");
+    }
+
+    #[test]
+    fn the_store_lock_is_free_while_a_page_is_parsed() {
+        let f = Fixture::new();
+        let (account, mailbox, s3) = one_source(&f);
+        s3.put("owner/1", "e1", &mime("m1", "Hello", "first"));
+        s3.put("owner/2", "e2", &mime("m2", "Again", "second"));
+        s3.put("owner/3", "e3", "not an email at all");
+        let mailbox = {
+            let conn = f.store.lock_conn().unwrap();
+            mail_store::list_mailboxes(&conn, Some(account))
+                .unwrap()
+                .into_iter()
+                .find(|m| m.id == mailbox)
+                .unwrap()
+        };
+        let probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = probes.clone();
+        let store = &f.store;
+        PARSE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |store| {
+                // Same thread: a lock held by the sync would make try_lock fail.
+                seen.borrow_mut().push(store.conn_is_free());
+            }));
+        });
+        let mut counts = Counts::default();
+        let client = MockClient(s3.clone());
+        let result = sync_mailbox(store, &client, &mailbox, &Recorder::default(), &mut counts);
+        PARSE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        result.unwrap();
+        assert_eq!(*probes.borrow(), vec![true, true, true]);
+        // Parse failures are counted exactly as before.
+        assert_eq!((counts.inserted, counts.failed), (2, 1));
+        assert_eq!(
+            f.scalar("SELECT parse_attempts FROM mail_object WHERE state='error'"),
+            1
+        );
+    }
+
+    #[test]
+    fn a_source_syncs_sent_mail_on_a_machine_that_never_sent() {
+        let f = Fixture::new();
+        let cred = f.credential("main");
+        let input = |label: &str| AccountInput {
+            id: None,
+            provider: "aws".into(),
+            credential_id: cred,
+            s3_credential_id: None,
+            label: label.into(),
+            ses_region: "us-east-1".into(),
+            bucket: "bucket-acme".into(),
+            s3_region: "us-east-1".into(),
+            default_from: None,
+            attach_policy: "on_demand".into(),
+            image_policy: "ask".into(),
+            enabled: true,
+            sort_order: 0,
+        };
+        let row = crate::mail::source_upsert(&f.store, input("acme")).unwrap();
+        crate::mail::mailboxes_upsert(
+            &f.store,
+            row.account.id,
+            vec![MailboxInput {
+                address: "owner@acme.test".into(),
+                s3_prefix: "owner/".into(),
+                display_name: "Owner".into(),
+                color: None,
+                sort_order: 0,
+            }],
+        )
+        .unwrap();
+        // Editing the source later must not duplicate the archive mailbox.
+        let mut edit = input("acme renamed");
+        edit.id = Some(row.account.id);
+        crate::mail::source_upsert(&f.store, edit).unwrap();
+        assert_eq!(
+            f.scalar("SELECT COUNT(*) FROM mail_mailbox WHERE s3_prefix='sent/'"),
+            1
+        );
+        let s3 = MockS3::new("a", &f.log);
+        let sent = mime("s1", "Sent from elsewhere", "hi").replace(
+            "From: Bob <bob@example.com>",
+            "From: Owner <owner@acme.test>",
+        );
+        s3.put("sent/1.eml", "e1", &sent);
+        let reports = f.sync(&[(row.account.id, &s3)]);
+        assert_eq!(reports[0].error, None);
+        assert_eq!(reports[0].inserted, 1);
+        assert_eq!(
+            f.text("SELECT direction FROM mail_message WHERE message_id_hdr='s1@example.com'"),
+            "outbound"
+        );
     }
 
     fn fts_hits(f: &Fixture, term: &str) -> i64 {
