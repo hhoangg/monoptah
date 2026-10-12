@@ -25,6 +25,22 @@ CLI without one exits right away. The bar under the terminal then reads
 `Process exited (code N)` with a note that it stopped right after starting, and
 a **Restart** button.
 
+When the CLI exits cleanly (code 0) after running for more than a few seconds,
+for example you quit it, the pane closes. The tab closes with it, or, if it was
+the last tab for that project, becomes an empty chat. The session is not
+archived: it stays in the history list until you archive it. A launch failure,
+an exit within a few seconds, a non-zero code, or `claude --resume` not finding
+its conversation keeps the pane open with the bar and **Restart**.
+
+## Moving a pane
+
+A terminal session in a split has a drag grip and a close button in its header.
+Drag it onto the tab bar to pull it out into its own tab, or close it with the
+button. Moving a pane to another tab, by dragging it or dropping it onto
+another pane, does not restart the CLI: the same process keeps running and the pane redraws at its new size. A
+pane that had already exited stays that way after a move, with the same bar and
+**Restart**.
+
 ## Restoring
 
 For Claude, the app saves a conversation id before the CLI starts. Quitting and

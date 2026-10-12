@@ -89,6 +89,8 @@ export function ProjectTerminalDock({
   const vertical = isVerticalDock(dock.side);
   const [dragging, setDragging] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  // Terminals whose exit already closed them, so a repeat event cannot close twice.
+  const exitClosed = useRef(new Set<string>());
   const sideButton = useRef<HTMLDivElement>(null);
   const drag = useRef<{ start: number; size: number } | null>(null);
   const sizeRef = useRef(dock.size);
@@ -261,6 +263,12 @@ export function ProjectTerminalDock({
               cwd={file.cwd}
               active={focused && file.id === dock.pane.activeFileId}
               onMetaChange={(patch) => onTerminalMetaChange?.(file.id, patch)}
+              onExit={(exit) => {
+                // A spawn failure keeps the terminal so its error stays readable.
+                if (exit.error || exitClosed.current.has(file.id)) return;
+                exitClosed.current.add(file.id);
+                onCloseTerminal(file.id);
+              }}
             />
           </div>
         ))}
