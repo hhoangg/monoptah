@@ -114,6 +114,8 @@ type Props = {
   /** Opens an empty folder editor. */
   onNewFolder?: () => void;
   onSynced?: () => void;
+  /** A sync is running; `total` is 0 while the bucket is still being listed. */
+  progress?: { done: number; total: number } | null;
 };
 
 export function MailFolderList({
@@ -130,6 +132,7 @@ export function MailFolderList({
   onSelectArchive,
   onNewFolder,
   onSynced,
+  progress = null,
 }: Props) {
   const collapsed = useCollapsedDomains();
   const [syncing, setSyncing] = useState(false);
@@ -343,11 +346,15 @@ export function MailFolderList({
           : null}
         <div className="flex items-center gap-2">
           <span className="min-w-0 flex-1 truncate">
-            {!status
-              ? ""
-              : setup === null
-                ? "Mail syncs in the background"
-                : "Nothing is syncing"}
+            {progress
+              ? progress.total > 0
+                ? `Syncing ${progress.done} of ${progress.total}`
+                : "Syncing…"
+              : !status
+                ? ""
+                : setup === null
+                  ? "Mail syncs in the background"
+                  : "Nothing is syncing"}
           </span>
           <button
             type="button"

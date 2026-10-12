@@ -103,7 +103,7 @@ export function MailView({
   onToggleSidebar,
 }: Props) {
   const side = useReadingPaneSide();
-  const { status, error, refresh } = useMailStatus();
+  const { status, error, refresh, progress } = useMailStatus();
   const mailboxPref = useSelectedMailbox();
   const folderPref = useSelectedFolder();
   const {
@@ -405,6 +405,7 @@ export function MailView({
             onSelectFolder={(id) => pick(null, String(id))}
             onSelectArchive={() => pick(null, ARCHIVE_PREF)}
             onSynced={() => void refresh()}
+            progress={progress}
           />
         </aside>
         <div

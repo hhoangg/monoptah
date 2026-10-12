@@ -370,3 +370,43 @@ describe("setup states, in the list pane's words", () => {
     expect(footer()).toContain("Nothing is syncing");
   });
 });
+
+describe("sync progress in the footer", () => {
+  const withProgress = (progress: { done: number; total: number } | null) =>
+    act(() =>
+      root.render(
+        createElement(MailFolderList, {
+          status: {
+            sources: [source(1, "Main", [mailbox(1, 1, "o@a.com")])],
+            unreadTotal: 0,
+            unreadableTotal: 0,
+            syncIntervalSecs: 3600,
+          } as unknown as MailStatus,
+          mailboxId: null,
+          folderId: null,
+          onSelectAll: vi.fn(),
+          onSelectMailbox: vi.fn(),
+          onSelectFolder: vi.fn(),
+          progress,
+        }),
+      ),
+    );
+
+  it("says how far a running sync has got", async () => {
+    await withProgress({ done: 42, total: 214 });
+    expect(footer()).toContain("Syncing 42 of 214");
+    expect(footer()).not.toContain("Mail syncs in the background");
+  });
+
+  it("does not claim a count while the bucket is still being listed", async () => {
+    await withProgress({ done: 0, total: 0 });
+    expect(footer()).toContain("Syncing…");
+    expect(footer()).not.toContain(" of ");
+  });
+
+  it("goes back to the resting line when the sync ends", async () => {
+    await withProgress({ done: 1, total: 2 });
+    await withProgress(null);
+    expect(footer()).toContain("Mail syncs in the background");
+  });
+});
