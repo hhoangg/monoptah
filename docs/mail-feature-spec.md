@@ -15,8 +15,9 @@ the reason are recorded, because the reason is the part that gets lost.
 
 In scope for v1:
 
-- One mail provider, AWS (SES for sending, S3 for receiving), behind a provider
-  abstraction so IMAP/Cloudflare can be added without touching the mailbox UI.
+- One mail provider, AWS (SES for sending, S3 for receiving). The AWS calls sit
+  behind small traits (§2.1), but there is no provider abstraction yet: adding
+  IMAP or Cloudflare would need one, and that is future work.
 - **Many domains.** Several SES regions, several buckets, several AWS key pairs,
   in any combination — see §4.1. One unified mailbox over all of them.
 - Mailboxes that map 1:1 to the SES receipt-rule → S3-prefix layout already in
@@ -50,13 +51,16 @@ Out of scope for v1 (named so they are not accidentally designed out):
 │  src/features/mail/model/*.ts               invoke wrappers, types    │
 └──────────────────────────── invoke() ─────────────────────────────────┘
 ┌─ rust ────────────────────────────────────────────────────────────────┐
-│  src-tauri/src/mail.rs           commands, sync loop, thread linking  │
+│  src-tauri/src/mail.rs           commands, clients, keychain           │
+│  src-tauri/src/mail_sync.rs      list-and-reconcile loop, scheduler   │
+│  src-tauri/src/mail_thread.rs    thread linking                       │
 │  src-tauri/src/mail_store.rs     SQL, schema, queries                 │
-│  src-tauri/src/mail_mime.rs      parse incoming, build outgoing       │
+│  src-tauri/src/mail_mime.rs      parse + sanitise incoming            │
+│  src-tauri/src/mail_build.rs     build outgoing MIME                  │
+│  src-tauri/src/mail_send.rs      outbox, send, sent copy              │
 │  src-tauri/src/aws_s3.rs         S3 calls, behind trait S3Api         │
-│  src-tauri/src/aws_ses.rs        SES calls                            │
+│  src-tauri/src/aws_ses.rs        SES calls, behind trait SesApi       │
 │  src-tauri/src/aws_sigv4.rs      request signing (reusable)           │
-│  src-tauri/src/mail_provider.rs  trait MailProvider + AwsProvider     │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -72,22 +76,21 @@ Hard rules that shape this:
 - **S3 is the source of truth for received mail.** Local rows are a cache plus
   local-only state (read, starred, archived, thread id, folder membership).
 
-### 2.1 Provider seam
+### 2.1 Provider seams
 
-```rust
-pub(crate) trait MailProvider {
-    fn list_objects(&self, prefix: &str, after: Option<&str>) -> Result<ObjectPage>;
-    fn get_object(&self, key: &str) -> Result<Vec<u8>>;
-    fn delete_objects(&self, keys: &[String]) -> Result<Vec<DeleteOutcome>>;
-    fn put_object(&self, key: &str, body: &[u8], content_type: &str) -> Result<()>;
-    fn send_raw(&self, from: &str, rcpt: &[String], mime: &[u8]) -> Result<String>;
-    fn verified_identities(&self) -> Result<Vec<Identity>>;
-}
-```
+There is no `MailProvider` trait and no `mail_provider.rs`. What exists is
+three seams, each added so the logic above it can be tested without AWS:
 
-`AwsProvider` is the only implementor in v1. Everything above the trait — sync,
-threading, folders, UI — is provider-agnostic. An IMAP provider would map
-`list_objects` to `UID SEARCH`/`FETCH` and `send_raw` to SMTP.
+- `S3Api` (`aws_s3.rs`): list, get, put, delete objects.
+- `SesApi` (`aws_ses.rs`): send raw, list identities, account state.
+- `AwsClients` (`mail.rs`): builds one of each for a source from its keychain
+  credentials. `ClientFactory` (`mail_sync.rs`) is the S3-only view of it that
+  the sync loop sees.
+
+Sync, send and identity refresh depend on those traits, never on `ureq` or a
+secret. They are not provider-agnostic: they know S3 prefixes, SES identities
+and `sent/`. A provider trait covering IMAP or Cloudflare would have to be
+designed against a second real provider, and is future work.
 
 ---
 
@@ -124,7 +127,7 @@ npm install @tiptap/react @tiptap/pm @tiptap/starter-kit @tiptap/extension-image
 | `@tiptap/starter-kit` | In v3 this bundles **Link** and **Underline** (both new in v3), plus Bold, Italic, Strike, Code, Blockquote, BulletList, OrderedList, ListItem, ListKeymap, CodeBlock, HardBreak, Heading, HorizontalRule, Paragraph, Text, Document, Dropcursor, Gapcursor, **Undo/Redo** and TrailingNode. Every button in the composer toolbar is covered by it — no separate extension packages, and no history extension to wire up. |
 | `@tiptap/extension-image` | The one thing StarterKit does not carry: inline images pasted or dropped into a draft, which become `cid:` parts on send. |
 
-All current at `3.31.x`, all MIT. Pin them to the same minor: TipTap's packages
+All current at `3.31.x`, all MIT. They are pinned to the same minor with `~3.31.4` in `package.json`: TipTap's packages
 peer-depend on each other at an *exact* version, so a mixed set fails to
 resolve. React 19 is in `@tiptap/react`'s peer range
 (`^17.0.0 || ^18.0.0 || ^19.0.0`).
@@ -305,7 +308,7 @@ CREATE TABLE IF NOT EXISTS mail_account (
   bucket         TEXT NOT NULL,
   s3_region      TEXT NOT NULL,
   default_from   TEXT,                       -- 'Name <owner@byptah.com>'
-  attach_policy  TEXT NOT NULL DEFAULT 'on_demand',  -- on_demand | always
+  attach_policy  TEXT NOT NULL DEFAULT 'on_demand',  -- on_demand | always (stored, not acted on)
   image_policy   TEXT NOT NULL DEFAULT 'ask',        -- ask | always | never
   enabled        INTEGER NOT NULL DEFAULT 1,
   sort_order     INTEGER NOT NULL DEFAULT 0,
@@ -523,7 +526,7 @@ CREATE TABLE IF NOT EXISTS mail_outbox (
   attachments_json TEXT NOT NULL DEFAULT '[]',  -- [{path,filename,mime,cid?}]
   in_reply_to   TEXT,
   references_json TEXT NOT NULL DEFAULT '[]',
-  state         TEXT NOT NULL DEFAULT 'draft',  -- draft|queued|sending|sent|failed
+  state         TEXT NOT NULL DEFAULT 'draft',  -- draft|queued|sending|sent|failed|unconfirmed
   attempts      INTEGER NOT NULL DEFAULT 0,
   last_error    TEXT,
   ses_message_id TEXT,
@@ -559,6 +562,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS mail_message_fts USING fts5 (
 
 `remove_diacritics 2` matters here: it makes `hoang` find `Hoàng`.
 
+`attach_policy = 'always'` is accepted and stored, but nothing downloads
+attachments early and no control sets it: attachments are fetched on demand
+whatever the value. It is kept so the column does not have to change when it is
+built.
+
 ### Where local state lives vs S3
 
 | State | Lives in | Note |
@@ -579,10 +587,23 @@ pattern), which wakes every 60 s and syncs any mailbox whose
 hour by default, in `monocode.mail.syncIntervalSeconds`). A `mail_sync_now`
 command triggers it immediately.
 
+Rust starts with Mail **off** and the webview pushes `monocode.mail.enabled`
+with `mail_set_enabled` at startup and on every change. While it is off the
+scheduler and the daily identity refresh do nothing: no S3 or SES call. Off is
+the default so there is no window at launch in which an off user's buckets
+could be read. Commands the user starts (Sync now, Test source) are not gated;
+Mail off hides their buttons.
+
+A source registers its `sent/` mailbox when it is saved, and the scheduler also
+registers it for every enabled source it plans, so a source created before
+that existed syncs mail sent from other machines without an edit.
+
 With several sources this needs three rules it would not need with one:
 
-- **One mutex per `credential_id`, not one global mutex.** Sources that share a
-  key pair are serialised, so a manual sync of one does not race a scheduled
+- **One mutex per S3 credential, not one global mutex.** The S3 listing is what
+  is contended, so the key that reads the bucket (`s3_credential_id`, else
+  `credential_id`) picks the lock, not the SES one. Sources that share that key
+  are serialised, so a manual sync of one does not race a scheduled
   sync of another and double-insert; sources on *different* AWS accounts run
   concurrently, because they cannot throttle each other.
 - **A source failing is isolated.** An `AccessDenied` on `acme-inbound` sets
@@ -766,6 +787,13 @@ with escaped text and `<br>`, else empty.
   webview cache or storage touched, no access to the app origin, and a guard
   that refuses `127.0.0.1`, RFC1918, `169.254.169.254` and `*.local`, which a
   webview fetch would happily reach. Say that in the UI, not the IP claim.
+- **Size and depth caps**: ammonia's parser is quadratic in nesting depth, so
+  one hostile mail could pin a sync thread. HTML over 2 MiB, or nested deeper
+  than 512 elements by a cheap tag scan that over-counts, is not sanitised. The
+  message is kept, never `error`: a notice paragraph, then the escaped text
+  part when there is one. The parse also runs before the app-wide store lock is
+  taken, and an attempt is recorded before it starts, so a parse that never
+  returns is given up on after 3 launches instead of hanging every one.
 - **`cid:` inline images**: resolved at render time against
   `mail_attachment.content_id` and swapped for a blob URL.
 
@@ -826,9 +854,10 @@ A "Plain text" toggle renders `body_text` in a plain `<pre>`-ish block with
 linkified URLs and no iframe at all. That is the safe path for anything
 suspicious, and it is what the keyboard-driven reader will mostly use.
 
-A "View raw source" action re-fetches the object from S3 and shows it in the
-existing CodeMirror viewer — no new dependency, and it makes the sample
-`Received:`/`DKIM-Signature` wall inspectable.
+A "View raw source" action re-fetches the object from S3 and shows it in a plain
+`<pre>` — no new dependency, and it makes the sample
+`Received:`/`DKIM-Signature` wall inspectable. A CodeMirror viewer would add
+highlighting nobody needs for RFC 822 and a second editor surface to size.
 
 ---
 
@@ -890,7 +919,8 @@ On send, `src/features/mail/model/mailCompose.ts` derives both MIME parts:
    `> ` for quotes, and appends `(https://…)` after a link whose text is not the
    URL. A real text part is required: `multipart/alternative` with a stub text
    part is what gets a message scored as spam.
-3. **`quoted_html`** is appended after both, unchanged.
+3. **`quoted_html`** is appended after both. It is the stored sanitised HTML with
+   two reader-side states undone (see below), nothing else.
 
 ### The quoted original
 
@@ -899,6 +929,13 @@ collapsed block under it, and appended at send time. The reason is the same one
 as above: pouring arbitrary received HTML through TipTap's schema would rewrite
 it. A **Quote inline** action inserts the *plain-text* rendering into the
 editor instead, for people who answer point by point.
+
+What is stored for the reader is not quite what should be sent. A remote image
+the user has not loaded is `src=""` plus `data-mono-src`; it goes out with its
+URL back in `src` (only absolute http(s) ones; a relative one has no base in the
+recipient's client). A `cid:` image points at a part of the original that a
+reply or forward does not attach, so it goes out as its alt text, or as nothing
+when it has none. `data:` images are left alone.
 
 ### Attachments and inline images
 
@@ -940,7 +977,7 @@ editorProps: {
 
 The composer is behind `lazySurface` (`src/shared/ui/lazySurface.tsx`), the
 same helper `App.tsx` uses for `AutomationsView`, with a `.preload` fired when
-the Mail view mounts. ProseMirror is a few hundred KB and nobody who only reads
+the pointer or focus reaches the Compose button. ProseMirror is a few hundred KB and nobody who only reads
 mail should pay for it.
 
 ---
@@ -1064,8 +1101,9 @@ has nothing in the bucket to read, so the two reads are answered differently:
 For `sending` and `unconfirmed` rows no message is recorded, and the staged
 files stay the only copy; none of this reads them for deletion.
 
-A send failure leaves `state='failed'` with `last_error`; the thread shows the
-message with a retry affordance. Sends are not retried automatically — a
+A send failure leaves `state='failed'` with `last_error`. The thread does not
+show it: the failed message is in the Outbox, which is where Send again and
+Re-arm live. Sends are not retried automatically — a
 half-delivered email resent silently is worse than a visible failure.
 
 ---
@@ -1078,7 +1116,8 @@ One `mail_folder` + N `mail_folder_rule`. The same model backs the ad-hoc filter
 chips in the thread list, which is why "Save as folder" is a pure data copy and
 not a re-implementation.
 
-Fields: `from`, `to`, `cc`, `recipient` (to ∪ cc), `subject`, `body`, `mailbox`,
+Fields: `from`, `to`, `cc`, `recipient` (to ∪ cc), `subject`, `body`, `text`
+(subject, body and participants), `mailbox`,
 `domain`, `account`, `has_attachment`, `date`, `is_unread`, `is_starred`.
 `domain` and `account` are what scope a folder to one or some of the configured
 sources; with neither, the folder spans every domain.
@@ -1086,6 +1125,13 @@ Operators: `is`, `contains`, `contains_any`, `starts_with`, `ends_with`,
 `matches` (SQLite `GLOB`, not a regex — no regex engine in the DB and no
 appetite for a user-supplied one), `before`, `after`, `within_days`, `true`.
 Each rule has a `negate` flag; `match_mode` is `all` or `any`.
+
+`subject`, `body` and `text` with `contains` are full-text matches on the FTS
+index; `text` queries all three columns (`{subject body people}`). `body` stays
+body-only so a folder saved with it keeps its meaning. `from`, `to`, `cc` and
+`recipient` ignore case and accents (`mail_fold`, registered on the connection),
+so `from:hoang` finds `Hoàng`, as a bare `hoang` does; `matches` stays a
+case-sensitive glob.
 
 ### Evaluation
 
@@ -1117,7 +1163,8 @@ several folders at once. `= 1` makes it behave like a real folder.
 
 `from:`, `to:`, `cc:`, `subject:`, `body:`, `has:attachment`, `is:unread`,
 `is:starred`, `in:owner@…`, `domain:byptah.com`, `source:byptah-mail`,
-`after:`/`before:`, bare words → `body` contains.
+`after:`/`before:`, bare words → `text` contains (subject, body and people).
+`body:` is body only. A rule on `body` is written back to the box as `body:…`.
 The parser's output is a `Vec<Rule>` — the identical type the rule editor and
 `mail_folder_rule` use. One grammar, one evaluator, three entry points.
 
@@ -1125,8 +1172,11 @@ The parser's output is a `Vec<Rule>` — the identical type the rule editor and
 
 ## 10. Delete and archive
 
-Both the toolbar and the context menu open the dialog in screen 5 of the
-mockup. There is no silent destructive default.
+The toolbar opens the dialog in screen 5 of the mockup. A row context menu is
+not built and is future work. On a thread that is already archived the dialog
+offers only the delete, behind the typed word, because archiving again does
+nothing. A smart folder cannot be named "Archive", which is the name of the
+Archive view. There is no silent destructive default.
 
 - **Archive locally** — `mail_message.state='archived'` for the thread's
   messages, `mail_thread.state='archived'`, `archived_at` set. S3 untouched.
@@ -1203,7 +1253,7 @@ exists.
 |---|---|---|
 | Any button | `SecondaryButton.tsx` | The only shared button. Has a `danger` prop — that is the Delete-on-S3 button. |
 | Compose / smart-folder / delete dialogs | `Modal.tsx` (`Modal`, `ModalPanel`) | Portals to `document.body` at `LAYER.dialog`, Escape handler, backdrop close. Sizes `sm` (420px) and `md` (560px); compose needs a wider panel, so pass `className` rather than adding a third size. |
-| From picker, mailbox menu, row context menu | `Popover.tsx` | Anchors to an element, ref, rect **or a bare point** — the point form is what makes it a context menu. `role="menu"` + hand-styled `role="menuitem"` buttons, as `MonoRailSection.tsx:318` does. |
+| From picker, mailbox menu (a row context menu is future work) | `Popover.tsx` | Anchors to an element, ref, rect **or a bare point** — the point form is what makes it a context menu. `role="menu"` + hand-styled `role="menuitem"` buttons, as `MonoRailSection.tsx:318` does. |
 | Region / credential / rule-field dropdowns | `SearchableSelect.tsx` | Has a `variant` of `field \| transparent \| row \| panel \| pill`. |
 | Mailbox colour, smart-folder colour | `ColorPickerPopover.tsx` (`ColorPickerPopover`, `ColorSwatchRow`) | Already exactly the swatch row in the mockup. |
 | `date` rule values | `DateTimePicker.tsx` | Plus its `toLocalDateTime` / `parseLocalDateTime` helpers. |
@@ -1372,7 +1422,7 @@ src/features/settings/ui/MailSourceCard.tsx      one bucket/region + its mailbox
 | File | Change |
 |---|---|
 | `src/shared/ui/icons.tsx` | Add the icons listed in §11.1, deep-imported, via `wrap()`. `Archive`, `Folder`, `ListFilter`, `Star`, `Trash2`, `Inbox`, `ImagePlus`, `ListBullet`, `Loader` already exist. |
-| `package.json` | The five TipTap packages in §3. |
+| `package.json` | The four TipTap packages in §3, pinned `~3.31.4`. |
 | `src/app/shell/Sidebar.tsx` | Add `onOpenMail` / `mailActive` to the props type, the destructure and the three pass-throughs; add an `IconButton` in the expanded row (~L2407-2475) and a `CompactRailAction` in the 48px rail (~L2682-2715); include `mailActive` in the two "a non-workspace view is open" checks (~L795, ~L2583). Use the Automations entry as the template. |
 | `src/app/App.tsx` | `mailViewOpen` state + ref mirror (~L1261); `onOpenMail` callback (~L11866 pattern); `setMailViewOpen(false)` in **every** other view opener — grep `setAutomationsViewOpen` and match each site; `lazySurface` import of `MailView` (~L838) and its `.preload` (~L1567); render branch (~L13399); the layout/visibility conditions that currently test `automationsViewOpen` (L1514, 1521, 2192, 5577, 12004, 12301, 12384, 12849, 12971, 13037-13053, 13279, 13444). |
 | `src/features/settings/model/settings.ts` | `"mail"` in the `SettingsSectionId` union (L20-32); a `SETTINGS_SECTIONS` entry in group `workspace` (after `inbox`); `SETTINGS_INDEX` rows for the searchable controls; `loadMailEnabled` / `saveMailEnabled` next to `loadNotesEnabled` (L791-802). |
@@ -1381,7 +1431,17 @@ src/features/settings/ui/MailSourceCard.tsx      one bucket/region + its mailbox
 | `src-tauri/src/lib.rs` | `mod mail;` and friends; the commands in `generate_handler!` (~L297+); `mail::init(app.handle())` in `.setup()` (~L268). |
 | `src-tauri/src/session_store.rs` | One line in `migrate()` (~L1005): `crate::mail_store::ensure_tables(conn)?;` |
 | `src-tauri/tauri.conf.json` | `frame-src 'none'` → `'self'` in both `security.csp` and `security.devCsp`. Nothing else. |
-| `src-tauri/Cargo.toml` | The four crates in §3. |
+| `src-tauri/Cargo.toml` | The four crates in §3, and the `functions` feature on `rusqlite` (for `mail_fold`). |
+
+Also changed, and not new files:
+
+| File | Change |
+|---|---|
+| `src/shared/ui/Modal.tsx` | An optional `width` prop that replaces the size's width on the positioned wrapper. A width class in `className` lands on the inner panel and leaves it off-centre. Unchanged when not passed. |
+| `src-tauri/src/fs.rs` | `write_attachment` now calls `write_attachment_into(dir, …)`, which takes the destination. A draft's file must outlive the OS temp pruning, so `mail_stage_attachment` stages it elsewhere. The generic command keeps the temp dir. |
+| `src/features/settings/ui/primitives.tsx` | `Group`, `Row`, `Segmented`, `Slider`, `Toggle`, `Select` moved out of `SettingsView.tsx` word for word (`Toggle` gained an optional `describedBy`). An upstream edit to one of them will conflict. |
+| `src-tauri/tauri.conf.json` | `frame-src 'none'` → `'self'`, applies to every feature, not just Mail. Safe because the mail frame has no `allow-scripts`, carries its own CSP, and no other raw-HTML insertion point receives sender HTML. A future upstream feature that inserts raw HTML into a same-origin frame must be reviewed against it. |
+| `.gitignore` | `/work/`. |
 
 Everything else is new files, which keeps the merge surface against upstream
 small — the pattern this fork already follows.
@@ -1434,6 +1494,10 @@ mail_mailboxes_delete(id)
 mail_sync_now(scope: SyncScope) -> Vec<SyncReport>  // all | source(id) | mailbox(id)
                                    // mailbox(id) syncs that mailbox's whole
                                    // source: the scheduler works per source.
+mail_set_enabled(enabled)          // Rust starts OFF; the webview pushes
+                                   // monocode.mail.enabled at startup and on
+                                   // change. Off stops the scheduled sync and
+                                   // the identity refresh.
 mail_sync_interval_set(secs)       // Rust cannot read localStorage, so the
                                    // webview MUST push the interval at startup
                                    // and on every settings change. Without it
@@ -1463,6 +1527,10 @@ mail_outbox_check(id) -> Vec<SendProblem>   // sandbox and sending_disabled, so
                                             // with the send path, so the
                                             // warning and the block cannot drift.
 mail_outbox_send(id) -> SendReport
+mail_outbox_rearm(id)                       // an unconfirmed row back to a draft,
+                                            // only on the user's say-so
+mail_stage_attachment(name, data) -> path   // copies a draft's file to a place
+                                            // that outlives temp pruning
 mail_outbox_list() / mail_outbox_delete(id)
 mail_identities(account_id: Option<i64>) -> Vec<Identity>
 mail_sendable_mailboxes() -> Vec<SendableMailbox>  // the From picker, grouped by domain
@@ -1532,8 +1600,8 @@ the template):
   107 days apart does not merge; same chain in `owner/` and `seller/` stays two
   threads; the same chain reaching `owner@hhoangg.com` and `owner@byptah.com`
   stays two threads; a 3-way merge reparents all messages and leaves no orphan thread.
-- Multi-source: two sources sharing one credential serialise, two on different
-  credentials do not; one source failing leaves the others' `last_error` NULL
+- Multi-source: two sources sharing one S3 credential serialise, two on different
+  S3 credentials do not; one source failing leaves the others' `last_error` NULL
   and their threads readable; a duplicate mailbox address across sources is
   rejected and the error names the existing source; deleting a credential still
   referenced is refused; the same domain verified in one region and not another
@@ -1542,7 +1610,7 @@ the template):
 - Sync reconcile: new key inserts; vanished key archives and does not delete;
   re-listed key does not un-archive a user-archived thread; etag change
   re-parses; `DeleteObjects` partial failure keeps the local row.
-- MIME parse of `work/` fixtures including the real sample mail: encoded-word
+- MIME parse of the fixtures in `src-tauri/tests/fixtures/mail`, including the real sample mail: encoded-word
   `From`, `multipart/alternative`, `Date` vs `Received` divergence, SES
   `Authentication-Results` → spf/dkim/dmarc columns.
 - Sanitiser: `<script>` removed; `onerror=` removed; `javascript:` href removed;
