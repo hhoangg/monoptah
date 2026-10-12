@@ -101,11 +101,25 @@ fn address_list(list: &[Recipient]) -> Address<'static> {
     )
 }
 
+/// Unicode category Cf. Rust's `char` has no category query, so the ranges are
+/// listed (Unicode 16). They include the bidi overrides and isolates that
+/// reorder a displayed file name, and the zero-width characters that hide
+/// parts of it.
+pub(crate) fn is_format_char(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2
+        | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F
+        | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
 /// A filename comes from the user's disk but ends up in a header, and a
-/// recipient's mail client may write it back to a disk: no separators.
+/// recipient's mail client may write it back to a disk: no separators, and no
+/// format characters that make the name read as something else.
 pub(crate) fn safe_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
+        .filter(|c| !is_format_char(*c))
         .map(|c| {
             if c.is_control() || c == '/' || c == '\\' {
                 '_'
@@ -386,6 +400,8 @@ mod tests {
         assert_eq!(safe_filename("  .hidden"), "hidden");
         assert_eq!(safe_filename("\r\n"), "__");
         assert_eq!(safe_filename("..."), "attachment");
+        assert_eq!(safe_filename("x\u{202E}fdp.terminal"), "xfdp.terminal");
+        assert!(is_format_char('\u{200D}') && !is_format_char('a') && !is_format_char('\u{00E9}'));
         let to = [who("a@x.com")];
         let files = [LoadedAttachment {
             filename: "dir/inner.txt".into(),

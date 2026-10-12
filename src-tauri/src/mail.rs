@@ -16,6 +16,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::aws_s3::{S3Api, S3Client, S3ErrorKind};
 use crate::aws_ses::{SesApi, SesClient, SesErrorKind};
 use crate::aws_sigv4::Credentials;
+use crate::mail_build;
 use crate::mail_send;
 use crate::mail_store::{
     self, AccountInput, CredentialInput, MailAccount, MailCredential, MailIdentity, MailMailbox,
@@ -24,7 +25,6 @@ use crate::mail_store::{
 use crate::mail_sync::{self, ClientFactory, SyncReport, SyncService, TauriEvents};
 use crate::session_store::{now_millis, SessionStore};
 
-const KEYCHAIN_SERVICE: &str = "com.monoptah.desktop";
 const PROVIDER: &str = "aws";
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// How often the daily identity refresh looks for sources that are due.
@@ -52,47 +52,67 @@ pub(crate) trait SecretStore: Send + Sync {
     fn remove(&self, credential_id: i64) -> Result<(), String>;
 }
 
-pub(crate) struct Keychain;
-
-fn entry(credential_id: i64, field: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(
-        KEYCHAIN_SERVICE,
-        &format!("mail.aws.cred.{credential_id}.{field}"),
-    )
-    .map_err(|_| "Could not access the system credential store.".to_string())
+pub(crate) struct Keychain {
+    service: String,
 }
 
-fn read_entry(credential_id: i64, field: &str) -> Result<Option<String>, String> {
-    match entry(credential_id, field)?.get_password() {
-        Ok(value) => Ok(Some(value)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(_) => Err("Could not read the AWS key from the system credential store.".into()),
+/// The entry names carry the database row id, and the dev build has its own
+/// database whose ids restart at 1. A shared service would let a dev save or
+/// delete overwrite the installed app's key pair, so the service is the running
+/// app's identifier. The production identifier is `com.monoptah.desktop`, the
+/// string this used to be hard-coded to, so installed apps keep their entries.
+pub(crate) fn keychain_service(app_identifier: &str) -> String {
+    app_identifier.to_string()
+}
+
+impl Keychain {
+    pub(crate) fn new(app_identifier: &str) -> Self {
+        Self {
+            service: keychain_service(app_identifier),
+        }
     }
-}
 
-fn write_entry(credential_id: i64, field: &str, value: &str) -> Result<(), String> {
-    entry(credential_id, field)?
-        .set_password(value)
-        .map_err(|_| "Could not save the AWS key to the system credential store.".to_string())
-}
+    fn entry(&self, credential_id: i64, field: &str) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(
+            &self.service,
+            &format!("mail.aws.cred.{credential_id}.{field}"),
+        )
+        .map_err(|_| "Could not access the system credential store.".to_string())
+    }
 
-fn delete_entry(credential_id: i64, field: &str) -> Result<(), String> {
-    match entry(credential_id, field)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(_) => Err("Could not remove the AWS key from the system credential store.".into()),
+    fn read_entry(&self, credential_id: i64, field: &str) -> Result<Option<String>, String> {
+        match self.entry(credential_id, field)?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err("Could not read the AWS key from the system credential store.".into()),
+        }
+    }
+
+    fn write_entry(&self, credential_id: i64, field: &str, value: &str) -> Result<(), String> {
+        self.entry(credential_id, field)?
+            .set_password(value)
+            .map_err(|_| "Could not save the AWS key to the system credential store.".to_string())
+    }
+
+    fn delete_entry(&self, credential_id: i64, field: &str) -> Result<(), String> {
+        match self.entry(credential_id, field)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("Could not remove the AWS key from the system credential store.".into()),
+        }
     }
 }
 
 impl SecretStore for Keychain {
     fn put(&self, credential_id: i64, keys: &KeyPair) -> Result<(), String> {
-        let previous = read_entry(credential_id, "access_key_id")?;
-        write_entry(credential_id, "access_key_id", &keys.access_key_id)?;
-        if let Err(error) = write_entry(credential_id, "secret_access_key", &keys.secret_access_key)
+        let previous = self.read_entry(credential_id, "access_key_id")?;
+        self.write_entry(credential_id, "access_key_id", &keys.access_key_id)?;
+        if let Err(error) =
+            self.write_entry(credential_id, "secret_access_key", &keys.secret_access_key)
         {
             // Never leave a new id sitting beside the old secret.
             let _ = match previous {
-                Some(old) => write_entry(credential_id, "access_key_id", &old),
-                None => delete_entry(credential_id, "access_key_id"),
+                Some(old) => self.write_entry(credential_id, "access_key_id", &old),
+                None => self.delete_entry(credential_id, "access_key_id"),
             };
             return Err(error);
         }
@@ -100,8 +120,8 @@ impl SecretStore for Keychain {
     }
 
     fn get(&self, credential_id: i64) -> Result<Option<KeyPair>, String> {
-        let id = read_entry(credential_id, "access_key_id")?;
-        let secret = read_entry(credential_id, "secret_access_key")?;
+        let id = self.read_entry(credential_id, "access_key_id")?;
+        let secret = self.read_entry(credential_id, "secret_access_key")?;
         Ok(match (id, secret) {
             (Some(access_key_id), Some(secret_access_key)) => Some(KeyPair {
                 access_key_id,
@@ -112,8 +132,8 @@ impl SecretStore for Keychain {
     }
 
     fn remove(&self, credential_id: i64) -> Result<(), String> {
-        let id = delete_entry(credential_id, "access_key_id");
-        let secret = delete_entry(credential_id, "secret_access_key");
+        let id = self.delete_entry(credential_id, "access_key_id");
+        let secret = self.delete_entry(credential_id, "secret_access_key");
         id.and(secret)
     }
 }
@@ -175,7 +195,7 @@ pub(crate) struct MailState {
 }
 
 pub fn init(app: &AppHandle) {
-    let secrets: Arc<dyn SecretStore> = Arc::new(Keychain);
+    let secrets: Arc<dyn SecretStore> = Arc::new(Keychain::new(&app.config().identifier));
     let live = Arc::new(LiveClients {
         secrets: secrets.clone(),
     });
@@ -446,6 +466,10 @@ pub(crate) fn source_upsert(
     let conn = store.lock_conn()?;
     validate_account(&conn, &mut input)?;
     let id = mail_store::upsert_account(&conn, &input).map_err(db)?;
+    // Registered with the source rather than on the first send: a machine that
+    // has never sent must still read the `sent/` copies another one wrote.
+    // Idempotent, so an edit costs one lookup.
+    mail_store::ensure_sent_mailbox(&conn, id).map_err(db)?;
     let account = mail_store::get_account(&conn, id)
         .map_err(db)?
         .ok_or_else(|| "The source was saved but could not be read back.".to_string())?;
@@ -499,13 +523,42 @@ pub(crate) fn mailboxes_upsert(
             mail_store::SENT_PREFIX
         ));
     }
+    // Two mailboxes whose prefixes nest list the same objects, so one message
+    // would be filed twice and a hard delete in one would pull the object out
+    // from under the other. Checked against the rows already stored as well.
+    let conn = store.lock_conn()?;
+    let stored: Vec<MailMailbox> = mail_store::list_user_mailboxes(&conn, Some(account_id))
+        .map_err(db)?
+        .into_iter()
+        .filter(|m| {
+            !rows
+                .iter()
+                .any(|r| r.address.eq_ignore_ascii_case(&m.address))
+        })
+        .collect();
+    let others = stored
+        .iter()
+        .map(|m| (m.address.as_str(), m.s3_prefix.as_str()));
+    let incoming = rows
+        .iter()
+        .map(|r| (r.address.as_str(), r.s3_prefix.as_str()));
+    let all: Vec<(&str, &str)> = others.chain(incoming).collect();
+    for (i, (address, prefix)) in all.iter().enumerate() {
+        if let Some((other, other_prefix)) = all[i + 1..]
+            .iter()
+            .find(|(_, o)| prefix.starts_with(o) || o.starts_with(prefix))
+        {
+            return Err(format!(
+                "Prefix '{prefix}' ({address}) overlaps '{other_prefix}' ({other}): each message would show up in both mailboxes. Give every mailbox its own folder, for example 'a/' and 'b/'."
+            ));
+        }
+    }
     if let Some(row) = rows.iter().find(|r| r.s3_prefix.starts_with('/')) {
         return Err(format!(
             "Prefix '{}' must not start with '/'.",
             row.s3_prefix
         ));
     }
-    let conn = store.lock_conn()?;
     if mail_store::get_account(&conn, account_id)
         .map_err(db)?
         .is_none()
@@ -971,12 +1024,14 @@ pub(crate) fn raw_message(
 }
 
 /// A name that is safe to create on any platform: one path component, no
-/// control or reserved characters, no leading dot.
+/// control, format or reserved characters, no leading dot. Format characters
+/// include the bidi overrides, which let `x\u{202E}fdp.terminal` display as
+/// `xlanimret.pdf`.
 fn safe_file_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = base
         .chars()
-        .filter(|c| !c.is_control() && !":*?\"<>|".contains(*c))
+        .filter(|c| !c.is_control() && !mail_build::is_format_char(*c) && !":*?\"<>|".contains(*c))
         .collect();
     let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
     let name: String = trimmed.chars().take(100).collect();
@@ -1058,10 +1113,63 @@ pub(crate) fn ensure_attachment(
         safe_file_name(&attachment.filename)
     ));
     std::fs::write(&path, bytes).map_err(|_| "Could not save the attachment.".to_string())?;
+    // A stranger's file: the mark is what makes Gatekeeper and SmartScreen
+    // check it when it is opened. Failing to set it must not cost the user the
+    // attachment, but it is logged so it is never silently absent.
+    if let Err(error) = mark_downloaded(&path) {
+        eprintln!(
+            "mail: could not mark attachment {} as downloaded from the internet: {error}",
+            path.display()
+        );
+    }
     let conn = store.lock_conn()?;
     mail_store::set_attachment_path(&conn, attachment_id, Some(&path.to_string_lossy()))
         .map_err(db)?;
     Ok(path)
+}
+
+/// Marks a file as coming from outside, the way a browser does: the
+/// `com.apple.quarantine` attribute on macOS, the `Zone.Identifier` stream
+/// (zone 3, Internet) on Windows. Nothing to do elsewhere.
+#[cfg(target_os = "macos")]
+fn mark_downloaded(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // `<flags>;<hex unix time>;<app>;`: 0081 is "downloaded, user not yet asked".
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let value = format!("0081;{secs:x};Monoptah;");
+    // SAFETY: both strings outlive the call, and the length passed is the
+    // value's own.
+    let rc = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            c"com.apple.quarantine".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn mark_downloaded(path: &Path) -> std::io::Result<()> {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    std::fs::write(stream, "[ZoneTransfer]\r\nZoneId=3\r\n")
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn mark_downloaded(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Returns how many message folders could not be removed. A folder that is
@@ -1123,13 +1231,35 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 || v4.is_documentation()
                 // 100.64.0.0/10, carrier-grade NAT
                 || (a == 100 && (64..128).contains(&b))
+                // 198.18.0.0/15, benchmarking; 240.0.0.0/4, reserved
+                || (a == 198 && (18..20).contains(&b))
+                || a >= 240
                 || a == 0)
         }
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => is_public_ip(IpAddr::V4(v4)),
             None => {
-                let first = v6.segments()[0];
+                let seg = v6.segments();
+                let first = seg[0];
+                // An IPv6 address that carries an IPv4 one reaches that host
+                // through a gateway, so it is only as public as the address inside.
+                let embedded = |hi: u16, lo: u16| {
+                    let [a, b] = hi.to_be_bytes();
+                    let [c, d] = lo.to_be_bytes();
+                    is_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)))
+                };
+                // 64:ff9b::/96 is NAT64; 64:ff9b:1::/48 is local-use NAT64.
+                let nat64 = seg[..2] == [0x64, 0xff9b] && seg[2..6] == [0; 4];
+                let local_nat64 = seg[..3] == [0x64, 0xff9b, 1];
+                // 2002::/16 is 6to4, the IPv4 address in the next two groups.
+                let six_to_four = first == 0x2002;
+                // ::a.b.c.d, deprecated IPv4-compatible; nothing legitimate uses it.
+                let v4_compatible = seg[..6] == [0; 6];
                 !(v6.is_loopback()
+                    || local_nat64
+                    || v4_compatible
+                    || (nat64 && !embedded(seg[6], seg[7]))
+                    || (six_to_four && !embedded(seg[1], seg[2]))
                     || v6.is_unspecified()
                     || v6.is_multicast()
                     || (first & 0xfe00) == 0xfc00
@@ -3150,6 +3280,7 @@ mod tests {
         assert_eq!(path.file_name().unwrap().to_string_lossy(), "2-evil.sh");
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         assert!(thread_detail(&store, thread).unwrap().messages[0].attachments[0].downloaded);
+        assert_marked_downloaded(&path);
 
         // Second call uses the file: no S3 object is needed any more.
         clients.objects.clear();
@@ -3161,6 +3292,46 @@ mod tests {
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[cfg(target_os = "macos")]
+    fn assert_marked_downloaded(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut buf = [0u8; 128];
+        let len = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                c"com.apple.quarantine".as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                0,
+            )
+        };
+        assert!(
+            len > 0,
+            "no quarantine attribute: {}",
+            std::io::Error::last_os_error()
+        );
+        let value = std::str::from_utf8(&buf[..len as usize]).unwrap();
+        assert!(
+            value.starts_with("0081;") && value.ends_with(";Monoptah;"),
+            "{value}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_marked_downloaded(path: &Path) {
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        assert_eq!(
+            std::fs::read_to_string(stream).unwrap(),
+            "[ZoneTransfer]\r\nZoneId=3\r\n"
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    fn assert_marked_downloaded(_path: &Path) {}
 
     fn reply_mail(subject: &str, id: &str, parent: &str) -> Vec<u8> {
         format!(
@@ -3557,6 +3728,103 @@ mod tests {
     }
 
     #[test]
+    fn the_keychain_service_follows_the_app_identifier_and_production_keeps_its_old_one() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let production = conf["identifier"].as_str().unwrap();
+        // The string every installed app already wrote its AWS keys under.
+        assert_eq!(keychain_service(production), "com.monoptah.desktop");
+        let dev: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.dev.conf.json")).unwrap();
+        assert_ne!(
+            keychain_service(dev["identifier"].as_str().unwrap()),
+            keychain_service(production)
+        );
+    }
+
+    #[test]
+    fn addresses_that_reach_private_hosts_through_a_gateway_are_refused() {
+        let ip = |s: &str| is_public_ip(s.parse().unwrap());
+        for private in [
+            // NAT64 with a loopback / private / metadata address inside
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::c0a8:101",
+            "64:ff9b:1::1",
+            // 6to4 with the same inside
+            "2002:7f00:1::",
+            "2002:a9fe:a9fe::1",
+            "2002:c0a8:101::",
+            // IPv4-compatible
+            "::8.8.8.8",
+            "::10.0.0.1",
+            "198.18.0.1",
+            "198.19.255.254",
+            "240.0.0.1",
+            "255.255.255.254",
+        ] {
+            assert!(!ip(private), "{private}");
+        }
+        for public in [
+            "64:ff9b::808:808",
+            "2002:808:808::1",
+            "198.17.255.255",
+            "198.20.0.0",
+            "8.8.8.8",
+            "2606:4700::1111",
+        ] {
+            assert!(ip(public), "{public}");
+        }
+    }
+
+    #[test]
+    fn mailbox_prefixes_in_one_source_cannot_nest() {
+        // `o` lists everything under `owner/`, and the reverse.
+        for (stored, added) in [("owner/", "o"), ("owner/", "owner/x/"), ("o", "owner/")] {
+            let first = mailbox_input("first@byptah.com", stored);
+            let (store, secrets) = setup();
+            let (source, _) = one_source(&store, &secrets);
+            let id = source.account.id;
+            // `one_source` already holds `owner/`; drop it so the case is exact.
+            {
+                let conn = store.lock_conn().unwrap();
+                conn.execute("DELETE FROM mail_mailbox WHERE s3_prefix = 'owner/'", [])
+                    .unwrap();
+            }
+            mailboxes_upsert(&store, id, vec![first]).unwrap();
+            let error =
+                mailboxes_upsert(&store, id, vec![mailbox_input("second@byptah.com", added)])
+                    .unwrap_err();
+            assert!(error.contains("overlaps"), "{stored} / {added}: {error}");
+        }
+        // Inside one batch, and with a sibling that does not nest.
+        let (store, secrets) = setup();
+        let (source, _) = one_source(&store, &secrets);
+        let id = source.account.id;
+        let error = mailboxes_upsert(
+            &store,
+            id,
+            vec![
+                mailbox_input("x@byptah.com", "a/"),
+                mailbox_input("y@byptah.com", "a/b/"),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("overlaps"), "{error}");
+        mailboxes_upsert(
+            &store,
+            id,
+            vec![
+                mailbox_input("x@byptah.com", "a/"),
+                mailbox_input("y@byptah.com", "b/"),
+            ],
+        )
+        .unwrap();
+        // Re-saving a mailbox with its own prefix is not an overlap with itself.
+        mailboxes_upsert(&store, id, vec![mailbox_input("x@byptah.com", "a/")]).unwrap();
+    }
+
+    #[test]
     fn remote_image_refuses_when_the_source_turns_images_off() {
         let (store, secrets) = setup();
         let (source, mailbox) = one_source(&store, &secrets);
@@ -3609,6 +3877,8 @@ mod tests {
         assert_eq!(safe_file_name("C:\\x\\..\\a?b.txt"), "ab.txt");
         assert_eq!(safe_file_name("..."), "attachment");
         assert_eq!(safe_file_name(""), "attachment");
+        assert_eq!(safe_file_name("x\u{202E}fdp.terminal"), "xfdp.terminal");
+        assert_eq!(safe_file_name("\u{200B}\u{FEFF}a\u{2066}b\u{2069}"), "ab");
         assert_eq!(safe_file_name(&"a".repeat(300)).len(), 100);
     }
 }

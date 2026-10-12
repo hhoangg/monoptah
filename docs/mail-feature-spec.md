@@ -1473,7 +1473,12 @@ mail_sendable_mailboxes() -> Vec<SendableMailbox>  // the From picker, grouped b
 ## 12. Credentials
 
 - Stored with `keyring::Entry`, the helpers in `codex_mono_store.rs:288-304`
-  being the existing precedent. Service `com.monoptah.desktop`, keys
+  being the existing precedent. Service is the running app's identifier
+  (`app.config().identifier`): `com.monoptah.desktop` in the installed app, so
+  existing entries keep working, and `com.monoptah.desktop.dev` in the dev
+  build. Entry names carry the database row id and the dev database restarts
+  its ids at 1, so a shared service would let a dev save or delete overwrite or
+  remove the installed app's keys. Keys
   `mail.aws.cred.<credential_id>.access_key_id` and `….secret_access_key`.
   Chosen over the `clickup-config.json` file pattern because this is an IAM key
   pair, not a scoped app token.
