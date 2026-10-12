@@ -573,12 +573,13 @@ fn classify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aws_sigv4::test_keys;
 
     fn client(bucket: &str) -> S3Client {
         S3Client::new(
             Credentials {
-                access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
-                secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+                access_key_id: test_keys::KEY_ID.into(),
+                secret_access_key: test_keys::SECRET.into(),
             },
             "eu-west-1",
             bucket,
@@ -697,9 +698,10 @@ mod tests {
             .find(|(k, _)| k == "Authorization")
             .unwrap()
             .1;
-        assert!(auth.starts_with(
-            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240102/eu-west-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="
-        ));
+        assert!(auth.starts_with(&format!(
+            "AWS4-HMAC-SHA256 Credential={}/20240102/eu-west-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=",
+            test_keys::KEY_ID
+        )));
         assert!(!p.headers.iter().any(|(k, _)| k == "host"));
     }
 

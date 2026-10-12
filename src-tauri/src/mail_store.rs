@@ -3805,7 +3805,7 @@ mod tests {
     use super::*;
     use crate::session_store::SessionStore;
 
-    const KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
+    use crate::aws_sigv4::test_keys::KEY_ID;
 
     fn credential(label: &str) -> CredentialInput {
         CredentialInput {

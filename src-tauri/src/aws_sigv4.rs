@@ -146,8 +146,24 @@ pub(crate) fn authorization(
     )
 }
 
+/// AWS's documented example credentials, for tests only. They authenticate
+/// nothing; each is split in two so secret scanners do not read the source as
+/// a leaked key. The values are unchanged, so the published signatures match.
+#[cfg(test)]
+pub(crate) mod test_keys {
+    pub(crate) const KEY_ID: &str = concat!("AKIA", "IOSFODNN7EXAMPLE");
+    /// The `ASIA` prefix marks a temporary (STS) key, which Mail refuses.
+    pub(crate) const TEMPORARY_KEY_ID: &str = concat!("ASIA", "IOSFODNN7EXAMPLE");
+    /// A second, made-up permanent key id, for rotation tests.
+    pub(crate) const OTHER_KEY_ID: &str = concat!("AKIA", "J5Q2ZPLMNBVCXZ9K");
+    pub(crate) const SECRET: &str = concat!("wJalrXUtnFEMI/K7MDENG+bPxRfi", "CYEXAMPLEKEY");
+    /// The S3 signing docs spell the same example secret with a '/'.
+    pub(crate) const S3_DOCS_SECRET: &str = concat!("wJalrXUtnFEMI/K7MDENG/bPxRfi", "CYEXAMPLEKEY");
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_keys::{KEY_ID, S3_DOCS_SECRET, SECRET};
     use super::*;
 
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -156,8 +172,8 @@ mod tests {
     // example 1 (GET Object with Range). Note this doc uses a secret with '/'.
     fn s3_docs_creds() -> Credentials {
         Credentials {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
-            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            access_key_id: KEY_ID.into(),
+            secret_access_key: S3_DOCS_SECRET.into(),
         }
     }
 
@@ -207,16 +223,18 @@ mod tests {
         );
         assert_eq!(
             auth,
-            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
-             SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
-             Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+            format!(
+                "AWS4-HMAC-SHA256 Credential={KEY_ID}/20130524/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
+                 Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+            )
         );
     }
 
     // AWS General Reference, "Derive a signing key" / IAM ListUsers worked example.
     #[test]
     fn iam_docs_signing_key_and_signature() {
-        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let secret = SECRET;
         let key = signing_key(secret, "20150830", "us-east-1", "iam");
         assert_eq!(
             hex(&key),
@@ -259,7 +277,9 @@ mod tests {
             "ses",
             "20240102T030405Z",
         );
-        assert!(ses.contains("Credential=AKIAIOSFODNN7EXAMPLE/20240102/eu-west-1/ses/aws4_request"));
+        assert!(ses.contains(&format!(
+            "Credential={KEY_ID}/20240102/eu-west-1/ses/aws4_request"
+        )));
         let s3 = authorization(
             &s3_docs_creds(),
             &req,

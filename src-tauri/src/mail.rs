@@ -2085,8 +2085,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
-    const KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
-    const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+    use crate::aws_sigv4::test_keys::{KEY_ID, OTHER_KEY_ID, SECRET, TEMPORARY_KEY_ID};
 
     #[derive(Default)]
     struct MemSecrets {
@@ -2594,7 +2593,7 @@ mod tests {
         bad.secret_access_key = "short secret".into();
         let error = credential_upsert(&store, &secrets, bad).unwrap_err();
         assert!(!error.contains("short secret"));
-        let mut session = keys("x", "ASIAIOSFODNN7EXAMPLE");
+        let mut session = keys("x", TEMPORARY_KEY_ID);
         session.default_region = None;
         assert!(credential_upsert(&store, &secrets, session)
             .unwrap_err()
@@ -2613,7 +2612,7 @@ mod tests {
         secrets.fail.store(false, Ordering::SeqCst);
         let first = credential(&store, &secrets, "a");
         secrets.fail.store(true, Ordering::SeqCst);
-        let rotated = keys("a", "AKIAJ5Q2ZPLMNBVCXZ9K");
+        let rotated = keys("a", OTHER_KEY_ID);
         assert!(credential_upsert(&store, &secrets, rotated).is_err());
         let conn = store.lock_conn().unwrap();
         let kept = mail_store::get_credential(&conn, first.id)
