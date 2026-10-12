@@ -1594,7 +1594,9 @@ mod tests {
         f.service.set_interval_secs(u64::MAX);
         assert_eq!(f.service.interval_secs(), MAX_INTERVAL_SECS);
         // A raw store of the unclamped value must not panic under the lock either.
-        f.service.interval_secs.store(u64::MAX, Ordering::Relaxed);
+        f.service
+            .interval_secs
+            .store(i64::MAX as u64, Ordering::Relaxed);
         assert_eq!(
             f.service
                 .sync_due(&f.store, &factory, &ev, now_millis())
