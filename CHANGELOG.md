@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-15
+
+### Added
+
+- Inbox: **Send to agent** on pull requests too, so a PR review runs as a regular session linked to the PR. It shows in the session list and in the PR's related threads.
+- Inbox: a spinner on a PR row and on its related-thread chips while a linked session is running, so you can see review progress from the list.
+
+### Changed
+
+- Inbox keeps its search, selected item, scroll position and loaded page per source when you leave it and come back. They reset when the app restarts; filters are still saved as before.
+- Mail keeps AWS key pairs in the app's database instead of the system keychain, so it no longer asks for the login password. The secret access key is encrypted with AES-256-GCM under a random per-install key stored in `mail.key` next to the database. Existing keys move over on first use (one keychain prompt per credential), then the keychain entry is removed. If `mail.key` is lost, enter the keys again in Mail settings.
+
 ## [0.18.0] - 2026-10-12
 
 ### Added
