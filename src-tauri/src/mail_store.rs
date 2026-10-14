@@ -8,8 +8,10 @@
 //! brackets before storing; a bracketed id never matches, so replies to it
 //! would silently split into a new thread.
 //!
-//! Secrets never enter this module. A credential row carries only a masked
-//! access key id; the key pair itself lives in the OS keychain.
+//! A credential row is described by a masked access key id only. The key pair
+//! sits on the same row as opaque strings (the secret already encrypted by
+//! `mail_secrets`), reachable solely through `credential_keys` and
+//! `set_credential_keys`; no listing or serialized struct selects them.
 //!
 //! Bookkeeping timestamps (`created_at`, `updated_at`, `refreshed_at`) are epoch
 //! milliseconds like the rest of the database; `date_utc` stays in seconds.
@@ -35,7 +37,8 @@ pub(crate) fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
     create_tables(conn)?;
     ensure_object_attempts(conn)?;
     ensure_identities_refreshed_at(conn)?;
-    ensure_outbox_sent_message(conn)
+    ensure_outbox_sent_message(conn)?;
+    ensure_credential_keys(conn)
 }
 
 /// `mail_fold(text)`: lower case with accents removed, for `from:` / `to:`
@@ -68,6 +71,8 @@ fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
           label          TEXT NOT NULL,
           access_key_masked TEXT NOT NULL,
           default_region TEXT,
+          access_key_id  TEXT,
+          secret_access_key TEXT,
           created_at     INTEGER NOT NULL,
           updated_at     INTEGER NOT NULL,
           UNIQUE (provider, label)
@@ -336,6 +341,13 @@ fn ensure_outbox_sent_message(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// For databases created before the key pair moved from the OS keychain onto the
+/// row. NULL is the right backfill: those rows still read the keychain once.
+fn ensure_credential_keys(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "mail_credential", "access_key_id", "TEXT")?;
+    add_column_if_missing(conn, "mail_credential", "secret_access_key", "TEXT")
+}
+
 /// A user-facing error carried through `rusqlite::Error` so callers keep a
 /// single error type. Its `Display` is exactly the message.
 fn user_error(message: String) -> rusqlite::Error {
@@ -428,6 +440,45 @@ pub(crate) fn list_credentials(conn: &Connection) -> rusqlite::Result<Vec<MailCr
         })
     })?;
     rows.collect()
+}
+
+/// The stored key pair of a credential as `(access_key_id, encrypted secret)`,
+/// or `None` when the row does not exist. Either half is `None` until a key
+/// pair has been written. Only `mail_secrets` calls this.
+pub(crate) fn credential_keys(
+    conn: &Connection,
+    id: i64,
+) -> rusqlite::Result<Option<(Option<String>, Option<String>)>> {
+    conn.query_row(
+        "SELECT access_key_id, secret_access_key FROM mail_credential WHERE id = ?1",
+        params![id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+/// Writes the key pair onto the row; `false` when the row is gone. With
+/// `only_if_empty` it leaves a row that already holds a secret alone, so a
+/// migration cannot overwrite a key the user entered in the meantime.
+pub(crate) fn set_credential_keys(
+    conn: &Connection,
+    id: i64,
+    access_key_id: &str,
+    encrypted_secret: &str,
+    only_if_empty: bool,
+) -> rusqlite::Result<bool> {
+    let guard = if only_if_empty {
+        " AND (secret_access_key IS NULL OR access_key_id IS NULL)"
+    } else {
+        ""
+    };
+    Ok(conn.execute(
+        &format!(
+            "UPDATE mail_credential SET access_key_id = ?2, secret_access_key = ?3
+             WHERE id = ?1{guard}"
+        ),
+        params![id, access_key_id, encrypted_secret],
+    )? > 0)
 }
 
 /// Deletes a credential nobody uses. A credential still referenced by a source
@@ -3907,6 +3958,29 @@ mod tests {
             .query_row("SELECT parse_attempts FROM mail_object", [], |r| r.get(0))
             .unwrap();
         assert_eq!(attempts, 0);
+    }
+
+    #[test]
+    fn ensure_tables_adds_the_key_pair_columns_to_an_older_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        // mail_credential as keychain-era builds created it.
+        conn.execute_batch(
+            "CREATE TABLE mail_credential (id INTEGER PRIMARY KEY, provider TEXT NOT NULL,
+               label TEXT NOT NULL, access_key_masked TEXT NOT NULL, default_region TEXT,
+               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE (provider, label));
+             INSERT INTO mail_credential (provider, label, access_key_masked, created_at, updated_at)
+               VALUES ('aws', 'old', 'AKIA\u{2022}\u{2022}\u{2022}\u{2022}3K7Q', 1, 1);",
+        )
+        .unwrap();
+        ensure_tables(&conn).unwrap();
+        ensure_tables(&conn).unwrap();
+        // The existing row has no key pair yet, so it still reads the keychain.
+        assert_eq!(credential_keys(&conn, 1).unwrap(), Some((None, None)));
+        assert!(set_credential_keys(&conn, 1, "AKIAEXAMPLE", "v1:x", false).unwrap());
+        assert_eq!(
+            credential_keys(&conn, 1).unwrap(),
+            Some((Some("AKIAEXAMPLE".into()), Some("v1:x".into())))
+        );
     }
 
     #[test]

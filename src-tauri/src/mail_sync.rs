@@ -76,7 +76,7 @@ impl SyncEvents for TauriEvents {
     }
 }
 
-/// Builds the S3 client for a source. Keychain lookup lives behind this, so the
+/// Builds the S3 client for a source. Secret lookup lives behind this, so the
 /// loop never sees a secret and tests never need one.
 pub(crate) trait ClientFactory: Send + Sync {
     fn client(&self, account: &MailAccount) -> Result<Box<dyn S3Api + Send>, String>;
