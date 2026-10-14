@@ -3,7 +3,8 @@
 //! network; the `#[tauri::command]` wrappers only fetch managed state.
 //!
 //! No command returns a secret. A credential is described by its masked key id
-//! (`AKIA••••3K7Q`), and the key pair itself lives in the OS keychain.
+//! (`AKIA••••3K7Q`), and the key pair itself is stored encrypted on its row (see
+//! `mail_secrets`).
 
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ use crate::aws_s3::{S3Api, S3Client, S3ErrorKind};
 use crate::aws_ses::{SesApi, SesClient, SesErrorKind};
 use crate::aws_sigv4::Credentials;
 use crate::mail_build;
+use crate::mail_secrets::{DbSecrets, KeyFile, LegacyKeychain};
 use crate::mail_send;
 use crate::mail_store::{
     self, AccountInput, CredentialInput, MailAccount, MailCredential, MailIdentity, MailMailbox,
@@ -35,7 +37,7 @@ const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_IMAGE_REDIRECTS: usize = 3;
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(15);
 
-// ── keychain ───────────────────────────────────────────────────────
+// ── key pairs ──────────────────────────────────────────────────────
 
 /// No `Debug` and no `Serialize`: neither half may reach a log or a command
 /// result by accident.
@@ -44,98 +46,13 @@ pub(crate) struct KeyPair {
     pub secret_access_key: String,
 }
 
-/// Where AWS key pairs live. The app uses the OS keychain; tests use memory, so
-/// `cargo test` never needs (or touches) a real keychain.
+/// Where AWS key pairs live. The app keeps them, encrypted, on the credential
+/// row; tests use memory. There is no `remove`: deleting the row deletes its
+/// key pair, and a store that took the database lock to clear it would deadlock
+/// `credential_delete`, which already holds it.
 pub(crate) trait SecretStore: Send + Sync {
     fn put(&self, credential_id: i64, keys: &KeyPair) -> Result<(), String>;
     fn get(&self, credential_id: i64) -> Result<Option<KeyPair>, String>;
-    fn remove(&self, credential_id: i64) -> Result<(), String>;
-}
-
-pub(crate) struct Keychain {
-    service: String,
-}
-
-/// The entry names carry the database row id, and the dev build has its own
-/// database whose ids restart at 1. A shared service would let a dev save or
-/// delete overwrite the installed app's key pair, so the service is the running
-/// app's identifier. The production identifier is `com.monoptah.desktop`, the
-/// string this used to be hard-coded to, so installed apps keep their entries.
-pub(crate) fn keychain_service(app_identifier: &str) -> String {
-    app_identifier.to_string()
-}
-
-impl Keychain {
-    pub(crate) fn new(app_identifier: &str) -> Self {
-        Self {
-            service: keychain_service(app_identifier),
-        }
-    }
-
-    fn entry(&self, credential_id: i64, field: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(
-            &self.service,
-            &format!("mail.aws.cred.{credential_id}.{field}"),
-        )
-        .map_err(|_| "Could not access the system credential store.".to_string())
-    }
-
-    fn read_entry(&self, credential_id: i64, field: &str) -> Result<Option<String>, String> {
-        match self.entry(credential_id, field)?.get_password() {
-            Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(_) => Err("Could not read the AWS key from the system credential store.".into()),
-        }
-    }
-
-    fn write_entry(&self, credential_id: i64, field: &str, value: &str) -> Result<(), String> {
-        self.entry(credential_id, field)?
-            .set_password(value)
-            .map_err(|_| "Could not save the AWS key to the system credential store.".to_string())
-    }
-
-    fn delete_entry(&self, credential_id: i64, field: &str) -> Result<(), String> {
-        match self.entry(credential_id, field)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => Err("Could not remove the AWS key from the system credential store.".into()),
-        }
-    }
-}
-
-impl SecretStore for Keychain {
-    fn put(&self, credential_id: i64, keys: &KeyPair) -> Result<(), String> {
-        let previous = self.read_entry(credential_id, "access_key_id")?;
-        self.write_entry(credential_id, "access_key_id", &keys.access_key_id)?;
-        if let Err(error) =
-            self.write_entry(credential_id, "secret_access_key", &keys.secret_access_key)
-        {
-            // Never leave a new id sitting beside the old secret.
-            let _ = match previous {
-                Some(old) => self.write_entry(credential_id, "access_key_id", &old),
-                None => self.delete_entry(credential_id, "access_key_id"),
-            };
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn get(&self, credential_id: i64) -> Result<Option<KeyPair>, String> {
-        let id = self.read_entry(credential_id, "access_key_id")?;
-        let secret = self.read_entry(credential_id, "secret_access_key")?;
-        Ok(match (id, secret) {
-            (Some(access_key_id), Some(secret_access_key)) => Some(KeyPair {
-                access_key_id,
-                secret_access_key,
-            }),
-            _ => None,
-        })
-    }
-
-    fn remove(&self, credential_id: i64) -> Result<(), String> {
-        let id = self.delete_entry(credential_id, "access_key_id");
-        let secret = self.delete_entry(credential_id, "secret_access_key");
-        id.and(secret)
-    }
 }
 
 // ── AWS clients ────────────────────────────────────────────────────
@@ -158,7 +75,7 @@ impl LiveClients {
                 access_key_id: keys.access_key_id,
                 secret_access_key: keys.secret_access_key,
             }),
-            None => Err("The AWS key for this source is missing from the system credential store. Enter it again in Mail settings.".into()),
+            None => Err("The AWS key for this source is missing or unreadable. Enter it again in Mail settings.".into()),
         }
     }
 }
@@ -195,7 +112,11 @@ pub(crate) struct MailState {
 }
 
 pub fn init(app: &AppHandle) {
-    let secrets: Arc<dyn SecretStore> = Arc::new(Keychain::new(&app.config().identifier));
+    let secrets: Arc<dyn SecretStore> = Arc::new(DbSecrets::new(
+        app.clone(),
+        KeyFile::new(app.path().app_data_dir().map_err(|e| e.to_string())),
+        Box::new(LegacyKeychain::new(&app.config().identifier)),
+    ));
     let live = Arc::new(LiveClients {
         secrets: secrets.clone(),
     });
@@ -321,8 +242,7 @@ pub(crate) fn credential_upsert(
         .map_err(db)?;
         (previous, id)
     };
-    // The keychain call happens without the database lock: it can block on a
-    // system prompt, and every other command waits on that lock.
+    // `put` takes the database lock itself, so it runs without ours.
     if let Err(error) = secrets.put(id, &keys) {
         let conn = store.lock_conn()?;
         match previous {
@@ -349,25 +269,15 @@ pub(crate) fn credential_upsert(
         .ok_or_else(|| "The credential was saved but could not be read back.".to_string())
 }
 
-pub(crate) fn credential_delete(
-    store: &SessionStore,
-    secrets: &dyn SecretStore,
-    id: i64,
-) -> Result<(), String> {
-    // One acquisition for check, secret and row. Released between them, a source
-    // saved in the gap would make the row delete refuse after the secret was
-    // already gone, leaving a source that cannot authenticate. The keychain call
-    // can block on a prompt while the lock is held; for a rare, user-initiated
-    // delete that is the price of not stranding a secret. (A tombstone flag
-    // would avoid it but needs a schema change this task does not own.)
+pub(crate) fn credential_delete(store: &SessionStore, id: i64) -> Result<(), String> {
+    // One acquisition for check and row. The key pair sits on the row, so
+    // deleting the row deletes it, and a source saved in between cannot be
+    // stranded without one.
     let conn = store.lock_conn()?;
     // Refuses a credential in use before anything is touched.
     if !mail_store::check_credential_unused(&conn, id).map_err(db)? {
         return Err("That credential no longer exists.".into());
     }
-    // Secret before row: if the keychain fails the row survives, so the UI can
-    // retry. The other order leaves a secret nothing points at.
-    secrets.remove(id)?;
     mail_store::delete_credential(&conn, id).map_err(db)?;
     Ok(())
 }
@@ -1447,12 +1357,8 @@ pub fn mail_credential_upsert(
 }
 
 #[tauri::command(async)]
-pub fn mail_credential_delete(
-    store: State<'_, SessionStore>,
-    mail: State<'_, MailState>,
-    id: i64,
-) -> Result<(), String> {
-    credential_delete(&store, &*mail.secrets, id)
+pub fn mail_credential_delete(store: State<'_, SessionStore>, id: i64) -> Result<(), String> {
+    credential_delete(&store, id)
 }
 
 #[tauri::command(async)]
@@ -2091,13 +1997,12 @@ mod tests {
     struct MemSecrets {
         map: Mutex<HashMap<i64, (String, String)>>,
         fail: AtomicBool,
-        fail_remove: AtomicBool,
     }
 
     impl SecretStore for MemSecrets {
         fn put(&self, id: i64, keys: &KeyPair) -> Result<(), String> {
             if self.fail.load(Ordering::SeqCst) {
-                return Err("keychain unavailable".into());
+                return Err("secret store unavailable".into());
             }
             self.map.lock().unwrap().insert(
                 id,
@@ -2110,13 +2015,6 @@ mod tests {
                 access_key_id: a.clone(),
                 secret_access_key: s.clone(),
             }))
-        }
-        fn remove(&self, id: i64) -> Result<(), String> {
-            if self.fail_remove.load(Ordering::SeqCst) {
-                return Err("keychain unavailable".into());
-            }
-            self.map.lock().unwrap().remove(&id);
-            Ok(())
         }
     }
 
@@ -2601,7 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_keychain_write_rolls_the_row_back() {
+    fn a_failed_secret_write_rolls_the_row_back() {
         let (store, secrets) = setup();
         secrets.fail.store(true, Ordering::SeqCst);
         assert!(credential_upsert(&store, &secrets, keys("a", KEY_ID)).is_err());
@@ -2626,29 +2524,14 @@ mod tests {
         let (store, secrets) = setup();
         let (source, _) = one_source(&store, &secrets);
         let id = source.account.credential_id;
-        let error = credential_delete(&store, &secrets, id).unwrap_err();
+        let error = credential_delete(&store, id).unwrap_err();
         assert!(error.contains("byptah (us-east-1)"), "{error}");
         assert!(secrets.get(id).unwrap().is_some());
 
         source_delete(&store, source.account.id).unwrap();
-        credential_delete(&store, &secrets, id).unwrap();
-        assert!(secrets.get(id).unwrap().is_none());
-    }
-
-    #[test]
-    fn a_failed_secret_removal_keeps_the_credential_row() {
-        let (store, secrets) = setup();
-        let cred = credential(&store, &secrets, "spare");
-        secrets.fail_remove.store(true, Ordering::SeqCst);
-        assert!(credential_delete(&store, &secrets, cred.id).is_err());
+        credential_delete(&store, id).unwrap();
         let conn = store.lock_conn().unwrap();
-        assert!(mail_store::get_credential(&conn, cred.id)
-            .unwrap()
-            .is_some());
-        drop(conn);
-        secrets.fail_remove.store(false, Ordering::SeqCst);
-        credential_delete(&store, &secrets, cred.id).unwrap();
-        assert!(secrets.get(cred.id).unwrap().is_none());
+        assert!(mail_store::get_credential(&conn, id).unwrap().is_none());
     }
 
     #[test]
@@ -2656,7 +2539,7 @@ mod tests {
         let (store, secrets) = setup();
         let (source, _) = one_source(&store, &secrets);
         let id = source.account.credential_id;
-        assert!(credential_delete(&store, &secrets, id).is_err());
+        assert!(credential_delete(&store, id).is_err());
         assert!(secrets.get(id).unwrap().is_some());
     }
 
@@ -3774,21 +3657,6 @@ mod tests {
             assert!(guard_url(&parse(private)).is_err(), "{private}");
         }
         assert!(guard_url(&parse("https://8.8.8.8/a.png")).is_ok());
-    }
-
-    #[test]
-    fn the_keychain_service_follows_the_app_identifier_and_production_keeps_its_old_one() {
-        let conf: serde_json::Value =
-            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
-        let production = conf["identifier"].as_str().unwrap();
-        // The string every installed app already wrote its AWS keys under.
-        assert_eq!(keychain_service(production), "com.monoptah.desktop");
-        let dev: serde_json::Value =
-            serde_json::from_str(include_str!("../tauri.dev.conf.json")).unwrap();
-        assert_ne!(
-            keychain_service(dev["identifier"].as_str().unwrap()),
-            keychain_service(production)
-        );
     }
 
     #[test]

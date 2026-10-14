@@ -33,6 +33,7 @@ mod macos_background;
 mod mail;
 mod mail_build;
 mod mail_mime;
+mod mail_secrets;
 mod mail_send;
 mod mail_store;
 mod mail_sync;
