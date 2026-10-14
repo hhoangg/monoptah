@@ -39,6 +39,7 @@ function item(overrides: Partial<InboxItem> = {}): InboxItem {
 function renderDetail(
   inboxItem: InboxItem,
   relatedSessions: SessionSummary[] = [],
+  busySessionIds?: ReadonlySet<string>,
 ) {
   return renderToStaticMarkup(
     createElement(InboxDetail, {
@@ -47,6 +48,7 @@ function renderDetail(
       projects: [],
       revision: 0,
       relatedSessions,
+      busySessionIds,
       onDiscuss: () => {},
       onStart: () => {},
     }),
@@ -363,6 +365,39 @@ describe("InboxDetail layout", () => {
     expect(header).toContain("Related thread");
     expect(header).toContain("Review MonoCode Pull Request");
     expect(body).not.toContain("Review MonoCode Pull Request");
+  });
+
+  it("offers Send to agent on pull requests too", () => {
+    const markup = renderDetail(item({ kind: "pr" }));
+    const header = markup.slice(
+      markup.indexOf("data-inbox-detail-header"),
+      markup.indexOf("data-inbox-detail-scroll"),
+    );
+
+    expect(header).toContain("Send to agent");
+  });
+
+  it("marks only the running related thread", () => {
+    const base = {
+      cwd: "/tmp/web",
+      harness: "codex",
+      model: "gpt-5",
+      runtimeMode: "supervised",
+      createdAt: 1,
+      updatedAt: 1,
+    } as const;
+    const markup = renderDetail(
+      item({ kind: "pr" }),
+      [
+        { ...base, id: "idle", title: "Idle review" },
+        { ...base, id: "busy", title: "Busy review" },
+      ],
+      new Set(["busy"]),
+    );
+
+    expect(markup).toContain("Open thread: Busy review (running)");
+    expect(markup).toContain('title="Open thread: Idle review"');
+    expect(markup).not.toContain("Idle review (running)");
   });
 });
 

@@ -13807,6 +13807,7 @@ function Workspace({
                   onAskRestart={onRestartInboxAsk}
                   onAskMount={setInboxAskPortal}
                   sessions={inboxRelatedSessions}
+                  busySessionIds={busySessionIds}
                   repairSessions={repairSessions}
                   onRepairChecks={onRepairChecks}
                   onOpenSession={onOpenInboxSession}

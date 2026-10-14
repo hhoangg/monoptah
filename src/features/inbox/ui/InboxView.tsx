@@ -127,6 +127,15 @@ import {
 } from "../model/inboxSeen";
 import { LIST_PAGE_SIZE, listWindowSize } from "../../../shared/lib/listWindow";
 import {
+  relatedThreadsLabel,
+  runningSessionCount,
+} from "../model/inboxRunningSessions";
+import {
+  getRememberedInboxView,
+  setRememberedInboxView,
+} from "../model/inboxViewMemory";
+import { TerminalSpinner } from "../../sessions/ui/TerminalSpinner";
+import {
   LINEAR_CHANGE_EVENT,
   linearConnected,
   linearIssueComment,
@@ -398,6 +407,8 @@ type Props = {
   repairSessions?: CiRepairProps["repairSessions"];
   onRepairChecks?: CiRepairProps["onRepairChecks"];
   sessions?: readonly SessionSummary[];
+  /** Ids of sessions mid-turn, so related threads can show they are running. */
+  busySessionIds?: ReadonlySet<string>;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
   /** Session-card destination to reveal after the Inbox list loads. */
   target?: LinkedWorkItem | null;
@@ -419,6 +430,7 @@ export function InboxView({
   repairSessions,
   onRepairChecks,
   sessions = [],
+  busySessionIds,
   onOpenSession,
   target = null,
   onOpenIntegrations,
@@ -427,7 +439,6 @@ export function InboxView({
   const listLock = useLockOverscroll<HTMLDivElement>();
   const listScrollRef = useRef<HTMLDivElement>(null);
   const loadMoreRef = useRef<HTMLLIElement>(null);
-  const [listLimit, setListLimit] = useState(LIST_PAGE_SIZE);
   const setListScrollRef = useCallback(
     (element: HTMLDivElement | null) => {
       listLock(element);
@@ -442,7 +453,6 @@ export function InboxView({
   const [groupColors] = useState(loadTabGroupColors);
   const [groupCustomColors] = useState(loadTabGroupCustomColors);
 
-  const [searchInput, setSearchInput] = useState("");
   const [items, setItems] = useState<InboxItem[]>(
     () => peekInboxForRail(recents, cwd)?.items ?? [],
   );
@@ -456,14 +466,65 @@ export function InboxView({
   );
   const [refresh, setRefresh] = useState(0);
   const targetSelectionKey = target ? linkedWorkItemInboxKey(target) : null;
-  const [selectedKey, setSelectedKey] = useState<string | null>(
-    targetSelectionKey,
-  );
   const [targetItem, setTargetItem] = useState<InboxItem | null>(null);
   const [filters, setFilters] = useState(loadInboxFilters);
   const [connections, setConnections] = useState(loadInboxConnections);
   const [source, setSource] = useState(() =>
     resolveInboxSource(loadInboxSource(), connections),
+  );
+  // Leaving the Inbox must not lose your place, so each source's search,
+  // selection and scroll are remembered. A linked target wins over all of it.
+  const [initialView] = useState(() =>
+    target ? null : getRememberedInboxView(source),
+  );
+  const [searchInput, setSearchInput] = useState(initialView?.search ?? "");
+  const [selectedKey, setSelectedKey] = useState<string | null>(
+    targetSelectionKey ?? initialView?.selectedKey ?? null,
+  );
+  const [listLimit, setListLimit] = useState(
+    initialView?.listLimit ?? LIST_PAGE_SIZE,
+  );
+  // The source whose view the state above currently holds; null while it holds
+  // a linked target's, which is not worth remembering.
+  const heldSourceRef = useRef<InboxSource | null>(initialView ? source : null);
+  const latestViewRef = useRef({ searchInput, selectedKey, listLimit });
+  latestViewRef.current = { searchInput, selectedKey, listLimit };
+  const scrollTopRef = useRef(initialView?.scrollTop ?? 0);
+  // Scroll to restore once the rows it points at are rendered.
+  const pendingScrollRef = useRef<number | null>(
+    initialView && initialView.scrollTop > 0 ? initialView.scrollTop : null,
+  );
+  // Set by a source switch that has already restored the list state, so the
+  // reset below does not undo it.
+  const skipListResetRef = useRef(false);
+  const rememberView = useCallback(() => {
+    const held = heldSourceRef.current;
+    if (!held) return;
+    const view = latestViewRef.current;
+    setRememberedInboxView(held, {
+      search: view.searchInput,
+      selectedKey: view.selectedKey,
+      scrollTop: scrollTopRef.current,
+      listLimit: view.listLimit > LIST_PAGE_SIZE ? view.listLimit : null,
+    });
+  }, []);
+  useEffect(() => rememberView, [rememberView]);
+  // Swaps the list state for the incoming source's remembered view, after
+  // saving the outgoing one.
+  const switchSource = useCallback(
+    (next: InboxSource) => {
+      rememberView();
+      const view = getRememberedInboxView(next);
+      heldSourceRef.current = next;
+      scrollTopRef.current = view.scrollTop;
+      pendingScrollRef.current = view.scrollTop;
+      skipListResetRef.current = true;
+      setSearchInput(view.search);
+      setSelectedKey(view.selectedKey);
+      setListLimit(view.listLimit ?? LIST_PAGE_SIZE);
+      setSource(next);
+    },
+    [rememberView],
   );
   const [connectMenuOpen, setConnectMenuOpen] = useState(false);
   const connectButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -539,9 +600,12 @@ export function InboxView({
 
   useEffect(() => {
     if (!target) return;
+    rememberView();
+    heldSourceRef.current = null;
+    pendingScrollRef.current = null;
     setSource("github");
     setSearchInput("");
-  }, [target]);
+  }, [rememberView, target]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -674,9 +738,11 @@ export function InboxView({
   useEffect(() => {
     const next = resolveInboxSource(source, connections);
     if (next === source) return;
-    setSource(next);
+    // A linked target's view stays as it is; only the tab moves.
+    if (heldSourceRef.current === null) setSource(next);
+    else switchSource(next);
     saveInboxSource(next);
-  }, [connections, source]);
+  }, [connections, source, switchSource]);
 
   const visibleSources = visibleInboxSources(connections);
   const connectableSources = connectableInboxSources(connections);
@@ -886,18 +952,42 @@ export function InboxView({
   const shownItems = visibleItems.slice(0, shownItemCount);
   const hasMoreItems = shownItemCount < visibleItems.length;
 
-  useEffect(() => {
-    setListLimit(LIST_PAGE_SIZE);
-    const scroller = listScrollRef.current;
-    if (scroller) scroller.scrollTop = 0;
-  }, [
+  const listResetDeps = [
     activeFilters,
     clickupHiddenSpaceIds,
     jiraHiddenProjectIds,
     linearHiddenTeamIds,
     searchInput,
     source,
-  ]);
+  ];
+  const prevListResetDeps = useRef<unknown[] | null>(null);
+  useEffect(() => {
+    const prev = prevListResetDeps.current;
+    prevListResetDeps.current = listResetDeps;
+    // Nothing changed on mount, and a restored view is already where it was.
+    if (!prev || listResetDeps.every((dep, i) => Object.is(dep, prev[i]))) {
+      return;
+    }
+    if (skipListResetRef.current) {
+      skipListResetRef.current = false;
+      return;
+    }
+    pendingScrollRef.current = null;
+    setListLimit(LIST_PAGE_SIZE);
+    const scroller = listScrollRef.current;
+    if (scroller) scroller.scrollTop = 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, listResetDeps);
+
+  // A restored offset needs the rows it points at, so it waits for the list.
+  useEffect(() => {
+    const top = pendingScrollRef.current;
+    const scroller = listScrollRef.current;
+    if (top == null || !scroller || loading) return;
+    pendingScrollRef.current = null;
+    scroller.scrollTop = top;
+    // Source is a dep so a switch between lists of equal length still restores.
+  }, [loading, source, visibleItems.length]);
 
   useEffect(() => {
     if (!hasMoreItems) return;
@@ -917,7 +1007,8 @@ export function InboxView({
 
   useEffect(() => {
     if (!selected) {
-      if (!targetSelectionKey) setSelectedKey(null);
+      // A remembered selection survives until the first load decides it.
+      if (!targetSelectionKey && !loading) setSelectedKey(null);
       return;
     }
     const key = inboxItemKey(selected);
@@ -931,7 +1022,7 @@ export function InboxView({
       return;
     }
     if (key !== selectedKey) setSelectedKey(key);
-  }, [selected, selectedKey, targetSelectionKey]);
+  }, [loading, selected, selectedKey, targetSelectionKey]);
 
   const onFiltersChange = (next: InboxFilters) => {
     const pruned = pruneInboxFilters(
@@ -943,7 +1034,8 @@ export function InboxView({
   };
 
   const onSourceChange = (next: InboxSource) => {
-    setSource(next);
+    if (next !== source) switchSource(next);
+    else setSource(next);
     saveInboxSource(next);
   };
 
@@ -1069,6 +1161,9 @@ export function InboxView({
       ) : null}
       <div
         ref={setListScrollRef}
+        onScroll={(event) => {
+          scrollTopRef.current = event.currentTarget.scrollTop;
+        }}
         className="min-h-0 flex-1 overflow-y-auto overscroll-none"
       >
         {noSourcesConnected ? (
@@ -1132,6 +1227,10 @@ export function InboxView({
                       projectName(item.projectPath),
                     )}
                     relatedSessionCount={relatedSessions.length}
+                    runningSessionCount={runningSessionCount(
+                      relatedSessions,
+                      busySessionIds,
+                    )}
                     onSelect={() => {
                       markInboxItemSeen({
                         key,
@@ -1232,6 +1331,7 @@ export function InboxView({
               relatedSessions={
                 selected ? relatedSessionsForInboxItem(selected, sessions) : []
               }
+              busySessionIds={busySessionIds}
               onDiscuss={() => setDiscussionOpen(true)}
               onStart={onStart}
               repairSessions={repairSessions}
@@ -1471,6 +1571,7 @@ function InboxDetailBody({
   projects,
   revision = 0,
   relatedSessions,
+  busySessionIds,
   onDiscuss,
   onStart,
   repairSessions,
@@ -1483,6 +1584,7 @@ function InboxDetailBody({
   projects: InboxProjectOption[];
   revision?: number;
   relatedSessions: readonly SessionSummary[];
+  busySessionIds?: ReadonlySet<string>;
   onDiscuss?: () => void;
   onStart?: (item: InboxItem, body?: string) => void | Promise<void>;
   repairSessions?: CiRepairProps["repairSessions"];
@@ -1506,6 +1608,7 @@ function InboxDetailBody({
       projects={projects}
       revision={revision}
       relatedSessions={relatedSessions}
+      busySessionIds={busySessionIds}
       onDiscuss={onDiscuss}
       onStart={onStart}
       repairSessions={repairSessions}
@@ -1571,6 +1674,7 @@ function InboxCard({
   mascotName,
   mascotColor,
   relatedSessionCount,
+  runningSessionCount: running,
   onSelect,
 }: {
   item: InboxItem;
@@ -1579,6 +1683,7 @@ function InboxCard({
   mascotName: string | null;
   mascotColor: string;
   relatedSessionCount: number;
+  runningSessionCount: number;
   onSelect: () => void;
 }) {
   useInboxSeenTick();
@@ -1614,7 +1719,7 @@ function InboxCard({
       aria-current={active ? "true" : undefined}
       aria-label={`${status.label} ${kindLabel.toLowerCase()} ${inboxItemRef(
         item,
-      )}: ${item.title}${attentionLabel ? `, ${attentionLabel}` : ""}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}` : ""}`}
+      )}: ${item.title}${attentionLabel ? `, ${attentionLabel}` : ""}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedThreadsLabel(relatedSessionCount, running)}` : ""}`}
       onClick={onSelect}
       className={`flex w-full flex-col rounded-md border px-2.5 py-2 text-left ${
         active
@@ -1641,10 +1746,14 @@ function InboxCard({
           <span className="flex shrink-0 items-center gap-1.5">
             {relatedSessionCount > 0 ? (
               <span
-                title={`${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}`}
+                title={relatedThreadsLabel(relatedSessionCount, running)}
                 className="inline-flex items-center gap-0.5 text-[11px] tabular-nums text-accent"
               >
-                <MessageMultiple className="size-3" strokeWidth={1.75} />
+                {running > 0 ? (
+                  <TerminalSpinner className="inline-block w-3 select-none text-center text-[11px] leading-none" />
+                ) : (
+                  <MessageMultiple className="size-3" strokeWidth={1.75} />
+                )}
                 {relatedSessionCount}
               </span>
             ) : null}
@@ -2069,6 +2178,7 @@ export function InboxDetail({
   projects,
   revision,
   relatedSessions,
+  busySessionIds,
   mode = "inbox",
   visible = true,
   onDiscuss,
@@ -2083,6 +2193,7 @@ export function InboxDetail({
   projects: InboxProjectOption[];
   revision: number;
   relatedSessions: readonly SessionSummary[];
+  busySessionIds?: ReadonlySet<string>;
   mode?: "inbox" | "panel";
   visible?: boolean;
   onDiscuss?: () => void;
@@ -2905,14 +3016,18 @@ export function InboxDetail({
                       session.title,
                       session.harness,
                     );
+                    const running = busySessionIds?.has(session.id) ?? false;
                     return (
                       <button
                         key={session.id}
                         type="button"
-                        title={`Open thread: ${title}`}
+                        title={`Open thread: ${title}${running ? " (running)" : ""}`}
                         onClick={() => void onOpenSession?.(session.id)}
                         className="inline-flex min-w-0 max-w-64 items-center gap-1 rounded-md bg-content/5 px-2 py-1 text-[11px] text-content/70 hover:bg-content/10 hover:text-content"
                       >
+                        {running ? (
+                          <TerminalSpinner className="inline-block w-3 shrink-0 select-none text-center text-[11px] leading-none text-accent" />
+                        ) : null}
                         <span className="truncate">{title}</span>
                         {session.archived ? (
                           <span className="shrink-0 text-content/40">
@@ -2925,7 +3040,7 @@ export function InboxDetail({
                 </div>
               ) : null}
               <div className="flex flex-wrap items-center gap-2 pt-0.5">
-                {onStart && item.kind !== "pr" ? (
+                {onStart ? (
                   <>
                     <button
                       type="button"
