@@ -5149,6 +5149,7 @@ function Workspace({
       workspaceNavigation.cancel();
       let session = await ensureOpenSession(sessionId);
       if (!session || session.inboxAsk) return;
+      setContributorsProject(null);
       const mono = monoForSession(session.id);
       if (mono) {
         await onOpenMono(mono.id);

@@ -214,3 +214,19 @@ it("a failed navigation after an accepted submit is not reported as a failed sta
     /try \{\s*await onSelectHistorySession\(session\.id\);\s*\} catch \{/,
   );
 });
+
+it("selecting a session from the sidebar closes the Contributors page", () => {
+  // The session sidebar stays visible beside Contributors (it is hidden for
+  // Notes, Mail, Search, Inbox and Settings), so its click has to close the
+  // page itself or the chosen session opens underneath it.
+  const start = lines.findIndex((l) =>
+    l.includes("const onSelectHistorySession"),
+  );
+  expect(start).toBeGreaterThan(-1);
+  const body = lines.slice(start, start + 12).join("\n");
+  // After the load guard, so a session that cannot open leaves the page alone,
+  // and before the first branch that returns with the session already shown.
+  expect(body).toMatch(
+    /if \(!session \|\| session\.inboxAsk\) return;\s*setContributorsProject\(null\);/,
+  );
+});
