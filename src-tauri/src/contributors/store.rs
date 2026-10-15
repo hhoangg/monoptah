@@ -11,12 +11,15 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
 
 use super::{
-    epoch_to_iso, git, now_epoch, parse_iso_epoch, select_duplicates, GitIdentity, RawCommit,
-    RawData, RawFile, RawPr, RawReview, RawSurvival,
+    epoch_to_iso, git, now_epoch, parse_iso_epoch, pr_heads, select_duplicates, CancelCheck,
+    GitIdentity, RawCommit, RawData, RawFile, RawPr, RawReview, RawSurvival,
 };
 
 /// How many `?` placeholders one `IN (...)` list may hold.
 const CHUNK: usize = 400;
+
+/// Hard stop for a hash listing that a cancel check can stop.
+const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS contrib_repos (
@@ -665,12 +668,29 @@ pub(super) fn listed_hashes(
     until: i64,
     flags: &[&str],
 ) -> Result<Vec<String>, String> {
+    listed_hashes_cancellable(root, head, since, until, flags, None)
+}
+
+/// `listed_hashes` that a cancel check can stop: git is killed and the error
+/// is `pr_heads::CANCELLED`.
+pub(super) fn listed_hashes_cancellable(
+    root: &Path,
+    head: &str,
+    since: i64,
+    until: i64,
+    flags: &[&str],
+    cancel: Option<CancelCheck>,
+) -> Result<Vec<String>, String> {
     let since_arg = format!("--since=@{since}");
     let until_arg = format!("--until=@{until}");
     let mut args = vec!["rev-list"];
     args.extend(flags);
     args.extend([since_arg.as_str(), until_arg.as_str(), head, "--"]);
-    Ok(git(root, args)?
+    let out = match cancel {
+        Some(cancel) => pr_heads::run_git(root, &args, None, LIST_TIMEOUT, &[], Some(cancel))?,
+        None => git(root, args)?,
+    };
+    Ok(out
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())

@@ -619,26 +619,146 @@ fn gh_rank(state: &str) -> u8 {
     }
 }
 
-fn ancestor_of(root: &Path, old: &str, head: &str) -> bool {
-    gh::is_object_id(old) && super::git(root, ["merge-base", "--is-ancestor", old, head]).is_ok()
+/// One git call of the plan that a cancel check can kill.
+fn git_cancellable(root: &Path, args: &[&str], cancel: CancelCheck) -> Result<String, String> {
+    pr_heads::run_git(root, args, None, BATCH_TIMEOUT, &[], Some(cancel))
+}
+
+fn is_cancel(error: &str) -> bool {
+    error == pr_heads::CANCELLED
+}
+
+fn ancestor_of(root: &Path, old: &str, head: &str, cancel: CancelCheck) -> Result<bool, String> {
+    if !gh::is_object_id(old) {
+        return Ok(false);
+    }
+    match git_cancellable(root, &["merge-base", "--is-ancestor", old, head], cancel) {
+        Ok(_) => Ok(true),
+        Err(error) if is_cancel(&error) => Err(error),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Is `head` a commit of this repository?
+fn commit_exists(root: &Path, head: &str, cancel: CancelCheck) -> Result<bool, String> {
+    if !gh::is_object_id(head) {
+        return Ok(false);
+    }
+    let spec = format!("{head}^{{commit}}");
+    match git_cancellable(root, &["cat-file", "-e", spec.as_str()], cancel) {
+        Ok(_) => Ok(true),
+        Err(error) if is_cancel(&error) => Err(error),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Committer time of each of `hashes`.
+fn commit_epochs(
+    root: &Path,
+    hashes: &[String],
+    cancel: CancelCheck,
+) -> Result<Vec<(String, i64)>, String> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let input = hashes.iter().map(|h| format!("{h}\n")).collect::<String>();
+    let out = pr_heads::run_git(
+        root,
+        &[
+            "log",
+            "--no-walk=unsorted",
+            "--stdin",
+            "--no-show-signature",
+            "--format=%H %ct",
+        ],
+        Some(input),
+        BATCH_TIMEOUT,
+        &[],
+        Some(cancel),
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let (hash, epoch) = line.split_once(' ')?;
+            Some((hash.to_string(), epoch.trim().parse().ok()?))
+        })
+        .collect())
 }
 
 fn clip(row: &CoverageRow, from: i64, to: i64) -> (i64, i64) {
     (row.from_epoch.max(from), row.to_epoch.min(to))
 }
 
-/// The stretches of time this request has to work on.
-fn plan(req: &SyncRequest, rows: &[CoverageRow], now: i64) -> Result<Vec<Task>, String> {
-    let list = |from: i64, to: i64, flags: &[&str]| {
-        store::listed_hashes(req.root, req.head, from, to, flags)
+/// What is left of `from..=to` once the inclusive `gaps` (sorted, apart) are
+/// taken out.
+fn outside(from: i64, to: i64, gaps: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut pieces = Vec::new();
+    let mut cursor = from;
+    for &(start, end) in gaps {
+        if start > cursor {
+            pieces.push((cursor, start - 1));
+        }
+        cursor = cursor.max(end.saturating_add(1));
+    }
+    if cursor <= to {
+        pieces.push((cursor, to));
+    }
+    pieces
+}
+
+/// A stretch to work on again from scratch: its commits are made sure of and
+/// its PRs and GitHub data derived once more. No survival, and when GitHub
+/// fails the PRs git derived are kept.
+struct Redo<'a> {
+    head: &'a str,
+    now: i64,
+    from: i64,
+    to: i64,
+    commits: Vec<String>,
+    dedupe: Vec<String>,
+    bump: Vec<CoverageRow>,
+}
+
+impl Redo<'_> {
+    fn task(self) -> Task {
+        Task {
+            from: self.from,
+            to: self.to,
+            commits: self.commits,
+            dedupe: self.dedupe,
+            survival: false,
+            on_gh_failure: OnGhFailure::KeepGit,
+            head: self.head.to_string(),
+            synced_at: self.now,
+            bump: self.bump,
+        }
+    }
+}
+
+/// The stretches of time this request has to work on. Nothing reaches past
+/// `now`: time that has not happened is not covered.
+fn plan(
+    req: &SyncRequest,
+    repo: i64,
+    rows: &[CoverageRow],
+    now: i64,
+    cancel: CancelCheck,
+) -> Result<Vec<Task>, String> {
+    let list = |head: &str, from: i64, to: i64, flags: &[&str]| {
+        store::listed_hashes_cancellable(req.root, head, from, to, flags, Some(cancel))
     };
     let in_window = ["--no-merges", "--date-order"];
+    let hi = now.min(req.to);
     match &req.mode {
-        SyncMode::Full => store::missing_intervals(rows, req.from, req.to)
-            .into_iter()
-            .map(|(from, to)| {
-                let dedupe = list(from, to, &in_window)?;
-                Ok(Task {
+        SyncMode::Full => {
+            if hi < req.from {
+                return Ok(Vec::new());
+            }
+            let gaps = store::missing_intervals(rows, req.from, hi);
+            let mut tasks = Vec::new();
+            for &(from, to) in &gaps {
+                let dedupe = list(req.head, from, to, &in_window)?;
+                tasks.push(Task {
                     from,
                     to,
                     commits: dedupe.clone(),
@@ -648,30 +768,85 @@ fn plan(req: &SyncRequest, rows: &[CoverageRow], now: i64) -> Result<Vec<Task>, 
                     head: req.head.to_string(),
                     synced_at: now,
                     bump: Vec::new(),
-                })
-            })
-            .collect(),
-        SyncMode::GithubRetry => rows
-            .iter()
-            .filter(|r| {
+                });
+            }
+
+            // Commits of the period that the store lacks although the
+            // coverage says their time was synced: a branch rewritten since,
+            // or a merge that brought in commits dated before the last sync.
+            let window = list(req.head, req.from, hi, &in_window)?;
+            let stored = req
+                .store
+                .with_read_conn(|conn| store::stored_hashes(conn, repo, &window))?;
+            let lacking: Vec<String> = window
+                .iter()
+                .filter(|h| !stored.contains(*h))
+                .cloned()
+                .collect();
+            let epochs = commit_epochs(req.root, &lacking, cancel)?;
+            for (from, to) in outside(req.from, hi, &gaps) {
+                let inside: Vec<&(String, i64)> = epochs
+                    .iter()
+                    .filter(|(_, at)| *at >= from && *at <= to)
+                    .collect();
+                // Whole months from the first to the last of them.
+                let months = month_chunks(from, to.saturating_add(1));
+                let touched: Vec<&(i64, i64)> = months
+                    .iter()
+                    .filter(|(start, end)| inside.iter().any(|(_, at)| at >= start && at < end))
+                    .collect();
+                let (Some(first), Some(last)) = (touched.first(), touched.last()) else {
+                    continue;
+                };
+                let (lo, end) = (first.0, last.1 - 1);
+                tasks.push(
+                    Redo {
+                        head: req.head,
+                        now,
+                        from: lo,
+                        to: end,
+                        commits: inside
+                            .iter()
+                            .filter(|(_, at)| *at >= lo && *at <= end)
+                            .map(|(h, _)| h.clone())
+                            .collect(),
+                        dedupe: window.clone(),
+                        bump: Vec::new(),
+                    }
+                    .task(),
+                );
+            }
+            Ok(tasks)
+        }
+        SyncMode::GithubRetry => {
+            let mut tasks = Vec::new();
+            for row in rows.iter().filter(|r| {
                 r.gh_state != "complete" && r.from_epoch <= req.to && r.to_epoch >= req.from
-            })
-            .map(|row| {
+            }) {
                 let (from, to) = clip(row, req.from, req.to);
-                let dedupe = list(from, to, &in_window)?;
-                Ok(Task {
+                // The row says which head it was synced at; the PRs are
+                // derived at that head so the row stays true. A head that is
+                // gone is replaced by the current one.
+                let head = if commit_exists(req.root, &row.head, cancel)? {
+                    row.head.as_str()
+                } else {
+                    req.head
+                };
+                let dedupe = list(head, from, to, &in_window)?;
+                tasks.push(Task {
                     from,
                     to,
                     commits: dedupe.clone(),
                     dedupe,
                     survival: false,
                     on_gh_failure: OnGhFailure::KeepStored,
-                    head: row.head.clone(),
+                    head: head.to_string(),
                     synced_at: row.synced_at,
                     bump: Vec::new(),
-                })
-            })
-            .collect(),
+                });
+            }
+            Ok(tasks)
+        }
         SyncMode::TopUp { old_head } => {
             let overlapping: Vec<&CoverageRow> = rows
                 .iter()
@@ -679,20 +854,23 @@ fn plan(req: &SyncRequest, rows: &[CoverageRow], now: i64) -> Result<Vec<Task>, 
                 .collect();
             // PRs merged since the oldest sync of the period; a period that
             // ended before that is only checked at its end.
-            let hi = now.min(req.to).max(req.from);
+            let hi = hi.max(req.from);
             let oldest = overlapping.iter().map(|r| r.synced_at).min();
-            let window = list(req.from, hi, &in_window)?;
-            let (lo, commits) = if ancestor_of(req.root, old_head, req.head) {
+            let window = list(req.head, req.from, hi, &in_window)?;
+            let (lo, commits) = if ancestor_of(req.root, old_head, req.head, cancel)? {
                 let lo = oldest.map_or(req.from, |at| at.min(hi).max(req.from));
                 let range = format!("{old_head}..{}", req.head);
-                let mut hashes: Vec<String> =
-                    super::git(req.root, ["rev-list", "--no-merges", range.as_str(), "--"])?
-                        .lines()
-                        .map(str::trim)
-                        .filter(|l| !l.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                hashes.extend(list(lo, hi, &["--no-merges"])?);
+                let mut hashes: Vec<String> = git_cancellable(
+                    req.root,
+                    &["rev-list", "--no-merges", range.as_str(), "--"],
+                    cancel,
+                )?
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+                hashes.extend(list(req.head, lo, hi, &["--no-merges"])?);
                 (lo, hashes)
             } else {
                 // A rewritten branch can differ anywhere in the period: take
@@ -707,17 +885,16 @@ fn plan(req: &SyncRequest, rows: &[CoverageRow], now: i64) -> Result<Vec<Task>, 
                     ..(*r).clone()
                 })
                 .collect();
-            Ok(vec![Task {
+            Ok(vec![Redo {
+                head: req.head,
+                now,
                 from: lo,
                 to: hi,
                 commits,
                 dedupe: window,
-                survival: false,
-                on_gh_failure: OnGhFailure::KeepGit,
-                head: req.head.to_string(),
-                synced_at: now,
                 bump,
-            }])
+            }
+            .task()])
         }
     }
 }
@@ -728,6 +905,42 @@ fn plan(req: &SyncRequest, rows: &[CoverageRow], now: i64) -> Result<Vec<Task>, 
 /// steps finished, so a cancelled run leaves stored batches but nothing that
 /// says the period is complete.
 pub(super) fn run_sync(req: &SyncRequest, reporter: &dyn Reporter) -> Result<SyncOutcome, String> {
+    match run_steps(req, reporter) {
+        Err(error) if is_cancel(&error) => Ok(cancelled("complete", None)),
+        other => other,
+    }
+}
+
+const CANCELLED_NOTE: &str = "The sync was cancelled before it finished.";
+
+/// What a stopped run reports: never `complete`, whatever it had learned about
+/// GitHub by then. Callers still read `cancelled`.
+fn cancelled(state: &str, note: Option<String>) -> SyncOutcome {
+    let (state, note) = if gh_rank(state) == 0 {
+        ("partial", note.or_else(|| Some(CANCELLED_NOTE.to_string())))
+    } else {
+        (state, note)
+    };
+    SyncOutcome {
+        cancelled: true,
+        gh_state: state.to_string(),
+        gh_note: note,
+    }
+}
+
+const SURVIVAL_CUT_NOTE: &str = "Survival sampling was cut short.";
+
+/// The note of a coverage row: GitHub's, and survival's when it was cut short.
+fn compose_note(github: Option<String>, survival_cut: bool) -> Option<String> {
+    match (github, survival_cut) {
+        (note, false) => note,
+        (None, true) => Some(SURVIVAL_CUT_NOTE.to_string()),
+        (Some(note), true) => Some(format!("{note} {SURVIVAL_CUT_NOTE}")),
+    }
+}
+
+fn run_steps(req: &SyncRequest, reporter: &dyn Reporter) -> Result<SyncOutcome, String> {
+    let stop = || reporter.cancelled();
     let dir = store::git_common_dir(req.root)?;
     let repo = {
         let conn = req.store.lock_conn()?;
@@ -737,17 +950,16 @@ pub(super) fn run_sync(req: &SyncRequest, reporter: &dyn Reporter) -> Result<Syn
         .store
         .with_read_conn(|conn| store::coverage(conn, repo, req.branch))?;
     let now = super::now_epoch();
-    let run = Run { req, repo };
-    let cancelled = |state: &str, note: Option<String>| SyncOutcome {
-        cancelled: true,
-        gh_state: state.to_string(),
-        gh_note: note,
+    let run = Run {
+        req,
+        repo,
+        cancel: &stop,
     };
 
     // Counting: exact totals for every later step.
     reporter.progress(SyncStep::Counting, 0, 1);
     let mut counted = Vec::new();
-    for task in plan(req, &rows, now)? {
+    for task in plan(req, repo, &rows, now, &stop)? {
         let chunks: Vec<(i64, i64)> = month_chunks(task.from, task.to.saturating_add(1))
             .into_iter()
             .rev()
@@ -755,7 +967,7 @@ pub(super) fn run_sync(req: &SyncRequest, reporter: &dyn Reporter) -> Result<Syn
             .collect();
         let entries = chunks
             .iter()
-            .map(|&(start, end)| run.first_parent_entries(start, end))
+            .map(|&(start, end)| run.first_parent_entries(&task.head, start, end))
             .collect::<Result<Vec<_>, _>>()?;
         let stored = req
             .store
@@ -806,7 +1018,7 @@ pub(super) fn run_sync(req: &SyncRequest, reporter: &dyn Reporter) -> Result<Syn
             if reporter.cancelled() {
                 return Ok(cancelled("complete", None));
             }
-            let derived = run.derive_month(*chunk, &dropped, &used)?;
+            let derived = run.derive_month(&item.task.head, *chunk, &dropped, &used)?;
             used.extend(derived.drafts.iter().map(|d| d.pr.id.clone()));
             months.push(Month {
                 chunk: *chunk,
@@ -847,7 +1059,7 @@ pub(super) fn run_sync(req: &SyncRequest, reporter: &dyn Reporter) -> Result<Syn
                     tally.unavailable.get_or_insert_with(|| note.clone());
                     GhMonth::Failed(note.clone())
                 }
-                (Ok(slug), None) => run.enrich_month(slug, month),
+                (Ok(slug), None) => run.enrich_month(&item.task.head, slug, month),
             };
             match &result {
                 GhMonth::Complete => {}
@@ -883,17 +1095,30 @@ pub(super) fn run_sync(req: &SyncRequest, reporter: &dyn Reporter) -> Result<Syn
         if reporter.cancelled() {
             return Ok(cancelled(worst.0, worst.1));
         }
-        let samples = if item.task.survival {
+        let (samples, cut) = if item.task.survival {
             // Eligibility is judged now, not at the end of the period.
             let candidates =
                 super::survival_candidates(months.iter().flat_map(|m| m.derived.drafts.iter()));
-            super::compute_survival(req.root, req.head, candidates, now, &Limits::DEFAULT).0
+            super::compute_survival(
+                req.root,
+                &item.task.head,
+                candidates,
+                now,
+                &Limits::DEFAULT,
+                Some(&stop),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
+        if reporter.cancelled() {
+            return Ok(cancelled(worst.0, worst.1));
+        }
         let (state, note) = tally.state();
+        let note = compose_note(note, cut);
         run.finish(&item.task, &samples, state, note.clone())?;
-        if gh_rank(state) > gh_rank(worst.0) {
+        if gh_rank(state) > gh_rank(worst.0)
+            || (worst.1.is_none() && gh_rank(state) == gh_rank(worst.0))
+        {
             worst = (state, note);
         }
         reporter.progress(SyncStep::Survival, index as u64 + 1, task_total);
@@ -901,7 +1126,7 @@ pub(super) fn run_sync(req: &SyncRequest, reporter: &dyn Reporter) -> Result<Syn
     reporter.progress(SyncStep::Survival, task_total, task_total);
 
     if counted.is_empty() {
-        worst = Run::state_of(&rows, req.from, req.to);
+        worst = Run::state_of(&rows, req.from, req.to.min(now));
     }
     Ok(SyncOutcome {
         cancelled: false,
@@ -913,6 +1138,7 @@ pub(super) fn run_sync(req: &SyncRequest, reporter: &dyn Reporter) -> Result<Syn
 struct Run<'a> {
     req: &'a SyncRequest<'a>,
     repo: i64,
+    cancel: CancelCheck<'a>,
 }
 
 impl Run<'_> {
@@ -930,10 +1156,10 @@ impl Run<'_> {
         }
     }
 
-    fn first_parent_entries(&self, from: i64, to: i64) -> Result<u64, String> {
+    fn first_parent_entries(&self, head: &str, from: i64, to: i64) -> Result<u64, String> {
         let since = format!("--since=@{from}");
         let until = format!("--until=@{to}");
-        rev_list_count(
+        let out = git_cancellable(
             self.req.root,
             &[
                 "rev-list",
@@ -941,21 +1167,33 @@ impl Run<'_> {
                 "--first-parent",
                 since.as_str(),
                 until.as_str(),
-                self.req.head,
+                head,
                 "--",
             ],
-        )
+            self.cancel,
+        )?;
+        out.trim()
+            .parse()
+            .map_err(|_| "git returned an unexpected count".to_string())
     }
 
     /// The PRs git derives for one month, from the commits in the store.
     fn derive_month(
         &self,
+        head: &str,
         chunk: (i64, i64),
         dropped: &HashSet<String>,
         used: &HashSet<String>,
     ) -> Result<Derived, String> {
         let req = self.req;
-        let hashes = store::listed_hashes(req.root, req.head, chunk.0, chunk.1, &["--no-merges"])?;
+        let hashes = store::listed_hashes_cancellable(
+            req.root,
+            head,
+            chunk.0,
+            chunk.1,
+            &["--no-merges"],
+            Some(self.cancel),
+        )?;
         let commits = req
             .store
             .with_read_conn(|conn| store::stored_commits(conn, self.repo, &hashes))?;
@@ -974,19 +1212,20 @@ impl Run<'_> {
         let window = Window::from_epochs(chunk.0, chunk.1);
         super::derive_prs_known(
             req.root,
-            req.head,
+            head,
             &window,
             known,
             dropped,
             &Limits::DEFAULT,
             used.clone(),
+            Some(self.cancel),
             &mut false,
         )
     }
 
     /// Overlays GitHub's PRs of the month on the ones git derived and keeps
     /// the reviews for the write.
-    fn enrich_month(&self, slug: &str, month: &mut Month) -> GhMonth {
+    fn enrich_month(&self, head: &str, slug: &str, month: &mut Month) -> GhMonth {
         let req = self.req;
         let window = Window::from_epochs(month.chunk.0, month.chunk.1);
         let request = gh::Request {
@@ -994,7 +1233,7 @@ impl Run<'_> {
             commits: req.commit_cache,
             root: req.root,
             branch: req.branch,
-            head: req.head,
+            head,
             window: &window,
             limits: &Limits::DEFAULT,
         };
@@ -1061,7 +1300,7 @@ impl Run<'_> {
         let mut conn = req.store.lock_conn()?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         if task.survival {
-            store::put_survival(&tx, self.repo, req.branch, req.head, samples)?;
+            store::put_survival(&tx, self.repo, req.branch, &task.head, samples)?;
         }
         // The rows the new one cuts back go first, so they cannot cut it.
         for row in &task.bump {
@@ -2234,6 +2473,7 @@ mod tests {
         let stopper = StopAt::new(SyncStep::Github, 1);
         let outcome = run_with(&h, &store, &github, SyncMode::Full, jan_feb(), &stopper);
         assert!(outcome.cancelled);
+        assert_ne!(outcome.gh_state, "complete");
         assert!(coverage_rows(&h, &store).is_empty());
         assert!(!load(&h, &store, jan_feb()).covered);
         assert!(row_count(&store, repo) > 0, "stored batches stay");
@@ -2250,7 +2490,7 @@ mod tests {
     }
 
     #[test]
-    fn a_covered_window_is_synced_again_without_any_work() {
+    fn a_complete_window_is_synced_again_without_any_work() {
         utc();
         let h = history();
         let (store, repo) = setup(&h.repo);
@@ -2853,5 +3093,277 @@ mod tests {
         assert!(chunks.windows(2).all(|w| w[0].1 == w[1].0));
         assert!(chunks.iter().all(|(a, b)| a < b));
         assert!(chunks.len() == 12 || chunks.len() == 13);
+    }
+
+    // -----------------------------------------------------------------------
+    // fix round 1
+    // -----------------------------------------------------------------------
+
+    fn git_date(epoch: i64) -> String {
+        format!("{epoch} +0000")
+    }
+
+    #[test]
+    fn a_full_sync_after_a_force_push_makes_the_period_covered_again() {
+        utc();
+        let h = history();
+        let (store, _) = setup(&h.repo);
+        full(&h, &store, &hub(history_prs(&h), vec![], None), jan_feb());
+        assert!(load(&h, &store, jan_feb()).covered);
+
+        let when = "2026-02-15T10:00:00+0000";
+        h.repo
+            .run(&["reset", "-q", "--hard", "HEAD~1"], ALICE, when);
+        h.repo
+            .commit(&[("other.txt", "o\n")], "Replacement push", ALICE, when);
+        let stale = load(&h, &store, jan_feb());
+        assert!(!stale.covered);
+        assert_eq!(stale.missing_commits, 1);
+
+        let report = Recorder::new();
+        run_with(
+            &h,
+            &store,
+            &hub(history_prs(&h), vec![], None),
+            SyncMode::Full,
+            jan_feb(),
+            &report,
+        );
+        assert_eq!(
+            events_of(&report, SyncStep::Commits).last().copied(),
+            Some((1, 1)),
+            "only the commit the store lacks"
+        );
+        let loaded = load(&h, &store, jan_feb());
+        assert!(loaded.covered);
+        let head = head_of(&h.repo);
+        assert!(loaded
+            .raw
+            .prs
+            .iter()
+            .any(|pr| pr.merge_commit.as_deref() == Some(head.as_str())));
+        assert_eq!(coverage_rows(&h, &store).len(), 1);
+    }
+
+    #[test]
+    fn a_merge_that_brings_in_commits_dated_before_the_last_sync_is_repaired() {
+        utc();
+        let h = history();
+        let (store, _) = setup(&h.repo);
+        let january = (at("2026-01-01T00:00:00Z"), at("2026-01-31T23:59:59Z"));
+        full(&h, &store, &hub(history_prs(&h), vec![], None), january);
+
+        // Later, a PR merges whose commits were written in January.
+        let when = "2026-01-25T10:00:00+0000";
+        h.repo
+            .run(&["checkout", "-q", "-b", "old", &h.squash7], ALICE, when);
+        h.repo.commit(&[("old.txt", "x\n")], "old work", BOB, when);
+        h.repo.run(&["checkout", "-q", "main"], ALICE, when);
+        let merged = "2026-02-20T10:00:00+0000";
+        h.repo.run(
+            &[
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "Merge pull request #20 from bob/old",
+                "old",
+            ],
+            ALICE,
+            merged,
+        );
+        let merge20 = head_of(&h.repo);
+        let mut prs = history_prs(&h);
+        prs.push(gh_merged(
+            20,
+            "bob",
+            "2026-02-20T10:00:00Z",
+            &merge20,
+            json!([]),
+        ));
+
+        let report = Recorder::new();
+        let github = hub(prs, vec![], None);
+        run_with(&h, &store, &github, SyncMode::Full, jan_feb(), &report);
+        let loaded = load(&h, &store, jan_feb());
+        assert!(loaded.covered, "missing {}", loaded.missing_commits);
+        assert!(loaded.raw.commits.iter().any(|c| c.subject == "old work"));
+        assert!(loaded.raw.prs.iter().any(|p| p.id == "20"));
+        // January's commit and PR list were looked at again.
+        assert!(merged_searches(&github)
+            .iter()
+            .any(|s| s.starts_with("merged:2026-01-01")));
+        // Neither of the two top-ups the page would offer is needed.
+        assert_eq!(
+            loaded.coverage_head.as_deref(),
+            Some(head_of(&h.repo).as_str())
+        );
+    }
+
+    #[test]
+    fn a_sync_never_covers_time_that_has_not_happened() {
+        utc();
+        let h = history();
+        let (store, _) = setup(&h.repo);
+        let from = at("2026-01-01T00:00:00Z");
+        let period_end = super::super::now_epoch() + 3_600;
+        full(&h, &store, &Unavailable, (from, period_end));
+        let row = coverage_rows(&h, &store).remove(0);
+        assert!(row.to_epoch <= super::super::now_epoch(), "{row:?}");
+        assert!(row.to_epoch < period_end);
+        assert!(!load(&h, &store, (from, period_end)).covered);
+
+        // A commit just after the covered time: the page must see it missing.
+        let late = row.to_epoch + 1;
+        let date = git_date(late);
+        h.repo
+            .commit(&[("late.txt", "x\n")], "Late push", ALICE, &date);
+        let window = (from, late + 1);
+        let seen = load(&h, &store, window);
+        assert!(!seen.covered);
+        assert_eq!(seen.missing_commits, 1);
+
+        while super::super::now_epoch() < window.1 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        full(&h, &store, &Unavailable, window);
+        assert!(load(&h, &store, window).covered);
+    }
+
+    #[test]
+    fn a_cancel_during_the_pull_request_step_stops_at_once_and_covers_nothing() {
+        utc();
+        let h = history();
+        let (store, _) = setup(&h.repo);
+        let started = Instant::now();
+        let stopper = StopAt::new(SyncStep::PullRequests, 1);
+        let outcome = run_with(
+            &h,
+            &store,
+            &hub(history_prs(&h), vec![], None),
+            SyncMode::Full,
+            jan_feb(),
+            &stopper,
+        );
+        assert!(outcome.cancelled);
+        assert_ne!(outcome.gh_state, "complete");
+        assert!(outcome.gh_note.is_some());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(coverage_rows(&h, &store).is_empty());
+        let github_ran = stopper
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.0 == SyncStep::Github);
+        assert!(!github_ran);
+    }
+
+    #[test]
+    fn the_merge_walk_and_the_survival_blame_obey_a_cancel_check() {
+        let h = history();
+        let root = h.repo.path();
+        let head = head_of(&h.repo);
+        let derived = super::super::derive_prs_known(
+            root,
+            &head,
+            &Window::from_epochs(at("2026-01-01T00:00:00Z"), at("2026-03-01T00:00:00Z")),
+            HashMap::new(),
+            &HashSet::new(),
+            &Limits::DEFAULT,
+            HashSet::new(),
+            Some(&|| true),
+            &mut false,
+        );
+        assert_eq!(derived.err().as_deref(), Some(pr_heads::CANCELLED));
+
+        let candidate = super::super::SurvivalCandidate {
+            pr_id: "7".to_string(),
+            landing: None,
+            merged_epoch: at("2026-01-10T10:00:00Z"),
+            hashes: HashSet::from([h.squash7.clone()]),
+            files: vec![super::super::RawFile {
+                path: "parser.txt".to_string(),
+                added: 3,
+                deleted: 0,
+            }],
+        };
+        let (samples, _) = super::super::compute_survival(
+            root,
+            &head,
+            vec![candidate],
+            super::super::now_epoch(),
+            &Limits::DEFAULT,
+            Some(&|| true),
+        );
+        assert!(samples.is_empty(), "no file is blamed once cancelled");
+    }
+
+    #[test]
+    fn a_github_retry_derives_and_stamps_the_head_its_row_was_synced_at() {
+        utc();
+        let h = history();
+        let (store, _) = setup(&h.repo);
+        let synced_head = head_of(&h.repo);
+        full(&h, &store, &Unavailable, jan_feb());
+        h.repo.commit(
+            &[("later.txt", "x\n")],
+            "Later push",
+            ALICE,
+            "2026-02-20T10:00:00+0000",
+        );
+        assert_ne!(head_of(&h.repo), synced_head);
+
+        let outcome = run_with(
+            &h,
+            &store,
+            &hub(history_prs(&h), vec![], None),
+            SyncMode::GithubRetry,
+            jan_feb(),
+            &Recorder::new(),
+        );
+        assert_eq!(outcome.gh_state, "complete");
+        let rows = coverage_rows(&h, &store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].head, synced_head);
+        assert_eq!(rows[0].gh_state, "complete");
+        let stored = store
+            .lock_conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM contrib_commits WHERE subject = 'Later push'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "the retry did not move to the new head");
+    }
+
+    #[test]
+    fn a_cut_short_survival_is_said_in_the_note() {
+        assert_eq!(compose_note(None, false), None);
+        assert_eq!(
+            compose_note(Some("gh said no".to_string()), false).as_deref(),
+            Some("gh said no")
+        );
+        assert_eq!(compose_note(None, true).as_deref(), Some(SURVIVAL_CUT_NOTE));
+        let both = compose_note(Some("gh said no".to_string()), true).unwrap();
+        assert!(both.starts_with("gh said no") && both.ends_with(SURVIVAL_CUT_NOTE));
+    }
+
+    #[test]
+    fn a_stopped_run_never_reports_a_complete_state() {
+        assert_eq!(cancelled("complete", None).gh_state, "partial");
+        assert!(cancelled("complete", None).gh_note.is_some());
+        assert_eq!(cancelled("unavailable", None).gh_state, "unavailable");
+        assert!(cancelled("partial", None).cancelled);
+    }
+
+    #[test]
+    fn the_parts_of_a_period_outside_some_gaps() {
+        assert_eq!(outside(0, 100, &[]), [(0, 100)]);
+        assert_eq!(outside(0, 100, &[(0, 10), (50, 60)]), [(11, 49), (61, 100)]);
+        assert_eq!(outside(0, 100, &[(90, 100)]), [(0, 89)]);
+        assert!(outside(0, 100, &[(0, 100)]).is_empty());
     }
 }

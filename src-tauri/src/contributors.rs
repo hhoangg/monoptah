@@ -239,6 +239,9 @@ enum WaitFailure {
 /// Asked while a child runs: should it be killed now?
 type CancelCheck<'a> = &'a dyn Fn() -> bool;
 
+/// A cancel check that several threads may ask.
+type SharedCancel<'a> = &'a (dyn Fn() -> bool + Sync);
+
 /// Waits for `child` to exit. The cancel check (when given) is asked on every
 /// poll, before the exit status, and a true answer kills the child; so does
 /// the deadline (when given). This is the one wait loop of the module.
@@ -1227,21 +1230,42 @@ struct Deriver<'a> {
     seen: HashSet<String>,
     derived: Derived,
     truncated: bool,
+    /// Asked before every git process and while one runs; a true answer ends
+    /// the walk with `pr_heads::CANCELLED`.
+    cancel: Option<CancelCheck<'a>>,
 }
 
+/// Hard stop for one git process of the walk when a cancel check is given.
+const WALK_TIMEOUT: Duration = Duration::from_secs(300);
+
 impl Deriver<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel.is_some_and(|cancelled| cancelled())
+    }
+
     /// Every git process of the walk goes through here so the budget holds.
     fn run<I, S>(&mut self, args: I) -> Result<String, String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        if self.cancelled() {
+            return Err(pr_heads::CANCELLED.to_string());
+        }
         if self.derived.git_calls >= self.limits.max_walk_git_calls {
             self.truncated = true;
             return Err("Too many git calls while walking merges".to_string());
         }
         self.derived.git_calls += 1;
-        git(self.root, args)
+        let Some(cancel) = self.cancel else {
+            return git(self.root, args);
+        };
+        let owned: Vec<String> = args
+            .into_iter()
+            .map(|a| a.as_ref().to_string_lossy().into_owned())
+            .collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        pr_heads::run_git(self.root, &refs, None, WALK_TIMEOUT, &[], Some(cancel))
     }
 
     fn log_entries(&mut self, args: &[String]) -> Result<Vec<ParsedCommit>, String> {
@@ -1262,6 +1286,9 @@ impl Deriver<'_> {
     /// what they already had must not be credited again by anything nested.
     fn walk(&mut self, entries: &[ParsedCommit], depth: usize, excludes: &[String]) {
         for entry in entries {
+            if self.cancelled() {
+                return;
+            }
             if !self.seen.insert(entry.hash.clone()) {
                 continue;
             }
@@ -1516,6 +1543,7 @@ fn derive_prs_from_git(
         dropped,
         limits,
         HashSet::new(),
+        None,
         truncated,
     )
 }
@@ -1532,6 +1560,7 @@ fn derive_prs_known(
     dropped: &HashSet<String>,
     limits: &Limits,
     used: HashSet<String>,
+    cancel: Option<CancelCheck>,
     truncated: &mut bool,
 ) -> Result<Derived, String> {
     let mut deriver = Deriver {
@@ -1548,6 +1577,7 @@ fn derive_prs_known(
             git_calls: 0,
         },
         truncated: false,
+        cancel,
     };
     let [since, until] = window.log_args();
     let args: Vec<String> = [
@@ -1566,6 +1596,9 @@ fn derive_prs_known(
     .to_vec();
     let chain = deriver.log_entries(&args)?;
     deriver.walk(&chain, 0, &[]);
+    if deriver.cancelled() {
+        return Err(pr_heads::CANCELLED.to_string());
+    }
     *truncated |= deriver.truncated;
     Ok(deriver.derived)
 }
@@ -1631,24 +1664,31 @@ fn survival_candidates<'a>(
 
 /// Lines per blamed commit for one file at `head`; `None` when the file cannot
 /// be blamed (deleted, renamed away, binary).
-fn blame_counts(root: &Path, head: &str, path: &str) -> Option<HashMap<String, u64>> {
+fn blame_counts(
+    root: &Path,
+    head: &str,
+    path: &str,
+    cancel: Option<CancelCheck>,
+) -> Option<HashMap<String, u64>> {
     // `--porcelain` repeats a `<sha> <orig> <final>` header for every line,
     // which is all that is needed here, with far less output than
     // `--line-porcelain`.
-    let out = git(
-        root,
-        [
-            "blame",
-            "-w",
-            "-M",
-            "--porcelain",
-            "--no-textconv",
-            head,
-            "--",
-            path,
-        ],
-    )
-    .ok()?;
+    let args = [
+        "blame",
+        "-w",
+        "-M",
+        "--porcelain",
+        "--no-textconv",
+        head,
+        "--",
+        path,
+    ];
+    let out = match cancel {
+        Some(cancel) => {
+            pr_heads::run_git(root, &args, None, WALK_TIMEOUT, &[], Some(cancel)).ok()?
+        }
+        None => git(root, args).ok()?,
+    };
     let mut counts: HashMap<String, u64> = HashMap::new();
     for line in out.lines() {
         let bytes = line.as_bytes();
@@ -1669,20 +1709,21 @@ fn blame_files(
     workers: usize,
     started: Instant,
     budget: Duration,
+    cancel: Option<SharedCancel>,
 ) -> HashMap<String, Option<HashMap<String, u64>>> {
     let next = AtomicUsize::new(0);
     let results = Mutex::new(HashMap::new());
     std::thread::scope(|scope| {
         for _ in 0..workers.clamp(1, paths.len().max(1)) {
             scope.spawn(|| loop {
-                if started.elapsed() >= budget {
+                if started.elapsed() >= budget || cancel.is_some_and(|c| c()) {
                     break;
                 }
                 let index = next.fetch_add(1, Ordering::Relaxed);
                 let Some(path) = paths.get(index) else {
                     break;
                 };
-                let counts = blame_counts(root, head, path);
+                let counts = blame_counts(root, head, path, cancel.map(|c| c as CancelCheck));
                 lock(&results).insert(path.clone(), counts);
             });
         }
@@ -1709,6 +1750,7 @@ fn compute_survival(
     mut candidates: Vec<SurvivalCandidate>,
     until_epoch: i64,
     limits: &Limits,
+    cancel: Option<SharedCancel>,
 ) -> (Vec<RawSurvival>, bool) {
     let cutoff = until_epoch - SURVIVAL_MIN_AGE_DAYS * 86_400;
     candidates.retain(|c| c.merged_epoch <= cutoff);
@@ -1774,6 +1816,7 @@ fn compute_survival(
         limits.survival_workers,
         started,
         limits.survival_budget,
+        cancel,
     );
     let mut samples = Vec::new();
     for (candidate, files) in planned {
@@ -1888,6 +1931,7 @@ fn collect_raw(
         survival_candidates(&derived.drafts),
         window.until_epoch,
         limits,
+        None,
     );
     truncated |= survival_cut;
 
@@ -3147,7 +3191,8 @@ pub(super) mod tests {
         };
         let until = parse_iso_epoch(UNTIL).unwrap();
         let spent = limits(|l| l.survival_budget = Duration::ZERO);
-        let (samples, cut) = compute_survival(repo.path(), &hash, vec![candidate], until, &spent);
+        let (samples, cut) =
+            compute_survival(repo.path(), &hash, vec![candidate], until, &spent, None);
         assert!(samples.is_empty());
         assert!(cut);
     }
@@ -3249,7 +3294,7 @@ pub(super) mod tests {
             "2026-02-01T10:00:00+0000",
         );
         let head = repo.run(&["rev-parse", "HEAD"], ALICE, "2026-02-01T10:00:00+0000");
-        let counts = blame_counts(repo.path(), &head, "a.txt").unwrap();
+        let counts = blame_counts(repo.path(), &head, "a.txt", None).unwrap();
         assert_eq!(counts.values().sum::<u64>(), 2);
         assert!(!marker.exists());
     }
