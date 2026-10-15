@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-10-15
+
+### Changed
+
+- **Contributors** works on large repositories. Pull request commits and diffs are now read from the local repository instead of GitHub. The heads of pull requests are fetched into the object store only, without creating any refs. `gh` only loads the pull request list, reviews and closed pull requests, and asks GitHub for commits only for the pull requests git cannot answer.
+- If GitHub runs out of time, Contributors keeps the data it has already loaded and says the data was cut short. Before, it threw everything away and fell back to git history.
+- The Contributors range is now **7d**, **30d** or a **Custom** range of up to 30 days that starts no earlier than the oldest selectable season. The 90d, 1y and All presets are gone, and a saved choice of one of them falls back to 30d.
+
+### Fixed
+
+- Clicking a session or switching workspace in the sidebar while Contributors is open now shows that session. Before, it only appeared after you clicked the project.
+- Contributors no longer credits a pull request to the author of the commits it carries when that person is not the one who opened it.
+
 ## [0.21.0] - 2026-10-15
 
 ### Added
