@@ -48,7 +48,7 @@ import {
   saveQuickComposerShortcut,
   saveTabAnimationsEnabled,
 } from "./settings";
-import { IS_MAC, MOD, SHIFT } from "../../../platform/tauri/platform";
+import { ALT, IS_MAC, MOD, SHIFT } from "../../../platform/tauri/platform";
 
 const KEY = "monocode.composerRunner";
 const MODEL_CONTROLS_KEY = "monocode.modelControls";
@@ -390,6 +390,12 @@ describe("grid arcade enabled setting", () => {
 });
 
 describe("workspace navigation keybindings", () => {
+  it("binds Toggle Git Blame to mod-alt-b and no other command shares it", () => {
+    const keys = `${MOD}${ALT}B`;
+    expect(
+      KEYBINDINGS.filter((row) => row.keys === keys).map((row) => row.command),
+    ).toEqual(["Editor: Toggle Git Blame"]);
+  });
   it("keeps separate shortcuts for the project rail and session sidebar", () => {
     expect(
       KEYBINDINGS.filter((row) =>

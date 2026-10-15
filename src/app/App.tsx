@@ -765,6 +765,7 @@ import {
   subscribeLiveAgentsEnabled,
   subscribeMailEnabled,
   subscribeNotesEnabled,
+  toggleBlameColumn,
   type CollapsedProjectRailMode,
   type SettingsSectionId,
   type FollowUpBehavior,
@@ -4456,6 +4457,26 @@ function Workspace({
                 sidebarCwdRef.current,
                 pin,
               )
+            : tab,
+        ),
+      );
+      setComposerFocused(false);
+    },
+    [activeTabId],
+  );
+
+  // Blame opens the commit in the repository of the file it was clicked in,
+  // which need not be the one the source-control panel is showing. The sidebar
+  // project is the focused file's, so the tab keeps it.
+  const onOpenBlameCommit = useCallback(
+    (
+      cwd: string,
+      commit: { sha: string; shortSha: string; subject: string },
+    ) => {
+      setTabs((prev) =>
+        prev.map((tab) =>
+          tab.id === activeTabId
+            ? openCommitTab(tab, cwd, commit, sidebarCwdRef.current)
             : tab,
         ),
       );
@@ -12649,6 +12670,8 @@ function Workspace({
           run("new-terminal-tab", a.onNewTerminalTab);
         else if (cmd === "toggle-terminal")
           run("toggle-terminal", a.onToggleProjectTerminal);
+        else if (cmd === "toggle-blame")
+          run("toggle-blame", () => void toggleBlameColumn());
         else if (cmd === "prev-session")
           run("prev-session", () => a.onNavigateSessionList(-1));
         else if (cmd === "next-session")
@@ -12759,6 +12782,9 @@ function Workspace({
       ),
       listen("toggle_terminal", () =>
         run("toggle-terminal", actions.current.onToggleProjectTerminal),
+      ),
+      listen("toggle_blame", () =>
+        run("toggle-blame", () => void toggleBlameColumn()),
       ),
       listen("focus_left", () =>
         run("focus-left", () => actions.current.onFocusDir("left")),
@@ -13637,6 +13663,7 @@ function Workspace({
                                     onCloseFile={onCloseFile}
                                     onCloseOtherFiles={onCloseOtherFiles}
                                     onPinFile={onPinFile}
+                                    onOpenBlameCommit={onOpenBlameCommit}
                                     onReorderFiles={onReorderFiles}
                                     onFileDirtyChange={onFileDirtyChange}
                                     onFileErrorCountChange={

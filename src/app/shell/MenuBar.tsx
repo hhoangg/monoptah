@@ -13,6 +13,7 @@ import {
   saveAutosave,
   subscribeAutosave,
   subscribeKeybindings,
+  toggleBlameColumn,
 } from "../../features/settings/model/settings";
 
 type MenuKey = "file" | "view" | "terminal";
@@ -188,6 +189,9 @@ export function MenuBar({
         case "toggle_session_sidebar":
           onToggleSessionSidebar();
           break;
+        case "toggle_blame":
+          toggleBlameColumn();
+          break;
         case "open_model_picker":
           window.dispatchEvent(new Event("open_model_picker"));
           break;
@@ -338,6 +342,12 @@ export function MenuBar({
             id: "toggle_terminal",
             label: "Toggle Terminal",
             shortcut: shortcut("Terminal: Toggle Dock", `${MOD}J`),
+          },
+          {
+            kind: "item",
+            id: "toggle_blame",
+            label: "Toggle Git Blame",
+            shortcut: shortcut("Editor: Toggle Git Blame", `${MOD}${ALT}B`),
           },
           {
             kind: "item",

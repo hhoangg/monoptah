@@ -148,6 +148,10 @@ type Shared = {
   ) => void;
   onQuestionInteraction?: (sessionId: string, requestId: number) => void;
   onOpenFile: (path: string) => void;
+  onOpenBlameCommit?: (
+    cwd: string,
+    commit: { sha: string; shortSha: string; subject: string },
+  ) => void;
   editorNavigation?: EditorNavigationTarget | null;
   onOpenDiff: (
     path?: string,
@@ -271,6 +275,7 @@ function PaneTreeComponent({
   onQuestionReply,
   onQuestionInteraction,
   onOpenFile,
+  onOpenBlameCommit,
   editorNavigation,
   onOpenDiff,
   onOpenPlan,
@@ -503,6 +508,7 @@ function PaneTreeComponent({
                   onDirtyChange={onFileDirtyChange}
                   onErrorCountChange={onFileErrorCountChange}
                   onOpenFile={onOpenFile}
+                  onOpenBlameCommit={onOpenBlameCommit}
                   onUpdatePlan={onUpdatePlan}
                   onBuildPlan={onBuildPlan}
                   editorNavigation={editorNavigation}

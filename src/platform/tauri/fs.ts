@@ -281,6 +281,29 @@ export function gitCommitFileDiff(
   return invoke<GitFileDiff>("git_commit_file_diff", { cwd, sha, relative });
 }
 
+export type GitBlameHunk = {
+  /** Full sha; all zeros for lines that are not committed yet. */
+  sha: string;
+  shortSha: string;
+  author: string;
+  /** Unix seconds. */
+  authorTime: number;
+  /** Commit subject. */
+  summary: string;
+  uncommitted: boolean;
+  /** 1-based line in the working-tree file. */
+  startLine: number;
+  lineCount: number;
+};
+
+export type GitBlame = { hunks: GitBlameHunk[] };
+
+/** Blame for the working-tree version of a file; empty for untracked,
+ * binary or oversized files. */
+export function gitBlame(cwd: string, relative: string): Promise<GitBlame> {
+  return invoke<GitBlame>("git_blame", { cwd, relative });
+}
+
 export function gitStageContents(
   cwd: string,
   relative: string,

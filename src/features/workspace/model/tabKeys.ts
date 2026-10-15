@@ -18,6 +18,7 @@
  *   New terminal        cmd-`
  *   New terminal tab    shift-cmd-`
  *   Toggle terminal     cmd-j
+ *   Toggle git blame    cmd-opt-b
  *   Zoom in             cmd-= (cmd-+ on shift layouts)
  *   Zoom out            cmd--
  *   Reset zoom          cmd-0
@@ -49,6 +50,7 @@ export type TabCommand =
   | "new-terminal"
   | "new-terminal-tab"
   | "toggle-terminal"
+  | "toggle-blame"
   | "prev-session"
   | "next-session"
   | "prev-session-in-tab"
@@ -66,6 +68,7 @@ export function tabCommand(e: KeyboardEvent): TabCommand | null {
 
   if (mod && e.altKey && !e.shiftKey) {
     if (e.key.toLowerCase() === "t") return "close-others";
+    if (e.key.toLowerCase() === "b") return "toggle-blame";
     if (e.key === "ArrowLeft") return { focus: "left" };
     if (e.key === "ArrowRight") return { focus: "right" };
     if (e.key === "ArrowUp") return { focus: "up" };
@@ -127,6 +130,7 @@ const TAB_COMMAND_KEYBINDINGS: Record<Exclude<TabCommand, object>, string> = {
   "new-terminal": "Terminal: New",
   "new-terminal-tab": "Terminal: New Tab",
   "toggle-terminal": "Terminal: Toggle Dock",
+  "toggle-blame": "Editor: Toggle Git Blame",
   "prev-session": "Session: Previous",
   "next-session": "Session: Next",
   "prev-session-in-tab": "Session: Previous in Current Tab",

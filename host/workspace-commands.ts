@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { FileMtime, FsEntry, GitPr, ProjectFile } from "../src/platform/tauri/fs";
+import { hostGitBlame } from "./git-blame";
 import { hostWorktrees } from "./git-worktrees";
 import { createHostBranch, hostBranches, switchHostBranch } from "./git-branches";
 import type { HostStore } from "./store";
@@ -71,6 +72,7 @@ export const WORKSPACE_COMMANDS = [
   "git_history",
   "git_commit_files",
   "git_commit_file_diff",
+  "git_blame",
   "git_staged_context",
   "git_range_context",
   "git_branches",
@@ -190,6 +192,8 @@ export class WorkspaceCommands {
         return this.gitCommitFiles(input.cwd, input.sha);
       case "git_commit_file_diff":
         return this.gitCommitFileDiff(input.cwd, input.sha, input.relative);
+      case "git_blame":
+        return this.gitBlame(input.cwd, input.relative);
       case "git_staged_context":
         return this.gitStagedContext(input.cwd, input.paths);
       case "git_range_context":
@@ -699,6 +703,12 @@ export class WorkspaceCommands {
       original: binary || tooLarge ? "" : original.bytes.toString("utf8"),
       current: binary || tooLarge ? "" : current.bytes.toString("utf8"),
       binary, tooLarge };
+  }
+
+  private async gitBlame(cwd: unknown, input: unknown) {
+    const root = await this.gitRoot(cwd);
+    const path = relative(root, workspacePath(root, input)).replace(/\\/g, "/");
+    return hostGitBlame(root, path, MAX_TEXT_FILE);
   }
 
   private async gitBlob(root: string, spec: string) {

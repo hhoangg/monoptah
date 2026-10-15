@@ -977,6 +977,35 @@ pub async fn git_commit_file_diff(
     .map_err(|e| e.to_string())?
 }
 
+/// One run of consecutive working-tree lines last changed by the same commit.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBlameHunk {
+    pub sha: String,
+    pub short_sha: String,
+    pub author: String,
+    pub author_time: i64,
+    pub summary: String,
+    pub uncommitted: bool,
+    pub start_line: u32,
+    pub line_count: u32,
+}
+
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBlame {
+    pub hunks: Vec<GitBlameHunk>,
+}
+
+/// Blame for the working-tree version of one file. Untracked, binary and
+/// oversized files return no hunks.
+#[tauri::command]
+pub async fn git_blame(cwd: String, relative: String) -> Result<GitBlame, String> {
+    tauri::async_runtime::spawn_blocking(move || git_blame_for(&expand_home(&cwd), &relative))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Stage a changed file (`git add`).
 #[tauri::command]
 pub async fn git_stage_file(cwd: String, relative: String) -> Result<(), String> {
@@ -2455,6 +2484,149 @@ fn git_commit_file_diff_for(root: &Path, sha: &str, relative: &str) -> Result<Gi
         binary,
         too_large,
     })
+}
+
+fn git_blame_for(root: &Path, relative: &str) -> Result<GitBlame, String> {
+    let relative = resolve_repo_path(root, relative)?;
+    if !git_is_work_tree(root) {
+        return Err("Not a git repository".into());
+    }
+    if !blame_candidate(&root.join(&relative)) {
+        return Ok(GitBlame::default());
+    }
+    let output = git_cmd()
+        .arg("--no-pager")
+        .arg("-C")
+        .arg(root)
+        .args(["blame", "--porcelain", "--", &relative])
+        // The untracked check below reads git's English error text.
+        .env("LC_ALL", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        return Ok(GitBlame {
+            hunks: parse_git_blame_porcelain(&text),
+        });
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let msg = stderr.trim();
+    // A file git has never seen (untracked, or any file before the first commit)
+    // has nothing to blame.
+    if msg.contains("no such path") || msg.contains("no such ref: HEAD") {
+        return Ok(GitBlame::default());
+    }
+    if msg.is_empty() {
+        Err("git blame failed".into())
+    } else {
+        Err(msg.to_string())
+    }
+}
+
+/// False for working-tree files that are oversized or look binary (a NUL byte
+/// in the first 8 KiB). A file that cannot be inspected is left to git, which
+/// reports why.
+fn blame_candidate(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return true;
+    };
+    if file
+        .metadata()
+        .map(|meta| meta.len() > MAX_TEXT_FILE_BYTES)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let mut head = Vec::with_capacity(8192);
+    if file.take(8192).read_to_end(&mut head).is_err() {
+        return true;
+    }
+    !head.contains(&0)
+}
+
+/// Parse `git blame --porcelain` output. Commit metadata is printed only the
+/// first time a sha appears, so it is cached by sha; consecutive lines from
+/// the same commit are merged into one hunk.
+fn parse_git_blame_porcelain(text: &str) -> Vec<GitBlameHunk> {
+    struct Meta {
+        author: String,
+        author_time: i64,
+        summary: String,
+    }
+    let mut metas: HashMap<&str, Meta> = HashMap::new();
+    // (sha, final line) for every blamed line, in output order.
+    let mut lines: Vec<(&str, u32)> = Vec::new();
+    let mut current: Option<&str> = None;
+    for line in text.lines() {
+        // File content is prefixed with a tab and may look like anything.
+        if line.starts_with('\t') {
+            continue;
+        }
+        if let Some((sha, final_line)) = blame_header(line) {
+            metas.entry(sha).or_insert(Meta {
+                author: String::new(),
+                author_time: 0,
+                summary: String::new(),
+            });
+            lines.push((sha, final_line));
+            current = Some(sha);
+            continue;
+        }
+        let Some(meta) = current.and_then(|sha| metas.get_mut(sha)) else {
+            continue;
+        };
+        if let Some(value) = line.strip_prefix("author ") {
+            meta.author = value.to_string();
+        } else if let Some(value) = line.strip_prefix("author-time ") {
+            meta.author_time = value.trim().parse().unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("summary ") {
+            meta.summary = value.to_string();
+        }
+    }
+    lines.sort_by_key(|(_, line)| *line);
+    let mut hunks: Vec<GitBlameHunk> = Vec::new();
+    for (sha, line) in lines {
+        if let Some(last) = hunks.last_mut() {
+            if last.sha == sha && last.start_line + last.line_count == line {
+                last.line_count += 1;
+                continue;
+            }
+        }
+        let meta = &metas[sha];
+        hunks.push(GitBlameHunk {
+            sha: sha.to_string(),
+            short_sha: sha.chars().take(7).collect(),
+            author: meta.author.clone(),
+            author_time: meta.author_time,
+            summary: meta.summary.clone(),
+            uncommitted: sha.bytes().all(|b| b == b'0'),
+            start_line: line,
+            line_count: 1,
+        });
+    }
+    hunks
+}
+
+/// `<sha> <original line> <final line> [<group size>]`, returning the sha and
+/// the final (working-tree) line number.
+fn blame_header(line: &str) -> Option<(&str, u32)> {
+    let mut parts = line.split(' ');
+    let sha = parts.next()?;
+    if !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let _original: u32 = parts.next()?.parse().ok()?;
+    let final_line: u32 = parts.next()?.parse().ok()?;
+    if let Some(group) = parts.next() {
+        group.parse::<u32>().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((sha, final_line))
 }
 
 fn git_stage_file_for(root: &Path, relative: &str) -> Result<(), String> {
@@ -7695,6 +7867,173 @@ mod tests {
         let history = git_history_for(&dir.0, Some(1)).unwrap();
         let sha = &history.commits[0].sha;
         assert!(git_commit_file_diff_for(&dir.0, sha, "../secret.txt").is_err());
+    }
+
+    const BLAME_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BLAME_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const BLAME_ZERO: &str = "0000000000000000000000000000000000000000";
+
+    fn blame_sample() -> String {
+        // Lines 1-2 and 5 come from A, 3-4 from B, 6 is uncommitted. A's
+        // metadata appears once; line content that looks like a header and
+        // like metadata must be ignored.
+        format!(
+            "{BLAME_A} 1 1 2\n\
+author Alice\n\
+author-mail <alice@example.com>\n\
+author-time 1700000000\n\
+author-tz +0000\n\
+summary first commit\n\
+filename f.txt\n\
+\tone\n\
+{BLAME_A} 2 2\n\
+\t{BLAME_B} 9 9 9\n\
+{BLAME_B} 7 3 2\n\
+author Bob\n\
+author-time 1700000500\n\
+summary second: fix\n\
+filename f.txt\n\
+\tauthor Mallory\n\
+{BLAME_B} 8 4\n\
+\tsummary nope\n\
+{BLAME_A} 5 5 1\n\
+\tfive\n\
+{BLAME_ZERO} 6 6 1\n\
+author Not Committed Yet\n\
+author-time 1700001000\n\
+summary Version of f.txt from f.txt\n\
+filename f.txt\n\
+\tsix\n"
+        )
+    }
+
+    #[test]
+    fn git_blame_parser_merges_groups_and_reuses_metadata() {
+        let hunks = parse_git_blame_porcelain(&blame_sample());
+        let spans: Vec<_> = hunks
+            .iter()
+            .map(|h| (h.sha.as_str(), h.start_line, h.line_count))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (BLAME_A, 1, 2),
+                (BLAME_B, 3, 2),
+                (BLAME_A, 5, 1),
+                (BLAME_ZERO, 6, 1)
+            ]
+        );
+        assert_eq!(hunks[0].author, "Alice");
+        assert_eq!(hunks[0].author_time, 1_700_000_000);
+        assert_eq!(hunks[0].summary, "first commit");
+        assert_eq!(hunks[0].short_sha, "aaaaaaa");
+        assert!(!hunks[0].uncommitted);
+        assert_eq!(hunks[1].author, "Bob");
+        assert_eq!(hunks[1].summary, "second: fix");
+        // Metadata was only printed with A's first line; later groups reuse it.
+        assert_eq!(hunks[2].author, "Alice");
+        assert_eq!(hunks[2].author_time, 1_700_000_000);
+        assert_eq!(hunks[2].summary, "first commit");
+        assert!(hunks[3].uncommitted);
+        assert_eq!(hunks[3].short_sha, "0000000");
+    }
+
+    #[test]
+    fn git_blame_parser_merges_adjacent_groups_of_one_commit() {
+        let text = format!(
+            "{BLAME_A} 1 1 1\nauthor A\nauthor-time 1\nsummary s\nfilename f\n\tx\n\
+{BLAME_A} 4 2 1\n\ty\n"
+        );
+        let hunks = parse_git_blame_porcelain(&text);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!((hunks[0].start_line, hunks[0].line_count), (1, 2));
+        assert!(parse_git_blame_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn git_blame_attributes_lines_to_commits_and_uncommitted_edits() {
+        let dir = tmp("git-blame");
+        if !init_git_commit(&dir.0, &[("a.txt", "one\ntwo\nthree\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        assert!(git(&dir.0, &["commit", "-am", "add four"]));
+        std::fs::write(dir.0.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+
+        let history = git_history_for(&dir.0, Some(2)).unwrap();
+        let (second, first) = (&history.commits[0].sha, &history.commits[1].sha);
+        let blame = git_blame_for(&dir.0, "a.txt").unwrap();
+        let spans: Vec<_> = blame
+            .hunks
+            .iter()
+            .map(|h| (h.sha.as_str(), h.start_line, h.line_count, h.uncommitted))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (first.as_str(), 1, 1, false),
+                (BLAME_ZERO, 2, 1, true),
+                (first.as_str(), 3, 1, false),
+                (second.as_str(), 4, 1, false),
+            ]
+        );
+        assert_eq!(blame.hunks[0].author, "Monoptah");
+        assert_eq!(blame.hunks[0].summary, "init");
+        assert_eq!(blame.hunks[3].summary, "add four");
+        assert_eq!(blame.hunks[0].short_sha, first[..7]);
+    }
+
+    #[test]
+    fn git_blame_untracked_binary_and_bad_inputs() {
+        let dir = tmp("git-blame-edge");
+        if !init_git_commit(&dir.0, &[("a.txt", "one\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("new.txt"), "fresh\n").unwrap();
+        assert!(git_blame_for(&dir.0, "new.txt").unwrap().hunks.is_empty());
+        // Once staged, git blames every line as uncommitted.
+        assert!(git(&dir.0, &["add", "new.txt"]));
+        let staged = git_blame_for(&dir.0, "new.txt").unwrap();
+        assert_eq!(staged.hunks.len(), 1);
+        assert!(staged.hunks[0].uncommitted);
+
+        std::fs::write(dir.0.join("bin.dat"), b"a\0b\n").unwrap();
+        assert!(git(&dir.0, &["add", "bin.dat"]));
+        assert!(git(&dir.0, &["commit", "-m", "bin"]));
+        assert!(git_blame_for(&dir.0, "bin.dat").unwrap().hunks.is_empty());
+
+        assert!(git_blame_for(&dir.0, "../secret.txt").is_err());
+        // Tracked but deleted from disk: git cannot read it, and says so.
+        std::fs::remove_file(dir.0.join("a.txt")).unwrap();
+        assert!(git_blame_for(&dir.0, "a.txt")
+            .unwrap_err()
+            .contains("Cannot lstat"));
+        let plain = tmp("git-blame-plain");
+        assert_eq!(
+            git_blame_for(&plain.0, "a.txt").unwrap_err(),
+            "Not a git repository"
+        );
+    }
+
+    #[test]
+    fn git_blame_skips_files_over_the_size_limit() {
+        let dir = tmp("git-blame-large");
+        if !init_git_commit(&dir.0, &[("a.txt", "one\n")]) {
+            return;
+        }
+        let big = vec![b'x'; MAX_TEXT_FILE_BYTES as usize + 1];
+        std::fs::write(dir.0.join("a.txt"), big).unwrap();
+        assert!(git_blame_for(&dir.0, "a.txt").unwrap().hunks.is_empty());
+    }
+
+    #[test]
+    fn git_blame_is_empty_before_the_first_commit() {
+        let dir = tmp("git-blame-unborn");
+        if !init_git(&dir.0, "main", None) {
+            return;
+        }
+        std::fs::write(dir.0.join("a.txt"), "one\n").unwrap();
+        assert!(git_blame_for(&dir.0, "a.txt").unwrap().hunks.is_empty());
     }
 
     #[test]

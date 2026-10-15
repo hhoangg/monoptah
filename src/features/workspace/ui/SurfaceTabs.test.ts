@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { Storage } from "happy-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { saveBlameColumn } from "../../settings/model/settings";
 import {
   newChangesTab,
   newCommitTab,
@@ -89,22 +91,46 @@ describe("appendProblems", () => {
 });
 
 describe("surfaceTabMenuItems", () => {
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", new Storage());
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const labels = (items: ReturnType<typeof surfaceTabMenuItems>) =>
+    items.flatMap((item) => (item.kind === "item" ? [item.label] : []));
+
   it("offers filesystem actions for regular and review file tabs", () => {
-    for (const review of [false, true]) {
-      const items = surfaceTabMenuItems(
-        newFileTab("/repo/src/app.ts", "/repo", review),
-      );
-      expect(
-        items.flatMap((item) => (item.kind === "item" ? [item.label] : [])),
-      ).toEqual([
-        "Open in Default App",
-        expect.stringMatching(/Reveal|Containing Folder/),
-        "Copy Path",
-        "Copy Relative Path",
-        "Copy File Name",
-        "Close",
-        "Close Others",
-      ]);
+    const common = [
+      "Open in Default App",
+      expect.stringMatching(/Reveal|Containing Folder/),
+      "Copy Path",
+      "Copy Relative Path",
+      "Copy File Name",
+    ];
+    expect(
+      labels(surfaceTabMenuItems(newFileTab("/repo/src/app.ts", "/repo"))),
+    ).toEqual([...common, "Show Git Blame", "Close", "Close Others"]);
+    // Blame stays off in review tabs, so there is nothing to toggle there.
+    expect(
+      labels(surfaceTabMenuItems(newFileTab("/repo/src/app.ts", "/repo", true))),
+    ).toEqual([...common, "Close", "Close Others"]);
+  });
+
+  it("labels the blame item by the current state of the column", () => {
+    const file = newFileTab("/repo/src/app.ts", "/repo");
+    expect(labels(surfaceTabMenuItems(file))).toContain("Show Git Blame");
+    saveBlameColumn(true);
+    const items = labels(surfaceTabMenuItems(file));
+    expect(items).toContain("Hide Git Blame");
+    expect(items).not.toContain("Show Git Blame");
+  });
+
+  it("leaves blame out of image and video tabs", () => {
+    for (const path of ["/repo/logo.png", "/repo/demo.mp4"]) {
+      const items = labels(surfaceTabMenuItems(newFileTab(path, "/repo")));
+      expect(items.some((label) => /Git Blame/.test(label))).toBe(false);
     }
   });
 

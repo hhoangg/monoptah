@@ -26,6 +26,11 @@ import {
 } from "../model/layout";
 import { displayPath } from "../../../shared/lib/paths";
 import { IS_MAC, IS_WIN } from "../../../platform/tauri/platform";
+import { isImagePath, isVideoPath } from "../../files/model/filePreview";
+import {
+  loadBlameColumn,
+  toggleBlameColumn,
+} from "../../settings/model/settings";
 import { releaseNotesTitle } from "../../../app/model/releaseNotes";
 import { terminalTabLabel } from "../../terminal/model/terminalTab";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
@@ -95,6 +100,19 @@ export function surfaceTabMenuItems(
     return [close, closeOthers];
   }
 
+  // Blame only applies to text files opened for editing, not review tabs.
+  const blame: ExplorerMenuItem[] =
+    isReviewTab(file) || isImagePath(file.path) || isVideoPath(file.path)
+      ? []
+      : [
+          {
+            kind: "item",
+            id: "toggle-blame",
+            label: loadBlameColumn() ? "Hide Git Blame" : "Show Git Blame",
+          },
+          { kind: "sep" },
+        ];
+
   return [
     { kind: "item", id: "open-default", label: "Open in Default App" },
     { kind: "item", id: "reveal", label: REVEAL_LABEL },
@@ -107,6 +125,7 @@ export function surfaceTabMenuItems(
     },
     { kind: "item", id: "copy-name", label: "Copy File Name" },
     { kind: "sep" },
+    ...blame,
     close,
     closeOthers,
   ];
@@ -229,6 +248,10 @@ export function SurfaceTabs({
       return;
     }
     if (!isFilesystemTab(menuFile) || isChangesTab(menuFile)) return;
+    if (id === "toggle-blame") {
+      toggleBlameColumn();
+      return;
+    }
 
     let action: Promise<void>;
     switch (id) {
