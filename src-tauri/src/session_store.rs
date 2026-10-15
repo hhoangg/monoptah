@@ -75,7 +75,6 @@ impl SessionStore {
     /// for or blocks the write connection. Stores without one (in-memory test
     /// stores) fall back to the write connection. Never call git or the network
     /// inside `f`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_read_conn<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, String>,

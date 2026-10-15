@@ -12,9 +12,7 @@
 mod gh;
 mod jobs;
 mod pr_heads;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod store;
-#[cfg_attr(not(test), allow(dead_code))]
 mod sync;
 
 use std::collections::{HashMap, HashSet};
@@ -2418,8 +2416,15 @@ pub async fn contributors_sync_cancel(
 /// The last event of every running and queued sync, for a page that was
 /// opened or reloaded after they started.
 #[tauri::command]
-pub fn contributors_sync_status(jobs: State<'_, jobs::JobManager>) -> Vec<jobs::SyncEvent> {
-    jobs.status()
+pub async fn contributors_sync_status(
+    jobs: State<'_, jobs::JobManager>,
+) -> Result<Vec<jobs::SyncEvent>, String> {
+    // Off the main thread: a clear of the repository holds the job lock while
+    // it deletes rows.
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.status())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Deletes everything synced for the repository; refused while a sync of it runs.

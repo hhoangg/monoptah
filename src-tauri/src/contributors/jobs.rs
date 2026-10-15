@@ -53,6 +53,9 @@ pub struct SyncEvent {
     pub repo_key: String,
     /// Folder name of the repository, for display.
     pub project: String,
+    /// Working tree the sync was requested from: the path of the project whose
+    /// Contributors page shows this job.
+    pub root: String,
     pub branch: String,
     pub step: SyncStep,
     pub done: u64,
@@ -107,6 +110,7 @@ impl JobSpec {
         SyncEvent {
             repo_key: self.repo_key.clone(),
             project: self.project.clone(),
+            root: self.root.to_string_lossy().into_owned(),
             branch: self.branch.clone(),
             step: SyncStep::Counting,
             done: 0,
@@ -204,11 +208,12 @@ impl Reporter for JobReporter {
     fn progress(&self, step: SyncStep, done: u64, total: u64) {
         let event = {
             let mut last = lock(&self.0.last);
+            let step_changed = last.event.step != step;
             last.event.step = step;
             last.event.done = done;
             last.event.total = total;
             last.event.percent = sync::percent(step, done, total);
-            if last.emitted_at.elapsed() < THROTTLE {
+            if !step_changed && last.emitted_at.elapsed() < THROTTLE {
                 return;
             }
             last.emitted_at = Instant::now();
@@ -286,20 +291,25 @@ impl JobManager {
             return Ok(());
         }
         let key = spec.repo_key.clone();
-        let event = spec.event(JobState::Queued);
-        self.0.sink.emit(&event);
-        let mut jobs = RepoJobs::default();
-        jobs.queued.push_back(Queued { spec, event });
-        repos.insert(key.clone(), jobs);
         let manager = self.clone();
         let worker_key = key.clone();
+        // The worker waits for the lock held here, so `queued` always goes
+        // out before its `running`.
         let spawned = std::thread::Builder::new()
             .name("contributors-sync".to_string())
             .spawn(move || manager.work(&worker_key));
         if let Err(error) = spawned {
-            repos.remove(&key);
-            return Err(format!("Could not start the sync: {error}"));
+            let message = format!("Could not start the sync: {error}");
+            let mut event = spec.event(JobState::Error);
+            event.error = Some(message.clone());
+            self.0.sink.emit(&event);
+            return Err(message);
         }
+        let event = spec.event(JobState::Queued);
+        self.0.sink.emit(&event);
+        let mut jobs = RepoJobs::default();
+        jobs.queued.push_back(Queued { spec, event });
+        repos.insert(key, jobs);
         Ok(())
     }
 
@@ -473,13 +483,25 @@ pub struct LoadResponse {
 /// find nothing, and nothing is written for a page that was only opened.
 const UNKNOWN_REPO: i64 = -1;
 
+/// A row written by a sync that reached the present: it ends at the moment it
+/// was synced. A row that ends earlier ends at a fixed past date (the
+/// previous-period half of another sync, or a merge of older rows into a newer
+/// head), so no time after it is known to be synced.
+fn reached_present(row: &store::CoverageRow) -> bool {
+    row.to_epoch.saturating_add(PRESENT_SLACK_SECS) >= row.synced_at
+}
+
+/// Clock skew between taking `now` and writing a row.
+const PRESENT_SLACK_SECS: i64 = 5;
+
 /// A period of the store, for `contributors_load`. Git is asked for hashes
 /// only, with no database lock held, then the store answers in one read
 /// transaction. Nothing is synced or fetched.
 ///
 /// The period never extends past `now`. When it reaches the present, the end
 /// is also pulled back to where the sync covered it: coverage stops at the
-/// moment of the last sync, so without this a current period would stop being
+/// moment of the last sync (only rows that reached the present count, see
+/// `reached_present`), so without this a current period would stop being
 /// covered a second after it was synced. What happened since shows up through
 /// the top-up that the moved head asks for.
 pub(super) fn load_response(
@@ -505,6 +527,7 @@ pub(super) fn load_response(
         let edge = rows
             .iter()
             .filter(|r| r.to_epoch >= since && r.from_epoch <= until)
+            .filter(|r| reached_present(r))
             .map(|r| r.to_epoch)
             .max();
         if let Some(edge) = edge {
@@ -896,6 +919,7 @@ mod tests {
             (JobState::Running, SyncStep::Commits, 1, 4)
         );
         assert_eq!(a.percent, sync::percent(SyncStep::Commits, 1, 4));
+        assert_eq!(a.root, "/nowhere");
         assert_eq!(find("b").state, JobState::Queued);
         assert_eq!(find("c").state, JobState::Running);
         assert_eq!(status.len(), 3);
@@ -1015,10 +1039,10 @@ mod tests {
     #[test]
     fn progress_after_the_throttle_window_is_emitted() {
         let (jobs, sink) = Harness::with_runner(|_: &JobSpec, reporter: &dyn Reporter| {
-            reporter.progress(SyncStep::Commits, 1, 10);
+            reporter.progress(SyncStep::Counting, 1, 10);
             std::thread::sleep(THROTTLE + Duration::from_millis(60));
-            reporter.progress(SyncStep::Commits, 5, 10);
-            reporter.progress(SyncStep::Commits, 6, 10);
+            reporter.progress(SyncStep::Counting, 5, 10);
+            reporter.progress(SyncStep::Counting, 6, 10);
             Ok(outcome(false))
         });
         jobs.start(spec("repo", "a")).unwrap();
@@ -1035,6 +1059,35 @@ mod tests {
         assert_eq!(seen[0], 0);
         assert!(seen.contains(&5), "{seen:?}");
         assert!(seen.len() <= 3, "{seen:?}");
+    }
+
+    #[test]
+    fn a_change_of_step_is_never_held_back_by_the_throttle() {
+        let (jobs, sink) = Harness::with_runner(|_: &JobSpec, reporter: &dyn Reporter| {
+            reporter.progress(SyncStep::Counting, 1, 1);
+            reporter.progress(SyncStep::Commits, 0, 7);
+            reporter.progress(SyncStep::PullRequests, 0, 3);
+            reporter.progress(SyncStep::Github, 0, 2);
+            Ok(outcome(false))
+        });
+        jobs.start(spec("repo", "a")).unwrap();
+        sink.wait_state("a", JobState::Done);
+
+        let steps: Vec<SyncStep> = sink
+            .all()
+            .iter()
+            .filter(|e| e.state == JobState::Running)
+            .map(|e| e.step)
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                SyncStep::Counting,
+                SyncStep::Commits,
+                SyncStep::PullRequests,
+                SyncStep::Github
+            ]
+        );
     }
 
     #[test]
@@ -1083,6 +1136,7 @@ mod tests {
         let event = SyncEvent {
             repo_key: "/r/.git".to_string(),
             project: "r".to_string(),
+            root: "/work/r".to_string(),
             branch: "main".to_string(),
             step: SyncStep::PullRequests,
             done: 3,
@@ -1096,6 +1150,7 @@ mod tests {
             serde_json::json!({
                 "repoKey": "/r/.git",
                 "project": "r",
+                "root": "/work/r",
                 "branch": "main",
                 "step": "pullRequests",
                 "done": 3,
@@ -1345,6 +1400,148 @@ mod tests {
         )
         .unwrap();
         assert!(!loaded.covered);
+    }
+
+    /// Replaces what the store knows about the coverage of `main` with `rows`
+    /// (from, to, synced_at), added the way a sync adds them.
+    fn set_coverage(store: &SessionStore, repo: &TestRepo, head: &str, rows: &[(i64, i64, i64)]) {
+        let dir = store::git_common_dir(repo.path()).unwrap();
+        let mut conn = store.lock_conn().unwrap();
+        let id = store::repo_id(&conn, &dir, None).unwrap();
+        conn.execute("DELETE FROM contrib_coverage", []).unwrap();
+        let tx = conn.transaction().unwrap();
+        for &(from_epoch, to_epoch, synced_at) in rows {
+            store::add_coverage(
+                &tx,
+                id,
+                "main",
+                &store::CoverageRow {
+                    from_epoch,
+                    to_epoch,
+                    head: head.to_string(),
+                    synced_at,
+                    gh_state: "unavailable".to_string(),
+                    gh_note: None,
+                },
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    /// A store that holds both commits of the repository, with no coverage.
+    fn stored_commits_only(repo: &TestRepo) -> (SessionStore, String) {
+        let store = SessionStore::open_in_memory().unwrap();
+        let spec = prepare_job(repo.path(), None, SINCE, UNTIL, "full", None).unwrap();
+        run_job(
+            &store,
+            &spec,
+            &gh::Unavailable,
+            &gh::CommitCache::new(),
+            &NoReport,
+        )
+        .unwrap();
+        let head = repo.run(&["rev-parse", "HEAD"], ALICE, "2026-01-07T10:00:00+0000");
+        (store, head)
+    }
+
+    fn at(iso: &str) -> i64 {
+        super::super::parse_iso_epoch(iso).unwrap()
+    }
+
+    #[test]
+    fn a_past_row_of_another_sync_does_not_cover_the_present() {
+        // Scenario A: a month synced a few days ago, whose row ends at the end
+        // of that month, then the last 7 days opened. The days after the
+        // month are not synced, and the head has not moved, so nothing else
+        // would ever ask for a sync.
+        let repo = repo_with_commits();
+        let (store, head) = stored_commits_only(&repo);
+        let now = at("2026-01-25T12:00:00Z");
+        set_coverage(
+            &store,
+            &repo,
+            &head,
+            &[(at("2025-12-01T00:00:00Z"), at("2026-01-20T23:59:59Z"), now)],
+        );
+        let loaded = load_response(
+            &store,
+            repo.path(),
+            None,
+            "2026-01-18T00:00:00Z",
+            "2099-01-01T00:00:00Z",
+            now,
+        )
+        .unwrap();
+        assert_eq!(loaded.missing_commits, 0);
+        assert!(!loaded.covered);
+    }
+
+    #[test]
+    fn a_row_merged_into_a_newer_sync_does_not_cover_the_present() {
+        // Scenario B: the current month synced up to the present, then an
+        // older stretch synced later; the two rows merge into one whose end is
+        // the first sync's moment but whose time is the second sync's.
+        let repo = repo_with_commits();
+        let (store, head) = stored_commits_only(&repo);
+        let first = at("2026-01-25T12:00:00Z");
+        let second = at("2026-01-28T12:00:00Z");
+        set_coverage(
+            &store,
+            &repo,
+            &head,
+            &[
+                (at("2026-01-01T00:00:00Z"), first, first),
+                (
+                    at("2025-10-01T00:00:00Z"),
+                    at("2025-12-31T23:59:59Z"),
+                    second,
+                ),
+            ],
+        );
+        let rows = store
+            .with_read_conn(|conn| {
+                let dir = store::git_common_dir(repo.path())?;
+                let id = store::find_repo_id(conn, &dir)?.unwrap();
+                store::coverage(conn, id, "main")
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the rows must have merged: {rows:?}");
+        assert_eq!(rows[0].synced_at, second);
+
+        let loaded = load_response(
+            &store,
+            repo.path(),
+            None,
+            "2026-01-01T00:00:00Z",
+            "2099-01-01T00:00:00Z",
+            second,
+        )
+        .unwrap();
+        assert!(!loaded.covered);
+    }
+
+    #[test]
+    fn a_row_that_reached_the_present_covers_it_even_with_old_neighbours() {
+        let repo = repo_with_commits();
+        let (store, head) = stored_commits_only(&repo);
+        let synced = at("2026-01-25T12:00:00Z");
+        set_coverage(
+            &store,
+            &repo,
+            &head,
+            &[(at("2025-12-01T00:00:00Z"), synced, synced)],
+        );
+        let loaded = load_response(
+            &store,
+            repo.path(),
+            None,
+            "2026-01-01T00:00:00Z",
+            "2099-01-01T00:00:00Z",
+            synced + 3_600,
+        )
+        .unwrap();
+        assert!(loaded.covered);
     }
 
     #[test]
