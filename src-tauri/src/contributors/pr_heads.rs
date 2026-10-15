@@ -38,7 +38,7 @@ const OFFLINE: &[(&str, &str)] = &[("GIT_NO_LAZY_FETCH", "1")];
 /// Runs git, feeding `input` on stdin when given. Both output pipes are
 /// drained on their own threads so a large reply cannot stall the child; the
 /// child is killed when `timeout` passes.
-fn run_git(
+pub(super) fn run_git(
     root: &Path,
     args: &[&str],
     input: Option<String>,

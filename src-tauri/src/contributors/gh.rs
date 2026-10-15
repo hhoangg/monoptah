@@ -238,12 +238,12 @@ fn is_rate_limit(stderr: &str) -> bool {
 }
 
 /// Wall clock left for the gh phase.
-struct Budget {
+pub(super) struct Budget {
     deadline: Instant,
 }
 
 impl Budget {
-    fn new(total: Duration) -> Self {
+    pub(super) fn new(total: Duration) -> Self {
         Self {
             deadline: Instant::now() + total,
         }
@@ -360,7 +360,7 @@ fn ask_gh_for_slug(gh: &dyn GhRunner, root: &Path, budget: &Budget) -> Result<St
 /// Is `gh` usable here? Ok is the repository slug, the error the note for the
 /// page. The remote is read first so a repository on another host is called
 /// unsupported instead of "not signed in".
-fn gh_status(gh: &dyn GhRunner, root: &Path, budget: &Budget) -> Result<String, String> {
+pub(super) fn gh_status(gh: &dyn GhRunner, root: &Path, budget: &Budget) -> Result<String, String> {
     let origin = origin(root);
     if origin == Origin::Foreign {
         return Err(UNSUPPORTED_HOST.to_string());

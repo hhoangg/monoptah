@@ -13,6 +13,8 @@ mod gh;
 mod pr_heads;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod store;
+#[cfg_attr(not(test), allow(dead_code))]
+mod sync;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -948,34 +950,47 @@ fn stop(child: &mut std::process::Child) {
 }
 
 /// Streams `git log -p` into `git patch-id --stable` without holding the patch
-/// text. Returns `None` when the patch text exceeds the byte cap. Every exit
-/// path kills a still-running `git log` and waits for both children, so a
-/// failure never leaves a process blocked on a full pipe.
+/// text. Returns `None` when the patch text exceeds the byte cap.
 fn patch_ids(
     root: &Path,
     head: &str,
     window: &Window,
     limits: &Limits,
 ) -> Result<Option<Vec<(String, String)>>, String> {
+    let mut log = git_command(root);
+    log.args([
+        "log",
+        "-p",
+        "--no-merges",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-show-signature",
+        "-n",
+    ])
+    .arg((limits.max_commits + 1).to_string())
+    .args(window.log_args())
+    .args([head, "--"]);
+    pipe_patch_ids(root, log, None, limits.max_patch_bytes)
+}
+
+/// Runs `log` (a `git log -p` command) into `git patch-id --stable`. `input`
+/// is written to the log's stdin, one line each, for `--stdin`. Returns `None`
+/// when the patch text exceeds `max_bytes`. Every exit path kills a
+/// still-running `git log` and waits for both children, so a failure never
+/// leaves a process blocked on a full pipe.
+fn pipe_patch_ids(
+    root: &Path,
+    mut log: Command,
+    input: Option<&[String]>,
+    max_bytes: usize,
+) -> Result<Option<Vec<(String, String)>>, String> {
     let spawn_error = |e: std::io::Error| format!("Could not run git: {e}");
-    let mut log = git_command(root)
-        .args([
-            "log",
-            "-p",
-            "--no-merges",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-show-signature",
-            "-n",
-        ])
-        .arg((limits.max_commits + 1).to_string())
-        .args(window.log_args())
-        .args([head, "--"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(spawn_error)?;
+    log.stdout(Stdio::piped()).stderr(Stdio::null());
+    if input.is_some() {
+        log.stdin(Stdio::piped());
+    }
+    let mut log = log.spawn().map_err(spawn_error)?;
     let mut ids = match git_command(root)
         .args(["patch-id", "--stable"])
         .stdin(Stdio::piped())
@@ -996,13 +1011,24 @@ fn patch_ids(
         stop(&mut ids);
         return Err("Could not connect git processes".to_string());
     };
+    // Feed the revisions from their own thread: git may answer before it has
+    // read them all. A write error only means git stopped early.
+    let feeder = match (input, log.stdin.take()) {
+        (Some(lines), Some(mut stdin)) => {
+            let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+            Some(std::thread::spawn(move || {
+                let _ = stdin.write_all(text.as_bytes());
+            }))
+        }
+        _ => None,
+    };
     // Drain patch-id output on its own thread so neither pipe can fill up.
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = ids_out.read_to_end(&mut bytes);
         String::from_utf8_lossy(&bytes).into_owned()
     });
-    let outcome = pump(&mut log_out, &mut ids_in, limits.max_patch_bytes);
+    let outcome = pump(&mut log_out, &mut ids_in, max_bytes);
     drop(ids_in);
     drop(log_out);
     if !matches!(outcome, Pump::Done) {
@@ -1010,6 +1036,9 @@ fn patch_ids(
     }
     let log_status = log.wait();
     let ids_status = ids.wait();
+    if let Some(feeder) = feeder {
+        let _ = feeder.join();
+    }
     let text = reader.join().unwrap_or_default();
     match outcome {
         Pump::TooBig => Ok(None),
