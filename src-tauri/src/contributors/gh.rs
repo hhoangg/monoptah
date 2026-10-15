@@ -14,13 +14,14 @@
 //!   `refs/pull/<N>/head` on `origin`: one `git ls-remote` lists the heads and
 //!   one object-only `git fetch` brings the missing ones in (no ref is created,
 //!   see `pr_heads`). The diff comes from the landing commit (`inspect_landing`).
-//! - A PR whose head cannot be made local (no network, the fetch failed or timed
-//!   out), or whose commits git cannot list, falls back to `gh` for its commits.
-//!   Its diff depends only on the landing (merge) commit: the files stay empty
-//!   when that commit is not local.
-//! - When the wall-clock budget runs out part way, what is already loaded is
-//!   kept: the newest PRs are overlaid, the oldest stay as git history only, and
-//!   the outcome says so (`CUT_SHORT`).
+//! - Commits fall back to `gh` when the PR head or the merge commit is not
+//!   local (no network, the fetch failed or timed out), or when git lists no
+//!   commits. The diff depends only on the landing (merge) commit: the files
+//!   stay empty when that commit is not local.
+//! - When the wall-clock budget runs out after the merged PR list is loaded,
+//!   every listed merged PR is still built, with its reviews and its local
+//!   files. The commits and closed PRs that were not loaded in time are left
+//!   out, and the outcome says so (`CUT_SHORT`).
 //!
 //! `gh pr list --json` limits that shape this module:
 //! - `commits` makes GitHub count `authors` nodes per commit, so a list call
@@ -58,7 +59,8 @@ const REPO_UNREADABLE: &str =
     "GitHub data could not be loaded: the repository is not readable with this account.";
 const CLOSED_FAILED_NOTE: &str = "Closed pull requests could not be loaded from GitHub.";
 const TOO_SLOW: &str = "GitHub data took too long to load. Try again later.";
-const CUT_SHORT: &str = "GitHub data was cut short; the oldest pull requests use git history only.";
+const CUT_SHORT: &str =
+    "GitHub data was cut short; some pull requests lack their GitHub commits or closed pull requests.";
 /// What `SystemGh` reports when it had to kill a call.
 const TIMED_OUT: &str = "gh timed out";
 
@@ -1574,8 +1576,11 @@ fn closed_pr(pr: &GhPr, commits: &[GhCommit]) -> RawPr {
 
 /// Replaces the git-derived PRs by GitHub's. Git PRs whose landing commit is
 /// part of a GitHub PR disappear (a rebase merge was several of them); the
-/// rest, such as direct pushes, stay as `source: "git"`.
-fn overlay(derived: &mut Derived, gh_drafts: Vec<PrDraft>) {
+/// rest, such as direct pushes, stay as `source: "git"`. Those lose the PR
+/// number read from their subject, unless `keep_numbers` (the GitHub data was
+/// cut short, so a number is not contradicted by GitHub's list); a number that
+/// is also a GitHub PR's is dropped either way.
+fn overlay(derived: &mut Derived, gh_drafts: Vec<PrDraft>, keep_numbers: bool) {
     let tagged: HashSet<&str> = gh_drafts
         .iter()
         .flat_map(|d| d.hashes.iter().map(String::as_str))
@@ -1599,8 +1604,11 @@ fn overlay(derived: &mut Derived, gh_drafts: Vec<PrDraft>) {
     for draft in derived.drafts.iter_mut() {
         // With GitHub's numbers available, a `#N` read from a git subject is
         // not trusted as a PR number any more (it may belong to an upstream).
-        draft.pr.number = None;
-        if !gh_ids.contains(&draft.pr.id) {
+        let clashes = gh_ids.contains(&draft.pr.id);
+        if !keep_numbers || clashes {
+            draft.pr.number = None;
+        }
+        if !clashes {
             continue;
         }
         let landing = draft.pr.merge_commit.clone().unwrap_or_default();
@@ -1638,8 +1646,9 @@ pub(super) struct Request<'a> {
 }
 
 /// Fetches GitHub's view of the window and overlays it on `derived`. On any
-/// failure, or when the wall-clock budget runs out, `derived` is left as the
-/// git fallback and the outcome says why.
+/// failure, or when the budget runs out before the merged PR list is loaded,
+/// `derived` is left as the git fallback and the outcome says why. When it runs
+/// out later, what was loaded is overlaid and the outcome is cut short.
 pub(super) fn enrich(request: &Request, derived: &mut Derived) -> Outcome {
     enrich_within(request, derived, GH_BUDGET)
 }
@@ -1666,23 +1675,14 @@ fn enrich_within(request: &Request, derived: &mut Derived, total: Duration) -> O
         Ok(fetched) => fetched,
         Err(note) => return Outcome::unavailable(note),
     };
-    overlay_fetched(request, derived, fetched, &budget, &|| {
-        budget.left().is_some()
-    })
+    overlay_fetched(request, derived, fetched)
 }
 
-/// Builds the PRs from what was fetched and overlays them on `derived`. Local
-/// git adds the final diff of each merged PR (within `budget`). `keep_going` is
-/// asked before each merged PR, newest first; once it says no the remaining
-/// (oldest) PRs are left out, stay as the git-derived ones, and the outcome is
-/// truncated with the `CUT_SHORT` note.
-fn overlay_fetched(
-    request: &Request,
-    derived: &mut Derived,
-    fetched: Fetched,
-    budget: &Budget,
-    keep_going: &dyn Fn() -> bool,
-) -> Outcome {
+/// Builds every fetched PR and overlays them on `derived`. Local git adds the
+/// final diff of each merged PR; it does not depend on the gh budget, so it
+/// runs even when that is spent. PRs without commits keep an empty list. A cut
+/// fetch is reported as truncated with the `CUT_SHORT` note.
+fn overlay_fetched(request: &Request, derived: &mut Derived, fetched: Fetched) -> Outcome {
     let Request {
         root,
         window,
@@ -1690,7 +1690,7 @@ fn overlay_fetched(
         ..
     } = *request;
     let mut truncated = fetched.truncated;
-    let mut cut_short = fetched.cut_short;
+    let cut_short = fetched.cut_short;
 
     // Newest first, the order the drafts are kept in.
     let mut order: Vec<&GhPr> = fetched.merged.iter().collect();
@@ -1708,7 +1708,6 @@ fn overlay_fetched(
     // The final diff of every merged PR whose landing commit is local. Git
     // only, so it runs on a few threads.
     let landings = par_map(&order, |pr| {
-        budget.left()?;
         let oid = pr.merge_commit.as_ref().and_then(|m| non_empty(&m.oid))?;
         let probes: Vec<CommitProbe> = commits_for(pr)
             .iter()
@@ -1727,10 +1726,6 @@ fn overlay_fetched(
     let mut drafts: Vec<PrDraft> = Vec::new();
     let mut reviews: Vec<RawReview> = Vec::new();
     for (pr, landing) in order.into_iter().zip(landings) {
-        if !keep_going() {
-            cut_short = true;
-            break;
-        }
         if let Some(landing) = &landing {
             truncated |= landing.capped;
         }
@@ -1760,7 +1755,7 @@ fn overlay_fetched(
             hashes: HashSet::new(),
         });
     }
-    overlay(derived, drafts);
+    overlay(derived, drafts, cut_short);
     let notes: Vec<&str> = [
         (cut_short, CUT_SHORT),
         (fetched.closed_failed, CLOSED_FAILED_NOTE),
@@ -2432,15 +2427,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&origin);
     }
 
+    /// Runs a git command in `dir` with an identity and returns its output.
+    fn git_as_ann(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=Ann", "-c", "user.email=ann@example.com"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A commit that adds `file`; returns its hash.
+    fn commit_adding(dir: &Path, file: &str) -> String {
+        std::fs::write(dir.join(file), "x\n").unwrap();
+        git_as_ann(dir, &["add", file]);
+        git_as_ann(dir, &["commit", "-q", "-m", &format!("add {file}")]);
+        git_as_ann(dir, &["rev-parse", "HEAD"])
+    }
+
     #[test]
-    fn running_out_of_time_after_the_merged_list_keeps_the_merged_prs() {
+    fn running_out_of_time_after_the_merged_list_still_overlays_every_merged_pr() {
         // The merged list arrives; the closed list then runs past the budget.
-        let origin = repo_with_origin("git@github.com:acme/widgets.git");
-        let list = serde_json::json!([
-            pr_row(1, "2026-02-01T10:00:00Z", "main"),
-            pr_row(2, "2026-02-02T10:00:00Z", "main")
-        ])
-        .to_string();
+        let root = repo_with_origin("git@github.com:acme/widgets.git");
+        git_as_ann(&root, &["checkout", "-q", "-b", "main"]);
+        let landed = [
+            commit_adding(&root, "f1.txt"),
+            commit_adding(&root, "f2.txt"),
+        ];
+        let rows: Vec<serde_json::Value> = (1..=2u64)
+            .map(|n| {
+                let mut row = pr_row(n, &format!("2026-02-0{n}T10:00:00Z"), "main");
+                row["mergeCommit"] = serde_json::json!({ "oid": landed[n as usize - 1] });
+                row["reviews"] = serde_json::json!([{
+                    "author": { "login": "bob" }, "state": "APPROVED",
+                    "submittedAt": format!("2026-02-0{n}T11:00:00Z")
+                }]);
+                row
+            })
+            .collect();
+        let list = serde_json::Value::Array(rows).to_string();
         let github = FakeGh::new(move |args| {
             if args[0] != "pr" {
                 Ok(String::new())
@@ -2470,22 +2498,45 @@ mod tests {
         let request = Request {
             gh: &github,
             commits: &cache,
-            root: &origin,
+            root: &root,
             branch: "main",
             head: "",
             window: &win,
             limits: &limits,
         };
         let mut derived = no_derived();
-        derived.drafts = (1..=2).map(git_pr).collect();
+        derived.drafts = (7..=8).map(git_pr).collect();
         let outcome = enrich_within(&request, &mut derived, Duration::from_millis(300));
         // Not a failure: GitHub data counts as available, and says it is short.
         assert!(outcome.available);
         assert!(outcome.truncated);
         assert_eq!(outcome.note.as_deref(), Some(CUT_SHORT));
-        // The budget was gone before any PR could be built, so the git PRs stay.
-        assert!(derived.drafts.iter().all(|d| d.pr.source == "git"));
-        let _ = std::fs::remove_dir_all(&origin);
+        // The budget is spent, yet both merged PRs are there with their local
+        // files and their reviews.
+        for n in 1..=2u64 {
+            let draft = derived
+                .drafts
+                .iter()
+                .find(|d| d.pr.id == n.to_string())
+                .unwrap();
+            assert_eq!(draft.pr.source, "gh", "PR {n}");
+            let paths: Vec<&str> = draft.pr.files.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(paths, [format!("f{n}.txt")], "PR {n}");
+        }
+        let mut reviewed: Vec<&str> = outcome.reviews.iter().map(|r| r.pr_id.as_str()).collect();
+        reviewed.sort();
+        assert_eq!(reviewed, ["1", "2"]);
+        // The git PRs GitHub did not replace keep the numbers they had.
+        for n in 7..=8u64 {
+            let draft = derived
+                .drafts
+                .iter()
+                .find(|d| d.pr.id == n.to_string())
+                .unwrap();
+            assert_eq!(draft.pr.source, "git");
+            assert_eq!(draft.pr.number, Some(n));
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2542,7 +2593,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_part_way_through_the_prs_overlays_the_newest_and_leaves_the_oldest_as_git() {
+    fn a_cut_fetch_builds_every_merged_pr_and_keeps_the_numbers_of_git_prs() {
         let root = scratch_dir();
         let reviewed = |n: u64| {
             serde_json::json!({
@@ -2555,16 +2606,14 @@ mod tests {
                 }]
             })
         };
-        // Listed oldest first on purpose: the order is made from `mergedAt`.
-        let merged = parse::<GhPr>(serde_json::json!([reviewed(1), reviewed(2), reviewed(3)]));
-        let fetched = Fetched {
-            merged,
+        let fetched = |cut_short: bool| Fetched {
+            merged: parse::<GhPr>(serde_json::json!([reviewed(1), reviewed(2), reviewed(3)])),
             merged_commits: HashMap::new(),
             closed: Vec::new(),
             closed_commits: HashMap::new(),
-            truncated: false,
+            truncated: cut_short,
             closed_failed: false,
-            cut_short: false,
+            cut_short,
         };
         let github = FakeGh::new(|_| Ok(String::new()));
         let cache = CommitCache::new();
@@ -2579,33 +2628,53 @@ mod tests {
             window: &win,
             limits: &limits,
         };
-        let mut derived = no_derived();
-        derived.drafts = (1..=3).map(git_pr).collect();
-        // Two PRs are built, then the time is up.
-        let asked = AtomicUsize::new(0);
-        let outcome = overlay_fetched(&request, &mut derived, fetched, &budget(), &|| {
-            asked.fetch_add(1, Ordering::SeqCst) < 2
-        });
+        // Git PR 1 is the landing of GitHub PR 1 (replaced). Git PR 2 has the
+        // id of GitHub PR 2 but another landing. Git PR 7 matches nothing.
+        let derived_with_git_prs = || {
+            let mut derived = no_derived();
+            let mut clashing = git_pr(2);
+            clashing.pr.merge_commit = Some("f".repeat(40));
+            derived.drafts = vec![git_pr(1), clashing, git_pr(7)];
+            derived
+        };
 
+        let mut derived = derived_with_git_prs();
+        let outcome = overlay_fetched(&request, &mut derived, fetched(true));
         assert!(outcome.available);
         assert!(outcome.truncated);
         assert_eq!(outcome.note.as_deref(), Some(CUT_SHORT));
-        let source_of = |id: &str| {
-            derived
-                .drafts
-                .iter()
-                .find(|d| d.pr.id == id)
-                .map(|d| d.pr.source.clone())
-        };
-        // PRs 3 and 2 come from GitHub; the oldest one is still the git PR.
-        assert_eq!(source_of("3").as_deref(), Some("gh"));
-        assert_eq!(source_of("2").as_deref(), Some("gh"));
-        assert_eq!(source_of("1").as_deref(), Some("git"));
-        assert_eq!(derived.drafts.len(), 3);
         let mut reviewed_prs: Vec<&str> =
             outcome.reviews.iter().map(|r| r.pr_id.as_str()).collect();
         reviewed_prs.sort();
-        assert_eq!(reviewed_prs, ["2", "3"]);
+        assert_eq!(reviewed_prs, ["1", "2", "3"]);
+        let gh_ids: Vec<&str> = derived
+            .drafts
+            .iter()
+            .filter(|d| d.pr.source == "gh")
+            .map(|d| d.pr.id.as_str())
+            .collect();
+        assert_eq!(gh_ids.len(), 3);
+        let git_numbers: Vec<(String, Option<u64>)> = derived
+            .drafts
+            .iter()
+            .filter(|d| d.pr.source == "git")
+            .map(|d| (d.pr.id.clone(), d.pr.number))
+            .collect();
+        // The kept number is the one the git PR had; a clash with a GitHub PR
+        // still drops it.
+        assert_eq!(git_numbers.len(), 2);
+        assert!(git_numbers.contains(&("7".to_string(), Some(7))));
+        assert!(git_numbers.iter().any(|(id, n)| id != "7" && n.is_none()));
+
+        // Whole data: a git number is no longer trusted.
+        let mut whole = derived_with_git_prs();
+        let outcome = overlay_fetched(&request, &mut whole, fetched(false));
+        assert_eq!(outcome.note, None);
+        assert!(whole
+            .drafts
+            .iter()
+            .filter(|d| d.pr.source == "git")
+            .all(|d| d.pr.number.is_none()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2634,7 +2703,7 @@ mod tests {
             closed_failed: true,
             cut_short: true,
         };
-        let outcome = overlay_fetched(&request, &mut no_derived(), fetched, &budget(), &|| true);
+        let outcome = overlay_fetched(&request, &mut no_derived(), fetched);
         assert!(outcome.truncated);
         assert_eq!(
             outcome.note.as_deref(),
