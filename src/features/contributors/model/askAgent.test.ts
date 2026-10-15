@@ -204,6 +204,24 @@ describe("buildAskSnapshot", () => {
     );
   });
 
+  it("names the page range in the stats note, a custom range by its two days", () => {
+    const note = (m: typeof model) =>
+      (
+        buildAskSnapshot({
+          model: m,
+          project: "/work/monoptah",
+          scope: { kind: "team" },
+          options: options(),
+          now: NOW,
+        }) as unknown as Snap
+      ).notes.find((n) => n.startsWith("The stats section covers"));
+    expect(note(model)).toContain('page range "30d"');
+    const custom = leaderboardModel({
+      range: { key: "custom", start: "2026-10-05", end: "2026-10-12" },
+    });
+    expect(note(custom)).toContain('page range "2026-10-05 to 2026-10-12"');
+  });
+
   it("limits prs to the focused person", () => {
     const s = snap({}, { kind: "person", personId: ana.personId } as never);
     expect(s.prs.length).toBeGreaterThan(0);

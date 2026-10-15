@@ -3,8 +3,8 @@ import type { Leaderboard } from "./leaderboard";
 import { buildResolver, identityKey } from "./identity";
 import type { MailmapPerson, Resolver } from "./identity";
 import { personColorMap } from "./palette";
-import { rangeBounds } from "./range";
-import type { RangeKey } from "./range";
+import { rangeBounds, rangeDays, rangeLabel } from "./range";
+import type { RangeValue } from "./range";
 import { observedIdentities, scoreSeason } from "./scoring";
 import type { SeasonScores } from "./scoring";
 import { previousSeason, seasonById, seasonOf } from "./season";
@@ -21,7 +21,7 @@ export type ContributorsModel = {
   config: ContributorsConfig;
   mailmap: MailmapPerson[];
   merge: boolean;
-  range: RangeKey;
+  range: RangeValue;
   resolver: Resolver;
   season: Season;
   /** Id of the month of `now`, whatever season is ranked. */
@@ -34,6 +34,10 @@ export type ContributorsModel = {
   stats: Stats;
   rangeStart: Date;
   rangeEnd: Date;
+  /** `7d`, `30d`, or the two days of a custom range. */
+  rangeLabel: string;
+  /** Whole days in the range; the previous period is as long. */
+  rangeDays: number;
   unmapped: UnmappedIdentity[];
   /**
    * One color per person, shared by every tab so a person looks the same on
@@ -53,25 +57,13 @@ const inRange = (start: Date, end: Date, iso: string | undefined) => {
   return t >= start.getTime() && t < end.getTime();
 };
 
-/**
- * The period KPI deltas compare with: the equal-length period right before the
- * range. Nothing exists before "all", so it gets an empty period that raw data
- * can never cover (deltas stay null). The leaderboard is separate: it always
- * compares with the previous season.
- */
-function previousPeriod(range: RangeKey, start: Date, end: Date) {
-  if (range === "all") return { start: new Date(0), end: new Date(0) };
-  const length = end.getTime() - start.getTime();
-  return { start: new Date(start.getTime() - length), end: start };
-}
-
 /** Pure; the hook memoizes it, so rescoring never touches the network. */
 export function buildContributorsModel(input: {
   raw: RawData;
   config: ContributorsConfig;
   mailmap: MailmapPerson[];
   merge: boolean;
-  range: RangeKey;
+  range: RangeValue;
   now: Date;
   user?: { name: string; email: string };
   /** The season to rank, e.g. "2026-09"; the month of `now` when absent or unknown. */
@@ -97,14 +89,7 @@ export function buildContributorsModel(input: {
     : undefined;
   const meId = mine ? resolver.personOf(mine) : undefined;
 
-  let earliest: Date | undefined;
-  for (const c of raw.commits) {
-    const t = Date.parse(c.committedAt);
-    if (!Number.isNaN(t) && (!earliest || t < earliest.getTime())) {
-      earliest = new Date(t);
-    }
-  }
-  const { start, end } = rangeBounds(range, now, earliest);
+  const { start, end } = rangeBounds(range, now);
   const colors = personColorMap([
     ...personRows({ raw, config, resolver }).map((p) => p.id),
     ...current.people.map((p) => p.personId),
@@ -116,9 +101,6 @@ export function buildContributorsModel(input: {
     resolver,
     rangeStart: start,
     rangeEnd: end,
-    previous: previousPeriod(range, start, end),
-    // A year of weeks is too many bars to read.
-    granularity: range === "1y" || range === "all" ? "month" : "week",
     colors,
   });
 
@@ -138,6 +120,8 @@ export function buildContributorsModel(input: {
     stats,
     rangeStart: start,
     rangeEnd: end,
+    rangeLabel: rangeLabel(range, now),
+    rangeDays: rangeDays(range, now),
     unmapped: unmappedIdentities({ raw, config, mailmap }),
     colors,
     meId,

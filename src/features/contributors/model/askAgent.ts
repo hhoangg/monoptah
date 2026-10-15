@@ -304,7 +304,7 @@ function buildAskSnapshotParts(input: {
   const notes = [...snapshot.notes];
   if (snapshot.stats) {
     notes.push(
-      `The stats section covers the page range "${model.range}" (${model.rangeStart.toISOString()} to ${model.rangeEnd.toISOString()}), not necessarily the whole season.`,
+      `The stats section covers the page range "${model.rangeLabel}" (${model.rangeStart.toISOString()} to ${model.rangeEnd.toISOString()}), not necessarily the whole season.`,
     );
   }
   if (omit.size > 0) {

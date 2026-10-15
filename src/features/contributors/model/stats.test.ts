@@ -183,8 +183,7 @@ describe("buildStats: kpis", () => {
 
 describe("buildStats: week buckets", () => {
   it("buckets commits per person into Monday-start weeks", () => {
-    const { buckets, granularity } = stats(sample());
-    expect(granularity).toBe("week");
+    const { buckets } = stats(sample());
     expect(
       buckets.map((b) => ({ start: b.start, byPerson: b.byPerson })),
     ).toEqual([
@@ -317,72 +316,5 @@ describe("buildStats: rows and legend", () => {
       "Bob",
       "Cat",
     ]);
-  });
-});
-
-describe("buildStats: month buckets", () => {
-  const monthly = (raw: RawData, start: Date, end: Date) =>
-    buildStats({
-      raw,
-      config,
-      resolver: makeResolver(raw, config),
-      rangeStart: start,
-      rangeEnd: end,
-      granularity: "month",
-    });
-
-  it("buckets by local calendar month and labels them", () => {
-    const raw = makeRaw({
-      commits: [
-        makeCommit("a", ANA, sep(20)),
-        makeCommit("b", BOB, oct(3)),
-        makeCommit("c", ANA, oct(30)),
-      ],
-    });
-    const { buckets, granularity } = monthly(
-      raw,
-      new Date(2026, 8, 15),
-      new Date(2026, 9, 31),
-    );
-    expect(granularity).toBe("month");
-    expect(buckets.map((b) => b.start)).toEqual(["2026-09-01", "2026-10-01"]);
-    expect(buckets.map((b) => b.label)).toEqual(["Sep 2026", "Oct 2026"]);
-    expect(buckets.map((b) => b.short)).toEqual(["Sep 2026", "Oct 2026"]);
-    expect(buckets[0].byPerson).toEqual({ "p-ana": 1 });
-    expect(buckets[1].byPerson).toEqual({ "bob@example.com": 1, "p-ana": 1 });
-  });
-
-  it("keeps empty months and crosses the year boundary", () => {
-    const raw = makeRaw({
-      commits: [
-        makeCommit("a", ANA, new Date(2025, 10, 10, 12).toISOString()),
-        makeCommit("b", ANA, new Date(2026, 1, 10, 12).toISOString()),
-      ],
-    });
-    const { buckets } = monthly(
-      raw,
-      new Date(2025, 10, 1),
-      new Date(2026, 2, 1),
-    );
-    expect(buckets.map((b) => b.start)).toEqual([
-      "2025-11-01",
-      "2025-12-01",
-      "2026-01-01",
-      "2026-02-01",
-    ]);
-    expect(buckets[1].byPerson).toEqual({});
-  });
-
-  it("only counts commits inside the range", () => {
-    const raw = makeRaw({
-      commits: [makeCommit("a", ANA, sep(2)), makeCommit("b", ANA, oct(3))],
-    });
-    const { buckets } = monthly(
-      raw,
-      new Date(2026, 8, 15),
-      new Date(2026, 9, 31),
-    );
-    expect(buckets[0].byPerson).toEqual({});
-    expect(buckets[1].byPerson).toEqual({ "p-ana": 1 });
   });
 });

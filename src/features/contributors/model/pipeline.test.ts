@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "./config";
 import { buildContributorsModel } from "./pipeline";
 import { sinceFor } from "./range";
+import type { CustomRange, RangeValue } from "./range";
 import {
   ANA,
   BOB,
@@ -217,34 +218,80 @@ describe("buildContributorsModel", () => {
     expect(model.unmapped).toEqual([]);
   });
 
-  it("charts weeks up to 90d and calendar months for 1y and all", () => {
-    const stats = (range: "7d" | "30d" | "90d" | "1y" | "all") =>
+  describe("custom range", () => {
+    const range: CustomRange = {
+      key: "custom",
+      start: "2026-10-06",
+      end: "2026-10-15",
+    };
+    const data = () =>
+      makeRaw({
+        since: sinceFor(range, NOW),
+        commits: [
+          makeCommit("before", ANA, oct(3), { files: [file("src/a.ts", 4)] }),
+          makeCommit("in1", ANA, oct(6), { files: [file("src/a.ts", 4)] }),
+          makeCommit("in2", ANA, oct(15), { files: [file("src/a.ts", 4)] }),
+          makeCommit("after", ANA, oct(18), { files: [file("src/a.ts", 4)] }),
+        ],
+      });
+    const build = (chosen: RangeValue = range) =>
       buildContributorsModel({
-        raw: raw(),
+        raw: data(),
         config: DEFAULT_CONFIG,
         mailmap: [],
         merge: true,
-        range,
+        range: chosen,
         now: NOW,
-      }).stats;
-    expect(stats("7d").granularity).toBe("week");
-    expect(stats("90d").granularity).toBe("week");
-    expect(stats("1y").granularity).toBe("month");
-    expect(stats("all").granularity).toBe("month");
+      });
+
+    it("shows exactly the chosen days, both inclusive", () => {
+      const model = build();
+      expect(model.rangeStart).toEqual(new Date(2026, 9, 6));
+      expect(model.rangeEnd).toEqual(new Date(2026, 9, 16));
+      expect(model.rangeDays).toBe(10);
+      expect(model.rangeLabel).toBe("2026-10-06 to 2026-10-15");
+      expect(model.stats.kpis.commits.value).toBe(2);
+    });
+
+    it("compares with the equal-length period right before the range", () => {
+      // Oct 6-15 is 10 days; the previous 10 days are Sep 26 - Oct 5.
+      const model = build();
+      expect(model.stats.kpis.commits.delta).toBe(1);
+    });
+
+    it("keeps the board on the ranked season, whatever the range", () => {
+      const model = build();
+      expect(model.season.id).toBe("2026-10");
+      expect(model.leaderboard.rows[0].name).toBe("Ana");
+    });
+
+    it("has no activity for a range with no commits", () => {
+      const model = build({
+        key: "custom",
+        start: "2026-10-09",
+        end: "2026-10-12",
+      });
+      expect(model.hasActivity).toBe(false);
+      expect(build().hasActivity).toBe(true);
+    });
+
+    it("enforces the 30 day cap on a stored value", () => {
+      const model = build({
+        key: "custom",
+        start: "2026-01-01",
+        end: "2026-10-15",
+      });
+      expect(model.rangeDays).toBe(30);
+      expect(model.rangeEnd).toEqual(new Date(2026, 9, 16));
+    });
+
+    it("labels a preset by its key", () => {
+      const model = build("30d");
+      expect(model.rangeLabel).toBe("30d");
+      expect(model.rangeDays).toBe(30);
+    });
   });
 
-  it("starts 'all' at the first commit and drops the deltas", () => {
-    const model = buildContributorsModel({
-      raw: raw(),
-      config: DEFAULT_CONFIG,
-      mailmap: [],
-      merge: true,
-      range: "all",
-      now: NOW,
-    });
-    expect(model.rangeStart).toEqual(new Date(2026, 9, 5));
-    expect(model.stats.kpis.commits.delta).toBeNull();
-  });
   describe("selected season", () => {
     const sept = (day: number) => new Date(2026, 8, day, 12).toISOString();
     const seasonRaw = () =>

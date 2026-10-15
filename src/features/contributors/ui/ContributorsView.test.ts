@@ -51,7 +51,7 @@ import {
 import { resetContributorsCache } from "../hooks/useContributors";
 import { REMOTE_PROJECT_PREFIX } from "../../projects/model/recents";
 import { RANGE_KEY } from "../model/prefs";
-import { seasonChoices } from "../model/range";
+import { formatDay, seasonChoices } from "../model/range";
 import { previousSeason } from "../model/season";
 import { ANA, BOB, file, makeCommit, makeRaw } from "../model/testFixtures";
 import { deferUnhandledEscape } from "../../workspace/model/tabKeys";
@@ -131,6 +131,35 @@ const byText = (selector: string, text: string) =>
   Array.from(container.querySelectorAll<HTMLElement>(selector)).find((el) =>
     (el.textContent ?? "").includes(text),
   );
+
+const rangeButton = (label: string) =>
+  Array.from(
+    container.querySelectorAll<HTMLElement>(
+      '[role="radiogroup"][aria-label="Range"] button',
+    ),
+  ).find((b) => b.textContent === label);
+
+const rangeInputs = () => {
+  const start = container.querySelector<HTMLInputElement>(
+    'input[type="date"][aria-label="Start date"]',
+  );
+  const end = container.querySelector<HTMLInputElement>(
+    'input[type="date"][aria-label="End date"]',
+  );
+  return start && end ? { start, end } : null;
+};
+
+/** Types a value into a controlled input the way a user edit reaches React. */
+async function setDay(input: HTMLInputElement, value: string) {
+  const set = Object.getOwnPropertyDescriptor(
+    HTMLInputElement.prototype,
+    "value",
+  )!.set!;
+  await act(async () => {
+    set.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -313,17 +342,132 @@ describe("ContributorsView", () => {
     expect(byText("button", "Ask Agent")).toBeUndefined();
   });
 
+  it("offers only 7d, 30d and Custom", async () => {
+    await mount();
+    const labels = Array.from(
+      container.querySelectorAll(
+        '[role="radiogroup"][aria-label="Range"] button',
+      ),
+    ).map((b) => b.textContent);
+    expect(labels).toEqual(["7d", "30d", "Custom"]);
+    expect(rangeInputs()).toBeNull();
+  });
+
   it("changes and remembers the range", async () => {
     await mount();
-    const seg = container.querySelector(
-      '[role="radiogroup"][aria-label="Range"]',
-    );
-    const ninety = Array.from(seg?.querySelectorAll("button") ?? []).find(
-      (b) => b.textContent === "90d",
-    );
-    await act(async () => ninety?.click());
-    expect(localStorage.getItem(RANGE_KEY)).toBe("90d");
-    expect(ninety?.getAttribute("aria-checked")).toBe("true");
+    const week = rangeButton("7d");
+    await act(async () => week?.click());
+    expect(localStorage.getItem(RANGE_KEY)).toBe("7d");
+    expect(week?.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("falls back to 30d for a saved range that no longer exists", async () => {
+    localStorage.setItem(RANGE_KEY, "90d");
+    await mount();
+    expect(rangeButton("30d")?.getAttribute("aria-checked")).toBe("true");
+  });
+
+  describe("custom range", () => {
+    const today = () => formatDay(new Date());
+    const daysAgo = (n: number) => {
+      const d = new Date();
+      return formatDay(
+        new Date(d.getFullYear(), d.getMonth(), d.getDate() - n),
+      );
+    };
+
+    it("starts from the days the current preset shows", async () => {
+      await mount();
+      await act(async () => rangeButton("Custom")?.click());
+      expect(rangeButton("Custom")?.getAttribute("aria-checked")).toBe("true");
+      const { start, end } = rangeInputs()!;
+      expect(start.value).toBe(daysAgo(29));
+      expect(end.value).toBe(today());
+      expect(localStorage.getItem(RANGE_KEY)).toBe(
+        `custom:${daysAgo(29)}:${today()}`,
+      );
+    });
+
+    it("loads the data of the picked days", async () => {
+      await mount();
+      await act(async () => rangeButton("Custom")?.click());
+      const before = vi.mocked(collectRaw).mock.calls.length;
+      await setDay(rangeInputs()!.start, daysAgo(200));
+      expect(vi.mocked(collectRaw).mock.calls.length).toBeGreaterThan(before);
+      const since = Date.parse(
+        vi.mocked(collectRaw).mock.calls.at(-1)![1].since,
+      );
+      expect(since).toBeLessThanOrEqual(Date.parse(daysAgo(200)));
+    });
+
+    it("keeps the span within 30 days when the start is moved further back", async () => {
+      await mount();
+      await act(async () => rangeButton("Custom")?.click());
+      await setDay(rangeInputs()!.start, daysAgo(90));
+      const { start, end } = rangeInputs()!;
+      expect(start.value).toBe(daysAgo(90));
+      expect(end.value).toBe(daysAgo(61));
+      expect(localStorage.getItem(RANGE_KEY)).toBe(
+        `custom:${daysAgo(90)}:${daysAgo(61)}`,
+      );
+    });
+
+    it("keeps the span within 30 days when the end is moved forward", async () => {
+      localStorage.setItem(RANGE_KEY, `custom:${daysAgo(90)}:${daysAgo(80)}`);
+      await mount();
+      await setDay(rangeInputs()!.end, daysAgo(10));
+      const { start, end } = rangeInputs()!;
+      expect(end.value).toBe(daysAgo(10));
+      expect(start.value).toBe(daysAgo(39));
+    });
+
+    it("does not allow an end after today", async () => {
+      await mount();
+      await act(async () => rangeButton("Custom")?.click());
+      expect(rangeInputs()!.end.max).toBe(today());
+      expect(rangeInputs()!.start.max).toBe(today());
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      await setDay(rangeInputs()!.end, formatDay(tomorrow));
+      expect(rangeInputs()!.end.value).toBe(today());
+    });
+
+    it("moves the other end when the picked start is after the end", async () => {
+      localStorage.setItem(RANGE_KEY, `custom:${daysAgo(20)}:${daysAgo(10)}`);
+      await mount();
+      await setDay(rangeInputs()!.start, daysAgo(5));
+      expect(rangeInputs()!.start.value).toBe(daysAgo(5));
+      expect(rangeInputs()!.end.value).toBe(daysAgo(5));
+    });
+
+    it("ignores a cleared date", async () => {
+      localStorage.setItem(RANGE_KEY, `custom:${daysAgo(20)}:${daysAgo(10)}`);
+      await mount();
+      await setDay(rangeInputs()!.start, "");
+      expect(rangeInputs()!.start.value).toBe(daysAgo(20));
+    });
+
+    it("clamps a saved range that is longer than 30 days", async () => {
+      localStorage.setItem(RANGE_KEY, `custom:${daysAgo(100)}:${daysAgo(5)}`);
+      await mount();
+      const { start, end } = rangeInputs()!;
+      expect(end.value).toBe(daysAgo(5));
+      expect(start.value).toBe(daysAgo(34));
+    });
+
+    it("goes back to a preset and hides the date inputs", async () => {
+      await mount();
+      await act(async () => rangeButton("Custom")?.click());
+      await act(async () => rangeButton("7d")?.click());
+      expect(rangeInputs()).toBeNull();
+      expect(localStorage.getItem(RANGE_KEY)).toBe("7d");
+    });
+
+    it("shows how many days the previous-period comparison covers", async () => {
+      localStorage.setItem(RANGE_KEY, `custom:${daysAgo(9)}:${today()}`);
+      await mount();
+      expect(container.textContent).toContain("vs prev 10d");
+    });
   });
 
   it("toggles merge identities and remembers it", async () => {
@@ -603,7 +747,7 @@ describe("ContributorsView hardening", () => {
       container.querySelectorAll(
         '[role="radiogroup"][aria-label="Range"] button',
       ),
-    ).find((b) => b.textContent === "All") as HTMLElement;
+    ).find((b) => b.textContent === "7d") as HTMLElement;
     await act(async () => all.click());
     expect(container.querySelector('[role="tablist"]')).not.toBeNull();
     expect(

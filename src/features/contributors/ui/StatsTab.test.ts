@@ -163,6 +163,14 @@ describe("StatsTab", () => {
     expect(container.textContent).toContain("vs prev 30d");
     expect(container.textContent).toMatch(/[▲▼] [+-]\d+%/);
   });
+
+  it("names a custom range's previous period by its length", async () => {
+    const m = model({
+      range: { key: "custom", start: "2026-10-06", end: "2026-10-15" },
+    });
+    await render(m);
+    expect(container.textContent).toContain("vs prev 10d");
+  });
 });
 
 describe("CommitChart", () => {
@@ -268,14 +276,8 @@ describe("CommitChart readability", () => {
     });
   };
 
-  it("uses weeks up to 90d and months for 1y and all", () => {
-    expect(model({ range: "90d" }).stats.granularity).toBe("week");
-    expect(model({ range: "1y" }).stats.granularity).toBe("month");
-    expect(model({ range: "all" }).stats.granularity).toBe("month");
-  });
-
   it("labels the x axis with the first and last bucket and no more than about eight", async () => {
-    const m = model({ range: "1y" });
+    const m = model({ range: "30d" });
     await draw(m);
     const labels = Array.from(container.querySelectorAll("[data-axis]")).map(
       (e) => e.textContent,
@@ -287,14 +289,10 @@ describe("CommitChart readability", () => {
     expect(labels.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("labels weeks as 'Mon D' and months as 'Mon YYYY'", async () => {
+  it("labels weeks as 'Mon D'", async () => {
     await draw(model({ range: "7d" }));
     expect(container.querySelector("[data-axis]")?.textContent).toMatch(
       /^[A-Z][a-z]{2} \d{1,2}$/,
-    );
-    await draw(model({ range: "1y" }));
-    expect(container.querySelector("[data-axis]")?.textContent).toMatch(
-      /^[A-Z][a-z]{2} \d{4}$/,
     );
   });
 
@@ -328,16 +326,14 @@ describe("CommitChart readability", () => {
     }
   });
 
-  it("names the granularity in the summary and the card heading", async () => {
-    const m = model({ range: "1y" });
+  it("names the week unit in the summary and the card heading", async () => {
+    const m = model();
     await draw(m);
     const label = container.querySelector("svg")?.getAttribute("aria-label");
-    expect(label).toContain("Commit activity per month");
-    expect(label).toContain("months");
+    expect(label).toContain("Commit activity per week");
+    expect(label).toContain("weeks");
     await render(m);
-    expect(container.textContent).toContain(
-      "per month, stacked by contributor",
-    );
+    expect(container.textContent).toContain("per week, stacked by contributor");
   });
 
   it("paints the table avatar with the row color from the shared map", async () => {

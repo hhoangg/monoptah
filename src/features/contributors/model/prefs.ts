@@ -1,5 +1,5 @@
-import { DEFAULT_RANGE, parseRange } from "./range";
-import type { RangeKey } from "./range";
+import { DEFAULT_RANGE, parseRange, serializeRange } from "./range";
+import type { RangeValue } from "./range";
 
 // The `monocode.` prefix is deliberately kept: renaming it would drop every
 // saved preference on existing installs.
@@ -22,10 +22,12 @@ function write(key: string, value: string) {
   }
 }
 
-export const readRange = (): RangeKey =>
-  parseRange(read(RANGE_KEY)) ?? DEFAULT_RANGE;
+/** A saved value that is no longer a range (the removed 90d, 1y, all) reads as the default. */
+export const readRange = (now: Date = new Date()): RangeValue =>
+  parseRange(read(RANGE_KEY), now) ?? DEFAULT_RANGE;
 
-export const writeRange = (range: RangeKey) => write(RANGE_KEY, range);
+export const writeRange = (range: RangeValue) =>
+  write(RANGE_KEY, serializeRange(range));
 
 export function readMerge(): boolean {
   return read(MERGE_KEY) !== "false";

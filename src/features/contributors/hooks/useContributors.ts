@@ -27,7 +27,7 @@ import { buildContributorsModel } from "../model/pipeline";
 import type { ContributorsModel } from "../model/pipeline";
 import { readMerge, readRange, writeMerge, writeRange } from "../model/prefs";
 import { seasonChoices, sinceFor } from "../model/range";
-import type { RangeKey } from "../model/range";
+import type { RangeValue } from "../model/range";
 import { seasonById } from "../model/season";
 import type { ContributorsConfig, RawData } from "../model/types";
 
@@ -221,7 +221,7 @@ export function useContributorsModel(input: {
   config: ContributorsConfig;
   mailmap: MailmapPerson[];
   merge: boolean;
-  range: RangeKey;
+  range: RangeValue;
   now: Date;
   user?: GitUser;
   seasonId?: string;
@@ -246,7 +246,7 @@ export function useContributorsModel(input: {
 }
 
 export function useContributors(cwd: string) {
-  const [range, setRangeState] = useState<RangeKey>(readRange);
+  const [range, setRangeState] = useState<RangeValue>(readRange);
   const [merge, setMergeState] = useState(readMerge);
   const [picked, setPicked] = useState<{ cwd: string; branch?: string }>({
     cwd,
@@ -420,7 +420,7 @@ export function useContributors(cwd: string) {
   const status: "loading" | "ready" | "error" =
     meta && shown ? "ready" : failed ? "error" : "loading";
 
-  const setRange = useCallback((next: RangeKey) => {
+  const setRange = useCallback((next: RangeValue) => {
     writeRange(next);
     setRangeState(next);
   }, []);

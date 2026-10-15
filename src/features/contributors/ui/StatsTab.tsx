@@ -56,7 +56,9 @@ function Kpi({ label, children }: { label: string; children: ReactNode }) {
 
 export function KpiCards({ model }: { model: ContributorsModel }) {
   const { kpis } = model.stats;
-  const versus = model.range === "all" ? "" : `vs prev ${model.range}`;
+  const versus = `vs prev ${
+    typeof model.range === "string" ? model.range : `${model.rangeDays}d`
+  }`;
   const commitsDelta = kpis.commits.delta;
   const linesDelta = kpis.lines.delta;
   const prsDelta = kpis.prsMerged.delta;
@@ -121,7 +123,7 @@ export function KpiCards({ model }: { model: ContributorsModel }) {
 }
 
 function chartSummary(stats: Stats): string {
-  const unit = stats.granularity;
+  const unit = "week";
   const { buckets } = stats;
   const totals = buckets.map((b) => ({
     label: b.label,
@@ -421,7 +423,7 @@ export function StatsTab({ model, onAskAgent }: Props) {
         <h3 className="border-b border-stroke px-3 py-2.5 text-[13px] font-semibold">
           Commit activity{" "}
           <span className="font-normal text-content/50">
-            per {stats.granularity}, stacked by contributor
+            per week, stacked by contributor
           </span>
         </h3>
         <Legend stats={stats} />

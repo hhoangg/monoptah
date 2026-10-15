@@ -30,7 +30,16 @@ import { Segmented, Select, Toggle } from "../../settings/ui/primitives";
 import { useContributors } from "../hooks/useContributors";
 import type { AskAgentRequest } from "../model/askAgent";
 import { CONFIG_PATH } from "../model/config";
-import { RANGE_OPTIONS } from "../model/range";
+import {
+  RANGE_OPTIONS,
+  formatDay,
+  parseDay,
+  rangeKeyOf,
+  toCustom,
+  withEnd,
+  withStart,
+} from "../model/range";
+import type { RangeKey } from "../model/range";
 import type { SnapshotScope } from "../model/snapshot";
 import type { ContributorsConfig } from "../model/types";
 import { AskAgentDialog } from "./AskAgentDialog";
@@ -48,6 +57,9 @@ const LeaderboardTab = lazySurface<LeaderboardTabProps>(() =>
 const IdentitiesTab = lazySurface<IdentitiesTabProps>(() =>
   import("./IdentitiesTab").then((m) => ({ default: m.IdentitiesTab })),
 );
+
+const DATE_INPUT =
+  "h-7 rounded-md border border-content/10 bg-transparent px-2 text-[12px] text-content outline-none focus:border-accent/50";
 
 type TabId = "stats" | "leaderboard" | "identities";
 
@@ -245,6 +257,21 @@ export function ContributorsView({
 
   const unmapped = model?.unmapped.length ?? 0;
 
+  const rangeKey = rangeKeyOf(data.range);
+  const customRange = typeof data.range === "string" ? null : data.range;
+  const onRangeKey = (next: RangeKey) => {
+    if (next === rangeKey) return;
+    // Custom starts from the days already on screen.
+    data.setRange(next === "custom" ? toCustom(data.range, new Date()) : next);
+  };
+  // A cleared or half-typed date reads as empty and is ignored; any day can be
+  // picked, because the other end follows when the span would be invalid.
+  const pickDay = (text: string, apply: typeof withStart) => {
+    const day = parseDay(text);
+    if (!day || !customRange) return;
+    data.setRange(apply(customRange, day, new Date()));
+  };
+
   const onTabKey = (e: KeyboardEvent<HTMLDivElement>) => {
     const index = TABS.findIndex((t) => t.id === tab);
     let target: number;
@@ -326,10 +353,35 @@ export function ContributorsView({
               ) : null}
               <Segmented
                 label="Range"
-                value={data.range}
+                value={rangeKey}
                 options={RANGE_OPTIONS}
-                onChange={data.setRange}
+                onChange={onRangeKey}
               />
+              {customRange ? (
+                <div
+                  role="group"
+                  aria-label="Custom range"
+                  className="flex items-center gap-1.5 text-[12px] text-content/60"
+                >
+                  <input
+                    type="date"
+                    aria-label="Start date"
+                    value={customRange.start}
+                    max={customRange.end}
+                    onChange={(e) => pickDay(e.target.value, withStart)}
+                    className={DATE_INPUT}
+                  />
+                  to
+                  <input
+                    type="date"
+                    aria-label="End date"
+                    value={customRange.end}
+                    max={formatDay(new Date())}
+                    onChange={(e) => pickDay(e.target.value, withEnd)}
+                    className={DATE_INPUT}
+                  />
+                </div>
+              ) : null}
               <label className="flex items-center gap-2 text-[12px] text-content/60">
                 Merge identities
                 <Toggle
