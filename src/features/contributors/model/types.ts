@@ -86,3 +86,32 @@ export type ContributorsConfig = {
   people: Person[]; // identities = lowercased emails, "gh:<login>", or names
   dismissedMerges: string[]; // suggestion ids the user dismissed
 };
+
+export type GhState = "complete" | "partial" | "unavailable";
+
+/** A period read from the sync store (`contributors_load`). */
+export type LoadResponse = {
+  raw: RawData;
+  /** The whole period is synced and nothing in it is missing. */
+  covered: boolean;
+  /** Commits of the period that the store does not have. */
+  missingCommits: number;
+  /** Epoch seconds of the last sync, or null when nothing is synced. */
+  syncedAt: number | null;
+  /** Branch head the synced period was last brought up to. */
+  coverageHead: string | null;
+  /** Branch head now. */
+  head: string;
+  ghState: GhState | null;
+};
+
+/** What syncing a period involves (`contributors_sync_estimate`). */
+export type SyncEstimate = {
+  commits: number;
+  storedCommits: number;
+  firstParent: number;
+  /** Null when GitHub cannot say. */
+  prs: number | null;
+};
+
+export type SyncMode = "full" | "topup" | "github";

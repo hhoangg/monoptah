@@ -7,10 +7,18 @@ vi.mock("../model/api", () => ({
   readConfig: vi.fn(),
   readMailmap: vi.fn(),
   writeConfig: vi.fn(),
-  collectRaw: vi.fn(),
+  loadStored: vi.fn(),
+  syncEstimate: vi.fn(),
+  startSync: vi.fn(),
+  cancelSync: vi.fn(),
+  syncStatus: vi.fn(),
+  clearSynced: vi.fn(),
   listBranches: vi.fn(),
   gitUser: vi.fn(),
 }));
+
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ ask: vi.fn() }));
 
 vi.mock("../../../app/shell/WindowControls", () => ({
   WindowControls: () => null,
@@ -40,18 +48,27 @@ vi.mock("./IdentitiesTab", async () => {
   };
 });
 
+import { listen } from "@tauri-apps/api/event";
+import { ask as askDialog } from "@tauri-apps/plugin-dialog";
 import {
-  collectRaw,
+  cancelSync,
+  clearSynced,
   gitUser,
   listBranches,
+  loadStored,
   readConfig,
   readMailmap,
+  startSync,
+  syncEstimate,
+  syncStatus,
   writeConfig,
 } from "../model/api";
 import { resetContributorsCache } from "../hooks/useContributors";
 import { REMOTE_PROJECT_PREFIX } from "../../projects/model/recents";
 import { RANGE_KEY } from "../model/prefs";
 import { currentPeriod, previousPeriod, syncWindow } from "../model/period";
+import type { SyncEvent } from "../model/syncEvents";
+import type { LoadResponse, RawData } from "../model/types";
 import { ANA, BOB, file, makeCommit, makeRaw } from "../model/testFixtures";
 import { deferUnhandledEscape } from "../../workspace/model/tabKeys";
 import { ContributorsView } from "./ContributorsView";
@@ -71,6 +88,53 @@ const liveRaw = (extra: Parameters<typeof makeRaw>[0] = {}) =>
       makeCommit("b1", BOB, recent(2), { files: [file("src/b.ts", 5)] }),
     ],
     ...extra,
+  });
+
+/** The store answers with this raw data for a period it has fully synced. */
+const stored = (
+  raw: RawData,
+  over: Partial<LoadResponse> = {},
+): LoadResponse => ({
+  raw,
+  covered: true,
+  missingCommits: 0,
+  syncedAt: Math.floor(Date.now() / 1000) - 300,
+  coverageHead: raw.head,
+  head: raw.head,
+  ghState: "complete",
+  ...over,
+});
+
+/** The store has nothing (or not everything) for the period. */
+const unsynced = (over: Partial<LoadResponse> = {}): LoadResponse =>
+  stored(makeRaw(), {
+    covered: false,
+    missingCommits: 40,
+    syncedAt: null,
+    coverageHead: null,
+    ghState: null,
+    ...over,
+  });
+
+const handlers: ((e: { payload: SyncEvent }) => void)[] = [];
+const emit = (event: Partial<SyncEvent> & { root: string }) =>
+  act(async () => {
+    const period = currentPeriod("7d", new Date());
+    const full: SyncEvent = {
+      repoKey: "/r/.git",
+      project: "r",
+      branch: "main",
+      from: Math.floor(syncWindow(period, new Date()).from.getTime() / 1000),
+      to: Math.floor(period.end.getTime() / 1000),
+      step: "commits",
+      done: 0,
+      total: 0,
+      percent: 0,
+      state: "running",
+      error: null,
+      ...event,
+    };
+    handlers.forEach((handler) => handler({ payload: full }));
   });
 
 // A CI account no person lists: the only identity that counts as unmapped.
@@ -162,7 +226,26 @@ beforeEach(() => {
     name: "Ana",
     email: "ana@example.com",
   });
-  vi.mocked(collectRaw).mockImplementation(async () => liveRaw());
+  vi.mocked(loadStored).mockImplementation(async () => stored(liveRaw()));
+  vi.mocked(syncEstimate).mockResolvedValue({
+    commits: 120,
+    storedCommits: 20,
+    firstParent: 90,
+    prs: 7,
+  });
+  vi.mocked(startSync).mockResolvedValue(undefined);
+  vi.mocked(cancelSync).mockResolvedValue(undefined);
+  vi.mocked(clearSynced).mockResolvedValue(undefined);
+  vi.mocked(syncStatus).mockResolvedValue([]);
+  vi.mocked(askDialog).mockResolvedValue(true);
+  handlers.length = 0;
+  vi.mocked(listen).mockImplementation((async (
+    _event: string,
+    handler: (e: { payload: SyncEvent }) => void,
+  ) => {
+    handlers.push(handler);
+    return () => undefined;
+  }) as unknown as typeof listen);
 });
 
 afterEach(async () => {
@@ -181,7 +264,7 @@ describe("ContributorsView", () => {
   });
 
   it("shows a loading state before the data arrives", async () => {
-    vi.mocked(collectRaw).mockReturnValueOnce(new Promise(() => {}));
+    vi.mocked(loadStored).mockReturnValueOnce(new Promise(() => {}));
     await mount();
     expect(container.querySelector('[role="status"]')?.textContent).toContain(
       "Reading the git history",
@@ -190,7 +273,7 @@ describe("ContributorsView", () => {
   });
 
   it("renders the three tabs with the unmapped count on Identities", async () => {
-    vi.mocked(collectRaw).mockImplementation(async () => withMachine());
+    vi.mocked(loadStored).mockImplementation(async () => stored(withMachine()));
     await mount();
     const tabs = Array.from(container.querySelectorAll('[role="tab"]'));
     expect(tabs.map((t) => t.textContent)).toEqual([
@@ -209,7 +292,7 @@ describe("ContributorsView", () => {
   });
 
   it("switches tabs and shows the tab content", async () => {
-    vi.mocked(collectRaw).mockImplementation(async () => withMachine());
+    vi.mocked(loadStored).mockImplementation(async () => stored(withMachine()));
     await mount();
     await openTab("Leaderboard", LEADERBOARD_MARKER);
     expect(
@@ -237,29 +320,50 @@ describe("ContributorsView", () => {
     ).toBe("true");
   });
 
-  it("shows the GitHub notice with the reason and retries with a forced refresh", async () => {
-    vi.mocked(collectRaw).mockImplementation(async () =>
-      liveRaw({
-        ghAvailable: false,
-        ghNote: "GitHub CLI (`gh`) is not installed.",
-      }),
+  it("shows the incomplete GitHub notice with the reason and retries the GitHub step", async () => {
+    vi.mocked(loadStored).mockImplementation(async () =>
+      stored(
+        liveRaw({
+          ghAvailable: false,
+          ghNote: "GitHub CLI (`gh`) is not installed.",
+        }),
+        { ghState: "unavailable" },
+      ),
     );
     await mount();
     const notice = container.querySelector('[role="status"]');
     expect(notice?.textContent).toContain(
-      "Review points are not counted because GitHub data is unavailable: GitHub CLI (`gh`) is not installed.",
+      "GitHub data is incomplete for this period. GitHub CLI (`gh`) is not installed.",
     );
-    await act(async () => byText("button", "Retry")?.click());
-    expect(vi.mocked(collectRaw).mock.calls.at(-1)?.[1].force).toBe(true);
+    await act(async () => byText("button", "Retry GitHub")?.click());
+    expect(vi.mocked(startSync).mock.calls.at(-1)?.[1]).toMatchObject({
+      mode: "github",
+    });
+  });
+
+  it("shows a partial GitHub read as incomplete data with the numbers still on screen", async () => {
+    vi.mocked(loadStored).mockImplementation(async () =>
+      stored(liveRaw({ ghNote: "GitHub rate limit reached." }), {
+        ghState: "partial",
+      }),
+    );
+    await mount();
+    expect(container.textContent).toContain(
+      "GitHub data is incomplete for this period.",
+    );
+    expect(container.textContent).toContain("GitHub rate limit reached.");
+    expect(container.querySelector('[role="tablist"]')).not.toBeNull();
   });
 
   it("shows a collector note as information when GitHub data is available", async () => {
-    vi.mocked(collectRaw).mockImplementation(async () =>
-      liveRaw({
-        ghAvailable: true,
-        ghNote:
-          "GitHub returned no pull requests for this period, so review points may be missing.",
-      }),
+    vi.mocked(loadStored).mockImplementation(async () =>
+      stored(
+        liveRaw({
+          ghAvailable: true,
+          ghNote:
+            "GitHub returned no pull requests for this period, so review points may be missing.",
+        }),
+      ),
     );
     await mount();
     const notice = container.querySelector('[role="status"]');
@@ -275,7 +379,7 @@ describe("ContributorsView", () => {
   });
 
   it("shows the error with a Retry that reloads", async () => {
-    vi.mocked(collectRaw).mockRejectedValueOnce("not a git repository");
+    vi.mocked(loadStored).mockRejectedValueOnce("not a git repository");
     await mount();
     expect(container.querySelector('[role="alert"]')?.textContent).toContain(
       "not a git repository",
@@ -286,14 +390,14 @@ describe("ContributorsView", () => {
   });
 
   it("clears the old error and shows the loading state while retrying", async () => {
-    vi.mocked(collectRaw).mockRejectedValueOnce("not a git repository");
+    vi.mocked(loadStored).mockRejectedValueOnce("not a git repository");
     await mount();
     expect(container.querySelector('[role="alert"]')).not.toBeNull();
     let release!: () => void;
-    vi.mocked(collectRaw).mockImplementationOnce(
+    vi.mocked(loadStored).mockImplementationOnce(
       () =>
         new Promise((resolve) => {
-          release = () => resolve(liveRaw());
+          release = () => resolve(stored(liveRaw()));
         }),
     );
     await act(async () => byText('[role="alert"] button', "Retry")?.click());
@@ -306,8 +410,8 @@ describe("ContributorsView", () => {
   });
 
   it("shows an empty state when there are no commits in the period", async () => {
-    vi.mocked(collectRaw).mockImplementation(async () =>
-      makeRaw({ since: recent(70) }),
+    vi.mocked(loadStored).mockImplementation(async () =>
+      stored(makeRaw({ since: recent(70) })),
     );
     await mount();
     expect(container.textContent).toContain("No commits in this period");
@@ -341,12 +445,13 @@ describe("ContributorsView", () => {
     expect(container.querySelector('[aria-label="Range"]')).toBeNull();
   });
 
-  it("collects from the start of the previous period, with the end open", async () => {
+  it("reads from the start of the previous period to the period end", async () => {
     await mount();
-    const week = syncWindow(currentPeriod("7d", new Date()), new Date());
-    const options = vi.mocked(collectRaw).mock.calls.at(-1)![1];
+    const period = currentPeriod("7d", new Date());
+    const week = syncWindow(period, new Date());
+    const options = vi.mocked(loadStored).mock.calls.at(-1)![1];
     expect(Date.parse(options.since)).toBe(week.from.getTime());
-    expect(options.until).toBeUndefined();
+    expect(Date.parse(options.until)).toBe(period.end.getTime());
   });
 
   it("changes and remembers the kind", async () => {
@@ -411,9 +516,9 @@ describe("ContributorsView", () => {
       expect(periodLabel()).toBe(previous.label);
       expect(localStorage.getItem(RANGE_KEY)).toBe(`month:${previous.id}`);
       const window = syncWindow(previous, now());
-      const options = vi.mocked(collectRaw).mock.calls.at(-1)![1];
+      const options = vi.mocked(loadStored).mock.calls.at(-1)![1];
       expect(Date.parse(options.since)).toBe(window.from.getTime());
-      expect(options.until).toBeUndefined();
+      expect(Date.parse(options.until)).toBe(previous.end.getTime());
       expect(arrow("Next period")?.disabled).toBe(false);
     });
 
@@ -473,7 +578,7 @@ describe("ContributorsView", () => {
       document.body.querySelectorAll('[role="option"]'),
     ).find((o) => o.textContent?.includes("dev")) as HTMLElement;
     await act(async () => dev.click());
-    expect(vi.mocked(collectRaw).mock.calls.at(-1)?.[1].branch).toBe("dev");
+    expect(vi.mocked(loadStored).mock.calls.at(-1)?.[1].branch).toBe("dev");
   });
 
   it("shows a config save failure from the Identities tab and clears it on success", async () => {
@@ -628,7 +733,6 @@ describe("ContributorsView with an unreadable config file", () => {
     vi.mocked(readConfig).mockResolvedValue(null);
     await act(async () => byText('[role="alert"] button', "Reload")?.click());
     expect(vi.mocked(readConfig).mock.calls.length).toBe(reads + 1);
-    expect(vi.mocked(collectRaw).mock.calls.at(-1)?.[1].force).toBe(true);
     expect(banner()).toBeUndefined();
   });
 
@@ -668,7 +772,7 @@ describe("ContributorsView with an unreadable config file", () => {
 
 describe("ContributorsView hardening", () => {
   it("says Contributors works on local projects for a remote path, and reads nothing", async () => {
-    const calls = vi.mocked(collectRaw).mock.calls.length;
+    const calls = vi.mocked(loadStored).mock.calls.length;
     await mount({ project: `${REMOTE_PROJECT_PREFIX}host/work/app` });
     expect(container.textContent).toContain(
       "Contributors works on local projects only",
@@ -678,7 +782,7 @@ describe("ContributorsView hardening", () => {
     expect(container.querySelector(".hidden")?.textContent).toContain(
       "Merge identities",
     );
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(calls);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(calls);
   });
 
   it("jumps to the first and last tab with Home and End", async () => {
@@ -705,10 +809,10 @@ describe("ContributorsView hardening", () => {
   it("keeps the page up and marks it busy while a new period loads", async () => {
     await mount();
     let release!: () => void;
-    vi.mocked(collectRaw).mockImplementationOnce(
+    vi.mocked(loadStored).mockImplementationOnce(
       () =>
         new Promise((resolve) => {
-          release = () => resolve(liveRaw());
+          release = () => resolve(stored(liveRaw()));
         }),
     );
     await act(async () => periodButton("Month")?.click());
@@ -731,13 +835,15 @@ describe("ContributorsView Ask Agent dialog", () => {
     });
     vi.stubGlobal("cancelAnimationFrame", () => {});
     // Commits made right now always fall in the current period.
-    vi.mocked(collectRaw).mockImplementation(async () =>
-      liveRaw({
-        commits: [
-          makeCommit("a1", ANA, recent(0), { files: [file("src/a.ts", 10)] }),
-          makeCommit("b1", BOB, recent(0), { files: [file("src/b.ts", 5)] }),
-        ],
-      }),
+    vi.mocked(loadStored).mockImplementation(async () =>
+      stored(
+        liveRaw({
+          commits: [
+            makeCommit("a1", ANA, recent(0), { files: [file("src/a.ts", 10)] }),
+            makeCommit("b1", BOB, recent(0), { files: [file("src/b.ts", 5)] }),
+          ],
+        }),
+      ),
     );
   });
 
@@ -768,10 +874,10 @@ describe("ContributorsView Ask Agent dialog", () => {
 
   it("disables Ask Agent until the data is ready and never opens a dialog later", async () => {
     let release!: () => void;
-    vi.mocked(collectRaw).mockImplementationOnce(
+    vi.mocked(loadStored).mockImplementationOnce(
       () =>
         new Promise((resolve) => {
-          release = () => resolve(liveRaw());
+          release = () => resolve(stored(liveRaw()));
         }),
     );
     const onAskAgent = vi.fn();
@@ -792,7 +898,7 @@ describe("ContributorsView Ask Agent dialog", () => {
   });
 
   it("disables Ask Agent after a failed load and opens nothing on retry", async () => {
-    vi.mocked(collectRaw).mockRejectedValueOnce(new Error("git failed"));
+    vi.mocked(loadStored).mockRejectedValueOnce(new Error("git failed"));
     await mount({ onStartAgentSession: vi.fn() });
     const ask = byText("button", "Ask Agent") as HTMLButtonElement;
     expect(ask.disabled).toBe(true);
@@ -1038,5 +1144,153 @@ describe("ContributorsView Escape", () => {
     await act(async () => cancel?.click());
     expect(dialog()).toBeNull();
     expect(document.activeElement).toBe(row);
+  });
+});
+
+describe("ContributorsView sync store", () => {
+  const text = () => container.textContent ?? "";
+  const project = () => `/work/project-${counter}`;
+
+  it("a never synced period offers Sync with the estimate and starts nothing", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsynced());
+    await mount();
+    expect(text()).toContain("No data for the last 7 days yet");
+    expect(text()).toContain("About 100 commits and 7 pull requests to read.");
+    expect(byText("button", "Sync")).toBeDefined();
+    expect(container.querySelector('[role="tablist"]')).toBeNull();
+    expect(startSync).not.toHaveBeenCalled();
+  });
+
+  it("names a calendar period by its label and omits pull requests when GitHub cannot count", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsynced());
+    vi.mocked(syncEstimate).mockResolvedValue({
+      commits: 1,
+      storedCommits: 0,
+      firstParent: 1,
+      prs: null,
+    });
+    await mount();
+    await act(async () => periodButton("Quarter")?.click());
+    expect(text()).toContain(
+      `No data for ${currentPeriod("quarter", new Date()).label} yet`,
+    );
+    expect(text()).toContain("About 1 commit to read.");
+    expect(text()).not.toContain("pull request");
+  });
+
+  it("Sync starts a full job, shows the step and progress, and Cancel stops it", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsynced());
+    await mount();
+    await act(async () => byText("button", "Sync")?.click());
+    expect(vi.mocked(startSync).mock.calls[0][1].mode).toBe("full");
+
+    await emit({
+      root: project(),
+      step: "commits",
+      done: 3200,
+      total: 12000,
+      percent: 27,
+    });
+    expect(text()).toContain("Syncing Commits: 3,200 of 12,000");
+    const bar = container.querySelector('[role="progressbar"]');
+    expect(bar?.getAttribute("aria-valuenow")).toBe("27");
+    expect(byText("button", "Sync")).toBeUndefined();
+
+    await act(async () => byText("button", "Cancel")?.click());
+    expect(cancelSync).toHaveBeenCalledWith(project());
+  });
+
+  it("shows the data when the job is done", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsynced());
+    await mount();
+    await act(async () => byText("button", "Sync")?.click());
+    vi.mocked(loadStored).mockImplementation(async () => stored(liveRaw()));
+    await emit({ root: project(), state: "done", percent: 100 });
+    await act(async () => {});
+    expect(container.querySelector('[role="tablist"]')).not.toBeNull();
+    expect(text()).toContain("Synced 5m ago");
+    expect(text()).not.toContain("No data for");
+  });
+
+  it("an incomplete period never shows partial numbers and offers Sync again", async () => {
+    vi.mocked(loadStored).mockResolvedValue(
+      stored(liveRaw(), { covered: false, missingCommits: 12 }),
+    );
+    await mount();
+    expect(text()).toContain("No data for the last 7 days yet");
+    expect(container.querySelector('[role="tablist"]')).toBeNull();
+    expect(text()).not.toContain("Commit activity");
+    expect(byText("button", "Sync")).toBeDefined();
+  });
+
+  it("a synced period shows when it was synced and a Sync again button", async () => {
+    await mount();
+    expect(text()).toContain("Synced 5m ago");
+    await act(async () => byText("button", "Sync again")?.click());
+    expect(vi.mocked(startSync).mock.calls[0][1].mode).toBe("full");
+  });
+
+  it("shows a small spinner and keeps the data while a top-up runs", async () => {
+    vi.mocked(loadStored).mockImplementation(async () =>
+      stored(liveRaw(), { coverageHead: "old1", head: "new2" }),
+    );
+    await mount();
+    expect(vi.mocked(startSync).mock.calls[0][1]).toMatchObject({
+      mode: "topup",
+      oldHead: "old1",
+    });
+    expect(container.querySelector('[role="tablist"]')).not.toBeNull();
+    expect(text()).toContain("Sync queued");
+  });
+
+  it("reports a failed sync and lets the user press Sync again", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsynced());
+    await mount();
+    await emit({ root: project(), state: "error", error: "git exploded" });
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "git exploded",
+    );
+    expect(byText("button", "Sync")).toBeDefined();
+  });
+
+  it("Clear synced data asks first, then clears and reloads", async () => {
+    await mount();
+    await act(async () =>
+      container
+        .querySelector<HTMLElement>('button[aria-label="More"]')
+        ?.click(),
+    );
+    const item = () =>
+      Array.from(
+        document.body.querySelectorAll<HTMLElement>('[role="menuitem"]'),
+      ).find((el) => el.textContent === "Clear synced data");
+
+    vi.mocked(askDialog).mockResolvedValueOnce(false);
+    await act(async () => item()?.click());
+    expect(askDialog).toHaveBeenCalledTimes(1);
+    expect(clearSynced).not.toHaveBeenCalled();
+
+    await act(async () =>
+      container
+        .querySelector<HTMLElement>('button[aria-label="More"]')
+        ?.click(),
+    );
+    vi.mocked(loadStored).mockResolvedValue(unsynced());
+    await act(async () => item()?.click());
+    expect(clearSynced).toHaveBeenCalledWith(project());
+    await act(async () => {});
+    expect(text()).toContain("No data for the last 7 days yet");
+  });
+
+  it("switching period while syncing shows the new period's own state", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsynced());
+    await mount();
+    await act(async () => byText("button", "Sync")?.click());
+    await emit({ root: project(), step: "commits", done: 1, total: 4 });
+    expect(text()).toContain("Syncing Commits: 1 of 4");
+    await act(async () => periodButton("Month")?.click());
+    expect(text()).not.toContain("Syncing Commits");
+    expect(byText("button", "Sync")).toBeDefined();
+    expect(cancelSync).not.toHaveBeenCalled();
   });
 });

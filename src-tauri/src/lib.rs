@@ -496,7 +496,6 @@ pub fn run() {
             contributors::contributors_read_mailmap,
             contributors::contributors_write_config,
             contributors::contributors_branches,
-            contributors::contributors_collect,
             contributors::contributors_load,
             contributors::contributors_sync_estimate,
             contributors::contributors_sync_start,

@@ -80,7 +80,6 @@ const MAX_SYNC_DEPTH: usize = 32;
 const SURVIVAL_MIN_AGE_DAYS: i64 = 30;
 const MAX_SURVIVAL_FILES: usize = 50;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
-const CACHE_CAPACITY: usize = 8;
 const CONFIG_DIR: &str = ".monoptah";
 const CONFIG_FILE: &str = "contributors.json";
 
@@ -578,15 +577,6 @@ struct Window {
     until_arg: String,
     since_epoch: i64,
     until_epoch: i64,
-    since_echo: String,
-    until_echo: String,
-    /// What distinguishes `until` in the cache: the exact text given, or for an
-    /// open end `now:` plus the UTC calendar day of the request (taken from the
-    /// same instant as `until_echo`). The key is coarse on purpose: a new HEAD
-    /// or a new `since` (which follows the local day) already misses, so only
-    /// changes seen on GitHub alone (new reviews, PRs merged but not pulled)
-    /// can stay stale, until the day turns or the refresh button forces a reload.
-    until_key: String,
     /// The edge has no zone, so git reads it in the local zone and the epoch
     /// above is only a UTC approximation until `for_repo` asks git.
     since_local: bool,
@@ -599,20 +589,17 @@ impl Window {
         let invalid = |label: &str, raw: &str| format!("Invalid {label} date: {raw}");
         let since_arg = git_date_arg(since, false).ok_or_else(|| invalid("since", since))?;
         let since_epoch = window_epoch(since, false).ok_or_else(|| invalid("since", since))?;
-        let (until_arg, until_epoch, until_echo, until_key) =
-            match until.map(str::trim).filter(|u| !u.is_empty()) {
-                Some(until) => {
-                    let arg = git_date_arg(until, true).ok_or_else(|| invalid("until", until))?;
-                    let epoch = window_epoch(until, true).ok_or_else(|| invalid("until", until))?;
-                    (arg, epoch, until.to_string(), until.to_string())
-                }
-                None => {
-                    let now = now_epoch();
-                    let iso = epoch_to_iso(now);
-                    let key = format!("now:{}", &iso[..10]);
-                    (format!("@{now}"), now, iso, key)
-                }
-            };
+        let (until_arg, until_epoch) = match until.map(str::trim).filter(|u| !u.is_empty()) {
+            Some(until) => {
+                let arg = git_date_arg(until, true).ok_or_else(|| invalid("until", until))?;
+                let epoch = window_epoch(until, true).ok_or_else(|| invalid("until", until))?;
+                (arg, epoch)
+            }
+            None => {
+                let now = now_epoch();
+                (format!("@{now}"), now)
+            }
+        };
         if since_epoch > until_epoch {
             return Err("The start date is after the end date.".to_string());
         }
@@ -621,9 +608,6 @@ impl Window {
             until_arg,
             since_epoch,
             until_epoch,
-            since_echo: since.to_string(),
-            until_echo,
-            until_key,
             since_local: parse_iso(since).is_some_and(|t| t.offset_minutes.is_none()),
             until_local: until
                 .map(str::trim)
@@ -656,15 +640,11 @@ impl Window {
     /// A window of exact instants, both edges inclusive: what one chunk of a
     /// sync works on. Git reads `@<epoch>` the same in every time zone.
     fn from_epochs(since: i64, until: i64) -> Self {
-        let (since_echo, until_echo) = (epoch_to_iso(since), epoch_to_iso(until));
         Self {
             since_arg: format!("@{since}"),
             until_arg: format!("@{until}"),
             since_epoch: since,
             until_epoch: until,
-            until_key: until_echo.clone(),
-            since_echo,
-            until_echo,
             since_local: false,
             until_local: false,
         }
@@ -996,6 +976,7 @@ fn stop(child: &mut std::process::Child) {
 
 /// Streams `git log -p` into `git patch-id --stable` without holding the patch
 /// text. Returns `None` when the patch text exceeds the byte cap.
+#[cfg(test)]
 fn patch_ids(
     root: &Path,
     head: &str,
@@ -1516,6 +1497,7 @@ fn sum_files(commits: &[&ParsedCommit]) -> Vec<RawFile> {
 ///
 /// PRs on the branch's own first-parent chain keep their `#N` as id and number;
 /// PRs that arrive through a sync merge are keyed by hash (see `single_parent_pr`).
+#[cfg(test)]
 fn derive_prs_from_git(
     root: &Path,
     head: &str,
@@ -1605,6 +1587,7 @@ fn derive_prs_known(
     Ok(deriver.derived)
 }
 
+#[cfg(test)]
 fn reverted_pr_ids(commits: &[ParsedCommit], derived: &Derived) -> Vec<String> {
     let mut by_commit: HashMap<&str, &str> = HashMap::new();
     for draft in &derived.drafts {
@@ -1850,6 +1833,7 @@ fn compute_survival(
     (samples, false)
 }
 
+#[cfg(test)]
 fn collect_raw(
     root: &Path,
     branch: &str,
@@ -1956,8 +1940,8 @@ fn collect_raw(
     let data = RawData {
         head: head.to_string(),
         branch: branch.to_string(),
-        since: window.since_echo.clone(),
-        until: window.until_echo.clone(),
+        since: epoch_to_iso(window.since_epoch),
+        until: epoch_to_iso(window.until_epoch),
         gh_available: github.available,
         gh_note: github.note,
         commits,
@@ -1970,89 +1954,9 @@ fn collect_raw(
     Ok(data)
 }
 
-// ---------------------------------------------------------------------------
-// cache
-// ---------------------------------------------------------------------------
-
-/// (repo root, branch, head sha, normalized since, normalized until)
-type CacheKey = (String, String, String, String, String);
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
-
-struct Cache {
-    entries: Mutex<Vec<(CacheKey, Arc<RawData>)>>,
-    inflight: Mutex<Vec<(CacheKey, Arc<Mutex<()>>)>>,
-    /// GitHub commit lists per PR; they outlive the entries above, so a new
-    /// HEAD does not refetch every PR.
-    commits: gh::CommitCache,
-}
-
-impl Cache {
-    const fn new() -> Self {
-        Self {
-            entries: Mutex::new(Vec::new()),
-            inflight: Mutex::new(Vec::new()),
-            commits: gh::CommitCache::new(),
-        }
-    }
-
-    fn get(&self, key: &CacheKey) -> Option<Arc<RawData>> {
-        lock(&self.entries)
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
-    }
-
-    fn insert(&self, key: CacheKey, value: Arc<RawData>) {
-        let mut entries = lock(&self.entries);
-        entries.retain(|(k, _)| *k != key);
-        entries.push((key, value));
-        while entries.len() > CACHE_CAPACITY {
-            entries.remove(0);
-        }
-    }
-
-    fn remove(&self, key: &CacheKey) {
-        lock(&self.entries).retain(|(k, _)| k != key);
-    }
-
-    /// One computation per key at a time; later callers wait, then hit the cache.
-    fn key_lock(&self, key: &CacheKey) -> Arc<Mutex<()>> {
-        let mut inflight = lock(&self.inflight);
-        if let Some((_, existing)) = inflight.iter().find(|(k, _)| k == key) {
-            return existing.clone();
-        }
-        let created = Arc::new(Mutex::new(()));
-        inflight.push((key.clone(), created.clone()));
-        created
-    }
-
-    fn release(&self, key: &CacheKey, held: &Arc<Mutex<()>>) {
-        let mut inflight = lock(&self.inflight);
-        // Only the map and the caller hold it: nobody is waiting.
-        if Arc::strong_count(held) <= 2 {
-            inflight.retain(|(k, _)| k != key);
-        }
-    }
-}
-
-/// Releases the in-flight slot of a key on every exit path, errors and panics
-/// included, so a failed collection can never block later calls for that key.
-struct SlotRelease<'a> {
-    cache: &'a Cache,
-    key: &'a CacheKey,
-    gate: &'a Arc<Mutex<()>>,
-}
-
-impl Drop for SlotRelease<'_> {
-    fn drop(&mut self) {
-        self.cache.release(self.key, self.gate);
-    }
-}
-
-static CACHE: Cache = Cache::new();
 
 /// The `gh` used by the commands. Tests default to "not installed" so they
 /// never reach the network; the ones about GitHub inject their own runner.
@@ -2066,61 +1970,41 @@ fn default_gh() -> gh::Unavailable {
     gh::Unavailable
 }
 
-fn collect_cached(
-    cache: &Cache,
-    cwd: &Path,
-    since: &str,
-    until: Option<&str>,
-    branch: Option<&str>,
-    force: bool,
-) -> Result<Arc<RawData>, String> {
-    collect_cached_with(cache, &default_gh(), cwd, since, until, branch, force)
-}
-
-fn collect_cached_with(
-    cache: &Cache,
+/// The one-shot collector over a whole window: the reference the sync store is
+/// tested against.
+#[cfg(test)]
+fn collect_once(
     github: &dyn gh::GhRunner,
     cwd: &Path,
     since: &str,
     until: Option<&str>,
     branch: Option<&str>,
-    force: bool,
-) -> Result<Arc<RawData>, String> {
+) -> Result<RawData, String> {
+    collect_with(github, &gh::CommitCache::new(), cwd, since, until, branch)
+}
+
+/// `collect_once` with the GitHub commit lists kept between runs.
+#[cfg(test)]
+fn collect_with(
+    github: &dyn gh::GhRunner,
+    commit_cache: &gh::CommitCache,
+    cwd: &Path,
+    since: &str,
+    until: Option<&str>,
+    branch: Option<&str>,
+) -> Result<RawData, String> {
     let root = repo_root(cwd)?;
     let window = Window::for_repo(&root, since, until)?;
     let (name, head) = resolve_branch(&root, branch)?;
-    let key: CacheKey = (
-        root.to_string_lossy().into_owned(),
-        name.clone(),
-        head.clone(),
-        window.since_echo.clone(),
-        window.until_key.clone(),
-    );
-
-    let gate = cache.key_lock(&key);
-    // Declared before the guard so it is dropped after it.
-    let _slot = SlotRelease {
-        cache,
-        key: &key,
-        gate: &gate,
-    };
-    let _guard = lock(&gate);
-    if force {
-        cache.remove(&key);
-    } else if let Some(hit) = cache.get(&key) {
-        return Ok(hit);
-    }
-    let data = Arc::new(collect_raw(
+    collect_raw(
         &root,
         &name,
         &head,
         &window,
         &Limits::DEFAULT,
         github,
-        &cache.commits,
-    )?);
-    cache.insert(key.clone(), data.clone());
-    Ok(data)
+        commit_cache,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2288,29 +2172,6 @@ pub async fn contributors_git_user(cwd: String) -> Result<GitUser, String> {
     tauri::async_runtime::spawn_blocking(move || read_git_user(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-pub async fn contributors_collect(
-    cwd: String,
-    since: String,
-    until: Option<String>,
-    branch: Option<String>,
-    force: Option<bool>,
-) -> Result<RawData, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        collect_cached(
-            &CACHE,
-            &expand_home(&cwd),
-            &since,
-            until.as_deref(),
-            branch.as_deref(),
-            force.unwrap_or(false),
-        )
-        .map(|data| (*data).clone())
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 /// The job manager the app manages: it runs syncs through `run_sync` and
@@ -2555,10 +2416,7 @@ pub(super) mod tests {
         }
 
         fn collect(&self) -> RawData {
-            collect_cached(&Cache::new(), self.path(), SINCE, Some(UNTIL), None, false)
-                .unwrap()
-                .as_ref()
-                .clone()
+            collect_once(&default_gh(), self.path(), SINCE, Some(UNTIL), None).unwrap()
         }
     }
 
@@ -2736,26 +2594,6 @@ pub(super) mod tests {
             pump(&mut input, &mut BrokenPipe, 100),
             Pump::Failed(_)
         ));
-    }
-
-    #[test]
-    fn a_failed_collection_releases_its_in_flight_slot() {
-        let cache = Cache::new();
-        let key: CacheKey = ("r".into(), "b".into(), "h".into(), "s".into(), "u".into());
-        let attempt = || -> Result<(), String> {
-            let gate = cache.key_lock(&key);
-            let _slot = SlotRelease {
-                cache: &cache,
-                key: &key,
-                gate: &gate,
-            };
-            let _guard = lock(&gate);
-            Err("boom".to_string())?;
-            Ok(())
-        };
-        assert!(attempt().is_err());
-        assert!(cache.inflight.lock().unwrap().is_empty());
-        assert!(attempt().is_err());
     }
 
     #[test]
@@ -3470,105 +3308,27 @@ pub(super) mod tests {
         );
         repo.checkout("main");
 
-        let cache = Cache::new();
         let side =
-            collect_cached(&cache, repo.path(), SINCE, Some(UNTIL), Some("side"), false).unwrap();
+            collect_once(&default_gh(), repo.path(), SINCE, Some(UNTIL), Some("side")).unwrap();
         assert_eq!(side.branch, "side");
         assert_eq!(side.commits.len(), 2);
-        let main = collect_cached(&cache, repo.path(), SINCE, Some(UNTIL), None, false).unwrap();
+        let main = collect_once(&default_gh(), repo.path(), SINCE, Some(UNTIL), None).unwrap();
         assert_eq!(main.branch, "main");
         assert_eq!(main.commits.len(), 1);
 
-        let err = collect_cached(&cache, repo.path(), SINCE, Some(UNTIL), Some("nope"), false)
-            .unwrap_err();
+        let err =
+            collect_once(&default_gh(), repo.path(), SINCE, Some(UNTIL), Some("nope")).unwrap_err();
         assert!(err.contains("nope"), "{err}");
-        let err = collect_cached(
-            &cache,
+        let err = collect_once(
+            &default_gh(),
             repo.path(),
             SINCE,
             Some(UNTIL),
             Some("--all"),
-            false,
         )
         .unwrap_err();
         assert!(err.contains("--all"), "{err}");
-        assert!(
-            collect_cached(&cache, repo.path(), "not a date", Some(UNTIL), None, false).is_err()
-        );
-    }
-
-    #[test]
-    fn the_cache_hits_until_forced_or_the_head_moves() {
-        let repo = TestRepo::new();
-        repo.commit(
-            &[("a.txt", "a\n")],
-            "One",
-            ALICE,
-            "2026-02-01T10:00:00+0000",
-        );
-        let cache = Cache::new();
-        let run = |force| {
-            collect_cached(
-                &cache,
-                repo.path(),
-                "2026-01-01",
-                Some("2026-06-30"),
-                None,
-                force,
-            )
-            .unwrap()
-        };
-        let first = run(false);
-        let second = run(false);
-        assert!(Arc::ptr_eq(&first, &second));
-        let forced = run(true);
-        assert!(!Arc::ptr_eq(&first, &forced));
-        assert!(Arc::ptr_eq(&forced, &run(false)));
-
-        repo.commit(
-            &[("b.txt", "b\n")],
-            "Two",
-            ALICE,
-            "2026-02-02T10:00:00+0000",
-        );
-        let moved = run(false);
-        assert!(!Arc::ptr_eq(&forced, &moved));
-        assert_eq!(moved.commits.len(), 2);
-        assert!(cache.inflight.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn the_cache_keeps_at_most_eight_entries_dropping_the_oldest() {
-        let cache = Cache::new();
-        let data = Arc::new(RawData {
-            head: String::new(),
-            branch: String::new(),
-            since: String::new(),
-            until: String::new(),
-            gh_available: false,
-            gh_note: None,
-            commits: Vec::new(),
-            prs: Vec::new(),
-            reviews: Vec::new(),
-            survival: Vec::new(),
-            reverted_pr_ids: Vec::new(),
-            truncated: false,
-        });
-        let key = |n: usize| -> CacheKey {
-            (
-                "r".into(),
-                "b".into(),
-                format!("h{n}"),
-                "s".into(),
-                "u".into(),
-            )
-        };
-        for n in 0..9 {
-            cache.insert(key(n), data.clone());
-        }
-        assert!(cache.get(&key(0)).is_none());
-        assert!((1..9).all(|n| cache.get(&key(n)).is_some()));
-        assert_eq!(cache.entries.lock().unwrap().len(), CACHE_CAPACITY);
+        assert!(collect_once(&default_gh(), repo.path(), "not a date", Some(UNTIL), None).is_err());
     }
 
     #[test]
@@ -3650,7 +3410,7 @@ pub(super) mod tests {
             read_mailmap(&dir).unwrap_err(),
             write_config(&dir, "{}").unwrap_err(),
             list_branches(&dir).unwrap_err(),
-            collect_cached(&Cache::new(), &dir, SINCE, None, None, false).unwrap_err(),
+            collect_once(&default_gh(), &dir, SINCE, None, None).unwrap_err(),
         ];
         let _ = std::fs::remove_dir_all(&dir);
         for err in outcomes {
@@ -3661,8 +3421,7 @@ pub(super) mod tests {
     #[test]
     fn an_empty_repository_reports_a_clear_error() {
         let repo = TestRepo::new();
-        let err = collect_cached(&Cache::new(), repo.path(), SINCE, Some(UNTIL), None, false)
-            .unwrap_err();
+        let err = collect_once(&default_gh(), repo.path(), SINCE, Some(UNTIL), None).unwrap_err();
         assert!(err.contains("no commits"), "{err}");
     }
 
@@ -3821,46 +3580,11 @@ pub(super) mod tests {
             ALICE,
             "2026-02-01T10:00:00+0000",
         );
-        let reversed = collect_cached(&Cache::new(), repo.path(), UNTIL, Some(SINCE), None, false);
+        let reversed = collect_once(&default_gh(), repo.path(), UNTIL, Some(SINCE), None);
         assert_eq!(
             reversed.err().unwrap(),
             "The start date is after the end date."
         );
-    }
-
-    #[test]
-    fn the_cache_key_uses_the_exact_window() {
-        let repo = TestRepo::new();
-        repo.commit(
-            &[("a.txt", "a\n")],
-            "One",
-            ALICE,
-            "2026-02-01T10:00:00+0000",
-        );
-        let cache = Cache::new();
-        let run = |since: &str, until: Option<&str>| {
-            collect_cached(&cache, repo.path(), since, until, None, false).unwrap()
-        };
-        let base = run("2026-01-01T00:00:00Z", Some("2026-06-30T00:00:00Z"));
-        assert!(Arc::ptr_eq(
-            &base,
-            &run("2026-01-01T00:00:00Z", Some("2026-06-30T00:00:00Z"))
-        ));
-        assert!(!Arc::ptr_eq(
-            &base,
-            &run("2026-01-01T12:00:00Z", Some("2026-06-30T00:00:00Z"))
-        ));
-        assert!(!Arc::ptr_eq(
-            &base,
-            &run("2026-01-01T00:00:00Z", Some("2026-06-30T12:00:00Z"))
-        ));
-        let today = epoch_to_iso(now_epoch())[..10].to_string();
-        let open = run("2026-01-01T00:00:00Z", None);
-        assert!(!Arc::ptr_eq(
-            &open,
-            &run("2026-01-01T00:00:00Z", Some(&today))
-        ));
-        assert!(Arc::ptr_eq(&open, &run("2026-01-01T00:00:00Z", None)));
     }
 
     #[test]
@@ -4607,26 +4331,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn equivalent_window_spellings_do_not_share_a_cache_entry() {
-        let repo = TestRepo::new();
-        repo.commit(
-            &[("a.txt", "a\n")],
-            "One",
-            ALICE,
-            "2026-02-01T10:00:00+0000",
-        );
-        let cache = Cache::new();
-        let run = |since: &str| {
-            collect_cached(&cache, repo.path(), since, Some("2026-06-30"), None, false).unwrap()
-        };
-        let date = run("2026-01-01");
-        let datetime = run("2026-01-01T00:00:00");
-        assert!(!Arc::ptr_eq(&date, &datetime));
-        assert_eq!(date.since, "2026-01-01");
-        assert_eq!(datetime.since, "2026-01-01T00:00:00");
-    }
-
-    #[test]
     fn nested_syncs_keep_the_exclusions_of_every_enclosing_merge() {
         let repo = TestRepo::new();
         repo.commit(
@@ -4986,16 +4690,7 @@ pub(super) mod tests {
             "2026-01-01T00:00:00+0000",
         );
 
-        let data = collect_cached_with(
-            &Cache::new(),
-            &github,
-            repo.path(),
-            SINCE,
-            Some(UNTIL),
-            None,
-            false,
-        )
-        .unwrap();
+        let data = collect_once(&github, repo.path(), SINCE, Some(UNTIL), None).unwrap();
 
         assert!(data.gh_available);
         assert_eq!(data.gh_note, None);
@@ -5104,16 +4799,7 @@ pub(super) mod tests {
                 )
             }
         });
-        let data = collect_cached_with(
-            &Cache::new(),
-            &github,
-            repo.path(),
-            SINCE,
-            Some(UNTIL),
-            None,
-            false,
-        )
-        .unwrap();
+        let data = collect_once(&github, repo.path(), SINCE, Some(UNTIL), None).unwrap();
         assert!(!data.gh_available);
         assert_eq!(
             data.gh_note.as_deref(),
@@ -5153,16 +4839,7 @@ pub(super) mod tests {
             serde_json::json!([]),
             serde_json::json!([]),
         );
-        let data = collect_cached_with(
-            &Cache::new(),
-            &github,
-            repo.path(),
-            SINCE,
-            Some(UNTIL),
-            None,
-            false,
-        )
-        .unwrap();
+        let data = collect_once(&github, repo.path(), SINCE, Some(UNTIL), None).unwrap();
         assert!(data.gh_available);
         assert_eq!(data.prs.len(), 2);
         let by_source = |source: &str| data.prs.iter().find(|p| p.source == source).unwrap();
@@ -5277,16 +4954,7 @@ pub(super) mod tests {
             serde_json::json!([]),
             serde_json::json!([]),
         );
-        let data = collect_cached_with(
-            &Cache::new(),
-            &github,
-            repo.path(),
-            SINCE,
-            Some(UNTIL),
-            None,
-            false,
-        )
-        .unwrap();
+        let data = collect_once(&github, repo.path(), SINCE, Some(UNTIL), None).unwrap();
         assert!(data.gh_available);
         let sampled: Vec<&str> = data.survival.iter().map(|s| s.pr_id.as_str()).collect();
         assert_eq!(sampled, ["7"]);
@@ -5488,20 +5156,19 @@ pub(super) mod tests {
             "closedAt": "2026-01-20T10:00:00Z", "baseRefName": "main"
         }]);
         let github = fake_github_without_commit_calls(merged, closed);
-        let cache = Cache::new();
-        let collect = |force: bool| {
-            collect_cached_with(
-                &cache,
+        let commit_lists = gh::CommitCache::new();
+        let collect = || {
+            collect_with(
                 &github,
+                &commit_lists,
                 repo.path(),
                 SINCE,
                 Some(UNTIL),
                 None,
-                force,
             )
             .unwrap()
         };
-        let data = collect(false);
+        let data = collect();
 
         // A failing `commits` call would have made gh unavailable.
         assert!(data.gh_available, "{:?}", data.gh_note);
@@ -5552,7 +5219,7 @@ pub(super) mod tests {
 
         // The commit lists are cached: a refresh needs neither the origin nor gh.
         drop(bare);
-        let again = collect(true);
+        let again = collect();
         assert!(again.gh_available, "{:?}", again.gh_note);
         assert_eq!(pr_by_id(&again, "7").commit_count, 2);
         assert_eq!(pr_by_id(&again, "11").commit_count, 2);
@@ -5604,16 +5271,7 @@ pub(super) mod tests {
             "closedAt": "2026-01-20T10:00:00Z", "baseRefName": "main"
         }]);
         let github = fake_github_without_commit_calls(serde_json::json!([]), closed);
-        let data = collect_cached_with(
-            &Cache::new(),
-            &github,
-            repo.path(),
-            SINCE,
-            Some(UNTIL),
-            None,
-            false,
-        )
-        .unwrap();
+        let data = collect_once(&github, repo.path(), SINCE, Some(UNTIL), None).unwrap();
 
         assert!(data.gh_available, "{:?}", data.gh_note);
         let eleven = pr_by_id(&data, "11");
@@ -5680,16 +5338,7 @@ pub(super) mod tests {
             serde_json::json!([]),
             serde_json::json!([]),
         );
-        let data = collect_cached_with(
-            &Cache::new(),
-            &github,
-            repo.path(),
-            SINCE,
-            Some(UNTIL),
-            None,
-            false,
-        )
-        .unwrap();
+        let data = collect_once(&github, repo.path(), SINCE, Some(UNTIL), None).unwrap();
         assert!(data.gh_available, "{:?}", data.gh_note);
         assert_eq!(pr_by_id(&data, "7").commit_count, 1);
         assert_eq!(pr_by_id(&data, "8").commit_count, 3);

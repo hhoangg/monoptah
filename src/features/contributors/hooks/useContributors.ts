@@ -6,12 +6,18 @@ import {
   useRef,
   useState,
 } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
-  collectRaw,
+  cancelSync as cancelSyncJobs,
+  clearSynced,
   gitUser,
   listBranches,
+  loadStored,
   readConfig,
   readMailmap,
+  startSync as queueSync,
+  syncEstimate,
+  syncStatus,
   writeConfig,
 } from "../model/api";
 import type { ContributorsBranches, GitUser } from "../model/api";
@@ -39,7 +45,15 @@ import {
   writeMerge,
   writePeriodPick,
 } from "../model/prefs";
-import type { ContributorsConfig, RawData } from "../model/types";
+import { SYNC_EVENT, isLive } from "../model/syncEvents";
+import type { SyncEvent } from "../model/syncEvents";
+import type {
+  ContributorsConfig,
+  LoadResponse,
+  RawData,
+  SyncEstimate,
+  SyncMode,
+} from "../model/types";
 
 type Meta = {
   /** What the page shows; moves ahead of `confirmed` while a save is in flight. */
@@ -70,15 +84,18 @@ const AUTO_RELOAD_MS = 15_000;
 // first and a revalidation refreshes it in the background. Both caches are
 // small LRUs, because the window moves daily and every period and branch adds one.
 const metaCache = new Map<string, Meta>();
-const rawCache = new Map<string, RawData>();
-const inFlight = new Map<string, Promise<RawData>>();
+const loadCache = new Map<string, LoadResponse>();
+const inFlight = new Map<string, Promise<LoadResponse>>();
+/** Auto top-ups already started, per period and branch head: one per head. */
+const toppedUp = new Set<string>();
 const saves = new Map<string, SaveState>();
 /** One read of a project's files at a time, so a remount does not repeat it. */
 const metaInFlight = new Map<
   string,
   { epoch: number; request: Promise<Meta> }
 >();
-const forcedAt = new Map<string, number>();
+/** Sequence number of the latest read started for a key. */
+const startedAt = new Map<string, number>();
 let requestSeq = 0;
 
 function remember<V>(cache: Map<string, V>, key: string, value: V) {
@@ -112,16 +129,17 @@ function saveState(cwd: string): SaveState {
 /** Test hook: forget everything cached. */
 export function resetContributorsCache() {
   metaCache.clear();
-  rawCache.clear();
+  loadCache.clear();
   inFlight.clear();
   metaInFlight.clear();
   saves.clear();
-  forcedAt.clear();
+  startedAt.clear();
+  toppedUp.clear();
 }
 
 /** Test hook: how many entries the caches hold. */
 export function contributorsCacheSize() {
-  return { raw: rawCache.size, meta: metaCache.size };
+  return { loads: loadCache.size, meta: metaCache.size };
 }
 
 const NO_BRANCHES: ContributorsBranches = { current: "", branches: [] };
@@ -168,40 +186,55 @@ function loadMetaShared(
   return request;
 }
 
-function loadRaw(
+/**
+ * Reads one period of the sync store. A plain read joins one already running;
+ * a fresh one (a forced refresh, or the reload after a sync ended) never does,
+ * because the running read may have looked at the store before the change.
+ * Whichever read started last decides what is cached.
+ */
+function loadPeriod(
   cwd: string,
   branch: string | undefined,
   since: string,
+  until: string,
   key: string,
-  force: boolean,
-): Promise<RawData> {
-  const joined =
-    inFlight.get(`${key}|force`) ?? (force ? undefined : inFlight.get(key));
+  fresh: boolean,
+): Promise<LoadResponse> {
+  const joined = fresh ? undefined : inFlight.get(key);
   if (joined) return joined;
-  const slot = force ? `${key}|force` : key;
   const seq = (requestSeq += 1);
-  if (force) forcedAt.set(key, seq);
-  const request = collectRaw(cwd, { since, branch, force })
-    .then((fresh) => {
-      const previous = rawCache.get(key);
-      // A forced refresh started after this answer was asked for: its data is
-      // newer (gh may have changed), so this one must not replace it.
-      if (!force && (forcedAt.get(key) ?? 0) > seq) {
-        if (!previous) remember(rawCache, key, fresh);
-        return rawCache.get(key) ?? fresh;
+  startedAt.set(key, seq);
+  const request = loadStored(cwd, { since, until, branch })
+    .then((answer) => {
+      const previous = loadCache.get(key);
+      // A read started after this one was asked for: its data is newer.
+      if ((startedAt.get(key) ?? 0) > seq) {
+        if (!previous) remember(loadCache, key, answer);
+        return loadCache.get(key) ?? answer;
       }
-      // Same HEAD and same sizes: keep the object so a focus revalidation does
-      // not rescore. A forced refresh always takes the new data.
-      const raw =
-        !force && previous && sameData(previous, fresh) ? previous : fresh;
-      remember(rawCache, key, raw);
-      return raw;
+      // Same state of the store: keep the object so a focus revalidation does
+      // not rescore.
+      const next = previous && sameLoad(previous, answer) ? previous : answer;
+      remember(loadCache, key, next);
+      return next;
     })
     .finally(() => {
-      if (inFlight.get(slot) === request) inFlight.delete(slot);
+      if (inFlight.get(key) === request) inFlight.delete(key);
     });
-  inFlight.set(slot, request);
+  inFlight.set(key, request);
   return request;
+}
+
+function sameLoad(a: LoadResponse, b: LoadResponse): boolean {
+  return (
+    a.covered === b.covered &&
+    a.missingCommits === b.missingCommits &&
+    a.syncedAt === b.syncedAt &&
+    a.coverageHead === b.coverageHead &&
+    a.head === b.head &&
+    a.ghState === b.ghState &&
+    sameData(a.raw, b.raw)
+  );
 }
 
 function sameData(a: RawData, b: RawData): boolean {
@@ -214,7 +247,8 @@ function sameData(a: RawData, b: RawData): boolean {
     a.truncated === b.truncated &&
     a.commits.length === b.commits.length &&
     a.prs.length === b.prs.length &&
-    a.reviews.length === b.reviews.length
+    a.reviews.length === b.reviews.length &&
+    a.survival.length === b.survival.length
   );
 }
 
@@ -223,6 +257,12 @@ const sameJson = (a: unknown, b: unknown) =>
 
 /** Whole seconds, so the cache key does not depend on milliseconds. */
 const isoSeconds = (date: Date) => date.toISOString().replace(/\.\d{3}Z$/, "Z");
+
+const epochSeconds = (date: Date) => Math.floor(date.getTime() / 1000);
+
+/** Identity of a job as the page sees it: project, branch and period window. */
+const jobKey = (root: string, branch: string, from: number, to: number) =>
+  `${root}\u0000${branch}\u0000${from}\u0000${to}`;
 
 const sameDay = (a: Date, b: Date) =>
   a.getFullYear() === b.getFullYear() &&
@@ -268,19 +308,29 @@ export function useContributors(cwd: string) {
   const [failures, setFailures] = useState<Record<string, string>>({});
   const [saveError, setSaveError] = useState<string | undefined>();
   const [refreshing, setRefreshing] = useState(false);
+  // The latest event of every job of this project, by `jobKey`. A queued
+  // entry made at the click stands in until the first real event arrives.
+  const [jobs, setJobs] = useState<Record<string, SyncEvent>>({});
+  const [estimate, setEstimate] = useState<{
+    key: string;
+    value: SyncEstimate | null;
+  } | null>(null);
+  const [actionError, setActionError] = useState<string | undefined>();
   // Caches live outside React; this re-renders after they change.
   const [, bump] = useReducer((n: number) => n + 1, 0);
 
   const branch = picked.cwd === cwd ? picked.branch : undefined;
   // A pick without an id follows the current period as the days pass.
   const period = useMemo(() => resolvePick(pick, now), [pick, now]);
-  // The end stays open: survival only samples PRs old enough relative to the
-  // end, and a PR merged after a past period still credits that period's days.
+  // The store is read from the start of the previous period (rank movement and
+  // deltas compare with it) to the end of the selected one; Rust clips an end
+  // in the future to now.
   const since = useMemo(
     () => isoSeconds(syncWindow(period, now).from),
     [period, now],
   );
-  const key = `${cwd}\u0000${branch ?? ""}\u0000${since}`;
+  const until = useMemo(() => isoSeconds(period.end), [period]);
+  const key = `${cwd}\u0000${branch ?? ""}\u0000${since}\u0000${until}`;
   const metaScope = `meta\u0000${cwd}`;
 
   const running = useRef(0);
@@ -303,7 +353,7 @@ export function useContributors(cwd: string) {
   }, []);
 
   const load = useCallback(
-    async (force: boolean) => {
+    async (force: boolean, fresh = force) => {
       if (!cwd) return;
       running.current += 1;
       setRefreshing(true);
@@ -348,7 +398,7 @@ export function useContributors(cwd: string) {
           fail(metaScope, errorText(error));
         },
       );
-      const raw = loadRaw(cwd, branch, since, key, force).then(
+      const raw = loadPeriod(cwd, branch, since, until, key, fresh).then(
         () => {
           clearFailure(key);
         },
@@ -361,12 +411,53 @@ export function useContributors(cwd: string) {
       if (running.current === 0) setRefreshing(false);
       bump();
     },
-    [cwd, branch, since, key, metaScope, fail, clearFailure],
+    [cwd, branch, since, until, key, metaScope, fail, clearFailure],
   );
 
   useEffect(() => {
     void load(false);
   }, [load]);
+
+  // Job events and the jobs already running when the page opened.
+  const cwdRef = useRef(cwd);
+  cwdRef.current = cwd;
+  const reloadRef = useRef<() => void>(() => undefined);
+  reloadRef.current = () => void load(false, true);
+  useEffect(() => {
+    if (!cwd) return;
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    const apply = (event: SyncEvent, seeding: boolean) => {
+      if (event.root !== cwdRef.current) return;
+      const at = jobKey(event.root, event.branch, event.from, event.to);
+      setJobs((all) => {
+        // A seed is older than any event already received.
+        if (seeding && at in all) return all;
+        if (isLive(event) || event.state === "error") {
+          return { ...all, [at]: event };
+        }
+        const { [at]: _gone, ...rest } = all;
+        return rest;
+      });
+      // What the job stored is what the page shows, so read it again.
+      if (!seeding && !isLive(event)) reloadRef.current();
+    };
+    listen<SyncEvent>(SYNC_EVENT, (e) => apply(e.payload, false))
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else stop = unlisten;
+      })
+      .catch(() => undefined);
+    syncStatus()
+      .then((running) => {
+        if (!disposed) running.forEach((event) => apply(event, true));
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      stop?.();
+    };
+  }, [cwd]);
 
   useEffect(() => {
     if (!cwd) return;
@@ -408,19 +499,100 @@ export function useContributors(cwd: string) {
   }, [now]);
 
   const meta = recall(metaCache, cwd);
-  const current = recall(rawCache, key);
+  const loaded = recall(loadCache, key);
+  // Only a fully synced period has numbers; a gap shows the sync state instead.
+  const current = loaded?.covered ? loaded.raw : undefined;
   // While a new period or branch loads, keep the last data of this project on
   // screen (marked stale) instead of blanking the page.
   const previouslyShown =
     lastShown.current?.cwd === cwd ? lastShown.current : undefined;
-  const shown = current ?? previouslyShown?.raw;
+  const shown = loaded ? current : previouslyShown?.raw;
   // The old data may not reach the newly picked period, so the period shown
   // stays with the data until the new request answers.
-  const shownPeriod = current ? period : (previouslyShown?.period ?? period);
+  const shownPeriod = loaded ? period : (previouslyShown?.period ?? period);
   if (shown) lastShown.current = { cwd, raw: shown, period: shownPeriod };
   const failed = failures[key] ?? failures[metaScope];
   const status: "loading" | "ready" | "error" =
-    meta && shown ? "ready" : failed ? "error" : "loading";
+    meta && (loaded || shown) ? "ready" : failed ? "error" : "loading";
+
+  const windowFrom = epochSeconds(syncWindow(period, now).from);
+  const windowTo = epochSeconds(period.end);
+  const branchName = loaded?.raw.branch ?? "";
+  const thisJob = loaded
+    ? jobs[jobKey(cwd, branchName, windowFrom, windowTo)]
+    : undefined;
+  const liveJob = thisJob && isLive(thisJob) ? thisJob : null;
+  const jobError =
+    thisJob?.state === "error"
+      ? (thisJob.error ?? "The sync failed.")
+      : undefined;
+  const notSynced = !!loaded && !loaded.covered;
+
+  // What is left to read, for a period the store does not have in full.
+  useEffect(() => {
+    if (!cwd || !loaded || loaded.covered || liveJob) return;
+    let stale = false;
+    syncEstimate(cwd, { from: since, to: until, branch }).then(
+      (value) => {
+        if (!stale) setEstimate({ key, value });
+      },
+      () => {
+        if (!stale) setEstimate({ key, value: null });
+      },
+    );
+    return () => {
+      stale = true;
+    };
+    // `loaded` is the trigger: a changed store means a changed estimate.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cwd, key, loaded, liveJob === null]);
+
+  const begin = useCallback(
+    (mode: SyncMode, oldHead?: string) => {
+      if (!cwd || !loaded) return Promise.resolve();
+      const at = jobKey(cwd, loaded.raw.branch, windowFrom, windowTo);
+      const base: SyncEvent = {
+        repoKey: "",
+        project: "",
+        root: cwd,
+        branch: loaded.raw.branch,
+        from: windowFrom,
+        to: windowTo,
+        step: "counting",
+        done: 0,
+        total: 0,
+        percent: 0,
+        state: "queued",
+        error: null,
+      };
+      setActionError(undefined);
+      setJobs((all) => ({ ...all, [at]: base }));
+      return queueSync(cwd, {
+        from: since,
+        to: until,
+        branch,
+        mode,
+        oldHead,
+      }).then(undefined, (error) => {
+        setJobs((all) => ({
+          ...all,
+          [at]: { ...base, state: "error", error: errorText(error) },
+        }));
+      });
+    },
+    [cwd, loaded, windowFrom, windowTo, since, until, branch],
+  );
+
+  // A synced period whose branch moved since the sync is topped up once per
+  // head. A gap at the same head is not a top-up: the user syncs it again.
+  useEffect(() => {
+    if (!cwd || !loaded?.covered || !loaded.coverageHead) return;
+    if (loaded.coverageHead === loaded.head || liveJob) return;
+    const once = `${key}\u0000${loaded.head}`;
+    if (toppedUp.has(once)) return;
+    toppedUp.add(once);
+    void begin("topup", loaded.coverageHead);
+  }, [cwd, key, loaded, liveJob, begin]);
 
   const select = useCallback((next: PeriodPick) => {
     writePeriodPick(next);
@@ -451,6 +623,40 @@ export function useContributors(cwd: string) {
     [cwd],
   );
   const refresh = useCallback((force: boolean) => load(force), [load]);
+
+  const startFullSync = useCallback(() => begin("full"), [begin]);
+  const retryGithub = useCallback(() => begin("github"), [begin]);
+  const cancelSync = useCallback(async () => {
+    if (!cwd) return;
+    try {
+      await cancelSyncJobs(cwd);
+    } catch (error) {
+      setActionError(errorText(error));
+    }
+  }, [cwd]);
+  const clearSyncedData = useCallback(async () => {
+    if (!cwd) return;
+    setActionError(undefined);
+    try {
+      await clearSynced(cwd);
+    } catch (error) {
+      setActionError(errorText(error));
+      return;
+    }
+    // Everything this project had in the page is gone with the store.
+    const mine = `${cwd}\u0000`;
+    for (const k of [...loadCache.keys()]) {
+      if (k.startsWith(mine)) loadCache.delete(k);
+    }
+    for (const k of [...toppedUp]) if (k.startsWith(mine)) toppedUp.delete(k);
+    setJobs((all) =>
+      Object.fromEntries(
+        Object.entries(all).filter(([k]) => !k.startsWith(mine)),
+      ),
+    );
+    lastShown.current = null;
+    await load(true);
+  }, [cwd, load]);
 
   const saveConfig = useCallback(
     async (next: ContributorsConfig) => {
@@ -513,7 +719,33 @@ export function useContributors(cwd: string) {
     error: failed,
     refreshing,
     /** The data on screen is for the previous period or branch while the new one loads. */
-    stale: !current && !!shown,
+    stale: !loaded && !!shown,
+    /** What the sync store knows about the selected period. */
+    sync: {
+      state: !loaded
+        ? ("loading" as const)
+        : loaded.covered
+          ? ("synced" as const)
+          : ("notSynced" as const),
+      /** What is left to read; only for `notSynced`. */
+      estimate: notSynced && estimate?.key === key ? estimate.value : null,
+      /** Epoch seconds of the last sync of the period. */
+      syncedAt: loaded?.syncedAt ?? null,
+      /** The data is shown but GitHub's part is missing or partial. */
+      ghIncomplete:
+        !!loaded?.covered &&
+        (loaded.ghState === "partial" || loaded.ghState === "unavailable"),
+      /** The queued or running job of this period, or null. */
+      job: liveJob,
+      jobError,
+      actionError,
+    },
+    /** The clock the page works on; moves with the calendar. */
+    now,
+    startSync: startFullSync,
+    cancelSync,
+    retryGithub,
+    clearSyncedData,
     raw: shown,
     model,
     config,

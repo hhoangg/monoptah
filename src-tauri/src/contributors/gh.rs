@@ -1535,6 +1535,8 @@ pub(super) struct Outcome {
     pub available: bool,
     pub note: Option<String>,
     pub reviews: Vec<RawReview>,
+    /// Read only by the one-shot collector the sync tests compare against.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub truncated: bool,
 }
 
@@ -1674,10 +1676,12 @@ pub(super) struct Request<'a> {
 /// failure, or when the budget runs out before the merged PR list is loaded,
 /// `derived` is left as the git fallback and the outcome says why. When it runs
 /// out later, what was loaded is overlaid and the outcome is cut short.
+#[cfg(test)]
 pub(super) fn enrich(request: &Request, derived: &mut Derived) -> Outcome {
     enrich_within(request, derived, GH_BUDGET)
 }
 
+#[cfg(test)]
 fn enrich_within(request: &Request, derived: &mut Derived, total: Duration) -> Outcome {
     let Request { gh, root, .. } = *request;
     let budget = Budget::new(total);

@@ -7,19 +7,34 @@ vi.mock("../model/api", () => ({
   readConfig: vi.fn(),
   readMailmap: vi.fn(),
   writeConfig: vi.fn(),
-  collectRaw: vi.fn(),
+  loadStored: vi.fn(),
+  syncEstimate: vi.fn(),
+  startSync: vi.fn(),
+  cancelSync: vi.fn(),
+  syncStatus: vi.fn(),
+  clearSynced: vi.fn(),
   listBranches: vi.fn(),
   gitUser: vi.fn(),
 }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
+import { listen } from "@tauri-apps/api/event";
 import {
-  collectRaw,
+  cancelSync,
+  clearSynced,
   gitUser,
   listBranches,
+  loadStored,
   readConfig,
   readMailmap,
+  startSync,
+  syncEstimate,
+  syncStatus,
   writeConfig,
 } from "../model/api";
+import { SYNC_EVENT } from "../model/syncEvents";
+import type { SyncEvent } from "../model/syncEvents";
+import type { LoadResponse } from "../model/types";
 import { DEFAULT_CONFIG, serializeConfig } from "../model/config";
 import { RANGE_KEY } from "../model/prefs";
 import { currentPeriod, previousPeriod, syncWindow } from "../model/period";
@@ -86,6 +101,61 @@ const rawFixture = () =>
     ],
   });
 
+const NOW_SECS = () => Math.floor(Date.now() / 1000);
+
+/** A period the store has fully synced, at the same head as the branch. */
+const loadFixture = (over: Partial<LoadResponse> = {}): LoadResponse => {
+  const raw = over.raw ?? rawFixture();
+  return {
+    raw,
+    covered: true,
+    missingCommits: 0,
+    syncedAt: NOW_SECS() - 300,
+    coverageHead: raw.head,
+    head: raw.head,
+    ghState: "complete",
+    ...over,
+  };
+};
+
+/** A period the store has nothing (or not everything) for. */
+const unsyncedFixture = (over: Partial<LoadResponse> = {}) =>
+  loadFixture({
+    raw: makeRaw(),
+    covered: false,
+    missingCommits: 40,
+    syncedAt: null,
+    coverageHead: null,
+    ghState: null,
+    ...over,
+  });
+
+const ESTIMATE = { commits: 40, storedCommits: 0, firstParent: 30, prs: 9 };
+
+// The mocked `listen` keeps every handler so a test can push events.
+const handlers: ((e: { payload: SyncEvent }) => void)[] = [];
+const secs = (date: Date) => Math.floor(date.getTime() / 1000);
+const windowOf = (p: Period) => ({
+  from: secs(syncWindow(p, new Date()).from),
+  to: secs(p.end),
+});
+const syncEvent = (cwd: string, over: Partial<SyncEvent> = {}): SyncEvent => ({
+  repoKey: "/repo/.git",
+  project: "repo",
+  root: cwd,
+  branch: "main",
+  ...windowOf(currentPeriod("7d", new Date())),
+  step: "commits",
+  done: 0,
+  total: 0,
+  percent: 0,
+  state: "running",
+  error: null,
+  ...over,
+});
+const emit = (event: SyncEvent) =>
+  act(async () => handlers.forEach((handler) => handler({ payload: event })));
+
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   localStorage.clear();
@@ -104,7 +174,23 @@ beforeEach(() => {
     name: "Ana",
     email: "ana@example.com",
   });
-  vi.mocked(collectRaw).mockImplementation(async () => rawFixture());
+  vi.mocked(loadStored).mockImplementation(async () => loadFixture());
+  vi.mocked(syncEstimate).mockResolvedValue(ESTIMATE);
+  vi.mocked(startSync).mockResolvedValue(undefined);
+  vi.mocked(cancelSync).mockResolvedValue(undefined);
+  vi.mocked(clearSynced).mockResolvedValue(undefined);
+  vi.mocked(syncStatus).mockResolvedValue([]);
+  handlers.length = 0;
+  vi.mocked(listen).mockImplementation((async (
+    _event: string,
+    handler: (e: { payload: SyncEvent }) => void,
+  ) => {
+    handlers.push(handler);
+    return () => {
+      const at = handlers.indexOf(handler);
+      if (at >= 0) handlers.splice(at, 1);
+    };
+  }) as unknown as typeof listen);
 });
 
 afterEach(async () => {
@@ -116,13 +202,13 @@ afterEach(async () => {
 
 describe("useContributors", () => {
   it("goes from loading to ready with raw data, branches and a model", async () => {
-    const gate = deferred<ReturnType<typeof rawFixture>>();
-    vi.mocked(collectRaw).mockReturnValueOnce(gate.promise);
+    const gate = deferred<LoadResponse>();
+    vi.mocked(loadStored).mockReturnValueOnce(gate.promise);
     await mount(nextCwd());
     expect(api.status).toBe("loading");
     expect(api.model).toBeUndefined();
 
-    await act(async () => gate.resolve(rawFixture()));
+    await act(async () => gate.resolve(loadFixture()));
     expect(api.status).toBe("ready");
     expect(api.raw?.commits).toHaveLength(1);
     expect(api.branches).toEqual(["main", "dev"]);
@@ -132,45 +218,43 @@ describe("useContributors", () => {
     expect(api.config).toEqual(DEFAULT_CONFIG);
   });
 
-  it("collects the default 7d period from the start of the previous 7 days, with the end open", async () => {
+  it("loads the default 7d period from the start of the previous 7 days to the period end", async () => {
     await mount(nextCwd());
-    const args = vi.mocked(collectRaw).mock.calls[0][1];
-    const window = syncWindow(currentPeriod("7d", new Date()), new Date());
+    const args = vi.mocked(loadStored).mock.calls[0][1];
+    const period = currentPeriod("7d", new Date());
+    const window = syncWindow(period, new Date());
     expect(args.since).toBe(isoSeconds(window.from));
-    expect(args.until).toBeUndefined();
-    expect(args.force).toBe(false);
+    expect(args.until).toBe(isoSeconds(period.end));
     expect(args.branch).toBeUndefined();
     expect(api.period.kind).toBe("7d");
     expect(api.model?.period.id).toBe("7d");
   });
 
-  it("collects a past month from the start of the month before it, with the end open", async () => {
+  it("loads a past month from the start of the month before it to its end", async () => {
     await mount(nextCwd());
     await selectMonthBack(3);
-    const args = vi.mocked(collectRaw).mock.calls.at(-1)![1];
+    const args = vi.mocked(loadStored).mock.calls.at(-1)![1];
     expect(args.since).toBe(isoSeconds(monthBack(4).start));
-    // A PR merged after the period still credits its days, and survival is
-    // measured against now, so nothing newer may be cut off.
-    expect(args.until).toBeUndefined();
+    expect(args.until).toBe(isoSeconds(MONTH_A.end));
     expect(api.model?.period.id).toBe(MONTH_A.id);
   });
 
-  it("collects the current month from the start of the previous one, with the end open", async () => {
+  it("loads the current month from the start of the previous one to its end", async () => {
     await mount(nextCwd());
     await act(async () => api.setKind("month"));
-    const args = vi.mocked(collectRaw).mock.calls.at(-1)![1];
-    expect(args.until).toBeUndefined();
+    const args = vi.mocked(loadStored).mock.calls.at(-1)![1];
+    expect(args.until).toBe(isoSeconds(monthBack(0).end));
     expect(args.since).toBe(isoSeconds(monthBack(1).start));
   });
 
-  it("collects again when the period changes, and not when it does not", async () => {
+  it("loads again when the period changes, and not when it does not", async () => {
     await mount(nextCwd());
     await act(async () => api.setKind("month"));
-    const base = vi.mocked(collectRaw).mock.calls.length;
+    const base = vi.mocked(loadStored).mock.calls.length;
     await act(async () => api.setKind("month"));
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(base);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(base);
     await act(async () => api.goPrevious());
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(base + 1);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(base + 1);
   });
 
   it("restores a saved period, and a saved removed range falls back to 7d", async () => {
@@ -199,17 +283,17 @@ describe("useContributors", () => {
     await act(async () => root.unmount());
     root = createRoot(container);
 
-    const gate = deferred<ReturnType<typeof rawFixture>>();
-    vi.mocked(collectRaw).mockReturnValueOnce(gate.promise);
+    const gate = deferred<LoadResponse>();
+    vi.mocked(loadStored).mockReturnValueOnce(gate.promise);
     await mount(cwd);
     expect(api.status).toBe("ready");
     expect(api.refreshing).toBe(true);
-    await act(async () => gate.resolve(rawFixture()));
+    await act(async () => gate.resolve(loadFixture()));
     expect(api.refreshing).toBe(false);
   });
 
   it("surfaces a load failure and recovers on a forced retry", async () => {
-    vi.mocked(collectRaw).mockRejectedValueOnce("git exploded");
+    vi.mocked(loadStored).mockRejectedValueOnce("git exploded");
     await mount(nextCwd());
     expect(api.status).toBe("error");
     expect(api.error).toBe("git exploded");
@@ -217,16 +301,16 @@ describe("useContributors", () => {
     await act(async () => api.refresh(true));
     expect(api.status).toBe("ready");
     expect(api.error).toBeUndefined();
-    expect(vi.mocked(collectRaw).mock.calls.at(-1)?.[1].force).toBe(true);
+    expect(vi.mocked(loadStored)).toHaveBeenCalledTimes(2);
   });
 
   it("drops the old error at once when retrying and shows loading until the answer", async () => {
-    vi.mocked(collectRaw).mockRejectedValueOnce("git exploded");
+    vi.mocked(loadStored).mockRejectedValueOnce("git exploded");
     await mount(nextCwd());
     expect(api.status).toBe("error");
 
-    const gate = deferred<ReturnType<typeof rawFixture>>();
-    vi.mocked(collectRaw).mockReturnValueOnce(gate.promise);
+    const gate = deferred<LoadResponse>();
+    vi.mocked(loadStored).mockReturnValueOnce(gate.promise);
     let retry!: Promise<void>;
     await act(async () => {
       retry = api.refresh(true);
@@ -236,7 +320,7 @@ describe("useContributors", () => {
     expect(api.refreshing).toBe(true);
 
     await act(async () => {
-      gate.resolve(rawFixture());
+      gate.resolve(loadFixture());
       await retry;
     });
     expect(api.status).toBe("ready");
@@ -244,18 +328,18 @@ describe("useContributors", () => {
 
   it("drops a refresh failure banner at once when refreshing again", async () => {
     await mount(nextCwd());
-    vi.mocked(collectRaw).mockRejectedValueOnce("offline");
+    vi.mocked(loadStored).mockRejectedValueOnce("offline");
     await act(async () => api.refresh(true));
     expect(api.status).toBe("ready");
     expect(api.error).toBe("offline");
 
-    const gate = deferred<ReturnType<typeof rawFixture>>();
-    vi.mocked(collectRaw).mockReturnValueOnce(gate.promise);
+    const gate = deferred<LoadResponse>();
+    vi.mocked(loadStored).mockReturnValueOnce(gate.promise);
     await act(async () => {
       void api.refresh(true);
     });
     expect(api.error).toBeUndefined();
-    await act(async () => gate.resolve(rawFixture()));
+    await act(async () => gate.resolve(loadFixture()));
   });
 
   it("reads the project files once even when the mount effect runs twice (StrictMode)", async () => {
@@ -273,7 +357,7 @@ describe("useContributors", () => {
     expect(readMailmap).toHaveBeenCalledTimes(1);
     expect(listBranches).toHaveBeenCalledTimes(1);
     expect(gitUser).toHaveBeenCalledTimes(1);
-    expect(collectRaw).toHaveBeenCalledTimes(1);
+    expect(loadStored).toHaveBeenCalledTimes(1);
   });
 
   it("a forced reload reads the files again instead of joining a read in flight", async () => {
@@ -439,20 +523,19 @@ describe("useContributors", () => {
     expect(api.config.weights).toMatchObject({ care: 2, review: 4 });
   });
 
-  it("forces a refresh through to Rust", async () => {
+  it("reads the store again on a forced refresh", async () => {
     await mount(nextCwd());
     await act(async () => api.refresh(true));
-    expect(vi.mocked(collectRaw).mock.calls.at(-1)?.[1].force).toBe(true);
+    expect(vi.mocked(loadStored)).toHaveBeenCalledTimes(2);
   });
 
-  it("revalidates on window focus without forcing", async () => {
+  it("revalidates on window focus", async () => {
     await mount(nextCwd());
-    const before = vi.mocked(collectRaw).mock.calls.length;
+    const before = vi.mocked(loadStored).mock.calls.length;
     await act(async () => {
       window.dispatchEvent(new Event("focus"));
     });
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(before + 1);
-    expect(vi.mocked(collectRaw).mock.calls.at(-1)?.[1].force).toBe(false);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(before + 1);
   });
 
   it("keeps the same raw object when a revalidation returns the same data", async () => {
@@ -467,7 +550,7 @@ describe("useContributors", () => {
   it("collects the chosen branch and keeps it per project", async () => {
     await mount(nextCwd());
     await act(async () => api.setBranch("dev"));
-    expect(vi.mocked(collectRaw).mock.calls.at(-1)?.[1].branch).toBe("dev");
+    expect(vi.mocked(loadStored).mock.calls.at(-1)?.[1].branch).toBe("dev");
     expect(api.branch).toBe("dev");
   });
 
@@ -549,9 +632,9 @@ describe("useContributors races", () => {
 
   it("ignores a late failure of an abandoned request", async () => {
     localStorage.setItem(RANGE_KEY, saved(MONTH_A));
-    const a = deferred<ReturnType<typeof rawFixture>>();
-    const b = deferred<ReturnType<typeof rawFixture>>();
-    vi.mocked(collectRaw)
+    const a = deferred<LoadResponse>();
+    const b = deferred<LoadResponse>();
+    vi.mocked(loadStored)
       .mockReset()
       .mockReturnValueOnce(a.promise)
       .mockReturnValueOnce(b.promise);
@@ -567,15 +650,15 @@ describe("useContributors races", () => {
 
   it("does not clear the current failure when an abandoned request succeeds", async () => {
     localStorage.setItem(RANGE_KEY, saved(MONTH_A));
-    const a = deferred<ReturnType<typeof rawFixture>>();
-    vi.mocked(collectRaw)
+    const a = deferred<LoadResponse>();
+    vi.mocked(loadStored)
       .mockReset()
       .mockReturnValueOnce(a.promise)
       .mockRejectedValueOnce("B failed");
     await mount(nextCwd());
     await act(async () => api.goPrevious());
     expect(api.error).toBe("B failed");
-    await act(async () => a.resolve(rawFixture()));
+    await act(async () => a.resolve(loadFixture()));
     expect(api.error).toBe("B failed");
     expect(api.status).toBe("error");
   });
@@ -596,40 +679,46 @@ describe("useContributors races", () => {
   });
 
   it("drops an older unforced answer that lands after a forced one", async () => {
-    const first = deferred<ReturnType<typeof rawFixture>>();
-    vi.mocked(collectRaw).mockReset().mockReturnValueOnce(first.promise);
+    const first = deferred<LoadResponse>();
+    vi.mocked(loadStored).mockReset().mockReturnValueOnce(first.promise);
     await mount(nextCwd());
-    const forced = deferred<ReturnType<typeof rawFixture>>();
-    vi.mocked(collectRaw).mockReturnValueOnce(forced.promise);
+    const forced = deferred<LoadResponse>();
+    vi.mocked(loadStored).mockReturnValueOnce(forced.promise);
     await act(async () => {
       void api.refresh(true);
     });
     await act(async () =>
-      forced.resolve({ ...rawFixture(), ghAvailable: true }),
+      forced.resolve(
+        loadFixture({ raw: { ...rawFixture(), ghAvailable: true } }),
+      ),
     );
     await act(async () =>
-      first.resolve({ ...rawFixture(), ghAvailable: false, ghNote: "old" }),
+      first.resolve(
+        loadFixture({
+          raw: { ...rawFixture(), ghAvailable: false, ghNote: "old" },
+        }),
+      ),
     );
     expect(api.raw?.ghAvailable).toBe(true);
   });
 
   it("does not refetch when the current branch is picked explicitly", async () => {
     await mount(nextCwd());
-    const calls = vi.mocked(collectRaw).mock.calls.length;
+    const calls = vi.mocked(loadStored).mock.calls.length;
     await act(async () => api.setBranch("main"));
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(calls);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(calls);
     expect(api.branch).toBe("main");
   });
 
   it("keeps showing the previous data, marked stale, while a new period loads", async () => {
     await mount(nextCwd());
-    const gate = deferred<ReturnType<typeof rawFixture>>();
-    vi.mocked(collectRaw).mockReturnValueOnce(gate.promise);
+    const gate = deferred<LoadResponse>();
+    vi.mocked(loadStored).mockReturnValueOnce(gate.promise);
     await act(async () => api.setKind("month"));
     expect(api.status).toBe("ready");
     expect(api.stale).toBe(true);
     expect(api.model).toBeDefined();
-    await act(async () => gate.resolve(rawFixture()));
+    await act(async () => gate.resolve(loadFixture()));
     expect(api.stale).toBe(false);
   });
 });
@@ -640,22 +729,22 @@ describe("useContributors automatic reloads", () => {
   it("reloads at most once per 15 seconds, and focus plus visibility count once", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(T0);
     await mount(nextCwd());
-    const base = vi.mocked(collectRaw).mock.calls.length;
+    const base = vi.mocked(loadStored).mock.calls.length;
     await act(async () => {
       window.dispatchEvent(new Event("focus"));
       document.dispatchEvent(new Event("visibilitychange"));
     });
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(base + 1);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(base + 1);
     clock.mockReturnValue(T0 + 5_000);
     await act(async () => {
       window.dispatchEvent(new Event("focus"));
     });
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(base + 1);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(base + 1);
     clock.mockReturnValue(T0 + 16_000);
     await act(async () => {
       window.dispatchEvent(new Event("focus"));
     });
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(base + 2);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(base + 2);
     clock.mockRestore();
   });
 
@@ -664,9 +753,9 @@ describe("useContributors automatic reloads", () => {
     await act(async () => {
       window.dispatchEvent(new Event("focus"));
     });
-    const calls = vi.mocked(collectRaw).mock.calls.length;
+    const calls = vi.mocked(loadStored).mock.calls.length;
     await act(async () => api.refresh(true));
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(calls + 1);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(calls + 1);
   });
 
   it("moves the 7d period to the new day after midnight without a refocus", async () => {
@@ -690,10 +779,10 @@ describe("useContributors period", () => {
     await mount(nextCwd());
     expect(api.period.kind).toBe("7d");
     expect(api.hasNext).toBe(false);
-    const before = vi.mocked(collectRaw).mock.calls.length;
+    const before = vi.mocked(loadStored).mock.calls.length;
     await act(async () => api.goPrevious());
     await act(async () => api.goNext());
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(before);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(before);
     expect(api.period.kind).toBe("7d");
   });
 
@@ -731,22 +820,22 @@ describe("useContributors period", () => {
   it("does not step past the current period", async () => {
     await mount(nextCwd());
     await act(async () => api.setKind("year"));
-    const before = vi.mocked(collectRaw).mock.calls.length;
+    const before = vi.mocked(loadStored).mock.calls.length;
     await act(async () => api.goNext());
     expect(api.period.id).toBe(currentPeriod("year", new Date()).id);
-    expect(vi.mocked(collectRaw).mock.calls.length).toBe(before);
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(before);
   });
 
   it("keeps showing the old period, marked stale, while the new one loads", async () => {
     await mount(nextCwd());
     await act(async () => api.setKind("month"));
-    const gate = deferred<ReturnType<typeof rawFixture>>();
-    vi.mocked(collectRaw).mockReturnValueOnce(gate.promise);
+    const gate = deferred<LoadResponse>();
+    vi.mocked(loadStored).mockReturnValueOnce(gate.promise);
     await act(async () => api.goPrevious());
     expect(api.period.id).toBe(monthBack(1).id);
     expect(api.stale).toBe(true);
     expect(api.model?.period.id).toBe(monthBack(0).id);
-    await act(async () => gate.resolve(rawFixture()));
+    await act(async () => gate.resolve(loadFixture()));
     expect(api.stale).toBe(false);
     expect(api.model?.period.id).toBe(monthBack(1).id);
   });
@@ -781,8 +870,374 @@ describe("useContributors cache", () => {
   it("keeps only the most recent entries", async () => {
     for (let i = 0; i < 9; i += 1) await mount(nextCwd());
     const size = contributorsCacheSize();
-    expect(size.raw).toBeLessThanOrEqual(6);
+    expect(size.loads).toBeLessThanOrEqual(6);
     expect(size.meta).toBeLessThanOrEqual(6);
-    expect(size.raw).toBeGreaterThan(0);
+    expect(size.loads).toBeGreaterThan(0);
+  });
+});
+
+describe("useContributors sync store states", () => {
+  it("a never synced period only loads and estimates, and starts nothing", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(nextCwd());
+    expect(api.status).toBe("ready");
+    expect(api.sync.state).toBe("notSynced");
+    expect(api.sync.estimate).toEqual(ESTIMATE);
+    // Cheap read of the store, one estimate, and nothing else.
+    expect(loadStored).toHaveBeenCalledTimes(1);
+    expect(syncEstimate).toHaveBeenCalledTimes(1);
+    expect(startSync).not.toHaveBeenCalled();
+    expect(cancelSync).not.toHaveBeenCalled();
+    // Numbers are never shown without a sync.
+    expect(api.model).toBeUndefined();
+    expect(api.raw).toBeUndefined();
+  });
+
+  it("estimates the window the sync would use", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(nextCwd());
+    const period = currentPeriod("7d", new Date());
+    expect(vi.mocked(syncEstimate).mock.calls[0][1]).toEqual({
+      from: isoSeconds(syncWindow(period, new Date()).from),
+      to: isoSeconds(period.end),
+      branch: undefined,
+    });
+  });
+
+  it("an incomplete period shows the estimate of what is left, never partial numbers", async () => {
+    vi.mocked(loadStored).mockResolvedValue(
+      unsyncedFixture({
+        raw: rawFixture(),
+        missingCommits: 12,
+        syncedAt: NOW_SECS() - 60,
+        coverageHead: "abc123",
+      }),
+    );
+    await mount(nextCwd());
+    expect(api.sync.state).toBe("notSynced");
+    expect(api.model).toBeUndefined();
+    expect(api.raw).toBeUndefined();
+    expect(api.sync.estimate).toEqual(ESTIMATE);
+    expect(startSync).not.toHaveBeenCalled();
+  });
+
+  it("a covered period shows its data and the sync time", async () => {
+    const at = NOW_SECS() - 300;
+    vi.mocked(loadStored).mockResolvedValue(loadFixture({ syncedAt: at }));
+    await mount(nextCwd());
+    expect(api.sync.state).toBe("synced");
+    expect(api.sync.syncedAt).toBe(at);
+    expect(api.model).toBeDefined();
+    expect(syncEstimate).not.toHaveBeenCalled();
+    expect(startSync).not.toHaveBeenCalled();
+  });
+
+  it("Sync starts a full job for the period window", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(nextCwd());
+    await act(async () => api.startSync());
+    const period = currentPeriod("7d", new Date());
+    expect(vi.mocked(startSync)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(startSync).mock.calls[0][1]).toEqual({
+      from: isoSeconds(syncWindow(period, new Date()).from),
+      to: isoSeconds(period.end),
+      branch: undefined,
+      mode: "full",
+    });
+  });
+
+  it("progress events of this project update the job and done reloads", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(cwd);
+    await act(async () => api.startSync());
+    expect(api.sync.job?.state).toBe("queued");
+
+    await emit(
+      syncEvent(cwd, { step: "commits", done: 30, total: 120, percent: 12 }),
+    );
+    expect(api.sync.job).toMatchObject({
+      state: "running",
+      step: "commits",
+      done: 30,
+      total: 120,
+      percent: 12,
+    });
+    // Nothing is reloaded while the job runs.
+    expect(loadStored).toHaveBeenCalledTimes(1);
+
+    vi.mocked(loadStored).mockResolvedValue(loadFixture());
+    await emit(syncEvent(cwd, { state: "done", percent: 100 }));
+    expect(loadStored).toHaveBeenCalledTimes(2);
+    expect(api.sync.state).toBe("synced");
+    expect(api.sync.job).toBeNull();
+    expect(api.model).toBeDefined();
+  });
+
+  it("ignores events of other projects and of other periods", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(cwd);
+    await emit(syncEvent("/somewhere/else"));
+    expect(api.sync.job).toBeNull();
+    const month = windowOf(currentPeriod("month", new Date()));
+    await emit(syncEvent(cwd, month));
+    expect(api.sync.job).toBeNull();
+    await emit(syncEvent(cwd, { branch: "dev" }));
+    expect(api.sync.job).toBeNull();
+    await emit(syncEvent(cwd));
+    expect(api.sync.job?.state).toBe("running");
+    expect(loadStored).toHaveBeenCalledTimes(1);
+  });
+
+  it("picks up a job that was already running when the page opened", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    vi.mocked(syncStatus).mockResolvedValue([
+      syncEvent(cwd, { step: "pullRequests", done: 2, total: 9, percent: 55 }),
+      syncEvent("/elsewhere"),
+    ]);
+    await mount(cwd);
+    expect(api.sync.job).toMatchObject({ step: "pullRequests", percent: 55 });
+  });
+
+  it("a failed job shows its error and Sync can be pressed again", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(cwd);
+    await emit(syncEvent(cwd, { state: "error", error: "git exploded" }));
+    expect(api.sync.job).toBeNull();
+    expect(api.sync.jobError).toBe("git exploded");
+    await act(async () => api.startSync());
+    expect(api.sync.jobError).toBeUndefined();
+    expect(api.sync.job?.state).toBe("queued");
+  });
+
+  it("a rejected start is reported as the job error", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    vi.mocked(startSync).mockRejectedValueOnce("Could not start the sync");
+    await mount(nextCwd());
+    await act(async () => api.startSync());
+    expect(api.sync.job).toBeNull();
+    expect(api.sync.jobError).toBe("Could not start the sync");
+  });
+
+  it("a cancelled job reloads what was stored and shows the new estimate", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(cwd);
+    await act(async () => api.startSync());
+    vi.mocked(loadStored).mockResolvedValue(
+      unsyncedFixture({ missingCommits: 15 }),
+    );
+    vi.mocked(syncEstimate).mockResolvedValue({
+      ...ESTIMATE,
+      storedCommits: 25,
+    });
+    await emit(syncEvent(cwd, { state: "cancelled" }));
+    expect(api.sync.state).toBe("notSynced");
+    expect(api.sync.job).toBeNull();
+    expect(api.sync.estimate?.storedCommits).toBe(25);
+  });
+
+  it("cancel asks Rust to stop the jobs of the project", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(cwd);
+    await act(async () => api.cancelSync());
+    expect(cancelSync).toHaveBeenCalledWith(cwd);
+  });
+
+  it("switching period while syncing keeps the job and shows the new period's state", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(cwd);
+    await act(async () => api.startSync());
+    await emit(syncEvent(cwd, { percent: 40 }));
+    expect(api.sync.job?.percent).toBe(40);
+
+    await act(async () => api.setKind("month"));
+    expect(cancelSync).not.toHaveBeenCalled();
+    expect(api.sync.state).toBe("notSynced");
+    expect(api.sync.job).toBeNull();
+
+    // The job of the first period is still known when the page returns to it.
+    await act(async () => api.setKind("7d"));
+    expect(api.sync.job?.percent).toBe(40);
+  });
+
+  it("a second Sync for another period queues instead of replacing the running one", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(cwd);
+    await act(async () => api.startSync());
+    await emit(syncEvent(cwd, { percent: 40 }));
+    await act(async () => api.setKind("month"));
+    await act(async () => api.startSync());
+    expect(api.sync.job?.state).toBe("queued");
+    expect(startSync).toHaveBeenCalledTimes(2);
+    await act(async () => api.setKind("7d"));
+    expect(api.sync.job?.state).toBe("running");
+  });
+
+  it("keeps the data on screen with a job spinner while a re-sync runs", async () => {
+    const cwd = nextCwd();
+    await mount(cwd);
+    await act(async () => api.startSync());
+    expect(vi.mocked(startSync).mock.calls[0][1].mode).toBe("full");
+    expect(api.sync.state).toBe("synced");
+    expect(api.sync.job?.state).toBe("queued");
+    expect(api.model).toBeDefined();
+  });
+});
+
+describe("useContributors top-up", () => {
+  const moved = (over: Partial<LoadResponse> = {}) =>
+    loadFixture({ coverageHead: "old1", head: "new2", ...over });
+
+  it("starts one top-up from the coverage head when the branch head moved", async () => {
+    vi.mocked(loadStored).mockResolvedValue(moved());
+    await mount(nextCwd());
+    expect(startSync).toHaveBeenCalledTimes(1);
+    const period = currentPeriod("7d", new Date());
+    expect(vi.mocked(startSync).mock.calls[0][1]).toEqual({
+      from: isoSeconds(syncWindow(period, new Date()).from),
+      to: isoSeconds(period.end),
+      branch: undefined,
+      mode: "topup",
+      oldHead: "old1",
+    });
+    expect(api.model).toBeDefined();
+    expect(api.sync.job?.state).toBe("queued");
+  });
+
+  it("does not start another one for the same head on a reload or a remount", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(moved());
+    await mount(cwd);
+    await act(async () => api.refresh(true));
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await mount(cwd);
+    expect(startSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts another one when the head moves again and the first one ended", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(moved());
+    await mount(cwd);
+    await emit(syncEvent(cwd, { state: "done", percent: 100 }));
+    vi.mocked(loadStored).mockResolvedValue(moved({ head: "new3" }));
+    await act(async () => api.refresh(true));
+    expect(startSync).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(startSync).mock.calls[1][1].oldHead).toBe("old1");
+  });
+
+  it("does nothing when the coverage head equals the head", async () => {
+    vi.mocked(loadStored).mockResolvedValue(
+      loadFixture({ coverageHead: "same", head: "same" }),
+    );
+    await mount(nextCwd());
+    expect(startSync).not.toHaveBeenCalled();
+  });
+
+  it("does not top up a period that is not covered, even with different heads", async () => {
+    vi.mocked(loadStored).mockResolvedValue(
+      unsyncedFixture({ coverageHead: "old1", head: "new2" }),
+    );
+    await mount(nextCwd());
+    expect(startSync).not.toHaveBeenCalled();
+  });
+
+  it("a covered gap at the same head needs a full sync, not a top-up", async () => {
+    vi.mocked(loadStored).mockResolvedValue(
+      unsyncedFixture({
+        raw: rawFixture(),
+        coverageHead: "same",
+        head: "same",
+        missingCommits: 3,
+      }),
+    );
+    await mount(nextCwd());
+    expect(startSync).not.toHaveBeenCalled();
+    await act(async () => api.startSync());
+    expect(vi.mocked(startSync).mock.calls[0][1].mode).toBe("full");
+  });
+
+  it("reloads when the top-up is done and drops the spinner", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(moved());
+    await mount(cwd);
+    expect(api.sync.job).not.toBeNull();
+    vi.mocked(loadStored).mockResolvedValue(
+      loadFixture({ coverageHead: "new2", head: "new2" }),
+    );
+    await emit(syncEvent(cwd, { state: "done", percent: 100 }));
+    expect(api.sync.job).toBeNull();
+    expect(startSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not top up a remote project (empty cwd)", async () => {
+    vi.mocked(loadStored).mockResolvedValue(moved());
+    await mount("");
+    expect(loadStored).not.toHaveBeenCalled();
+    expect(startSync).not.toHaveBeenCalled();
+  });
+});
+
+describe("useContributors GitHub state and clearing", () => {
+  it.each(["partial", "unavailable"] as const)(
+    "flags %s GitHub data and Retry GitHub starts a github job",
+    async (ghState) => {
+      vi.mocked(loadStored).mockResolvedValue(loadFixture({ ghState }));
+      await mount(nextCwd());
+      expect(api.sync.ghIncomplete).toBe(true);
+      expect(api.model).toBeDefined();
+      await act(async () => api.retryGithub());
+      expect(vi.mocked(startSync).mock.calls[0][1].mode).toBe("github");
+    },
+  );
+
+  it("does not flag complete GitHub data", async () => {
+    await mount(nextCwd());
+    expect(api.sync.ghIncomplete).toBe(false);
+  });
+
+  it("clearing deletes the synced data and shows the empty state after the reload", async () => {
+    const cwd = nextCwd();
+    await mount(cwd);
+    expect(api.sync.state).toBe("synced");
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await act(async () => api.clearSyncedData());
+    expect(clearSynced).toHaveBeenCalledWith(cwd);
+    expect(api.sync.state).toBe("notSynced");
+    expect(api.model).toBeUndefined();
+  });
+
+  it("clearing allows a top-up for the same head again", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(
+      loadFixture({ coverageHead: "old1", head: "new2" }),
+    );
+    await mount(cwd);
+    expect(startSync).toHaveBeenCalledTimes(1);
+    await act(async () => api.clearSyncedData());
+    await act(async () => api.refresh(true));
+    expect(startSync).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports why clearing was refused and keeps the data", async () => {
+    vi.mocked(clearSynced).mockRejectedValueOnce(
+      "A sync of this repository is running. Cancel it first.",
+    );
+    await mount(nextCwd());
+    await act(async () => api.clearSyncedData());
+    expect(api.sync.actionError).toBe(
+      "A sync of this repository is running. Cancel it first.",
+    );
+    expect(api.model).toBeDefined();
   });
 });

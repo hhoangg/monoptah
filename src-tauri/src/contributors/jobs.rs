@@ -53,10 +53,14 @@ pub struct SyncEvent {
     pub repo_key: String,
     /// Folder name of the repository, for display.
     pub project: String,
-    /// Working tree the sync was requested from: the path of the project whose
-    /// Contributors page shows this job.
+    /// Path the sync was requested from: the project whose Contributors page
+    /// shows this job.
     pub root: String,
     pub branch: String,
+    /// The period the job works on, inclusive epoch seconds, as `prepare_job`
+    /// read it from the request.
+    pub from: i64,
+    pub to: i64,
     pub step: SyncStep,
     pub done: u64,
     pub total: u64,
@@ -90,6 +94,9 @@ pub(super) struct JobSpec {
     pub project: String,
     /// The working tree the git commands run in.
     pub root: PathBuf,
+    /// The path the request came from (a project folder of the webview): jobs
+    /// are reported under it so the page can find its own.
+    pub cwd: PathBuf,
     pub branch: String,
     /// Both edges inclusive epoch seconds.
     pub from: i64,
@@ -110,8 +117,10 @@ impl JobSpec {
         SyncEvent {
             repo_key: self.repo_key.clone(),
             project: self.project.clone(),
-            root: self.root.to_string_lossy().into_owned(),
+            root: self.cwd.to_string_lossy().into_owned(),
             branch: self.branch.clone(),
+            from: self.from,
+            to: self.to,
             step: SyncStep::Counting,
             done: 0,
             total: 0,
@@ -455,6 +464,7 @@ pub(super) fn prepare_job(
         project: project_name(&repo_key),
         repo_key,
         root,
+        cwd: cwd.to_path_buf(),
         branch,
         from: window.since_epoch,
         to: window.until_epoch,
@@ -734,6 +744,7 @@ mod tests {
             repo_key: repo.to_string(),
             project: repo.to_string(),
             root: PathBuf::from("/nowhere"),
+            cwd: PathBuf::from("/page/nowhere"),
             branch: branch.to_string(),
             from: 100,
             to: 200,
@@ -919,7 +930,8 @@ mod tests {
             (JobState::Running, SyncStep::Commits, 1, 4)
         );
         assert_eq!(a.percent, sync::percent(SyncStep::Commits, 1, 4));
-        assert_eq!(a.root, "/nowhere");
+        assert_eq!(a.root, "/page/nowhere");
+        assert_eq!((a.from, a.to), (100, 200));
         assert_eq!(find("b").state, JobState::Queued);
         assert_eq!(find("c").state, JobState::Running);
         assert_eq!(status.len(), 3);
@@ -1138,6 +1150,8 @@ mod tests {
             project: "r".to_string(),
             root: "/work/r".to_string(),
             branch: "main".to_string(),
+            from: 1_700_000_000,
+            to: 1_700_086_400,
             step: SyncStep::PullRequests,
             done: 3,
             total: 9,
@@ -1152,6 +1166,8 @@ mod tests {
                 "project": "r",
                 "root": "/work/r",
                 "branch": "main",
+                "from": 1_700_000_000,
+                "to": 1_700_086_400,
                 "step": "pullRequests",
                 "done": 3,
                 "total": 9,
@@ -1207,6 +1223,14 @@ mod tests {
         assert_eq!(a.to - a.from, 31 * 86_400 - 1);
         assert!(a.repo_key.ends_with(".git"));
         assert!(!a.project.is_empty() && !a.project.ends_with(".git"));
+        assert_eq!(a.cwd, repo.path());
+
+        // Events carry the path the page asked from, not the repository top.
+        let sub = repo.path().join("nested");
+        std::fs::create_dir(&sub).unwrap();
+        let nested = prepare_job(&sub, None, SINCE, UNTIL, "full", None).unwrap();
+        assert_eq!(nested.event(JobState::Queued).root, sub.to_string_lossy());
+        assert_eq!(nested.event(JobState::Queued).from, a.from);
 
         let top = prepare_job(repo.path(), None, SINCE, UNTIL, "topup", Some("abc")).unwrap();
         assert_eq!(

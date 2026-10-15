@@ -1,19 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { RawData } from "./types";
+import type { LoadResponse, SyncEstimate, SyncMode } from "./types";
+import type { SyncEvent } from "./syncEvents";
 
 // Plain `invoke`: these commands read the local repository and are not routed
 // to remote machines.
 
 export type ContributorsBranches = { current: string; branches: string[] };
 export type GitUser = { name: string; email: string };
-
-export type CollectOptions = {
-  since: string;
-  until?: string;
-  branch?: string;
-  /** Skip the Rust cache and re-run git and gh. */
-  force?: boolean;
-};
 
 /** The config file text, or null when the file does not exist. */
 export function readConfig(cwd: string): Promise<string | null> {
@@ -29,17 +22,68 @@ export function writeConfig(cwd: string, text: string): Promise<void> {
   return invoke<void>("contributors_write_config", { cwd, content: text });
 }
 
-export function collectRaw(
+/** One period of the sync store; nothing is synced or fetched. */
+export function loadStored(
   cwd: string,
-  { since, until, branch, force }: CollectOptions,
-): Promise<RawData> {
-  return invoke<RawData>("contributors_collect", {
+  { since, until, branch }: { since: string; until: string; branch?: string },
+): Promise<LoadResponse> {
+  return invoke<LoadResponse>("contributors_load", {
     cwd,
-    since,
-    until: until ?? null,
     branch: branch ?? null,
-    force: force ?? false,
+    since,
+    until,
   });
+}
+
+type SyncWindowArgs = { from: string; to: string; branch?: string };
+
+/** What syncing a period involves; cheap counts only. */
+export function syncEstimate(
+  cwd: string,
+  { from, to, branch }: SyncWindowArgs,
+): Promise<SyncEstimate> {
+  return invoke<SyncEstimate>("contributors_sync_estimate", {
+    cwd,
+    branch: branch ?? null,
+    from,
+    to,
+  });
+}
+
+/** Queues a sync; progress arrives as `SYNC_EVENT`. */
+export function startSync(
+  cwd: string,
+  {
+    from,
+    to,
+    branch,
+    mode,
+    oldHead,
+  }: SyncWindowArgs & { mode: SyncMode; oldHead?: string },
+): Promise<void> {
+  return invoke<void>("contributors_sync_start", {
+    cwd,
+    branch: branch ?? null,
+    from,
+    to,
+    mode,
+    oldHead: oldHead ?? null,
+  });
+}
+
+/** Stops the running sync of the repository and drops the ones queued behind it. */
+export function cancelSync(cwd: string): Promise<void> {
+  return invoke<void>("contributors_sync_cancel", { cwd });
+}
+
+/** The latest event of every running and queued job. */
+export function syncStatus(): Promise<SyncEvent[]> {
+  return invoke<SyncEvent[]>("contributors_sync_status");
+}
+
+/** Deletes everything synced for the repository. */
+export function clearSynced(cwd: string): Promise<void> {
+  return invoke<void>("contributors_clear", { cwd });
 }
 
 export function listBranches(cwd: string): Promise<ContributorsBranches> {

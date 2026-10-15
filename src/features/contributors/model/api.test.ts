@@ -4,11 +4,16 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
 import {
-  collectRaw,
+  cancelSync,
+  clearSynced,
   gitUser,
   listBranches,
+  loadStored,
   readConfig,
   readMailmap,
+  startSync,
+  syncEstimate,
+  syncStatus,
   writeConfig,
 } from "./api";
 
@@ -44,32 +49,94 @@ describe("contributors api", () => {
     });
   });
 
-  it("collects raw data with explicit nulls for omitted options", async () => {
+  it("loads a period from the store with an explicit null branch", async () => {
     mocked.mockResolvedValueOnce({ head: "abc" });
-    await collectRaw("/repo", { since: "2026-09-01T00:00:00Z" });
-    expect(mocked).toHaveBeenCalledWith("contributors_collect", {
-      cwd: "/repo",
+    await loadStored("/repo", {
       since: "2026-09-01T00:00:00Z",
-      until: null,
+      until: "2026-10-01T00:00:00Z",
+    });
+    expect(mocked).toHaveBeenCalledWith("contributors_load", {
+      cwd: "/repo",
       branch: null,
-      force: false,
+      since: "2026-09-01T00:00:00Z",
+      until: "2026-10-01T00:00:00Z",
     });
   });
 
-  it("forwards until, branch and force", async () => {
-    mocked.mockResolvedValueOnce({ head: "abc" });
-    await collectRaw("/repo", {
-      since: "2026-09-01T00:00:00Z",
-      until: "2026-10-01T00:00:00Z",
+  it("forwards the branch of a load, an estimate and a sync start", async () => {
+    mocked.mockResolvedValue(undefined);
+    const window = { from: "2026-09-01T00:00:00Z", to: "2026-10-01T00:00:00Z" };
+    await loadStored("/repo", {
+      since: window.from,
+      until: window.to,
       branch: "dev",
-      force: true,
     });
-    expect(mocked).toHaveBeenCalledWith("contributors_collect", {
+    await syncEstimate("/repo", { ...window, branch: "dev" });
+    await startSync("/repo", { ...window, branch: "dev", mode: "full" });
+    expect(
+      mocked.mock.calls.map(([, args]) => (args as { branch: string }).branch),
+    ).toEqual(["dev", "dev", "dev"]);
+  });
+
+  it("estimates a period", async () => {
+    mocked.mockResolvedValueOnce({
+      commits: 5,
+      storedCommits: 2,
+      firstParent: 4,
+      prs: null,
+    });
+    await expect(
+      syncEstimate("/repo", {
+        from: "2026-09-01T00:00:00Z",
+        to: "2026-10-01T00:00:00Z",
+      }),
+    ).resolves.toMatchObject({ commits: 5, prs: null });
+    expect(mocked).toHaveBeenCalledWith("contributors_sync_estimate", {
       cwd: "/repo",
-      since: "2026-09-01T00:00:00Z",
-      until: "2026-10-01T00:00:00Z",
+      branch: null,
+      from: "2026-09-01T00:00:00Z",
+      to: "2026-10-01T00:00:00Z",
+    });
+  });
+
+  it("starts a sync with explicit nulls for the optional arguments", async () => {
+    mocked.mockResolvedValue(undefined);
+    const window = { from: "2026-09-01T00:00:00Z", to: "2026-10-01T00:00:00Z" };
+    await startSync("/repo", { ...window, mode: "full" });
+    expect(mocked).toHaveBeenLastCalledWith("contributors_sync_start", {
+      cwd: "/repo",
+      branch: null,
+      ...window,
+      mode: "full",
+      oldHead: null,
+    });
+    await startSync("/repo", {
+      ...window,
       branch: "dev",
-      force: true,
+      mode: "topup",
+      oldHead: "abc",
+    });
+    expect(mocked).toHaveBeenLastCalledWith("contributors_sync_start", {
+      cwd: "/repo",
+      branch: "dev",
+      ...window,
+      mode: "topup",
+      oldHead: "abc",
+    });
+  });
+
+  it("cancels, lists and clears", async () => {
+    mocked.mockResolvedValue(undefined);
+    await cancelSync("/repo");
+    expect(mocked).toHaveBeenLastCalledWith("contributors_sync_cancel", {
+      cwd: "/repo",
+    });
+    mocked.mockResolvedValueOnce([]);
+    await expect(syncStatus()).resolves.toEqual([]);
+    expect(mocked).toHaveBeenLastCalledWith("contributors_sync_status");
+    await clearSynced("/repo");
+    expect(mocked).toHaveBeenLastCalledWith("contributors_clear", {
+      cwd: "/repo",
     });
   });
 

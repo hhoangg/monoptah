@@ -6,6 +6,7 @@ import {
   type KeyboardEvent,
   type MouseEvent,
 } from "react";
+import { ask as askDialog } from "@tauri-apps/plugin-dialog";
 import { OverlayNav } from "../../../app/shell/TitleBar";
 import { WindowControls } from "../../../app/shell/WindowControls";
 import { IS_MAC } from "../../../platform/tauri/platform";
@@ -21,12 +22,15 @@ import {
   ChevronRight,
   CircleAlert,
   Loader,
+  MoreHorizontal,
   RefreshCw,
+  Trash2,
   Sparkles,
   Trophy,
   Users,
 } from "../../../shared/ui/icons";
 import { lazySurface } from "../../../shared/ui/lazySurface";
+import { Popover } from "../../../shared/ui/Popover";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 import { Segmented, Select, Toggle } from "../../settings/ui/primitives";
 import { useContributors } from "../hooks/useContributors";
@@ -40,6 +44,7 @@ import type { AskProvider } from "./AskAgentDialog";
 import { GhNotice } from "./GhNotice";
 import type { IdentitiesTabProps } from "./IdentitiesTab";
 import type { LeaderboardTabProps } from "./LeaderboardTab";
+import { NotSyncedPanel, SyncedBar } from "./SyncPanel";
 import { StatsTab } from "./StatsTab";
 
 // Loaded on first use: the tabs are separate files so each can grow without
@@ -169,7 +174,9 @@ export function ContributorsView({
   // The formula sidebar slides in over the page body, below the header.
   const [sidebarHost, setSidebarHost] = useState<HTMLDivElement | null>(null);
   const [ask, setAsk] = useState<AskState | null>(null);
-  const { model, refreshing } = data;
+  const [menu, setMenu] = useState(false);
+  const menuButton = useRef<HTMLButtonElement | null>(null);
+  const { model, refreshing, sync } = data;
   const status = remote ? "remote" : data.status;
   // The config file exists but cannot be read: every write is blocked.
   const locked = !remote && !!data.configError;
@@ -249,6 +256,19 @@ export function ContributorsView({
   }, [data.branches, data.branch]);
 
   const unmapped = model?.unmapped.length ?? 0;
+
+  // A native sheet: `window.confirm` is swallowed when a macOS menu accelerator fires.
+  const clearSynced = async () => {
+    setMenu(false);
+    const confirmed = await askDialog(
+      "Delete the synced Contributors data of this repository? You can sync it again at any time.",
+      { title: "Monoptah", kind: "warning" },
+    );
+    if (confirmed) await data.clearSyncedData();
+  };
+  // "Last 7 days" reads wrong in "No data for ... yet"; the others name themselves.
+  const periodName =
+    data.period.kind === "7d" ? "the last 7 days" : data.period.label;
 
   const onTabKey = (e: KeyboardEvent<HTMLDivElement>) => {
     const index = TABS.findIndex((t) => t.id === tab);
@@ -377,7 +397,7 @@ export function ContributorsView({
               <button
                 type="button"
                 aria-label="Refresh"
-                title="Refresh from git and GitHub"
+                title="Reload synced data"
                 disabled={status === "loading" || refreshing}
                 onClick={() => void data.refresh(true)}
                 className="rounded-md p-1.5 text-content/40 hover:bg-content/8 hover:text-content disabled:opacity-30"
@@ -391,6 +411,38 @@ export function ContributorsView({
                   <RefreshCw className="size-3.5" strokeWidth={1.75} />
                 )}
               </button>
+              <button
+                ref={menuButton}
+                type="button"
+                aria-label="More"
+                aria-haspopup="menu"
+                aria-expanded={menu}
+                onClick={() => setMenu((open) => !open)}
+                className="rounded-md p-1.5 text-content/40 hover:bg-content/8 hover:text-content aria-expanded:bg-content/8 aria-expanded:text-content"
+              >
+                <MoreHorizontal className="size-3.5" strokeWidth={1.75} />
+              </button>
+              {menu ? (
+                <Popover
+                  anchor={menuButton}
+                  align="end"
+                  width={200}
+                  onDismiss={() => setMenu(false)}
+                  role="menu"
+                  aria-label="Contributors options"
+                  className="p-1"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => void clearSynced()}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-content/85 hover:bg-content/8"
+                  >
+                    <Trash2 className="size-3.5 shrink-0" strokeWidth={1.75} />
+                    Clear synced data
+                  </button>
+                </Popover>
+              ) : null}
               {openAsk ? (
                 <button
                   type="button"
@@ -407,6 +459,10 @@ export function ContributorsView({
             {data.saveError ? (
               <Alert>{`Could not save ${CONFIG_PATH}: ${data.saveError}`}</Alert>
             ) : null}
+            {sync.jobError ? (
+              <Alert>{`The sync stopped: ${sync.jobError}`}</Alert>
+            ) : null}
+            {sync.actionError ? <Alert>{sync.actionError}</Alert> : null}
 
             {status === "loading" ? (
               <div
@@ -425,6 +481,16 @@ export function ContributorsView({
               >
                 {data.error ?? "Could not load contributors."}
               </Alert>
+            ) : null}
+
+            {status === "ready" && !model && sync.state === "notSynced" ? (
+              <NotSyncedPanel
+                label={periodName}
+                estimate={sync.estimate}
+                job={sync.job}
+                onSync={() => void data.startSync()}
+                onCancel={() => void data.cancelSync()}
+              />
             ) : null}
 
             {status === "ready" && model ? (
@@ -446,12 +512,24 @@ export function ContributorsView({
                     {`${CONFIG_PATH} could not be read (${data.configError}). Fix the file in your repo, then reload. Editing is disabled until then.`}
                   </Alert>
                 ) : null}
-                {!model.raw.ghAvailable || model.raw.ghNote?.trim() ? (
+                {data.stale ? null : (
+                  <SyncedBar
+                    syncedAt={sync.syncedAt}
+                    now={data.now}
+                    job={sync.job}
+                    onSync={() => void data.startSync()}
+                    onCancel={() => void data.cancelSync()}
+                  />
+                )}
+                {sync.ghIncomplete ||
+                !model.raw.ghAvailable ||
+                model.raw.ghNote?.trim() ? (
                   <GhNotice
                     available={model.raw.ghAvailable}
+                    incomplete={sync.ghIncomplete}
                     note={model.raw.ghNote}
-                    retrying={refreshing}
-                    onRetry={() => void data.refresh(true)}
+                    retrying={sync.job !== null}
+                    onRetry={() => void data.retryGithub()}
                   />
                 ) : null}
                 {model.raw.truncated ? (

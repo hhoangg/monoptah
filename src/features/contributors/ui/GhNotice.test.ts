@@ -81,3 +81,37 @@ describe("GhNotice retry", () => {
     expect(container.querySelector("button")?.disabled).toBe(true);
   });
 });
+
+describe("GhNotice with incomplete GitHub data", () => {
+  it("says the period is incomplete and offers Retry GitHub", () => {
+    const markup = renderToStaticMarkup(
+      createElement(GhNotice, {
+        incomplete: true,
+        available: true,
+        note: "GitHub rate limit reached.",
+        onRetry: () => {},
+      }),
+    );
+    expect(markup).toContain("GitHub data is incomplete for this period.");
+    expect(markup).toContain("GitHub rate limit reached.");
+    expect(markup).toContain("Retry GitHub");
+    expect(markup).toContain("amber");
+    expect(markup).not.toContain("..");
+  });
+
+  it("reads well without a note, and says review points are lost when GitHub is unavailable", () => {
+    const partial = renderToStaticMarkup(
+      createElement(GhNotice, {
+        incomplete: true,
+        available: true,
+        onRetry: () => {},
+      }),
+    );
+    expect(partial).toContain("GitHub data is incomplete for this period.");
+    expect(partial).not.toContain("not counted");
+    const down = renderToStaticMarkup(
+      createElement(GhNotice, { incomplete: true, onRetry: () => {} }),
+    );
+    expect(down).toContain("Review points are not counted.");
+  });
+});

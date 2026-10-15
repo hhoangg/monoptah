@@ -2916,16 +2916,9 @@ mod tests {
         assert!(loaded.covered);
 
         let github = hub(prs, vec![], None);
-        let old = super::super::collect_cached_with(
-            &super::super::Cache::new(),
-            &github,
-            h.repo.path(),
-            "2026-01-01T00:00:00Z",
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let old =
+            super::super::collect_once(&github, h.repo.path(), "2026-01-01T00:00:00Z", None, None)
+                .unwrap();
         let new = &loaded.raw;
 
         let sorted = |mut prs: Vec<RawPr>| {
@@ -2976,14 +2969,12 @@ mod tests {
         let window = (at("2026-01-01T00:00:00Z"), now);
         full(&h, &store, &Unavailable, window);
         let new = load(&h, &store, window).raw;
-        let old = super::super::collect_cached_with(
-            &super::super::Cache::new(),
+        let old = super::super::collect_once(
             &Unavailable,
             h.repo.path(),
             "2026-01-01T00:00:00Z",
             None,
             None,
-            false,
         )
         .unwrap();
         let sorted = |mut prs: Vec<RawPr>| {

@@ -253,3 +253,27 @@ it("the title-bar tabs are inert while Contributors is open", () => {
   expect(app).toContain("IS_MAC && compactRailActive && !chromeSurfaceOpen");
   expect(app).toMatch(/const chromeSurfaceOpen =[^;]*contributorsViewOpen;/);
 });
+
+// The one-shot collector was replaced by the sync store. Built from parts so
+// this file does not match itself.
+const RETIRED = ["contributors", "collect"].join("_");
+const RETIRED_FN = ["collect", "Raw"].join("");
+
+it("the retired one-shot collect command is not invoked or registered anywhere", async () => {
+  const sources = import.meta.glob("../features/contributors/**/*.{ts,tsx}", {
+    query: "?raw",
+    import: "default",
+  });
+  const hits: string[] = [];
+  for (const [path, load] of Object.entries(sources)) {
+    if (path.endsWith("contributorsWiring.test.ts")) continue;
+    const text = (await load()) as string;
+    if (text.includes(RETIRED) || text.includes(RETIRED_FN)) hits.push(path);
+  }
+  expect(hits).toEqual([]);
+  expect(app).not.toContain(RETIRED);
+  const lib = (await import("../../src-tauri/src/lib.rs?raw")).default;
+  expect(lib).not.toContain(RETIRED);
+  expect(lib).toContain("contributors::contributors_load");
+  expect(lib).toContain("contributors::contributors_sync_start");
+});
