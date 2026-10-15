@@ -14,9 +14,13 @@
 //!   `refs/pull/<N>/head` on `origin`: one `git ls-remote` lists the heads and
 //!   one object-only `git fetch` brings the missing ones in (no ref is created,
 //!   see `pr_heads`). The diff comes from the landing commit (`inspect_landing`).
-//! - A PR whose head or merge commit cannot be made local (no network, the
-//!   fetch failed or timed out) falls back to `gh` for its commits only, and its
-//!   diff stays empty.
+//! - A PR whose head cannot be made local (no network, the fetch failed or timed
+//!   out), or whose commits git cannot list, falls back to `gh` for its commits.
+//!   Its diff depends only on the landing (merge) commit: the files stay empty
+//!   when that commit is not local.
+//! - When the wall-clock budget runs out part way, what is already loaded is
+//!   kept: the newest PRs are overlaid, the oldest stay as git history only, and
+//!   the outcome says so (`CUT_SHORT`).
 //!
 //! `gh pr list --json` limits that shape this module:
 //! - `commits` makes GitHub count `authors` nodes per commit, so a list call
@@ -54,6 +58,7 @@ const REPO_UNREADABLE: &str =
     "GitHub data could not be loaded: the repository is not readable with this account.";
 const CLOSED_FAILED_NOTE: &str = "Closed pull requests could not be loaded from GitHub.";
 const TOO_SLOW: &str = "GitHub data took too long to load. Try again later.";
+const CUT_SHORT: &str = "GitHub data was cut short; the oldest pull requests use git history only.";
 /// What `SystemGh` reports when it had to kill a call.
 const TIMED_OUT: &str = "gh timed out";
 
@@ -1034,13 +1039,15 @@ impl CommitCache {
     }
 }
 
-/// One `gh` call per search, on up to `WORKERS` threads. Rows come back in the
-/// order of `searches`; the first failure (in that order) is the result.
+/// One `gh` call per search, on up to `WORKERS` threads. The rows of the calls
+/// that succeeded come back in the order of `searches`, and so does the first
+/// failure (in that order), if any: the caller decides whether the rows that
+/// did arrive are worth keeping.
 fn run_searches(
     ctx: &Ctx,
     state: &str,
     searches: &[String],
-) -> Result<Vec<Vec<GhPrCommits>>, String> {
+) -> (Vec<Vec<GhPrCommits>>, Option<String>) {
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let slots: Vec<Mutex<Option<SearchResult>>> =
@@ -1074,19 +1081,32 @@ fn run_searches(
         }
     });
     let mut all = Vec::new();
+    let mut failure = None;
     for slot in slots {
         match slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
             Some(Ok(rows)) => all.push(rows),
-            Some(Err(note)) => return Err(note),
-            None => return Err(TOO_SLOW.to_string()),
+            Some(Err(note)) => failure = failure.or(Some(note)),
+            // Never started: another call failed first.
+            None => failure = failure.or_else(|| Some(TOO_SLOW.to_string())),
         }
     }
-    Ok(all)
+    (all, failure)
+}
+
+/// What a commit lookup found.
+struct Found {
+    commits: CommitsByPr,
+    /// some list was cut at its cap
+    truncated: bool,
+    /// The budget ran out; the PRs missing from `commits` were not looked up.
+    cut_short: bool,
 }
 
 /// Commits of the given PRs: from the cache, else in a few calls over narrow
-/// time ranges. `kind` is the search qualifier (`merged` or `closed`), `state`
-/// the gh state and `extra` further search terms.
+/// time ranges, newest first so that a spent budget leaves out the oldest. A
+/// call that runs out of time keeps what the others found. `kind` is the search
+/// qualifier (`merged` or `closed`), `state` the gh state and `extra` further
+/// search terms.
 fn fetch_commits(
     ctx: &Ctx,
     cache: &CommitCache,
@@ -1094,7 +1114,7 @@ fn fetch_commits(
     kind: &str,
     extra: &str,
     items: &[(u64, String)],
-) -> Result<(CommitsByPr, bool), String> {
+) -> Result<Found, String> {
     let mut found: CommitsByPr = HashMap::new();
     // In time order, runs of PRs that are not cached. A cached PR ends a run:
     // a `merged:lo..hi` range spanning it would return it again and could push
@@ -1124,7 +1144,8 @@ fn fetch_commits(
     }
     let searches: Vec<String> = runs
         .iter()
-        .flat_map(|run| run.chunks(COMMIT_CHUNK))
+        .rev()
+        .flat_map(|run| run.chunks(COMMIT_CHUNK).rev())
         .map(|group| {
             let (lo, hi) = (&group[0].1, &group[group.len() - 1].1);
             format!("{kind}:{lo}..{hi}{extra}")
@@ -1132,7 +1153,13 @@ fn fetch_commits(
         .collect();
     let wanted: HashMap<u64, &String> = missing.iter().map(|(n, at)| (*n, at)).collect();
     let mut truncated = false;
-    for rows in run_searches(ctx, state, &searches)? {
+    let (answers, failure) = run_searches(ctx, state, &searches);
+    let cut_short = match failure {
+        Some(note) if note == TOO_SLOW => true,
+        Some(note) => return Err(note),
+        None => false,
+    };
+    for rows in answers {
         truncated |= rows.len() >= COMMIT_CHUNK_LIMIT;
         for row in rows {
             let Some(at) = wanted.get(&row.number) else {
@@ -1146,7 +1173,11 @@ fn fetch_commits(
             found.insert(row.number, commits);
         }
     }
-    Ok((found, truncated))
+    Ok(Found {
+        commits: found,
+        truncated,
+        cut_short,
+    })
 }
 
 /// `f` over every item on up to `WORKERS` threads. The results keep the order
@@ -1180,6 +1211,8 @@ struct Lists {
     closed_cut: bool,
     /// The closed-PR fetch failed; the merged data is still complete.
     closed_failed: bool,
+    /// The budget ran out during the closed-PR fetch; the merged list is whole.
+    cut_short: bool,
 }
 
 struct Fetched {
@@ -1190,6 +1223,8 @@ struct Fetched {
     truncated: bool,
     /// The closed-PR fetch failed; the merged data is still complete.
     closed_failed: bool,
+    /// The budget ran out; what is missing from the commit maps was not looked up.
+    cut_short: bool,
 }
 
 fn fetch_closed_list(ctx: &Ctx, branch: &str, range: &str) -> Result<(Vec<GhPr>, bool), String> {
@@ -1214,7 +1249,7 @@ fn fetch_closed_list(ctx: &Ctx, branch: &str, range: &str) -> Result<(Vec<GhPr>,
 /// The merged and closed PR lists. The merged list is what makes gh usable;
 /// closed PRs only add to it. A failure there is not a reason to drop
 /// everything. It is not "history too large" either, so it gets its own flag
-/// instead of `truncated`.
+/// instead of `truncated`. Running out of time there keeps the merged list.
 fn fetch_lists(ctx: &Ctx, branch: &str, window: &Window) -> Result<Lists, String> {
     let range = format!(
         "{}..{}",
@@ -1238,18 +1273,21 @@ fn fetch_lists(ctx: &Ctx, branch: &str, window: &Window) -> Result<Lists, String
     let truncated = merged.len() >= MERGED_LIMIT;
     merged.retain(|pr| matches_branch(pr, branch) && non_empty(&pr.merged_at).is_some());
 
-    let (closed, closed_cut, closed_failed) = match fetch_closed_list(ctx, branch, &range) {
-        Ok((closed, cut)) => (closed, cut, false),
-        // Out of time is out of time for everything.
-        Err(note) if note == TOO_SLOW => return Err(note),
-        Err(_) => (Vec::new(), false, true),
-    };
+    let (closed, closed_cut, closed_failed, cut_short) =
+        match fetch_closed_list(ctx, branch, &range) {
+            Ok((closed, cut)) => (closed, cut, false, false),
+            // Out of time is out of time for everything, but the merged list
+            // is already here.
+            Err(note) if note == TOO_SLOW => (Vec::new(), false, false, true),
+            Err(_) => (Vec::new(), false, true, false),
+        };
     Ok(Lists {
         merged,
         closed,
         truncated,
         closed_cut,
         closed_failed,
+        cut_short,
     })
 }
 
@@ -1276,7 +1314,7 @@ fn commits_of(
     side: Side,
     prs: &[GhPr],
     base: &str,
-) -> Result<(CommitsByPr, bool), String> {
+) -> Result<Found, String> {
     let (state, extra) = match side {
         Side::Merged => ("merged", base.to_string()),
         Side::Closed { .. } => ("closed", format!(" -is:merged{base}")),
@@ -1333,7 +1371,8 @@ fn commits_of(
         )
     });
     for ((number, at, _, _), commits) in from_git.into_iter().zip(read) {
-        let Some((commits, cut)) = commits else {
+        // No commits is no answer: a PR has at least one, so gh is asked.
+        let Some((commits, cut)) = commits.filter(|(list, _)| !list.is_empty()) else {
             continue;
         };
         let commits: Arc<Vec<GhCommit>> = Arc::new(commits.iter().map(gh_commit).collect());
@@ -1344,9 +1383,13 @@ fn commits_of(
 
     // What is still missing comes from gh. The lists git just filled are in the
     // cache, so they split the time ranges like any other cached PR.
-    let (rest, cut) = fetch_commits(ctx, cache, state, state, &extra, &items)?;
-    found.extend(rest);
-    Ok((found, truncated || cut))
+    let rest = fetch_commits(ctx, cache, state, state, &extra, &items)?;
+    found.extend(rest.commits);
+    Ok(Found {
+        commits: found,
+        truncated: truncated || rest.truncated,
+        cut_short: rest.cut_short,
+    })
 }
 
 /// Everything gh and local git say about the PRs of the window. `find_local`
@@ -1369,8 +1412,9 @@ fn fetch_all(
     let local = find_local(&lists);
     let base = base_clause(branch);
     let mut truncated = lists.truncated;
+    let mut cut_short = lists.cut_short;
 
-    let (merged_commits, cut) = commits_of(
+    let merged = commits_of(
         ctx,
         cache,
         limits,
@@ -1379,7 +1423,8 @@ fn fetch_all(
         &lists.merged,
         &base,
     )?;
-    truncated |= cut;
+    truncated |= merged.truncated;
+    cut_short |= merged.cut_short;
 
     let mut closed_failed = lists.closed_failed;
     let (closed, closed_commits) = if closed_failed {
@@ -1394,11 +1439,11 @@ fn fetch_all(
             &lists.closed,
             &base,
         ) {
-            Ok((commits, cut)) => {
-                truncated |= cut || lists.closed_cut;
-                (lists.closed, commits)
+            Ok(found) => {
+                truncated |= found.truncated || lists.closed_cut;
+                cut_short |= found.cut_short;
+                (lists.closed, found.commits)
             }
-            Err(note) if note == TOO_SLOW => return Err(note),
             Err(_) => {
                 closed_failed = true;
                 (Vec::new(), HashMap::new())
@@ -1407,11 +1452,12 @@ fn fetch_all(
     };
     Ok(Fetched {
         merged: lists.merged,
-        merged_commits,
+        merged_commits: merged.commits,
         closed,
         closed_commits,
-        truncated,
+        truncated: truncated || cut_short,
         closed_failed,
+        cut_short,
     })
 }
 
@@ -1603,8 +1649,6 @@ fn enrich_within(request: &Request, derived: &mut Derived, total: Duration) -> O
         gh,
         commits: cache,
         root,
-        window,
-        limits,
         ..
     } = *request;
     let budget = Budget::new(total);
@@ -1622,7 +1666,31 @@ fn enrich_within(request: &Request, derived: &mut Derived, total: Duration) -> O
         Ok(fetched) => fetched,
         Err(note) => return Outcome::unavailable(note),
     };
+    overlay_fetched(request, derived, fetched, &budget, &|| {
+        budget.left().is_some()
+    })
+}
+
+/// Builds the PRs from what was fetched and overlays them on `derived`. Local
+/// git adds the final diff of each merged PR (within `budget`). `keep_going` is
+/// asked before each merged PR, newest first; once it says no the remaining
+/// (oldest) PRs are left out, stay as the git-derived ones, and the outcome is
+/// truncated with the `CUT_SHORT` note.
+fn overlay_fetched(
+    request: &Request,
+    derived: &mut Derived,
+    fetched: Fetched,
+    budget: &Budget,
+    keep_going: &dyn Fn() -> bool,
+) -> Outcome {
+    let Request {
+        root,
+        window,
+        limits,
+        ..
+    } = *request;
     let mut truncated = fetched.truncated;
+    let mut cut_short = fetched.cut_short;
 
     // Newest first, the order the drafts are kept in.
     let mut order: Vec<&GhPr> = fetched.merged.iter().collect();
@@ -1659,8 +1727,9 @@ fn enrich_within(request: &Request, derived: &mut Derived, total: Duration) -> O
     let mut drafts: Vec<PrDraft> = Vec::new();
     let mut reviews: Vec<RawReview> = Vec::new();
     for (pr, landing) in order.into_iter().zip(landings) {
-        if budget.left().is_none() {
-            return Outcome::unavailable(TOO_SLOW.to_string());
+        if !keep_going() {
+            cut_short = true;
+            break;
         }
         if let Some(landing) = &landing {
             truncated |= landing.capped;
@@ -1692,13 +1761,18 @@ fn enrich_within(request: &Request, derived: &mut Derived, total: Duration) -> O
         });
     }
     overlay(derived, drafts);
+    let notes: Vec<&str> = [
+        (cut_short, CUT_SHORT),
+        (fetched.closed_failed, CLOSED_FAILED_NOTE),
+    ]
+    .into_iter()
+    .filter_map(|(on, note)| on.then_some(note))
+    .collect();
     Outcome {
         available: true,
-        note: fetched
-            .closed_failed
-            .then(|| CLOSED_FAILED_NOTE.to_string()),
+        note: (!notes.is_empty()).then(|| notes.join(" ")),
         reviews,
-        truncated,
+        truncated: truncated || cut_short,
     }
 }
 
@@ -1816,6 +1890,15 @@ mod tests {
 
     /// The lists and the gh commit calls, with no PR head available locally.
     fn fetch(github: &FakeGh, cache: &CommitCache, branch: &str) -> Result<Fetched, String> {
+        fetch_within(github, cache, branch, Duration::from_secs(60))
+    }
+
+    fn fetch_within(
+        github: &FakeGh,
+        cache: &CommitCache,
+        branch: &str,
+        total: Duration,
+    ) -> Result<Fetched, String> {
         let win = window();
         let request = Request {
             gh: github,
@@ -1826,7 +1909,7 @@ mod tests {
             window: &win,
             limits: &Limits::DEFAULT,
         };
-        with_ctx(github, Duration::from_secs(60), |ctx| {
+        with_ctx(github, total, |ctx| {
             fetch_all(ctx, &request, |_| HashMap::new())
         })
     }
@@ -2317,13 +2400,14 @@ mod tests {
         );
         assert!(lock(&github.calls).is_empty());
 
-        // The budget runs out while the merged list is being read.
+        // The budget runs out while the merged list is being read: there is
+        // nothing to keep yet. (Running out after that keeps the data, see
+        // `running_out_of_time_after_the_merged_list_keeps_the_merged_prs`.)
         let origin = repo_with_origin("git@github.com:acme/widgets.git");
-        let list = serde_json::json!([pr_row(1, "2026-02-01T10:00:00Z", "main")]).to_string();
         let slow = FakeGh::new(move |args| {
             if args[0] == "pr" {
                 std::thread::sleep(Duration::from_millis(150));
-                Ok(list.clone())
+                Err(failed(TIMED_OUT))
             } else {
                 Ok(String::new())
             }
@@ -2346,6 +2430,289 @@ mod tests {
         assert_eq!(pr_calls, 1);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    #[test]
+    fn running_out_of_time_after_the_merged_list_keeps_the_merged_prs() {
+        // The merged list arrives; the closed list then runs past the budget.
+        let origin = repo_with_origin("git@github.com:acme/widgets.git");
+        let list = serde_json::json!([
+            pr_row(1, "2026-02-01T10:00:00Z", "main"),
+            pr_row(2, "2026-02-02T10:00:00Z", "main")
+        ])
+        .to_string();
+        let github = FakeGh::new(move |args| {
+            if args[0] != "pr" {
+                Ok(String::new())
+            } else if args.contains(&"closed") {
+                std::thread::sleep(Duration::from_millis(400));
+                Err(failed(TIMED_OUT))
+            } else {
+                Ok(list.clone())
+            }
+        });
+        let fetched = fetch_within(
+            &github,
+            &CommitCache::new(),
+            "main",
+            Duration::from_millis(300),
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(fetched.merged.len(), 2);
+        assert!(fetched.cut_short);
+        assert!(fetched.truncated);
+        assert!(fetched.closed.is_empty());
+
+        let cache = CommitCache::new();
+        let limits = Limits::DEFAULT;
+        let win = window();
+        let request = Request {
+            gh: &github,
+            commits: &cache,
+            root: &origin,
+            branch: "main",
+            head: "",
+            window: &win,
+            limits: &limits,
+        };
+        let mut derived = no_derived();
+        derived.drafts = (1..=2).map(git_pr).collect();
+        let outcome = enrich_within(&request, &mut derived, Duration::from_millis(300));
+        // Not a failure: GitHub data counts as available, and says it is short.
+        assert!(outcome.available);
+        assert!(outcome.truncated);
+        assert_eq!(outcome.note.as_deref(), Some(CUT_SHORT));
+        // The budget was gone before any PR could be built, so the git PRs stay.
+        assert!(derived.drafts.iter().all(|d| d.pr.source == "git"));
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    #[test]
+    fn a_commit_lookup_running_out_of_time_keeps_the_newest_commit_lists() {
+        // 30 merged PRs, one a minute: chunks of 25 split them into minutes 1-25
+        // and 26-30. Only the newest chunk answers in time.
+        let rows: Vec<serde_json::Value> = (1..=30)
+            .map(|n| pr_row(n, &format!("2026-02-01T10:{n:02}:00Z"), "main"))
+            .collect();
+        let list = serde_json::Value::Array(rows).to_string();
+        let newest: Vec<serde_json::Value> = (26..=30)
+            .map(|n| serde_json::json!({ "number": n, "commits": [{ "messageHeadline": "c" }] }))
+            .collect();
+        let newest = serde_json::Value::Array(newest).to_string();
+        let github = FakeGh::new(move |args| {
+            if args.contains(&"closed") {
+                Ok("[]".to_string())
+            } else if args.contains(&COMMIT_FIELDS) {
+                if args.iter().any(|a| a.contains("..2026-02-01T10:30:00Z")) {
+                    Ok(newest.clone())
+                } else {
+                    std::thread::sleep(Duration::from_millis(500));
+                    Err(failed(TIMED_OUT))
+                }
+            } else {
+                Ok(list.clone())
+            }
+        });
+        let cache = CommitCache::new();
+        let fetched = fetch_within(&github, &cache, "main", Duration::from_millis(300))
+            .ok()
+            .unwrap();
+        assert!(fetched.cut_short);
+        assert!(fetched.truncated);
+        assert_eq!(fetched.merged.len(), 30);
+        let mut found: Vec<u64> = fetched.merged_commits.keys().copied().collect();
+        found.sort();
+        assert_eq!(found, (26..=30).collect::<Vec<_>>());
+        // Only what arrived is cached.
+        assert!(cache
+            .get(&(
+                "acme/widgets".to_string(),
+                28,
+                "2026-02-01T10:28:00Z".to_string()
+            ))
+            .is_some());
+        assert!(cache
+            .get(&(
+                "acme/widgets".to_string(),
+                3,
+                "2026-02-01T10:03:00Z".to_string()
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn a_cut_part_way_through_the_prs_overlays_the_newest_and_leaves_the_oldest_as_git() {
+        let root = scratch_dir();
+        let reviewed = |n: u64| {
+            serde_json::json!({
+                "number": n, "title": format!("PR {n}"), "author": { "login": "ann" },
+                "mergedAt": format!("2026-02-0{n}T10:00:00Z"), "baseRefName": "main",
+                "mergeCommit": { "oid": format!("{n:040x}") },
+                "reviews": [{
+                    "author": { "login": "bob" }, "state": "APPROVED",
+                    "submittedAt": format!("2026-02-0{n}T11:00:00Z")
+                }]
+            })
+        };
+        // Listed oldest first on purpose: the order is made from `mergedAt`.
+        let merged = parse::<GhPr>(serde_json::json!([reviewed(1), reviewed(2), reviewed(3)]));
+        let fetched = Fetched {
+            merged,
+            merged_commits: HashMap::new(),
+            closed: Vec::new(),
+            closed_commits: HashMap::new(),
+            truncated: false,
+            closed_failed: false,
+            cut_short: false,
+        };
+        let github = FakeGh::new(|_| Ok(String::new()));
+        let cache = CommitCache::new();
+        let limits = Limits::DEFAULT;
+        let win = window();
+        let request = Request {
+            gh: &github,
+            commits: &cache,
+            root: &root,
+            branch: "main",
+            head: "",
+            window: &win,
+            limits: &limits,
+        };
+        let mut derived = no_derived();
+        derived.drafts = (1..=3).map(git_pr).collect();
+        // Two PRs are built, then the time is up.
+        let asked = AtomicUsize::new(0);
+        let outcome = overlay_fetched(&request, &mut derived, fetched, &budget(), &|| {
+            asked.fetch_add(1, Ordering::SeqCst) < 2
+        });
+
+        assert!(outcome.available);
+        assert!(outcome.truncated);
+        assert_eq!(outcome.note.as_deref(), Some(CUT_SHORT));
+        let source_of = |id: &str| {
+            derived
+                .drafts
+                .iter()
+                .find(|d| d.pr.id == id)
+                .map(|d| d.pr.source.clone())
+        };
+        // PRs 3 and 2 come from GitHub; the oldest one is still the git PR.
+        assert_eq!(source_of("3").as_deref(), Some("gh"));
+        assert_eq!(source_of("2").as_deref(), Some("gh"));
+        assert_eq!(source_of("1").as_deref(), Some("git"));
+        assert_eq!(derived.drafts.len(), 3);
+        let mut reviewed_prs: Vec<&str> =
+            outcome.reviews.iter().map(|r| r.pr_id.as_str()).collect();
+        reviewed_prs.sort();
+        assert_eq!(reviewed_prs, ["2", "3"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cut_note_comes_with_the_closed_failure_note_when_both_apply() {
+        let root = scratch_dir();
+        let github = FakeGh::new(|_| Ok(String::new()));
+        let cache = CommitCache::new();
+        let limits = Limits::DEFAULT;
+        let win = window();
+        let request = Request {
+            gh: &github,
+            commits: &cache,
+            root: &root,
+            branch: "main",
+            head: "",
+            window: &win,
+            limits: &limits,
+        };
+        let fetched = Fetched {
+            merged: Vec::new(),
+            merged_commits: HashMap::new(),
+            closed: Vec::new(),
+            closed_commits: HashMap::new(),
+            truncated: false,
+            closed_failed: true,
+            cut_short: true,
+        };
+        let outcome = overlay_fetched(&request, &mut no_derived(), fetched, &budget(), &|| true);
+        assert!(outcome.truncated);
+        assert_eq!(
+            outcome.note.as_deref(),
+            Some(format!("{CUT_SHORT} {CLOSED_FAILED_NOTE}").as_str())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pr_whose_local_commit_list_is_empty_is_sent_to_gh() {
+        use std::process::Command as Cmd;
+        let root = scratch_dir();
+        let run = |args: &[&str]| {
+            let out = Cmd::new("git")
+                .current_dir(&root)
+                .args(["-c", "user.name=Ann", "-c", "user.email=ann@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "first"]);
+        let first = run(&["rev-parse", "HEAD"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "second"]);
+        let second = run(&["rev-parse", "HEAD"]);
+        // The landing's first parent already reaches the head, so git answers
+        // with no commits at all: that is no answer.
+        let list = serde_json::json!([{
+            "number": 1, "title": "PR 1", "author": { "login": "ann" },
+            "mergedAt": "2026-02-01T10:00:00Z", "baseRefName": "main",
+            "mergeCommit": { "oid": format!("{second}") }
+        }])
+        .to_string();
+        let github = FakeGh::new(move |args| {
+            if args.contains(&"closed") {
+                Ok("[]".to_string())
+            } else if args.contains(&COMMIT_FIELDS) {
+                Ok(serde_json::json!([
+                    { "number": 1, "commits": [{ "messageHeadline": "from gh" }] }
+                ])
+                .to_string())
+            } else {
+                Ok(list.clone())
+            }
+        });
+        let cache = CommitCache::new();
+        let limits = Limits::DEFAULT;
+        let win = window();
+        let request = Request {
+            gh: &github,
+            commits: &cache,
+            root: &root,
+            branch: "main",
+            head: "",
+            window: &win,
+            limits: &limits,
+        };
+        let fetched = with_ctx(&github, Duration::from_secs(60), |ctx| {
+            let ctx = Ctx {
+                root: &root,
+                ..*ctx
+            };
+            fetch_all(&ctx, &request, |_| HashMap::from([(1, first.clone())]))
+        })
+        .ok()
+        .unwrap();
+        assert_eq!(fetched.merged_commits[&1].len(), 1);
+        assert_eq!(
+            fetched.merged_commits[&1][0].message_headline.as_deref(),
+            Some("from gh")
+        );
+        assert!(lock(&github.calls)
+            .iter()
+            .any(|c| c.contains(&COMMIT_FIELDS.to_string())));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
