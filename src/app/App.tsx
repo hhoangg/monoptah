@@ -6400,6 +6400,7 @@ function Workspace({
   const onSelectWorkspace = useCallback(
     (focus?: WorktreeFocus) => {
       closeMonoView();
+      setContributorsProject(null);
       setProjectCwd(sidebarCwdRef.current);
       workspaceNavigation.selectWorkspace(sidebarCwdRef.current, focus);
     },

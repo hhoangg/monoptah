@@ -230,3 +230,26 @@ it("selecting a session from the sidebar closes the Contributors page", () => {
     /if \(!session \|\| session\.inboxAsk\) return;\s*setContributorsProject\(null\);/,
   );
 });
+
+it("switching workspace from the sidebar closes the Contributors page", () => {
+  const start = lines.findIndex((l) => l.includes("const onSelectWorkspace"));
+  expect(start).toBeGreaterThan(-1);
+  const body = lines.slice(start, start + 8).join("\n");
+  expect(body).toContain("setContributorsProject(null);");
+});
+
+it("the title-bar tabs are inert while Contributors is open", () => {
+  // activateTab does not close Contributors, so a tab click would open its
+  // session underneath the page. It cannot happen: the workspace, title bar
+  // included, sits in the wrapper that is hidden and inert for the page.
+  const wrapper = lines.findIndex((l) => l.includes('? "hidden"'));
+  expect(wrapper).toBeGreaterThan(-1);
+  const head = lines.slice(wrapper - 12, wrapper + 25).join("\n");
+  expect(head.match(/contributorsViewOpen/g)?.length).toBeGreaterThanOrEqual(3);
+  const titleBar = lines.findIndex((l) =>
+    l.includes("{compactTitleBar ? null : workspaceTitleBar}"),
+  );
+  expect(titleBar).toBeGreaterThan(wrapper);
+  expect(app).toContain("IS_MAC && compactRailActive && !chromeSurfaceOpen");
+  expect(app).toMatch(/const chromeSurfaceOpen =[^;]*contributorsViewOpen;/);
+});
