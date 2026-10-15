@@ -50,51 +50,24 @@ fn run_git(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Could not run git: {e}"))?;
-    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
-        let (send, receive) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            let _ = send.send(bytes);
-        });
-        receive
-    }
     if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
         // A thread, so a child that stops reading cannot block the deadline.
         std::thread::spawn(move || {
             let _ = stdin.write_all(input.as_bytes());
         });
     }
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(TIMED_OUT.to_string());
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(e.to_string()),
-        }
-    };
-    // A grandchild that kept a pipe open must not hold the call forever.
-    let grace = Duration::from_secs(5);
-    let out = String::from_utf8_lossy(&stdout.recv_timeout(grace).unwrap_or_default()).into_owned();
-    if status.success() {
-        return Ok(out);
+    let done = wait_with_deadline(&mut child, timeout).map_err(|failure| match failure {
+        WaitFailure::TimedOut => TIMED_OUT.to_string(),
+        WaitFailure::Io(e) => e,
+    })?;
+    if done.status.success() {
+        return Ok(done.stdout);
     }
-    let err = String::from_utf8_lossy(&stderr.recv_timeout(grace).unwrap_or_default())
-        .trim()
-        .to_string();
+    let err = done.stderr.trim();
     Err(if err.is_empty() {
         "git failed".to_string()
     } else {
-        err
+        err.to_string()
     })
 }
 
@@ -212,6 +185,9 @@ pub(super) fn ensure_local(
                 "--no-write-fetch-head",
                 "--no-recurse-submodules",
                 "--quiet",
+                // A configured pull refspec would otherwise update
+                // remote-tracking refs opportunistically.
+                "--refmap=",
                 "origin",
             ];
             args.extend(refs.iter().map(String::as_str));
@@ -443,6 +419,16 @@ mod tests {
         g(&origin, &["fetch", "-q", clone.to_str().unwrap(), &local]);
         g(&origin, &["update-ref", "refs/pull/2/head", &local]);
         assert!(git(&clone, ["cat-file", "-e", &remote_only]).is_err());
+        // A user-configured pull refspec must not turn the fetch into a ref update.
+        g(
+            &clone,
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/pull/*/head:refs/remotes/origin/pr/*",
+            ],
+        );
         let refs_before = refs(&clone);
 
         let heads = vec![(1, remote_only.clone()), (2, local.clone())];

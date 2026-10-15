@@ -217,6 +217,63 @@ fn git_command(root: &Path) -> Command {
     command
 }
 
+/// A child process that ran to completion.
+struct Finished {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Why `wait_with_deadline` gave up on a child.
+enum WaitFailure {
+    TimedOut,
+    Io(String),
+}
+
+/// Waits for a child spawned with piped stdout and stderr. Both pipes are
+/// drained on their own threads so a large reply cannot fill them and stall
+/// the child; the child is killed when `timeout` passes.
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<Finished, WaitFailure> {
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            let _ = send.send(bytes);
+        });
+        receive
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(WaitFailure::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(WaitFailure::Io(e.to_string())),
+        }
+    };
+    // A grandchild that kept a pipe open must not hold the call forever.
+    let grace = Duration::from_secs(5);
+    Ok(Finished {
+        status,
+        stdout: String::from_utf8_lossy(&stdout.recv_timeout(grace).unwrap_or_default())
+            .into_owned(),
+        stderr: String::from_utf8_lossy(&stderr.recv_timeout(grace).unwrap_or_default())
+            .into_owned(),
+    })
+}
+
 fn git<I, S>(root: &Path, args: I) -> Result<String, String>
 where
     I: IntoIterator<Item = S>,

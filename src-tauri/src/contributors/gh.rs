@@ -111,47 +111,17 @@ impl GhRunner for SystemGh {
                 GhError::Failed(e.to_string())
             }
         })?;
-        // Drain both pipes on their own threads so a large JSON reply cannot
-        // fill the pipe and stall the child.
-        fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
-            let (send, receive) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                if let Some(mut pipe) = pipe {
-                    let _ = pipe.read_to_end(&mut bytes);
-                }
-                let _ = send.send(bytes);
-            });
-            receive
+        let done = wait_with_deadline(&mut child, timeout).map_err(|failure| match failure {
+            WaitFailure::TimedOut => GhError::Failed(TIMED_OUT.to_string()),
+            WaitFailure::Io(e) => GhError::Failed(e),
+        })?;
+        if done.status.success() {
+            return Ok(done.stdout);
         }
-        let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(GhError::Failed(TIMED_OUT.to_string()));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-                Err(e) => return Err(GhError::Failed(e.to_string())),
-            }
-        };
-        // A grandchild that kept a pipe open must not hold the call forever.
-        let grace = Duration::from_secs(5);
-        let out =
-            String::from_utf8_lossy(&stdout.recv_timeout(grace).unwrap_or_default()).into_owned();
-        let err =
-            String::from_utf8_lossy(&stderr.recv_timeout(grace).unwrap_or_default()).into_owned();
-        if status.success() {
-            return Ok(out);
-        }
-        Err(GhError::Failed(if err.trim().is_empty() {
-            out
+        Err(GhError::Failed(if done.stderr.trim().is_empty() {
+            done.stdout
         } else {
-            err
+            done.stderr
         }))
     }
 }
