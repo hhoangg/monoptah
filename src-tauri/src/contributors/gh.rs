@@ -1,16 +1,31 @@
 //! GitHub (`gh`) enrichment of the Contributors raw data.
 //!
 //! When `gh` is installed, signed in and the repository has a GitHub remote,
-//! the PRs derived from git are replaced by what GitHub reports (author,
-//! commits, reviews, closing issues) and the final diff of each PR is read
-//! from the local repository. Otherwise the git-derived PRs stay and the note
+//! the PRs derived from git are replaced by what GitHub reports and by what the
+//! local repository can read. Otherwise the git-derived PRs stay and the note
 //! says why. Nothing here scores anything.
+//!
+//! What comes from where:
+//! - `gh` gives what git cannot have: the PR list (number, title, author,
+//!   merge time, merge commit), reviews and closing issues, and the closed PR
+//!   list.
+//! - Local git gives the commits of each PR and the final diff of each merged
+//!   PR. The commits are read from the PR head, which GitHub keeps at
+//!   `refs/pull/<N>/head` on `origin`: one `git ls-remote` lists the heads and
+//!   one object-only `git fetch` brings the missing ones in (no ref is created,
+//!   see `pr_heads`). The diff comes from the landing commit (`inspect_landing`).
+//! - A PR whose head or merge commit cannot be made local (no network, the
+//!   fetch failed or timed out) falls back to `gh` for its commits only, and its
+//!   diff stays empty.
 //!
 //! `gh pr list --json` limits that shape this module:
 //! - `commits` makes GitHub count `authors` nodes per commit, so a list call
 //!   with it is rejected above ~40 PRs ("exceeds the maximum limit of 500,000
 //!   nodes"). The list is therefore fetched without `commits`, and the commits
-//!   come from small follow-up calls over narrow `merged:` time ranges.
+//!   that git cannot give come from small follow-up calls over narrow `merged:`
+//!   time ranges.
+//! - `files` is not requested either: it made the list calls heavy, and the
+//!   final diff is computed locally.
 //! - Inline review comments are not exposed by `--json reviews`; only review
 //!   bodies are available, so v1 counts one comment per review body longer
 //!   than 20 characters and never counts inline comments.
@@ -19,8 +34,8 @@
 //!
 //! Every call names the repository (`-R owner/name`, from `origin`), because
 //! in a fork `gh` would otherwise pick `upstream` and overlay another
-//! project's PRs. The whole phase has a wall-clock budget; commit lookups run
-//! on a few worker threads and their results are kept per PR in `CommitCache`.
+//! project's PRs. The whole phase has a wall-clock budget; local work runs on
+//! a few worker threads and the commits of each PR are kept in `CommitCache`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -48,11 +63,11 @@ const CLOSED_LIMIT: usize = 500;
 /// PRs per follow-up `commits` call. GitHub's node budget allows about 40.
 const COMMIT_CHUNK: usize = 25;
 const COMMIT_CHUNK_LIMIT: usize = 30;
-/// PRs whose final diff is computed with local git; the rest use gh `files`.
-const MAX_LOCAL_PRS: usize = 500;
 const COMMENT_MIN_CHARS: usize = 20;
 /// Wall clock for the whole gh phase; past it the git fallback is kept.
 const GH_BUDGET: Duration = Duration::from_secs(90);
+/// Most of the budget the PR head lookup and fetch may use together.
+const HEADS_BUDGET: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKERS: usize = 4;
@@ -60,7 +75,7 @@ const COMMIT_CACHE_CAP: usize = 5000;
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 const MERGED_FIELDS: &str =
-    "number,title,author,mergedAt,mergeCommit,closingIssuesReferences,reviews,baseRefName,files";
+    "number,title,author,mergedAt,mergeCommit,closingIssuesReferences,reviews,baseRefName";
 const CLOSED_FIELDS: &str = "number,title,author,closedAt,baseRefName";
 const COMMIT_FIELDS: &str = "number,commits";
 
@@ -468,14 +483,6 @@ struct GhCommit {
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct GhFile {
-    path: String,
-    additions: u64,
-    deletions: u64,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
 struct GhLabel {
     name: String,
 }
@@ -516,8 +523,6 @@ struct GhPr {
     closing_issues_references: Vec<GhIssueRef>,
     #[serde(deserialize_with = "nullable")]
     reviews: Vec<GhReview>,
-    #[serde(deserialize_with = "nullable")]
-    files: Vec<GhFile>,
 }
 
 #[derive(Deserialize, Default)]
@@ -596,9 +601,39 @@ fn author_login(actor: &Option<GhActor>) -> String {
     }
 }
 
+/// Bots are told apart by gh's flag or by a `[bot]` login (the form git
+/// noreply addresses give).
+fn is_bot_author(author: &GhCommitAuthor) -> bool {
+    author.is_bot
+        || non_empty(&author.login).is_some_and(|l| l.to_ascii_lowercase().ends_with("[bot]"))
+}
+
+/// The one email every non-bot commit author of the PR shares (case
+/// insensitive). `None` when they differ, when one of them has no email, or
+/// when there is no such author.
+fn sole_email(commits: &[GhCommit]) -> Option<&str> {
+    let mut found: Option<&str> = None;
+    for author in commits
+        .iter()
+        .flat_map(|c| c.authors.iter())
+        .filter(|a| !is_bot_author(a))
+    {
+        let email = non_empty(&author.email)?;
+        match found {
+            Some(seen) if !seen.eq_ignore_ascii_case(email) => return None,
+            Some(_) => {}
+            None => found = Some(email),
+        }
+    }
+    found
+}
+
 /// The PR author. The email comes from the PR's own commits written by the
-/// same login (first non-empty one); without it the email stays empty and the
-/// TypeScript side resolves the person through `gh:<login>`.
+/// same login (first non-empty one). Commits read from local git only know a
+/// login for noreply addresses, so without a match by login the email is the
+/// one all non-bot commit authors share, if there is exactly one. Otherwise it
+/// stays empty and the TypeScript side resolves the person through
+/// `gh:<login>`.
 fn pr_author(actor: &Option<GhActor>, commits: &[GhCommit]) -> GitIdentity {
     let login = author_login(actor);
     let name = actor
@@ -612,12 +647,33 @@ fn pr_author(actor: &Option<GhActor>, commits: &[GhCommit]) -> GitIdentity {
         .flat_map(|c| c.authors.iter())
         .filter(|a| non_empty(&a.login).is_some_and(|l| bare_login(l) == bare))
         .find_map(|a| non_empty(&a.email))
+        .or_else(|| sole_email(commits))
         .unwrap_or("")
         .to_string();
     GitIdentity {
         name,
         email,
         login: Some(login),
+    }
+}
+
+/// A commit read from local git in the shape gh reports it: the author first,
+/// then the `Co-authored-by` identities.
+fn gh_commit(commit: &pr_heads::LocalCommit) -> GhCommit {
+    let author = |who: &GitIdentity| GhCommitAuthor {
+        name: Some(who.name.clone()),
+        email: Some(who.email.clone()),
+        login: who.login.clone(),
+        is_bot: false,
+    };
+    GhCommit {
+        message_headline: Some(commit.headline.clone()),
+        authored_date: Some(commit.authored_at.clone()),
+        committed_date: Some(commit.committed_at.clone()),
+        authors: std::iter::once(&commit.author)
+            .chain(commit.co_authors.iter())
+            .map(author)
+            .collect(),
     }
 }
 
@@ -669,18 +725,6 @@ fn branch_commits(commits: &[GhCommit], pr_author: &GitIdentity) -> Vec<RawBranc
                 committed_at: committed,
                 authors,
             }
-        })
-        .collect()
-}
-
-fn gh_files(files: &[GhFile]) -> Vec<RawFile> {
-    files
-        .iter()
-        .filter(|f| !f.path.is_empty() && (f.additions > 0 || f.deletions > 0))
-        .map(|f| RawFile {
-            path: f.path.clone(),
-            added: f.additions,
-            deleted: f.deletions,
         })
         .collect()
 }
@@ -1105,6 +1149,39 @@ fn fetch_commits(
     Ok((found, truncated))
 }
 
+/// `f` over every item on up to `WORKERS` threads. The results keep the order
+/// of `items`; `f` answers `None` for an item it skipped.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> Option<R> + Sync) -> Vec<Option<R>> {
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..WORKERS.min(items.len()) {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(index) else {
+                    break;
+                };
+                *lock(&slots[index]) = f(item);
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| slot.into_inner().unwrap_or_else(|e| e.into_inner()))
+        .collect()
+}
+
+/// The merged and closed PR lists, before any commit is looked up.
+struct Lists {
+    merged: Vec<GhPr>,
+    closed: Vec<GhPr>,
+    truncated: bool,
+    /// the closed list itself was full
+    closed_cut: bool,
+    /// The closed-PR fetch failed; the merged data is still complete.
+    closed_failed: bool,
+}
+
 struct Fetched {
     merged: Vec<GhPr>,
     merged_commits: CommitsByPr,
@@ -1115,12 +1192,7 @@ struct Fetched {
     closed_failed: bool,
 }
 
-fn fetch_closed(
-    ctx: &Ctx,
-    cache: &CommitCache,
-    branch: &str,
-    range: &str,
-) -> Result<(Vec<GhPr>, CommitsByPr, bool), String> {
+fn fetch_closed_list(ctx: &Ctx, branch: &str, range: &str) -> Result<(Vec<GhPr>, bool), String> {
     let base = base_clause(branch);
     let search = format!("closed:{range} -is:merged{base}");
     let limit = CLOSED_LIMIT.to_string();
@@ -1136,28 +1208,20 @@ fn fetch_closed(
     ])?;
     let cut_list = closed.len() >= CLOSED_LIMIT;
     closed.retain(|pr| matches_branch(pr, branch) && non_empty(&pr.closed_at).is_some());
-    let wanted: Vec<(u64, String)> = closed
-        .iter()
-        .filter_map(|pr| Some((pr.number, non_empty(&pr.closed_at)?.to_string())))
-        .collect();
-    let extra = format!(" -is:merged{base}");
-    let (commits, cut_commits) = fetch_commits(ctx, cache, "closed", "closed", &extra, &wanted)?;
-    Ok((closed, commits, cut_list || cut_commits))
+    Ok((closed, cut_list))
 }
 
-fn fetch_all(
-    ctx: &Ctx,
-    cache: &CommitCache,
-    branch: &str,
-    window: &Window,
-) -> Result<Fetched, String> {
+/// The merged and closed PR lists. The merged list is what makes gh usable;
+/// closed PRs only add to it. A failure there is not a reason to drop
+/// everything. It is not "history too large" either, so it gets its own flag
+/// instead of `truncated`.
+fn fetch_lists(ctx: &Ctx, branch: &str, window: &Window) -> Result<Lists, String> {
     let range = format!(
         "{}..{}",
         epoch_to_iso(window.since_epoch),
         epoch_to_iso(window.until_epoch)
     );
     let base = base_clause(branch);
-    let mut truncated = false;
 
     let search = format!("merged:{range}{base}");
     let limit = MERGED_LIMIT.to_string();
@@ -1171,39 +1235,223 @@ fn fetch_all(
         "--json",
         MERGED_FIELDS,
     ])?;
-    truncated |= merged.len() >= MERGED_LIMIT;
+    let truncated = merged.len() >= MERGED_LIMIT;
     merged.retain(|pr| matches_branch(pr, branch) && non_empty(&pr.merged_at).is_some());
-    let wanted: Vec<(u64, String)> = merged
-        .iter()
-        .filter_map(|pr| Some((pr.number, non_empty(&pr.merged_at)?.to_string())))
-        .collect();
-    let (merged_commits, cut) = fetch_commits(ctx, cache, "merged", "merged", &base, &wanted)?;
-    truncated |= cut;
 
-    // The merged fetch is what makes gh usable; closed PRs only add to it. A
-    // failure there is not a reason to drop everything. It is not "history too
-    // large" either, so it gets its own note instead of `truncated`.
-    let mut closed_failed = false;
-    let (closed, closed_commits) = match fetch_closed(ctx, cache, branch, &range) {
-        Ok((closed, commits, cut)) => {
-            truncated |= cut;
-            (closed, commits)
-        }
+    let (closed, closed_cut, closed_failed) = match fetch_closed_list(ctx, branch, &range) {
+        Ok((closed, cut)) => (closed, cut, false),
         // Out of time is out of time for everything.
         Err(note) if note == TOO_SLOW => return Err(note),
-        Err(_) => {
-            closed_failed = true;
-            (Vec::new(), HashMap::new())
+        Err(_) => (Vec::new(), false, true),
+    };
+    Ok(Lists {
+        merged,
+        closed,
+        truncated,
+        closed_cut,
+        closed_failed,
+    })
+}
+
+/// Which PRs `commits_of` resolves.
+#[derive(Clone, Copy)]
+enum Side<'a> {
+    Merged,
+    /// Closed without merging; the PR's commits are the ones the collected
+    /// branch head does not reach.
+    Closed {
+        branch_head: &'a str,
+    },
+}
+
+/// The commits of `prs`, all of one `side`: from the cache, else from the PR
+/// head in local git (`local` maps a PR number to its head, already local),
+/// else, for the PRs that git could not answer, in a few gh calls over narrow
+/// time ranges. `base` is the `base:<branch>` search clause.
+fn commits_of(
+    ctx: &Ctx,
+    cache: &CommitCache,
+    limits: &Limits,
+    local: &HashMap<u64, String>,
+    side: Side,
+    prs: &[GhPr],
+    base: &str,
+) -> Result<(CommitsByPr, bool), String> {
+    let (state, extra) = match side {
+        Side::Merged => ("merged", base.to_string()),
+        Side::Closed { .. } => ("closed", format!(" -is:merged{base}")),
+    };
+    let mut found: CommitsByPr = HashMap::new();
+    let mut truncated = false;
+    // Every PR with its merged or closed time, then the ones git can read, with
+    // what it needs to read them.
+    let mut items: Vec<(u64, String)> = Vec::new();
+    let mut from_git: Vec<(u64, String, &str, String)> = Vec::new();
+    for pr in prs {
+        let at = match side {
+            Side::Merged => non_empty(&pr.merged_at),
+            Side::Closed { .. } => non_empty(&pr.closed_at),
+        };
+        let Some(at) = at else {
+            continue;
+        };
+        items.push((pr.number, at.to_string()));
+        let key = (ctx.slug.to_string(), pr.number, at.to_string());
+        if let Some(hit) = cache.get(&key) {
+            // A list as long as the cap was most likely cut when it was made.
+            truncated |= hit.len() >= limits.max_branch_commits;
+            found.insert(pr.number, hit);
+            continue;
+        }
+        // What the PR's own commits are measured against: before the landing
+        // for a merged PR (the branch for a merge commit, the pre-squash
+        // branch for a squash, the original commits for a rebase), the
+        // collected branch for a closed one.
+        let exclude = match side {
+            Side::Merged => pr
+                .merge_commit
+                .as_ref()
+                .and_then(|m| non_empty(&m.oid))
+                .filter(|oid| is_object_id(oid))
+                .map(|oid| format!("{oid}^1")),
+            Side::Closed { branch_head } => {
+                is_object_id(branch_head).then(|| branch_head.to_string())
+            }
+        };
+        if let (Some(head), Some(exclude)) = (local.get(&pr.number), exclude) {
+            from_git.push((pr.number, at.to_string(), head.as_str(), exclude));
+        }
+    }
+
+    let read = par_map(&from_git, |(_, _, head, exclude)| {
+        ctx.budget.left()?;
+        pr_heads::pr_commits(
+            ctx.root,
+            head,
+            std::slice::from_ref(exclude),
+            limits.max_branch_commits,
+        )
+    });
+    for ((number, at, _, _), commits) in from_git.into_iter().zip(read) {
+        let Some((commits, cut)) = commits else {
+            continue;
+        };
+        let commits: Arc<Vec<GhCommit>> = Arc::new(commits.iter().map(gh_commit).collect());
+        cache.insert((ctx.slug.to_string(), number, at), commits.clone());
+        found.insert(number, commits);
+        truncated |= cut;
+    }
+
+    // What is still missing comes from gh. The lists git just filled are in the
+    // cache, so they split the time ranges like any other cached PR.
+    let (rest, cut) = fetch_commits(ctx, cache, state, state, &extra, &items)?;
+    found.extend(rest);
+    Ok((found, truncated || cut))
+}
+
+/// Everything gh and local git say about the PRs of the window. `find_local`
+/// runs once the lists are known and answers which PRs (by number) have their
+/// head commit in the local repository.
+fn fetch_all(
+    ctx: &Ctx,
+    request: &Request,
+    find_local: impl FnOnce(&Lists) -> HashMap<u64, String>,
+) -> Result<Fetched, String> {
+    let Request {
+        commits: cache,
+        branch,
+        window,
+        head,
+        limits,
+        ..
+    } = *request;
+    let lists = fetch_lists(ctx, branch, window)?;
+    let local = find_local(&lists);
+    let base = base_clause(branch);
+    let mut truncated = lists.truncated;
+
+    let (merged_commits, cut) = commits_of(
+        ctx,
+        cache,
+        limits,
+        &local,
+        Side::Merged,
+        &lists.merged,
+        &base,
+    )?;
+    truncated |= cut;
+
+    let mut closed_failed = lists.closed_failed;
+    let (closed, closed_commits) = if closed_failed {
+        (Vec::new(), HashMap::new())
+    } else {
+        match commits_of(
+            ctx,
+            cache,
+            limits,
+            &local,
+            Side::Closed { branch_head: head },
+            &lists.closed,
+            &base,
+        ) {
+            Ok((commits, cut)) => {
+                truncated |= cut || lists.closed_cut;
+                (lists.closed, commits)
+            }
+            Err(note) if note == TOO_SLOW => return Err(note),
+            Err(_) => {
+                closed_failed = true;
+                (Vec::new(), HashMap::new())
+            }
         }
     };
     Ok(Fetched {
-        merged,
+        merged: lists.merged,
         merged_commits,
         closed,
         closed_commits,
         truncated,
         closed_failed,
     })
+}
+
+/// The head commit, by PR number, of the PRs in `lists` that have no commit
+/// list cached and whose head is in the local repository afterwards. One
+/// `git ls-remote` and one object-only fetch share `HEADS_BUDGET` (never more
+/// than what is left of the budget). Any failure just leaves PRs out, and they
+/// fall back to gh.
+fn local_heads(ctx: &Ctx, cache: &CommitCache, lists: &Lists) -> HashMap<u64, String> {
+    let merged = lists.merged.iter().map(|pr| (pr, &pr.merged_at));
+    let closed = lists.closed.iter().map(|pr| (pr, &pr.closed_at));
+    let uncached: Vec<u64> = merged
+        .chain(closed)
+        .filter(|(pr, at)| {
+            non_empty(at).is_some_and(|at| {
+                cache
+                    .get(&(ctx.slug.to_string(), pr.number, at.to_string()))
+                    .is_none()
+            })
+        })
+        .map(|(pr, _)| pr.number)
+        .collect();
+    let Some(left) = ctx.budget.left().filter(|_| !uncached.is_empty()) else {
+        return HashMap::new();
+    };
+    let total = left.min(HEADS_BUDGET);
+    let started = Instant::now();
+    let Ok(remote) = pr_heads::remote_pr_heads(ctx.root, total) else {
+        return HashMap::new();
+    };
+    let wanted: Vec<(u64, String)> = uncached
+        .into_iter()
+        .filter_map(|n| Some((n, remote.get(&n)?.clone())))
+        .collect();
+    let present =
+        pr_heads::ensure_local(ctx.root, &wanted, total.saturating_sub(started.elapsed()));
+    wanted
+        .into_iter()
+        .filter(|(n, _)| present.contains(n))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,9 +1499,7 @@ fn merged_pr(pr: &GhPr, commits: &[GhCommit], landing: Option<&Landing>) -> RawP
         commit_count: (commits.len() as u64).max(1),
         branch_commits: branch_commits(commits, &author),
         landing_co_authors: co_authors,
-        files: landing
-            .and_then(|l| l.files.clone())
-            .unwrap_or_else(|| gh_files(&pr.files)),
+        files: landing.and_then(|l| l.files.clone()).unwrap_or_default(),
         closes_bug: closes_bug(pr),
         author,
     }
@@ -1339,6 +1585,8 @@ pub(super) struct Request<'a> {
     pub commits: &'a CommitCache,
     pub root: &'a Path,
     pub branch: &'a str,
+    /// The collected branch head; what a closed PR's commits are measured against.
+    pub head: &'a str,
     pub window: &'a Window,
     pub limits: &'a Limits,
 }
@@ -1355,9 +1603,9 @@ fn enrich_within(request: &Request, derived: &mut Derived, total: Duration) -> O
         gh,
         commits: cache,
         root,
-        branch,
         window,
         limits,
+        ..
     } = *request;
     let budget = Budget::new(total);
     let slug = match gh_status(gh, root, &budget) {
@@ -1370,50 +1618,55 @@ fn enrich_within(request: &Request, derived: &mut Derived, total: Duration) -> O
         slug: &slug,
         budget: &budget,
     };
-    let fetched = match fetch_all(&ctx, cache, branch, window) {
+    let fetched = match fetch_all(&ctx, request, |lists| local_heads(&ctx, cache, lists)) {
         Ok(fetched) => fetched,
         Err(note) => return Outcome::unavailable(note),
     };
     let mut truncated = fetched.truncated;
 
-    // Newest first, so the PRs that miss the local-diff cap are the oldest.
+    // Newest first, the order the drafts are kept in.
     let mut order: Vec<&GhPr> = fetched.merged.iter().collect();
     order.sort_by_key(|pr| {
         std::cmp::Reverse(parse_iso_epoch(pr.merged_at.as_deref().unwrap_or("")))
     });
     let no_commits: Arc<Vec<GhCommit>> = Arc::new(Vec::new());
+    let commits_for = |pr: &GhPr| {
+        fetched
+            .merged_commits
+            .get(&pr.number)
+            .unwrap_or(&no_commits)
+            .clone()
+    };
+    // The final diff of every merged PR whose landing commit is local. Git
+    // only, so it runs on a few threads.
+    let landings = par_map(&order, |pr| {
+        budget.left()?;
+        let oid = pr.merge_commit.as_ref().and_then(|m| non_empty(&m.oid))?;
+        let probes: Vec<CommitProbe> = commits_for(pr)
+            .iter()
+            .map(|c| CommitProbe {
+                headline: non_empty(&c.message_headline).unwrap_or("").to_string(),
+                email: c
+                    .authors
+                    .first()
+                    .and_then(|a| non_empty(&a.email))
+                    .unwrap_or("")
+                    .to_string(),
+            })
+            .collect();
+        inspect_landing(root, oid, &probes, limits)
+    });
     let mut drafts: Vec<PrDraft> = Vec::new();
     let mut reviews: Vec<RawReview> = Vec::new();
-    for (index, pr) in order.into_iter().enumerate() {
+    for (pr, landing) in order.into_iter().zip(landings) {
         if budget.left().is_none() {
             return Outcome::unavailable(TOO_SLOW.to_string());
         }
-        let commits = fetched
-            .merged_commits
-            .get(&pr.number)
-            .unwrap_or(&no_commits);
-        let landing = if index < MAX_LOCAL_PRS {
-            let oid = pr.merge_commit.as_ref().and_then(|m| non_empty(&m.oid));
-            let probes: Vec<CommitProbe> = commits
-                .iter()
-                .map(|c| CommitProbe {
-                    headline: non_empty(&c.message_headline).unwrap_or("").to_string(),
-                    email: c
-                        .authors
-                        .first()
-                        .and_then(|a| non_empty(&a.email))
-                        .unwrap_or("")
-                        .to_string(),
-                })
-                .collect();
-            oid.and_then(|oid| inspect_landing(root, oid, &probes, limits))
-        } else {
-            None
-        };
         if let Some(landing) = &landing {
             truncated |= landing.capped;
         }
-        let raw = merged_pr(pr, commits, landing.as_ref());
+        let commits = commits_for(pr);
+        let raw = merged_pr(pr, &commits, landing.as_ref());
         reviews.extend(map_reviews(
             pr,
             &raw.id,
@@ -1541,6 +1794,8 @@ mod tests {
         let dir = scratch_dir();
         git(&dir, ["init", "-q"]).unwrap();
         git(&dir, ["remote", "add", "origin", url]).unwrap();
+        // No network in tests: looking up PR heads fails at once.
+        git(&dir, ["config", "protocol.allow", "never"]).unwrap();
         dir
     }
 
@@ -1559,9 +1814,20 @@ mod tests {
         f(&ctx)
     }
 
+    /// The lists and the gh commit calls, with no PR head available locally.
     fn fetch(github: &FakeGh, cache: &CommitCache, branch: &str) -> Result<Fetched, String> {
+        let win = window();
+        let request = Request {
+            gh: github,
+            commits: cache,
+            root: Path::new("."),
+            branch,
+            head: "",
+            window: &win,
+            limits: &Limits::DEFAULT,
+        };
         with_ctx(github, Duration::from_secs(60), |ctx| {
-            fetch_all(ctx, cache, branch, &window())
+            fetch_all(ctx, &request, |_| HashMap::new())
         })
     }
 
@@ -1805,6 +2071,7 @@ mod tests {
             commits: &cache,
             root: &root,
             branch: "main",
+            head: "",
             window: &win,
             limits: &limits,
         };
@@ -1873,6 +2140,7 @@ mod tests {
             commits: &cache,
             root: &root,
             branch: "main",
+            head: "",
             window: &win,
             limits: &limits,
         };
@@ -1927,6 +2195,7 @@ mod tests {
             commits: &cache,
             root: &alias,
             branch: "main",
+            head: "",
             window: &win,
             limits: &limits,
         };
@@ -2036,6 +2305,7 @@ mod tests {
             commits: &cache,
             root: &root,
             branch: "main",
+            head: "",
             window: &win,
             limits: &limits,
         };
@@ -2063,6 +2333,7 @@ mod tests {
             commits: &cache,
             root: &origin,
             branch: "main",
+            head: "",
             window: &win,
             limits: &limits,
         };
@@ -2181,6 +2452,98 @@ mod tests {
         assert!(lock(&changed.calls)
             .iter()
             .any(|c| c.contains(&COMMIT_FIELDS.to_string())));
+    }
+
+    #[test]
+    fn every_merged_pr_gets_its_files_from_local_git_beyond_the_old_cap() {
+        use std::io::Write;
+        const COUNT: u64 = 510;
+        let root = repo_with_origin("git@github.com:acme/widgets.git");
+        // One commit per PR, written in a single process.
+        let mut stream = String::new();
+        for i in 1..=COUNT {
+            let message = format!("PR {i}");
+            let at = 1_767_225_600 + i * 60;
+            let who = format!("Ann <ann@example.com> {at} +0000");
+            stream.push_str(&format!(
+                "commit refs/heads/main\nauthor {who}\ncommitter {who}\ndata {}\n{message}\n\
+                 M 100644 inline f{i}.txt\ndata 2\nx\n\n",
+                message.len()
+            ));
+        }
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["fast-import", "--quiet"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let shas: Vec<String> = git(&root, ["rev-list", "--reverse", "main"])
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(shas.len() as u64, COUNT);
+
+        let rows: Vec<serde_json::Value> = (1..=COUNT)
+            .map(|n| {
+                let mut row = pr_row(
+                    n,
+                    &format!("2026-02-01T{:02}:{:02}:00Z", n / 60, n % 60),
+                    "main",
+                );
+                row["mergeCommit"] = serde_json::json!({ "oid": shas[n as usize - 1] });
+                row
+            })
+            .collect();
+        let list = serde_json::Value::Array(rows).to_string();
+        let github = FakeGh::new(move |args| {
+            if args[0] != "pr" {
+                return Ok(repo_view());
+            }
+            let json = args[args.iter().position(|a| *a == "--json").unwrap() + 1];
+            Ok(if json == MERGED_FIELDS {
+                list.clone()
+            } else {
+                "[]".to_string()
+            })
+        });
+        let cache = CommitCache::new();
+        let limits = Limits::DEFAULT;
+        let win = window();
+        let request = Request {
+            gh: &github,
+            commits: &cache,
+            root: &root,
+            branch: "main",
+            head: "",
+            window: &win,
+            limits: &limits,
+        };
+        let mut derived = no_derived();
+        let outcome = enrich_within(&request, &mut derived, Duration::from_secs(120));
+        assert!(outcome.available, "{:?}", outcome.note);
+        assert_eq!(derived.drafts.len() as u64, COUNT);
+        // Newest first, and the oldest PRs (past the former 500 cap) have files.
+        let ids: Vec<u64> = derived
+            .drafts
+            .iter()
+            .map(|d| d.pr.id.parse().unwrap())
+            .collect();
+        assert_eq!(ids, (1..=COUNT).rev().collect::<Vec<_>>());
+        for draft in &derived.drafts {
+            let n = draft.pr.number.unwrap();
+            let paths: Vec<&str> = draft.pr.files.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(paths, [format!("f{n}.txt")], "PR {n}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2341,27 +2704,76 @@ mod tests {
     }
 
     #[test]
-    fn gh_files_are_the_fallback_without_a_local_commit() {
+    fn a_merged_pr_without_a_local_landing_has_no_files() {
+        // gh `files` is no longer requested; a diff only comes from local git.
         let pr = only_pr(serde_json::json!({
             "number": 7, "title": "Remote only", "author": { "login": "ann" },
             "mergedAt": "2026-01-10T10:00:00Z", "baseRefName": "main",
-            "files": [
-                { "path": "a.rs", "additions": 5, "deletions": 2, "changeType": "MODIFIED" },
-                { "path": "moved.rs", "additions": 0, "deletions": 0 }
-            ]
+            "files": [{ "path": "a.rs", "additions": 5, "deletions": 2 }]
         }));
         let raw = merged_pr(&pr, &[], None);
-        assert_eq!(
-            raw.files,
-            [RawFile {
-                path: "a.rs".into(),
-                added: 5,
-                deleted: 2
-            }]
-        );
+        assert!(raw.files.is_empty());
         assert_eq!(raw.source, "gh");
         assert_eq!(raw.id, "7");
         assert_eq!(raw.number, Some(7));
+        assert!(!MERGED_FIELDS.contains("files"));
+    }
+
+    fn commit_by_emails(emails: &[(&str, bool)]) -> GhCommit {
+        GhCommit {
+            authors: emails
+                .iter()
+                .map(|(email, is_bot)| GhCommitAuthor {
+                    name: Some("Someone".into()),
+                    email: Some(email.to_string()),
+                    login: None,
+                    is_bot: *is_bot,
+                })
+                .collect(),
+            ..GhCommit::default()
+        }
+    }
+
+    #[test]
+    fn the_author_email_falls_back_to_the_one_email_all_authors_share() {
+        let actor = Some(GhActor {
+            login: Some("ann".into()),
+            ..GhActor::default()
+        });
+        // No commit carries the login; every non-bot author has the same email.
+        let same = vec![
+            commit_by_emails(&[("Ann@Example.com", false)]),
+            commit_by_emails(&[("ann@example.com", false), ("bot@example.com", true)]),
+        ];
+        assert_eq!(pr_author(&actor, &same).email, "Ann@Example.com");
+
+        // Two different emails: nobody can be told apart, so it stays empty.
+        let two = vec![
+            commit_by_emails(&[("ann@example.com", false)]),
+            commit_by_emails(&[("ben@example.com", false)]),
+        ];
+        assert_eq!(pr_author(&actor, &two).email, "");
+
+        // An author without an email breaks the "all share" rule.
+        let unknown = vec![commit_by_emails(&[("ann@example.com", false), ("", false)])];
+        assert_eq!(pr_author(&actor, &unknown).email, "");
+
+        // A match by login still wins over the fallback.
+        let matched = vec![GhCommit {
+            authors: vec![
+                GhCommitAuthor {
+                    email: Some("other@example.com".into()),
+                    ..GhCommitAuthor::default()
+                },
+                GhCommitAuthor {
+                    email: Some("ann@work.example".into()),
+                    login: Some("ann".into()),
+                    ..GhCommitAuthor::default()
+                },
+            ],
+            ..GhCommit::default()
+        }];
+        assert_eq!(pr_author(&actor, &matched).email, "ann@work.example");
     }
 
     #[test]

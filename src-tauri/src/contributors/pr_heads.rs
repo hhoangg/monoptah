@@ -20,7 +20,6 @@ const TIMED_OUT: &str = "git timed out";
 
 /// One commit of a PR branch, read from the local repository.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct LocalCommit {
     pub hash: String,
     pub headline: String,
@@ -73,7 +72,6 @@ fn run_git(
 
 /// `git <args>` with a hard timeout. A timeout kills the process and returns
 /// `Err("git timed out")`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn run_with_timeout(
     root: &Path,
     args: &[&str],
@@ -109,7 +107,6 @@ fn parse_pr_heads(text: &str) -> HashMap<u64, String> {
 
 /// The head commit of every PR the `origin` remote knows, by PR number. One
 /// network call.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn remote_pr_heads(
     root: &Path,
     timeout: Duration,
@@ -149,7 +146,6 @@ fn commits_present(root: &Path, shas: &[&str]) -> HashSet<String> {
 /// missing commits are fetched, with no destination ref, so the repository
 /// gains objects and nothing else. All fetches share the one `timeout`; a
 /// failed or skipped fetch just leaves its PRs out of the result.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn ensure_local(
     root: &Path,
     heads: &[(u64, String)],
@@ -212,7 +208,6 @@ pub(super) fn ensure_local(
 /// everything `exclude` reaches. At most `max` are returned and the flag says
 /// whether there were more (the newest `max` are kept). `None` when git
 /// fails, for example because `head` is not available locally.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn pr_commits(
     root: &Path,
     head: &str,

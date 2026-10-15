@@ -1697,6 +1697,7 @@ fn collect_raw(
             commits: commit_cache,
             root,
             branch,
+            head,
             window,
             limits,
         },
@@ -4621,6 +4622,13 @@ mod tests {
             ALICE,
             "2026-01-01T00:00:00+0000",
         );
+        // No network in tests: the PR head lookup fails at once, so the commits
+        // come from the gh fallback.
+        repo.run(
+            &["config", "protocol.allow", "never"],
+            ALICE,
+            "2026-01-01T00:00:00+0000",
+        );
         repo.run(
             &[
                 "remote",
@@ -4668,7 +4676,7 @@ mod tests {
         assert_eq!(seven.branch_commits.len(), 2);
         assert!(seven.closes_bug);
         assert_eq!(seven.merge_commit.as_deref(), Some(squash.as_str()));
-        // The local final diff wins over gh's `files`.
+        // gh `files` is not read; the final diff is the local one.
         assert_eq!(file_stats(&seven.files), [("parser.txt", 3, 0)]);
 
         let eight = pr_by_id(&data, "8");
@@ -4937,6 +4945,354 @@ mod tests {
         let sampled: Vec<&str> = data.survival.iter().map(|s| s.pr_id.as_str()).collect();
         assert_eq!(sampled, ["7"]);
         assert_eq!(data.survival[0].alive, 3);
+    }
+
+    /// A bare repository that stands in for GitHub's side of `origin`: it
+    /// holds `refs/pull/<n>/head` for the PRs.
+    struct Bare(PathBuf);
+
+    impl Bare {
+        fn attach(repo: &TestRepo) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("monoptah-origin-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let when = "2026-01-01T00:00:00+0000";
+            repo.run(
+                &["init", "-q", "--bare", dir.to_str().unwrap()],
+                ALICE,
+                when,
+            );
+            repo.run(
+                &["remote", "add", "origin", dir.to_str().unwrap()],
+                ALICE,
+                when,
+            );
+            Self(dir)
+        }
+
+        fn publish(&self, repo: &TestRepo, number: u64, sha: &str) {
+            repo.run(
+                &[
+                    "push",
+                    "-q",
+                    "origin",
+                    &format!("{sha}:refs/pull/{number}/head"),
+                ],
+                ALICE,
+                "2026-01-01T00:00:00+0000",
+            );
+        }
+    }
+
+    impl Drop for Bare {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Drops the objects no ref reaches any more, so a PR branch that was
+    /// only pushed to the origin is not in the repository.
+    fn forget_unreachable(repo: &TestRepo) {
+        let when = "2026-01-01T00:00:00+0000";
+        repo.run(&["reflog", "expire", "--expire=now", "--all"], ALICE, when);
+        repo.run(&["prune", "--expire=now"], ALICE, when);
+    }
+
+    fn has_object(repo: &TestRepo, sha: &str) -> bool {
+        git(
+            repo.path(),
+            ["cat-file", "-e", &format!("{sha}^{{commit}}")],
+        )
+        .is_ok()
+    }
+
+    /// Like `fake_github`, but any `commits` follow-up call fails: commits must
+    /// come from local git.
+    fn fake_github_without_commit_calls(
+        merged: serde_json::Value,
+        closed: serde_json::Value,
+    ) -> gh::FakeGh {
+        gh::FakeGh::new(move |args| {
+            let value = |flag: &str| {
+                args.iter()
+                    .position(|a| *a == flag)
+                    .map(|i| args[i + 1])
+                    .unwrap_or("")
+            };
+            let (state, fields) = (value("--state"), value("--json"));
+            match (args[0], state, fields) {
+                ("auth", _, _) => Ok("ok".to_string()),
+                ("repo", _, _) => Ok(serde_json::json!({
+                    "nameWithOwner": "acme/widgets",
+                    "url": "https://github.com/acme/widgets"
+                })
+                .to_string()),
+                ("pr", _, "number,commits") => Err(gh::GhError::Failed(
+                    "commits must come from local git".to_string(),
+                )),
+                ("pr", "merged", _) => Ok(merged.to_string()),
+                ("pr", "closed", _) => Ok(closed.to_string()),
+                _ => panic!("unexpected gh call {args:?}"),
+            }
+        })
+    }
+
+    fn gh_pr(number: u64, login: &str, merged_at: &str, oid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "number": number, "title": format!("PR {number}"), "author": actor(login, login),
+            "mergedAt": merged_at, "mergeCommit": { "oid": oid },
+            "baseRefName": "main", "closingIssuesReferences": [], "reviews": []
+        })
+    }
+
+    #[test]
+    fn pr_commits_and_diffs_come_from_local_git_without_gh_commit_calls() {
+        let repo = TestRepo::new();
+        let bare = Bare::attach(&repo);
+        repo.commit(
+            &[("a.txt", "1\n")],
+            "base",
+            ALICE,
+            "2026-01-05T10:00:00+0000",
+        );
+
+        // PR 7, squash merged: its branch only exists on the origin.
+        repo.checkout_new("pr7");
+        let s1 = repo.commit(
+            &[("parser.txt", "1\n")],
+            "parse one",
+            ALICE,
+            "2026-01-06T10:00:00+0000",
+        );
+        let s2 = repo.commit(
+            &[("parser.txt", "1\n2\n3\n")],
+            "parse all",
+            ALICE,
+            "2026-01-07T10:00:00+0000",
+        );
+        bare.publish(&repo, 7, &s2);
+        repo.checkout("main");
+        repo.run(
+            &["branch", "-q", "-D", "pr7"],
+            ALICE,
+            "2026-01-01T00:00:00+0000",
+        );
+        let squash = repo.commit(
+            &[("parser.txt", "1\n2\n3\n")],
+            "Add parser (#7)",
+            ALICE,
+            "2026-01-10T10:00:00+0000",
+        );
+
+        // PR 9, merged with a merge commit: its commits are already local.
+        repo.checkout_new("feature");
+        repo.commit(&[("f1.txt", "x\n")], "f1", BOB, "2026-01-11T10:00:00+0000");
+        let f2 = repo.commit(
+            &[("f2.txt", "x\ny\n")],
+            "f2",
+            BOB,
+            "2026-01-12T10:00:00+0000",
+        );
+        bare.publish(&repo, 9, &f2);
+        repo.checkout("main");
+        repo.commit(
+            &[("m1.txt", "m\n")],
+            "m1",
+            ALICE,
+            "2026-01-13T10:00:00+0000",
+        );
+        merge_pr_branch(
+            &repo,
+            "feature",
+            "Merge pull request #9 from bob/feature",
+            "2026-01-14T10:00:00+0000",
+        );
+        let merge = repo.run(&["rev-parse", "HEAD"], ALICE, "2026-01-14T10:00:00+0000");
+
+        // PR 11, closed without merging: only on the origin.
+        repo.checkout_new("closed11");
+        repo.commit(
+            &[("wip.txt", "w\n")],
+            "wip one",
+            BOB,
+            "2026-01-15T10:00:00+0000",
+        );
+        let c2 = repo.commit(
+            &[("wip.txt", "w\nw\n")],
+            "wip two",
+            BOB,
+            "2026-01-16T10:00:00+0000",
+        );
+        bare.publish(&repo, 11, &c2);
+        repo.checkout("main");
+        repo.run(
+            &["branch", "-q", "-D", "closed11"],
+            ALICE,
+            "2026-01-01T00:00:00+0000",
+        );
+        forget_unreachable(&repo);
+        assert!(!has_object(&repo, &s2) && !has_object(&repo, &c2));
+
+        let merged = serde_json::json!([
+            gh_pr(7, "alice", "2026-01-10T10:00:00Z", &squash),
+            gh_pr(9, "bob", "2026-01-14T10:00:00Z", &merge),
+        ]);
+        let closed = serde_json::json!([{
+            "number": 11, "title": "Abandoned", "author": actor("bob", "Bob"),
+            "closedAt": "2026-01-20T10:00:00Z", "baseRefName": "main"
+        }]);
+        let github = fake_github_without_commit_calls(merged, closed);
+        let cache = Cache::new();
+        let collect = |force: bool| {
+            collect_cached_with(
+                &cache,
+                &github,
+                repo.path(),
+                SINCE,
+                Some(UNTIL),
+                None,
+                force,
+            )
+            .unwrap()
+        };
+        let data = collect(false);
+
+        // A failing `commits` call would have made gh unavailable.
+        assert!(data.gh_available, "{:?}", data.gh_note);
+        assert_eq!(data.gh_note, None);
+        assert!(github
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| !c.contains(&"number,commits".to_string())));
+
+        let seven = pr_by_id(&data, "7");
+        assert_eq!(seven.source, "gh");
+        assert_eq!(seven.commit_count, 2);
+        assert_eq!(seven.branch_commits.len(), 2);
+        assert_eq!(
+            seven.branch_commits[0].authors[0].email,
+            "alice@example.com"
+        );
+        // No commit carries the login, but all of them share one email.
+        assert_eq!(seven.author.email, "alice@example.com");
+        assert_eq!(file_stats(&seven.files), [("parser.txt", 3, 0)]);
+        assert!(has_object(&repo, &s1) && has_object(&repo, &s2));
+
+        let nine = pr_by_id(&data, "9");
+        assert_eq!(nine.commit_count, 2);
+        assert_eq!(nine.branch_commits.len(), 2);
+        assert_eq!(nine.branch_commits[0].authors[0].email, "bob@example.com");
+        assert_eq!(
+            file_stats(&nine.files),
+            [("f1.txt", 1, 0), ("f2.txt", 2, 0)]
+        );
+
+        let eleven = pr_by_id(&data, "11");
+        assert_eq!(eleven.state, "closed");
+        assert_eq!(eleven.commit_count, 2);
+        assert_eq!(eleven.branch_commits.len(), 2);
+        assert!(!data.truncated);
+
+        // Fetching added objects and nothing else: no ref, no FETCH_HEAD.
+        let refs = repo.run(
+            &["for-each-ref", "--format=%(refname)"],
+            ALICE,
+            "2026-01-01T00:00:00+0000",
+        );
+        assert!(!refs.contains("refs/pull"), "{refs}");
+        assert!(!repo.path().join(".git").join("FETCH_HEAD").exists());
+
+        // The commit lists are cached: a refresh needs neither the origin nor gh.
+        drop(bare);
+        let again = collect(true);
+        assert!(again.gh_available, "{:?}", again.gh_note);
+        assert_eq!(pr_by_id(&again, "7").commit_count, 2);
+        assert_eq!(pr_by_id(&again, "11").commit_count, 2);
+    }
+
+    #[test]
+    fn a_pr_whose_head_cannot_be_fetched_still_gets_commits_from_gh() {
+        let repo = TestRepo::new();
+        let bare = Bare::attach(&repo);
+        repo.commit(
+            &[("a.txt", "1\n")],
+            "base",
+            ALICE,
+            "2026-01-05T10:00:00+0000",
+        );
+        repo.checkout_new("pr7");
+        let head = repo.commit(
+            &[("p.txt", "1\n")],
+            "local work",
+            ALICE,
+            "2026-01-06T10:00:00+0000",
+        );
+        bare.publish(&repo, 7, &head);
+        repo.checkout("main");
+        repo.run(
+            &["branch", "-q", "-D", "pr7"],
+            ALICE,
+            "2026-01-01T00:00:00+0000",
+        );
+        let squash = repo.commit(
+            &[("p.txt", "1\n")],
+            "Add p (#7)",
+            ALICE,
+            "2026-01-10T10:00:00+0000",
+        );
+        let other = repo.commit(
+            &[("q.txt", "1\n")],
+            "Add q (#8)",
+            ALICE,
+            "2026-01-12T10:00:00+0000",
+        );
+        forget_unreachable(&repo);
+
+        // PR 8 has no head on the origin, so gh is asked for its commits only.
+        let merged = serde_json::json!([
+            gh_pr(7, "alice", "2026-01-10T10:00:00Z", &squash),
+            gh_pr(8, "alice", "2026-01-12T10:00:00Z", &other),
+        ]);
+        let merged_commits = serde_json::json!([
+            { "number": 8, "commits": [
+                gh_commit("q one", "alice", "alice@example.com", "2026-01-11T10:00:00Z"),
+                gh_commit("q two", "alice", "alice@example.com", "2026-01-11T11:00:00Z"),
+                gh_commit("q three", "alice", "alice@example.com", "2026-01-11T12:00:00Z"),
+            ] }
+        ]);
+        let github = fake_github(
+            merged,
+            merged_commits,
+            serde_json::json!([]),
+            serde_json::json!([]),
+        );
+        let data = collect_cached_with(
+            &Cache::new(),
+            &github,
+            repo.path(),
+            SINCE,
+            Some(UNTIL),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(data.gh_available, "{:?}", data.gh_note);
+        assert_eq!(pr_by_id(&data, "7").commit_count, 1);
+        assert_eq!(pr_by_id(&data, "8").commit_count, 3);
+        let searches: Vec<String> = github
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains(&"number,commits".to_string()) && c[5] == "merged")
+            .map(|c| c[c.iter().position(|a| a == "--search").unwrap() + 1].clone())
+            .collect();
+        assert_eq!(
+            searches,
+            ["merged:2026-01-12T10:00:00Z..2026-01-12T10:00:00Z base:main"]
+        );
     }
 
     #[test]
