@@ -71,6 +71,28 @@ impl SessionStore {
         self.conn.try_lock().is_ok()
     }
 
+    /// Runs `f` on the query-only read connection, so a long read never waits
+    /// for or blocks the write connection. Stores without one (in-memory test
+    /// stores) fall back to the write connection. Never call git or the network
+    /// inside `f`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_read_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let read_conn = self
+            .read_conn
+            .lock()
+            .map_err(|_| "Session read store is locked".to_string())?;
+        if let Some(conn) = read_conn.as_ref() {
+            f(conn)
+        } else {
+            drop(read_conn);
+            let conn = self.lock_conn()?;
+            f(&conn)
+        }
+    }
+
     pub(crate) fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
         self.conn
             .lock()
@@ -830,7 +852,6 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
     if current < 10 {
-        crate::contributors::store::ensure_tables(conn)?;
         crate::notes::ensure_notes_table(conn)?;
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (10, ?1)",
@@ -965,8 +986,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
     if current < 20 {
-        // Contributors keeps processed commits, PRs and reviews here.
-        crate::contributors::store::ensure_tables(conn)?;
+        // Contributors keeps processed commits, PRs and reviews here. The
+        // tables themselves are created in the unconditional block below, so
+        // a database that recorded another build's version 20 gets them too.
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (20, ?1)",
             params![now_millis()],
@@ -1019,6 +1041,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     ensure_orchestration_history(conn)?;
     crate::mono_transcript::ensure_tables(conn)?;
     crate::mail_store::ensure_tables(conn)?;
+    crate::contributors::store::ensure_tables(conn)?;
     Ok(())
 }
 

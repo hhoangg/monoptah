@@ -457,9 +457,20 @@ pub(super) fn coverage(
     rows.map(|row| row.map_err(sql)).collect()
 }
 
-/// Adds an interval, folding in every stored interval it overlaps or touches.
-/// The result keeps the head, time, GitHub state and note of the most recently
-/// synced of them (the new row wins a tie).
+/// Rank of a GitHub state: the higher, the less complete the data.
+fn gh_rank(state: &str) -> u8 {
+    match state {
+        "unavailable" => 2,
+        "partial" => 1,
+        _ => 0,
+    }
+}
+
+/// Adds an interval. Stored intervals that overlap or touch it and carry the
+/// same GitHub state are folded in (the most recently synced of them supplies
+/// head, time and note; the new row wins a tie). Intervals with another state
+/// are never merged, so a window synced without GitHub keeps saying so: where
+/// the new interval overlaps one of them, that one is cut back to make room.
 pub(super) fn add_coverage(
     tx: &Transaction,
     repo: i64,
@@ -467,10 +478,13 @@ pub(super) fn add_coverage(
     row: &CoverageRow,
 ) -> Result<(), String> {
     let mut merged = row.clone();
+    let mut remainders: Vec<CoverageRow> = Vec::new();
     for other in coverage(tx, repo, branch)? {
+        let overlaps = other.from_epoch <= row.to_epoch && other.to_epoch >= row.from_epoch;
         let touches = other.from_epoch <= row.to_epoch.saturating_add(1)
             && other.to_epoch.saturating_add(1) >= row.from_epoch;
-        if !touches {
+        let same_state = other.gh_state == row.gh_state;
+        if !(overlaps || (touches && same_state)) {
             continue;
         }
         tx.execute(
@@ -479,32 +493,49 @@ pub(super) fn add_coverage(
             params![repo, branch, other.from_epoch],
         )
         .map_err(sql)?;
-        let (from, to) = (
-            merged.from_epoch.min(other.from_epoch),
-            merged.to_epoch.max(other.to_epoch),
-        );
-        if other.synced_at > merged.synced_at {
-            merged = other;
+        if same_state {
+            let (from, to) = (
+                merged.from_epoch.min(other.from_epoch),
+                merged.to_epoch.max(other.to_epoch),
+            );
+            if other.synced_at > merged.synced_at {
+                merged = other;
+            }
+            merged.from_epoch = from;
+            merged.to_epoch = to;
+        } else {
+            if other.from_epoch < row.from_epoch {
+                remainders.push(CoverageRow {
+                    to_epoch: row.from_epoch - 1,
+                    ..other.clone()
+                });
+            }
+            if other.to_epoch > row.to_epoch {
+                remainders.push(CoverageRow {
+                    from_epoch: row.to_epoch + 1,
+                    ..other
+                });
+            }
         }
-        merged.from_epoch = from;
-        merged.to_epoch = to;
     }
-    tx.execute(
-        "INSERT INTO contrib_coverage
-           (repo_id, branch, from_epoch, to_epoch, head, synced_at, gh_state, gh_note)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            repo,
-            branch,
-            merged.from_epoch,
-            merged.to_epoch,
-            merged.head,
-            merged.synced_at,
-            merged.gh_state,
-            merged.gh_note
-        ],
-    )
-    .map_err(sql)?;
+    for interval in remainders.iter().chain(std::iter::once(&merged)) {
+        tx.execute(
+            "INSERT INTO contrib_coverage
+               (repo_id, branch, from_epoch, to_epoch, head, synced_at, gh_state, gh_note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                repo,
+                branch,
+                interval.from_epoch,
+                interval.to_epoch,
+                interval.head,
+                interval.synced_at,
+                interval.gh_state,
+                interval.gh_note
+            ],
+        )
+        .map_err(sql)?;
+    }
     Ok(())
 }
 
@@ -553,37 +584,88 @@ type CommitColumns = (
     bool,
 );
 
-/// Assembles the period `since..=until` of `branch` at `head` from the store.
-/// Which commits belong to it comes from git (hashes only); everything else is
-/// read from the tables. Nothing here fetches or computes: a missing commit or
-/// an uncovered interval only lowers `covered`.
-pub(super) fn load(
-    conn: &Connection,
+/// What git says about a window, gathered without touching the database.
+#[derive(Clone, Debug)]
+pub(super) struct WindowCommits {
+    /// Non-merge commits of the window, `--date-order`.
+    pub hashes: Vec<String>,
+    /// Every commit of the window, merges included: what a PR's merge commit
+    /// must be part of for the PR to still belong to the branch.
+    pub reachable: HashSet<String>,
+}
+
+/// Lists the commits of `since..=until` reachable from `head`. Runs git only:
+/// call it with no database lock held, then pass the result to `load_window`.
+pub(super) fn window_commits(
     root: &Path,
-    repo: i64,
-    branch: &str,
     head: &str,
     since: i64,
     until: i64,
-) -> Result<Loaded, String> {
-    let listing = git(
+) -> Result<WindowCommits, String> {
+    let since_arg = format!("--since=@{since}");
+    let until_arg = format!("--until=@{until}");
+    let lines = |out: String| -> Vec<String> {
+        out.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let hashes = lines(git(
         root,
         [
             "rev-list",
             "--no-merges",
             "--date-order",
-            format!("--since=@{since}").as_str(),
-            format!("--until=@{until}").as_str(),
+            since_arg.as_str(),
+            until_arg.as_str(),
             head,
             "--",
         ],
-    )?;
-    let hashes: Vec<String> = listing
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect();
+    )?);
+    let reachable = lines(git(
+        root,
+        [
+            "rev-list",
+            since_arg.as_str(),
+            until_arg.as_str(),
+            head,
+            "--",
+        ],
+    )?)
+    .into_iter()
+    .collect();
+    Ok(WindowCommits { hashes, reachable })
+}
+
+/// Assembles the period `since..=until` of `branch` at `head` from the store.
+/// Database only, in one read transaction so a batch committed meanwhile
+/// cannot tear the snapshot: pass the store's read connection
+/// (`SessionStore::with_read_conn`). Nothing here fetches or computes: a
+/// missing commit or an uncovered interval only lowers `covered`.
+pub(super) fn load_window(
+    conn: &Connection,
+    repo: i64,
+    branch: &str,
+    head: &str,
+    since: i64,
+    until: i64,
+    commits: &WindowCommits,
+) -> Result<Loaded, String> {
+    let tx = conn.unchecked_transaction().map_err(sql)?;
+    load_in(&tx, repo, branch, head, since, until, commits)
+}
+
+fn load_in(
+    conn: &Connection,
+    repo: i64,
+    branch: &str,
+    head: &str,
+    since: i64,
+    until: i64,
+    window: &WindowCommits,
+) -> Result<Loaded, String> {
+    let hashes = &window.hashes;
 
     let rows: Vec<CommitColumns> = query_in(
         conn,
@@ -591,7 +673,7 @@ pub(super) fn load(
                 co_authors_json, files_json, patch_id, reverts, oversized
          FROM contrib_commits WHERE repo_id = ? AND hash IN ({in})",
         &[&repo],
-        &hashes,
+        hashes,
         |row| {
             Ok((
                 row.get(0)?,
@@ -615,7 +697,7 @@ pub(super) fn load(
     // Keep each patch once: the earliest commit, as the live collector does.
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut committed: HashMap<String, i64> = HashMap::new();
-    for hash in &hashes {
+    for hash in hashes {
         let Some(row) = by_hash.get(hash) else {
             continue;
         };
@@ -633,38 +715,13 @@ pub(super) fn load(
         "SELECT hash, pr_id FROM contrib_commit_prs
          WHERE repo_id = ? AND branch = ? AND hash IN ({in})",
         &[&repo, &branch],
-        &hashes,
+        hashes,
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )?
     .into_iter()
     .collect();
 
-    let mut commits = Vec::new();
-    let mut reverts: Vec<(String, String)> = Vec::new();
-    for hash in &hashes {
-        let Some(row) = by_hash.remove(hash) else {
-            continue;
-        };
-        if let Some(reverted) = &row.9 {
-            reverts.push((hash.clone(), reverted.clone()));
-        }
-        if dropped.contains(hash) {
-            continue;
-        }
-        commits.push(RawCommit {
-            pr_id: pr_of.get(hash).cloned(),
-            hash: row.0,
-            subject: row.1,
-            author: unjson::<GitIdentity>(&row.2)?,
-            committer: unjson::<GitIdentity>(&row.3)?,
-            authored_at: row.4,
-            committed_at: row.5,
-            co_authors: unjson::<Vec<GitIdentity>>(&row.6)?,
-            files: unjson::<Vec<RawFile>>(&row.7)?,
-        });
-    }
-
-    let prs: Vec<RawPr> = {
+    let mut prs: Vec<RawPr> = {
         let mut stmt = conn
             .prepare(
                 "SELECT pr_json FROM contrib_prs
@@ -684,6 +741,45 @@ pub(super) fn load(
         }
         prs
     };
+    // A merged PR whose merge commit is no longer on the branch (force push,
+    // rebase, reset) is gone with it. Closed PRs have no merge commit.
+    let gone: HashSet<String> = prs
+        .iter()
+        .filter(|pr| {
+            pr.state == "merged"
+                && pr
+                    .merge_commit
+                    .as_deref()
+                    .is_some_and(|c| !c.is_empty() && !window.reachable.contains(c))
+        })
+        .map(|pr| pr.id.clone())
+        .collect();
+    prs.retain(|pr| !gone.contains(&pr.id));
+
+    let mut commits = Vec::new();
+    let mut reverts: Vec<(String, String)> = Vec::new();
+    for hash in hashes {
+        let Some(row) = by_hash.remove(hash) else {
+            continue;
+        };
+        if let Some(reverted) = &row.9 {
+            reverts.push((hash.clone(), reverted.clone()));
+        }
+        if dropped.contains(hash) {
+            continue;
+        }
+        commits.push(RawCommit {
+            pr_id: pr_of.get(hash).filter(|id| !gone.contains(*id)).cloned(),
+            hash: row.0,
+            subject: row.1,
+            author: unjson::<GitIdentity>(&row.2)?,
+            committer: unjson::<GitIdentity>(&row.3)?,
+            authored_at: row.4,
+            committed_at: row.5,
+            co_authors: unjson::<Vec<GitIdentity>>(&row.6)?,
+            files: unjson::<Vec<RawFile>>(&row.7)?,
+        });
+    }
 
     let reviews: Vec<RawReview> = {
         let mut stmt = conn
@@ -700,7 +796,10 @@ pub(super) fn load(
             .map_err(sql)?;
         let mut reviews = Vec::new();
         for row in rows {
-            reviews.push(unjson::<RawReview>(&row.map_err(sql)?)?);
+            let review = unjson::<RawReview>(&row.map_err(sql)?)?;
+            if !gone.contains(&review.pr_id) {
+                reviews.push(review);
+            }
         }
         reviews
     };
@@ -743,7 +842,7 @@ pub(super) fn load(
     .collect();
     let mut reverted_pr_ids: Vec<String> = Vec::new();
     for (commit, sha) in &reverts {
-        let Some(pr_id) = reverted_pr_of.get(sha) else {
+        let Some(pr_id) = reverted_pr_of.get(sha).filter(|id| !gone.contains(*id)) else {
             continue;
         };
         // A revert is itself a PR; it must not flag its own PR.
@@ -757,11 +856,18 @@ pub(super) fn load(
 
     let intervals = coverage(conn, repo, branch)?;
     let covered = missing_intervals(&intervals, since, until).is_empty() && missing_commits == 0;
-    let latest = intervals
+    let overlapping: Vec<&CoverageRow> = intervals
         .iter()
         .filter(|r| r.from_epoch <= until && r.to_epoch >= since)
-        .max_by_key(|r| r.synced_at);
-    let gh_state = latest.map(|r| r.gh_state.clone());
+        .collect();
+    // The window is only as complete as its weakest part: report the worst
+    // GitHub state (and that row's note), and the oldest sync for "synced at"
+    // and for where a top-up has to start.
+    let worst = overlapping
+        .iter()
+        .max_by_key(|r| (gh_rank(&r.gh_state), r.synced_at));
+    let oldest = overlapping.iter().min_by_key(|r| r.synced_at);
+    let gh_state = worst.map(|r| r.gh_state.clone());
 
     Ok(Loaded {
         raw: RawData {
@@ -770,7 +876,7 @@ pub(super) fn load(
             since: epoch_to_iso(since),
             until: epoch_to_iso(until),
             gh_available: gh_state.as_deref().is_some_and(|s| s != "unavailable"),
-            gh_note: latest.and_then(|r| r.gh_note.clone()),
+            gh_note: worst.and_then(|r| r.gh_note.clone()),
             commits,
             prs,
             reviews,
@@ -780,8 +886,8 @@ pub(super) fn load(
         },
         covered,
         missing_commits,
-        synced_at: latest.map(|r| r.synced_at),
-        coverage_head: latest.map(|r| r.head.clone()),
+        synced_at: oldest.map(|r| r.synced_at),
+        coverage_head: oldest.map(|r| r.head.clone()),
         gh_state,
     })
 }
@@ -980,18 +1086,20 @@ mod tests {
         }
     }
 
+    fn load_between(f: &Fixture, head: &str, since: i64, until: i64) -> Loaded {
+        let commits = window_commits(f.repo.path(), head, since, until).unwrap();
+        f.store
+            .with_read_conn(|conn| load_window(conn, f.id, "main", head, since, until, &commits))
+            .unwrap()
+    }
+
     fn load_all(f: &Fixture, head: &str) -> Loaded {
-        let conn = f.store.lock_conn().unwrap();
-        load(
-            &conn,
-            f.repo.path(),
-            f.id,
-            "main",
+        load_between(
+            f,
             head,
             epoch("2026-02-01T00:00:00Z"),
             epoch("2026-03-01T00:00:00Z"),
         )
-        .unwrap()
     }
 
     // migration
@@ -1034,6 +1142,46 @@ mod tests {
         }
         assert_eq!(tables, 7);
         assert!(version >= 20);
+    }
+
+    #[test]
+    fn tables_are_created_even_when_version_20_is_already_recorded() {
+        let path = std::env::temp_dir().join(format!(
+            "monoptah-contributors-store-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        drop(SessionStore::open(path.clone()).unwrap());
+        {
+            // Another build used version 20 for something else.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE contrib_repos; DROP TABLE contrib_commits; DROP TABLE contrib_prs;
+                 DROP TABLE contrib_commit_prs; DROP TABLE contrib_reviews;
+                 DROP TABLE contrib_survival; DROP TABLE contrib_coverage;",
+            )
+            .unwrap();
+            let version: i64 = conn
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(version >= 20);
+        }
+        let store = SessionStore::open(path.clone()).unwrap();
+        let conn = store.lock_conn().unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'contrib_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        assert_eq!(tables, 7);
     }
 
     // repo identity
@@ -1182,17 +1330,12 @@ mod tests {
             [(100, 200), (400, 500)]
         );
         // Adjacent (201 follows 200): merged, newest head and time win.
-        let mut fresh = coverage_row(201, 300, "h3", 30);
-        fresh.gh_state = "partial".to_string();
-        fresh.gh_note = Some("rate limited".to_string());
-        add(fresh);
+        add(coverage_row(201, 300, "h3", 30));
         let rows = read("main");
         assert_eq!(rows.len(), 2);
         assert_eq!((rows[0].from_epoch, rows[0].to_epoch), (100, 300));
         assert_eq!(rows[0].head, "h3");
         assert_eq!(rows[0].synced_at, 30);
-        assert_eq!(rows[0].gh_state, "partial");
-        assert_eq!(rows[0].gh_note.as_deref(), Some("rate limited"));
         // Overlaps both: everything folds into one, an older row never wins.
         add(coverage_row(250, 450, "h0", 5));
         let rows = read("main");
@@ -1200,9 +1343,65 @@ mod tests {
         assert_eq!((rows[0].from_epoch, rows[0].to_epoch), (100, 500));
         assert_eq!(rows[0].head, "h3");
         assert_eq!(rows[0].synced_at, 30);
-        assert_eq!(rows[0].gh_state, "partial");
         // A branch has its own intervals.
         assert!(read("other").is_empty());
+    }
+
+    fn state_row(from: i64, to: i64, state: &str, synced_at: i64) -> CoverageRow {
+        let mut row = coverage_row(from, to, &format!("h{synced_at}"), synced_at);
+        row.gh_state = state.to_string();
+        row.gh_note = (state != "complete").then(|| format!("{state} note"));
+        row
+    }
+
+    #[test]
+    fn intervals_with_different_github_states_are_not_merged() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let id = {
+            let conn = store.lock_conn().unwrap();
+            repo_id(&conn, "/r/.git", None).unwrap()
+        };
+        write(&store, |tx| {
+            add_coverage(tx, id, "main", &state_row(100, 199, "unavailable", 10))?;
+            add_coverage(tx, id, "main", &state_row(200, 299, "complete", 20))
+        })
+        .unwrap();
+        let conn = store.lock_conn().unwrap();
+        let rows = coverage(&conn, id, "main").unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.from_epoch, r.to_epoch, r.gh_state.as_str()))
+                .collect::<Vec<_>>(),
+            [(100, 199, "unavailable"), (200, 299, "complete")]
+        );
+        assert!(missing_intervals(&rows, 100, 299).is_empty());
+    }
+
+    #[test]
+    fn a_new_interval_replaces_the_overlap_of_another_state() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let id = {
+            let conn = store.lock_conn().unwrap();
+            repo_id(&conn, "/r/.git", None).unwrap()
+        };
+        write(&store, |tx| {
+            add_coverage(tx, id, "main", &state_row(100, 400, "unavailable", 10))?;
+            add_coverage(tx, id, "main", &state_row(200, 299, "complete", 20))
+        })
+        .unwrap();
+        let conn = store.lock_conn().unwrap();
+        let rows = coverage(&conn, id, "main").unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.from_epoch, r.to_epoch, r.gh_state.as_str(), r.synced_at))
+                .collect::<Vec<_>>(),
+            [
+                (100, 199, "unavailable", 10),
+                (200, 299, "complete", 20),
+                (300, 400, "unavailable", 10)
+            ]
+        );
+        assert!(missing_intervals(&rows, 100, 400).is_empty());
     }
 
     #[test]
@@ -1465,17 +1664,12 @@ mod tests {
     #[test]
     fn load_leaves_out_commits_dated_outside_the_window() {
         let f = synced_fixture();
-        let conn = f.store.lock_conn().unwrap();
-        let loaded = load(
-            &conn,
-            f.repo.path(),
-            f.id,
-            "main",
+        let loaded = load_between(
+            &f,
             &f.hashes[2],
             epoch("2026-02-02T00:00:00Z"),
             epoch("2026-02-02T23:00:00Z"),
-        )
-        .unwrap();
+        );
         let subjects: Vec<&str> = loaded
             .raw
             .commits
@@ -1530,6 +1724,90 @@ mod tests {
             .unwrap();
         }
         assert!(load_all(&f, &f.hashes[2]).raw.reverted_pr_ids.is_empty());
+    }
+
+    #[test]
+    fn load_reports_the_worst_github_state_of_the_window() {
+        let f = synced_fixture();
+        {
+            let conn = f.store.lock_conn().unwrap();
+            conn.execute("DELETE FROM contrib_coverage WHERE repo_id = ?1", [f.id])
+                .unwrap();
+        }
+        let (jan, feb, mar) = (
+            epoch("2026-01-01T00:00:00Z"),
+            epoch("2026-02-01T00:00:00Z"),
+            epoch("2026-03-01T00:00:00Z"),
+        );
+        write(&f.store, |tx| {
+            add_coverage(
+                tx,
+                f.id,
+                "main",
+                &state_row(jan, feb - 1, "unavailable", 100),
+            )?;
+            add_coverage(tx, f.id, "main", &state_row(feb, mar - 1, "complete", 200))?;
+            add_coverage(tx, f.id, "main", &state_row(mar, mar + 99, "partial", 300))
+        })
+        .unwrap();
+        // February alone is complete.
+        let feb_only = load_between(&f, &f.hashes[2], feb, mar - 1);
+        assert!(feb_only.covered);
+        assert_eq!(feb_only.gh_state.as_deref(), Some("complete"));
+        assert!(feb_only.raw.gh_available);
+        // January and February together are only as good as January.
+        let both = load_between(&f, &f.hashes[2], jan, mar - 1);
+        assert!(both.covered);
+        assert_eq!(both.gh_state.as_deref(), Some("unavailable"));
+        assert!(!both.raw.gh_available);
+        assert_eq!(both.raw.gh_note.as_deref(), Some("unavailable note"));
+        assert_eq!(both.synced_at, Some(100));
+        // Complete plus partial reports the partial row and its note.
+        let late = load_between(&f, &f.hashes[2], feb, mar + 10);
+        assert_eq!(late.gh_state.as_deref(), Some("partial"));
+        assert!(late.raw.gh_available);
+        assert_eq!(late.raw.gh_note.as_deref(), Some("partial note"));
+    }
+
+    #[test]
+    fn load_drops_merged_prs_whose_merge_commit_left_the_branch() {
+        let f = synced_fixture();
+        let mut gone = pr("gone", "merged", Some("2026-02-03T11:00:00Z"), None);
+        gone.merge_commit = Some(f.hashes[2].clone());
+        let mut kept = pr("kept", "merged", Some("2026-02-02T11:00:00Z"), None);
+        kept.merge_commit = Some(f.hashes[1].clone());
+        let shut = pr("shut", "closed", None, Some("2026-02-02T12:00:00Z"));
+        write(&f.store, |tx| {
+            put_prs(
+                tx,
+                f.id,
+                "main",
+                &[
+                    (gone, vec![f.hashes[2].clone()]),
+                    (kept, vec![f.hashes[1].clone()]),
+                    (shut, Vec::new()),
+                ],
+            )?;
+            put_reviews(tx, f.id, "main", &[review("gone", "2026-02-03T12:00:00Z")])
+        })
+        .unwrap();
+        let before = load_all(&f, &f.hashes[2]).raw;
+        assert!(before.prs.iter().any(|p| p.id == "gone"));
+        f.repo.run(
+            &["reset", "-q", "--hard", "HEAD~1"],
+            ALICE,
+            "2026-02-04T10:00:00+0000",
+        );
+        let raw = load_all(&f, &f.hashes[1]).raw;
+        let mut ids: Vec<&str> = raw.prs.iter().map(|p| p.id.as_str()).collect();
+        ids.sort_unstable();
+        // pr-1 has no merge commit recorded, so nothing says it left.
+        assert_eq!(ids, ["kept", "pr-1", "shut"]);
+        assert!(raw.reviews.iter().all(|r| r.pr_id != "gone"));
+        assert!(raw
+            .commits
+            .iter()
+            .all(|c| c.pr_id.as_deref() != Some("gone")));
     }
 
     // clearing
