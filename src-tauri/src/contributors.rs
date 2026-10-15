@@ -10,6 +10,7 @@
 //! final PR list. The result is cached as a whole.
 
 mod gh;
+mod pr_heads;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
