@@ -830,6 +830,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
     if current < 10 {
+        crate::contributors::store::ensure_tables(conn)?;
         crate::notes::ensure_notes_table(conn)?;
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (10, ?1)",
@@ -960,6 +961,14 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (19, ?1)",
+            params![now_millis()],
+        )?;
+    }
+    if current < 20 {
+        // Contributors keeps processed commits, PRs and reviews here.
+        crate::contributors::store::ensure_tables(conn)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (20, ?1)",
             params![now_millis()],
         )?;
     }
@@ -2353,7 +2362,7 @@ mod tests {
                        ON sessions (cwd, has_user_message, updated_at DESC, id, harness,
                                     model, runtime_mode, title, provider_session_id,
                                     created_at, branch, archived, pinned, linked_work_item_json);
-                     DELETE FROM schema_migrations WHERE version IN (16, 17, 18, 19);",
+                     DELETE FROM schema_migrations WHERE version IN (16, 17, 18, 19, 20);",
                 )
                 .unwrap();
                 migrate(&conn).unwrap();

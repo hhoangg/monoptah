@@ -11,6 +11,8 @@
 
 mod gh;
 mod pr_heads;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod store;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -2105,17 +2107,17 @@ pub async fn contributors_collect(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    type Who = (&'static str, &'static str);
+    pub(super) type Who = (&'static str, &'static str);
 
-    const ALICE: Who = ("Alice", "alice@example.com");
+    pub(super) const ALICE: Who = ("Alice", "alice@example.com");
     const BOB: Who = ("Bob", "bob@example.com");
     const SINCE: &str = "2026-01-01T00:00:00Z";
     const UNTIL: &str = "2026-06-30T00:00:00Z";
 
-    struct TestRepo {
+    pub(super) struct TestRepo {
         dir: PathBuf,
     }
 
@@ -2126,7 +2128,7 @@ mod tests {
     }
 
     impl TestRepo {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "monoptah-contributors-test-{}",
                 uuid::Uuid::new_v4()
@@ -2141,11 +2143,11 @@ mod tests {
             repo
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             &self.dir
         }
 
-        fn run(&self, args: &[&str], who: Who, date: &str) -> String {
+        pub(super) fn run(&self, args: &[&str], who: Who, date: &str) -> String {
             let output = Command::new("git")
                 .arg("-C")
                 .arg(&self.dir)
@@ -2188,7 +2190,13 @@ mod tests {
             std::fs::write(path, content).unwrap();
         }
 
-        fn commit(&self, files: &[(&str, &str)], message: &str, who: Who, date: &str) -> String {
+        pub(super) fn commit(
+            &self,
+            files: &[(&str, &str)],
+            message: &str,
+            who: Who,
+            date: &str,
+        ) -> String {
             for (path, content) in files {
                 self.write(path, content);
             }
