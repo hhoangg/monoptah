@@ -30,7 +30,7 @@ describe("utf8ToBase64", () => {
 });
 
 describe("contributorsSessionTitle", () => {
-  it("names the season from the file name", () => {
+  it("names the period from the file name", () => {
     expect(contributorsSessionTitle("contributors-2026-10.json")).toBe(
       "Contributors 2026-10",
     );

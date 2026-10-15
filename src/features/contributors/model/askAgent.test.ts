@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { currentPeriod } from "./period";
 import { buildContributorsModel } from "./pipeline";
 import { DEFAULT_CONFIG } from "./config";
 import {
@@ -74,12 +75,12 @@ describe("personNameOf", () => {
 });
 
 describe("askContextChips", () => {
-  it("lists project, branch, season, people and the three data parts for a team", () => {
+  it("lists project, branch, period, people and the three data parts for a team", () => {
     const chips = askContextChips(model, "/work/monoptah", { kind: "team" });
     expect(chips.map((c) => c.id)).toEqual([
       "project",
       "branch",
-      "season",
+      "period",
       "people",
       "scores",
       "formula",
@@ -87,7 +88,7 @@ describe("askContextChips", () => {
     ]);
     expect(chips[0].label).toBe("monoptah");
     expect(chips[1].label).toBe(model.raw.branch);
-    expect(chips[2].label).toBe(`${model.season.label} season`);
+    expect(chips[2].label).toBe(model.period.label);
     expect(chips[3].label).toMatch(/^4 people · \d+ identities$/);
     expect(chips[4].label).toBe("Scores + breakdown");
     expect(chips[5].label).toBe("Scoring formula");
@@ -99,7 +100,7 @@ describe("askContextChips", () => {
     expect(Object.fromEntries(chips.map((c) => [c.id, c.removable]))).toEqual({
       project: false,
       branch: false,
-      season: false,
+      period: false,
       people: true,
       scores: true,
       formula: true,
@@ -115,7 +116,7 @@ describe("askContextChips", () => {
     expect(person.map((c) => c.id)).toEqual([
       "project",
       "branch",
-      "season",
+      "period",
       "focus",
       "people",
       "scores",
@@ -191,35 +192,34 @@ describe("buildAskSnapshot", () => {
     expect(s.commits.length).toBeGreaterThan(0);
   });
 
-  it("tells the agent what was left out and what the stats cover", () => {
+  it("tells the agent what was left out", () => {
     const s = snap({ omit: ["formula", "ai"] });
     const note = s.notes.find((n: string) => n.startsWith("Left out"));
     expect(note).toContain("scoring formula");
     expect(note).toContain("AI-assisted");
-    expect(
-      s.notes.some((n: string) => n.startsWith("The stats section covers")),
-    ).toBe(true);
     expect(snap().notes.some((n: string) => n.startsWith("Left out"))).toBe(
       false,
     );
   });
 
-  it("names the page range in the stats note, a custom range by its two days", () => {
-    const note = (m: typeof model) =>
-      (
+  it("describes the period once, for the scores and the stats alike", () => {
+    const s = snap();
+    expect(s.notes.some((n: string) => n.includes("page range"))).toBe(false);
+    const withPeriod = JSON.parse(
+      JSON.stringify(
         buildAskSnapshot({
-          model: m,
+          model,
           project: "/work/monoptah",
           scope: { kind: "team" },
           options: options(),
           now: NOW,
-        }) as unknown as Snap
-      ).notes.find((n) => n.startsWith("The stats section covers"));
-    expect(note(model)).toContain('page range "30d"');
-    const custom = leaderboardModel({
-      range: { key: "custom", start: "2026-10-05", end: "2026-10-12" },
+        }),
+      ),
+    ) as { period: { kind: string; label: string } };
+    expect(withPeriod.period).toMatchObject({
+      kind: "month",
+      label: "Oct 2026",
     });
-    expect(note(custom)).toContain('page range "2026-10-05 to 2026-10-12"');
   });
 
   it("limits prs to the focused person", () => {
@@ -245,13 +245,13 @@ describe("buildAskRequest", () => {
       harness: "claude",
     });
     expect(req.question).toBe("Who drove the work?");
-    expect(req.fileName).toBe(`contributors-${model.season.id}.json`);
+    expect(req.fileName).toBe(`contributors-${model.period.id}.json`);
     expect(req.harness).toBe("claude");
     expect(req.scope).toEqual({ kind: "team" });
     expect(req.prompt).toContain("Question: Who drove the work?");
     expect(req.prompt).toContain(req.fileName);
     expect(req.prompt).toContain('"monoptah"');
-    expect(JSON.parse(req.snapshotJson).season.id).toBe(model.season.id);
+    expect(JSON.parse(req.snapshotJson).period.id).toBe(model.period.id);
   });
 
   it("expresses allowTools in the prompt", () => {
@@ -292,7 +292,7 @@ describe("anonymised snapshot (people chip removed)", () => {
     config: DEFAULT_CONFIG,
     mailmap: [],
     merge: true,
-    range: "30d",
+    period: currentPeriod("month", NOW),
     now: NOW,
     user: { name: "Ana", email: "ana@example.com" },
   });
@@ -406,7 +406,7 @@ describe("anonymised snapshot (people chip removed)", () => {
 });
 
 describe("people chip counts", () => {
-  it("counts people seen only in the stats range too", () => {
+  it("counts people seen only in the stats rows too", () => {
     const rows = model.leaderboard.rows.length;
     const people = askContextChips(model, "/work/monoptah", {
       kind: "team",

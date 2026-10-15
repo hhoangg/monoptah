@@ -2,7 +2,7 @@
 import { DEFAULT_CONFIG } from "../model/config";
 import { buildContributorsModel } from "../model/pipeline";
 import type { ContributorsModel } from "../model/pipeline";
-import { sinceFor } from "../model/range";
+import { currentPeriod, syncWindow } from "../model/period";
 import {
   ANA,
   BOB,
@@ -41,7 +41,7 @@ export function leaderboardRaw(extra: Partial<RawData> = {}): RawData {
       }),
     );
   return makeRaw({
-    since: sinceFor("30d", NOW),
+    since: syncWindow(currentPeriod("month", NOW), NOW).from.toISOString(),
     commits: [
       ...days("ana-o", ANA, [1, 2, 5, 6, 7, 8], oct),
       ...days("bob-o", BOB, [1, 2, 5, 6], oct),
@@ -76,7 +76,7 @@ export function leaderboardModel(
     config: DEFAULT_CONFIG,
     mailmap: [],
     merge: true,
-    range: "30d",
+    period: currentPeriod("month", NOW),
     now: NOW,
     user: { name: "Ana", email: "ana@example.com" },
     ...overrides,

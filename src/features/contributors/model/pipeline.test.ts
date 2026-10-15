@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "./config";
 import { buildContributorsModel } from "./pipeline";
-import { sinceFor } from "./range";
-import type { CustomRange, RangeValue } from "./range";
+import { currentPeriod, previousPeriod, syncWindow } from "./period";
+import type { Period } from "./period";
 import {
   ANA,
   BOB,
@@ -16,6 +16,9 @@ import {
 } from "./testFixtures";
 
 const NOW = new Date(2026, 9, 20, 10);
+const MONTH = currentPeriod("month", NOW);
+/** The since the hook collects for a period. */
+const sinceOf = (period: Period) => syncWindow(period, NOW).from.toISOString();
 
 function raw() {
   return makeRaw({
@@ -31,19 +34,19 @@ function raw() {
 }
 
 describe("buildContributorsModel", () => {
-  it("scores the current and the previous season and builds the board and stats", () => {
+  it("scores the period and the one before it and builds the board and stats", () => {
     const model = buildContributorsModel({
       raw: raw(),
       config: DEFAULT_CONFIG,
       mailmap: [],
       merge: true,
-      range: "30d",
+      period: MONTH,
       now: NOW,
     });
-    expect(model.season.id).toBe("2026-10");
-    expect(model.previousSeason.id).toBe("2026-09");
-    expect(model.current.season.id).toBe("2026-10");
-    expect(model.previous.season.id).toBe("2026-09");
+    expect(model.period.id).toBe("2026-10");
+    expect(model.previousPeriod.id).toBe("2026-09");
+    expect(model.current.period.id).toBe("2026-10");
+    expect(model.previous.period.id).toBe("2026-09");
     expect(model.leaderboard.rows.length).toBeGreaterThan(0);
     expect(model.stats.kpis.commits.value).toBe(3);
     expect(model.hasActivity).toBe(true);
@@ -64,7 +67,7 @@ describe("buildContributorsModel", () => {
       config,
       mailmap: [],
       merge: true,
-      range: "30d",
+      period: MONTH,
       now: NOW,
     });
     const off = buildContributorsModel({
@@ -72,7 +75,7 @@ describe("buildContributorsModel", () => {
       config,
       mailmap: [],
       merge: false,
-      range: "30d",
+      period: MONTH,
       now: NOW,
     });
     expect(on.stats.rows.map((r) => r.name).sort()).toEqual(["Ana", "Bob"]);
@@ -85,7 +88,7 @@ describe("buildContributorsModel", () => {
       config: DEFAULT_CONFIG,
       mailmap: [],
       merge: true,
-      range: "30d",
+      period: MONTH,
       now: NOW,
       user: { name: "Bob", email: "BOB@example.com" },
     });
@@ -99,7 +102,7 @@ describe("buildContributorsModel", () => {
       config: DEFAULT_CONFIG,
       mailmap: [],
       merge: true,
-      range: "30d" as const,
+      period: MONTH,
       now: NOW,
     };
     expect(
@@ -120,20 +123,20 @@ describe("buildContributorsModel", () => {
       config: DEFAULT_CONFIG,
       mailmap: [],
       merge: true,
-      range: "30d",
+      period: MONTH,
       now: NOW,
       user: { name: "Zed", email: "z@x.io" },
     });
     expect(model.resolver.people.some((p) => p.id === "z@x.io")).toBe(false);
   });
 
-  it("reports no activity when nothing falls inside the range", () => {
+  it("reports no activity when nothing falls inside the period", () => {
     const model = buildContributorsModel({
       raw: makeRaw(),
       config: DEFAULT_CONFIG,
       mailmap: [],
       merge: true,
-      range: "30d",
+      period: MONTH,
       now: NOW,
     });
     expect(model.hasActivity).toBe(false);
@@ -145,7 +148,7 @@ describe("buildContributorsModel", () => {
       config: DEFAULT_CONFIG,
       mailmap: [],
       merge: true,
-      range: "30d",
+      period: MONTH,
       now: NOW,
     });
     // ana@example.com and bob@example.com are ordinary authors; the .local
@@ -153,9 +156,10 @@ describe("buildContributorsModel", () => {
     expect(model.unmapped.map((u) => u.key)).toEqual(["ana@laptop.local"]);
   });
 
-  it("compares KPIs with the equal-length period before the range and the board with the previous season", () => {
+  it("compares KPIs and the board with the previous period of the same kind", () => {
+    const week = currentPeriod("7d", NOW);
     const data = makeRaw({
-      since: sinceFor("7d", NOW),
+      since: sinceOf(week),
       commits: [
         makeCommit("old", ANA, new Date(2026, 8, 25, 12).toISOString(), {
           files: [file("src/a.ts", 4)],
@@ -170,20 +174,22 @@ describe("buildContributorsModel", () => {
       config: DEFAULT_CONFIG,
       mailmap: [],
       merge: true,
-      range: "7d",
+      period: week,
       now: NOW,
     });
     // 7d = Oct 14-20; the previous 7 days are Oct 7-13 (empty), not Sep 25.
     expect(model.stats.kpis.commits.value).toBe(3);
     expect(model.stats.kpis.commits.delta).toBeNull();
     expect(model.stats.kpis.prsMerged.delta).toBe(0);
-    expect(model.previous.season.id).toBe("2026-09");
-    expect(model.previous.people.map((p) => p.mainCommits)).toEqual([1]);
+    expect(model.period.id).toBe("7d");
+    expect(model.previousPeriod.start).toEqual(new Date(2026, 9, 7));
+    expect(model.previous.period.start).toEqual(new Date(2026, 9, 7));
+    expect(model.previous.people).toEqual([]);
   });
 
-  it("shows deltas for the default range with the since the hook really collects", () => {
+  it("shows deltas for a month with the since the hook really collects", () => {
     const data = makeRaw({
-      since: sinceFor("30d", NOW),
+      since: sinceOf(MONTH),
       commits: [
         makeCommit("old", ANA, new Date(2026, 8, 5, 9).toISOString(), {
           files: [file("src/a.ts", 4)],
@@ -196,7 +202,7 @@ describe("buildContributorsModel", () => {
       config: DEFAULT_CONFIG,
       mailmap: [],
       merge: true,
-      range: "30d",
+      period: MONTH,
       now: NOW,
     });
     expect(model.stats.kpis.commits.delta).not.toBeNull();
@@ -211,138 +217,105 @@ describe("buildContributorsModel", () => {
         { name: "Ana", identities: ["ana@example.com", "ana@laptop.local"] },
       ],
       merge: true,
-      range: "30d",
+      period: MONTH,
       now: NOW,
     });
     expect(model.stats.rows.map((r) => r.name).sort()).toEqual(["Ana", "Bob"]);
     expect(model.unmapped).toEqual([]);
   });
 
-  describe("custom range", () => {
-    const range: CustomRange = {
-      key: "custom",
-      start: "2026-10-06",
-      end: "2026-10-15",
-    };
-    const data = () =>
-      makeRaw({
-        since: sinceFor(range, NOW),
-        commits: [
-          makeCommit("before", ANA, oct(3), { files: [file("src/a.ts", 4)] }),
-          makeCommit("in1", ANA, oct(6), { files: [file("src/a.ts", 4)] }),
-          makeCommit("in2", ANA, oct(15), { files: [file("src/a.ts", 4)] }),
-          makeCommit("after", ANA, oct(18), { files: [file("src/a.ts", 4)] }),
-        ],
-      });
-    const build = (chosen: RangeValue = range) =>
-      buildContributorsModel({
-        raw: data(),
-        config: DEFAULT_CONFIG,
-        mailmap: [],
-        merge: true,
-        range: chosen,
-        now: NOW,
-      });
-
-    it("shows exactly the chosen days, both inclusive", () => {
-      const model = build();
-      expect(model.rangeStart).toEqual(new Date(2026, 9, 6));
-      expect(model.rangeEnd).toEqual(new Date(2026, 9, 16));
-      expect(model.rangeDays).toBe(10);
-      expect(model.rangeLabel).toBe("2026-10-06 to 2026-10-15");
-      expect(model.stats.kpis.commits.value).toBe(2);
-    });
-
-    it("compares with the equal-length period right before the range", () => {
-      // Oct 6-15 is 10 days; the previous 10 days are Sep 26 - Oct 5.
-      const model = build();
-      expect(model.stats.kpis.commits.delta).toBe(1);
-    });
-
-    it("keeps the board on the ranked season, whatever the range", () => {
-      const model = build();
-      expect(model.season.id).toBe("2026-10");
-      expect(model.leaderboard.rows[0].name).toBe("Ana");
-    });
-
-    it("has no activity for a range with no commits", () => {
-      const model = build({
-        key: "custom",
-        start: "2026-10-09",
-        end: "2026-10-12",
-      });
-      expect(model.hasActivity).toBe(false);
-      expect(build().hasActivity).toBe(true);
-    });
-
-    it("enforces the 30 day cap on a stored value", () => {
-      const model = build({
-        key: "custom",
-        start: "2026-01-01",
-        end: "2026-10-15",
-      });
-      expect(model.rangeDays).toBe(30);
-      expect(model.rangeEnd).toEqual(new Date(2026, 9, 16));
-    });
-
-    it("labels a preset by its key", () => {
-      const model = build("30d");
-      expect(model.rangeLabel).toBe("30d");
-      expect(model.rangeDays).toBe(30);
-    });
-  });
-
-  describe("selected season", () => {
+  describe("periods", () => {
     const sept = (day: number) => new Date(2026, 8, day, 12).toISOString();
-    const seasonRaw = () =>
+    const periodRaw = () =>
       makeRaw({
-        since: new Date(2026, 6, 1).toISOString(),
+        since: new Date(2025, 0, 1).toISOString(),
         commits: [
+          makeCommit("y1", ANA, new Date(2025, 5, 3, 12).toISOString(), {
+            files: [file("src/a.ts", 10)],
+          }),
+          makeCommit("q1", ANA, new Date(2026, 5, 3, 12).toISOString(), {
+            files: [file("src/a.ts", 10)],
+          }),
           makeCommit("s1", BOB, sept(8), { files: [file("src/a.ts", 30)] }),
           makeCommit("s2", BOB, sept(9), { files: [file("src/a.ts", 30)] }),
           makeCommit("o1", ANA, oct(5), { files: [file("src/b.ts", 10)] }),
+          makeCommit("o2", ANA, oct(18), { files: [file("src/b.ts", 10)] }),
         ],
       });
-    const build = (seasonId?: string) =>
+    const build = (period: Period) =>
       buildContributorsModel({
-        raw: seasonRaw(),
+        raw: periodRaw(),
         config: DEFAULT_CONFIG,
         mailmap: [],
         merge: true,
-        range: "30d",
+        period,
         now: NOW,
-        seasonId,
       });
 
-    it("scores the current month when none is selected", () => {
-      const model = build();
-      expect(model.season.id).toBe("2026-10");
+    it("ranks and shows the stats of the same month", () => {
+      const model = build(MONTH);
+      expect(model.period.id).toBe("2026-10");
       expect(model.leaderboard.rows.map((r) => r.name)).toEqual(["Ana"]);
+      expect(model.stats.kpis.commits.value).toBe(2);
+      expect(model.stats.granularity).toBe("day");
     });
 
-    it("re-scores an older season from the same raw data", () => {
-      const model = build("2026-09");
-      expect(model.season.id).toBe("2026-09");
-      expect(model.previousSeason.id).toBe("2026-08");
-      expect(model.current.season.id).toBe("2026-09");
+    it("re-scores an older month from the same raw data", () => {
+      const model = build(previousPeriod(MONTH));
+      expect(model.period.id).toBe("2026-09");
+      expect(model.previousPeriod.id).toBe("2026-08");
+      expect(model.current.period.id).toBe("2026-09");
       expect(model.leaderboard.rows.map((r) => r.name)).toEqual(["Bob"]);
+      expect(model.stats.kpis.commits.value).toBe(2);
     });
 
-    it("compares with the season before the selected one", () => {
-      const model = build("2026-10");
-      expect(model.previousSeason.id).toBe("2026-09");
+    it("moves rank against the previous period of the same kind", () => {
+      const model = build(MONTH);
+      expect(model.previousPeriod.id).toBe("2026-09");
       expect(model.leaderboard.rows[0].movement).toBeNull();
     });
 
-    it("falls back to the current month for an unknown id", () => {
-      expect(build("nope").season.id).toBe("2026-10");
+    it("covers a quarter with weekly buckets and a year with monthly ones", () => {
+      const quarter = build(currentPeriod("quarter", NOW));
+      expect(quarter.period.id).toBe("2026-Q4");
+      expect(quarter.stats.granularity).toBe("week");
+      expect(quarter.stats.kpis.commits.value).toBe(2);
+      const year = build(currentPeriod("year", NOW));
+      expect(year.period.id).toBe("2026");
+      expect(year.stats.granularity).toBe("month");
+      expect(year.stats.kpis.commits.value).toBe(5);
+      expect(year.stats.buckets.map((b) => b.start)).toEqual([
+        "2026-01-01",
+        "2026-02-01",
+        "2026-03-01",
+        "2026-04-01",
+        "2026-05-01",
+        "2026-06-01",
+        "2026-07-01",
+        "2026-08-01",
+        "2026-09-01",
+        "2026-10-01",
+      ]);
     });
 
-    it("keeps the stats range tied to now, not to the season", () => {
-      const a = build();
-      const b = build("2026-09");
-      expect(b.rangeStart).toEqual(a.rangeStart);
-      expect(b.rangeEnd).toEqual(a.rangeEnd);
+    it("compares the year with the year before", () => {
+      const year = build(currentPeriod("year", NOW));
+      expect(year.previousPeriod.id).toBe("2025");
+      expect(year.stats.kpis.commits.delta).toBe(4);
+    });
+
+    it("stops the chart at today for the current period", () => {
+      const week = build(currentPeriod("7d", NOW));
+      expect(week.stats.buckets).toHaveLength(7);
+      expect(week.stats.buckets[6].start).toBe("2026-10-20");
+      const month = build(MONTH);
+      expect(month.stats.buckets).toHaveLength(20);
+    });
+
+    it("has no activity for a period with no commits", () => {
+      expect(build(currentPeriod("7d", NOW)).hasActivity).toBe(true);
+      const empty = build(previousPeriod(previousPeriod(MONTH)));
+      expect(empty.hasActivity).toBe(false);
     });
   });
   describe("person colors", () => {
@@ -372,7 +345,7 @@ describe("buildContributorsModel", () => {
         config: DEFAULT_CONFIG,
         mailmap: [],
         merge: true,
-        range: "30d",
+        period: MONTH,
         now: NOW,
         ...extra,
       });
@@ -395,30 +368,16 @@ describe("buildContributorsModel", () => {
       }
     });
 
-    it("keeps a person's color across ranges, seasons and merge", () => {
+    it("keeps a person's color across periods", () => {
       const base = build().colors;
-      expect(build({ range: "7d" }).colors).toEqual(base);
-      expect(build({ seasonId: "2026-09" }).colors).toEqual(base);
+      expect(build({ period: currentPeriod("7d", NOW) }).colors).toEqual(base);
+      expect(build({ period: previousPeriod(MONTH) }).colors).toEqual(base);
     });
 
-    it("keeps colors of people outside the range distinct too", () => {
-      const model = build({ range: "7d" });
+    it("keeps colors of people outside the period distinct too", () => {
+      const model = build({ period: currentPeriod("7d", NOW) });
       const ids = Object.keys(model.colors);
       expect(new Set(ids.map((id) => model.colors[id])).size).toBe(ids.length);
     });
-  });
-
-  it("knows the current season from now, whatever season is ranked", () => {
-    const model = buildContributorsModel({
-      raw: raw(),
-      config: DEFAULT_CONFIG,
-      mailmap: [],
-      merge: true,
-      range: "30d",
-      now: NOW,
-      seasonId: "2026-09",
-    });
-    expect(model.season.id).toBe("2026-09");
-    expect(model.currentSeasonId).toBe("2026-10");
   });
 });

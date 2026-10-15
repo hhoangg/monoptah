@@ -13,10 +13,12 @@ import {
   prPoints,
   prSize,
   qualityFactor,
-  scoreSeason,
+  scorePeriod,
   streakOf,
 } from "./scoring";
-import type { PersonScore, SeasonScores } from "./scoring";
+import { currentPeriod } from "./period";
+import type { Period } from "./period";
+import type { PersonScore, PeriodScores } from "./scoring";
 import {
   ANA,
   BOB,
@@ -24,7 +26,8 @@ import {
   CLAUDE,
   DEPENDABOT,
   GITHUB,
-  SEASON,
+  PERIOD,
+  PERIOD_NOW,
   file,
   ident,
   makeCommit,
@@ -40,16 +43,17 @@ import type { ContributorsConfig, RawCommit, RawData, RawPr } from "./types";
 function score(
   raw: RawData,
   config: ContributorsConfig = DEFAULT_CONFIG,
-): SeasonScores {
-  return scoreSeason({
+): PeriodScores {
+  return scorePeriod({
     raw,
     config,
     resolver: makeResolver(raw, config),
-    season: SEASON,
+    period: PERIOD,
+    now: PERIOD_NOW,
   });
 }
 
-function of(scores: SeasonScores, name: string): PersonScore {
+function of(scores: PeriodScores, name: string): PersonScore {
   const found = scores.people.find((p) => p.name === name);
   if (!found) throw new Error(`no person named ${name}`);
   return found;
@@ -183,7 +187,8 @@ describe("isTestPath and isDocsPath", () => {
 
 describe("streakOf", () => {
   const day = (d: number) => `2026-10-${String(d).padStart(2, "0")}`;
-  const streak = (days: number[]) => streakOf(days.map(day), SEASON);
+  const streak = (days: number[]) =>
+    streakOf(days.map(day), PERIOD, PERIOD_NOW);
 
   it("is 0 without activity", () => {
     expect(streak([])).toBe(0);
@@ -212,13 +217,39 @@ describe("streakOf", () => {
     expect(streak([9, 13, 14])).toBe(2);
   });
 
-  it("ignores days outside the season", () => {
-    expect(streakOf(["2026-09-30", "2026-10-01"], SEASON)).toBe(1);
-    expect(streakOf(["2026-11-02"], SEASON)).toBe(0);
+  it("ignores days outside the period", () => {
+    expect(streakOf(["2026-09-30", "2026-10-01"], PERIOD, PERIOD_NOW)).toBe(1);
+    expect(streakOf(["2026-11-02"], PERIOD, PERIOD_NOW)).toBe(0);
   });
 
   it("takes the longest run", () => {
     expect(streak([1, 2, 6, 7, 8, 9])).toBe(4);
+  });
+
+  it("does not look past today in the current period", () => {
+    const now = new Date(2026, 9, 9, 10);
+    expect(streakOf([5, 6, 7, 8, 9, 12, 13].map(day), PERIOD, now)).toBe(5);
+  });
+
+  it("runs over the days of a 7d period, even across a month change", () => {
+    const now = new Date(2026, 10, 3, 10); // Tue 2026-11-03
+    const week = currentPeriod("7d", now);
+    expect(
+      streakOf(
+        ["2026-10-28", "2026-10-29", "2026-10-30", "2026-11-02"],
+        week,
+        now,
+      ),
+    ).toBe(4);
+    expect(streakOf(["2026-10-27"], week, now)).toBe(0);
+  });
+
+  it("runs across the whole of a quarter", () => {
+    const now = new Date(2026, 11, 31, 10);
+    const quarter = currentPeriod("quarter", now);
+    expect(
+      streakOf(["2026-10-30", "2026-11-02", "2026-12-31"], quarter, now),
+    ).toBe(2);
   });
 });
 
@@ -254,7 +285,7 @@ describe("observedIdentities", () => {
   });
 });
 
-describe("scoreSeason: delivery", () => {
+describe("scorePeriod: delivery", () => {
   it("scores a merged PR by its final diff and commit count", () => {
     const raw = makeRaw({
       prs: [
@@ -359,7 +390,7 @@ describe("scoreSeason: delivery", () => {
     expect(of(score(raw), "Ana").activeDays).toBe(1);
   });
 
-  it("only counts PRs merged inside the season", () => {
+  it("only counts PRs merged inside the period", () => {
     const raw = makeRaw({
       prs: [
         makePr("before", ANA, new Date(2026, 8, 30, 23).toISOString()),
@@ -397,7 +428,7 @@ describe("scoreSeason: delivery", () => {
   });
 });
 
-describe("scoreSeason: quality", () => {
+describe("scorePeriod: quality", () => {
   it("multiplies delivery by the survival factor", () => {
     const raw = makeRaw({
       prs: [makePr("1", ANA, oct(8)), makePr("2", ANA, oct(9))],
@@ -458,7 +489,7 @@ describe("scoreSeason: quality", () => {
   });
 });
 
-describe("scoreSeason: care", () => {
+describe("scorePeriod: care", () => {
   const care = (pr: Partial<RawPr>) =>
     of(score(makeRaw({ prs: [makePr("1", ANA, oct(8), pr)] })), "Ana");
 
@@ -515,7 +546,7 @@ describe("scoreSeason: care", () => {
   });
 });
 
-describe("scoreSeason: credit", () => {
+describe("scorePeriod: credit", () => {
   it("splits 60/40 with human co-authors", () => {
     const raw = makeRaw({
       prs: [
@@ -632,11 +663,12 @@ describe("scoreSeason: credit", () => {
       ],
       observedIdentities: observedIdentities(raw),
     });
-    const scores = scoreSeason({
+    const scores = scorePeriod({
       raw,
       config: DEFAULT_CONFIG,
       resolver,
-      season: SEASON,
+      period: PERIOD,
+      now: PERIOD_NOW,
     });
     expect(scores.people).toEqual([]);
     expect(scores.unattributed.prs).toBe(1);
@@ -701,11 +733,12 @@ describe("scoreSeason: credit", () => {
         ],
         observedIdentities: observedIdentities(raw),
       });
-      return scoreSeason({
+      return scorePeriod({
         raw,
         config: DEFAULT_CONFIG,
         resolver,
-        season: SEASON,
+        period: PERIOD,
+        now: PERIOD_NOW,
       });
     };
 
@@ -771,7 +804,7 @@ describe("scoreSeason: credit", () => {
   });
 });
 
-describe("scoreSeason: commits and consistency", () => {
+describe("scorePeriod: commits and consistency", () => {
   it("counts owned mainline commits and their days", () => {
     const raw = makeRaw({
       commits: [
@@ -819,7 +852,7 @@ describe("scoreSeason: commits and consistency", () => {
     expect(ana.streak).toBe(2);
   });
 
-  it("ignores branch commit days outside the season", () => {
+  it("ignores branch commit days outside the period", () => {
     const sep = new Date(2026, 8, 29).toISOString();
     const raw = makeRaw({
       prs: [
@@ -885,7 +918,7 @@ describe("scoreSeason: commits and consistency", () => {
     expect(ana.consistency).toBe(5 * 3 + 2 * 2);
   });
 
-  it("counts branch commit days of a PR merged in the next season", () => {
+  it("counts branch commit days of a PR merged in the next period", () => {
     const at = (d: number) => oct(d, 10);
     const raw = makeRaw({
       prs: [
@@ -906,7 +939,7 @@ describe("scoreSeason: commits and consistency", () => {
   });
 });
 
-describe("scoreSeason: breadth", () => {
+describe("scorePeriod: breadth", () => {
   const moduleFiles = (n: number) =>
     Array.from({ length: n }, (_, i) => file(`mod${i}/sub/a.ts`, 40));
 
@@ -977,7 +1010,7 @@ describe("scoreSeason: breadth", () => {
   });
 });
 
-describe("scoreSeason: review", () => {
+describe("scorePeriod: review", () => {
   const base = () =>
     makeRaw({
       prs: [makePr("1", ANA, oct(8))],
@@ -1055,7 +1088,7 @@ describe("scoreSeason: review", () => {
     expect(of(scores, "Bob").review).toBe(9);
   });
 
-  it("skips bot reviewers, unknown PRs and reviews outside the season", () => {
+  it("skips bot reviewers, unknown PRs and reviews outside the period", () => {
     const raw = {
       ...base(),
       reviews: [
@@ -1085,7 +1118,7 @@ describe("scoreSeason: review", () => {
   });
 });
 
-describe("scoreSeason: weights", () => {
+describe("scorePeriod: weights", () => {
   it("multiplies each dimension subtotal", () => {
     const raw = makeRaw({
       prs: [
@@ -1172,7 +1205,7 @@ describe("scoreSeason: weights", () => {
   });
 });
 
-describe("scoreSeason: AI assistance", () => {
+describe("scorePeriod: AI assistance", () => {
   it("is the share of PRs with an agent author or co-author", () => {
     const raw = makeRaw({
       prs: [
@@ -1231,7 +1264,7 @@ describe("scoreSeason: AI assistance", () => {
   });
 });
 
-describe("scoreSeason: unattributed commits and newcomers", () => {
+describe("scorePeriod: unattributed commits and newcomers", () => {
   it("counts agent commits nobody can own", () => {
     const raw = makeRaw({
       commits: [
@@ -1247,7 +1280,7 @@ describe("scoreSeason: unattributed commits and newcomers", () => {
     expect(scores.people).toEqual([]);
   });
 
-  it("flags people whose first activity is inside the season", () => {
+  it("flags people whose first activity is inside the period", () => {
     const raw = makeRaw({
       commits: [
         makeCommit("a1", ANA, new Date(2026, 8, 10).toISOString()),
@@ -1260,7 +1293,7 @@ describe("scoreSeason: unattributed commits and newcomers", () => {
     expect(scores.newcomers).toEqual(["bob@example.com"]);
   });
 
-  it("does not guess when the raw data does not reach the previous season", () => {
+  it("does not guess when the raw data does not reach the previous period", () => {
     const raw = makeRaw({
       since: new Date(2026, 9, 1).toISOString(),
       commits: [makeCommit("b1", BOB, oct(6))],
@@ -1281,8 +1314,8 @@ describe("scoreSeason: unattributed commits and newcomers", () => {
   });
 });
 
-describe("scoreSeason: output", () => {
-  it("sorts people by score then name and carries the season", () => {
+describe("scorePeriod: output", () => {
+  it("sorts people by score then name and carries the period", () => {
     const raw = makeRaw({
       prs: [
         makePr("1", BOB, oct(8)),
@@ -1291,7 +1324,7 @@ describe("scoreSeason: output", () => {
       ],
     });
     const scores = score(raw);
-    expect(scores.season.id).toBe("2026-10");
+    expect(scores.period.id).toBe("2026-10");
     expect(scores.people.map((p) => p.name)).toEqual(["Cat", "Ana", "Bob"]);
   });
 
@@ -1506,5 +1539,67 @@ describe("worked example (scoring-vi.md section 7)", () => {
     expect(x.netNegativePrs).toBe(1);
     expect(x.mainCommits).toBe(6);
     expect(x.branchCommits).toBe(42);
+  });
+});
+
+describe("scorePeriod: period kinds", () => {
+  const scoreIn = (raw: RawData, period: Period, now: Date) =>
+    scorePeriod({
+      raw,
+      config: DEFAULT_CONFIG,
+      resolver: makeResolver(raw, DEFAULT_CONFIG),
+      period,
+      now,
+    });
+  const at = (month: number, day: number) =>
+    new Date(2026, month, day, 12).toISOString();
+  const commit = (id: string, iso: string) =>
+    makeCommit(id, ANA, iso, { files: [file("src/a.ts", 5)] });
+
+  it("scores only the last 7 days for 7d", () => {
+    const now = new Date(2026, 9, 20, 10);
+    const raw = makeRaw({
+      commits: [
+        commit("old", oct(13)),
+        commit("a", oct(14)),
+        commit("b", oct(20)),
+      ],
+    });
+    const scores = scoreIn(raw, currentPeriod("7d", now), now);
+    expect(scores.period.id).toBe("7d");
+    expect(of(scores, "Ana").activeDays).toBe(2);
+  });
+
+  it("counts every active day of a quarter and of a year", () => {
+    const now = new Date(2026, 11, 20, 10);
+    const raw = makeRaw({
+      commits: [
+        commit("q3", at(8, 30)),
+        commit("q4a", at(9, 1)),
+        commit("q4b", at(10, 15)),
+        commit("q4c", at(11, 19)),
+      ],
+    });
+    expect(
+      of(scoreIn(raw, currentPeriod("quarter", now), now), "Ana").activeDays,
+    ).toBe(3);
+    expect(
+      of(scoreIn(raw, currentPeriod("year", now), now), "Ana").activeDays,
+    ).toBe(4);
+  });
+
+  it("flags newcomers against the previous period of the same kind", () => {
+    const now = new Date(2026, 9, 20, 10);
+    const week = currentPeriod("7d", now);
+    const raw = makeRaw({
+      since: new Date(2026, 9, 7).toISOString(),
+      commits: [commit("a", oct(15))],
+    });
+    expect(scoreIn(raw, week, now).newcomers).toEqual(["ana@example.com"]);
+    const short = makeRaw({
+      since: new Date(2026, 9, 14).toISOString(),
+      commits: [commit("a", oct(15))],
+    });
+    expect(scoreIn(short, week, now).newcomers).toEqual([]);
   });
 });

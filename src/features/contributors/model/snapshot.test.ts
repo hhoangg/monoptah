@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "./config";
 import { buildLeaderboard } from "./leaderboard";
-import { SCORING, scoreSeason } from "./scoring";
+import { SCORING, scorePeriod } from "./scoring";
 import {
   buildAgentPrompt,
   buildSnapshot,
@@ -14,7 +14,8 @@ import {
   ANA,
   BOB,
   CLAUDE,
-  SEASON,
+  PERIOD,
+  PERIOD_NOW,
   file,
   makeCommit,
   makePr,
@@ -36,12 +37,18 @@ function build(
   withStats = false,
 ) {
   const resolver = makeResolver(raw, config);
-  const scores = scoreSeason({ raw, config, resolver, season: SEASON });
+  const scores = scorePeriod({
+    raw,
+    config,
+    resolver,
+    period: PERIOD,
+    now: PERIOD_NOW,
+  });
   const leaderboard = buildLeaderboard(scores, null, {});
   return buildSnapshot({
     project: "monoptah",
     branch: "main",
-    season: SEASON,
+    period: PERIOD,
     scores,
     leaderboard,
     stats: withStats
@@ -49,8 +56,8 @@ function build(
           raw,
           config,
           resolver,
-          rangeStart: SEASON.start,
-          rangeEnd: SEASON.end,
+          rangeStart: PERIOD.start,
+          rangeEnd: PERIOD.end,
         })
       : undefined,
     config,
@@ -86,24 +93,24 @@ const sample = () =>
 const ANA_ID = "ana@example.com";
 
 describe("snapshotFileName", () => {
-  it("names the file after the season", () => {
-    expect(snapshotFileName(SEASON)).toBe("contributors-2026-10.json");
+  it("names the file after the period", () => {
+    expect(snapshotFileName(PERIOD)).toBe("contributors-2026-10.json");
   });
 });
 
 describe("suggestedQuestions", () => {
   it("has the team suggestions", () => {
     expect(suggestedQuestions({ kind: "team" })).toEqual([
-      "Summarize this season: who drove what, and where are the risks?",
+      "Summarize this period: who drove what, and where are the risks?",
       "Which modules depend on a single person (bus factor)?",
-      "Compare this season with the last 3 and explain the trend.",
+      "Compare this period with the last 3 and explain the trend.",
       "Are any scores inflated by generated code or huge PRs?",
     ]);
   });
 
   it("has the suggestions about yourself", () => {
     expect(suggestedQuestions({ kind: "me", personId: "x" })).toEqual([
-      "Why did my rank change since last season?",
+      "Why did my rank change since the previous period?",
       "What would raise my Quality factor?",
       "Which of my PRs had the most rework, and why?",
     ]);
@@ -113,7 +120,7 @@ describe("suggestedQuestions", () => {
     expect(
       suggestedQuestions({ kind: "person", personId: "x" }, "Tuan Nguyen"),
     ).toEqual([
-      "Summarize Tuan Nguyen's contributions this season.",
+      "Summarize Tuan Nguyen's contributions this period.",
       "What are Tuan Nguyen's strengths across the 5 dimensions?",
       "Show Tuan Nguyen's PRs with the most iteration and what slowed them down.",
       "Is Tuan Nguyen's Delivery low because of review or mentoring work?",
@@ -122,7 +129,7 @@ describe("suggestedQuestions", () => {
 
   it("falls back to a neutral name", () => {
     expect(suggestedQuestions({ kind: "person", personId: "x" })[0]).toBe(
-      "Summarize this person's contributions this season.",
+      "Summarize this person's contributions this period.",
     );
   });
 });
@@ -132,10 +139,10 @@ describe("buildAgentPrompt", () => {
     question: "Why is Ana first?",
     fileName: "contributors-2026-10.json",
     projectName: "monoptah",
-    seasonLabel: "Oct 2026",
+    periodLabel: "Oct 2026",
   };
 
-  it("states project, season, file and question", () => {
+  it("states project, period, file and question", () => {
     const text = buildAgentPrompt({
       ...base,
       scope: { kind: "team" },
@@ -194,16 +201,17 @@ describe("buildAgentPrompt", () => {
 });
 
 describe("buildSnapshot", () => {
-  it("describes the project, season and generation time", () => {
+  it("describes the project, period and generation time", () => {
     const snap = build(sample(), { kind: "team" });
     expect(snap.generatedAt).toBe(NOW.toISOString());
     expect(snap.project).toBe("monoptah");
     expect(snap.branch).toBe("main");
-    expect(snap.season).toEqual({
+    expect(snap.period).toEqual({
+      kind: "month",
       id: "2026-10",
       label: "Oct 2026",
-      start: SEASON.start.toISOString(),
-      end: SEASON.end.toISOString(),
+      start: PERIOD.start.toISOString(),
+      end: PERIOD.end.toISOString(),
     });
     expect(snap.scope).toEqual({ kind: "team" });
     expect(snap.ghAvailable).toBe(true);
@@ -345,7 +353,7 @@ describe("buildSnapshot", () => {
     }
   });
 
-  it("includes in-season commits only when asked", () => {
+  it("includes in-period commits only when asked", () => {
     expect("commits" in build(sample(), { kind: "team" })).toBe(false);
     const snap = build(
       sample(),

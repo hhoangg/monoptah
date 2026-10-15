@@ -22,7 +22,7 @@ export type AskAgentRequest = {
   prompt: string;
   /** Pretty-printed JSON text of the snapshot, to write into the attachment. */
   snapshotJson: string;
-  /** Attachment name, `contributors-<season id>.json`. */
+  /** Attachment name, `contributors-<period id>.json`. */
   fileName: string;
   /**
    * Provider chosen in the dialog. It is set whenever the dialog knew any
@@ -56,7 +56,7 @@ export const DEFAULT_ASK_OPTIONS: AskOptions = {
 };
 
 export type AskChipId =
-  "project" | "branch" | "season" | "focus" | AskContextPart;
+  "project" | "branch" | "period" | "focus" | AskContextPart;
 
 export type AskChip = {
   id: AskChipId;
@@ -84,7 +84,7 @@ export function askSubtitle(scope: AskScope, personName?: string): string {
 const plural = (n: number, one: string, many = `${one}s`) =>
   `${n} ${n === 1 ? one : many}`;
 
-/** Everyone the snapshot lists: the season's ranking plus the page range's rows. */
+/** Everyone the snapshot lists: the period's ranking plus the stats rows. */
 function listedPersonIds(model: ContributorsModel): string[] {
   const ids = [...model.leaderboard.rows]
     .sort((a, b) => a.rank - b.rank)
@@ -113,8 +113,8 @@ export function askContextChips(
     { id: "project", label: projectName(project), removable: false },
     { id: "branch", label: model.raw.branch, removable: false },
     {
-      id: "season",
-      label: `${model.season.label} season`,
+      id: "period",
+      label: model.period.label,
       removable: false,
     },
   ];
@@ -249,7 +249,7 @@ function buildAskSnapshotParts(input: {
   const snapshot: Snapshot = buildSnapshot({
     project: projectName(input.project),
     branch: model.raw.branch,
-    season: model.season,
+    period: model.period,
     scores: model.current,
     leaderboard: model.leaderboard,
     stats: model.stats,
@@ -302,11 +302,6 @@ function buildAskSnapshotParts(input: {
   if (snapshot.commits && anon) out.commits = snapshot.commits.map(anon.commit);
 
   const notes = [...snapshot.notes];
-  if (snapshot.stats) {
-    notes.push(
-      `The stats section covers the page range "${model.rangeLabel}" (${model.rangeStart.toISOString()} to ${model.rangeEnd.toISOString()}), not necessarily the whole season.`,
-    );
-  }
   if (omit.size > 0) {
     notes.push(
       `Left out at the user's request: ${[...omit].map((part) => OMIT_TEXT[part]).join(", ")}.`,
@@ -366,7 +361,7 @@ export function buildAskRequest(input: {
 }): AskAgentRequest {
   const { model, scope } = input;
   const question = input.question.trim();
-  const fileName = snapshotFileName(model.season);
+  const fileName = snapshotFileName(model.period);
   const built = buildAskSnapshotParts(input);
   return {
     question,
@@ -376,7 +371,7 @@ export function buildAskRequest(input: {
       fileName,
       allowTools: input.options.allowTools,
       projectName: projectName(input.project),
-      seasonLabel: model.season.label,
+      periodLabel: model.period.label,
       personName: built.personName,
       contains: contentsOf(input.options),
     }),

@@ -25,10 +25,20 @@ import { parseMailmap } from "../model/identity";
 import type { MailmapPerson } from "../model/identity";
 import { buildContributorsModel } from "../model/pipeline";
 import type { ContributorsModel } from "../model/pipeline";
-import { readMerge, readRange, writeMerge, writeRange } from "../model/prefs";
-import { seasonChoices, sinceFor } from "../model/range";
-import type { RangeValue } from "../model/range";
-import { seasonById } from "../model/season";
+import {
+  nextPeriod,
+  pickOf,
+  previousPeriod,
+  resolvePick,
+  syncWindow,
+} from "../model/period";
+import type { Period, PeriodKind, PeriodPick } from "../model/period";
+import {
+  readMerge,
+  readPeriodPick,
+  writeMerge,
+  writePeriodPick,
+} from "../model/prefs";
 import type { ContributorsConfig, RawData } from "../model/types";
 
 type Meta = {
@@ -58,7 +68,7 @@ const AUTO_RELOAD_MS = 15_000;
 
 // Module-level so returning to the page is instant: the cached data renders
 // first and a revalidation refreshes it in the background. Both caches are
-// small LRUs, because `since` moves daily and every range and branch adds one.
+// small LRUs, because the window moves daily and every period and branch adds one.
 const metaCache = new Map<string, Meta>();
 const rawCache = new Map<string, RawData>();
 const inFlight = new Map<string, Promise<RawData>>();
@@ -162,6 +172,7 @@ function loadRaw(
   cwd: string,
   branch: string | undefined,
   since: string,
+  until: string,
   key: string,
   force: boolean,
 ): Promise<RawData> {
@@ -171,7 +182,7 @@ function loadRaw(
   const slot = force ? `${key}|force` : key;
   const seq = (requestSeq += 1);
   if (force) forcedAt.set(key, seq);
-  const request = collectRaw(cwd, { since, branch, force })
+  const request = collectRaw(cwd, { since, until, branch, force })
     .then((fresh) => {
       const previous = rawCache.get(key);
       // A forced refresh started after this answer was asked for: its data is
@@ -211,6 +222,9 @@ function sameData(a: RawData, b: RawData): boolean {
 const sameJson = (a: unknown, b: unknown) =>
   JSON.stringify(a) === JSON.stringify(b);
 
+/** Whole seconds, so the cache key does not depend on milliseconds. */
+const isoSeconds = (date: Date) => date.toISOString().replace(/\.\d{3}Z$/, "Z");
+
 const sameDay = (a: Date, b: Date) =>
   a.getFullYear() === b.getFullYear() &&
   a.getMonth() === b.getMonth() &&
@@ -221,12 +235,11 @@ export function useContributorsModel(input: {
   config: ContributorsConfig;
   mailmap: MailmapPerson[];
   merge: boolean;
-  range: RangeValue;
+  period: Period;
   now: Date;
   user?: GitUser;
-  seasonId?: string;
 }): ContributorsModel | undefined {
-  const { raw, config, mailmap, merge, range, now, user, seasonId } = input;
+  const { raw, config, mailmap, merge, period, now, user } = input;
   return useMemo(
     () =>
       raw
@@ -235,25 +248,22 @@ export function useContributorsModel(input: {
             config,
             mailmap,
             merge,
-            range,
+            period,
             now,
             user,
-            seasonId,
           })
         : undefined,
-    [raw, config, mailmap, merge, range, now, user, seasonId],
+    [raw, config, mailmap, merge, period, now, user],
   );
 }
 
 export function useContributors(cwd: string) {
-  const [range, setRangeState] = useState<RangeValue>(readRange);
+  const [pick, setPickState] = useState<PeriodPick>(() => readPeriodPick());
   const [merge, setMergeState] = useState(readMerge);
   const [picked, setPicked] = useState<{ cwd: string; branch?: string }>({
     cwd,
   });
   const [now, setNow] = useState(() => new Date());
-  // null follows the current month as the days pass.
-  const [seasonPick, setSeasonPick] = useState<string | null>(null);
   // One message per request scope, so a late answer for an abandoned request
   // can only touch its own entry.
   const [failures, setFailures] = useState<Record<string, string>>({});
@@ -263,20 +273,12 @@ export function useContributors(cwd: string) {
   const [, bump] = useReducer((n: number) => n + 1, 0);
 
   const branch = picked.cwd === cwd ? picked.branch : undefined;
-  const seasons = useMemo(
-    () => seasonChoices(now).map(({ id, label }) => ({ id, label })),
-    [now],
-  );
-  // A pick that scrolled out of the six choices (the month turned) is dropped.
-  const seasonId =
-    seasonPick && seasons.some((s) => s.id === seasonPick)
-      ? seasonPick
-      : seasons[0].id;
-  const since = useMemo(
-    () => sinceFor(range, now, seasonById(seasonId) ?? undefined),
-    [range, now, seasonId],
-  );
-  const key = `${cwd}\u0000${branch ?? ""}\u0000${since}`;
+  // A pick without an id follows the current period as the days pass.
+  const period = useMemo(() => resolvePick(pick, now), [pick, now]);
+  const span = useMemo(() => syncWindow(period, now), [period, now]);
+  const since = isoSeconds(span.from);
+  const until = isoSeconds(span.to);
+  const key = `${cwd}\u0000${branch ?? ""}\u0000${since}\u0000${until}`;
   const metaScope = `meta\u0000${cwd}`;
 
   const running = useRef(0);
@@ -284,7 +286,7 @@ export function useContributors(cwd: string) {
   const lastShown = useRef<{
     cwd: string;
     raw: RawData;
-    seasonId: string;
+    period: Period;
   } | null>(null);
 
   const fail = useCallback((scope: string, message: string) => {
@@ -344,7 +346,7 @@ export function useContributors(cwd: string) {
           fail(metaScope, errorText(error));
         },
       );
-      const raw = loadRaw(cwd, branch, since, key, force).then(
+      const raw = loadRaw(cwd, branch, since, until, key, force).then(
         () => {
           clearFailure(key);
         },
@@ -357,7 +359,7 @@ export function useContributors(cwd: string) {
       if (running.current === 0) setRefreshing(false);
       bump();
     },
-    [cwd, branch, since, key, metaScope, fail, clearFailure],
+    [cwd, branch, since, until, key, metaScope, fail, clearFailure],
   );
 
   useEffect(() => {
@@ -384,7 +386,7 @@ export function useContributors(cwd: string) {
     };
   }, [cwd, load]);
 
-  // A window left open across midnight would keep ending the range at the old
+  // A window left open across midnight would keep ending the period at the old
   // "tomorrow" and miss the new day's commits.
   useEffect(() => {
     const nextDay = new Date(
@@ -405,31 +407,35 @@ export function useContributors(cwd: string) {
 
   const meta = recall(metaCache, cwd);
   const current = recall(rawCache, key);
-  // While a new range or branch loads, keep the last data of this project on
+  // While a new period or branch loads, keep the last data of this project on
   // screen (marked stale) instead of blanking the page.
   const previouslyShown =
     lastShown.current?.cwd === cwd ? lastShown.current : undefined;
   const shown = current ?? previouslyShown?.raw;
-  // The old data may not reach the newly picked season, so the season shown
+  // The old data may not reach the newly picked period, so the period shown
   // stays with the data until the new request answers.
-  const shownSeasonId = current
-    ? seasonId
-    : (previouslyShown?.seasonId ?? seasonId);
-  if (shown) lastShown.current = { cwd, raw: shown, seasonId: shownSeasonId };
+  const shownPeriod = current ? period : (previouslyShown?.period ?? period);
+  if (shown) lastShown.current = { cwd, raw: shown, period: shownPeriod };
   const failed = failures[key] ?? failures[metaScope];
   const status: "loading" | "ready" | "error" =
     meta && shown ? "ready" : failed ? "error" : "loading";
 
-  const setRange = useCallback((next: RangeValue) => {
-    writeRange(next);
-    setRangeState(next);
+  const select = useCallback((next: PeriodPick) => {
+    writePeriodPick(next);
+    setPickState(next);
   }, []);
-  const setSeason = useCallback(
-    (next: string) => {
-      setSeasonPick(next === seasons[0].id ? null : next);
-    },
-    [seasons],
+  const setKind = useCallback(
+    (kind: PeriodKind) => select({ kind, id: null }),
+    [select],
   );
+  const goPrevious = useCallback(() => {
+    if (period.kind === "7d") return;
+    select(pickOf(previousPeriod(period), now));
+  }, [period, now, select]);
+  const goNext = useCallback(() => {
+    const next = nextPeriod(period, now);
+    if (next) select(pickOf(next, now));
+  }, [period, now, select]);
   const setMerge = useCallback((next: boolean) => {
     writeMerge(next);
     setMergeState(next);
@@ -495,17 +501,16 @@ export function useContributors(cwd: string) {
     config,
     mailmap,
     merge,
-    range,
+    period: shownPeriod,
     now,
     user: meta?.user,
-    seasonId: shownSeasonId,
   });
 
   return {
     status,
     error: failed,
     refreshing,
-    /** The data on screen is for the previous range or branch while the new one loads. */
+    /** The data on screen is for the previous period or branch while the new one loads. */
     stale: !current && !!shown,
     raw: shown,
     model,
@@ -518,15 +523,15 @@ export function useContributors(cwd: string) {
     branches: meta?.branches.branches ?? [],
     branch: branch ?? shown?.branch ?? meta?.branches.current ?? "",
     setBranch,
-    range,
-    setRange,
+    /** The selected period; the model shows it unless `stale`. */
+    period,
+    setKind,
+    goPrevious,
+    goNext,
+    /** False for 7d and for the current period: nothing lies ahead. */
+    hasNext: nextPeriod(period, now) !== null,
     merge,
     setMerge,
-    /** Id of the season the leaderboard was asked to show, e.g. "2026-10". */
-    season: seasonId,
-    /** The current month and the five before it, newest first. */
-    seasons,
-    setSeason,
   };
 }
 

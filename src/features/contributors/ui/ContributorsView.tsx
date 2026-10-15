@@ -17,6 +17,8 @@ import { HARNESS_TITLE } from "../../sessions/model/session";
 import type { HarnessId } from "../../sessions/model/session";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import {
+  ChevronLeft,
+  ChevronRight,
   CircleAlert,
   Loader,
   RefreshCw,
@@ -30,17 +32,7 @@ import { Segmented, Select, Toggle } from "../../settings/ui/primitives";
 import { useContributors } from "../hooks/useContributors";
 import type { AskAgentRequest } from "../model/askAgent";
 import { CONFIG_PATH } from "../model/config";
-import {
-  RANGE_OPTIONS,
-  earliestCustomDay,
-  formatDay,
-  parseDay,
-  rangeKeyOf,
-  toCustom,
-  withEnd,
-  withStart,
-} from "../model/range";
-import type { RangeKey } from "../model/range";
+import { PERIOD_KINDS } from "../model/period";
 import type { SnapshotScope } from "../model/snapshot";
 import type { ContributorsConfig } from "../model/types";
 import { AskAgentDialog } from "./AskAgentDialog";
@@ -59,8 +51,8 @@ const IdentitiesTab = lazySurface<IdentitiesTabProps>(() =>
   import("./IdentitiesTab").then((m) => ({ default: m.IdentitiesTab })),
 );
 
-const DATE_INPUT =
-  "h-7 rounded-md border border-content/10 bg-transparent px-2 text-[12px] text-content outline-none focus:border-accent/50";
+const PERIOD_ARROW =
+  "flex size-7 items-center justify-center rounded-md text-content/60 hover:bg-content/8 hover:text-content disabled:pointer-events-none disabled:opacity-35";
 
 type TabId = "stats" | "leaderboard" | "identities";
 
@@ -258,24 +250,6 @@ export function ContributorsView({
 
   const unmapped = model?.unmapped.length ?? 0;
 
-  const rangeKey = rangeKeyOf(data.range);
-  const customRange = typeof data.range === "string" ? null : data.range;
-  const onRangeKey = (next: RangeKey) => {
-    if (next === rangeKey) return;
-    // Custom starts from the days already on screen.
-    data.setRange(next === "custom" ? toCustom(data.range, new Date()) : next);
-  };
-  // A cleared or half-typed date reads as empty and is ignored. Any day between
-  // the earliest allowed one and today can be picked, because the other end
-  // follows when the span would be invalid; a typed day outside is clamped.
-  const today = formatDay(new Date());
-  const earliest = formatDay(earliestCustomDay(new Date()));
-  const pickDay = (text: string, apply: typeof withStart) => {
-    const day = parseDay(text);
-    if (!day || !customRange) return;
-    data.setRange(apply(customRange, day, new Date()));
-  };
-
   const onTabKey = (e: KeyboardEvent<HTMLDivElement>) => {
     const index = TABS.findIndex((t) => t.id === tab);
     let target: number;
@@ -356,36 +330,40 @@ export function ContributorsView({
                 />
               ) : null}
               <Segmented
-                label="Range"
-                value={rangeKey}
-                options={RANGE_OPTIONS}
-                onChange={onRangeKey}
+                label="Period"
+                value={data.period.kind}
+                options={PERIOD_KINDS}
+                onChange={data.setKind}
               />
-              {customRange ? (
+              {data.period.kind !== "7d" ? (
                 <div
                   role="group"
-                  aria-label="Custom range"
-                  className="flex items-center gap-1.5 text-[12px] text-content/60"
+                  aria-label="Period navigation"
+                  className="flex items-center gap-0.5 text-[12px]"
                 >
-                  <input
-                    type="date"
-                    aria-label="Start date"
-                    value={customRange.start}
-                    min={earliest}
-                    max={today}
-                    onChange={(e) => pickDay(e.target.value, withStart)}
-                    className={DATE_INPUT}
-                  />
-                  to
-                  <input
-                    type="date"
-                    aria-label="End date"
-                    value={customRange.end}
-                    min={earliest}
-                    max={today}
-                    onChange={(e) => pickDay(e.target.value, withEnd)}
-                    className={DATE_INPUT}
-                  />
+                  <button
+                    type="button"
+                    aria-label="Previous period"
+                    onClick={data.goPrevious}
+                    className={PERIOD_ARROW}
+                  >
+                    <ChevronLeft className="size-3.5" strokeWidth={1.75} />
+                  </button>
+                  <span
+                    aria-live="polite"
+                    className="min-w-[4.5rem] text-center tabular-nums"
+                  >
+                    {data.period.label}
+                  </span>
+                  <button
+                    type="button"
+                    aria-label="Next period"
+                    disabled={!data.hasNext}
+                    onClick={data.goNext}
+                    className={PERIOD_ARROW}
+                  >
+                    <ChevronRight className="size-3.5" strokeWidth={1.75} />
+                  </button>
                 </div>
               ) : null}
               <label className="flex items-center gap-2 text-[12px] text-content/60">
@@ -524,10 +502,10 @@ export function ContributorsView({
                           strokeWidth={1.75}
                         />
                         <p className="text-[13px] font-medium">
-                          No commits in this range
+                          No commits in this period
                         </p>
                         <p className="text-[12px] text-content/50">
-                          Try a longer range or another branch.
+                          Try another period or branch.
                         </p>
                       </div>
                     )
@@ -536,9 +514,6 @@ export function ContributorsView({
                     <LeaderboardTab
                       model={model}
                       onAskAgent={openAsk}
-                      seasons={data.seasons}
-                      season={data.season}
-                      onSeasonChange={data.setSeason}
                       onChangeConfig={saveConfig}
                       editLocked={locked}
                       sidebarHost={sidebarHost}

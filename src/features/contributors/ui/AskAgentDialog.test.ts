@@ -122,7 +122,7 @@ describe("AskAgentDialog header and context", () => {
     expect(
       q('[aria-label="Context sent to the agent"]')?.textContent,
     ).toContain("monoptah");
-    for (const id of ["project", "branch", "season"]) {
+    for (const id of ["project", "branch", "period"]) {
       expect(chip(id)).not.toBeNull();
       expect(chip(id)!.querySelector("button")).toBeNull();
     }
@@ -134,7 +134,7 @@ describe("AskAgentDialog header and context", () => {
   it("names the snapshot file in the hint", async () => {
     await mount();
     expect(q('[role="dialog"]')?.textContent).toContain(
-      `Opens a new session with contributors-${model.season.id}.json attached`,
+      `Opens a new session with contributors-${model.period.id}.json attached`,
     );
   });
 });
@@ -245,7 +245,7 @@ describe("AskAgentDialog snapshot options", () => {
     const { request } = await start(onStart);
     expect(request.scope).toEqual(scope);
     expect(request.question).toBe("Why is Bob low?");
-    expect(request.fileName).toBe(`contributors-${model.season.id}.json`);
+    expect(request.fileName).toBe(`contributors-${model.period.id}.json`);
     expect(JSON.parse(request.snapshotJson).focus.name).toBe("Bob");
   });
 });
@@ -271,7 +271,7 @@ describe("AskAgentDialog suggestions and question", () => {
     expect(me).not.toContain(team[0]);
     await mount({ scope: { kind: "person", personId: bob.personId } });
     const person = all("[data-suggestion]").map((b) => b.textContent);
-    expect(person).toContain("Summarize Bob's contributions this season.");
+    expect(person).toContain("Summarize Bob's contributions this period.");
   });
 
   it("disables Start session while the question is empty or blank", async () => {

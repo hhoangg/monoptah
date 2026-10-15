@@ -1,9 +1,9 @@
 import type { Resolver } from "./identity";
 import type { Leaderboard, LeaderboardRow } from "./leaderboard";
 import { SCORING, attributeCommits } from "./scoring";
-import type { PrScore, SeasonScores } from "./scoring";
-import { isInSeason } from "./season";
-import type { Season } from "./season";
+import { isInPeriod } from "./period";
+import type { Period } from "./period";
+import type { PrScore, PeriodScores } from "./scoring";
 import type { Stats } from "./stats";
 import type { ContributorsConfig, RawData } from "./types";
 
@@ -62,7 +62,13 @@ export type Snapshot = {
   generatedAt: string;
   project: string;
   branch: string;
-  season: { id: string; label: string; start: string; end: string };
+  period: {
+    kind: string;
+    id: string;
+    label: string;
+    start: string;
+    end: string;
+  };
   scope: SnapshotScope;
   ghAvailable: boolean;
   formula: {
@@ -87,8 +93,8 @@ const MAX_COMMITS = 2000;
 const round2 = (n: number) => Math.round(n * 100) / 100;
 const roundOrNull = (n: number | null) => (n === null ? null : round2(n));
 
-export const snapshotFileName = (season: Season) =>
-  `contributors-${season.id}.json`;
+export const snapshotFileName = (period: Period) =>
+  `contributors-${period.id}.json`;
 
 function formulaDescription(): string[] {
   const s = SCORING;
@@ -103,7 +109,7 @@ function formulaDescription(): string[] {
     `Breadth: ${s.MODULE_PTS} points for each module (first two folders of a path) with at least ${s.MODULE_MIN_EFF} effective lines of the person's own PRs, at most ${s.MODULE_CAP} modules.`,
     "Co-authors: with human Co-authored-by trailers the PR author gets 60% and the others share 40%. Agents never take a share.",
     "AI agents: work co-authored by an agent counts fully for the human behind it. Agent-authored work goes to the PR author, then the committer, then the identity mapping. AI-assisted % is informational and never changes a score.",
-    "Seasons are calendar months in local time and days are bucketed by committer date. Rank movement is the previous rank minus the current rank.",
+    "Periods are the last 7 days or a calendar month, quarter or year in local time, and days are bucketed by committer date. Rank movement is the previous rank minus the current rank.",
   ];
 }
 
@@ -161,7 +167,7 @@ function toPr(row: LeaderboardRow, pr: PrScore): SnapshotPr {
 }
 
 function buildNotes(
-  scores: SeasonScores,
+  scores: PeriodScores,
   raw: RawData | undefined,
   ghAvailable: boolean,
   commitsCapped: boolean,
@@ -204,8 +210,8 @@ function buildNotes(
 export function buildSnapshot(input: {
   project: string;
   branch: string;
-  season: Season;
-  scores: SeasonScores;
+  period: Period;
+  scores: PeriodScores;
   leaderboard: Leaderboard;
   stats?: Stats;
   config: ContributorsConfig;
@@ -216,29 +222,29 @@ export function buildSnapshot(input: {
   resolver: Resolver;
   now: Date;
 }): Snapshot {
-  const { season, scores, leaderboard, scope, include, raw, resolver } = input;
+  const { period, scores, leaderboard, scope, include, raw, resolver } = input;
   const people = leaderboard.rows.map((row) => toPerson(row, resolver));
   const focusId = scope.kind === "team" ? null : scope.personId;
 
   let commits: SnapshotCommit[] | undefined;
   let commitsCapped = false;
   if (include.rawCommits && raw) {
-    const inSeason = attributeCommits({
+    const inPeriod = attributeCommits({
       raw,
       config: input.config,
       resolver,
     })
       .filter(
         (c) =>
-          isInSeason(season, c.commit.committedAt) &&
+          isInPeriod(period, c.commit.committedAt) &&
           (focusId === null || c.personId === focusId),
       )
       .sort(
         (a, b) =>
           Date.parse(b.commit.committedAt) - Date.parse(a.commit.committedAt),
       );
-    commitsCapped = inSeason.length > MAX_COMMITS;
-    commits = inSeason.slice(0, MAX_COMMITS).map((c) => ({
+    commitsCapped = inPeriod.length > MAX_COMMITS;
+    commits = inPeriod.slice(0, MAX_COMMITS).map((c) => ({
       hash: c.commit.hash.slice(0, 12),
       author: `${c.commit.author.name} <${c.commit.author.email}>`,
       person: c.personId ? resolver.nameOf(c.personId) : null,
@@ -251,11 +257,12 @@ export function buildSnapshot(input: {
     generatedAt: input.now.toISOString(),
     project: input.project,
     branch: input.branch,
-    season: {
-      id: season.id,
-      label: season.label,
-      start: season.start.toISOString(),
-      end: season.end.toISOString(),
+    period: {
+      kind: period.kind,
+      id: period.id,
+      label: period.label,
+      start: period.start.toISOString(),
+      end: period.end.toISOString(),
     },
     scope,
     ghAvailable: input.ghAvailable,
@@ -296,14 +303,14 @@ export function buildSnapshot(input: {
 }
 
 const TEAM_QUESTIONS = [
-  "Summarize this season: who drove what, and where are the risks?",
+  "Summarize this period: who drove what, and where are the risks?",
   "Which modules depend on a single person (bus factor)?",
-  "Compare this season with the last 3 and explain the trend.",
+  "Compare this period with the last 3 and explain the trend.",
   "Are any scores inflated by generated code or huge PRs?",
 ];
 
 const ME_QUESTIONS = [
-  "Why did my rank change since last season?",
+  "Why did my rank change since the previous period?",
   "What would raise my Quality factor?",
   "Which of my PRs had the most rework, and why?",
 ];
@@ -316,7 +323,7 @@ export function suggestedQuestions(
   if (scope.kind === "me") return [...ME_QUESTIONS];
   const who = name ?? "this person";
   return [
-    `Summarize ${who}'s contributions this season.`,
+    `Summarize ${who}'s contributions this period.`,
     `What are ${who}'s strengths across the 5 dimensions?`,
     `Show ${who}'s PRs with the most iteration and what slowed them down.`,
     `Is ${who}'s Delivery low because of review or mentoring work?`,
@@ -349,7 +356,7 @@ export function buildAgentPrompt(input: {
   fileName: string;
   allowTools: boolean;
   projectName: string;
-  seasonLabel: string;
+  periodLabel: string;
   personName?: string;
   /** What the file holds, as noun phrases; defaults to the full snapshot. */
   contains?: string[];
@@ -358,7 +365,7 @@ export function buildAgentPrompt(input: {
     ? "You may run read-only git and gh commands inside this project to dig deeper. Do not change anything."
     : "Do not run commands; answer only from the attached snapshot.";
   return [
-    `I am looking at the Contributors leaderboard of the project "${input.projectName}" for the ${input.seasonLabel} season.`,
+    `I am looking at the Contributors leaderboard of the project "${input.projectName}" for the period "${input.periodLabel}".`,
     `Scope of my question: ${scopeLine(input.scope, input.personName)}.`,
     `The attached file ${input.fileName} is the exact data I see: ${listOf(input.contains ?? DEFAULT_CONTENTS)}. Treat it as the source of truth for every number.`,
     tools,

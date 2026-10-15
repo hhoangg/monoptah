@@ -2,8 +2,8 @@
 import { DEFAULT_CONFIG } from "./config";
 import { buildResolver } from "./identity";
 import { observedIdentities } from "./scoring";
-import { seasonOf } from "./season";
-import type { Season } from "./season";
+import { currentPeriod } from "./period";
+import type { Period } from "./period";
 import type {
   ContributorsConfig,
   GitIdentity,
@@ -18,7 +18,11 @@ import type {
 export const oct = (day: number, hour = 12) =>
   new Date(2026, 9, day, hour).toISOString();
 
-export const SEASON: Season = seasonOf(new Date(2026, 9, 15));
+/** October 2026 as a period. */
+export const PERIOD: Period = currentPeriod("month", new Date(2026, 9, 15));
+
+/** The last day of `PERIOD`, so every day of it counts as elapsed. */
+export const PERIOD_NOW = new Date(2026, 9, 31, 12);
 
 export const ident = (name: string, email: string, login?: string) =>
   login ? { name, email, login } : { name, email };

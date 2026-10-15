@@ -2,6 +2,7 @@
 import { act, createElement, useMemo, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { currentPeriod } from "../model/period";
 import { buildContributorsModel } from "../model/pipeline";
 import type { ContributorsConfig } from "../model/types";
 import {
@@ -72,7 +73,7 @@ function Harness({
         config,
         mailmap,
         merge,
-        range: "30d",
+        period: currentPeriod("month", NOW),
         now: NOW,
       }),
     [config, merge, mailmap],
@@ -778,7 +779,7 @@ describe("person colors", () => {
       config: CONFIG,
       mailmap: [],
       merge: true,
-      range: "30d",
+      period: currentPeriod("month", NOW),
       now: NOW,
     });
     // A color no hash would pick, so only the shared map can explain it.

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "./config";
+import { currentPeriod } from "./period";
 import { buildContributorsModel } from "./pipeline";
 import {
   file,
@@ -100,7 +101,7 @@ const build = (raw: ReturnType<typeof syntheticRaw>) =>
     config: DEFAULT_CONFIG,
     mailmap: [],
     merge: true,
-    range: "30d",
+    period: currentPeriod("month", NOW),
     now: NOW,
   });
 

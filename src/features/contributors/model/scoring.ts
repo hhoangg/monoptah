@@ -2,13 +2,13 @@ import { identityKey, isAgent, isExcluded, isHuman } from "./identity";
 import type { Resolver } from "./identity";
 import { isIgnoredPath } from "./patterns";
 import {
-  isInSeason,
+  isInPeriod,
   isWeekend,
   localDayKey,
-  previousSeason,
-  seasonDayKeys,
-} from "./season";
-import type { Season } from "./season";
+  periodDayKeys,
+  previousPeriod,
+} from "./period";
+import type { Period } from "./period";
 import type {
   ContributorsConfig,
   GitIdentity,
@@ -105,12 +105,12 @@ export type PersonScore = {
   prs: PrScore[];
 };
 
-export type SeasonScores = {
-  season: Season;
+export type PeriodScores = {
+  period: Period;
   people: PersonScore[];
   unattributed: { prs: number; commits: number };
   ghAvailable: boolean;
-  /** People whose first activity in the data falls inside the season (empty when the data does not reach the previous season). */
+  /** People whose first activity in the data falls inside the period (empty when the data does not reach the previous period). */
   newcomers: string[];
 };
 
@@ -198,19 +198,20 @@ export function moduleOf(path: string): string {
 }
 
 /**
- * Longest run of consecutive active working days (Mon-Fri) in the season.
+ * Longest run of consecutive active working days (Mon-Fri) in the period.
  * Weekend days are skipped entirely: they neither break nor extend the run,
  * though an active weekend day still counts as an active day elsewhere.
  * Holidays have no data source and are not modelled.
  */
 export function streakOf(
   activeDayKeys: Iterable<string>,
-  season: Season,
+  period: Period,
+  now: Date,
 ): number {
   const active = new Set(activeDayKeys);
   let run = 0;
   let best = 0;
-  for (const key of seasonDayKeys(season)) {
+  for (const key of periodDayKeys(period, now)) {
     if (isWeekend(key)) continue;
     if (active.has(key)) {
       run += 1;
@@ -464,13 +465,15 @@ const newAcc = (personId: string): Acc => ({
   aiUnits: 0,
 });
 
-export function scoreSeason(input: {
+export function scorePeriod(input: {
   raw: RawData;
   config: ContributorsConfig;
   resolver: Resolver;
-  season: Season;
-}): SeasonScores {
-  const { raw, config, resolver, season } = input;
+  period: Period;
+  /** Today; the streak does not look at days after it. */
+  now: Date;
+}): PeriodScores {
+  const { raw, config, resolver, period, now } = input;
   const ctx = makeCtx(raw, config, resolver);
   const prCredits = creditPrs(ctx, raw.prs);
   const accs = new Map<string, Acc>();
@@ -493,7 +496,7 @@ export function scoreSeason(input: {
     }
   };
   const markDay = (personId: string, iso: string) => {
-    if (isInSeason(season, iso)) acc(personId).days.add(localDayKey(iso));
+    if (isInPeriod(period, iso)) acc(personId).days.add(localDayKey(iso));
   };
 
   const commitsByPr = new Map<string, RawCommit[]>();
@@ -517,8 +520,8 @@ export function scoreSeason(input: {
     const credit = prCredits.get(pr.id);
     const owner = credit?.status === "owned" ? credit.personId : null;
     const when = pr.state === "merged" ? pr.mergedAt : pr.closedAt;
-    const seasonal =
-      when !== undefined && isInSeason(season, when) ? when : null;
+    const inPeriod =
+      when !== undefined && isInPeriod(period, when) ? when : null;
 
     if (owner && when !== undefined) note(owner, when);
     for (const bc of pr.branchCommits) {
@@ -528,21 +531,21 @@ export function scoreSeason(input: {
       }
       for (const personId of people) {
         note(personId, bc.committedAt);
-        // markDay keeps only days inside the season, so a PR that closes in
-        // the next month still credits its days here.
+        // markDay keeps only days inside the period, so a PR that closes after
+        // the period still credits its days here.
         markDay(personId, bc.committedAt);
       }
     }
     if (
       owner &&
-      seasonal &&
+      inPeriod &&
       pr.state === "closed" &&
       pr.branchCommits.length === 0
     ) {
-      markDay(owner, seasonal);
+      markDay(owner, inPeriod);
     }
 
-    if (pr.state !== "merged" || !seasonal) continue;
+    if (pr.state !== "merged" || !inPeriod) continue;
     if (credit?.status === "unattributed") unattributed.prs += 1;
     if (!owner) continue;
 
@@ -598,9 +601,9 @@ export function scoreSeason(input: {
         fix: flags.fix,
         reverted: isReverted,
         aiAssisted,
-        mergedAt: seasonal,
+        mergedAt: inPeriod,
       });
-      note(personId, seasonal);
+      note(personId, inPeriod);
     }
 
     const a = acc(owner);
@@ -620,7 +623,7 @@ export function scoreSeason(input: {
     prCredits,
   )) {
     if (personId) note(personId, commit.committedAt);
-    if (!isInSeason(season, commit.committedAt)) continue;
+    if (!isInPeriod(period, commit.committedAt)) continue;
     if (!personId) {
       unattributed.commits += 1;
       continue;
@@ -653,7 +656,7 @@ export function scoreSeason(input: {
         sharesOf(ctx, pr, ownerId).some(([id]) => id === reviewerId);
       if (sharing || reviewerId === resolver.personOf(pr.author)) continue;
       note(reviewerId, review.submittedAt);
-      if (!isInSeason(season, review.submittedAt)) continue;
+      if (!isInPeriod(period, review.submittedAt)) continue;
       const key = `${reviewerId}\u0000${pr.id}`;
       const pair = pairs.get(key) ?? { reviewerId, prId: pr.id, comments: 0 };
       pair.comments += review.comments;
@@ -669,7 +672,7 @@ export function scoreSeason(input: {
   }
 
   const people = Array.from(accs.values()).map((a) =>
-    finishPerson(a, config, resolver, season),
+    finishPerson(a, config, resolver, period, now),
   );
   people.sort(
     (a, b) =>
@@ -678,17 +681,17 @@ export function scoreSeason(input: {
       a.personId.localeCompare(b.personId),
   );
 
-  const dataReachesPreviousSeason =
-    Date.parse(raw.since) <= previousSeason(season).start.getTime();
-  const newcomers = dataReachesPreviousSeason
+  const dataReachesPreviousPeriod =
+    Date.parse(raw.since) <= previousPeriod(period).start.getTime();
+  const newcomers = dataReachesPreviousPeriod
     ? people
         .map((p) => p.personId)
-        .filter((id) => (firstActivity.get(id) ?? 0) >= season.start.getTime())
+        .filter((id) => (firstActivity.get(id) ?? 0) >= period.start.getTime())
         .sort()
     : [];
 
   return {
-    season,
+    period,
     people,
     unattributed,
     ghAvailable: raw.ghAvailable,
@@ -700,7 +703,8 @@ function finishPerson(
   a: Acc,
   config: ContributorsConfig,
   resolver: Resolver,
-  season: Season,
+  period: Period,
+  now: Date,
 ): PersonScore {
   const survival = a.written > 0 ? a.alive / a.written : null;
   const quality = qualityFactor(survival);
@@ -709,7 +713,7 @@ function finishPerson(
     .sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))
     .slice(0, SCORING.MODULE_CAP)
     .map(([module]) => module);
-  const streak = streakOf(a.days, season);
+  const streak = streakOf(a.days, period, now);
   const breadth = SCORING.MODULE_PTS * modules.length;
   const consistency =
     SCORING.ACTIVE_DAY * a.days.size +

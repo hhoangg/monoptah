@@ -3,19 +3,23 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   MERGE_KEY,
   RANGE_KEY,
+  parsePick,
   readMerge,
-  readRange,
+  readPeriodPick,
+  serializePick,
   writeMerge,
-  writeRange,
+  writePeriodPick,
 } from "./prefs";
+
+const NOW = new Date(2026, 9, 15, 12);
 
 beforeEach(() => {
   localStorage.clear();
 });
 
 describe("contributors prefs", () => {
-  it("defaults to 30d and merging on", () => {
-    expect(readRange()).toBe("30d");
+  it("defaults to 7d and merging on", () => {
+    expect(readPeriodPick(NOW)).toEqual({ kind: "7d", id: null });
     expect(readMerge()).toBe(true);
   });
 
@@ -24,45 +28,66 @@ describe("contributors prefs", () => {
     expect(MERGE_KEY).toBe("monocode.contributors.mergeIdentities");
   });
 
-  it("round-trips the presets and falls back on garbage", () => {
-    writeRange("7d");
-    expect(localStorage.getItem(RANGE_KEY)).toBe("7d");
-    expect(readRange()).toBe("7d");
-    localStorage.setItem(RANGE_KEY, "forever");
-    expect(readRange()).toBe("30d");
-  });
-
-  it("falls back to 30d for the removed presets", () => {
-    for (const removed of ["90d", "1y", "all"]) {
-      localStorage.setItem(RANGE_KEY, removed);
-      expect(readRange()).toBe("30d");
+  it("stores a kind that follows the current period as the bare kind", () => {
+    for (const kind of ["7d", "month", "quarter", "year"] as const) {
+      writePeriodPick({ kind, id: null });
+      expect(localStorage.getItem(RANGE_KEY)).toBe(kind);
+      expect(readPeriodPick(NOW)).toEqual({ kind, id: null });
     }
   });
 
-  it("round-trips a custom range", () => {
-    const now = new Date(2026, 9, 15, 12);
-    const range = {
-      key: "custom",
-      start: "2026-10-01",
-      end: "2026-10-10",
-    } as const;
-    writeRange(range);
-    expect(localStorage.getItem(RANGE_KEY)).toBe(
-      "custom:2026-10-01:2026-10-10",
-    );
-    expect(readRange(now)).toEqual(range);
+  it("stores a pinned period as kind:id and reads it back", () => {
+    const cases = [
+      { kind: "month", id: "2026-08", text: "month:2026-08" },
+      { kind: "quarter", id: "2026-Q2", text: "quarter:2026-Q2" },
+      { kind: "year", id: "2025", text: "year:2025" },
+    ] as const;
+    for (const { kind, id, text } of cases) {
+      writePeriodPick({ kind, id });
+      expect(localStorage.getItem(RANGE_KEY)).toBe(text);
+      expect(readPeriodPick(NOW)).toEqual({ kind, id });
+    }
   });
 
-  it("clamps a stored custom range that is too long and drops a broken one", () => {
-    const now = new Date(2026, 9, 15, 12);
-    localStorage.setItem(RANGE_KEY, "custom:2026-01-01:2026-10-15");
-    expect(readRange(now)).toEqual({
-      key: "custom",
-      start: "2026-09-16",
-      end: "2026-10-15",
-    });
-    localStorage.setItem(RANGE_KEY, "custom:soon:later");
-    expect(readRange(now)).toBe("30d");
+  it("falls back to 7d for the removed ranges", () => {
+    for (const removed of [
+      "30d",
+      "90d",
+      "1y",
+      "all",
+      "custom",
+      "custom:2026-10-01:2026-10-10",
+    ]) {
+      localStorage.setItem(RANGE_KEY, removed);
+      expect(readPeriodPick(NOW)).toEqual({ kind: "7d", id: null });
+    }
+  });
+
+  it("falls back to 7d for garbage and unusable ids", () => {
+    for (const bad of [
+      "forever",
+      "",
+      ":",
+      "month:",
+      "month:2026-13",
+      "month:2026-Q3",
+      "quarter:2026-Q9",
+      "year:soon",
+      "7d:7d",
+      "7d:x",
+      "month:2027-01",
+      "Month",
+    ]) {
+      localStorage.setItem(RANGE_KEY, bad);
+      expect(readPeriodPick(NOW)).toEqual({ kind: "7d", id: null });
+    }
+  });
+
+  it("serializes and parses symmetrically", () => {
+    const pick = { kind: "quarter", id: "2026-Q1" } as const;
+    expect(parsePick(serializePick(pick), NOW)).toEqual(pick);
+    expect(parsePick(null, NOW)).toBeUndefined();
+    expect(parsePick(undefined, NOW)).toBeUndefined();
   });
 
   it("round-trips the merge toggle", () => {

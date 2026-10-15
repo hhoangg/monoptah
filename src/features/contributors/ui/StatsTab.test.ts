@@ -15,16 +15,18 @@ import {
   oct,
   withConfig,
 } from "../model/testFixtures";
-import { sinceFor } from "../model/range";
+import { currentPeriod, syncWindow } from "../model/period";
 import { CommitChart, StatsTab } from "./StatsTab";
 
 const NOW = new Date(2026, 9, 20, 10);
+const MONTH = currentPeriod("month", NOW);
+const sinceOf = (period = MONTH) => syncWindow(period, NOW).from.toISOString();
 
 function model(
   overrides: Partial<Parameters<typeof buildContributorsModel>[0]> = {},
 ) {
   const raw = makeRaw({
-    since: sinceFor("30d", NOW),
+    since: sinceOf(overrides.period),
     commits: [
       makeCommit("p1", ANA, new Date(2026, 9, 1, 9).toISOString(), {
         files: [file("src/a.ts", 12000, 1000)],
@@ -54,7 +56,7 @@ function model(
     }),
     mailmap: [],
     merge: true,
-    range: "30d",
+    period: MONTH,
     now: NOW,
     ...overrides,
   });
@@ -149,9 +151,9 @@ describe("StatsTab", () => {
     ).toBeNull();
   });
 
-  it("says so when nobody committed in the range", async () => {
+  it("says so when nobody committed in the period", async () => {
     await render(model({ raw: makeRaw() }));
-    expect(container.textContent).toContain("No contributors in this range.");
+    expect(container.textContent).toContain("No contributors in this period.");
   });
 
   it("shows the change against the previous period with an arrow, a sign and a color", async () => {
@@ -160,21 +162,22 @@ describe("StatsTab", () => {
     await render(m);
     if (delta === null)
       throw new Error("fixture should cover the previous period");
-    expect(container.textContent).toContain("vs prev 30d");
+    expect(container.textContent).toContain("vs Sep 2026");
     expect(container.textContent).toMatch(/[▲▼] [+-]\d+%/);
   });
 
-  it("names a custom range's previous period by its length", async () => {
-    const m = model({
-      range: { key: "custom", start: "2026-10-06", end: "2026-10-15" },
-    });
-    await render(m);
-    expect(container.textContent).toContain("vs prev 10d");
+  it("names the previous period of each kind", async () => {
+    await render(model({ period: currentPeriod("7d", NOW) }));
+    expect(container.textContent).toContain("vs prev 7d");
+    await render(model({ period: currentPeriod("quarter", NOW) }));
+    expect(container.textContent).toContain("vs Q3 2026");
+    await render(model({ period: currentPeriod("year", NOW) }));
+    expect(container.textContent).toContain("vs 2025");
   });
 });
 
 describe("CommitChart", () => {
-  it("renders one bar group per week and stacks a segment per contributor", async () => {
+  it("renders one bar group per day and stacks a segment per contributor", async () => {
     const m = model();
     await act(async () => {
       root.render(createElement(CommitChart, { stats: m.stats }));
@@ -182,8 +185,8 @@ describe("CommitChart", () => {
     const svg = container.querySelector("svg") as SVGElement;
     expect(svg.getAttribute("role")).toBe("img");
     expect(svg.getAttribute("viewBox")).toBe("0 0 1000 180");
-    const weeks = container.querySelectorAll("g[data-bucket]");
-    expect(weeks).toHaveLength(m.stats.buckets.length);
+    const days = container.querySelectorAll("g[data-bucket]");
+    expect(days).toHaveLength(m.stats.buckets.length);
     const segments = container.querySelectorAll("rect[data-person]");
     const expected = m.stats.buckets.reduce(
       (n, w) => n + Object.values(w.byPerson).filter((c) => c > 0).length,
@@ -199,9 +202,9 @@ describe("CommitChart", () => {
     });
     const label =
       container.querySelector("svg")?.getAttribute("aria-label") ?? "";
-    expect(label).toContain("Commit activity per week");
-    expect(label).toContain(`${m.stats.buckets.length} weeks`);
-    expect(label).toContain("busiest week");
+    expect(label).toContain("Commit activity per day");
+    expect(label).toContain(`${m.stats.buckets.length} days`);
+    expect(label).toContain("busiest day");
   });
 
   it("scales the tallest week to the full height and the others proportionally", async () => {
@@ -216,7 +219,7 @@ describe("CommitChart", () => {
     expect(Math.min(...heights)).toBeGreaterThan(0);
   });
 
-  it("draws no segments for an empty range", async () => {
+  it("draws no segments for an empty period", async () => {
     const m = model({ raw: makeRaw() });
     await act(async () => {
       root.render(createElement(CommitChart, { stats: m.stats }));
@@ -277,7 +280,7 @@ describe("CommitChart readability", () => {
   };
 
   it("labels the x axis with the first and last bucket and no more than about eight", async () => {
-    const m = model({ range: "30d" });
+    const m = model({ period: MONTH });
     await draw(m);
     const labels = Array.from(container.querySelectorAll("[data-axis]")).map(
       (e) => e.textContent,
@@ -289,8 +292,8 @@ describe("CommitChart readability", () => {
     expect(labels.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("labels weeks as 'Mon D'", async () => {
-    await draw(model({ range: "7d" }));
+  it("labels days as 'Mon D'", async () => {
+    await draw(model({ period: currentPeriod("7d", NOW) }));
     expect(container.querySelector("[data-axis]")?.textContent).toMatch(
       /^[A-Z][a-z]{2} \d{1,2}$/,
     );
@@ -326,14 +329,24 @@ describe("CommitChart readability", () => {
     }
   });
 
-  it("names the week unit in the summary and the card heading", async () => {
-    const m = model();
-    await draw(m);
-    const label = container.querySelector("svg")?.getAttribute("aria-label");
-    expect(label).toContain("Commit activity per week");
-    expect(label).toContain("weeks");
-    await render(m);
-    expect(container.textContent).toContain("per week, stacked by contributor");
+  it("names the unit of the period in the summary and the card heading", async () => {
+    const units = [
+      ["month", "day"],
+      ["7d", "day"],
+      ["quarter", "week"],
+      ["year", "month"],
+    ] as const;
+    for (const [kind, unit] of units) {
+      const m = model({ period: currentPeriod(kind, NOW) });
+      await draw(m);
+      const label = container.querySelector("svg")?.getAttribute("aria-label");
+      expect(label).toContain(`Commit activity per ${unit}`);
+      expect(label).toContain(`${unit}s`);
+      await render(m);
+      expect(container.textContent).toContain(
+        `per ${unit}, stacked by contributor`,
+      );
+    }
   });
 
   it("paints the table avatar with the row color from the shared map", async () => {
@@ -383,7 +396,7 @@ describe("StatsTab legend", () => {
       commits: count - i,
     }));
     const raw = makeRaw({
-      since: sinceFor("30d", NOW),
+      since: sinceOf(),
       commits: people.flatMap(({ who, commits }, i) =>
         Array.from({ length: commits }, (_, n) =>
           makeCommit(`c${i}-${n}`, who, oct(10 + (n % 8)), {
@@ -397,7 +410,7 @@ describe("StatsTab legend", () => {
       config: withConfig({}),
       mailmap: [],
       merge: true,
-      range: "30d",
+      period: MONTH,
       now: NOW,
     });
   };

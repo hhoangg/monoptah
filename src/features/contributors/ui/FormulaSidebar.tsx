@@ -277,10 +277,10 @@ export function FormulaSidebar({
   const { config, raw } = model;
   const me = model.leaderboard.rows.find((r) => r.isMe);
   const reason = raw.ghNote?.trim().replace(/[.\s]+$/, "");
-  const seasonWord =
-    model.season.id === model.currentSeasonId
-      ? "this season"
-      : `in ${model.season.label}`;
+  const periodWord =
+    model.period.kind === "7d"
+      ? "in the last 7 days"
+      : `in ${model.period.label}`;
   const customWeights = WEIGHT_FIELDS.filter(
     ({ key }) => config.weights[key] !== 1,
   );
@@ -319,14 +319,14 @@ export function FormulaSidebar({
       <Section
         title={
           me
-            ? `Your score ${seasonWord}: ${formatScore(me.score)}`
-            : `Your score ${seasonWord}`
+            ? `Your score ${periodWord}: ${formatScore(me.score)}`
+            : `Your score ${periodWord}`
         }
       >
         {me ? (
           <Breakdown row={me} weights={config.weights} />
         ) : (
-          <p>{`No activity for you ${seasonWord} yet`}</p>
+          <p>{`No activity for you ${periodWord} yet`}</p>
         )}
         {customWeights.length > 0 ? (
           <p>
@@ -410,6 +410,10 @@ export function FormulaSidebar({
       <Section title="Consistency">
         <p>
           {`${SCORING.ACTIVE_DAY} points per active day, plus ${SCORING.STREAK_K} per day of streak (max ${SCORING.STREAK_CAP}). Weekends never break a streak.`}
+        </p>
+        <p>
+          Consistency grows with the length of the period; Breadth is capped, so
+          in long periods it weighs less.
         </p>
       </Section>
 

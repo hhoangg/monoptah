@@ -22,9 +22,8 @@ import {
 } from "../model/api";
 import { DEFAULT_CONFIG, serializeConfig } from "../model/config";
 import { RANGE_KEY } from "../model/prefs";
-import { formatDay, seasonChoices } from "../model/range";
-import type { CustomRange } from "../model/range";
-import { previousSeason } from "../model/season";
+import { currentPeriod, previousPeriod, syncWindow } from "../model/period";
+import type { Period } from "../model/period";
 import { ANA, file, makeCommit, makeRaw } from "../model/testFixtures";
 import {
   contributorsCacheSize,
@@ -39,20 +38,23 @@ let root: Root;
 let api: Api;
 let cwdCounter = 0;
 
-// Months back but inside the custom range horizon, so their windows reach well
-// before the previous season and two of them always give different cache keys.
-const dayBack = (n: number) => {
-  const d = new Date();
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate() - n);
+const isoSeconds = (date: Date) => date.toISOString().replace(".000Z", "Z");
+
+/** The month `n` months before the current one. */
+const monthBack = (n: number): Period => {
+  let p = currentPeriod("month", new Date());
+  for (let i = 0; i < n; i += 1) p = previousPeriod(p);
+  return p;
 };
-const rangeBack = (from: number, to: number): CustomRange => ({
-  key: "custom",
-  start: formatDay(dayBack(from)),
-  end: formatDay(dayBack(to)),
-});
-const RANGE_A = rangeBack(120, 111); // 10 days
-const RANGE_B = rangeBack(100, 91);
-const saved = (r: CustomRange) => `custom:${r.start}:${r.end}`;
+const MONTH_A = monthBack(3);
+const MONTH_B = monthBack(4);
+const saved = (p: Period) => `${p.kind}:${p.id}`;
+
+/** Selects the month `n` months back through the same controls the page uses. */
+async function selectMonthBack(n: number) {
+  await act(async () => api.setKind("month"));
+  for (let i = 0; i < n; i += 1) await act(async () => api.goPrevious());
+}
 const nextCwd = () => `/repo-${(cwdCounter += 1)}`;
 
 function Probe({ cwd }: { cwd: string }) {
@@ -130,52 +132,68 @@ describe("useContributors", () => {
     expect(api.config).toEqual(DEFAULT_CONFIG);
   });
 
-  it("collects since the earlier of the range start and the previous season", async () => {
+  it("collects the window of the default 7d period: from the previous 7 days to tomorrow", async () => {
     await mount(nextCwd());
     const args = vi.mocked(collectRaw).mock.calls[0][1];
-    const since = Date.parse(args.since);
-    const now = new Date();
-    const previousSeasonStart = new Date(
-      now.getFullYear(),
-      now.getMonth() - 1,
-      1,
-    );
-    expect(since).toBeLessThanOrEqual(previousSeasonStart.getTime());
+    const window = syncWindow(currentPeriod("7d", new Date()), new Date());
+    expect(args.since).toBe(isoSeconds(window.from));
+    expect(args.until).toBe(isoSeconds(window.to));
     expect(args.force).toBe(false);
     expect(args.branch).toBeUndefined();
+    expect(api.period.kind).toBe("7d");
+    expect(api.model?.period.id).toBe("7d");
   });
 
-  it("collects a custom range from the equal-length period before it, with the end open", async () => {
+  it("collects a past month from the start of the month before it to its own end", async () => {
     await mount(nextCwd());
-    await act(async () => api.setRange(RANGE_A));
+    await selectMonthBack(3);
     const args = vi.mocked(collectRaw).mock.calls.at(-1)![1];
-    // 10 days; the previous 10 days start 130 days back.
-    expect(args.since).toBe(dayBack(130).toISOString().replace(".000Z", "Z"));
-    // The board ranks the current month whatever the range, so nothing newer
-    // than the range may be cut off.
-    expect(args.until).toBeUndefined();
-    expect(api.model?.rangeLabel).toBe(`${RANGE_A.start} to ${RANGE_A.end}`);
+    expect(args.since).toBe(isoSeconds(monthBack(4).start));
+    expect(args.until).toBe(isoSeconds(monthBack(3).end));
+    expect(api.model?.period.id).toBe(MONTH_A.id);
   });
 
-  it("collects again when the custom days change, and not when they do not", async () => {
+  it("caps the current month at tomorrow", async () => {
     await mount(nextCwd());
-    await act(async () => api.setRange(RANGE_A));
+    await act(async () => api.setKind("month"));
+    const args = vi.mocked(collectRaw).mock.calls.at(-1)![1];
+    const today = new Date();
+    const tomorrow = new Date(
+      today.getFullYear(),
+      today.getMonth(),
+      today.getDate() + 1,
+    );
+    expect(args.until).toBe(isoSeconds(tomorrow));
+    expect(args.since).toBe(isoSeconds(monthBack(1).start));
+  });
+
+  it("collects again when the period changes, and not when it does not", async () => {
+    await mount(nextCwd());
+    await act(async () => api.setKind("month"));
     const base = vi.mocked(collectRaw).mock.calls.length;
-    await act(async () => api.setRange({ ...RANGE_A }));
+    await act(async () => api.setKind("month"));
     expect(vi.mocked(collectRaw).mock.calls.length).toBe(base);
-    await act(async () => api.setRange(RANGE_B));
+    await act(async () => api.goPrevious());
     expect(vi.mocked(collectRaw).mock.calls.length).toBe(base + 1);
   });
 
-  it("restores a saved custom range and a saved removed preset falls back", async () => {
-    localStorage.setItem(RANGE_KEY, saved(RANGE_A));
+  it("restores a saved period, and a saved removed range falls back to 7d", async () => {
+    localStorage.setItem(RANGE_KEY, saved(MONTH_A));
     await mount(nextCwd());
-    expect(api.range).toEqual(RANGE_A);
-    await act(async () => root.unmount());
-    root = createRoot(container);
-    localStorage.setItem(RANGE_KEY, "1y");
-    await mount(nextCwd());
-    expect(api.range).toBe("30d");
+    expect(api.period.id).toBe(MONTH_A.id);
+    for (const removed of [
+      "1y",
+      "30d",
+      "custom:2026-10-01:2026-10-09",
+      "all",
+    ]) {
+      await act(async () => root.unmount());
+      root = createRoot(container);
+      localStorage.setItem(RANGE_KEY, removed);
+      await mount(nextCwd());
+      expect(api.period.kind).toBe("7d");
+      expect(api.period.id).toBe("7d");
+    }
   });
 
   it("shows cached data at once when the page is opened again", async () => {
@@ -457,15 +475,15 @@ describe("useContributors", () => {
     expect(api.branch).toBe("dev");
   });
 
-  it("persists the range and the merge toggle", async () => {
+  it("persists the period and the merge toggle", async () => {
     await mount(nextCwd());
-    await act(async () => api.setRange(RANGE_A));
+    await selectMonthBack(3);
     await act(async () => api.setMerge(false));
-    expect(localStorage.getItem(RANGE_KEY)).toBe(saved(RANGE_A));
+    expect(localStorage.getItem(RANGE_KEY)).toBe(saved(MONTH_A));
     expect(localStorage.getItem("monocode.contributors.mergeIdentities")).toBe(
       "false",
     );
-    expect(api.range).toEqual(RANGE_A);
+    expect(api.period.id).toBe(MONTH_A.id);
     expect(api.merge).toBe(false);
     expect(api.model?.merge).toBe(false);
   });
@@ -534,7 +552,7 @@ describe("useContributors races", () => {
   });
 
   it("ignores a late failure of an abandoned request", async () => {
-    localStorage.setItem(RANGE_KEY, saved(RANGE_A));
+    localStorage.setItem(RANGE_KEY, saved(MONTH_A));
     const a = deferred<ReturnType<typeof rawFixture>>();
     const b = deferred<ReturnType<typeof rawFixture>>();
     vi.mocked(collectRaw)
@@ -542,7 +560,7 @@ describe("useContributors races", () => {
       .mockReturnValueOnce(a.promise)
       .mockReturnValueOnce(b.promise);
     await mount(nextCwd());
-    await act(async () => api.setRange(RANGE_B));
+    await act(async () => api.goPrevious());
     await act(async () => b.reject("B failed"));
     expect(api.status).toBe("error");
     expect(api.error).toBe("B failed");
@@ -552,14 +570,14 @@ describe("useContributors races", () => {
   });
 
   it("does not clear the current failure when an abandoned request succeeds", async () => {
-    localStorage.setItem(RANGE_KEY, saved(RANGE_A));
+    localStorage.setItem(RANGE_KEY, saved(MONTH_A));
     const a = deferred<ReturnType<typeof rawFixture>>();
     vi.mocked(collectRaw)
       .mockReset()
       .mockReturnValueOnce(a.promise)
       .mockRejectedValueOnce("B failed");
     await mount(nextCwd());
-    await act(async () => api.setRange(RANGE_B));
+    await act(async () => api.goPrevious());
     expect(api.error).toBe("B failed");
     await act(async () => a.resolve(rawFixture()));
     expect(api.error).toBe("B failed");
@@ -607,11 +625,11 @@ describe("useContributors races", () => {
     expect(api.branch).toBe("main");
   });
 
-  it("keeps showing the previous data, marked stale, while a new range loads", async () => {
+  it("keeps showing the previous data, marked stale, while a new period loads", async () => {
     await mount(nextCwd());
     const gate = deferred<ReturnType<typeof rawFixture>>();
     vi.mocked(collectRaw).mockReturnValueOnce(gate.promise);
-    await act(async () => api.setRange(RANGE_B));
+    await act(async () => api.setKind("month"));
     expect(api.status).toBe("ready");
     expect(api.stale).toBe(true);
     expect(api.model).toBeDefined();
@@ -655,104 +673,111 @@ describe("useContributors automatic reloads", () => {
     expect(vi.mocked(collectRaw).mock.calls.length).toBe(calls + 1);
   });
 
-  it("moves the range to the new day after midnight without a refocus", async () => {
+  it("moves the 7d period to the new day after midnight without a refocus", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     try {
       vi.setSystemTime(new Date(2026, 9, 15, 23, 59, 0));
       await mount(nextCwd());
-      expect(api.model?.rangeEnd).toEqual(new Date(2026, 9, 16));
+      expect(api.model?.period.end).toEqual(new Date(2026, 9, 16));
       await act(async () => {
         await vi.advanceTimersByTimeAsync(2 * 60_000);
       });
-      expect(api.model?.rangeEnd).toEqual(new Date(2026, 9, 17));
+      expect(api.model?.period.end).toEqual(new Date(2026, 9, 17));
     } finally {
       vi.useRealTimers();
     }
   });
 });
 
-describe("useContributors season", () => {
-  const choices = () => seasonChoices(new Date());
-
-  it("defaults to the current month and offers it with the five before", async () => {
+describe("useContributors period", () => {
+  it("defaults to the last 7 days, with nothing ahead and no stepping back", async () => {
     await mount(nextCwd());
-    const ids = choices().map((s) => s.id);
-    expect(api.seasons.map((s) => s.id)).toEqual(ids);
-    expect(api.seasons).toHaveLength(6);
-    expect(api.seasons[0].label).toBe(choices()[0].label);
-    expect(api.season).toBe(ids[0]);
-    expect(api.model?.season.id).toBe(ids[0]);
-  });
-
-  it("loads an earlier since for a season the data does not cover, then ranks it", async () => {
-    await mount(nextCwd());
+    expect(api.period.kind).toBe("7d");
+    expect(api.hasNext).toBe(false);
     const before = vi.mocked(collectRaw).mock.calls.length;
-    const picked = choices()[4];
-    await act(async () => api.setSeason(picked.id));
-    const calls = vi.mocked(collectRaw).mock.calls;
-    expect(calls.length).toBe(before + 1);
-    const since = Date.parse(calls.at(-1)![1].since);
-    expect(since).toBeLessThanOrEqual(previousSeason(picked).start.getTime());
-    expect(api.season).toBe(picked.id);
-    expect(api.model?.season.id).toBe(picked.id);
-    expect(api.model?.previousSeason.id).toBe(choices()[5].id);
-  });
-
-  it("re-scores a covered season from the loaded data without a request", async () => {
-    await mount(nextCwd());
-    await act(async () => api.setRange(RANGE_A));
-    const before = vi.mocked(collectRaw).mock.calls.length;
-    const picked = choices()[2];
-    await act(async () => api.setSeason(picked.id));
+    await act(async () => api.goPrevious());
+    await act(async () => api.goNext());
     expect(vi.mocked(collectRaw).mock.calls.length).toBe(before);
-    expect(api.model?.season.id).toBe(picked.id);
-    expect(api.status).toBe("ready");
+    expect(api.period.kind).toBe("7d");
   });
 
-  it("keeps showing the old season, marked stale, while the new one loads", async () => {
+  it("selects the current period of a kind and remembers the kind alone", async () => {
     await mount(nextCwd());
+    for (const kind of ["month", "quarter", "year"] as const) {
+      await act(async () => api.setKind(kind));
+      expect(api.period.id).toBe(currentPeriod(kind, new Date()).id);
+      expect(api.model?.period.id).toBe(api.period.id);
+      expect(api.hasNext).toBe(false);
+      expect(localStorage.getItem(RANGE_KEY)).toBe(kind);
+    }
+  });
+
+  it("steps back and forward and ranks the stepped period", async () => {
+    await mount(nextCwd());
+    await act(async () => api.setKind("quarter"));
+    const current = currentPeriod("quarter", new Date());
+    await act(async () => api.goPrevious());
+    expect(api.period.id).toBe(previousPeriod(current).id);
+    expect(api.model?.period.id).toBe(previousPeriod(current).id);
+    expect(api.model?.previousPeriod.id).toBe(
+      previousPeriod(previousPeriod(current)).id,
+    );
+    expect(api.hasNext).toBe(true);
+    expect(localStorage.getItem(RANGE_KEY)).toBe(
+      `quarter:${previousPeriod(current).id}`,
+    );
+    await act(async () => api.goNext());
+    expect(api.period.id).toBe(current.id);
+    expect(api.hasNext).toBe(false);
+    expect(localStorage.getItem(RANGE_KEY)).toBe("quarter");
+  });
+
+  it("does not step past the current period", async () => {
+    await mount(nextCwd());
+    await act(async () => api.setKind("year"));
+    const before = vi.mocked(collectRaw).mock.calls.length;
+    await act(async () => api.goNext());
+    expect(api.period.id).toBe(currentPeriod("year", new Date()).id);
+    expect(vi.mocked(collectRaw).mock.calls.length).toBe(before);
+  });
+
+  it("keeps showing the old period, marked stale, while the new one loads", async () => {
+    await mount(nextCwd());
+    await act(async () => api.setKind("month"));
     const gate = deferred<ReturnType<typeof rawFixture>>();
     vi.mocked(collectRaw).mockReturnValueOnce(gate.promise);
-    const picked = choices()[5];
-    await act(async () => api.setSeason(picked.id));
-    expect(api.season).toBe(picked.id);
+    await act(async () => api.goPrevious());
+    expect(api.period.id).toBe(monthBack(1).id);
     expect(api.stale).toBe(true);
-    expect(api.model?.season.id).toBe(choices()[0].id);
+    expect(api.model?.period.id).toBe(monthBack(0).id);
     await act(async () => gate.resolve(rawFixture()));
     expect(api.stale).toBe(false);
-    expect(api.model?.season.id).toBe(picked.id);
+    expect(api.model?.period.id).toBe(monthBack(1).id);
   });
 
-  it("drops a pick that scrolled out of the six choices when the month turns", async () => {
+  it("follows the calendar when the current month turns, but not a pinned past month", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     try {
       vi.setSystemTime(new Date(2026, 9, 31, 23, 59, 0));
       await mount(nextCwd());
-      await act(async () => api.setSeason("2026-05"));
-      expect(api.season).toBe("2026-05");
+      await act(async () => api.setKind("month"));
+      expect(api.period.id).toBe("2026-10");
       await act(async () => {
         await vi.advanceTimersByTimeAsync(2 * 60_000);
       });
-      expect(api.seasons.map((s) => s.id)).not.toContain("2026-05");
-      expect(api.season).toBe("2026-11");
-      expect(api.model?.season.id).toBe("2026-11");
+      expect(api.period.id).toBe("2026-11");
+      expect(api.model?.period.id).toBe("2026-11");
+      await act(async () => api.goPrevious());
+      await act(async () => api.goPrevious());
+      expect(api.period.id).toBe("2026-09");
+      vi.setSystemTime(new Date(2026, 10, 30, 23, 59, 0));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2 * 60_000);
+      });
+      expect(api.period.id).toBe("2026-09");
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("exposes the month of now to the model, whatever is ranked", async () => {
-    await mount(nextCwd());
-    await act(async () => api.setSeason(choices()[1].id));
-    expect(api.model?.currentSeasonId).toBe(choices()[0].id);
-  });
-
-  it("goes back to the current month", async () => {
-    await mount(nextCwd());
-    await act(async () => api.setSeason(choices()[1].id));
-    await act(async () => api.setSeason(choices()[0].id));
-    expect(api.season).toBe(choices()[0].id);
-    expect(api.model?.season.id).toBe(choices()[0].id);
   });
 });
 

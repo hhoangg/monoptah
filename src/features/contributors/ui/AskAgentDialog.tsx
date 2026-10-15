@@ -281,7 +281,7 @@ export function AskAgentDialog({
           ) : null}
           <span className="min-w-0 flex-1 text-[11px] text-content/45">
             Opens a new session with{" "}
-            <code className="font-mono">{snapshotFileName(model.season)}</code>{" "}
+            <code className="font-mono">{snapshotFileName(model.period)}</code>{" "}
             attached
           </span>
           <SecondaryButton onClick={onClose} disabled={starting}>

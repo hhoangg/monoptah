@@ -4,11 +4,12 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../model/config";
 import { formatScore } from "../model/format";
+import { currentPeriod, previousPeriod } from "../model/period";
 import type { ContributorsModel } from "../model/pipeline";
 import { SCORING } from "../model/scoring";
 import { withConfig } from "../model/testFixtures";
 import { FormulaSidebar, type FormulaSidebarProps } from "./FormulaSidebar";
-import { leaderboardModel } from "./leaderboardFixture";
+import { NOW, leaderboardModel } from "./leaderboardFixture";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -90,7 +91,7 @@ describe("FormulaSidebar breakdown", () => {
     const me = model.leaderboard.rows.find((r) => r.isMe)!;
     await render(model);
     expect(text()).toContain(
-      `Your score this season: ${formatScore(me.score)}`,
+      `Your score in Oct 2026: ${formatScore(me.score)}`,
     );
     for (const key of [
       "delivery",
@@ -164,46 +165,62 @@ describe("FormulaSidebar breakdown", () => {
     expect(text()).toContain("Custom weights are active: Consistency ×2.");
   });
 
-  it("explains when the viewer has no activity this season", async () => {
+  it("explains when the viewer has no activity in the period", async () => {
     await render(leaderboardModel({ user: undefined }));
-    expect(text()).toContain("Your score this season");
-    expect(text()).toContain("No activity for you this season yet");
+    expect(text()).toContain("Your score in Oct 2026");
+    expect(text()).toContain("No activity for you in Oct 2026 yet");
     expect(panel().querySelector("[data-part]")).toBeNull();
   });
 
-  it("names an older season instead of this season", async () => {
-    await render(leaderboardModel({ seasonId: "2026-09" }));
+  it("names an older month by its label", async () => {
+    await render(
+      leaderboardModel({ period: previousPeriod(currentPeriod("month", NOW)) }),
+    );
     expect(text()).toContain("Your score in Sep 2026:");
   });
 });
 
-describe("FormulaSidebar current season", () => {
+describe("FormulaSidebar period wording", () => {
   afterEach(() => vi.useRealTimers());
 
-  it("calls the model's own month this season even when the clock is in another month", async () => {
+  it("names the model's period, whatever the clock says", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date(2026, 10, 5, 9));
+    vi.setSystemTime(new Date(2027, 0, 3));
     await render(leaderboardModel());
-    expect(text()).toContain("Your score this season:");
-    expect(text()).not.toContain("Your score in Oct 2026");
+    expect(text()).toContain("Your score in Oct 2026:");
   });
 
-  it("names a past season by its label whatever the clock says", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date(2026, 8, 12, 9));
-    await render(leaderboardModel({ seasonId: "2026-09" }));
-    expect(text()).toContain("Your score in Sep 2026:");
+  it("says the last 7 days for the 7d period", async () => {
+    await render(leaderboardModel({ period: currentPeriod("7d", NOW) }));
+    expect(text()).toContain("Your score in the last 7 days");
+  });
+
+  it("names a quarter and a year by their labels", async () => {
+    await render(leaderboardModel({ period: currentPeriod("quarter", NOW) }));
+    expect(text()).toContain("Your score in Q4 2026");
+    await render(leaderboardModel({ period: currentPeriod("year", NOW) }));
+    expect(text()).toContain("Your score in 2026");
   });
 
   it("uses the same wording for a missing viewer", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date(2027, 0, 3));
-    await render(leaderboardModel({ user: undefined }));
-    expect(text()).toContain("No activity for you this season yet");
+    await render(
+      leaderboardModel({
+        user: undefined,
+        period: currentPeriod("quarter", NOW),
+      }),
+    );
+    expect(text()).toContain("No activity for you in Q4 2026 yet");
   });
 });
 
 describe("FormulaSidebar copy", () => {
+  it("says that Consistency grows with the period and Breadth is capped", async () => {
+    await render(leaderboardModel());
+    expect(text()).toContain(
+      "Consistency grows with the length of the period; Breadth is capped, so in long periods it weighs less.",
+    );
+  });
+
   it("renders the numbers from the scoring constants", async () => {
     await render(leaderboardModel());
     const t = text();

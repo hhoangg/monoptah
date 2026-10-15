@@ -51,8 +51,7 @@ import {
 import { resetContributorsCache } from "../hooks/useContributors";
 import { REMOTE_PROJECT_PREFIX } from "../../projects/model/recents";
 import { RANGE_KEY } from "../model/prefs";
-import { earliestCustomDay, formatDay, seasonChoices } from "../model/range";
-import { previousSeason } from "../model/season";
+import { currentPeriod, previousPeriod, syncWindow } from "../model/period";
 import { ANA, BOB, file, makeCommit, makeRaw } from "../model/testFixtures";
 import { deferUnhandledEscape } from "../../workspace/model/tabKeys";
 import { ContributorsView } from "./ContributorsView";
@@ -132,34 +131,18 @@ const byText = (selector: string, text: string) =>
     (el.textContent ?? "").includes(text),
   );
 
-const rangeButton = (label: string) =>
+const periodButton = (label: string) =>
   Array.from(
     container.querySelectorAll<HTMLElement>(
-      '[role="radiogroup"][aria-label="Range"] button',
+      '[role="radiogroup"][aria-label="Period"] button',
     ),
   ).find((b) => b.textContent === label);
 
-const rangeInputs = () => {
-  const start = container.querySelector<HTMLInputElement>(
-    'input[type="date"][aria-label="Start date"]',
-  );
-  const end = container.querySelector<HTMLInputElement>(
-    'input[type="date"][aria-label="End date"]',
-  );
-  return start && end ? { start, end } : null;
-};
+const arrow = (label: "Previous period" | "Next period") =>
+  container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
 
-/** Types a value into a controlled input the way a user edit reaches React. */
-async function setDay(input: HTMLInputElement, value: string) {
-  const set = Object.getOwnPropertyDescriptor(
-    HTMLInputElement.prototype,
-    "value",
-  )!.set!;
-  await act(async () => {
-    set.call(input, value);
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-  });
-}
+const periodLabel = () =>
+  container.querySelector('[aria-label="Period navigation"] span')?.textContent;
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -322,12 +305,12 @@ describe("ContributorsView", () => {
     expect(container.querySelector('[role="tablist"]')).not.toBeNull();
   });
 
-  it("shows an empty state when there are no commits in the range", async () => {
+  it("shows an empty state when there are no commits in the period", async () => {
     vi.mocked(collectRaw).mockImplementation(async () =>
       makeRaw({ since: recent(70) }),
     );
     await mount();
-    expect(container.textContent).toContain("No commits in this range");
+    expect(container.textContent).toContain("No commits in this period");
   });
 
   it("fires the team scope from the Ask Agent button, which is absent without a handler", async () => {
@@ -342,166 +325,129 @@ describe("ContributorsView", () => {
     expect(byText("button", "Ask Agent")).toBeUndefined();
   });
 
-  it("offers only 7d, 30d and Custom", async () => {
+  it("offers 7d, Month, Quarter and Year, with no arrows for 7d", async () => {
     await mount();
     const labels = Array.from(
       container.querySelectorAll(
-        '[role="radiogroup"][aria-label="Range"] button',
+        '[role="radiogroup"][aria-label="Period"] button',
       ),
     ).map((b) => b.textContent);
-    expect(labels).toEqual(["7d", "30d", "Custom"]);
-    expect(rangeInputs()).toBeNull();
+    expect(labels).toEqual(["7d", "Month", "Quarter", "Year"]);
+    expect(periodButton("7d")?.getAttribute("aria-checked")).toBe("true");
+    expect(
+      container.querySelector('[aria-label="Period navigation"]'),
+    ).toBeNull();
+    expect(container.querySelector('input[type="date"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Range"]')).toBeNull();
   });
 
-  it("changes and remembers the range", async () => {
+  it("collects the window of the period, from the previous start to the end capped at tomorrow", async () => {
     await mount();
-    const week = rangeButton("7d");
-    await act(async () => week?.click());
+    const week = syncWindow(currentPeriod("7d", new Date()), new Date());
+    const options = vi.mocked(collectRaw).mock.calls.at(-1)![1];
+    expect(Date.parse(options.since)).toBe(week.from.getTime());
+    expect(Date.parse(options.until!)).toBe(week.to.getTime());
+  });
+
+  it("changes and remembers the kind", async () => {
+    await mount();
+    const month = periodButton("Month");
+    await act(async () => month?.click());
+    expect(localStorage.getItem(RANGE_KEY)).toBe("month");
+    expect(month?.getAttribute("aria-checked")).toBe("true");
+    expect(periodLabel()).toBe(currentPeriod("month", new Date()).label);
+    await act(async () => periodButton("Quarter")?.click());
+    expect(localStorage.getItem(RANGE_KEY)).toBe("quarter");
+    expect(periodLabel()).toBe(currentPeriod("quarter", new Date()).label);
+    await act(async () => periodButton("Year")?.click());
+    expect(localStorage.getItem(RANGE_KEY)).toBe("year");
+    expect(periodLabel()).toBe(String(new Date().getFullYear()));
+    await act(async () => periodButton("7d")?.click());
     expect(localStorage.getItem(RANGE_KEY)).toBe("7d");
-    expect(week?.getAttribute("aria-checked")).toBe("true");
+    expect(
+      container.querySelector('[aria-label="Period navigation"]'),
+    ).toBeNull();
   });
 
-  it("falls back to 30d for a saved range that no longer exists", async () => {
-    localStorage.setItem(RANGE_KEY, "90d");
+  it("falls back to 7d for a saved range that no longer exists", async () => {
+    for (const saved of [
+      "30d",
+      "90d",
+      "all",
+      "custom:2026-10-01:2026-10-09",
+      "x",
+    ]) {
+      localStorage.setItem(RANGE_KEY, saved);
+      resetContributorsCache();
+      await mount();
+      expect(periodButton("7d")?.getAttribute("aria-checked")).toBe("true");
+      await act(async () => root.render(createElement("div")));
+    }
+  });
+
+  it("restores a saved period", async () => {
+    const aug = previousPeriod(currentPeriod("month", new Date()));
+    localStorage.setItem(RANGE_KEY, `month:${aug.id}`);
     await mount();
-    expect(rangeButton("30d")?.getAttribute("aria-checked")).toBe("true");
+    expect(periodButton("Month")?.getAttribute("aria-checked")).toBe("true");
+    expect(periodLabel()).toBe(aug.label);
   });
 
-  describe("custom range", () => {
-    const today = () => formatDay(new Date());
-    const daysAgo = (n: number) => {
-      const d = new Date();
-      return formatDay(
-        new Date(d.getFullYear(), d.getMonth(), d.getDate() - n),
-      );
-    };
+  describe("stepping through periods", () => {
+    const now = () => new Date();
 
-    it("starts from the days the current preset shows", async () => {
+    it("disables Next on the current period", async () => {
       await mount();
-      await act(async () => rangeButton("Custom")?.click());
-      expect(rangeButton("Custom")?.getAttribute("aria-checked")).toBe("true");
-      const { start, end } = rangeInputs()!;
-      expect(start.value).toBe(daysAgo(29));
-      expect(end.value).toBe(today());
+      await act(async () => periodButton("Month")?.click());
+      expect(arrow("Next period")?.disabled).toBe(true);
+      expect(arrow("Previous period")?.disabled).toBe(false);
+    });
+
+    it("goes back, remembers the pick and loads the window of that period", async () => {
+      await mount();
+      await act(async () => periodButton("Month")?.click());
+      await act(async () => arrow("Previous period")?.click());
+      const previous = previousPeriod(currentPeriod("month", now()));
+      expect(periodLabel()).toBe(previous.label);
+      expect(localStorage.getItem(RANGE_KEY)).toBe(`month:${previous.id}`);
+      const window = syncWindow(previous, now());
+      const options = vi.mocked(collectRaw).mock.calls.at(-1)![1];
+      expect(Date.parse(options.since)).toBe(window.from.getTime());
+      expect(Date.parse(options.until!)).toBe(window.to.getTime());
+      expect(arrow("Next period")?.disabled).toBe(false);
+    });
+
+    it("steps forward to the current period and follows it again", async () => {
+      await mount();
+      await act(async () => periodButton("Quarter")?.click());
+      await act(async () => arrow("Previous period")?.click());
+      await act(async () => arrow("Previous period")?.click());
+      await act(async () => arrow("Next period")?.click());
+      await act(async () => arrow("Next period")?.click());
+      expect(periodLabel()).toBe(currentPeriod("quarter", now()).label);
+      expect(localStorage.getItem(RANGE_KEY)).toBe("quarter");
+      expect(arrow("Next period")?.disabled).toBe(true);
+    });
+
+    it("steps years", async () => {
+      await mount();
+      await act(async () => periodButton("Year")?.click());
+      await act(async () => arrow("Previous period")?.click());
+      expect(periodLabel()).toBe(String(now().getFullYear() - 1));
       expect(localStorage.getItem(RANGE_KEY)).toBe(
-        `custom:${daysAgo(29)}:${today()}`,
+        `year:${now().getFullYear() - 1}`,
       );
     });
+  });
 
-    it("loads the data of the picked days", async () => {
-      await mount();
-      await act(async () => rangeButton("Custom")?.click());
-      const before = vi.mocked(collectRaw).mock.calls.length;
-      await setDay(rangeInputs()!.start, daysAgo(200));
-      expect(vi.mocked(collectRaw).mock.calls.length).toBeGreaterThan(before);
-      const since = Date.parse(
-        vi.mocked(collectRaw).mock.calls.at(-1)![1].since,
-      );
-      expect(since).toBeLessThanOrEqual(Date.parse(daysAgo(200)));
-    });
-
-    it("keeps the span within 30 days when the start is moved further back", async () => {
-      await mount();
-      await act(async () => rangeButton("Custom")?.click());
-      await setDay(rangeInputs()!.start, daysAgo(90));
-      const { start, end } = rangeInputs()!;
-      expect(start.value).toBe(daysAgo(90));
-      expect(end.value).toBe(daysAgo(61));
-      expect(localStorage.getItem(RANGE_KEY)).toBe(
-        `custom:${daysAgo(90)}:${daysAgo(61)}`,
-      );
-    });
-
-    it("keeps the span within 30 days when the end is moved forward", async () => {
-      localStorage.setItem(RANGE_KEY, `custom:${daysAgo(90)}:${daysAgo(80)}`);
-      await mount();
-      await setDay(rangeInputs()!.end, daysAgo(10));
-      const { start, end } = rangeInputs()!;
-      expect(end.value).toBe(daysAgo(10));
-      expect(start.value).toBe(daysAgo(39));
-    });
-
-    it("does not allow an end after today", async () => {
-      await mount();
-      await act(async () => rangeButton("Custom")?.click());
-      expect(rangeInputs()!.end.max).toBe(today());
-      expect(rangeInputs()!.start.max).toBe(today());
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      await setDay(rangeInputs()!.end, formatDay(tomorrow));
-      expect(rangeInputs()!.end.value).toBe(today());
-    });
-
-    it("limits both inputs to the horizon season selection reaches", async () => {
-      await mount();
-      await act(async () => rangeButton("Custom")?.click());
-      const earliest = formatDay(earliestCustomDay(new Date()));
-      const { start, end } = rangeInputs()!;
-      expect(start.min).toBe(earliest);
-      expect(end.min).toBe(earliest);
-      expect(start.max).toBe(today());
-    });
-
-    it("clamps a typed start older than the horizon", async () => {
-      await mount();
-      await act(async () => rangeButton("Custom")?.click());
-      const earliest = formatDay(earliestCustomDay(new Date()));
-      await setDay(rangeInputs()!.start, "2020-01-01");
-      const { start, end } = rangeInputs()!;
-      expect(start.value).toBe(earliest);
-      expect(
-        Date.parse(end.value) - Date.parse(start.value),
-      ).toBeLessThanOrEqual(29 * 86_400_000);
-      expect(localStorage.getItem(RANGE_KEY)).toBe(
-        `custom:${start.value}:${end.value}`,
-      );
-    });
-
-    it("clamps a saved range older than the horizon", async () => {
-      localStorage.setItem(RANGE_KEY, "custom:2020-01-01:2020-01-10");
-      await mount();
-      const earliest = formatDay(earliestCustomDay(new Date()));
-      const { start, end } = rangeInputs()!;
-      expect(start.value).toBe(earliest);
-      expect(end.value).toBe(earliest);
-    });
-
-    it("moves the other end when the picked start is after the end", async () => {
-      localStorage.setItem(RANGE_KEY, `custom:${daysAgo(20)}:${daysAgo(10)}`);
-      await mount();
-      await setDay(rangeInputs()!.start, daysAgo(5));
-      expect(rangeInputs()!.start.value).toBe(daysAgo(5));
-      expect(rangeInputs()!.end.value).toBe(daysAgo(5));
-    });
-
-    it("ignores a cleared date", async () => {
-      localStorage.setItem(RANGE_KEY, `custom:${daysAgo(20)}:${daysAgo(10)}`);
-      await mount();
-      await setDay(rangeInputs()!.start, "");
-      expect(rangeInputs()!.start.value).toBe(daysAgo(20));
-    });
-
-    it("clamps a saved range that is longer than 30 days", async () => {
-      localStorage.setItem(RANGE_KEY, `custom:${daysAgo(100)}:${daysAgo(5)}`);
-      await mount();
-      const { start, end } = rangeInputs()!;
-      expect(end.value).toBe(daysAgo(5));
-      expect(start.value).toBe(daysAgo(34));
-    });
-
-    it("goes back to a preset and hides the date inputs", async () => {
-      await mount();
-      await act(async () => rangeButton("Custom")?.click());
-      await act(async () => rangeButton("7d")?.click());
-      expect(rangeInputs()).toBeNull();
-      expect(localStorage.getItem(RANGE_KEY)).toBe("7d");
-    });
-
-    it("shows how many days the previous-period comparison covers", async () => {
-      localStorage.setItem(RANGE_KEY, `custom:${daysAgo(9)}:${today()}`);
-      await mount();
-      expect(container.textContent).toContain("vs prev 10d");
-    });
+  it("shows how the previous period is compared", async () => {
+    await mount();
+    expect(container.textContent).toContain("vs prev 7d");
+    await act(async () => periodButton("Month")?.click());
+    await act(async () => {});
+    const previous = previousPeriod(currentPeriod("month", new Date()));
+    // The mocked data starts 70 days back, so it covers the previous month.
+    expect(container.textContent).toContain(`vs ${previous.label}`);
   });
 
   it("toggles merge identities and remembers it", async () => {
@@ -557,28 +503,16 @@ describe("ContributorsView leaderboard", () => {
     await openTab("Leaderboard", LEADERBOARD_MARKER);
   };
 
-  it("offers the current month and five before, and loads earlier data for an older pick", async () => {
+  it("has no season picker: the page period drives the board", async () => {
     await openLeaderboard();
-    const before = vi.mocked(collectRaw).mock.calls.length;
-    const trigger = container.querySelector(
-      'button[aria-label^="Season:"]',
-    ) as HTMLButtonElement;
-    await act(async () => trigger.click());
-    const options = Array.from(
-      document.body.querySelectorAll<HTMLElement>('[role="option"]'),
+    expect(container.querySelector('button[aria-label^="Season"]')).toBeNull();
+    expect(container.textContent).toContain(
+      `period: ${currentPeriod("7d", new Date()).label}`,
     );
-    expect(options).toHaveLength(6);
-    const oldest = options[5];
-    await act(async () => oldest.click());
-    const calls = vi.mocked(collectRaw).mock.calls;
-    expect(calls.length).toBe(before + 1);
-    const picked = seasonChoices(new Date())[5];
-    expect(Date.parse(calls.at(-1)![1].since)).toBeLessThanOrEqual(
-      previousSeason(picked).start.getTime(),
+    await act(async () => periodButton("Month")?.click());
+    expect(container.textContent).toContain(
+      `period: ${currentPeriod("month", new Date()).label}`,
     );
-    expect(
-      container.querySelector('button[aria-label^="Season:"]')?.textContent,
-    ).toBe(picked.label);
   });
 
   it("opens the formula sidebar over the page body, outside the scrolling content", async () => {
@@ -768,7 +702,7 @@ describe("ContributorsView hardening", () => {
     );
   });
 
-  it("keeps the page up and marks it busy while a new range loads", async () => {
+  it("keeps the page up and marks it busy while a new period loads", async () => {
     await mount();
     let release!: () => void;
     vi.mocked(collectRaw).mockImplementationOnce(
@@ -777,12 +711,7 @@ describe("ContributorsView hardening", () => {
           release = () => resolve(liveRaw());
         }),
     );
-    const all = Array.from(
-      container.querySelectorAll(
-        '[role="radiogroup"][aria-label="Range"] button',
-      ),
-    ).find((b) => b.textContent === "7d") as HTMLElement;
-    await act(async () => all.click());
+    await act(async () => periodButton("Month")?.click());
     expect(container.querySelector('[role="tablist"]')).not.toBeNull();
     expect(
       container.querySelector('[role="tabpanel"]')?.getAttribute("aria-busy"),
@@ -801,7 +730,7 @@ describe("ContributorsView Ask Agent dialog", () => {
       return 1;
     });
     vi.stubGlobal("cancelAnimationFrame", () => {});
-    // Commits made right now always fall in the current season.
+    // Commits made right now always fall in the current period.
     vi.mocked(collectRaw).mockImplementation(async () =>
       liveRaw({
         commits: [

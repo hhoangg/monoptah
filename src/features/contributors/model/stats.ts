@@ -3,7 +3,8 @@ import type { Resolver } from "./identity";
 import { colorFromMap } from "./palette";
 import { attributeCommits, attributePrs } from "./scoring";
 import type { AttributedCommit } from "./scoring";
-import { localDayKey } from "./season";
+import { localDayKey } from "./period";
+import type { Period } from "./period";
 import type { ContributorsConfig, RawData } from "./types";
 
 export type StatsRow = {
@@ -20,12 +21,27 @@ export type StatsRow = {
   color: string;
 };
 
+export type BucketGranularity = "day" | "week" | "month";
+
+/** Chart buckets for a period: days for 7d and month, weeks for a quarter, months for a year. */
+export function bucketGranularity(period: Period): BucketGranularity {
+  switch (period.kind) {
+    case "7d":
+    case "month":
+      return "day";
+    case "quarter":
+      return "week";
+    case "year":
+      return "month";
+  }
+}
+
 export type Bucket = {
-  /** Local day key of the first day of the week (Monday). */
+  /** Local day key of the first day of the day, week (Monday) or month. */
   start: string;
-  /** Tooltip text: "Week of Oct 5, 2026". */
+  /** Tooltip text: "Oct 5, 2026", "Week of Oct 5, 2026" or "Oct 2026". */
   label: string;
-  /** Axis text: "Oct 5". */
+  /** Axis text: "Oct 5" or "Oct 2026". */
   short: string;
   byPerson: Record<string, number>;
 };
@@ -38,6 +54,7 @@ export type Stats = {
     lines: { added: number; deleted: number; delta: number | null };
     prsMerged: { value: number; delta: number | null };
   };
+  granularity: BucketGranularity;
   buckets: Bucket[];
   rows: StatsRow[];
   legend: { personId: string; name: string; color: string }[];
@@ -62,7 +79,7 @@ function fraction(current: number, previous: number): number | null {
   return previous === 0 ? null : (current - previous) / previous;
 }
 
-type Period = { commits: number; added: number; deleted: number; prs: number };
+type Totals = { commits: number; added: number; deleted: number; prs: number };
 
 export function buildStats(input: {
   raw: RawData;
@@ -72,10 +89,13 @@ export function buildStats(input: {
   rangeEnd: Date;
   /** Defaults to the period of equal length right before `rangeStart`. */
   previous?: Range;
+  /** Chart buckets: calendar weeks (default), days or calendar months. */
+  granularity?: BucketGranularity;
   /** Shared person colors; an id missing from it gets its hashed color. */
   colors?: Record<string, string>;
 }): Stats {
   const { raw, config, resolver } = input;
+  const granularity = input.granularity ?? "week";
   const range: Range = { start: input.rangeStart, end: input.rangeEnd };
   const length = range.end.getTime() - range.start.getTime();
   const previous: Range = input.previous ?? {
@@ -90,8 +110,8 @@ export function buildStats(input: {
   );
   const prs = attributePrs({ raw, config, resolver });
 
-  const periodOf = (r: Range): Period => {
-    const period: Period = { commits: 0, added: 0, deleted: 0, prs: 0 };
+  const periodOf = (r: Range): Totals => {
+    const period: Totals = { commits: 0, added: 0, deleted: 0, prs: 0 };
     for (const c of commits) {
       if (!inRange(r, c.commit.committedAt)) continue;
       period.commits += 1;
@@ -161,7 +181,8 @@ export function buildStats(input: {
         delta: previousCovered ? now.prs - earlier.prs : null,
       },
     },
-    buckets: buildBuckets(inside, range),
+    granularity,
+    buckets: buildBuckets(inside, range, granularity),
     rows,
     legend: rows.map((r) => ({
       personId: r.personId,
@@ -233,33 +254,64 @@ const MONTHS = [
   "Dec",
 ];
 
-function bucketAt(start: Date): Bucket {
+function bucketAt(start: Date, granularity: BucketGranularity): Bucket {
   const month = MONTHS[start.getMonth()];
   const year = start.getFullYear();
   const day = start.getDate();
+  if (granularity === "month") {
+    return {
+      start: dayKeyOf(start),
+      label: `${month} ${year}`,
+      short: `${month} ${year}`,
+      byPerson: {},
+    };
+  }
   return {
     start: dayKeyOf(start),
-    label: `Week of ${month} ${day}, ${year}`,
+    label:
+      granularity === "day"
+        ? `${month} ${day}, ${year}`
+        : `Week of ${month} ${day}, ${year}`,
     short: `${month} ${day}`,
     byPerson: {},
   };
 }
 
-function buildBuckets(inside: AttributedCommit[], range: Range): Bucket[] {
-  const next = (date: Date) =>
-    new Date(date.getFullYear(), date.getMonth(), date.getDate() + 7);
+function buildBuckets(
+  inside: AttributedCommit[],
+  range: Range,
+  granularity: BucketGranularity,
+): Bucket[] {
+  const startOf = (date: Date) => {
+    if (granularity === "month") {
+      return new Date(date.getFullYear(), date.getMonth(), 1);
+    }
+    return granularity === "day"
+      ? new Date(date.getFullYear(), date.getMonth(), date.getDate())
+      : mondayOf(date);
+  };
+  const next = (date: Date) => {
+    if (granularity === "month") {
+      return new Date(date.getFullYear(), date.getMonth() + 1, 1);
+    }
+    return new Date(
+      date.getFullYear(),
+      date.getMonth(),
+      date.getDate() + (granularity === "day" ? 1 : 7),
+    );
+  };
   const buckets = new Map<string, Bucket>();
   for (
-    let b = mondayOf(range.start);
+    let b = startOf(range.start);
     b.getTime() < range.end.getTime();
     b = next(b)
   ) {
-    buckets.set(dayKeyOf(b), bucketAt(b));
+    buckets.set(dayKeyOf(b), bucketAt(b, granularity));
   }
   for (const c of inside) {
     if (!c.personId) continue;
     const bucket = buckets.get(
-      dayKeyOf(mondayOf(new Date(c.commit.committedAt))),
+      dayKeyOf(startOf(new Date(c.commit.committedAt))),
     );
     if (bucket) {
       bucket.byPerson[c.personId] = (bucket.byPerson[c.personId] ?? 0) + 1;

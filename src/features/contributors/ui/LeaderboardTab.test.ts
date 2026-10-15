@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { formatScore } from "../model/format";
 import type { LeaderboardRow } from "../model/leaderboard";
 import type { ContributorsModel } from "../model/pipeline";
-import { seasonChoices } from "../model/range";
+import { currentPeriod, previousPeriod } from "../model/period";
 import { makeRaw } from "../model/testFixtures";
 import { leaderboardModel, NOW } from "./leaderboardFixture";
 import { LeaderboardTab, type LeaderboardTabProps } from "./LeaderboardTab";
@@ -101,11 +101,11 @@ describe("LeaderboardTab ranking", () => {
     expect(text[6]).toBe(`${ana.streak}d`);
   });
 
-  it("names the season and states the motivation note", async () => {
+  it("names the period and states the motivation note", async () => {
     await render(leaderboardModel());
     const text = container.textContent ?? "";
     expect(text).toContain("Ranking");
-    expect(text).toContain("season: Oct 2026 · resets monthly");
+    expect(text).toContain("period: Oct 2026");
     expect(text).toContain(
       "Rankings are for motivation, not performance review.",
     );
@@ -172,7 +172,7 @@ describe("LeaderboardTab ranking", () => {
 });
 
 describe("LeaderboardTab movement", () => {
-  it("shows up, down, unchanged and new with the previous-season explanation", async () => {
+  it("shows up, down, unchanged and new with the previous-period explanation", async () => {
     const model = leaderboardModel();
     expect(model.leaderboard.rows.map((r) => r.movement)).toEqual([
       1,
@@ -190,24 +190,24 @@ describe("LeaderboardTab movement", () => {
       ] as const;
     });
     expect(glyphs[0][0]).toBe("▲1");
-    expect(glyphs[0][1]).toBe("Up 1 place vs previous season");
+    expect(glyphs[0][1]).toBe("Up 1 place vs previous period");
     expect(glyphs[0][2]).toContain("text-diff-add-fg");
     expect(glyphs[1][0]).toBe("▼1");
-    expect(glyphs[1][1]).toBe("Down 1 place vs previous season");
+    expect(glyphs[1][1]).toBe("Down 1 place vs previous period");
     expect(glyphs[1][2]).toContain("text-diff-del-fg");
     expect(glyphs[2][0]).toBe("·");
-    expect(glyphs[2][1]).toBe("Same rank as the previous season");
+    expect(glyphs[2][1]).toBe("Same rank as the previous period");
     expect(glyphs[3][0]).toBe("·");
-    expect(glyphs[3][1]).toBe("Not ranked in the previous season");
+    expect(glyphs[3][1]).toBe("Not ranked in the previous period");
   });
 
   it("pluralizes a bigger move", async () => {
     await render(withMovement(leaderboardModel(), 1, 2));
     const el = rows()[1].querySelector<HTMLElement>("[title]");
     expect(el?.querySelector("[aria-hidden]")?.textContent).toBe("▲2");
-    expect(el?.getAttribute("title")).toBe("Up 2 places vs previous season");
+    expect(el?.getAttribute("title")).toBe("Up 2 places vs previous period");
     expect(el?.querySelector(".sr-only")?.textContent).toBe(
-      "Up 2 places vs previous season",
+      "Up 2 places vs previous period",
     );
     expect(el?.hasAttribute("aria-label")).toBe(false);
   });
@@ -321,58 +321,34 @@ describe("LeaderboardTab ask", () => {
   });
 });
 
-describe("LeaderboardTab season", () => {
-  const seasons = seasonChoices(NOW).map(({ id, label }) => ({ id, label }));
-
-  it("shows the selected season and reports a new pick", async () => {
-    const onSeason = vi.fn();
-    await render(leaderboardModel(), {
-      seasons,
-      season: "2026-10",
-      onSeasonChange: onSeason,
-    });
-    const trigger = container.querySelector(
-      'button[aria-label="Season: Oct 2026"]',
-    ) as HTMLButtonElement;
-    expect(trigger).not.toBeNull();
-    await act(async () => trigger.click());
-    const options = Array.from(
-      document.querySelectorAll<HTMLElement>('[role="option"]'),
-    ).map((o) => o.textContent);
-    expect(options).toEqual([
-      "Oct 2026",
-      "Sep 2026",
-      "Aug 2026",
-      "Jul 2026",
-      "Jun 2026",
-      "May 2026",
-    ]);
-    await act(async () =>
-      document.querySelectorAll<HTMLElement>('[role="option"]')[1].click(),
-    );
-    expect(onSeason).toHaveBeenCalledWith("2026-09");
-  });
-
-  it("has no selector without a season list", async () => {
+describe("LeaderboardTab period", () => {
+  it("has no period selector of its own: the page owns it", async () => {
     await render(leaderboardModel());
     expect(container.querySelector('button[aria-label^="Season"]')).toBeNull();
+    expect(container.querySelector('button[aria-label^="Period"]')).toBeNull();
   });
 
-  it("titles the board with the scored season", async () => {
-    await render(leaderboardModel({ seasonId: "2026-09" }), {
-      seasons,
-      season: "2026-09",
-      onSeasonChange: vi.fn(),
-    });
-    expect(container.textContent).toContain(
-      "season: Sep 2026 · resets monthly",
+  it("titles the board with the ranked period", async () => {
+    await render(
+      leaderboardModel({ period: previousPeriod(currentPeriod("month", NOW)) }),
     );
+    expect(container.textContent).toContain("period: Sep 2026");
+    expect(container.textContent).not.toContain("resets monthly");
     expect(rows().map(nameOf)).toEqual(["Bob", "Ana", "Cat"]);
+  });
+
+  it("titles the board with a 7d, quarter or year period", async () => {
+    await render(leaderboardModel({ period: currentPeriod("7d", NOW) }));
+    expect(container.textContent).toContain("period: Last 7 days");
+    await render(leaderboardModel({ period: currentPeriod("quarter", NOW) }));
+    expect(container.textContent).toContain("period: Q4 2026");
+    await render(leaderboardModel({ period: currentPeriod("year", NOW) }));
+    expect(container.textContent).toContain("period: 2026");
   });
 });
 
 describe("LeaderboardTab empty", () => {
-  it("explains an empty season instead of showing an empty table", async () => {
+  it("explains an empty period instead of showing an empty table", async () => {
     await render(leaderboardModel({ raw: makeRaw() }));
     expect(container.textContent).toContain("No scored activity in Oct 2026");
     expect(container.querySelector("table")).toBeNull();
@@ -462,6 +438,6 @@ describe("LeaderboardTab formula sidebar", () => {
     const me = model.leaderboard.rows[0];
     expect(
       document.querySelector('[role="complementary"]')?.textContent,
-    ).toContain(`Your score this season: ${formatScore(me.score)}`);
+    ).toContain(`Your score in Oct 2026: ${formatScore(me.score)}`);
   });
 });

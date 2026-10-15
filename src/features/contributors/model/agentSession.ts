@@ -15,8 +15,8 @@ export function utf8ToBase64(text: string): string {
 
 /** `contributors-2026-10.json` becomes "Contributors 2026-10". */
 export function contributorsSessionTitle(fileName: string): string {
-  const season = /^contributors-(.+)\.json$/.exec(fileName)?.[1];
-  return season ? `Contributors ${season}` : "Contributors";
+  const id = /^contributors-(.+)\.json$/.exec(fileName)?.[1];
+  return id ? `Contributors ${id}` : "Contributors";
 }
 
 /**

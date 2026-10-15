@@ -1,6 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { Bot, Trophy, Users } from "../../../shared/ui/icons";
-import { Select } from "../../settings/ui/primitives";
 import { formatScore } from "../model/format";
 import type { LeaderboardRow } from "../model/leaderboard";
 import { colorFromMap } from "../model/palette";
@@ -14,11 +13,6 @@ import { ScrollX } from "./ScrollX";
 export type LeaderboardTabProps = {
   model: ContributorsModel;
   onAskAgent?: (scope: SnapshotScope) => void;
-  /** The seasons on offer (newest first); without them there is no selector. */
-  seasons?: { id: string; label: string }[];
-  /** Id of the selected season. */
-  season?: string;
-  onSeasonChange?: (id: string) => void;
   onChangeConfig?: (config: ContributorsConfig) => void;
   /** The config file cannot be read: weights cannot be edited. */
   editLocked?: boolean;
@@ -35,33 +29,33 @@ const ORDINAL = ["1st", "2nd", "3rd"];
 const plural = (n: number, one: string, many = `${one}s`) =>
   `${n} ${n === 1 ? one : many}`;
 
-/** Glyph, tone and explanation for the rank change against the previous season. */
+/** Glyph, tone and explanation for the rank change against the previous period. */
 function movementView(movement: number | null) {
   if (movement === null) {
     return {
       glyph: "·",
       tone: "text-content/40",
-      title: "Not ranked in the previous season",
+      title: "Not ranked in the previous period",
     };
   }
   if (movement > 0) {
     return {
       glyph: `▲${movement}`,
       tone: "text-diff-add-fg",
-      title: `Up ${plural(movement, "place")} vs previous season`,
+      title: `Up ${plural(movement, "place")} vs previous period`,
     };
   }
   if (movement < 0) {
     return {
       glyph: `▼${-movement}`,
       tone: "text-diff-del-fg",
-      title: `Down ${plural(-movement, "place")} vs previous season`,
+      title: `Down ${plural(-movement, "place")} vs previous period`,
     };
   }
   return {
     glyph: "·",
     tone: "text-content/40",
-    title: "Same rank as the previous season",
+    title: "Same rank as the previous period",
   };
 }
 
@@ -233,9 +227,6 @@ function RankingRow({
 export function LeaderboardTab({
   model,
   onAskAgent,
-  seasons,
-  season,
-  onSeasonChange,
   onChangeConfig,
   editLocked,
   sidebarHost,
@@ -259,20 +250,8 @@ export function LeaderboardTab({
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-4 pt-3">
           <h2 className="text-[14px] font-semibold">Ranking</h2>
           <span className="text-[12px] text-content/50">
-            {`season: ${model.season.label} · resets monthly`}
+            {`period: ${model.period.label}`}
           </span>
-          <span className="flex-1" />
-          {seasons && season && onSeasonChange ? (
-            <Select
-              label="Season"
-              value={season}
-              options={seasons.map(({ id, label }) => ({
-                value: id,
-                label,
-              }))}
-              onChange={onSeasonChange}
-            />
-          ) : null}
         </div>
         <p className="px-4 pb-2 pt-0.5 text-[12px] text-content/50">
           Rankings are for motivation, not performance review.
@@ -282,10 +261,10 @@ export function LeaderboardTab({
           <div className="flex flex-col items-center gap-2 border-t border-stroke px-4 py-8 text-center">
             <Users className="size-5 text-content/35" strokeWidth={1.75} />
             <p className="text-[13px] font-medium">
-              {`No scored activity in ${model.season.label}`}
+              {`No scored activity in ${model.period.label}`}
             </p>
             <p className="text-[12px] text-content/50">
-              Merged pull requests, commits and reviews in the season appear
+              Merged pull requests, commits and reviews in the period appear
               here.
             </p>
           </div>

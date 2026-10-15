@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildLeaderboard, trend } from "./leaderboard";
-import type { PersonScore, SeasonScores } from "./scoring";
-import { seasonOf } from "./season";
+import { currentPeriod } from "./period";
+import type { PersonScore, PeriodScores } from "./scoring";
 
 function person(id: string, extra: Partial<PersonScore> = {}): PersonScore {
   return {
@@ -35,10 +35,10 @@ function person(id: string, extra: Partial<PersonScore> = {}): PersonScore {
 function season(
   people: PersonScore[],
   month = 9,
-  extra: Partial<SeasonScores> = {},
-): SeasonScores {
+  extra: Partial<PeriodScores> = {},
+): PeriodScores {
   return {
-    season: seasonOf(new Date(2026, month, 10)),
+    period: currentPeriod("month", new Date(2026, month, 10)),
     people,
     unattributed: { prs: 0, commits: 0 },
     ghAvailable: true,

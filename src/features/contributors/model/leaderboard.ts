@@ -1,4 +1,4 @@
-import type { PersonScore, SeasonScores } from "./scoring";
+import type { PersonScore, PeriodScores } from "./scoring";
 
 export type BadgeId =
   "streak" | "builder" | "cleaner" | "bug-hunter" | "reviewer" | "newcomer";
@@ -16,7 +16,7 @@ export type LeaderboardRow = PersonScore & {
 const STREAK_BADGE_DAYS = 10;
 const MIN_BADGE_PRS = 2;
 const MAX_BADGES = 3;
-const TREND_SEASONS = 6;
+const TREND_PERIODS = 6;
 
 const BADGES: Record<BadgeId, Badge> = {
   streak: { id: "streak", label: "Streak", icon: "fire" },
@@ -88,8 +88,8 @@ function awardBadges(
 export type Leaderboard = { rows: LeaderboardRow[]; podium: LeaderboardRow[] };
 
 export function buildLeaderboard(
-  current: SeasonScores,
-  previous: SeasonScores | null,
+  current: PeriodScores,
+  previous: PeriodScores | null,
   opts: { meId?: string },
 ): Leaderboard {
   const people = ranked(current.people);
@@ -112,13 +112,13 @@ export function buildLeaderboard(
   return { rows, podium: rows.slice(0, 3) };
 }
 
-/** Score per person over the last 6 seasons, oldest first; 0 for a season they were absent. */
+/** Score per person over the last 6 periods, oldest first; 0 for a period they were absent. */
 export function trend(
-  seasons: SeasonScores[],
+  periods: PeriodScores[],
 ): { personId: string; points: number[] }[] {
-  const recent = [...seasons]
-    .sort((a, b) => a.season.start.getTime() - b.season.start.getTime())
-    .slice(-TREND_SEASONS);
+  const recent = [...periods]
+    .sort((a, b) => a.period.start.getTime() - b.period.start.getTime())
+    .slice(-TREND_PERIODS);
   const ids = new Set<string>();
   for (const s of [...recent].reverse()) {
     for (const p of s.people) ids.add(p.personId);
