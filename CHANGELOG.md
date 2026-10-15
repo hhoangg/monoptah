@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-15
+
+### Added
+
+- **Contributors**, a per-project page for who is shipping what. Open it from a project's context menu in the sidebar. It has three tabs: **Stats** (commits, contributors, lines changed and merged PRs with change against the previous period, a stacked activity chart, and a contributor table), **Leaderboard** (monthly seasons with a podium, rank movement against the previous season, badges and a "How is the score calculated?" sidebar that opens with your own breakdown) and **Identities** (rename people, drag or move identities between them, accept or dismiss suggested merges, exclude bots).
+- Scores reward impact, not busyness. The unit is the merged pull request whatever the merge strategy; points come from the final diff plus the effort on the PR branch, with caps and diminishing returns, then Care, Review, Consistency and Breadth. Commits co-authored by AI agents count in full for the person; an agent-authored commit is credited to the PR author, then the committer, then your identity mapping. Lockfiles, build output, vendored and generated files, merge commits, whitespace-only changes, duplicate cherry-picks and bots are ignored.
+- Data comes from `git`, and from the GitHub CLI (`gh`) when it is installed and signed in. Without `gh`, pull requests are inferred from git history and the page says plainly that Review points are not counted. Collection runs in the background and is cached per branch head.
+- **Ask Agent** buttons for the whole team, one person, or your own score. A dialog shows exactly what is sent (you can remove parts and drop emails), then starts a new chat session in the project with a `contributors-<season>.json` snapshot attached and your question.
+- Team-shared settings live in `.monoptah/contributors.json` in the repository: people and identity mapping, excluded and agent identities, ignore globs and score weights. A missing file means defaults, and `.mailmap` is read as a base layer. An unreadable file blocks editing instead of being overwritten.
+
 ## [0.19.0] - 2026-10-15
 
 ### Added
