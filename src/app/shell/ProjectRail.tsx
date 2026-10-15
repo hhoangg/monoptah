@@ -126,6 +126,7 @@ type Props = {
   settingsSection?: SettingsSectionId;
   onOpenSettings?: () => void;
   onOpenNotificationSettings?: (projectPath?: string) => void;
+  onOpenContributors?: (projectPath: string) => void;
   onSelectSettingsSection?: (section: SettingsSectionId) => void;
   onCloseSettings?: () => void;
   updateNotice?: InstalledUpdate | null;
@@ -168,6 +169,7 @@ export function ProjectRail({
   settingsSection = "general",
   onOpenSettings,
   onOpenNotificationSettings,
+  onOpenContributors,
   onSelectSettingsSection,
   onCloseSettings,
   updateNotice = null,
@@ -216,6 +218,7 @@ export function ProjectRail({
   const projectMenu = useProjectMenu({
     onRemoveProject,
     onOpenNotificationSettings,
+    onOpenContributors,
     onOpen: () => setInboxMenu(null),
   });
   useEffect(() => {

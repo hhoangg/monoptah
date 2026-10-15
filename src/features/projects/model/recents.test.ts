@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   archiveProject,
   forgetProject,
+  isKnownProject,
   loadArchivedProjects,
   loadPinnedProjects,
   loadProjectRailOrder,
@@ -224,5 +225,26 @@ describe("archiveProject", () => {
     forgetProject("/tmp/gone");
     expect(loadArchivedProjects()).toEqual([]);
     expect(loadRecents()).toEqual([]);
+  });
+});
+
+describe("isKnownProject", () => {
+  it("knows remembered, pinned and current projects", () => {
+    rememberProject("/tmp/recent");
+    savePinnedProjects(["/tmp/pinned"]);
+    expect(isKnownProject("/tmp/recent", "/tmp/other")).toBe(true);
+    expect(isKnownProject("/tmp/recent/", "/tmp/other")).toBe(true);
+    expect(isKnownProject("/tmp/pinned", "/tmp/other")).toBe(true);
+    expect(isKnownProject("/tmp/current", "/tmp/current")).toBe(true);
+  });
+
+  it("forgets archived and deleted projects", () => {
+    rememberProject("/tmp/archived");
+    rememberProject("/tmp/deleted");
+    archiveProject("/tmp/archived");
+    forgetProject("/tmp/deleted");
+    expect(isKnownProject("/tmp/archived", "/tmp/other")).toBe(false);
+    expect(isKnownProject("/tmp/deleted", "/tmp/other")).toBe(false);
+    expect(isKnownProject("/tmp/never", "/tmp/other")).toBe(false);
   });
 });

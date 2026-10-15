@@ -48,6 +48,7 @@ import {
 import {
   defaultSessionChoice,
   modelsFor,
+  sessionModelForHarness,
 } from "../features/sessions/model/models";
 import { isHarnessAvailable } from "../integrations/harness/core/availability";
 import {
@@ -170,9 +171,18 @@ import { resolveZoomKeybinding } from "../features/settings/model/zoomKeybinding
 import { resolveAppShortcut } from "../features/settings/model/appShortcuts";
 import { runUpdateFlow } from "./model/updater";
 import {
+  attachmentsFromPaths,
   displayAttachments,
   prepareAttachments,
 } from "../features/sessions/model/attachments";
+import type { AskAgentRequest } from "../features/contributors/model/askAgent";
+import {
+  composeSessionPrompt,
+  contributorsSessionTitle,
+  failureMessage,
+  resolveHarness,
+  utf8ToBase64,
+} from "../features/contributors/model/agentSession";
 import {
   basename,
   homeDir,
@@ -413,6 +423,7 @@ import {
   forgetProject,
   lastProjectPath,
   loadRecents,
+  isKnownProject,
   isLocalProject,
   isRemoteProjectPath,
   looksLikeProject,
@@ -472,6 +483,7 @@ import {
   HARNESS_LABEL,
   HARNESS_TITLE,
   canReplaceSessionTitle,
+  harnessSupportsAttachments,
   formatSessionTitle,
   sessionNeedsInput,
   newContinuationSession,
@@ -868,6 +880,14 @@ const MailView = lazySurface(
   async () => {
     const module = await import("../features/mail/ui/MailView");
     return { default: module.MailView };
+  },
+  { suspense: false },
+);
+
+const ContributorsView = lazySurface(
+  async () => {
+    const module = await import("../features/contributors/ui/ContributorsView");
+    return { default: module.ContributorsView };
   },
   { suspense: false },
 );
@@ -1275,6 +1295,11 @@ function Workspace({
   const [notesViewOpen, setNotesViewOpen] = useState(false);
   const [automationsViewOpen, setAutomationsViewOpen] = useState(false);
   const [mailViewOpen, setMailViewOpen] = useState(false);
+  // The page is scoped to one project; null means it is closed.
+  const [contributorsProject, setContributorsProject] = useState<string | null>(
+    null,
+  );
+  const contributorsViewOpen = contributorsProject !== null;
   const [inspectedWorkerId, setInspectedWorkerId] = useState<string | null>(
     null,
   );
@@ -1314,6 +1339,7 @@ function Workspace({
     notes: false,
     automations: false,
     mail: false,
+    contributors: null as string | null,
   });
   const [updateNotice, setUpdateNotice] = useState(installedUpdate);
   const [whatsNewVersion, setWhatsNewVersion] = useState<string | null>(null);
@@ -1544,6 +1570,7 @@ function Workspace({
       !notesViewOpen &&
       !automationsViewOpen &&
       !mailViewOpen &&
+      !contributorsViewOpen &&
       !settingsOpen &&
       !monoViewId,
     standaloneSessionId: inboxViewOpen
@@ -1552,6 +1579,7 @@ function Workspace({
           !notesViewOpen &&
           !automationsViewOpen &&
           !mailViewOpen &&
+          !contributorsViewOpen &&
           !settingsOpen
         ? (monoViewId ?? undefined)
         : undefined,
@@ -1560,6 +1588,7 @@ function Workspace({
       !searchViewOpen &&
       !notesViewOpen &&
       !automationsViewOpen &&
+      !contributorsViewOpen &&
       !settingsOpen
         ? shownMonoSessionId
         : undefined,
@@ -1570,6 +1599,8 @@ function Workspace({
   automationsViewOpenRef.current = automationsViewOpen;
   const mailViewOpenRef = useRef(mailViewOpen);
   mailViewOpenRef.current = mailViewOpen;
+  const contributorsProjectRef = useRef(contributorsProject);
+  contributorsProjectRef.current = contributorsProject;
   const settingsOpenRef = useRef(settingsOpen);
   settingsOpenRef.current = settingsOpen;
   const sessionNavigationIdsRef = useRef<readonly string[]>([]);
@@ -1630,6 +1661,7 @@ function Workspace({
         listAutomations,
         ...(notesEnabled ? [NotesView.preload, loadNotes] : []),
         ...(mailEnabled ? [MailView.preload] : []),
+        ContributorsView.preload,
       ]),
     [notesEnabled, mailEnabled],
   );
@@ -2264,6 +2296,7 @@ function Workspace({
             !notesViewOpenRef.current &&
             !automationsViewOpenRef.current &&
             !mailViewOpenRef.current &&
+            contributorsProjectRef.current === null &&
             !settingsOpenRef.current
           ) {
             setComposerFocused(true);
@@ -2303,6 +2336,7 @@ function Workspace({
     notesViewOpen,
     automationsViewOpen,
     mailViewOpen,
+    contributorsViewOpen,
     settingsOpen,
     flushForegroundHarnessEvents,
   ]);
@@ -2823,6 +2857,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       const session = newWorkspaceSession(
         cwd,
         sessionDefaults?.runtimeMode,
@@ -2867,6 +2902,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       const existing = findRemoteSessionTab(
         tabsRef.current,
         sessionsRef.current,
@@ -2899,6 +2935,7 @@ function Workspace({
         setNotesViewOpen(false);
         setAutomationsViewOpen(false);
         setMailViewOpen(false);
+        setContributorsProject(null);
         const cwd =
           item.projectPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
         setSidebarTab("sessions", cwd);
@@ -2943,6 +2980,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       const cwd =
         (card.sourceCwd && looksLikeProject(card.sourceCwd)
           ? card.sourceCwd
@@ -4948,6 +4986,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       lastMonoIdRef.current = monoId;
       const session = await ensureMonoSession(monoId, {
         home: homeDir,
@@ -5189,6 +5228,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       setSettingsOpen(false);
       setFilePickerOpen(false);
       setSidebarTab("sessions", session.cwd);
@@ -5794,6 +5834,7 @@ function Workspace({
             notesViewOpenRef.current ||
             automationsViewOpenRef.current ||
             mailViewOpenRef.current ||
+            contributorsProjectRef.current !== null ||
             settingsOpenRef.current ||
             filePickerOpenRef.current ||
             whatsNewVersionRef.current,
@@ -6371,6 +6412,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
 
       // At most one folder can take the blank session, and it keeps the
       // retargeting rules `onCwdChange` already owns.
@@ -6488,6 +6530,21 @@ function Workspace({
         );
       }
       setRecents(remaining);
+      // The Contributors page is scoped to its own project and can outlive a
+      // switch to another one, so removal has to close it explicitly.
+      if (
+        contributorsProjectRef.current !== null &&
+        sameProjectPath(contributorsProjectRef.current, normalized)
+      ) {
+        setContributorsProject(null);
+      }
+      const returnContributors = settingsReturnViewRef.current.contributors;
+      if (
+        returnContributors !== null &&
+        sameProjectPath(returnContributors, normalized)
+      ) {
+        settingsReturnViewRef.current.contributors = null;
+      }
 
       const tabs = tabsRef.current;
       const sessions = sessionsRef.current;
@@ -8842,6 +8899,7 @@ function Workspace({
           setNotesViewOpen(false);
           setAutomationsViewOpen(false);
           setMailViewOpen(false);
+          setContributorsProject(null);
           setSidebarTab("sessions", session.cwd);
         }
 
@@ -9064,6 +9122,7 @@ function Workspace({
             setNotesViewOpen(false);
             setAutomationsViewOpen(false);
             setMailViewOpen(false);
+            setContributorsProject(null);
             setSidebarTab("sessions", cwd);
           },
           submit: (id, text, attachments, options) =>
@@ -10570,6 +10629,9 @@ function Workspace({
 
   useEffect(() => {
     const onEscape = (event: KeyboardEvent) => {
+      // The Contributors page closes itself on Escape; the turn running in a
+      // tab behind it must not be stopped by the same key.
+      if (contributorsProjectRef.current !== null) return;
       const focusedBusySessionId = () => {
         const agentId = monoViewIdRef.current;
         if (agentId) {
@@ -11773,6 +11835,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       onOpenApprovalSession(sessionId);
     },
     [onOpenApprovalSession],
@@ -11924,6 +11987,7 @@ function Workspace({
     setNotesViewOpen(false);
     setAutomationsViewOpen(false);
     setMailViewOpen(false);
+    setContributorsProject(null);
     setFilePickerInitialQuery("");
     setFilePickerResetToken((token) => token + 1);
     setFilePickerOpen(true);
@@ -11934,6 +11998,7 @@ function Workspace({
     setNotesViewOpen(false);
     setAutomationsViewOpen(false);
     setMailViewOpen(false);
+    setContributorsProject(null);
     setFilePickerInitialQuery(">");
     setFilePickerResetToken((token) => token + 1);
     setFilePickerOpen(true);
@@ -11951,6 +12016,7 @@ function Workspace({
     setNotesViewOpen(false);
     setAutomationsViewOpen(false);
     setMailViewOpen(false);
+    setContributorsProject(null);
     setSidebarTab("files");
     setFilesSearchOpen(true);
     setSearchFocusToken((token) => token + 1);
@@ -11965,6 +12031,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       setSearchViewOpen(true);
       setSearchViewFocusToken((token) => token + 1);
     });
@@ -11983,6 +12050,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       setInboxViewOpen(true);
     });
   }, []);
@@ -11997,6 +12065,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       setInboxViewOpen(false);
       const cwd =
         sessionsRef.current.find((session) => session.id === sessionId)?.cwd ??
@@ -12083,6 +12152,7 @@ function Workspace({
       setInboxViewOpen(false);
       setNotesViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       setSearchViewOpen(false);
       setSidebarTab("sessions", cwd);
       await onSelectHistorySession(session.id);
@@ -12095,6 +12165,81 @@ function Workspace({
     ],
   );
 
+  /**
+   * Starts a chat about the Contributors snapshot. Nothing is created until the
+   * snapshot is written, so a failure there leaves no stray session; every
+   * failure is thrown as an Error for the dialog to show.
+   */
+  const onStartContributorsSession = useCallback(
+    async (project: string, request: AskAgentRequest) => {
+      if (!project || isRemoteProjectPath(project)) {
+        throw new Error("Contributors works on local projects only.");
+      }
+      const harness = resolveHarness(request.harness, HARNESSES);
+      const runtimeMode = sessionDefaults?.runtimeMode;
+      const base = harness
+        ? newSession(
+            harness,
+            project,
+            sessionModelForHarness(harness, project),
+            runtimeMode,
+            undefined,
+            { surface: "chat" },
+          )
+        : // The prompt is submitted right away, which needs a chat.
+          newDefaultSession(project, runtimeMode, { surface: "chat" });
+
+      let path: string;
+      try {
+        path = await invoke<string>("write_attachment", {
+          name: request.fileName,
+          data: utf8ToBase64(request.snapshotJson),
+        });
+      } catch (error) {
+        throw new Error(failureMessage("write the snapshot", error));
+      }
+      let attachments: Attachment[] = [];
+      if (harnessSupportsAttachments(base.harness)) {
+        try {
+          attachments = await attachmentsFromPaths([path]);
+        } catch (error) {
+          throw new Error(failureMessage("attach the snapshot", error));
+        }
+      }
+      const prompt = composeSessionPrompt({
+        prompt: request.prompt,
+        path,
+        attached: attachments.length > 0,
+      });
+
+      const session = {
+        ...base,
+        title: contributorsSessionTitle(request.fileName),
+      };
+      const withSession = [...sessionsRef.current, session];
+      sessionsRef.current = withSession;
+      setSessions(withSession);
+      if (!onSubmit(session.id, prompt, attachments)) {
+        const without = sessionsRef.current.filter(
+          (item) => item.id !== session.id,
+        );
+        sessionsRef.current = without;
+        setSessions(without);
+        throw new Error(
+          "The agent did not accept the message. Try again in a moment.",
+        );
+      }
+      setContributorsProject(null);
+      setSidebarTab("sessions", project);
+      try {
+        await onSelectHistorySession(session.id);
+      } catch {
+        // The session is already running; a retry would start a second one.
+      }
+    },
+    [onSelectHistorySession, onSubmit, sessionDefaults?.runtimeMode],
+  );
+
   const onOpenNotes = useCallback(() => {
     workspaceNavigation.cancel();
     if (!loadNotesEnabled()) return;
@@ -12105,6 +12250,7 @@ function Workspace({
       setInboxViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       setNotesViewOpen(true);
     });
   }, []);
@@ -12122,6 +12268,7 @@ function Workspace({
       setInboxViewOpen(false);
       setNotesViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       setAutomationsViewOpen(true);
     });
   }, []);
@@ -12140,12 +12287,37 @@ function Workspace({
       setInboxViewOpen(false);
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
+      setContributorsProject(null);
       setMailViewOpen(true);
     });
   }, []);
 
   const onLeaveMail = useCallback(() => {
     setMailViewOpen(false);
+  }, []);
+
+  const onOpenContributors = useCallback(
+    (path: string) => {
+      workspaceNavigation.cancel();
+      if (!path || isRemoteProjectPath(path)) return;
+      // The page is scoped to `path`; it never changes the current project,
+      // tabs, recents or the back stack.
+      startTransition(() => {
+        setFilePickerOpen(false);
+        setSettingsOpen(false);
+        setSearchViewOpen(false);
+        setInboxViewOpen(false);
+        setNotesViewOpen(false);
+        setAutomationsViewOpen(false);
+        setMailViewOpen(false);
+        setContributorsProject(path);
+      });
+    },
+    [workspaceNavigation.cancel],
+  );
+
+  const onLeaveContributors = useCallback(() => {
+    setContributorsProject(null);
   }, []);
 
   const onOpenAutomationSession = useCallback(
@@ -12155,6 +12327,7 @@ function Workspace({
         throw new Error("This conversation is no longer available.");
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
+      setContributorsProject(null);
       setSearchViewOpen(false);
       setInboxViewOpen(false);
       setNotesViewOpen(false);
@@ -12178,6 +12351,7 @@ function Workspace({
           notes: notesViewOpenRef.current,
           automations: automationsViewOpenRef.current,
           mail: mailViewOpenRef.current,
+          contributors: contributorsProjectRef.current,
         };
       }
       startTransition(() => {
@@ -12187,6 +12361,7 @@ function Workspace({
         setNotesViewOpen(false);
         setAutomationsViewOpen(false);
         setMailViewOpen(false);
+        setContributorsProject(null);
         if (section) {
           setSettingsSection(section);
           saveSettingsSection(section);
@@ -12241,6 +12416,14 @@ function Workspace({
     setNotesViewOpen(returnView.notes && loadNotesEnabled());
     setAutomationsViewOpen(returnView.automations);
     setMailViewOpen(returnView.mail && loadMailEnabled());
+    // The project may have been archived or deleted while Settings was open.
+    const contributors = returnView.contributors;
+    setContributorsProject(
+      contributors !== null &&
+        isKnownProject(contributors, projectCwdRef.current)
+        ? contributors
+        : null,
+    );
     setSettingsOpen(false);
   }, []);
 
@@ -12282,6 +12465,10 @@ function Workspace({
       setMailViewOpen(false);
       return;
     }
+    if (contributorsViewOpen) {
+      setContributorsProject(null);
+      return;
+    }
     if (monoViewIdRef.current) {
       closeMonoView();
       setComposerFocused(true);
@@ -12298,6 +12485,7 @@ function Workspace({
     notesViewOpen,
     automationsViewOpen,
     mailViewOpen,
+    contributorsViewOpen,
   ]);
 
   const onRailForward = useCallback(() => {
@@ -12307,6 +12495,7 @@ function Workspace({
     setNotesViewOpen(false);
     setAutomationsViewOpen(false);
     setMailViewOpen(false);
+    setContributorsProject(null);
     onVisitForward();
   }, [onVisitForward]);
 
@@ -12589,6 +12778,7 @@ function Workspace({
             notesViewOpenRef.current ||
             automationsViewOpenRef.current ||
             mailViewOpenRef.current ||
+            contributorsProjectRef.current !== null ||
             settingsOpenRef.current ||
             filePickerOpenRef.current ||
             Boolean(whatsNewVersionRef.current);
@@ -12673,6 +12863,7 @@ function Workspace({
         !notesViewOpenRef.current &&
         !automationsViewOpenRef.current &&
         !mailViewOpenRef.current &&
+        contributorsProjectRef.current === null &&
         !(
           e.target instanceof Element &&
           e.target.closest("[data-session-drop], [data-agent-tab]")
@@ -13284,7 +13475,8 @@ function Workspace({
     inboxViewOpen ||
     notesViewOpen ||
     automationsViewOpen ||
-    mailViewOpen;
+    mailViewOpen ||
+    contributorsViewOpen;
   const compactProjectRail = collapsedProjectRailMode === "compact";
   const compactRailActive = compactProjectRail && !projectRailOpen;
   const compactTitleNavigation =
@@ -13410,7 +13602,8 @@ function Workspace({
                 inboxViewOpen ||
                 notesViewOpen ||
                 automationsViewOpen ||
-                mailViewOpen
+                mailViewOpen ||
+                contributorsViewOpen
               }
               canGoForward={tabVisitNav.canForward}
               onGoBack={onRailBack}
@@ -13446,6 +13639,7 @@ function Workspace({
               onOpenNotes={notesEnabled ? onOpenNotes : undefined}
               onOpenAutomations={onOpenAutomations}
               onOpenMail={mailEnabled ? onOpenMail : undefined}
+              onOpenContributors={onOpenContributors}
               onGoToFile={onGoToFile}
               searchActive={searchViewOpen}
               inboxActive={inboxViewOpen}
@@ -13480,7 +13674,8 @@ function Workspace({
                   inboxViewOpen ||
                   notesViewOpen ||
                   automationsViewOpen ||
-                  mailViewOpen
+                  mailViewOpen ||
+                  contributorsViewOpen
                     ? "hidden"
                     : "flex min-h-0 min-w-0 flex-1 flex-col"
                 }
@@ -13490,7 +13685,8 @@ function Workspace({
                   inboxViewOpen ||
                   notesViewOpen ||
                   automationsViewOpen ||
-                  mailViewOpen
+                  mailViewOpen ||
+                  contributorsViewOpen
                 }
                 inert={
                   searchViewOpen ||
@@ -13499,6 +13695,7 @@ function Workspace({
                   notesViewOpen ||
                   automationsViewOpen ||
                   mailViewOpen ||
+                  contributorsViewOpen ||
                   undefined
                 }
               >
@@ -13733,6 +13930,7 @@ function Workspace({
                             !notesViewOpen &&
                             !automationsViewOpen &&
                             !mailViewOpen &&
+                            !contributorsViewOpen &&
                             !monoViewId &&
                             activeLinkedWorkItemPanel?.sessionId ===
                               panel.sessionId
@@ -13846,6 +14044,19 @@ function Workspace({
                   onToggleSidebar={onToggleSidebar}
                 />
               ) : null}
+              {contributorsProject !== null ? (
+                <ContributorsView
+                  key={contributorsProject}
+                  project={contributorsProject}
+                  besideRail={projectRailOpen || compactProjectRail}
+                  compactRail={compactRailActive}
+                  onClose={onLeaveContributors}
+                  onToggleSidebar={onToggleSidebar}
+                  onStartAgentSession={(request) =>
+                    onStartContributorsSession(contributorsProject, request)
+                  }
+                />
+              ) : null}
               {settingsOpen ? (
                 <SettingsView
                   section={settingsSection}
@@ -13879,6 +14090,7 @@ function Workspace({
               notesViewOpen ||
               automationsViewOpen ||
               mailViewOpen ||
+              contributorsViewOpen ||
               settingsOpen ||
               monoCovers ? null : (
                 <UsageFooter
