@@ -5213,6 +5213,72 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_pr_does_not_inherit_the_history_the_local_branch_is_missing() {
+        let repo = TestRepo::new();
+        let bare = Bare::attach(&repo);
+        let when = "2026-01-01T00:00:00+0000";
+        let base = repo.commit(
+            &[("a.txt", "1\n")],
+            "base",
+            ALICE,
+            "2026-01-05T10:00:00+0000",
+        );
+        // Two commits other people landed on main; the clone has them only as
+        // `origin/main`, its own `main` is behind.
+        repo.commit(
+            &[("m1.txt", "m\n")],
+            "main one",
+            ALICE,
+            "2026-01-08T10:00:00+0000",
+        );
+        repo.commit(
+            &[("m2.txt", "m\n")],
+            "main two",
+            ALICE,
+            "2026-01-09T10:00:00+0000",
+        );
+        repo.checkout_new("closed11");
+        let wip = repo.commit(
+            &[("wip.txt", "w\n")],
+            "wip",
+            BOB,
+            "2026-01-15T10:00:00+0000",
+        );
+        bare.publish(&repo, 11, &wip);
+        repo.checkout("main");
+        repo.run(&["push", "-q", "origin", "main"], ALICE, when);
+        repo.run(&["fetch", "-q", "origin"], ALICE, when);
+        repo.run(&["reset", "-q", "--hard", &base], ALICE, when);
+        repo.run(&["branch", "-q", "-D", "closed11"], ALICE, when);
+        forget_unreachable(&repo);
+        assert!(!has_object(&repo, &wip));
+
+        let closed = serde_json::json!([{
+            "number": 11, "title": "Abandoned", "author": actor("bob", "Bob"),
+            "closedAt": "2026-01-20T10:00:00Z", "baseRefName": "main"
+        }]);
+        let github = fake_github_without_commit_calls(serde_json::json!([]), closed);
+        let data = collect_cached_with(
+            &Cache::new(),
+            &github,
+            repo.path(),
+            SINCE,
+            Some(UNTIL),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(data.gh_available, "{:?}", data.gh_note);
+        let eleven = pr_by_id(&data, "11");
+        assert_eq!(eleven.state, "closed");
+        // Only Bob's own commit; main one and main two are other people's.
+        assert_eq!(eleven.branch_commits.len(), 1);
+        assert_eq!(eleven.branch_commits[0].authors[0].email, "bob@example.com");
+        assert_eq!(eleven.commit_count, 1);
+    }
+
+    #[test]
     fn a_pr_whose_head_cannot_be_fetched_still_gets_commits_from_gh() {
         let repo = TestRepo::new();
         let bare = Bare::attach(&repo);

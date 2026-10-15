@@ -29,6 +29,12 @@ pub(super) struct LocalCommit {
     pub committed_at: String,
 }
 
+/// Environment of the object lookups that must stay offline. In a partial
+/// clone (`--filter=blob:none`) git would otherwise fetch every missing object
+/// it is asked about, one network round trip each. git older than 2.44 does not
+/// know the variable, which is harmless.
+const OFFLINE: &[(&str, &str)] = &[("GIT_NO_LAZY_FETCH", "1")];
+
 /// Runs git, feeding `input` on stdin when given. Both output pipes are
 /// drained on their own threads so a large reply cannot stall the child; the
 /// child is killed when `timeout` passes.
@@ -37,9 +43,11 @@ fn run_git(
     args: &[&str],
     input: Option<String>,
     timeout: Duration,
+    envs: &[(&str, &str)],
 ) -> Result<String, String> {
     let mut child = git_command(root)
         .args(args)
+        .envs(envs.iter().copied())
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -77,7 +85,18 @@ pub(super) fn run_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, String> {
-    run_git(root, args, None, timeout)
+    run_git(root, args, None, timeout, &[])
+}
+
+/// A local object lookup: `LOCAL_TIMEOUT` at most (`timeout` when it is
+/// shorter), and never the network, even in a partial clone.
+fn run_offline(
+    root: &Path,
+    args: &[&str],
+    input: Option<String>,
+    timeout: Duration,
+) -> Result<String, String> {
+    run_git(root, args, input, timeout.min(LOCAL_TIMEOUT), OFFLINE)
 }
 
 /// Parses `<sha>\trefs/pull/<N>/head` lines; anything else is skipped.
@@ -116,19 +135,15 @@ pub(super) fn remote_pr_heads(
 }
 
 /// The subset of `shas` that exist as commits in the local repository. One
-/// `git cat-file --batch-check` process.
-fn commits_present(root: &Path, shas: &[&str]) -> HashSet<String> {
-    if shas.is_empty() {
+/// `git cat-file --batch-check` process, which never starts once `timeout` is
+/// zero and never fetches a missing object.
+fn commits_present(root: &Path, shas: &[&str], timeout: Duration) -> HashSet<String> {
+    if shas.is_empty() || timeout.is_zero() {
         return HashSet::new();
     }
     let mut input = shas.join("\n");
     input.push('\n');
-    let Ok(out) = run_git(
-        root,
-        &["cat-file", "--batch-check"],
-        Some(input),
-        LOCAL_TIMEOUT,
-    ) else {
+    let Ok(out) = run_offline(root, &["cat-file", "--batch-check"], Some(input), timeout) else {
         return HashSet::new();
     };
     // `<sha> <type> <size>` for an object, `<sha> missing` otherwise.
@@ -141,16 +156,58 @@ fn commits_present(root: &Path, shas: &[&str]) -> HashSet<String> {
         .collect()
 }
 
+/// The arguments of one object-only fetch of the PR heads `numbers`.
+fn fetch_args(numbers: &[u64]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--no-recurse-submodules",
+        // Do not start `git maintenance --auto` in the user's repository.
+        "--no-auto-maintenance",
+        "--quiet",
+        // A configured pull refspec would otherwise update remote-tracking
+        // refs opportunistically.
+        "--refmap=",
+        "origin",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    args.extend(numbers.iter().map(|n| format!("refs/pull/{n}/head")));
+    args
+}
+
+/// The commit `refs/remotes/origin/<branch>` points to, when that ref exists in
+/// the local repository. The ref is only read, never created or fetched. A name
+/// that could be taken for an option is refused before git sees it.
+pub(super) fn remote_branch_tip(root: &Path, branch: &str) -> Option<String> {
+    if branch.is_empty() || branch.starts_with('-') {
+        return None;
+    }
+    let name = format!("refs/remotes/origin/{branch}^{{commit}}");
+    let out = run_offline(
+        root,
+        &["rev-parse", "--verify", "--quiet", &name],
+        None,
+        LOCAL_TIMEOUT,
+    )
+    .ok()?;
+    let sha = out.trim();
+    gh::is_object_id(sha).then(|| sha.to_string())
+}
+
 /// Makes the head commits of `heads` (PR number, sha) available locally and
 /// returns the PR numbers whose head commit is there afterwards. Only the
 /// missing commits are fetched, with no destination ref, so the repository
-/// gains objects and nothing else. All fetches share the one `timeout`; a
-/// failed or skipped fetch just leaves its PRs out of the result.
+/// gains objects and nothing else. The lookups and all fetches share the one
+/// `timeout`; a failed or skipped step just leaves its PRs out of the result.
 pub(super) fn ensure_local(
     root: &Path,
     heads: &[(u64, String)],
     timeout: Duration,
 ) -> HashSet<u64> {
+    let deadline = Instant::now() + timeout;
+    let left = || deadline.saturating_duration_since(Instant::now());
     let valid: Vec<&(u64, String)> = heads
         .iter()
         .filter(|(_, sha)| gh::is_object_id(sha))
@@ -158,35 +215,20 @@ pub(super) fn ensure_local(
     let mut shas: Vec<&str> = valid.iter().map(|(_, sha)| sha.as_str()).collect();
     shas.sort_unstable();
     shas.dedup();
-    let mut present = commits_present(root, &shas);
+    let mut present = commits_present(root, &shas, left());
     let missing: Vec<u64> = valid
         .iter()
         .filter(|(_, sha)| !present.contains(sha))
         .map(|(number, _)| *number)
         .collect();
     if !missing.is_empty() {
-        let deadline = Instant::now() + timeout;
         for chunk in missing.chunks(FETCH_CHUNK) {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = left();
             if left.is_zero() {
                 break;
             }
-            let refs: Vec<String> = chunk
-                .iter()
-                .map(|n| format!("refs/pull/{n}/head"))
-                .collect();
-            let mut args = vec![
-                "fetch",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "--no-recurse-submodules",
-                "--quiet",
-                // A configured pull refspec would otherwise update
-                // remote-tracking refs opportunistically.
-                "--refmap=",
-                "origin",
-            ];
-            args.extend(refs.iter().map(String::as_str));
+            let args = fetch_args(chunk);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
             // Not an error: the PRs of a failed chunk fail the re-check below.
             let _ = run_with_timeout(root, &args, left);
         }
@@ -195,7 +237,7 @@ pub(super) fn ensure_local(
             .copied()
             .filter(|sha| !present.contains(*sha))
             .collect();
-        present.extend(commits_present(root, &absent));
+        present.extend(commits_present(root, &absent, left()));
     }
     valid
         .iter()
@@ -231,7 +273,8 @@ pub(super) fn pr_commits(
     .to_vec();
     args.extend(exclude.iter().map(|sha| format!("^{sha}")));
     args.push("--".to_string());
-    let out = git(root, &args).ok()?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_offline(root, &args, None, LOCAL_TIMEOUT).ok()?;
     let (parsed, _) = parse_log(&out, 0);
     let truncated = parsed.len() > max;
     // `git log` is newest first and `-n` cuts the oldest, so cut then flip.
@@ -468,6 +511,67 @@ mod tests {
         let sha = publish_pr(&scratch, &origin, 1, "late");
         let ready = ensure_local(&clone, &[(1, sha)], Duration::ZERO);
         assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn the_fetch_does_not_start_auto_maintenance() {
+        let args = fetch_args(&[3, 5]);
+        assert!(args.iter().any(|a| a == "--no-auto-maintenance"));
+        assert!(args.ends_with(&[
+            "origin".to_string(),
+            "refs/pull/3/head".to_string(),
+            "refs/pull/5/head".to_string()
+        ]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_lookups_never_lazy_fetch() {
+        let scratch = Scratch::new();
+        let dir = scratch.sub("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        g(&dir, &["init", "-q"]);
+        let alias = "alias.show-env=!echo lazy=$GIT_NO_LAZY_FETCH";
+        let out = run_offline(
+            &dir,
+            &["-c", alias, "show-env"],
+            None,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "lazy=1");
+        // The shared runner leaves it alone, so the fetch itself is unchanged.
+        let out =
+            run_with_timeout(&dir, &["-c", alias, "show-env"], Duration::from_secs(30)).unwrap();
+        assert_eq!(out.trim(), "lazy=");
+    }
+
+    #[test]
+    fn ensure_local_shares_one_deadline_with_the_object_lookups() {
+        let (_scratch, dir, _base, shas) = branch_repo();
+        let heads = vec![(1, shas[0].clone())];
+        assert_eq!(
+            ensure_local(&dir, &heads, Duration::from_secs(30)),
+            HashSet::from([1])
+        );
+        // Nothing starts once the time is spent, not even the local lookup.
+        assert!(ensure_local(&dir, &heads, Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn remote_branch_tip_reads_the_tracking_ref_and_nothing_else() {
+        let scratch = Scratch::new();
+        let (_origin, clone) = origin_and_clone(&scratch);
+        let tip = g(&clone, &["rev-parse", "refs/remotes/origin/main"]);
+        let refs_before = refs(&clone);
+        assert_eq!(remote_branch_tip(&clone, "main"), Some(tip));
+        // Unknown branches, and names that look like options, are refused.
+        assert_eq!(remote_branch_tip(&clone, "nope"), None);
+        assert_eq!(remote_branch_tip(&clone, ""), None);
+        assert_eq!(remote_branch_tip(&clone, "--all"), None);
+        assert_eq!(remote_branch_tip(&clone, "-main"), None);
+        assert_eq!(remote_branch_tip(&clone, "main^{tree}"), None);
+        assert_eq!(refs(&clone), refs_before);
     }
 
     fn branch_repo() -> (Scratch, PathBuf, String, Vec<String>) {

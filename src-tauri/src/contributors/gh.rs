@@ -616,15 +616,29 @@ fn is_bot_author(author: &GhCommitAuthor) -> bool {
 }
 
 /// The one email every non-bot commit author of the PR shares (case
-/// insensitive). `None` when they differ, when one of them has no email, or
-/// when there is no such author.
-fn sole_email(commits: &[GhCommit]) -> Option<&str> {
+/// insensitive), when those authors can only be the PR author: none carries a
+/// login (the login match already failed, so a login belongs to someone else)
+/// and every name is the PR author's `name` or `login` (case insensitive).
+/// `None` when they differ, when one of them has no email, or when there is no
+/// such author.
+fn sole_email<'a>(commits: &'a [GhCommit], name: &str, login: &str) -> Option<&'a str> {
+    let is_pr_author = |author: &GhCommitAuthor| {
+        non_empty(&author.login).is_none()
+            && non_empty(&author.name).is_some_and(|who| {
+                let who = who.trim();
+                (!name.trim().is_empty() && who.eq_ignore_ascii_case(name.trim()))
+                    || bare_login(who) == bare_login(login)
+            })
+    };
     let mut found: Option<&str> = None;
     for author in commits
         .iter()
         .flat_map(|c| c.authors.iter())
         .filter(|a| !is_bot_author(a))
     {
+        if !is_pr_author(author) {
+            return None;
+        }
         let email = non_empty(&author.email)?;
         match found {
             Some(seen) if !seen.eq_ignore_ascii_case(email) => return None,
@@ -638,9 +652,9 @@ fn sole_email(commits: &[GhCommit]) -> Option<&str> {
 /// The PR author. The email comes from the PR's own commits written by the
 /// same login (first non-empty one). Commits read from local git only know a
 /// login for noreply addresses, so without a match by login the email is the
-/// one all non-bot commit authors share, if there is exactly one. Otherwise it
-/// stays empty and the TypeScript side resolves the person through
-/// `gh:<login>`.
+/// one all non-bot commit authors share, if there is exactly one and they are
+/// named like the PR author (see `sole_email`). Otherwise it stays empty and the
+/// TypeScript side resolves the person through `gh:<login>`.
 fn pr_author(actor: &Option<GhActor>, commits: &[GhCommit]) -> GitIdentity {
     let login = author_login(actor);
     let name = actor
@@ -654,7 +668,7 @@ fn pr_author(actor: &Option<GhActor>, commits: &[GhCommit]) -> GitIdentity {
         .flat_map(|c| c.authors.iter())
         .filter(|a| non_empty(&a.login).is_some_and(|l| bare_login(l) == bare))
         .find_map(|a| non_empty(&a.email))
-        .or_else(|| sole_email(commits))
+        .or_else(|| sole_email(commits, &name, &login))
         .unwrap_or("")
         .to_string();
     GitIdentity {
@@ -1326,7 +1340,9 @@ fn commits_of(
     // Every PR with its merged or closed time, then the ones git can read, with
     // what it needs to read them.
     let mut items: Vec<(u64, String)> = Vec::new();
-    let mut from_git: Vec<(u64, String, &str, String)> = Vec::new();
+    let mut from_git: Vec<(u64, String, &str, Vec<String>)> = Vec::new();
+    // The remote-tracking tip of each base branch, looked up once.
+    let mut bases: HashMap<String, Option<String>> = HashMap::new();
     for pr in prs {
         let at = match side {
             Side::Merged => non_empty(&pr.merged_at),
@@ -1347,16 +1363,26 @@ fn commits_of(
         // for a merged PR (the branch for a merge commit, the pre-squash
         // branch for a squash, the original commits for a rebase), the
         // collected branch for a closed one.
-        let exclude = match side {
+        let exclude: Option<Vec<String>> = match side {
             Side::Merged => pr
                 .merge_commit
                 .as_ref()
                 .and_then(|m| non_empty(&m.oid))
                 .filter(|oid| is_object_id(oid))
-                .map(|oid| format!("{oid}^1")),
-            Side::Closed { branch_head } => {
-                is_object_id(branch_head).then(|| branch_head.to_string())
-            }
+                .map(|oid| vec![format!("{oid}^1")]),
+            // The local branch can be behind `origin`, and with a detached
+            // HEAD it is not the PR's base at all, so the history of the
+            // base on the remote is left out too.
+            Side::Closed { branch_head } => is_object_id(branch_head).then(|| {
+                let mut exclude = vec![branch_head.to_string()];
+                if let Some(base) = non_empty(&pr.base_ref_name) {
+                    let tip = bases
+                        .entry(base.to_string())
+                        .or_insert_with(|| pr_heads::remote_branch_tip(ctx.root, base));
+                    exclude.extend(tip.clone());
+                }
+                exclude
+            }),
         };
         if let (Some(head), Some(exclude)) = (local.get(&pr.number), exclude) {
             from_git.push((pr.number, at.to_string(), head.as_str(), exclude));
@@ -1365,12 +1391,7 @@ fn commits_of(
 
     let read = par_map(&from_git, |(_, _, head, exclude)| {
         ctx.budget.left()?;
-        pr_heads::pr_commits(
-            ctx.root,
-            head,
-            std::slice::from_ref(exclude),
-            limits.max_branch_commits,
-        )
+        pr_heads::pr_commits(ctx.root, head, exclude, limits.max_branch_commits)
     });
     for ((number, at, _, _), commits) in from_git.into_iter().zip(read) {
         // No commits is no answer: a PR has at least one, so gh is asked.
@@ -3160,7 +3181,7 @@ mod tests {
             authors: emails
                 .iter()
                 .map(|(email, is_bot)| GhCommitAuthor {
-                    name: Some("Someone".into()),
+                    name: Some("Ann Lee".into()),
                     email: Some(email.to_string()),
                     login: None,
                     is_bot: *is_bot,
@@ -3174,6 +3195,7 @@ mod tests {
     fn the_author_email_falls_back_to_the_one_email_all_authors_share() {
         let actor = Some(GhActor {
             login: Some("ann".into()),
+            name: Some("ann lee".into()),
             ..GhActor::default()
         });
         // No commit carries the login; every non-bot author has the same email.
@@ -3210,6 +3232,44 @@ mod tests {
             ..GhCommit::default()
         }];
         assert_eq!(pr_author(&actor, &matched).email, "ann@work.example");
+    }
+
+    #[test]
+    fn the_shared_email_is_not_given_to_someone_who_did_not_write_the_commits() {
+        let by = |name: &str, login: Option<&str>, email: &str| GhCommit {
+            authors: vec![GhCommitAuthor {
+                name: Some(name.into()),
+                email: Some(email.into()),
+                login: login.map(str::to_string),
+                is_bot: false,
+            }],
+            ..GhCommit::default()
+        };
+        let bob = Some(GhActor {
+            login: Some("bob".into()),
+            name: Some("Bob Ray".into()),
+            ..GhActor::default()
+        });
+        // Bob opens a PR that carries only Alice's commits (gh fallback, so
+        // the commits carry her login): the email must not become hers.
+        let alices = vec![by("Alice", Some("alice"), "alice@example.com")];
+        assert_eq!(pr_author(&bob, &alices).email, "");
+        // Local git knows no login for her ordinary address, but the name
+        // still tells her apart from Bob.
+        let alices = vec![by("Alice", None, "alice@example.com")];
+        assert_eq!(pr_author(&bob, &alices).email, "");
+        // Automation committing for the PR.
+        let ci = vec![by("CI", None, "ci@corp.example")];
+        assert_eq!(pr_author(&bob, &ci).email, "");
+        // A login on the only author is someone else's, whatever the name says.
+        let other = vec![by("Bob Ray", Some("bobby"), "bobby@example.com")];
+        assert_eq!(pr_author(&bob, &other).email, "");
+
+        // The name of the PR author, or the login, is enough.
+        let by_name = vec![by("bob ray", None, "bob@example.com")];
+        assert_eq!(pr_author(&bob, &by_name).email, "bob@example.com");
+        let by_login = vec![by("Bob", None, "bob@home.example")];
+        assert_eq!(pr_author(&bob, &by_login).email, "bob@home.example");
     }
 
     #[test]
