@@ -278,6 +278,7 @@ pub fn run() {
         .setup(|app| {
             harness::reap_orphaned_harness_processes();
             session_store::init(app.handle())?;
+            app.manage(contributors::new_jobs(app.handle().clone()));
             control::init(app.handle())?;
             tui_hook::init(app.handle())?;
             reminders::init(app.handle());
@@ -496,6 +497,12 @@ pub fn run() {
             contributors::contributors_write_config,
             contributors::contributors_branches,
             contributors::contributors_collect,
+            contributors::contributors_load,
+            contributors::contributors_sync_estimate,
+            contributors::contributors_sync_start,
+            contributors::contributors_sync_cancel,
+            contributors::contributors_sync_status,
+            contributors::contributors_clear,
             contributors::contributors_git_user,
             fs::create_path,
             fs::rename_path,

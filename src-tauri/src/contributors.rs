@@ -10,6 +10,7 @@
 //! final PR list. The result is cached as a whole.
 
 mod gh;
+mod jobs;
 mod pr_heads;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod store;
@@ -27,7 +28,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use tauri::{AppHandle, Manager, State};
+
 use crate::fs::expand_home;
+use crate::session_store::SessionStore;
 
 /// Safety caps of the git collection. Exceeding any cap below sets
 /// `RawData.truncated`; the survival count caps (`max_survival_prs`,
@@ -2306,6 +2310,129 @@ pub async fn contributors_collect(
             force.unwrap_or(false),
         )
         .map(|data| (*data).clone())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The job manager the app manages: it runs syncs through `run_sync` and
+/// tells the webview about them on `contributors://sync`.
+pub(crate) fn new_jobs(app: AppHandle) -> jobs::JobManager {
+    jobs::JobManager::new(
+        std::sync::Arc::new(jobs::AppRunner(app.clone())),
+        std::sync::Arc::new(jobs::TauriSink(app)),
+    )
+}
+
+/// A period read from the store. Starts no git or GitHub work beyond listing
+/// the period's commit hashes.
+#[tauri::command]
+pub async fn contributors_load(
+    app: AppHandle,
+    cwd: String,
+    branch: Option<String>,
+    since: String,
+    until: String,
+) -> Result<jobs::LoadResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = app.state::<SessionStore>();
+        jobs::load_response(
+            &store,
+            &expand_home(&cwd),
+            branch.as_deref(),
+            &since,
+            &until,
+            now_epoch(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn contributors_sync_estimate(
+    app: AppHandle,
+    cwd: String,
+    branch: Option<String>,
+    from: String,
+    to: String,
+) -> Result<sync::Estimate, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = app.state::<SessionStore>();
+        jobs::estimate_response(
+            &store,
+            &default_gh(),
+            &expand_home(&cwd),
+            branch.as_deref(),
+            &from,
+            &to,
+            now_epoch(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Queues a sync. Returns at once; progress comes as `contributors://sync`.
+#[tauri::command]
+pub async fn contributors_sync_start(
+    jobs: State<'_, jobs::JobManager>,
+    cwd: String,
+    branch: Option<String>,
+    from: String,
+    to: String,
+    mode: String,
+    old_head: Option<String>,
+) -> Result<(), String> {
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let spec = jobs::prepare_job(
+            &expand_home(&cwd),
+            branch.as_deref(),
+            &from,
+            &to,
+            &mode,
+            old_head.as_deref(),
+        )?;
+        jobs.start(spec)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Stops the running sync of the repository and drops the ones queued behind it.
+#[tauri::command]
+pub async fn contributors_sync_cancel(
+    jobs: State<'_, jobs::JobManager>,
+    cwd: String,
+) -> Result<(), String> {
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        jobs.cancel(&jobs::repo_key(&expand_home(&cwd))?);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The last event of every running and queued sync, for a page that was
+/// opened or reloaded after they started.
+#[tauri::command]
+pub fn contributors_sync_status(jobs: State<'_, jobs::JobManager>) -> Vec<jobs::SyncEvent> {
+    jobs.status()
+}
+
+/// Deletes everything synced for the repository; refused while a sync of it runs.
+#[tauri::command]
+pub async fn contributors_clear(
+    app: AppHandle,
+    jobs: State<'_, jobs::JobManager>,
+    cwd: String,
+) -> Result<(), String> {
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = app.state::<SessionStore>();
+        jobs::clear_repo(&jobs, &store, &expand_home(&cwd))
     })
     .await
     .map_err(|e| e.to_string())?
