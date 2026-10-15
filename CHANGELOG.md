@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-15
+
+### Added
+
+- **Git blame** in the file editor. The line under the cursor shows who last changed it, how long ago and the commit subject at the end of the line; turn it off in Settings → Chat → Editor → Inline blame.
+- A **blame column** before the line numbers with the author and date of each block of lines. Toggle it from View → Toggle Git Blame (`Cmd+Alt+B`, `Ctrl+Alt+B` on Windows and Linux) or a file tab's context menu; it is off by default.
+- Hovering either one shows the commit's short sha, author, date and subject, and clicking opens that commit's tab. Lines you have edited but not committed show "Not committed yet", and authorship stays on the right lines while you type. Untracked, binary and very large files show no blame, and it works for projects on connected machines too.
+
 ## [0.20.0] - 2026-10-15
 
 ### Added
