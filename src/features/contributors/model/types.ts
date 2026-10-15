@@ -94,6 +94,11 @@ export type LoadResponse = {
   raw: RawData;
   /** The whole period is synced and nothing in it is missing. */
   covered: boolean;
+  /**
+   * Part of the period was never synced or its sync was cancelled. False
+   * with `covered` false: a synced period that lacks some commits.
+   */
+  hasGaps: boolean;
   /** Commits of the period that the store does not have. */
   missingCommits: number;
   /** Epoch seconds of the last sync, or null when nothing is synced. */

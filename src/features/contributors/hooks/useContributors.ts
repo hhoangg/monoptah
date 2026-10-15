@@ -6,18 +6,14 @@ import {
   useRef,
   useState,
 } from "react";
-import { listen } from "@tauri-apps/api/event";
 import {
-  cancelSync as cancelSyncJobs,
   clearSynced,
   gitUser,
   listBranches,
   loadStored,
   readConfig,
   readMailmap,
-  startSync as queueSync,
   syncEstimate,
-  syncStatus,
   writeConfig,
 } from "../model/api";
 import type { ContributorsBranches, GitUser } from "../model/api";
@@ -45,8 +41,17 @@ import {
   writeMerge,
   writePeriodPick,
 } from "../model/prefs";
-import { SYNC_EVENT, isLive } from "../model/syncEvents";
-import type { SyncEvent } from "../model/syncEvents";
+import { isLive } from "../model/syncEvents";
+import {
+  cancelSyncJobs,
+  ensureSyncJobs,
+  forgetSyncJobs,
+  jobKey,
+  onSyncJobEnded,
+  resetSyncJobs,
+  startSyncJob,
+  useSyncJobs,
+} from "../model/syncJobs";
 import type {
   ContributorsConfig,
   LoadResponse,
@@ -135,6 +140,7 @@ export function resetContributorsCache() {
   saves.clear();
   startedAt.clear();
   toppedUp.clear();
+  resetSyncJobs();
 }
 
 /** Test hook: how many entries the caches hold. */
@@ -260,10 +266,6 @@ const isoSeconds = (date: Date) => date.toISOString().replace(/\.\d{3}Z$/, "Z");
 
 const epochSeconds = (date: Date) => Math.floor(date.getTime() / 1000);
 
-/** Identity of a job as the page sees it: project, branch and period window. */
-const jobKey = (root: string, branch: string, from: number, to: number) =>
-  `${root}\u0000${branch}\u0000${from}\u0000${to}`;
-
 const sameDay = (a: Date, b: Date) =>
   a.getFullYear() === b.getFullYear() &&
   a.getMonth() === b.getMonth() &&
@@ -308,12 +310,12 @@ export function useContributors(cwd: string) {
   const [failures, setFailures] = useState<Record<string, string>>({});
   const [saveError, setSaveError] = useState<string | undefined>();
   const [refreshing, setRefreshing] = useState(false);
-  // The latest event of every job of this project, by `jobKey`. A queued
-  // entry made at the click stands in until the first real event arrives.
-  const [jobs, setJobs] = useState<Record<string, SyncEvent>>({});
+  // Jobs of every project, from the app-wide store; this page reads its own.
+  const jobs = useSyncJobs();
   const [estimate, setEstimate] = useState<{
     key: string;
     value: SyncEstimate | null;
+    error?: string;
   } | null>(null);
   const [actionError, setActionError] = useState<string | undefined>();
   // Caches live outside React; this re-renders after they change.
@@ -418,45 +420,15 @@ export function useContributors(cwd: string) {
     void load(false);
   }, [load]);
 
-  // Job events and the jobs already running when the page opened.
-  const cwdRef = useRef(cwd);
-  cwdRef.current = cwd;
+  // Listen to the sync jobs, and read what a job that ended stored.
   const reloadRef = useRef<() => void>(() => undefined);
   reloadRef.current = () => void load(false, true);
   useEffect(() => {
     if (!cwd) return;
-    let disposed = false;
-    let stop: (() => void) | undefined;
-    const apply = (event: SyncEvent, seeding: boolean) => {
-      if (event.root !== cwdRef.current) return;
-      const at = jobKey(event.root, event.branch, event.from, event.to);
-      setJobs((all) => {
-        // A seed is older than any event already received.
-        if (seeding && at in all) return all;
-        if (isLive(event) || event.state === "error") {
-          return { ...all, [at]: event };
-        }
-        const { [at]: _gone, ...rest } = all;
-        return rest;
-      });
-      // What the job stored is what the page shows, so read it again.
-      if (!seeding && !isLive(event)) reloadRef.current();
-    };
-    listen<SyncEvent>(SYNC_EVENT, (e) => apply(e.payload, false))
-      .then((unlisten) => {
-        if (disposed) unlisten();
-        else stop = unlisten;
-      })
-      .catch(() => undefined);
-    syncStatus()
-      .then((running) => {
-        if (!disposed) running.forEach((event) => apply(event, true));
-      })
-      .catch(() => undefined);
-    return () => {
-      disposed = true;
-      stop?.();
-    };
+    void ensureSyncJobs();
+    return onSyncJobEnded((event) => {
+      if (event.root === cwd) reloadRef.current();
+    });
   }, [cwd]);
 
   useEffect(() => {
@@ -500,8 +472,16 @@ export function useContributors(cwd: string) {
 
   const meta = recall(metaCache, cwd);
   const loaded = recall(loadCache, key);
-  // Only a fully synced period has numbers; a gap shows the sync state instead.
-  const current = loaded?.covered ? loaded.raw : undefined;
+  // A synced period that lacks some commits (a merge brought older ones in)
+  // keeps its stored numbers on screen while a background sync repairs it.
+  const repair =
+    !!loaded &&
+    !loaded.covered &&
+    !loaded.hasGaps &&
+    loaded.missingCommits > 0 &&
+    loaded.coverageHead !== null;
+  // Only a synced period has numbers; a gap shows the sync state instead.
+  const current = loaded?.covered || repair ? loaded?.raw : undefined;
   // While a new period or branch loads, keep the last data of this project on
   // screen (marked stale) instead of blanking the page.
   const previouslyShown =
@@ -526,18 +506,18 @@ export function useContributors(cwd: string) {
     thisJob?.state === "error"
       ? (thisJob.error ?? "The sync failed.")
       : undefined;
-  const notSynced = !!loaded && !loaded.covered;
+  const notSynced = !!loaded && !loaded.covered && !repair;
 
-  // What is left to read, for a period the store does not have in full.
+  // What is left to read, for a period that has to be synced by hand.
   useEffect(() => {
-    if (!cwd || !loaded || loaded.covered || liveJob) return;
+    if (!cwd || !notSynced || liveJob) return;
     let stale = false;
     syncEstimate(cwd, { from: since, to: until, branch }).then(
       (value) => {
         if (!stale) setEstimate({ key, value });
       },
-      () => {
-        if (!stale) setEstimate({ key, value: null });
+      (error) => {
+        if (!stale) setEstimate({ key, value: null, error: errorText(error) });
       },
     );
     return () => {
@@ -550,37 +530,16 @@ export function useContributors(cwd: string) {
   const begin = useCallback(
     (mode: SyncMode, oldHead?: string) => {
       if (!cwd || !loaded) return Promise.resolve();
-      const at = jobKey(cwd, loaded.raw.branch, windowFrom, windowTo);
-      const base: SyncEvent = {
-        repoKey: "",
-        project: "",
-        root: cwd,
-        branch: loaded.raw.branch,
-        from: windowFrom,
-        to: windowTo,
-        step: "counting",
-        done: 0,
-        total: 0,
-        percent: 0,
-        state: "queued",
-        error: null,
-      };
       setActionError(undefined);
-      setJobs((all) => ({ ...all, [at]: base }));
-      return queueSync(cwd, {
-        from: since,
-        to: until,
+      return startSyncJob(cwd, {
+        branchName: loaded.raw.branch,
         branch,
+        window: { from: syncWindow(period, now).from, to: period.end },
         mode,
         oldHead,
-      }).then(undefined, (error) => {
-        setJobs((all) => ({
-          ...all,
-          [at]: { ...base, state: "error", error: errorText(error) },
-        }));
       });
     },
-    [cwd, loaded, windowFrom, windowTo, since, until, branch],
+    [cwd, loaded, branch, period, now],
   );
 
   // A synced period whose branch moved since the sync is topped up once per
@@ -593,6 +552,16 @@ export function useContributors(cwd: string) {
     toppedUp.add(once);
     void begin("topup", loaded.coverageHead);
   }, [cwd, key, loaded, liveJob, begin]);
+
+  // Commits the store lacks inside a synced period are read in the
+  // background, once per head; a full sync only repairs what is missing.
+  useEffect(() => {
+    if (!cwd || !loaded || !repair || liveJob) return;
+    const once = `${key}\u0000repair\u0000${loaded.head}`;
+    if (toppedUp.has(once)) return;
+    toppedUp.add(once);
+    void begin("full");
+  }, [cwd, key, loaded, repair, liveJob, begin]);
 
   const select = useCallback((next: PeriodPick) => {
     writePeriodPick(next);
@@ -649,11 +618,7 @@ export function useContributors(cwd: string) {
       if (k.startsWith(mine)) loadCache.delete(k);
     }
     for (const k of [...toppedUp]) if (k.startsWith(mine)) toppedUp.delete(k);
-    setJobs((all) =>
-      Object.fromEntries(
-        Object.entries(all).filter(([k]) => !k.startsWith(mine)),
-      ),
-    );
+    forgetSyncJobs(cwd);
     lastShown.current = null;
     await load(true);
   }, [cwd, load]);
@@ -724,24 +689,26 @@ export function useContributors(cwd: string) {
     sync: {
       state: !loaded
         ? ("loading" as const)
-        : loaded.covered
-          ? ("synced" as const)
-          : ("notSynced" as const),
+        : notSynced
+          ? ("notSynced" as const)
+          : ("synced" as const),
       /** What is left to read; only for `notSynced`. */
       estimate: notSynced && estimate?.key === key ? estimate.value : null,
+      /** Why the estimate is missing, when it could not be made. */
+      estimateError:
+        notSynced && estimate?.key === key ? estimate.error : undefined,
       /** Epoch seconds of the last sync of the period. */
       syncedAt: loaded?.syncedAt ?? null,
       /** The data is shown but GitHub's part is missing or partial. */
       ghIncomplete:
-        !!loaded?.covered &&
+        !!loaded &&
+        !notSynced &&
         (loaded.ghState === "partial" || loaded.ghState === "unavailable"),
       /** The queued or running job of this period, or null. */
       job: liveJob,
       jobError,
       actionError,
     },
-    /** The clock the page works on; moves with the calendar. */
-    now,
     startSync: startFullSync,
     cancelSync,
     retryGithub,

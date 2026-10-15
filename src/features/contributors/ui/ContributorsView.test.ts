@@ -97,6 +97,7 @@ const stored = (
 ): LoadResponse => ({
   raw,
   covered: true,
+  hasGaps: false,
   missingCommits: 0,
   syncedAt: Math.floor(Date.now() / 1000) - 300,
   coverageHead: raw.head,
@@ -109,6 +110,7 @@ const stored = (
 const unsynced = (over: Partial<LoadResponse> = {}): LoadResponse =>
   stored(makeRaw(), {
     covered: false,
+    hasGaps: true,
     missingCommits: 40,
     syncedAt: null,
     coverageHead: null,
@@ -117,6 +119,8 @@ const unsynced = (over: Partial<LoadResponse> = {}): LoadResponse =>
   });
 
 const handlers: ((e: { payload: SyncEvent }) => void)[] = [];
+// What Rust would list as running: the page checks its jobs against it.
+let listed: SyncEvent[] = [];
 const emit = (event: Partial<SyncEvent> & { root: string }) =>
   act(async () => {
     const period = currentPeriod("7d", new Date());
@@ -134,6 +138,7 @@ const emit = (event: Partial<SyncEvent> & { root: string }) =>
       error: null,
       ...event,
     };
+    listed = full.state === "queued" || full.state === "running" ? [full] : [];
     handlers.forEach((handler) => handler({ payload: full }));
   });
 
@@ -233,10 +238,28 @@ beforeEach(() => {
     firstParent: 90,
     prs: 7,
   });
-  vi.mocked(startSync).mockResolvedValue(undefined);
+  listed = [];
+  vi.mocked(startSync).mockImplementation(async (cwd, args) => {
+    listed = [
+      {
+        repoKey: "/r/.git",
+        project: "r",
+        root: cwd,
+        branch: "main",
+        from: Date.parse(args.from) / 1000,
+        to: Date.parse(args.to) / 1000,
+        step: "counting",
+        done: 0,
+        total: 0,
+        percent: 0,
+        state: "queued",
+        error: null,
+      },
+    ];
+  });
   vi.mocked(cancelSync).mockResolvedValue(undefined);
   vi.mocked(clearSynced).mockResolvedValue(undefined);
-  vi.mocked(syncStatus).mockResolvedValue([]);
+  vi.mocked(syncStatus).mockImplementation(async () => listed);
   vi.mocked(askDialog).mockResolvedValue(true);
   handlers.length = 0;
   vi.mocked(listen).mockImplementation((async (
@@ -267,7 +290,7 @@ describe("ContributorsView", () => {
     vi.mocked(loadStored).mockReturnValueOnce(new Promise(() => {}));
     await mount();
     expect(container.querySelector('[role="status"]')?.textContent).toContain(
-      "Reading the git history",
+      "Loading synced data",
     );
     expect(container.querySelector('[role="tablist"]')).toBeNull();
   });
@@ -403,7 +426,7 @@ describe("ContributorsView", () => {
     await act(async () => byText('[role="alert"] button', "Retry")?.click());
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(container.querySelector('[role="status"]')?.textContent).toContain(
-      "Reading the git history",
+      "Loading synced data",
     );
     await act(async () => release());
     expect(container.querySelector('[role="tablist"]')).not.toBeNull();
@@ -778,7 +801,7 @@ describe("ContributorsView hardening", () => {
       "Contributors works on local projects only",
     );
     expect(container.querySelector('[role="tablist"]')).toBeNull();
-    expect(container.textContent).not.toContain("Reading the git history");
+    expect(container.textContent).not.toContain("Loading synced data");
     expect(container.querySelector(".hidden")?.textContent).toContain(
       "Merge identities",
     );
@@ -1214,7 +1237,11 @@ describe("ContributorsView sync store", () => {
 
   it("an incomplete period never shows partial numbers and offers Sync again", async () => {
     vi.mocked(loadStored).mockResolvedValue(
-      stored(liveRaw(), { covered: false, missingCommits: 12 }),
+      stored(liveRaw(), {
+        covered: false,
+        hasGaps: true,
+        missingCommits: 12,
+      }),
     );
     await mount();
     expect(text()).toContain("No data for the last 7 days yet");
@@ -1292,5 +1319,47 @@ describe("ContributorsView sync store", () => {
     expect(text()).not.toContain("Syncing Commits");
     expect(byText("button", "Sync")).toBeDefined();
     expect(cancelSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps the 'Synced ... ago' line moving with a real clock, not the calendar", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      vi.mocked(loadStored).mockImplementation(async () =>
+        stored(liveRaw(), { syncedAt: Math.floor(Date.now() / 1000) }),
+      );
+      await mount();
+      expect(text()).toContain("Synced just now");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2 * 60_000);
+      });
+      expect(text()).toContain("Synced 2m ago");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60 * 60_000);
+      });
+      expect(text()).toContain("Synced 1h ago");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says why the estimate is missing and still offers Sync", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsynced());
+    vi.mocked(syncEstimate).mockRejectedValue("git is not responding");
+    await mount();
+    expect(text()).toContain(
+      "Could not estimate the size: git is not responding",
+    );
+    expect(byText("button", "Sync")).toBeDefined();
+  });
+
+  it("keeps the stored numbers on screen while a merge's older commits are read", async () => {
+    vi.mocked(loadStored).mockImplementation(async () =>
+      stored(liveRaw(), { covered: false, hasGaps: false, missingCommits: 2 }),
+    );
+    await mount();
+    expect(container.querySelector('[role="tablist"]')).not.toBeNull();
+    expect(text()).not.toContain("No data for");
+    expect(vi.mocked(startSync).mock.calls[0][1].mode).toBe("full");
+    expect(text()).toContain("Sync queued");
   });
 });

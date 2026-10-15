@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { Loader, RefreshCw, Users } from "../../../shared/ui/icons";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 import { relativeTime } from "../model/format";
@@ -30,6 +31,20 @@ export function progressText(job: SyncEvent): string {
     : `Syncing ${step}`;
 }
 
+const MINUTE_MS = 60_000;
+
+/** The wall clock, refreshed every minute, for "5m ago" lines. */
+function useMinuteClock(): Date {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    // The page may have been mounted a while ago: catch up at once.
+    setNow(new Date());
+    const timer = setInterval(() => setNow(new Date()), MINUTE_MS);
+    return () => clearInterval(timer);
+  }, []);
+  return now;
+}
+
 function ProgressBar({ percent }: { percent: number }) {
   return (
     <div
@@ -52,6 +67,7 @@ function ProgressBar({ percent }: { percent: number }) {
 export function NotSyncedPanel({
   label,
   estimate,
+  estimateError,
   job,
   onSync,
   onCancel,
@@ -59,6 +75,8 @@ export function NotSyncedPanel({
   /** "the last 7 days", "Q3 2026" */
   label: string;
   estimate: SyncEstimate | null;
+  /** Why there is no estimate; Sync is still offered. */
+  estimateError?: string;
   job: SyncEvent | null;
   onSync: () => void;
   onCancel: () => void;
@@ -83,6 +101,11 @@ export function NotSyncedPanel({
               {estimateText(estimate)}
             </p>
           ) : null}
+          {!estimate && estimateError ? (
+            <p className="text-[12px] text-content/50">
+              {`Could not estimate the size: ${estimateError}`}
+            </p>
+          ) : null}
           <div className="pt-1">
             <SecondaryButton onClick={onSync}>
               <RefreshCw className="size-3" strokeWidth={1.75} />
@@ -98,18 +121,17 @@ export function NotSyncedPanel({
 /** One line above a synced period: when it was synced, and a sync or top-up running. */
 export function SyncedBar({
   syncedAt,
-  now,
   job,
   onSync,
   onCancel,
 }: {
   /** Epoch seconds. */
   syncedAt: number | null;
-  now: Date;
   job: SyncEvent | null;
   onSync: () => void;
   onCancel: () => void;
 }) {
+  const now = useMinuteClock();
   const when =
     syncedAt === null
       ? ""

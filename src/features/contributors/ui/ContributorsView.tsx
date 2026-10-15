@@ -470,7 +470,7 @@ export function ContributorsView({
                 className="flex items-center gap-2 py-10 text-[12px] text-content/50"
               >
                 <Loader className="size-4 animate-spin" strokeWidth={1.75} />
-                Reading the git history...
+                Loading synced data...
               </div>
             ) : null}
 
@@ -487,6 +487,7 @@ export function ContributorsView({
               <NotSyncedPanel
                 label={periodName}
                 estimate={sync.estimate}
+                estimateError={sync.estimateError}
                 job={sync.job}
                 onSync={() => void data.startSync()}
                 onCancel={() => void data.cancelSync()}
@@ -515,7 +516,6 @@ export function ContributorsView({
                 {data.stale ? null : (
                   <SyncedBar
                     syncedAt={sync.syncedAt}
-                    now={data.now}
                     job={sync.job}
                     onSync={() => void data.startSync()}
                     onCancel={() => void data.cancelSync()}

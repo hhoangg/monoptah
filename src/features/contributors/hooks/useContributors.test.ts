@@ -109,6 +109,7 @@ const loadFixture = (over: Partial<LoadResponse> = {}): LoadResponse => {
   return {
     raw,
     covered: true,
+    hasGaps: false,
     missingCommits: 0,
     syncedAt: NOW_SECS() - 300,
     coverageHead: raw.head,
@@ -123,6 +124,7 @@ const unsyncedFixture = (over: Partial<LoadResponse> = {}) =>
   loadFixture({
     raw: makeRaw(),
     covered: false,
+    hasGaps: true,
     missingCommits: 40,
     syncedAt: null,
     coverageHead: null,
@@ -153,8 +155,22 @@ const syncEvent = (cwd: string, over: Partial<SyncEvent> = {}): SyncEvent => ({
   error: null,
   ...over,
 });
+// What Rust would list as running: the store checks its jobs against it.
+let listed: SyncEvent[] = [];
+const sameJob = (a: SyncEvent, b: SyncEvent) =>
+  a.root === b.root && a.from === b.from && a.to === b.to;
+const list = (event: SyncEvent) => {
+  const rest = listed.filter((other) => !sameJob(other, event));
+  listed =
+    event.state === "queued" || event.state === "running"
+      ? [...rest, event]
+      : rest;
+};
 const emit = (event: SyncEvent) =>
-  act(async () => handlers.forEach((handler) => handler({ payload: event })));
+  act(async () => {
+    list(event);
+    handlers.forEach((handler) => handler({ payload: event }));
+  });
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -176,10 +192,20 @@ beforeEach(() => {
   });
   vi.mocked(loadStored).mockImplementation(async () => loadFixture());
   vi.mocked(syncEstimate).mockResolvedValue(ESTIMATE);
-  vi.mocked(startSync).mockResolvedValue(undefined);
+  listed = [];
+  vi.mocked(startSync).mockImplementation(async (cwd, args) => {
+    list(
+      syncEvent(cwd, {
+        branch: "main",
+        from: Date.parse(args.from) / 1000,
+        to: Date.parse(args.to) / 1000,
+        state: "queued",
+      }),
+    );
+  });
   vi.mocked(cancelSync).mockResolvedValue(undefined);
   vi.mocked(clearSynced).mockResolvedValue(undefined);
-  vi.mocked(syncStatus).mockResolvedValue([]);
+  vi.mocked(syncStatus).mockImplementation(async () => listed);
   handlers.length = 0;
   vi.mocked(listen).mockImplementation((async (
     _event: string,
@@ -893,6 +919,27 @@ describe("useContributors sync store states", () => {
     expect(api.raw).toBeUndefined();
   });
 
+  it("keeps the reason when the estimate fails, and Sync stays available", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    vi.mocked(syncEstimate).mockRejectedValue("git is not responding");
+    await mount(nextCwd());
+    expect(api.sync.state).toBe("notSynced");
+    expect(api.sync.estimate).toBeNull();
+    expect(api.sync.estimateError).toBe("git is not responding");
+    await act(async () => api.startSync());
+    expect(startSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a queued entry that Rust never turned into a job (a duplicate request)", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    // Rust accepted the request but lists nothing for this path.
+    vi.mocked(startSync).mockResolvedValue(undefined);
+    vi.mocked(syncStatus).mockResolvedValue([]);
+    await mount(nextCwd());
+    await act(async () => api.startSync());
+    expect(api.sync.job).toBeNull();
+  });
+
   it("estimates the window the sync would use", async () => {
     vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
     await mount(nextCwd());
@@ -1152,19 +1199,74 @@ describe("useContributors top-up", () => {
     expect(startSync).not.toHaveBeenCalled();
   });
 
-  it("a covered gap at the same head needs a full sync, not a top-up", async () => {
+  it("a synced period that lacks commits keeps its data and is repaired by one full sync per head", async () => {
+    const cwd = nextCwd();
+    const lacking = (over: Partial<LoadResponse> = {}) =>
+      loadFixture({
+        covered: false,
+        hasGaps: false,
+        missingCommits: 3,
+        coverageHead: "old1",
+        head: "new2",
+        ...over,
+      });
+    vi.mocked(loadStored).mockResolvedValue(lacking());
+    await mount(cwd);
+    // Numbers stay on screen: the stored commits are shown while it updates.
+    expect(api.sync.state).toBe("synced");
+    expect(api.model).toBeDefined();
+    expect(syncEstimate).not.toHaveBeenCalled();
+    expect(startSync).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(startSync).mock.calls[0][1].mode).toBe("full");
+    expect(api.sync.job?.state).toBe("queued");
+
+    // Not again for the same head, even when the job ended and it still lacks.
+    await emit(syncEvent(cwd, { state: "done", percent: 100 }));
+    await act(async () => api.refresh(true));
+    expect(startSync).toHaveBeenCalledTimes(1);
+
+    // A moved head is a new reason to repair.
+    vi.mocked(loadStored).mockResolvedValue(lacking({ head: "new3" }));
+    await act(async () => api.refresh(true));
+    expect(startSync).toHaveBeenCalledTimes(2);
+  });
+
+  it("repairs a lack at the same head as well", async () => {
     vi.mocked(loadStored).mockResolvedValue(
-      unsyncedFixture({
-        raw: rawFixture(),
+      loadFixture({
+        covered: false,
+        hasGaps: false,
+        missingCommits: 2,
         coverageHead: "same",
         head: "same",
-        missingCommits: 3,
       }),
     );
     await mount(nextCwd());
-    expect(startSync).not.toHaveBeenCalled();
-    await act(async () => api.startSync());
     expect(vi.mocked(startSync).mock.calls[0][1].mode).toBe("full");
+    expect(api.model).toBeDefined();
+  });
+
+  it("a gap (never synced or cancelled) stays manual even with a coverage head", async () => {
+    vi.mocked(loadStored).mockResolvedValue(
+      unsyncedFixture({
+        raw: rawFixture(),
+        coverageHead: "old1",
+        head: "new2",
+        missingCommits: 12,
+      }),
+    );
+    await mount(nextCwd());
+    expect(api.sync.state).toBe("notSynced");
+    expect(api.model).toBeUndefined();
+    expect(startSync).not.toHaveBeenCalled();
+  });
+
+  it("a repair of nothing missing is not started", async () => {
+    vi.mocked(loadStored).mockResolvedValue(
+      loadFixture({ covered: false, hasGaps: false, missingCommits: 0 }),
+    );
+    await mount(nextCwd());
+    expect(startSync).not.toHaveBeenCalled();
   });
 
   it("reloads when the top-up is done and drops the spinner", async () => {

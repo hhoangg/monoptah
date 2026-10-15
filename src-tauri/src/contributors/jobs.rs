@@ -478,6 +478,10 @@ pub struct LoadResponse {
     pub raw: RawData,
     /// The whole period is synced and nothing in it is missing.
     pub covered: bool,
+    /// Part of the period was never synced or its sync was cancelled. False
+    /// with `covered` false means a synced period that lacks some commits (a
+    /// merge brought older ones in): it can be repaired in the background.
+    pub has_gaps: bool,
     /// Commits of the period that the store does not have.
     pub missing_commits: u64,
     pub synced_at: Option<i64>,
@@ -552,6 +556,7 @@ pub(super) fn load_response(
     Ok(LoadResponse {
         raw: loaded.raw,
         covered: loaded.covered,
+        has_gaps: loaded.has_gaps,
         missing_commits: loaded.missing_commits,
         synced_at: loaded.synced_at,
         coverage_head: loaded.coverage_head,
@@ -1304,6 +1309,7 @@ mod tests {
 
         let loaded = load_response(&store, repo.path(), None, SINCE, UNTIL, now_secs()).unwrap();
         assert!(!loaded.covered);
+        assert!(loaded.has_gaps, "never synced is a gap, not a repair");
         assert_eq!(loaded.missing_commits, 2);
         assert!(loaded.raw.commits.is_empty());
         assert_eq!(loaded.head, head);
@@ -1366,6 +1372,7 @@ mod tests {
         assert!(outcome.cancelled);
         let loaded = load_response(&store, repo.path(), None, SINCE, UNTIL, now_secs()).unwrap();
         assert!(!loaded.covered);
+        assert!(loaded.has_gaps, "a cancelled sync leaves a gap");
     }
 
     #[test]
@@ -1424,6 +1431,7 @@ mod tests {
         )
         .unwrap();
         assert!(!loaded.covered);
+        assert!(loaded.has_gaps);
     }
 
     /// Replaces what the store knows about the coverage of `main` with `rows`
@@ -1589,8 +1597,40 @@ mod tests {
         );
         let loaded = load_response(&store, repo.path(), None, SINCE, UNTIL, now_secs()).unwrap();
         assert!(!loaded.covered);
+        assert!(!loaded.has_gaps);
         assert_eq!(loaded.missing_commits, 1);
         assert_ne!(loaded.coverage_head.as_deref(), Some(loaded.head.as_str()));
+    }
+
+    #[test]
+    fn a_merge_bringing_older_commits_into_a_synced_period_is_a_repair_not_a_gap() {
+        let repo = repo_with_commits();
+        let store = SessionStore::open_in_memory().unwrap();
+        let spec = prepare_job(repo.path(), None, SINCE, UNTIL, "full", None).unwrap();
+        run_job(
+            &store,
+            &spec,
+            &gh::Unavailable,
+            &gh::CommitCache::new(),
+            &NoReport,
+        )
+        .unwrap();
+        // A commit dated before the sync, as a non-fast-forward merge brings.
+        repo.commit(
+            &[("old.txt", "o\n")],
+            "dated earlier",
+            ALICE,
+            "2026-01-02T10:00:00+0000",
+        );
+        let loaded = load_response(&store, repo.path(), None, SINCE, UNTIL, now_secs()).unwrap();
+        assert!(!loaded.covered);
+        assert!(!loaded.has_gaps, "the coverage is intact");
+        assert_eq!(loaded.missing_commits, 1);
+        assert!(loaded.coverage_head.is_some());
+        assert!(
+            !loaded.raw.commits.is_empty(),
+            "the stored data stays loadable"
+        );
     }
 
     #[test]
@@ -1657,6 +1697,7 @@ mod tests {
                 "coverageHead",
                 "covered",
                 "ghState",
+                "hasGaps",
                 "head",
                 "missingCommits",
                 "raw",

@@ -139,6 +139,9 @@ pub(super) struct CoverageRow {
 pub(super) struct Loaded {
     pub raw: RawData,
     pub covered: bool,
+    /// Part of the window was never synced (or its sync was cancelled), as
+    /// opposed to a synced window that only lacks some commits.
+    pub has_gaps: bool,
     pub missing_commits: u64,
     pub synced_at: Option<i64>,
     pub coverage_head: Option<String>,
@@ -1012,7 +1015,8 @@ fn load_in(
     }
 
     let intervals = coverage(conn, repo, branch)?;
-    let covered = missing_intervals(&intervals, since, until).is_empty() && missing_commits == 0;
+    let has_gaps = !missing_intervals(&intervals, since, until).is_empty();
+    let covered = !has_gaps && missing_commits == 0;
     let overlapping: Vec<&CoverageRow> = intervals
         .iter()
         .filter(|r| r.from_epoch <= until && r.to_epoch >= since)
@@ -1042,6 +1046,7 @@ fn load_in(
             truncated: false,
         },
         covered,
+        has_gaps,
         missing_commits,
         synced_at: oldest.map(|r| r.synced_at),
         coverage_head: oldest.map(|r| r.head.clone()),
@@ -1861,6 +1866,8 @@ mod tests {
         }
         let loaded = load_all(&f, &f.hashes[2]);
         assert!(!loaded.covered);
+        // Synced, but a commit is not stored: not a gap in the coverage.
+        assert!(!loaded.has_gaps);
         assert_eq!(loaded.missing_commits, 1);
         assert_eq!(loaded.raw.commits.len(), 2);
     }
@@ -1889,6 +1896,7 @@ mod tests {
         .unwrap();
         let loaded = load_all(&f, &f.hashes[2]);
         assert!(!loaded.covered);
+        assert!(loaded.has_gaps);
         assert_eq!(loaded.missing_commits, 0);
         assert_eq!(loaded.synced_at, Some(5));
     }
@@ -1903,6 +1911,7 @@ mod tests {
         }
         let loaded = load_all(&f, &f.hashes[2]);
         assert!(!loaded.covered);
+        assert!(loaded.has_gaps);
         assert_eq!(loaded.synced_at, None);
         assert_eq!(loaded.coverage_head, None);
         assert_eq!(loaded.gh_state, None);
