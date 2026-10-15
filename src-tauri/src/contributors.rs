@@ -4922,6 +4922,7 @@ mod tests {
 
     /// Runs `f` on a thread so a read that blocks fails the test instead of
     /// hanging it.
+    #[cfg(unix)]
     fn within_a_few_seconds<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
