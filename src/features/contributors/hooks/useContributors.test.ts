@@ -22,7 +22,7 @@ import {
 } from "../model/api";
 import { DEFAULT_CONFIG, serializeConfig } from "../model/config";
 import { RANGE_KEY } from "../model/prefs";
-import { seasonChoices } from "../model/range";
+import { formatDay, seasonChoices } from "../model/range";
 import type { CustomRange } from "../model/range";
 import { previousSeason } from "../model/season";
 import { ANA, file, makeCommit, makeRaw } from "../model/testFixtures";
@@ -39,18 +39,20 @@ let root: Root;
 let api: Api;
 let cwdCounter = 0;
 
-// Far in the past, so their windows never depend on today's date and two of
-// them always give different cache keys.
-const JAN_2020: CustomRange = {
-  key: "custom",
-  start: "2020-01-01",
-  end: "2020-01-10",
+// Months back but inside the custom range horizon, so their windows reach well
+// before the previous season and two of them always give different cache keys.
+const dayBack = (n: number) => {
+  const d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() - n);
 };
-const MAR_2020: CustomRange = {
+const rangeBack = (from: number, to: number): CustomRange => ({
   key: "custom",
-  start: "2020-03-01",
-  end: "2020-03-10",
-};
+  start: formatDay(dayBack(from)),
+  end: formatDay(dayBack(to)),
+});
+const RANGE_A = rangeBack(120, 111); // 10 days
+const RANGE_B = rangeBack(100, 91);
+const saved = (r: CustomRange) => `custom:${r.start}:${r.end}`;
 const nextCwd = () => `/repo-${(cwdCounter += 1)}`;
 
 function Probe({ cwd }: { cwd: string }) {
@@ -145,32 +147,30 @@ describe("useContributors", () => {
 
   it("collects a custom range from the equal-length period before it, with the end open", async () => {
     await mount(nextCwd());
-    await act(async () => api.setRange(JAN_2020));
+    await act(async () => api.setRange(RANGE_A));
     const args = vi.mocked(collectRaw).mock.calls.at(-1)![1];
-    // Jan 1-10 is 10 days; the previous 10 days start Dec 22, 2019.
-    expect(args.since).toBe(
-      new Date(2019, 11, 22).toISOString().replace(".000Z", "Z"),
-    );
+    // 10 days; the previous 10 days start 130 days back.
+    expect(args.since).toBe(dayBack(130).toISOString().replace(".000Z", "Z"));
     // The board ranks the current month whatever the range, so nothing newer
     // than the range may be cut off.
     expect(args.until).toBeUndefined();
-    expect(api.model?.rangeLabel).toBe("2020-01-01 to 2020-01-10");
+    expect(api.model?.rangeLabel).toBe(`${RANGE_A.start} to ${RANGE_A.end}`);
   });
 
   it("collects again when the custom days change, and not when they do not", async () => {
     await mount(nextCwd());
-    await act(async () => api.setRange(JAN_2020));
+    await act(async () => api.setRange(RANGE_A));
     const base = vi.mocked(collectRaw).mock.calls.length;
-    await act(async () => api.setRange({ ...JAN_2020 }));
+    await act(async () => api.setRange({ ...RANGE_A }));
     expect(vi.mocked(collectRaw).mock.calls.length).toBe(base);
-    await act(async () => api.setRange(MAR_2020));
+    await act(async () => api.setRange(RANGE_B));
     expect(vi.mocked(collectRaw).mock.calls.length).toBe(base + 1);
   });
 
   it("restores a saved custom range and a saved removed preset falls back", async () => {
-    localStorage.setItem(RANGE_KEY, "custom:2020-01-01:2020-01-10");
+    localStorage.setItem(RANGE_KEY, saved(RANGE_A));
     await mount(nextCwd());
-    expect(api.range).toEqual(JAN_2020);
+    expect(api.range).toEqual(RANGE_A);
     await act(async () => root.unmount());
     root = createRoot(container);
     localStorage.setItem(RANGE_KEY, "1y");
@@ -459,15 +459,13 @@ describe("useContributors", () => {
 
   it("persists the range and the merge toggle", async () => {
     await mount(nextCwd());
-    await act(async () => api.setRange(JAN_2020));
+    await act(async () => api.setRange(RANGE_A));
     await act(async () => api.setMerge(false));
-    expect(localStorage.getItem(RANGE_KEY)).toBe(
-      "custom:2020-01-01:2020-01-10",
-    );
+    expect(localStorage.getItem(RANGE_KEY)).toBe(saved(RANGE_A));
     expect(localStorage.getItem("monocode.contributors.mergeIdentities")).toBe(
       "false",
     );
-    expect(api.range).toEqual(JAN_2020);
+    expect(api.range).toEqual(RANGE_A);
     expect(api.merge).toBe(false);
     expect(api.model?.merge).toBe(false);
   });
@@ -536,7 +534,7 @@ describe("useContributors races", () => {
   });
 
   it("ignores a late failure of an abandoned request", async () => {
-    localStorage.setItem(RANGE_KEY, "custom:2020-01-01:2020-01-10");
+    localStorage.setItem(RANGE_KEY, saved(RANGE_A));
     const a = deferred<ReturnType<typeof rawFixture>>();
     const b = deferred<ReturnType<typeof rawFixture>>();
     vi.mocked(collectRaw)
@@ -544,7 +542,7 @@ describe("useContributors races", () => {
       .mockReturnValueOnce(a.promise)
       .mockReturnValueOnce(b.promise);
     await mount(nextCwd());
-    await act(async () => api.setRange(MAR_2020));
+    await act(async () => api.setRange(RANGE_B));
     await act(async () => b.reject("B failed"));
     expect(api.status).toBe("error");
     expect(api.error).toBe("B failed");
@@ -554,14 +552,14 @@ describe("useContributors races", () => {
   });
 
   it("does not clear the current failure when an abandoned request succeeds", async () => {
-    localStorage.setItem(RANGE_KEY, "custom:2020-01-01:2020-01-10");
+    localStorage.setItem(RANGE_KEY, saved(RANGE_A));
     const a = deferred<ReturnType<typeof rawFixture>>();
     vi.mocked(collectRaw)
       .mockReset()
       .mockReturnValueOnce(a.promise)
       .mockRejectedValueOnce("B failed");
     await mount(nextCwd());
-    await act(async () => api.setRange(MAR_2020));
+    await act(async () => api.setRange(RANGE_B));
     expect(api.error).toBe("B failed");
     await act(async () => a.resolve(rawFixture()));
     expect(api.error).toBe("B failed");
@@ -613,7 +611,7 @@ describe("useContributors races", () => {
     await mount(nextCwd());
     const gate = deferred<ReturnType<typeof rawFixture>>();
     vi.mocked(collectRaw).mockReturnValueOnce(gate.promise);
-    await act(async () => api.setRange(MAR_2020));
+    await act(async () => api.setRange(RANGE_B));
     expect(api.status).toBe("ready");
     expect(api.stale).toBe(true);
     expect(api.model).toBeDefined();
@@ -702,7 +700,7 @@ describe("useContributors season", () => {
 
   it("re-scores a covered season from the loaded data without a request", async () => {
     await mount(nextCwd());
-    await act(async () => api.setRange(JAN_2020));
+    await act(async () => api.setRange(RANGE_A));
     const before = vi.mocked(collectRaw).mock.calls.length;
     const picked = choices()[2];
     await act(async () => api.setSeason(picked.id));

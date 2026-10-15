@@ -32,6 +32,7 @@ import type { AskAgentRequest } from "../model/askAgent";
 import { CONFIG_PATH } from "../model/config";
 import {
   RANGE_OPTIONS,
+  earliestCustomDay,
   formatDay,
   parseDay,
   rangeKeyOf,
@@ -264,8 +265,11 @@ export function ContributorsView({
     // Custom starts from the days already on screen.
     data.setRange(next === "custom" ? toCustom(data.range, new Date()) : next);
   };
-  // A cleared or half-typed date reads as empty and is ignored; any day can be
-  // picked, because the other end follows when the span would be invalid.
+  // A cleared or half-typed date reads as empty and is ignored. Any day between
+  // the earliest allowed one and today can be picked, because the other end
+  // follows when the span would be invalid; a typed day outside is clamped.
+  const today = formatDay(new Date());
+  const earliest = formatDay(earliestCustomDay(new Date()));
   const pickDay = (text: string, apply: typeof withStart) => {
     const day = parseDay(text);
     if (!day || !customRange) return;
@@ -367,7 +371,8 @@ export function ContributorsView({
                     type="date"
                     aria-label="Start date"
                     value={customRange.start}
-                    max={customRange.end}
+                    min={earliest}
+                    max={today}
                     onChange={(e) => pickDay(e.target.value, withStart)}
                     className={DATE_INPUT}
                   />
@@ -376,7 +381,8 @@ export function ContributorsView({
                     type="date"
                     aria-label="End date"
                     value={customRange.end}
-                    max={formatDay(new Date())}
+                    min={earliest}
+                    max={today}
                     onChange={(e) => pickDay(e.target.value, withEnd)}
                     className={DATE_INPUT}
                   />

@@ -51,7 +51,7 @@ import {
 import { resetContributorsCache } from "../hooks/useContributors";
 import { REMOTE_PROJECT_PREFIX } from "../../projects/model/recents";
 import { RANGE_KEY } from "../model/prefs";
-import { formatDay, seasonChoices } from "../model/range";
+import { earliestCustomDay, formatDay, seasonChoices } from "../model/range";
 import { previousSeason } from "../model/season";
 import { ANA, BOB, file, makeCommit, makeRaw } from "../model/testFixtures";
 import { deferUnhandledEscape } from "../../workspace/model/tabKeys";
@@ -430,6 +430,40 @@ describe("ContributorsView", () => {
       tomorrow.setDate(tomorrow.getDate() + 1);
       await setDay(rangeInputs()!.end, formatDay(tomorrow));
       expect(rangeInputs()!.end.value).toBe(today());
+    });
+
+    it("limits both inputs to the horizon season selection reaches", async () => {
+      await mount();
+      await act(async () => rangeButton("Custom")?.click());
+      const earliest = formatDay(earliestCustomDay(new Date()));
+      const { start, end } = rangeInputs()!;
+      expect(start.min).toBe(earliest);
+      expect(end.min).toBe(earliest);
+      expect(start.max).toBe(today());
+    });
+
+    it("clamps a typed start older than the horizon", async () => {
+      await mount();
+      await act(async () => rangeButton("Custom")?.click());
+      const earliest = formatDay(earliestCustomDay(new Date()));
+      await setDay(rangeInputs()!.start, "2020-01-01");
+      const { start, end } = rangeInputs()!;
+      expect(start.value).toBe(earliest);
+      expect(
+        Date.parse(end.value) - Date.parse(start.value),
+      ).toBeLessThanOrEqual(29 * 86_400_000);
+      expect(localStorage.getItem(RANGE_KEY)).toBe(
+        `custom:${start.value}:${end.value}`,
+      );
+    });
+
+    it("clamps a saved range older than the horizon", async () => {
+      localStorage.setItem(RANGE_KEY, "custom:2020-01-01:2020-01-10");
+      await mount();
+      const earliest = formatDay(earliestCustomDay(new Date()));
+      const { start, end } = rangeInputs()!;
+      expect(start.value).toBe(earliest);
+      expect(end.value).toBe(earliest);
     });
 
     it("moves the other end when the picked start is after the end", async () => {

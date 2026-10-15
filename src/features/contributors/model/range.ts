@@ -52,23 +52,38 @@ export function parseDay(text: string): Date | undefined {
 }
 
 /**
- * A custom range from two days, forced to be valid: it ends no later than
- * today, starts no later than it ends, and spans at most `MAX_CUSTOM_DAYS`.
- * When the span is too long the end is kept and the start moves.
+ * The earliest day a custom range may reach: the start of the season before the
+ * oldest selectable one, which is as far back as season selection already
+ * collects. A far-past range would otherwise collect years of history.
+ */
+export function earliestCustomDay(now: Date): Date {
+  const choices = seasonChoices(now);
+  return previousSeason(choices[choices.length - 1]).start;
+}
+
+/**
+ * A custom range from two days, forced to be valid: it neither starts nor ends
+ * before `earliestCustomDay`, ends no later than today, starts no later than
+ * it ends, and spans at most `MAX_CUSTOM_DAYS`. When the span is too long the
+ * end is kept and the start moves.
  */
 export function customRange(start: Date, end: Date, now: Date): CustomRange {
   const today = startOfDay(now);
-  const last = startOfDay(end) < today ? startOfDay(end) : today;
+  const bound = earliestCustomDay(now);
+  let last = startOfDay(end) < today ? startOfDay(end) : today;
+  if (last < bound) last = bound;
   let first = startOfDay(start);
   if (first > last) first = last;
   const earliest = addDays(last, -(MAX_CUSTOM_DAYS - 1));
   if (first < earliest) first = earliest;
+  if (first < bound) first = bound;
   return { key: "custom", start: formatDay(first), end: formatDay(last) };
 }
 
 /**
  * The range after the user picks a new first day. The other end follows when
- * the pick would make the span invalid, so any day can be picked.
+ * the pick would make the span invalid, so any day within the allowed window
+ * (`earliestCustomDay` to today) can be picked.
  */
 export function withStart(
   range: CustomRange,
@@ -76,7 +91,9 @@ export function withStart(
   now: Date,
 ): CustomRange {
   const end = parseDay(range.end) ?? startOfDay(now);
-  const first = startOfDay(pick);
+  const bound = earliestCustomDay(now);
+  const picked = startOfDay(pick);
+  const first = picked < bound ? bound : picked;
   const last =
     first > end
       ? first
@@ -93,7 +110,9 @@ export function withEnd(
   now: Date,
 ): CustomRange {
   const start = parseDay(range.start) ?? startOfDay(now);
-  const last = startOfDay(pick);
+  const bound = earliestCustomDay(now);
+  const picked = startOfDay(pick);
+  const last = picked < bound ? bound : picked;
   const first =
     last < start
       ? last

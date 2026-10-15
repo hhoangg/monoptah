@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   customRange,
+  earliestCustomDay,
   formatDay,
   parseDay,
   parseRange,
@@ -16,7 +17,7 @@ import {
   withStart,
 } from "./range";
 import type { CustomRange } from "./range";
-import { seasonById, seasonOf } from "./season";
+import { previousSeason, seasonById, seasonOf } from "./season";
 
 const NOW = new Date(2026, 9, 15, 14, 30); // Thu Oct 15 2026, local
 const day = (y: number, m: number, d: number) => new Date(y, m - 1, d);
@@ -75,6 +76,44 @@ describe("customRange", () => {
   });
 });
 
+describe("earliestCustomDay", () => {
+  it("is the start of the season before the oldest selectable one", () => {
+    // Oct 2026 offers Oct..May, so the horizon is Apr 1.
+    expect(earliestCustomDay(NOW)).toEqual(new Date(2026, 3, 1));
+    // Crosses the year boundary.
+    expect(earliestCustomDay(new Date(2027, 1, 3))).toEqual(
+      new Date(2026, 7, 1),
+    );
+  });
+
+  it("is the same horizon season selection collects back to", () => {
+    const choices = seasonChoices(NOW);
+    expect(earliestCustomDay(NOW)).toEqual(
+      previousSeason(choices[choices.length - 1]).start,
+    );
+  });
+});
+
+describe("customRange horizon", () => {
+  it("moves a start before the horizon up to it", () => {
+    expect(customRange(day(2026, 1, 1), day(2026, 4, 10), NOW)).toEqual(
+      custom("2026-04-01", "2026-04-10"),
+    );
+  });
+
+  it("allows a range that starts on the horizon", () => {
+    expect(customRange(day(2026, 4, 1), day(2026, 4, 30), NOW)).toEqual(
+      custom("2026-04-01", "2026-04-30"),
+    );
+  });
+
+  it("moves an end before the horizon up to it, as one day", () => {
+    expect(customRange(day(2020, 1, 1), day(2020, 1, 10), NOW)).toEqual(
+      custom("2026-04-01", "2026-04-01"),
+    );
+  });
+});
+
 describe("withStart and withEnd", () => {
   const base = custom("2026-10-01", "2026-10-15");
 
@@ -110,6 +149,15 @@ describe("withStart and withEnd", () => {
     );
   });
 
+  it("stops at the horizon when the pick is older", () => {
+    expect(withStart(base, day(2020, 1, 1), NOW)).toEqual(
+      custom("2026-04-01", "2026-04-30"),
+    );
+    expect(withEnd(base, day(2020, 1, 1), NOW)).toEqual(
+      custom("2026-04-01", "2026-04-01"),
+    );
+  });
+
   it("never lets the end pass today", () => {
     expect(withStart(base, day(2026, 10, 14), NOW).end).toBe("2026-10-15");
     expect(withEnd(base, day(2026, 12, 1), NOW).end).toBe("2026-10-15");
@@ -142,6 +190,15 @@ describe("parseRange", () => {
     );
     expect(parseRange("custom:2026-10-10:2027-01-01", NOW)).toEqual(
       custom("2026-10-10", "2026-10-15"),
+    );
+  });
+
+  it("clamps a stored custom range older than the horizon", () => {
+    expect(parseRange("custom:2020-01-01:2020-01-10", NOW)).toEqual(
+      custom("2026-04-01", "2026-04-01"),
+    );
+    expect(parseRange("custom:2026-03-20:2026-04-10", NOW)).toEqual(
+      custom("2026-04-01", "2026-04-10"),
     );
   });
 
@@ -275,8 +332,8 @@ describe("sinceFor", () => {
   });
 
   it("reaches back before a custom range in the past, whatever the current season", () => {
-    const range = custom("2025-03-10", "2025-03-19"); // 10 days
-    expect(sinceFor(range, NOW)).toBe(iso(new Date(2025, 1, 28))); // Mar 10 minus 10 days
+    const range = custom("2026-05-10", "2026-05-19"); // 10 days
+    expect(sinceFor(range, NOW)).toBe(iso(new Date(2026, 3, 30))); // May 10 minus 10 days
   });
 
   it("is the same for every moment of one day", () => {
