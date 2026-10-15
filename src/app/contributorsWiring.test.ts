@@ -3,7 +3,7 @@ import app from "./App.tsx?raw";
 
 // App.tsx is too large to mount in a test, so the wiring is checked on the
 // source: a missed opener leaves two views mounted at once.
-const lines = app.split("\n");
+const lines = app.split(/\r?\n/);
 const indexesOf = (text: string) =>
   lines.flatMap((line, i) => (line.trim() === text ? [i] : []));
 
