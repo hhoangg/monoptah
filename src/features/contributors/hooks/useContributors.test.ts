@@ -132,38 +132,34 @@ describe("useContributors", () => {
     expect(api.config).toEqual(DEFAULT_CONFIG);
   });
 
-  it("collects the window of the default 7d period: from the previous 7 days to tomorrow", async () => {
+  it("collects the default 7d period from the start of the previous 7 days, with the end open", async () => {
     await mount(nextCwd());
     const args = vi.mocked(collectRaw).mock.calls[0][1];
     const window = syncWindow(currentPeriod("7d", new Date()), new Date());
     expect(args.since).toBe(isoSeconds(window.from));
-    expect(args.until).toBe(isoSeconds(window.to));
+    expect(args.until).toBeUndefined();
     expect(args.force).toBe(false);
     expect(args.branch).toBeUndefined();
     expect(api.period.kind).toBe("7d");
     expect(api.model?.period.id).toBe("7d");
   });
 
-  it("collects a past month from the start of the month before it to its own end", async () => {
+  it("collects a past month from the start of the month before it, with the end open", async () => {
     await mount(nextCwd());
     await selectMonthBack(3);
     const args = vi.mocked(collectRaw).mock.calls.at(-1)![1];
     expect(args.since).toBe(isoSeconds(monthBack(4).start));
-    expect(args.until).toBe(isoSeconds(monthBack(3).end));
+    // A PR merged after the period still credits its days, and survival is
+    // measured against now, so nothing newer may be cut off.
+    expect(args.until).toBeUndefined();
     expect(api.model?.period.id).toBe(MONTH_A.id);
   });
 
-  it("caps the current month at tomorrow", async () => {
+  it("collects the current month from the start of the previous one, with the end open", async () => {
     await mount(nextCwd());
     await act(async () => api.setKind("month"));
     const args = vi.mocked(collectRaw).mock.calls.at(-1)![1];
-    const today = new Date();
-    const tomorrow = new Date(
-      today.getFullYear(),
-      today.getMonth(),
-      today.getDate() + 1,
-    );
-    expect(args.until).toBe(isoSeconds(tomorrow));
+    expect(args.until).toBeUndefined();
     expect(args.since).toBe(isoSeconds(monthBack(1).start));
   });
 

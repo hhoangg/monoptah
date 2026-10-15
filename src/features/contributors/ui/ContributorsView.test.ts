@@ -341,12 +341,12 @@ describe("ContributorsView", () => {
     expect(container.querySelector('[aria-label="Range"]')).toBeNull();
   });
 
-  it("collects the window of the period, from the previous start to the end capped at tomorrow", async () => {
+  it("collects from the start of the previous period, with the end open", async () => {
     await mount();
     const week = syncWindow(currentPeriod("7d", new Date()), new Date());
     const options = vi.mocked(collectRaw).mock.calls.at(-1)![1];
     expect(Date.parse(options.since)).toBe(week.from.getTime());
-    expect(Date.parse(options.until!)).toBe(week.to.getTime());
+    expect(options.until).toBeUndefined();
   });
 
   it("changes and remembers the kind", async () => {
@@ -413,7 +413,7 @@ describe("ContributorsView", () => {
       const window = syncWindow(previous, now());
       const options = vi.mocked(collectRaw).mock.calls.at(-1)![1];
       expect(Date.parse(options.since)).toBe(window.from.getTime());
-      expect(Date.parse(options.until!)).toBe(window.to.getTime());
+      expect(options.until).toBeUndefined();
       expect(arrow("Next period")?.disabled).toBe(false);
     });
 

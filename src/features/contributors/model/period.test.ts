@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished } from "vitest";
 import {
   DEFAULT_PERIOD_KIND,
   PERIOD_KINDS,
@@ -11,6 +11,7 @@ import {
   pickOf,
   resolvePick,
   periodFromId,
+  previousComparableSpan,
   previousPeriod,
   syncWindow,
 } from "./period";
@@ -241,6 +242,63 @@ describe("syncWindow", () => {
     const w = syncWindow(aug, NOW);
     expect(ymd(w.from)).toEqual([2026, 7, 1]);
     expect(ymd(w.to)).toEqual([2026, 9, 1]);
+  });
+});
+
+describe("previousComparableSpan", () => {
+  it("covers the same elapsed days of the previous month", () => {
+    const now = new Date(2026, 9, 3, 15); // Oct 3
+    const span = previousComparableSpan(currentPeriod("month", now), now);
+    expect(ymd(span.start)).toEqual([2026, 9, 1]);
+    expect(ymd(span.end)).toEqual([2026, 9, 4]);
+  });
+
+  it("is capped at the end of a shorter previous month", () => {
+    const now = new Date(2026, 2, 31, 10); // Mar 31 vs 28 days of Feb
+    const span = previousComparableSpan(currentPeriod("month", now), now);
+    expect(ymd(span.start)).toEqual([2026, 2, 1]);
+    expect(ymd(span.end)).toEqual([2026, 3, 1]);
+  });
+
+  it("is the whole previous period for a complete past period", () => {
+    const quarter = previousPeriod(currentPeriod("quarter", NOW));
+    const span = previousComparableSpan(quarter, NOW);
+    const before = previousPeriod(quarter);
+    expect(span.start.getTime()).toBe(before.start.getTime());
+    expect(span.end.getTime()).toBe(before.end.getTime());
+  });
+
+  it("is the previous 7 days for 7d", () => {
+    const span = previousComparableSpan(currentPeriod("7d", NOW), NOW);
+    expect(ymd(span.start)).toEqual([2026, 9, 2]);
+    expect(ymd(span.end)).toEqual([2026, 9, 9]);
+  });
+
+  it("covers the elapsed part of the previous quarter and year", () => {
+    const now = new Date(2026, 9, 10, 9); // 10 days into Q4
+    const q = previousComparableSpan(currentPeriod("quarter", now), now);
+    expect(ymd(q.start)).toEqual([2026, 7, 1]);
+    expect(ymd(q.end)).toEqual([2026, 7, 11]);
+    const y = previousComparableSpan(currentPeriod("year", NOW), NOW);
+    expect(ymd(y.start)).toEqual([2025, 1, 1]);
+    expect(ymd(y.end)).toEqual([2025, 9, 16]);
+  });
+
+  it("counts calendar days across a DST change", (ctx) => {
+    const original = process.env.TZ;
+    onTestFinished(() => {
+      if (original === undefined) delete process.env.TZ;
+      else process.env.TZ = original;
+    });
+    process.env.TZ = "Europe/Berlin";
+    const winter = new Date(2026, 0, 1).getTimezoneOffset();
+    const summer = new Date(2026, 6, 1).getTimezoneOffset();
+    if (winter === summer) ctx.skip();
+    const now = new Date(2026, 3, 2, 10); // Apr 2, after the March change
+    const span = previousComparableSpan(currentPeriod("month", now), now);
+    expect(ymd(span.start)).toEqual([2026, 3, 1]);
+    expect(ymd(span.end)).toEqual([2026, 3, 3]);
+    expect(span.end.getHours()).toBe(0);
   });
 });
 

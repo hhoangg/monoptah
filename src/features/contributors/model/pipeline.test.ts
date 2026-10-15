@@ -298,6 +298,67 @@ describe("buildContributorsModel", () => {
       ]);
     });
 
+    it("compares a partly elapsed month with the same days of the previous one", () => {
+      const day3 = new Date(2026, 9, 3, 10);
+      const at = (m: number, d: number) =>
+        new Date(2026, m, d, 12).toISOString();
+      const data = makeRaw({
+        since: new Date(2026, 8, 1).toISOString(),
+        commits: [
+          makeCommit("s1", ANA, at(8, 1), { files: [file("src/a.ts", 4)] }),
+          makeCommit("s2", ANA, at(8, 2), { files: [file("src/a.ts", 4)] }),
+          makeCommit("s3", ANA, at(8, 3), { files: [file("src/a.ts", 4)] }),
+          makeCommit("s20", ANA, at(8, 20), { files: [file("src/a.ts", 4)] }),
+          makeCommit("s21", ANA, at(8, 21), { files: [file("src/a.ts", 4)] }),
+          makeCommit("o1", ANA, at(9, 1), { files: [file("src/a.ts", 4)] }),
+          makeCommit("o2", ANA, at(9, 2), { files: [file("src/a.ts", 4)] }),
+          makeCommit("o3", ANA, at(9, 3), { files: [file("src/a.ts", 4)] }),
+        ],
+      });
+      const model = buildContributorsModel({
+        raw: data,
+        config: DEFAULT_CONFIG,
+        mailmap: [],
+        merge: true,
+        period: currentPeriod("month", day3),
+        now: day3,
+      });
+      // 3 commits so far against 3 in Sep 1-3 (not 5 in all of September).
+      expect(model.stats.kpis.commits.value).toBe(3);
+      expect(model.stats.kpis.commits.delta).toBe(0);
+      // Rank movement still scores the whole previous month.
+      expect(model.previous.period.id).toBe("2026-09");
+      expect(model.previous.people[0].activeDays).toBe(5);
+    });
+
+    it("compares a complete past quarter with the whole previous quarter", () => {
+      const at = (m: number, d: number) =>
+        new Date(2026, m, d, 12).toISOString();
+      const data = makeRaw({
+        since: new Date(2026, 0, 1).toISOString(),
+        commits: [
+          makeCommit("q1a", ANA, at(0, 5), { files: [file("src/a.ts", 4)] }),
+          makeCommit("q1b", ANA, at(2, 28), { files: [file("src/a.ts", 4)] }),
+          makeCommit("q2a", ANA, at(3, 2), { files: [file("src/a.ts", 4)] }),
+          makeCommit("q2b", ANA, at(4, 2), { files: [file("src/a.ts", 4)] }),
+          makeCommit("q2c", ANA, at(5, 28), { files: [file("src/a.ts", 4)] }),
+          makeCommit("q2d", ANA, at(5, 29), { files: [file("src/a.ts", 4)] }),
+        ],
+      });
+      const q2 = previousPeriod(previousPeriod(currentPeriod("quarter", NOW)));
+      expect(q2.id).toBe("2026-Q2");
+      const model = buildContributorsModel({
+        raw: data,
+        config: DEFAULT_CONFIG,
+        mailmap: [],
+        merge: true,
+        period: q2,
+        now: NOW,
+      });
+      expect(model.stats.kpis.commits.value).toBe(4);
+      expect(model.stats.kpis.commits.delta).toBe(1); // 4 vs the 2 of Q1
+    });
+
     it("compares the year with the year before", () => {
       const year = build(currentPeriod("year", NOW));
       expect(year.previousPeriod.id).toBe("2025");

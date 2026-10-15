@@ -2,7 +2,7 @@ import type { Resolver } from "./identity";
 import type { Leaderboard, LeaderboardRow } from "./leaderboard";
 import { SCORING, attributeCommits } from "./scoring";
 import { isInPeriod } from "./period";
-import type { Period } from "./period";
+import type { Period, PeriodKind } from "./period";
 import type { PrScore, PeriodScores } from "./scoring";
 import type { Stats } from "./stats";
 import type { ContributorsConfig, RawData } from "./types";
@@ -63,7 +63,7 @@ export type Snapshot = {
   project: string;
   branch: string;
   period: {
-    kind: string;
+    kind: PeriodKind;
     id: string;
     label: string;
     start: string;

@@ -3,7 +3,12 @@ import type { Leaderboard } from "./leaderboard";
 import { buildResolver, identityKey } from "./identity";
 import type { MailmapPerson, Resolver } from "./identity";
 import { personColorMap } from "./palette";
-import { isInPeriod, previousPeriod, syncWindow } from "./period";
+import {
+  isInPeriod,
+  previousComparableSpan,
+  previousPeriod,
+  syncWindow,
+} from "./period";
 import type { Period } from "./period";
 import { observedIdentities, scorePeriod } from "./scoring";
 import type { PeriodScores } from "./scoring";
@@ -88,7 +93,9 @@ export function buildContributorsModel(input: {
     rangeStart: period.start,
     // The current period runs to today, so the chart has no empty future buckets.
     rangeEnd: syncWindow(period, now).to,
-    previous: { start: before.start, end: before.end },
+    // Same elapsed days of the previous period, so a partly elapsed period is
+    // not compared with a whole one. Rank movement still uses the whole of it.
+    previous: previousComparableSpan(period, now),
     granularity: bucketGranularity(period),
     colors,
   });

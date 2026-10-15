@@ -172,7 +172,6 @@ function loadRaw(
   cwd: string,
   branch: string | undefined,
   since: string,
-  until: string,
   key: string,
   force: boolean,
 ): Promise<RawData> {
@@ -182,7 +181,7 @@ function loadRaw(
   const slot = force ? `${key}|force` : key;
   const seq = (requestSeq += 1);
   if (force) forcedAt.set(key, seq);
-  const request = collectRaw(cwd, { since, until, branch, force })
+  const request = collectRaw(cwd, { since, branch, force })
     .then((fresh) => {
       const previous = rawCache.get(key);
       // A forced refresh started after this answer was asked for: its data is
@@ -275,10 +274,13 @@ export function useContributors(cwd: string) {
   const branch = picked.cwd === cwd ? picked.branch : undefined;
   // A pick without an id follows the current period as the days pass.
   const period = useMemo(() => resolvePick(pick, now), [pick, now]);
-  const span = useMemo(() => syncWindow(period, now), [period, now]);
-  const since = isoSeconds(span.from);
-  const until = isoSeconds(span.to);
-  const key = `${cwd}\u0000${branch ?? ""}\u0000${since}\u0000${until}`;
+  // The end stays open: survival only samples PRs old enough relative to the
+  // end, and a PR merged after a past period still credits that period's days.
+  const since = useMemo(
+    () => isoSeconds(syncWindow(period, now).from),
+    [period, now],
+  );
+  const key = `${cwd}\u0000${branch ?? ""}\u0000${since}`;
   const metaScope = `meta\u0000${cwd}`;
 
   const running = useRef(0);
@@ -346,7 +348,7 @@ export function useContributors(cwd: string) {
           fail(metaScope, errorText(error));
         },
       );
-      const raw = loadRaw(cwd, branch, since, until, key, force).then(
+      const raw = loadRaw(cwd, branch, since, key, force).then(
         () => {
           clearFailure(key);
         },
@@ -359,7 +361,7 @@ export function useContributors(cwd: string) {
       if (running.current === 0) setRefreshing(false);
       bump();
     },
-    [cwd, branch, since, until, key, metaScope, fail, clearFailure],
+    [cwd, branch, since, key, metaScope, fail, clearFailure],
   );
 
   useEffect(() => {

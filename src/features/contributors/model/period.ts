@@ -186,6 +186,29 @@ export function syncWindow(p: Period, now: Date): { from: Date; to: Date } {
   };
 }
 
+/**
+ * The span of the previous period that matches how much of `p` has elapsed, so
+ * a partly elapsed period is compared with the same days of the one before it:
+ * the 3rd of October against Sep 1-3, not the whole of September. A complete
+ * period compares whole with whole. Built from calendar days, so a DST change
+ * does not shift the end.
+ */
+export function previousComparableSpan(
+  p: Period,
+  now: Date,
+): { start: Date; end: Date } {
+  const before = previousPeriod(p);
+  const elapsedEnd = syncWindow(p, now).to;
+  const utcDay = (d: Date) =>
+    Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+  const days = Math.round((utcDay(elapsedEnd) - utcDay(p.start)) / 86_400_000);
+  const end = addDays(before.start, days);
+  return {
+    start: before.start,
+    end: end.getTime() < before.end.getTime() ? end : before.end,
+  };
+}
+
 export function isInPeriod(p: Period, iso: string): boolean {
   const t = new Date(iso).getTime();
   if (Number.isNaN(t)) return false;
