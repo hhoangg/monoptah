@@ -34,7 +34,13 @@ import {
 } from "../../../shared/ui/icons";
 import { formatInteger } from "../../../shared/lib/numbers";
 import { minimalSetup } from "codemirror";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   MarkdownViewShell,
   useMarkdownMode,
@@ -42,10 +48,18 @@ import {
 import { useColorScheme } from "../../../shared/hooks/useColorScheme";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import { isLightScheme } from "../../settings/model/appearance";
-import { loadAutosave, loadFormatOnSave } from "../../settings/model/settings";
+import {
+  loadAutosave,
+  loadBlameColumn,
+  loadFormatOnSave,
+  loadInlineBlame,
+  subscribeBlameColumn,
+  subscribeInlineBlame,
+} from "../../settings/model/settings";
 import { formatText } from "../../../shared/lib/format";
 import {
   basename,
+  gitBlame,
   gitDiffFiles,
   gitFileDiff,
   gitStageContents,
@@ -91,6 +105,11 @@ import {
   editorGit,
   setGitOriginal,
 } from "../editor/editorGit";
+import {
+  editorBlame,
+  setBlame,
+  type EditorBlameOptions,
+} from "../editor/editorBlame";
 import { editorLint } from "../editor/editorLint";
 import { editorSearch } from "../editor/editorSearch";
 import { editorScrollbar } from "../editor/editorScrollbar";
@@ -102,17 +121,28 @@ export const FILE_EDITOR_AUTOSAVE_DELAY_MS = 1_000;
 
 const editorScheme = new Compartment();
 const editorGitConfig = new Compartment();
+const editorBlameConfig = new Compartment();
 
 type Props = {
   path: string;
   cwd: string;
+  /** Focused: takes keyboard focus. */
   active: boolean;
+  /** On screen, focused or not; blame refreshes only while this holds. */
+  shown?: boolean;
   showDiff?: boolean;
   navigation?: EditorNavigationRequest | null;
   onDirtyChange: (path: string, dirty: boolean) => void;
   onErrorCountChange?: (path: string, count: number) => void;
   onOpenFile?: (path: string) => void;
+  /** Open a blamed commit from the file's own repository. */
+  onOpenCommit?: OpenBlameCommit;
 };
+
+export type OpenBlameCommit = (
+  cwd: string,
+  commit: { sha: string; shortSha: string; subject: string },
+) => void;
 
 type LoadState =
   | { status: "loading" }
@@ -127,15 +157,21 @@ export function FileEditor({
   path,
   cwd,
   active,
+  shown = true,
   showDiff = false,
   navigation,
   onDirtyChange,
   onErrorCountChange,
   onOpenFile,
+  onOpenCommit,
 }: Props) {
   const [loadState, setLoadState] = useState<LoadState>({ status: "loading" });
   const [saveState, setSaveState] = useState<SaveState>({ status: "idle" });
   const [reloadKey, setReloadKey] = useState(0);
+  // Bumped each time a reload brings new content from disk, so blame can be
+  // refetched against the same content. A reload that finds nothing new (the
+  // watcher's first sample, a touched file) leaves it alone.
+  const [diskRevision, setDiskRevision] = useState(0);
   const [draft, setDraft] = useState("");
   const [gitBase, setGitBase] = useState<{
     path: string;
@@ -168,6 +204,7 @@ export function FileEditor({
   const dirtyRef = useRef(false);
   const pendingDiskRef = useRef(false);
   const eolRef = useRef<LineEnding>("\n");
+  const appliedContentRef = useRef<string | null>(null);
   const onDirtyChangeRef = useRef(onDirtyChange);
   onDirtyChangeRef.current = onDirtyChange;
 
@@ -177,6 +214,7 @@ export function FileEditor({
     // into the LF document doubles every line (see editorDoc.ts).
     eolRef.current = detectLineEnding(raw);
     const content = normalizeLineBreaks(raw);
+    appliedContentRef.current = content;
     setLoadState((current) => {
       if (current.status === "ready" && current.content === content) {
         return current;
@@ -201,7 +239,11 @@ export function FileEditor({
           dirtyRef.current = false;
           onDirtyChangeRef.current(path, false);
         }
+        const before = appliedContentRef.current;
         applyDiskContent(content);
+        if (appliedContentRef.current !== before) {
+          setDiskRevision((revision) => revision + 1);
+        }
       } catch (error: unknown) {
         if (generation !== loadGeneration.current) return;
         if (dirtyRef.current && !force) {
@@ -414,6 +456,13 @@ export function FileEditor({
   const relativePath = path.startsWith(`${cwd}/`)
     ? path.slice(cwd.length + 1)
     : path;
+  // Blame follows the same repository rules as the git diff, and stays off in
+  // review tabs so it does not compete with the diff gutter.
+  const gitRelative = displayPath(path, cwd);
+  const blameTarget =
+    !showDiff && cwd && cwd !== "~" && gitRelative && gitRelative !== path
+      ? { cwd, relative: gitRelative }
+      : null;
 
   if (loadState.status === "loading") {
     return (
@@ -489,6 +538,7 @@ export function FileEditor({
                 showDiff={showDiff}
                 gitOriginal={gitOriginal}
                 active={active && mode === "source"}
+                shown={shown && mode === "source"}
                 navigation={navigation}
                 onDirtyChange={dirtyChange}
                 onErrorCountChange={errorCountChange}
@@ -500,6 +550,10 @@ export function FileEditor({
                     : undefined
                 }
                 onDocChange={setDraft}
+                blameCwd={blameTarget?.cwd ?? null}
+                blameRelative={blameTarget?.relative ?? null}
+                diskRevision={diskRevision}
+                onOpenCommit={onOpenCommit}
               />
             </div>
           }
@@ -513,6 +567,7 @@ export function FileEditor({
           showDiff={showDiff}
           gitOriginal={gitOriginal}
           active={active}
+          shown={shown}
           navigation={navigation}
           onDirtyChange={dirtyChange}
           onErrorCountChange={errorCountChange}
@@ -521,6 +576,10 @@ export function FileEditor({
           onStageGit={
             showDiff && gitDiff?.kind === "unstaged" ? stageGit : undefined
           }
+          blameCwd={blameTarget?.cwd ?? null}
+          blameRelative={blameTarget?.relative ?? null}
+          diskRevision={diskRevision}
+          onOpenCommit={onOpenCommit}
         />
       )}
       <footer className="flex h-6 shrink-0 items-center border-t border-stroke px-2.5 font-mono text-[10.5px] text-content/40">
@@ -551,6 +610,7 @@ export function CodeMirrorEditor({
   showDiff,
   gitOriginal,
   active,
+  shown = true,
   navigation,
   onDirtyChange,
   onErrorCountChange,
@@ -559,6 +619,10 @@ export function CodeMirrorEditor({
   onStageGit,
   onDocChange,
   formatOnSave = true,
+  blameCwd = null,
+  blameRelative = null,
+  diskRevision = 0,
+  onOpenCommit,
 }: {
   path: string;
   commentPath: string;
@@ -566,6 +630,8 @@ export function CodeMirrorEditor({
   showDiff: boolean;
   gitOriginal: string | null;
   active: boolean;
+  /** On screen, focused or not; blame refreshes only while this holds. */
+  shown?: boolean;
   navigation?: EditorNavigationRequest | null;
   onDirtyChange: (dirty: boolean) => void;
   onErrorCountChange: (count: number) => void;
@@ -574,12 +640,19 @@ export function CodeMirrorEditor({
   onStageGit?: (contents: string) => Promise<void>;
   onDocChange?: (content: string) => void;
   formatOnSave?: boolean;
+  /** Repository and repo-relative path to blame; null turns blame off. */
+  blameCwd?: string | null;
+  blameRelative?: string | null;
+  /** Changes whenever the document was reconciled with the file on disk. */
+  diskRevision?: number;
+  onOpenCommit?: OpenBlameCommit;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const savedDocumentRef = useRef<Text | null>(null);
   const dirtyRef = useRef(false);
   const activeRef = useRef(active);
+  const shownRef = useRef(shown);
   const onDirtyChangeRef = useRef(onDirtyChange);
   const onErrorCountChangeRef = useRef(onErrorCountChange);
   const onSaveRef = useRef(onSave);
@@ -587,6 +660,9 @@ export function CodeMirrorEditor({
   const onStageGitRef = useRef(onStageGit);
   const canStage = onStageGit !== undefined;
   const onDocChangeRef = useRef(onDocChange);
+  const onOpenCommitRef = useRef(onOpenCommit);
+  const reloadBlameRef = useRef<() => void>(() => {});
+  const activateBlameRef = useRef<() => void>(() => {});
   const valueRef = useRef(value);
   const navigationTokenRef = useRef<number | undefined>(undefined);
   const pendingNavigationRef = useRef<EditorNavigationRequest | null>(null);
@@ -604,6 +680,34 @@ export function CodeMirrorEditor({
     useState<DiffCommentComposerTarget | null>(null);
   const [selectionTarget, setSelectionTarget] =
     useState<EditorSelectionTarget | null>(null);
+  const blameInline = useSyncExternalStore(
+    subscribeInlineBlame,
+    loadInlineBlame,
+    loadInlineBlame,
+  );
+  const blameColumn = useSyncExternalStore(
+    subscribeBlameColumn,
+    loadBlameColumn,
+    loadBlameColumn,
+  );
+  const blameAvailable = blameCwd !== null && blameRelative !== null;
+  const blameWanted = blameAvailable && (blameInline || blameColumn);
+  const canOpenCommit = onOpenCommit !== undefined;
+  const blameOptions: EditorBlameOptions = {
+    inline: blameAvailable && blameInline,
+    column: blameAvailable && blameColumn,
+    onOpenCommit:
+      canOpenCommit && blameCwd !== null
+        ? (hunk) =>
+            onOpenCommitRef.current?.(blameCwd, {
+              sha: hunk.sha,
+              shortSha: hunk.shortSha,
+              subject: hunk.summary,
+            })
+        : undefined,
+  };
+  const blameOptionsRef = useRef(blameOptions);
+  blameOptionsRef.current = blameOptions;
   const gitOptions = {
     onStage: canStage
       ? (contents: string) => onStageGitRef.current?.(contents)
@@ -611,12 +715,14 @@ export function CodeMirrorEditor({
     onComment: setCommentTarget,
   };
   activeRef.current = active;
+  shownRef.current = shown;
   onDirtyChangeRef.current = onDirtyChange;
   onErrorCountChangeRef.current = onErrorCountChange;
   onSaveRef.current = onSave;
   canAutosaveRef.current = canAutosave;
   onStageGitRef.current = onStageGit;
   onDocChangeRef.current = onDocChange;
+  onOpenCommitRef.current = onOpenCommit;
   valueRef.current = value;
   gitOriginalRef.current = gitOriginal;
 
@@ -752,6 +858,8 @@ export function CodeMirrorEditor({
         if (disposed || generation !== saveGeneration) return;
         savedDocumentRef.current = document;
         markDirty();
+        // The file on disk now matches the editor, so blame can be fetched.
+        reloadBlameRef.current();
       })();
       return true;
     };
@@ -777,6 +885,9 @@ export function CodeMirrorEditor({
       extensions: [
         minimalSetup,
         showDiff ? editorGitConfig.of(editorGit(gitOptions)) : [],
+        showDiff
+          ? []
+          : editorBlameConfig.of(editorBlame(blameOptionsRef.current)),
         // Diff tabs put the fold arrows first so each line number sits right
         // beside its +/- glyph.
         showDiff
@@ -908,6 +1019,23 @@ export function CodeMirrorEditor({
 
   useEffect(() => {
     const view = viewRef.current;
+    if (!view || showDiff) return;
+    view.dispatch({
+      effects: editorBlameConfig.reconfigure(
+        editorBlame(blameOptionsRef.current),
+      ),
+    });
+  }, [
+    blameAvailable,
+    blameInline,
+    blameColumn,
+    blameCwd,
+    canOpenCommit,
+    showDiff,
+  ]);
+
+  useEffect(() => {
+    const view = viewRef.current;
     if (!view || !showDiff) return;
     let changed = false;
     preserveEditorViewport(view, () => {
@@ -943,6 +1071,85 @@ export function CodeMirrorEditor({
       syncChunkNav(view);
     }
   }, [showDiff, syncChunkNav, value]);
+
+  // Blame describes the file as saved, so it is requested only for a clean
+  // editor and applied only while the document is still the one it was
+  // requested for. Hidden tabs stay mounted, so only an editor that is on
+  // screen fetches (focus does not matter: an agent can commit while the user
+  // is in the next pane); a hidden one just notes that its blame is stale and
+  // fetches once when it is shown.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || showDiff) return;
+    if (!blameWanted) {
+      reloadBlameRef.current = () => {};
+      activateBlameRef.current = () => {};
+      setBlame(view, null);
+      return;
+    }
+    const cwd = blameCwd;
+    const relative = blameRelative;
+    if (cwd === null || relative === null) return;
+    let cancelled = false;
+    let generation = 0;
+    let stale = true;
+
+    const request = () => {
+      if (cancelled) return;
+      if (!shownRef.current) {
+        stale = true;
+        return;
+      }
+      stale = false;
+      load();
+    };
+
+    const load = () => {
+      if (cancelled || dirtyRef.current) return;
+      const id = ++generation;
+      const requested = view.state.doc;
+      void gitBlame(cwd, relative)
+        .then((blame) => {
+          if (cancelled || id !== generation) return;
+          if (viewRef.current !== view) return;
+          if (view.state.doc !== requested || dirtyRef.current) {
+            // The document moved on; fetch again once it is clean.
+            if (!dirtyRef.current) request();
+            return;
+          }
+          // Untracked, binary and oversized files come back empty.
+          setBlame(view, blame.hunks.length > 0 ? blame : null);
+        })
+        .catch(() => {
+          if (cancelled || id !== generation) return;
+          if (viewRef.current === view) setBlame(view, null);
+        });
+    };
+    reloadBlameRef.current = request;
+    activateBlameRef.current = () => {
+      if (stale) request();
+    };
+
+    request();
+    const onVisible = () => {
+      if (!document.hidden) request();
+    };
+    window.addEventListener("focus", onVisible);
+    document.addEventListener("visibilitychange", onVisible);
+    const unsubGit = subscribeGitChanged(onVisible);
+    return () => {
+      cancelled = true;
+      reloadBlameRef.current = () => {};
+      activateBlameRef.current = () => {};
+      window.removeEventListener("focus", onVisible);
+      document.removeEventListener("visibilitychange", onVisible);
+      unsubGit();
+    };
+  }, [blameCwd, blameRelative, blameWanted, diskRevision, path, showDiff]);
+
+  useEffect(() => {
+    if (shown) activateBlameRef.current();
+  }, [shown]);
 
   useEffect(() => {
     if (!navigation) {

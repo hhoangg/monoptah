@@ -75,6 +75,11 @@ type Props = {
   onErrorCountChange: (fileId: string, count: number) => void;
   onReorderFiles: (paneId: string, ids: string[]) => void;
   onOpenFile: (path: string) => void;
+  /** Open a commit picked from blame, in the repository of its file. */
+  onOpenBlameCommit?: (
+    cwd: string,
+    commit: { sha: string; shortSha: string; subject: string },
+  ) => void;
   onUpdatePlan: (sessionId: string, blockId: string, text: string) => void;
   onBuildPlan: (
     sessionId: string,
@@ -103,6 +108,7 @@ function FilePaneComponent({
   onErrorCountChange,
   onReorderFiles,
   onOpenFile,
+  onOpenBlameCommit,
   onUpdatePlan,
   onBuildPlan,
   editorNavigation,
@@ -232,6 +238,7 @@ function FilePaneComponent({
                   cwd={file.cwd}
                   showDiff={!!file.review}
                   active={focused && file.id === pane.activeFileId}
+                  shown={visible && file.id === pane.activeFileId}
                   navigation={
                     editorNavigation &&
                     editorPathsEqual(file.path, editorNavigation.path)
@@ -245,6 +252,7 @@ function FilePaneComponent({
                     onErrorCountChange(file.id, count)
                   }
                   onOpenFile={onOpenFile}
+                  onOpenCommit={onOpenBlameCommit}
                 />
               )}
             </div>
@@ -272,6 +280,7 @@ export const FilePane = memo(FilePaneComponent, (previous, next) => {
     previous.onErrorCountChange !== next.onErrorCountChange ||
     previous.onReorderFiles !== next.onReorderFiles ||
     previous.onOpenFile !== next.onOpenFile ||
+    previous.onOpenBlameCommit !== next.onOpenBlameCommit ||
     previous.onUpdatePlan !== next.onUpdatePlan ||
     previous.onBuildPlan !== next.onBuildPlan ||
     previous.editorNavigation !== next.editorNavigation ||

@@ -405,6 +405,12 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     keywords: "prettier quotes editor save format",
   },
   {
+    id: "inline-blame",
+    section: "chat",
+    label: "Inline blame",
+    keywords: "git blame author line editor annotation history",
+  },
+  {
     id: "diff-view",
     section: "chat",
     label: "Diff view",
@@ -1138,6 +1144,73 @@ export function subscribeAutosave(onStoreChange: () => void) {
   };
 }
 
+const INLINE_BLAME_KEY = "monocode.editorInlineBlame";
+const INLINE_BLAME_CHANGE_EVENT = "monocode:editor-inline-blame-change";
+
+export const INLINE_BLAME_DEFAULT = true;
+
+export function loadInlineBlame(): boolean {
+  return readFlag(INLINE_BLAME_KEY) ?? INLINE_BLAME_DEFAULT;
+}
+
+export function saveInlineBlame(value: boolean): boolean {
+  writeFlag(INLINE_BLAME_KEY, value);
+  const saved = loadInlineBlame();
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(INLINE_BLAME_CHANGE_EVENT));
+  }
+  return saved;
+}
+
+export function subscribeInlineBlame(onStoreChange: () => void) {
+  if (typeof window === "undefined") return () => {};
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === INLINE_BLAME_KEY) onStoreChange();
+  };
+  window.addEventListener(INLINE_BLAME_CHANGE_EVENT, onStoreChange);
+  window.addEventListener("storage", onStorage);
+  return () => {
+    window.removeEventListener(INLINE_BLAME_CHANGE_EVENT, onStoreChange);
+    window.removeEventListener("storage", onStorage);
+  };
+}
+
+const BLAME_COLUMN_KEY = "monocode.editorBlameColumn";
+const BLAME_COLUMN_CHANGE_EVENT = "monocode:editor-blame-column-change";
+
+export const BLAME_COLUMN_DEFAULT = false;
+
+export function loadBlameColumn(): boolean {
+  return readFlag(BLAME_COLUMN_KEY) ?? BLAME_COLUMN_DEFAULT;
+}
+
+export function saveBlameColumn(value: boolean): boolean {
+  writeFlag(BLAME_COLUMN_KEY, value);
+  const saved = loadBlameColumn();
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(BLAME_COLUMN_CHANGE_EVENT));
+  }
+  return saved;
+}
+
+/** Flip the blame column and return the new value. */
+export function toggleBlameColumn(): boolean {
+  return saveBlameColumn(!loadBlameColumn());
+}
+
+export function subscribeBlameColumn(onStoreChange: () => void) {
+  if (typeof window === "undefined") return () => {};
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === BLAME_COLUMN_KEY) onStoreChange();
+  };
+  window.addEventListener(BLAME_COLUMN_CHANGE_EVENT, onStoreChange);
+  window.addEventListener("storage", onStorage);
+  return () => {
+    window.removeEventListener(BLAME_COLUMN_CHANGE_EVENT, onStoreChange);
+    window.removeEventListener("storage", onStorage);
+  };
+}
+
 const CLAUDE_HOOKS_KEY = "monocode.claudeHooks";
 
 export const CLAUDE_HOOKS_DEFAULT = true;
@@ -1288,6 +1361,11 @@ export const KEYBINDINGS: KeybindingRow[] = [
   { command: "Terminal: New", keys: `${MOD}\``, when: "Always" },
   { command: "Terminal: New Tab", keys: `${MOD}${SHIFT}\``, when: "Always" },
   { command: "Terminal: Toggle Dock", keys: `${MOD}J`, when: "Always" },
+  {
+    command: "Editor: Toggle Git Blame",
+    keys: `${MOD}${ALT}B`,
+    when: "Always",
+  },
   { command: "Editor: Find", keys: `${MOD}F`, when: "editorFocus" },
   { command: "Editor: Replace", keys: `${MOD}${ALT}F`, when: "editorFocus" },
 ];

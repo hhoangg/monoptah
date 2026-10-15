@@ -2,7 +2,9 @@
 import { act, createElement, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { FilePaneTab } from "../model/layout";
+import { Storage } from "happy-dom";
+import { loadBlameColumn } from "../../settings/model/settings";
+import { newTerminalFile, type FilePaneTab } from "../model/layout";
 import { SurfaceTabs } from "./SurfaceTabs";
 
 const actions = vi.hoisted(() => ({
@@ -68,6 +70,7 @@ async function pick(label: string) {
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("localStorage", new Storage());
   vi.spyOn(HTMLElement.prototype, "scrollIntoView").mockImplementation(
     () => {},
   );
@@ -142,6 +145,38 @@ describe("file tab context menu", () => {
 
     await pick("Close Others");
     expect(props.onCloseOtherFiles).toHaveBeenCalledWith("second");
+  });
+
+  it("toggles the blame column from a file tab and relabels the item", async () => {
+    const menu = openSecondMenu();
+    expect(menu.textContent).toContain("Show Git Blame");
+    expect(loadBlameColumn()).toBe(false);
+
+    await pick("Show Git Blame");
+    expect(loadBlameColumn()).toBe(true);
+
+    expect(openSecondMenu().textContent).toContain("Hide Git Blame");
+    await pick("Hide Git Blame");
+    expect(loadBlameColumn()).toBe(false);
+  });
+
+  it("offers no blame item on a terminal tab", () => {
+    const terminal = newTerminalFile("/repo");
+    props = { ...props, files: [...files, terminal], activeFileId: "first" };
+    render();
+    const tab = container.querySelector<HTMLElement>(
+      `[data-tab-slot-id="${terminal.id}"] [role="tab"]`,
+    )!;
+    act(() => {
+      tab.parentElement!.dispatchEvent(
+        new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+      );
+    });
+    const menu = document.querySelector<HTMLElement>(
+      '[role="menu"][aria-label="File tab actions"]',
+    )!;
+    expect(menu.textContent).toContain("Close Others");
+    expect(menu.textContent).not.toContain("Git Blame");
   });
 
   it("shows a file opening error instead of failing silently", async () => {

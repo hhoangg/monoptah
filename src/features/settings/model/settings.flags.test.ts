@@ -202,3 +202,59 @@ it("disables close-to-tray outside Windows without consulting storage", () => {
   expect(settings.loadCloseToTray()).toBe(false);
   expect(read).not.toHaveBeenCalled();
 });
+
+describe("editor blame settings", () => {
+  it("defaults to inline on and the column off", () => {
+    expect(settings.loadInlineBlame()).toBe(true);
+    expect(settings.loadBlameColumn()).toBe(false);
+  });
+
+  it("persists under the monocode prefix", () => {
+    settings.saveInlineBlame(false);
+    settings.saveBlameColumn(true);
+    expect(localStorage.getItem("monocode.editorInlineBlame")).toBe("0");
+    expect(localStorage.getItem("monocode.editorBlameColumn")).toBe("1");
+    expect(settings.loadInlineBlame()).toBe(false);
+    expect(settings.loadBlameColumn()).toBe(true);
+  });
+
+  it("notifies subscribers after saving, until they unsubscribe", () => {
+    const inline = vi.fn();
+    const column = vi.fn();
+    const offInline = settings.subscribeInlineBlame(inline);
+    const offColumn = settings.subscribeBlameColumn(column);
+
+    settings.saveInlineBlame(false);
+    expect(inline).toHaveBeenCalledTimes(1);
+    expect(column).not.toHaveBeenCalled();
+    settings.saveBlameColumn(true);
+    expect(column).toHaveBeenCalledTimes(1);
+    expect(inline).toHaveBeenCalledTimes(1);
+
+    window.dispatchEvent(
+      new StorageEvent("storage", { key: "monocode.editorInlineBlame" }),
+    );
+    window.dispatchEvent(new StorageEvent("storage", { key: "other" }));
+    expect(inline).toHaveBeenCalledTimes(2);
+
+    offInline();
+    offColumn();
+    settings.saveInlineBlame(true);
+    settings.saveBlameColumn(false);
+    expect(inline).toHaveBeenCalledTimes(2);
+    expect(column).toHaveBeenCalledTimes(1);
+  });
+
+  it("flips the blame column and returns the new value", () => {
+    expect(settings.toggleBlameColumn()).toBe(true);
+    expect(settings.loadBlameColumn()).toBe(true);
+    expect(settings.toggleBlameColumn()).toBe(false);
+    expect(settings.loadBlameColumn()).toBe(false);
+  });
+
+  it("is findable in settings search", () => {
+    expect(settings.searchSettings("inline blame").map((r) => r.settingId)).toContain(
+      "inline-blame",
+    );
+  });
+});

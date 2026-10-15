@@ -39,6 +39,7 @@ const HOST_COMMANDS = new Set([
   "git_history",
   "git_commit_files",
   "git_commit_file_diff",
+  "git_blame",
   "git_staged_context",
   "git_range_context",
   "git_branches",

@@ -155,7 +155,9 @@ pub fn dispatch(app: &AppHandle, id: &str) {
         }
         // New Tab, Close Tab, Sidebar, Zoom, Reload, Command Palette, and Close All Tabs target
         // one window: a broadcast would make every window act on a single menu click. New Tab and
-        // Close Tab also open or close a dock terminal when that window's dock has focus.
+        // Close Tab also open or close a dock terminal when that window's dock has focus. Toggle
+        // Git Blame flips a shared setting, so a broadcast would flip it once per window; other
+        // windows follow through the storage event.
         "new_tab"
         | "close_tab"
         | "toggle_sidebar"
@@ -165,6 +167,7 @@ pub fn dispatch(app: &AppHandle, id: &str) {
         | "zoom_reset"
         | "reload"
         | "open_command_palette"
+        | "toggle_blame"
         | "close_all_tabs" => emit_to_focused(app, id),
         _ => {}
     }
@@ -279,6 +282,14 @@ fn build(
         "Toggle Terminal",
         "CmdOrCtrl+J",
         "Terminal: Toggle Dock",
+        overrides,
+    )?;
+    let toggle_blame = menu_item(
+        app,
+        "toggle_blame",
+        "Toggle Git Blame",
+        "CmdOrCtrl+Alt+B",
+        "Editor: Toggle Git Blame",
         overrides,
     )?;
     let split_right = menu_item(
@@ -484,6 +495,7 @@ fn build(
         .item(&open_inbox)
         .item(&open_notes)
         .item(&toggle_terminal)
+        .item(&toggle_blame)
         .item(&open_model_picker)
         .separator()
         .item(&focus_left)

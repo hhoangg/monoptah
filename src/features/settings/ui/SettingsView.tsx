@@ -344,6 +344,7 @@ import {
   loadFileTabMode,
   loadFollowUpBehavior,
   loadFormatOnSave,
+  loadInlineBlame,
   loadGridArcadeEnabled,
   loadLiveAgentsEnabled,
   loadModelControls,
@@ -367,6 +368,7 @@ import {
   saveFileTabMode,
   saveFollowUpBehavior,
   saveFormatOnSave,
+  saveInlineBlame,
   saveGridArcadeEnabled,
   saveLiveAgentsEnabled,
   saveModelControls,
@@ -996,6 +998,7 @@ function ChatPage() {
     useState<ModelControls>(loadModelControls);
   const [diffViewer, setDiffViewer] = useState<DiffViewer>(loadDiffViewer);
   const [formatOnSave, setFormatOnSave] = useState(loadFormatOnSave);
+  const [inlineBlame, setInlineBlame] = useState(loadInlineBlame);
   const [composerRunner, setComposerRunner] = useState(loadComposerRunner);
   const composerAutocorrect = useComposerAutocorrect();
   const [gridArcadeEnabled, setGridArcadeEnabled] = useState(
@@ -1040,6 +1043,11 @@ function ChatPage() {
   const onFormatOnSave = (next: boolean) => {
     saveFormatOnSave(next);
     setFormatOnSave(next);
+  };
+
+  const onInlineBlame = (next: boolean) => {
+    saveInlineBlame(next);
+    setInlineBlame(next);
   };
 
   const onComposerRunner = (next: boolean) => {
@@ -1135,7 +1143,7 @@ function ChatPage() {
 
       <Group
         title="Editor"
-        description="What happens when you save a file in the workspace editor."
+        description="How the workspace editor saves files and annotates lines."
       >
         <Row
           id="format-on-save"
@@ -1146,6 +1154,17 @@ function ChatPage() {
             label="Format on save"
             on={formatOnSave}
             onChange={onFormatOnSave}
+          />
+        </Row>
+        <Row
+          id="inline-blame"
+          label="Inline blame"
+          description="Show who last changed the line under the cursor, and when, at the end of that line."
+        >
+          <Toggle
+            label="Inline blame"
+            on={inlineBlame}
+            onChange={onInlineBlame}
           />
         </Row>
       </Group>

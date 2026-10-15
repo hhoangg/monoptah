@@ -107,6 +107,21 @@ describe("tabCommand", () => {
     );
   });
 
+  it("toggles git blame with mod-alt-b", () => {
+    expect(tabCommand(key({ key: "b", metaKey: true, altKey: true }))).toBe(
+      "toggle-blame",
+    );
+    expect(tabCommand(key({ key: "B", ctrlKey: true, altKey: true }))).toBe(
+      "toggle-blame",
+    );
+    // Plain mod-b and mod-shift-b stay with the sidebar shortcuts.
+    expect(tabCommand(key({ key: "b", metaKey: true }))).toBeNull();
+    expect(tabCommandKeybinding("toggle-blame")).toBe("Editor: Toggle Git Blame");
+    expect(
+      tabCommandForKeybinding("Editor: Toggle Git Blame", key({ key: "b" })),
+    ).toBe("toggle-blame");
+  });
+
   it("walks tab visit history with cmd-brackets", () => {
     expect(
       tabCommand(key({ key: "[", code: "BracketLeft", metaKey: true })),

@@ -405,6 +405,7 @@ pub fn run() {
             fs::git_history,
             fs::git_commit_files,
             fs::git_commit_file_diff,
+            fs::git_blame,
             fs::git_stage_file,
             fs::git_stage_contents,
             fs::git_unstage_file,

@@ -130,6 +130,22 @@ it("generates context for selected added and deleted files without reading exclu
   expect(git("show", ":other.txt")).toBe("EXCLUDED_SECRET");
 });
 
+it("blames a project file and rejects paths outside the checkout", async () => {
+  const { commands, home, repo } = fixture();
+  const { cwd, write } = repo();
+  write("chosen.txt", "old\nedited\n");
+  const blame = (await commands.run("git_blame", { cwd, relative: "chosen.txt" })) as {
+    hunks: Array<{ summary: string; uncommitted: boolean; startLine: number; lineCount: number }>;
+  };
+  expect(blame.hunks).toMatchObject([
+    { summary: "Initial", uncommitted: false, startLine: 1, lineCount: 1 },
+    { uncommitted: true, startLine: 2, lineCount: 1 },
+  ]);
+  writeFileSync(join(home, "secret.txt"), "secret\n");
+  for (const relative of ["../secret.txt", join(home, "secret.txt"), ".git/config"])
+    await expect(commands.run("git_blame", { cwd, relative })).rejects.toThrow();
+});
+
 it("supports the first commit while leaving other staged new files out", async () => {
   const { commands, repo } = fixture();
   const { cwd, git, write } = repo("new", false);
