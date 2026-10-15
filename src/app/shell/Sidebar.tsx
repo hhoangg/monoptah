@@ -345,6 +345,7 @@ type Props = {
   settingsSection?: SettingsSectionId;
   onOpenSettings?: () => void;
   onOpenNotificationSettings?: (projectPath?: string) => void;
+  onOpenContributors?: (projectPath: string) => void;
   onSelectSettingsSection?: (section: SettingsSectionId) => void;
   onCloseSettings?: () => void;
   updateNotice?: InstalledUpdate | null;
@@ -443,6 +444,7 @@ function SidebarComponent({
   settingsSection = "general",
   onOpenSettings,
   onOpenNotificationSettings,
+  onOpenContributors,
   onSelectSettingsSection,
   onCloseSettings,
   updateNotice = null,
@@ -1752,6 +1754,7 @@ function SidebarComponent({
               onSearch={onSearch}
               onOpenInbox={onOpenInbox}
               onOpenNotificationSettings={onOpenNotificationSettings}
+              onOpenContributors={onOpenContributors}
               onOpenNotes={notesEnabled ? onOpenNotes : undefined}
               onOpenAutomations={onOpenAutomations}
               onOpenMail={onOpenMail}
@@ -2276,6 +2279,7 @@ function SidebarComponent({
           onOpenInbox={onOpenInbox}
           inboxActive={inboxActive}
           onOpenNotificationSettings={onOpenNotificationSettings}
+          onOpenContributors={onOpenContributors}
           onOpenNotes={notesEnabled ? onOpenNotes : undefined}
           notesActive={notesActive}
           onOpenAutomations={onOpenAutomations}
@@ -2325,6 +2329,7 @@ function SidebarComponent({
           settingsSection={settingsSection}
           onOpenSettings={onOpenSettings}
           onOpenNotificationSettings={onOpenNotificationSettings}
+          onOpenContributors={onOpenContributors}
           onSelectSettingsSection={onSelectSettingsSection}
           onCloseSettings={onCloseSettings}
           updateNotice={updateNotice}
@@ -2357,6 +2362,7 @@ export const Sidebar = memo(SidebarComponent);
 function SearchableProjectPickerWithMenu({
   onRemoveProject,
   onOpenNotificationSettings,
+  onOpenContributors,
   ...pickerProps
 }: Omit<
   ComponentProps<typeof SearchableProjectPicker>,
@@ -2364,10 +2370,12 @@ function SearchableProjectPickerWithMenu({
 > & {
   onRemoveProject?: Props["onRemoveProject"];
   onOpenNotificationSettings?: (projectPath?: string) => void;
+  onOpenContributors?: (projectPath: string) => void;
 }) {
   const projectMenu = useProjectMenu({
     onRemoveProject,
     onOpenNotificationSettings,
+    onOpenContributors,
   });
   return (
     <>
@@ -2392,6 +2400,7 @@ function SidebarProjectPicker({
   onSearch,
   onOpenInbox,
   onOpenNotificationSettings,
+  onOpenContributors,
   onOpenNotes,
   onOpenAutomations,
   onOpenMail,
@@ -2413,6 +2422,7 @@ function SidebarProjectPicker({
   onSearch?: () => void;
   onOpenInbox?: () => void;
   onOpenNotificationSettings?: (projectPath?: string) => void;
+  onOpenContributors?: (projectPath: string) => void;
   onOpenNotes?: () => void;
   onOpenAutomations?: () => void;
   onOpenMail?: () => void;
@@ -2442,6 +2452,7 @@ function SidebarProjectPicker({
         onOpenProject={onOpenProject}
         onRemoveProject={onRemoveProject}
         onOpenNotificationSettings={onOpenNotificationSettings}
+        onOpenContributors={onOpenContributors}
       />
       <div className="ml-auto flex items-center">
         {onNew ? (
@@ -2550,6 +2561,7 @@ function CompactProjectRail({
   onOpenInbox,
   inboxActive,
   onOpenNotificationSettings,
+  onOpenContributors,
   onOpenNotes,
   notesActive,
   onOpenAutomations,
@@ -2582,6 +2594,7 @@ function CompactProjectRail({
   onOpenInbox?: () => void;
   inboxActive: boolean;
   onOpenNotificationSettings?: (projectPath?: string) => void;
+  onOpenContributors?: (projectPath: string) => void;
   onOpenNotes?: () => void;
   notesActive: boolean;
   onOpenAutomations?: () => void;
@@ -2708,6 +2721,7 @@ function CompactProjectRail({
             onOpenProject={onOpenProject}
             onRemoveProject={onRemoveProject}
             onOpenNotificationSettings={onOpenNotificationSettings}
+            onOpenContributors={onOpenContributors}
             monos={pickerMonos}
           />
         ) : null}

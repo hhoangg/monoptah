@@ -1,0 +1,294 @@
+import { identityKey, isHuman } from "./identity";
+import type { Resolver } from "./identity";
+import { colorFromMap } from "./palette";
+import { attributeCommits, attributePrs } from "./scoring";
+import type { AttributedCommit } from "./scoring";
+import { localDayKey } from "./season";
+import type { ContributorsConfig, RawData } from "./types";
+
+export type StatsRow = {
+  personId: string;
+  name: string;
+  commits: number;
+  added: number;
+  deleted: number;
+  files: number;
+  aiAssistedPct: number;
+  sharePct: number;
+  lastActive: string | null;
+  identities: string[];
+  color: string;
+};
+
+export type BucketGranularity = "week" | "month";
+
+export type Bucket = {
+  /** Local day key of the first day of the week (Monday) or month. */
+  start: string;
+  /** Tooltip text: "Week of Oct 5, 2026" or "Oct 2026". */
+  label: string;
+  /** Axis text: "Oct 5" or "Oct 2026". */
+  short: string;
+  byPerson: Record<string, number>;
+};
+
+export type Stats = {
+  kpis: {
+    commits: { value: number; delta: number | null };
+    contributors: { value: number; identities: number; newcomers: number };
+    /** `delta` is the fraction change in lines changed (added + deleted). */
+    lines: { added: number; deleted: number; delta: number | null };
+    prsMerged: { value: number; delta: number | null };
+  };
+  granularity: BucketGranularity;
+  buckets: Bucket[];
+  rows: StatsRow[];
+  legend: { personId: string; name: string; color: string }[];
+};
+
+type Range = { start: Date; end: Date };
+
+const inRange = (range: Range, iso: string | undefined) => {
+  if (!iso) return false;
+  const t = Date.parse(iso);
+  return t >= range.start.getTime() && t < range.end.getTime();
+};
+
+function mondayOf(date: Date): Date {
+  const back = (date.getDay() + 6) % 7;
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() - back);
+}
+
+const dayKeyOf = (date: Date) => localDayKey(date.toISOString());
+
+function fraction(current: number, previous: number): number | null {
+  return previous === 0 ? null : (current - previous) / previous;
+}
+
+type Period = { commits: number; added: number; deleted: number; prs: number };
+
+export function buildStats(input: {
+  raw: RawData;
+  config: ContributorsConfig;
+  resolver: Resolver;
+  rangeStart: Date;
+  rangeEnd: Date;
+  /** Defaults to the period of equal length right before `rangeStart`. */
+  previous?: Range;
+  /** Chart buckets: calendar weeks (default) or calendar months for long ranges. */
+  granularity?: BucketGranularity;
+  /** Shared person colors; an id missing from it gets its hashed color. */
+  colors?: Record<string, string>;
+}): Stats {
+  const { raw, config, resolver } = input;
+  const granularity = input.granularity ?? "week";
+  const range: Range = { start: input.rangeStart, end: input.rangeEnd };
+  const length = range.end.getTime() - range.start.getTime();
+  const previous: Range = input.previous ?? {
+    start: new Date(range.start.getTime() - length),
+    end: range.start,
+  };
+  // Rule: every commit count here is of commits credited to a person, so the
+  // KPI total equals the sum of the contributors table. Commits nobody can be
+  // credited for (agent work with no human) are left out everywhere.
+  const commits = attributeCommits({ raw, config, resolver }).filter(
+    (c) => c.personId !== null,
+  );
+  const prs = attributePrs({ raw, config, resolver });
+
+  const periodOf = (r: Range): Period => {
+    const period: Period = { commits: 0, added: 0, deleted: 0, prs: 0 };
+    for (const c of commits) {
+      if (!inRange(r, c.commit.committedAt)) continue;
+      period.commits += 1;
+      for (const f of c.files) {
+        period.added += f.added;
+        period.deleted += f.deleted;
+      }
+    }
+    period.prs = prs.filter(
+      ({ pr }) => pr.state === "merged" && inRange(r, pr.mergedAt),
+    ).length;
+    return period;
+  };
+
+  const now = periodOf(range);
+  const earlier = periodOf(previous);
+  const previousCovered = Date.parse(raw.since) <= previous.start.getTime();
+
+  const inside = commits.filter((c) => inRange(range, c.commit.committedAt));
+  const byPerson = new Map<string, AttributedCommit[]>();
+  for (const c of inside) {
+    if (!c.personId) continue;
+    const list = byPerson.get(c.personId);
+    if (list) list.push(c);
+    else byPerson.set(c.personId, [c]);
+  }
+
+  const rows = buildRows(byPerson, resolver, config, input.colors ?? {});
+  const total = rows.reduce((sum, r) => sum + r.commits, 0);
+  for (const row of rows) row.sharePct = (row.commits / total) * 100;
+
+  const firstCommit = new Map<string, number>();
+  for (const c of commits) {
+    if (!c.personId) continue;
+    const t = Date.parse(c.commit.committedAt);
+    const cur = firstCommit.get(c.personId);
+    if (cur === undefined || t < cur) firstCommit.set(c.personId, t);
+  }
+  // Same rule as the leaderboard: the first activity in the data is inside
+  // the range and the data reaches back to the start of the previous period.
+  const newcomers = previousCovered
+    ? rows.filter(
+        (r) => (firstCommit.get(r.personId) ?? 0) >= range.start.getTime(),
+      ).length
+    : 0;
+
+  return {
+    kpis: {
+      commits: {
+        value: now.commits,
+        delta: previousCovered ? fraction(now.commits, earlier.commits) : null,
+      },
+      contributors: {
+        value: rows.length,
+        identities: new Set(rows.flatMap((r) => r.identities)).size,
+        newcomers,
+      },
+      lines: {
+        added: now.added,
+        deleted: now.deleted,
+        delta: previousCovered
+          ? fraction(now.added + now.deleted, earlier.added + earlier.deleted)
+          : null,
+      },
+      prsMerged: {
+        value: now.prs,
+        delta: previousCovered ? now.prs - earlier.prs : null,
+      },
+    },
+    granularity,
+    buckets: buildBuckets(inside, range, granularity),
+    rows,
+    legend: rows.map((r) => ({
+      personId: r.personId,
+      name: r.name,
+      color: r.color,
+    })),
+  };
+}
+
+function buildRows(
+  byPerson: Map<string, AttributedCommit[]>,
+  resolver: Resolver,
+  config: ContributorsConfig,
+  colors: Record<string, string>,
+): StatsRow[] {
+  const rows = Array.from(byPerson, ([personId, list]): StatsRow => {
+    let added = 0;
+    let deleted = 0;
+    let ai = 0;
+    let last = 0;
+    const paths = new Set<string>();
+    const identities = new Set<string>();
+    for (const c of list) {
+      added += c.files.reduce((s, f) => s + f.added, 0);
+      deleted += c.files.reduce((s, f) => s + f.deleted, 0);
+      for (const f of c.files) paths.add(f.path);
+      if (c.aiAssisted) ai += 1;
+      last = Math.max(last, Date.parse(c.commit.committedAt));
+      if (isHuman(config, c.commit.author)) {
+        identities.add(identityKey(c.commit.author));
+      }
+    }
+    return {
+      personId,
+      name: resolver.nameOf(personId),
+      commits: list.length,
+      added,
+      deleted,
+      files: paths.size,
+      aiAssistedPct: Math.round((ai / list.length) * 100),
+      sharePct: 0,
+      lastActive: last > 0 ? new Date(last).toISOString() : null,
+      identities: Array.from(identities).sort(),
+      color: "",
+    };
+  });
+  rows.sort(
+    (a, b) =>
+      b.commits - a.commits ||
+      a.name.localeCompare(b.name) ||
+      a.personId.localeCompare(b.personId),
+  );
+  for (const row of rows) row.color = colorFromMap(colors, row.personId);
+  return rows;
+}
+
+const MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
+function bucketAt(start: Date, granularity: BucketGranularity): Bucket {
+  const month = MONTHS[start.getMonth()];
+  const year = start.getFullYear();
+  if (granularity === "month") {
+    return {
+      start: dayKeyOf(start),
+      label: `${month} ${year}`,
+      short: `${month} ${year}`,
+      byPerson: {},
+    };
+  }
+  const day = start.getDate();
+  return {
+    start: dayKeyOf(start),
+    label: `Week of ${month} ${day}, ${year}`,
+    short: `${month} ${day}`,
+    byPerson: {},
+  };
+}
+
+function buildBuckets(
+  inside: AttributedCommit[],
+  range: Range,
+  granularity: BucketGranularity,
+): Bucket[] {
+  const startOf = (date: Date) =>
+    granularity === "month"
+      ? new Date(date.getFullYear(), date.getMonth(), 1)
+      : mondayOf(date);
+  const next = (date: Date) =>
+    granularity === "month"
+      ? new Date(date.getFullYear(), date.getMonth() + 1, 1)
+      : new Date(date.getFullYear(), date.getMonth(), date.getDate() + 7);
+  const buckets = new Map<string, Bucket>();
+  for (
+    let b = startOf(range.start);
+    b.getTime() < range.end.getTime();
+    b = next(b)
+  ) {
+    buckets.set(dayKeyOf(b), bucketAt(b, granularity));
+  }
+  for (const c of inside) {
+    if (!c.personId) continue;
+    const bucket = buckets.get(
+      dayKeyOf(startOf(new Date(c.commit.committedAt))),
+    );
+    if (bucket) {
+      bucket.byPerson[c.personId] = (bucket.byPerson[c.personId] ?? 0) + 1;
+    }
+  }
+  return Array.from(buckets.values());
+}

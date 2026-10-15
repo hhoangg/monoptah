@@ -11,6 +11,7 @@ mod chat_background;
 mod checkpoint;
 mod clickup;
 mod codex_mono_store;
+mod contributors;
 mod control;
 pub mod control_cli;
 mod cursor_store;
@@ -489,6 +490,12 @@ pub fn run() {
             worktrees::git_worktree_remove,
             worktrees::git_orchestration_worktree_remove,
             worktrees::git_orchestration_branch_remove,
+            contributors::contributors_read_config,
+            contributors::contributors_read_mailmap,
+            contributors::contributors_write_config,
+            contributors::contributors_branches,
+            contributors::contributors_collect,
+            contributors::contributors_git_user,
             fs::create_path,
             fs::rename_path,
             fs::delete_path,

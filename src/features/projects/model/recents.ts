@@ -310,6 +310,16 @@ export function knownProjectPaths(): string[] {
   return out;
 }
 
+/** True while the project is in the rail: remembered, pinned, or current. */
+export function isKnownProject(path: string, currentCwd: string): boolean {
+  if (!path) return false;
+  if (currentCwd && sameProjectPath(path, currentCwd)) return true;
+  return (
+    loadRecents().some((item) => sameProjectPath(item.path, path)) ||
+    loadPinnedProjects().some((entry) => sameProjectPath(entry, path))
+  );
+}
+
 /** All projects for the rail, keyed by normalized path. */
 export function collectRailProjects(
   recents: RecentProject[],
