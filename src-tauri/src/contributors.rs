@@ -648,6 +648,23 @@ impl Window {
         Ok(window)
     }
 
+    /// A window of exact instants, both edges inclusive: what one chunk of a
+    /// sync works on. Git reads `@<epoch>` the same in every time zone.
+    fn from_epochs(since: i64, until: i64) -> Self {
+        let (since_echo, until_echo) = (epoch_to_iso(since), epoch_to_iso(until));
+        Self {
+            since_arg: format!("@{since}"),
+            until_arg: format!("@{until}"),
+            since_epoch: since,
+            until_epoch: until,
+            until_key: until_echo.clone(),
+            since_echo,
+            until_echo,
+            since_local: false,
+            until_local: false,
+        }
+    }
+
     fn log_args(&self) -> [String; 2] {
         [
             format!("--since={}", self.since_arg),
@@ -1149,7 +1166,12 @@ fn is_pr_merge(subject: &str) -> bool {
 /// `numbered` is false for PRs that reached the branch through a sync merge:
 /// their `#N` belongs to another repository (an upstream), so they are keyed by
 /// hash and carry no number.
-fn single_parent_pr(landing: &ParsedCommit, used: &mut HashSet<String>, numbered: bool) -> PrDraft {
+fn single_parent_pr(
+    landing: &ParsedCommit,
+    files: &[RawFile],
+    used: &mut HashSet<String>,
+    numbered: bool,
+) -> PrDraft {
     let parsed = pr_number_from_subject(&landing.subject);
     let squash = parsed.is_some();
     let candidate = parsed.filter(|_| numbered);
@@ -1176,7 +1198,7 @@ fn single_parent_pr(landing: &ParsedCommit, used: &mut HashSet<String>, numbered
         },
         branch_commits: Vec::new(),
         landing_co_authors: landing.co_authors.clone(),
-        files: landing.files.clone(),
+        files: files.to_vec(),
         closes_bug: false,
     };
     PrDraft {
@@ -1185,11 +1207,20 @@ fn single_parent_pr(landing: &ParsedCommit, used: &mut HashSet<String>, numbered
     }
 }
 
+/// What the walk needs of a non-merge commit of the window: the walk reads
+/// everything else about it from its own `git log`, so a commit that came out
+/// of the store (which keeps no message body) serves as well as a parsed one.
+#[derive(Clone, Copy)]
+struct Known<'a> {
+    author: &'a GitIdentity,
+    files: &'a [RawFile],
+}
+
 struct Deriver<'a> {
     root: &'a Path,
     window: &'a Window,
     limits: &'a Limits,
-    by_hash: HashMap<&'a str, &'a ParsedCommit>,
+    by_hash: HashMap<&'a str, Known<'a>>,
     dropped: &'a HashSet<String>,
     used: HashSet<String>,
     /// First-parent entries already turned into PR units (guards overlaps).
@@ -1274,16 +1305,16 @@ impl Deriver<'_> {
     }
 
     fn single_unit(&mut self, entry: &ParsedCommit, numbered: bool) {
-        let Some(full) = self.by_hash.get(entry.hash.as_str()).copied() else {
+        let Some(known) = self.by_hash.get(entry.hash.as_str()).copied() else {
             return;
         };
-        if self.dropped.contains(&full.hash) {
+        if self.dropped.contains(&entry.hash) {
             return;
         }
-        let draft = single_parent_pr(full, &mut self.used, numbered);
+        let draft = single_parent_pr(entry, known.files, &mut self.used, numbered);
         self.derived
             .commit_pr
-            .insert(full.hash.clone(), draft.pr.id.clone());
+            .insert(entry.hash.clone(), draft.pr.id.clone());
         self.derived.drafts.push(draft);
     }
 
@@ -1465,13 +1496,51 @@ fn derive_prs_from_git(
     limits: &Limits,
     truncated: &mut bool,
 ) -> Result<Derived, String> {
+    let known = commits
+        .iter()
+        .map(|c| {
+            (
+                c.hash.as_str(),
+                Known {
+                    author: &c.author,
+                    files: &c.files,
+                },
+            )
+        })
+        .collect();
+    derive_prs_known(
+        root,
+        head,
+        window,
+        known,
+        dropped,
+        limits,
+        HashSet::new(),
+        truncated,
+    )
+}
+
+/// `derive_prs_from_git` over the commits of `window` however they were read.
+/// `used` holds PR ids that are taken already, for a caller that derives one
+/// window after another into the same set of PRs.
+#[allow(clippy::too_many_arguments)]
+fn derive_prs_known(
+    root: &Path,
+    head: &str,
+    window: &Window,
+    by_hash: HashMap<&str, Known>,
+    dropped: &HashSet<String>,
+    limits: &Limits,
+    used: HashSet<String>,
+    truncated: &mut bool,
+) -> Result<Derived, String> {
     let mut deriver = Deriver {
         root,
         window,
         limits,
-        by_hash: commits.iter().map(|c| (c.hash.as_str(), c)).collect(),
+        by_hash,
         dropped,
-        used: HashSet::new(),
+        used,
         seen: HashSet::new(),
         derived: Derived {
             drafts: Vec::new(),
@@ -1535,6 +1604,29 @@ struct SurvivalCandidate {
     merged_epoch: i64,
     hashes: HashSet<String>,
     files: Vec<RawFile>,
+}
+
+/// The merged PRs among `drafts` as survival candidates.
+fn survival_candidates<'a>(
+    drafts: impl IntoIterator<Item = &'a PrDraft>,
+) -> Vec<SurvivalCandidate> {
+    drafts
+        .into_iter()
+        .filter_map(|d| {
+            let landing = if d.pr.source == "gh" {
+                Some(d.pr.merge_commit.clone()?)
+            } else {
+                None
+            };
+            Some(SurvivalCandidate {
+                pr_id: d.pr.id.clone(),
+                landing,
+                merged_epoch: parse_iso_epoch(d.pr.merged_at.as_deref()?)?,
+                hashes: d.hashes.clone(),
+                files: d.pr.files.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Lines per blamed commit for one file at `head`; `None` when the file cannot
@@ -1790,26 +1882,13 @@ fn collect_raw(
     truncated |= github.truncated;
     let reverted = reverted_pr_ids(&parsed, &derived);
 
-    let candidates = derived
-        .drafts
-        .iter()
-        .filter_map(|d| {
-            let landing = if d.pr.source == "gh" {
-                Some(d.pr.merge_commit.clone()?)
-            } else {
-                None
-            };
-            Some(SurvivalCandidate {
-                pr_id: d.pr.id.clone(),
-                landing,
-                merged_epoch: parse_iso_epoch(d.pr.merged_at.as_deref()?)?,
-                hashes: d.hashes.clone(),
-                files: d.pr.files.clone(),
-            })
-        })
-        .collect();
-    let (survival, survival_cut) =
-        compute_survival(root, head, candidates, window.until_epoch, limits);
+    let (survival, survival_cut) = compute_survival(
+        root,
+        head,
+        survival_candidates(&derived.drafts),
+        window.until_epoch,
+        limits,
+    );
     truncated |= survival_cut;
 
     let commits = parsed
@@ -2195,7 +2274,7 @@ pub(super) mod tests {
     pub(super) type Who = (&'static str, &'static str);
 
     pub(super) const ALICE: Who = ("Alice", "alice@example.com");
-    const BOB: Who = ("Bob", "bob@example.com");
+    pub(super) const BOB: Who = ("Bob", "bob@example.com");
     const SINCE: &str = "2026-01-01T00:00:00Z";
     const UNTIL: &str = "2026-06-30T00:00:00Z";
 

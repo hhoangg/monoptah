@@ -72,7 +72,7 @@ const COMMIT_CHUNK: usize = 25;
 const COMMIT_CHUNK_LIMIT: usize = 30;
 const COMMENT_MIN_CHARS: usize = 20;
 /// Wall clock for the whole gh phase; past it the git fallback is kept.
-const GH_BUDGET: Duration = Duration::from_secs(90);
+pub(super) const GH_BUDGET: Duration = Duration::from_secs(90);
 /// Most of the budget the PR head lookup and fetch may use together.
 const HEADS_BUDGET: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1679,41 +1679,69 @@ pub(super) fn enrich(request: &Request, derived: &mut Derived) -> Outcome {
 }
 
 fn enrich_within(request: &Request, derived: &mut Derived, total: Duration) -> Outcome {
+    let Request { gh, root, .. } = *request;
+    let budget = Budget::new(total);
+    let slug = match gh_status(gh, root, &budget) {
+        Ok(slug) => slug,
+        Err(note) => return Outcome::unavailable(note),
+    };
+    enrich_checked(request, &slug, &budget, derived)
+}
+
+/// `enrich` for a repository `gh_status` already vouched for: a sync that
+/// enriches month after month checks once and gives each month its own
+/// `budget`. Every review of a PR is kept, whatever the window (the reader
+/// picks the ones of its period), so that a PR listed in one month does not
+/// lose the reviews it got in the month before.
+pub(super) fn enrich_checked(
+    request: &Request,
+    slug: &str,
+    budget: &Budget,
+    derived: &mut Derived,
+) -> Outcome {
     let Request {
         gh,
         commits: cache,
         root,
         ..
     } = *request;
-    let budget = Budget::new(total);
-    let slug = match gh_status(gh, root, &budget) {
-        Ok(slug) => slug,
-        Err(note) => return Outcome::unavailable(note),
-    };
     let ctx = Ctx {
         gh,
         root,
-        slug: &slug,
-        budget: &budget,
+        slug,
+        budget,
     };
     let fetched = match fetch_all(&ctx, request, |lists| local_heads(&ctx, cache, lists)) {
         Ok(fetched) => fetched,
         Err(note) => return Outcome::unavailable(note),
     };
-    overlay_fetched(request, derived, fetched)
+    overlay_fetched_in(request, derived, fetched, (i64::MIN, i64::MAX))
+}
+
+/// `overlay_fetched_in` keeping the reviews of the request's window.
+#[cfg(test)]
+fn overlay_fetched(request: &Request, derived: &mut Derived, fetched: Fetched) -> Outcome {
+    let window = request.window;
+    overlay_fetched_in(
+        request,
+        derived,
+        fetched,
+        (window.since_epoch, window.until_epoch),
+    )
 }
 
 /// Builds every fetched PR and overlays them on `derived`. Local git adds the
 /// final diff of each merged PR; it does not depend on the gh budget, so it
 /// runs even when that is spent. PRs without commits keep an empty list. A cut
-/// fetch is reported as truncated with the `CUT_SHORT` note.
-fn overlay_fetched(request: &Request, derived: &mut Derived, fetched: Fetched) -> Outcome {
-    let Request {
-        root,
-        window,
-        limits,
-        ..
-    } = *request;
+/// fetch is reported as truncated with the `CUT_SHORT` note. Reviews submitted
+/// outside `review_bounds` (inclusive) are dropped.
+fn overlay_fetched_in(
+    request: &Request,
+    derived: &mut Derived,
+    fetched: Fetched,
+    review_bounds: (i64, i64),
+) -> Outcome {
+    let Request { root, limits, .. } = *request;
     let mut truncated = fetched.truncated;
     let cut_short = fetched.cut_short;
 
@@ -1756,12 +1784,7 @@ fn overlay_fetched(request: &Request, derived: &mut Derived, fetched: Fetched) -
         }
         let commits = commits_for(pr);
         let raw = merged_pr(pr, &commits, landing.as_ref());
-        reviews.extend(map_reviews(
-            pr,
-            &raw.id,
-            window.since_epoch,
-            window.until_epoch,
-        ));
+        reviews.extend(map_reviews(pr, &raw.id, review_bounds.0, review_bounds.1));
         let mut hashes: HashSet<String> = landing
             .map(|l| l.hashes.into_iter().collect())
             .unwrap_or_default();

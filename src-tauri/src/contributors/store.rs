@@ -426,6 +426,69 @@ pub(super) fn put_survival(
     Ok(())
 }
 
+/// Deletes the PRs `ids` of a branch with their commit links and reviews.
+/// Survival rows stay: they are keyed by PR id and a PR that is written again
+/// under the same id keeps its sample.
+fn delete_prs(tx: &Transaction, repo: i64, branch: &str, ids: &[String]) -> Result<(), String> {
+    for id in ids {
+        for table in ["contrib_commit_prs", "contrib_reviews", "contrib_prs"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE repo_id = ?1 AND branch = ?2 AND pr_id = ?3"),
+                params![repo, branch, id],
+            )
+            .map_err(sql)?;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes the PRs of a branch merged or closed within `from..=to`: the stored
+/// side of writing that stretch of time again.
+pub(super) fn clear_prs_in(
+    tx: &Transaction,
+    repo: i64,
+    branch: &str,
+    from: i64,
+    to: i64,
+) -> Result<(), String> {
+    let ids: Vec<String> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT pr_id FROM contrib_prs
+                 WHERE repo_id = ?1 AND branch = ?2
+                   AND ((merged_epoch BETWEEN ?3 AND ?4) OR (closed_epoch BETWEEN ?3 AND ?4))",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map(params![repo, branch, from, to], |row| row.get(0))
+            .map_err(sql)?;
+        rows.map(|row| row.map_err(sql)).collect::<Result<_, _>>()?
+    };
+    delete_prs(tx, repo, branch, &ids)
+}
+
+/// Deletes the stored PRs, other than `keep`, whose merge commit is one of
+/// `merge_commits`: a GitHub PR supersedes the PR git derived for the same
+/// landing, also when the two fell on either side of a chunk boundary.
+pub(super) fn drop_prs_landing_in(
+    tx: &Transaction,
+    repo: i64,
+    branch: &str,
+    merge_commits: &[String],
+    keep: &HashSet<String>,
+) -> Result<(), String> {
+    let found = query_in(
+        tx,
+        "SELECT pr_id FROM contrib_prs
+         WHERE repo_id = ? AND branch = ? AND merge_commit IN ({in})",
+        &[&repo, &branch],
+        merge_commits,
+        |row| row.get::<_, String>(0),
+    )?;
+    let stale: Vec<String> = found.into_iter().filter(|id| !keep.contains(id)).collect();
+    delete_prs(tx, repo, branch, &stale)
+}
+
 // ---------------------------------------------------------------------------
 // coverage
 // ---------------------------------------------------------------------------
@@ -613,6 +676,88 @@ pub(super) fn listed_hashes(
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// The stored commits among `hashes`, as sync's merge graph walk needs them
+/// (no message body is stored, so none is returned).
+pub(super) fn stored_commits(
+    conn: &Connection,
+    repo: i64,
+    hashes: &[String],
+) -> Result<Vec<RawCommit>, String> {
+    let rows = query_in(
+        conn,
+        "SELECT hash, subject, author_json, committer_json, authored_at, committed_at,
+                co_authors_json, files_json
+         FROM contrib_commits WHERE repo_id = ? AND hash IN ({in})",
+        &[&repo],
+        hashes,
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        },
+    )?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(RawCommit {
+                pr_id: None,
+                hash: row.0,
+                subject: row.1,
+                author: unjson::<GitIdentity>(&row.2)?,
+                committer: unjson::<GitIdentity>(&row.3)?,
+                authored_at: row.4,
+                committed_at: row.5,
+                co_authors: unjson::<Vec<GitIdentity>>(&row.6)?,
+                files: unjson::<Vec<RawFile>>(&row.7)?,
+            })
+        })
+        .collect()
+}
+
+/// The commits among `hashes` (newest first, as listed) that repeat the patch
+/// of an earlier commit and so count for nothing: the rule `load_window` applies.
+pub(super) fn dropped_duplicates(
+    conn: &Connection,
+    repo: i64,
+    hashes: &[String],
+) -> Result<HashSet<String>, String> {
+    let rows: HashMap<String, (String, Option<String>)> = query_in(
+        conn,
+        "SELECT hash, committed_at, patch_id FROM contrib_commits
+         WHERE repo_id = ? AND hash IN ({in})",
+        &[&repo],
+        hashes,
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?),
+            ))
+        },
+    )?
+    .into_iter()
+    .collect();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut committed: HashMap<String, i64> = HashMap::new();
+    for hash in hashes {
+        let Some((at, patch)) = rows.get(hash) else {
+            continue;
+        };
+        if let Some(epoch) = parse_iso_epoch(at) {
+            committed.insert(hash.clone(), epoch);
+        }
+        if let Some(patch) = patch {
+            pairs.push((patch.clone(), hash.clone()));
+        }
+    }
+    Ok(select_duplicates(&pairs, &committed))
 }
 
 /// Lists the commits of `since..=until` reachable from `head`. Runs git only:
@@ -1558,6 +1703,129 @@ mod tests {
         // The earlier hash list is gone, not merged with the new one.
         let pr_ids: Vec<Option<&str>> = raw.commits.iter().map(|c| c.pr_id.as_deref()).collect();
         assert_eq!(pr_ids, [Some("pr-1"), None, None]);
+    }
+
+    #[test]
+    fn clearing_a_stretch_of_time_removes_its_prs_with_links_and_reviews_only() {
+        let f = synced_fixture();
+        let epoch = |text: &str| parse_iso_epoch(text).unwrap();
+        write(&f.store, |tx| {
+            let mut closed = pr("pr-3", "closed", None, Some("2026-02-20T10:00:00Z"));
+            closed.merge_commit = None;
+            put_prs(
+                tx,
+                f.id,
+                "main",
+                &[
+                    (
+                        pr("pr-1", "merged", Some("2026-01-03T11:00:00Z"), None),
+                        vec![f.hashes[0].clone()],
+                    ),
+                    (
+                        pr("pr-2", "merged", Some("2026-02-03T11:00:00Z"), None),
+                        vec![f.hashes[1].clone()],
+                    ),
+                    (closed, vec![]),
+                ],
+            )?;
+            put_reviews(
+                tx,
+                f.id,
+                "main",
+                &[
+                    review("pr-1", "2026-01-04T12:00:00Z"),
+                    review("pr-2", "2026-02-04T12:00:00Z"),
+                ],
+            )?;
+            put_survival(
+                tx,
+                f.id,
+                "main",
+                "head",
+                &[RawSurvival {
+                    pr_id: "pr-2".to_string(),
+                    written: 4,
+                    alive: 3,
+                }],
+            )?;
+            clear_prs_in(
+                tx,
+                f.id,
+                "main",
+                epoch("2026-02-01T00:00:00Z"),
+                epoch("2026-02-28T23:59:59Z"),
+            )
+        })
+        .unwrap();
+        let conn = f.store.lock_conn().unwrap();
+        let ids: Vec<String> = conn
+            .prepare("SELECT pr_id FROM contrib_prs WHERE repo_id = ?1")
+            .unwrap()
+            .query_map([f.id], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(ids, ["pr-1"], "the closed PR of February went too");
+        assert_eq!(count(&conn, "contrib_commit_prs", f.id), 1);
+        assert_eq!(count(&conn, "contrib_reviews", f.id), 1);
+        let sampled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM contrib_survival WHERE repo_id = ?1 AND pr_id = 'pr-2'",
+                [f.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sampled, 1,
+            "a sample stays for a PR that is written again under its id"
+        );
+    }
+
+    #[test]
+    fn a_landing_in_another_stretch_is_dropped_unless_its_pr_is_kept() {
+        let f = synced_fixture();
+        write(&f.store, |tx| {
+            let landing = |id: &str, at: &str, commit: &str| {
+                let mut pr = pr(id, "merged", Some(at), None);
+                pr.merge_commit = Some(commit.to_string());
+                pr
+            };
+            put_prs(
+                tx,
+                f.id,
+                "main",
+                &[
+                    (
+                        landing("old", "2026-01-31T23:59:59Z", "abc"),
+                        vec!["abc".to_string()],
+                    ),
+                    (
+                        landing("mine", "2026-02-01T00:00:00Z", "abc"),
+                        vec!["abd".to_string()],
+                    ),
+                    (landing("other", "2026-01-30T10:00:00Z", "zzz"), vec![]),
+                ],
+            )?;
+            drop_prs_landing_in(
+                tx,
+                f.id,
+                "main",
+                &["abc".to_string()],
+                &HashSet::from(["mine".to_string()]),
+            )
+        })
+        .unwrap();
+        let conn = f.store.lock_conn().unwrap();
+        let mut ids: Vec<String> = conn
+            .prepare("SELECT pr_id FROM contrib_prs WHERE repo_id = ?1")
+            .unwrap()
+            .query_map([f.id], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        ids.sort();
+        // `pr-1` comes with the fixture.
+        assert_eq!(ids, ["mine", "other", "pr-1"]);
     }
 
     #[test]
