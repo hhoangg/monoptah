@@ -2758,7 +2758,7 @@ mod tests {
         let list = serde_json::json!([{
             "number": 1, "title": "PR 1", "author": { "login": "ann" },
             "mergedAt": "2026-02-01T10:00:00Z", "baseRefName": "main",
-            "mergeCommit": { "oid": format!("{second}") }
+            "mergeCommit": { "oid": second.to_string() }
         }])
         .to_string();
         let github = FakeGh::new(move |args| {
