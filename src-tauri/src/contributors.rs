@@ -228,18 +228,53 @@ struct Finished {
     stderr: String,
 }
 
-/// Why `wait_with_deadline` gave up on a child.
+/// Why a wait for a child gave up.
 enum WaitFailure {
     TimedOut,
+    /// The caller's cancel check turned true; the child was killed.
+    Cancelled,
     Io(String),
+}
+
+/// Asked while a child runs: should it be killed now?
+type CancelCheck<'a> = &'a dyn Fn() -> bool;
+
+/// Waits for `child` to exit. The cancel check (when given) is asked on every
+/// poll, before the exit status, and a true answer kills the child; so does
+/// the deadline (when given). This is the one wait loop of the module.
+fn poll_child(
+    child: &mut std::process::Child,
+    timeout: Option<Duration>,
+    cancel: Option<CancelCheck>,
+) -> Result<std::process::ExitStatus, WaitFailure> {
+    let deadline = timeout.map(|t| Instant::now() + t);
+    loop {
+        if cancel.is_some_and(|cancelled| cancelled()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(WaitFailure::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if deadline.is_some_and(|d| Instant::now() >= d) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(WaitFailure::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(WaitFailure::Io(e.to_string())),
+        }
+    }
 }
 
 /// Waits for a child spawned with piped stdout and stderr. Both pipes are
 /// drained on their own threads so a large reply cannot fill them and stall
-/// the child; the child is killed when `timeout` passes.
-fn wait_with_deadline(
+/// the child; the child is killed when `timeout` passes or when `cancel`
+/// (if given) turns true.
+fn wait_with_deadline_or_cancel(
     child: &mut std::process::Child,
     timeout: Duration,
+    cancel: Option<CancelCheck>,
 ) -> Result<Finished, WaitFailure> {
     fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
         let (send, receive) = std::sync::mpsc::channel();
@@ -254,19 +289,7 @@ fn wait_with_deadline(
     }
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(WaitFailure::TimedOut);
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(WaitFailure::Io(e.to_string())),
-        }
-    };
+    let status = poll_child(child, Some(timeout), cancel)?;
     // A grandchild that kept a pipe open must not hold the call forever.
     let grace = Duration::from_secs(5);
     Ok(Finished {
@@ -971,20 +994,35 @@ fn patch_ids(
     .arg((limits.max_commits + 1).to_string())
     .args(window.log_args())
     .args([head, "--"]);
-    pipe_patch_ids(root, log, None, limits.max_patch_bytes)
+    match pipe_patch_ids(root, log, None, limits.max_patch_bytes, None)? {
+        PatchPipe::Ids(ids) => Ok(Some(ids)),
+        PatchPipe::TooBig => Ok(None),
+        PatchPipe::Cancelled => Err("cancelled".to_string()),
+    }
+}
+
+/// How a run of the patch-id pipe ended.
+enum PatchPipe {
+    /// `(patch id, commit)` pairs
+    Ids(Vec<(String, String)>),
+    /// The patch text exceeded the byte cap.
+    TooBig,
+    /// The cancel check turned true; both children were killed.
+    Cancelled,
 }
 
 /// Runs `log` (a `git log -p` command) into `git patch-id --stable`. `input`
-/// is written to the log's stdin, one line each, for `--stdin`. Returns `None`
-/// when the patch text exceeds `max_bytes`. Every exit path kills a
-/// still-running `git log` and waits for both children, so a failure never
-/// leaves a process blocked on a full pipe.
+/// is written to the log's stdin, one line each, for `--stdin`. Every exit
+/// path kills a still-running `git log` and waits for both children, so a
+/// failure never leaves a process blocked on a full pipe. `cancel` is asked
+/// while the pipe runs; a true answer kills both children.
 fn pipe_patch_ids(
     root: &Path,
     mut log: Command,
     input: Option<&[String]>,
     max_bytes: usize,
-) -> Result<Option<Vec<(String, String)>>, String> {
+    cancel: Option<CancelCheck>,
+) -> Result<PatchPipe, String> {
     let spawn_error = |e: std::io::Error| format!("Could not run git: {e}");
     log.stdout(Stdio::piped()).stderr(Stdio::null());
     if input.is_some() {
@@ -1028,27 +1066,42 @@ fn pipe_patch_ids(
         let _ = ids_out.read_to_end(&mut bytes);
         String::from_utf8_lossy(&bytes).into_owned()
     });
-    let outcome = pump(&mut log_out, &mut ids_in, max_bytes);
-    drop(ids_in);
-    drop(log_out);
-    if !matches!(outcome, Pump::Done) {
+    // The copy runs on its own thread so this one can watch for a cancel; it
+    // closes patch-id's stdin when it ends, which lets patch-id exit.
+    let pumper = std::thread::spawn(move || {
+        let outcome = pump(&mut log_out, &mut ids_in, max_bytes);
+        drop(ids_in);
+        outcome
+    });
+    let ids_status = poll_child(&mut ids, None, cancel);
+    let cancelled = matches!(ids_status, Err(WaitFailure::Cancelled));
+    if cancelled {
+        // patch-id is gone; killing git log closes the pipe the pump reads.
+        stop(&mut log);
+    }
+    let outcome = pumper
+        .join()
+        .unwrap_or_else(|_| Pump::Failed("Could not read git output".to_string()));
+    if cancelled || !matches!(outcome, Pump::Done) {
         let _ = log.kill();
     }
     let log_status = log.wait();
-    let ids_status = ids.wait();
     if let Some(feeder) = feeder {
         let _ = feeder.join();
     }
     let text = reader.join().unwrap_or_default();
+    if cancelled {
+        return Ok(PatchPipe::Cancelled);
+    }
     match outcome {
-        Pump::TooBig => Ok(None),
+        Pump::TooBig => Ok(PatchPipe::TooBig),
         Pump::Failed(error) => Err(error),
         Pump::Done => {
             let ok = log_status.is_ok_and(|s| s.success()) && ids_status.is_ok_and(|s| s.success());
             if !ok {
                 return Err("git could not compute patch ids".to_string());
             }
-            Ok(Some(
+            Ok(PatchPipe::Ids(
                 text.lines()
                     .filter_map(|line| {
                         let (patch, commit) = line.split_once(' ')?;

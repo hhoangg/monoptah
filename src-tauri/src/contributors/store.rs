@@ -594,6 +594,27 @@ pub(super) struct WindowCommits {
     pub reachable: HashSet<String>,
 }
 
+/// Hashes `git rev-list <flags>` prints for `since..=until` of `head`.
+pub(super) fn listed_hashes(
+    root: &Path,
+    head: &str,
+    since: i64,
+    until: i64,
+    flags: &[&str],
+) -> Result<Vec<String>, String> {
+    let since_arg = format!("--since=@{since}");
+    let until_arg = format!("--until=@{until}");
+    let mut args = vec!["rev-list"];
+    args.extend(flags);
+    args.extend([since_arg.as_str(), until_arg.as_str(), head, "--"]);
+    Ok(git(root, args)?
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Lists the commits of `since..=until` reachable from `head`. Runs git only:
 /// call it with no database lock held, then pass the result to `load_window`.
 pub(super) fn window_commits(
@@ -602,39 +623,10 @@ pub(super) fn window_commits(
     since: i64,
     until: i64,
 ) -> Result<WindowCommits, String> {
-    let since_arg = format!("--since=@{since}");
-    let until_arg = format!("--until=@{until}");
-    let lines = |out: String| -> Vec<String> {
-        out.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-    let hashes = lines(git(
-        root,
-        [
-            "rev-list",
-            "--no-merges",
-            "--date-order",
-            since_arg.as_str(),
-            until_arg.as_str(),
-            head,
-            "--",
-        ],
-    )?);
-    let reachable = lines(git(
-        root,
-        [
-            "rev-list",
-            since_arg.as_str(),
-            until_arg.as_str(),
-            head,
-            "--",
-        ],
-    )?)
-    .into_iter()
-    .collect();
+    let hashes = listed_hashes(root, head, since, until, &["--no-merges", "--date-order"])?;
+    let reachable = listed_hashes(root, head, since, until, &[])?
+        .into_iter()
+        .collect();
     Ok(WindowCommits { hashes, reachable })
 }
 

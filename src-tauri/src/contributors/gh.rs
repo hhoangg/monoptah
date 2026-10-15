@@ -133,10 +133,14 @@ impl GhRunner for SystemGh {
                 GhError::Failed(e.to_string())
             }
         })?;
-        let done = wait_with_deadline(&mut child, timeout).map_err(|failure| match failure {
-            WaitFailure::TimedOut => GhError::Failed(TIMED_OUT.to_string()),
-            WaitFailure::Io(e) => GhError::Failed(e),
-        })?;
+        let done =
+            wait_with_deadline_or_cancel(&mut child, timeout, None).map_err(
+                |failure| match failure {
+                    WaitFailure::TimedOut => GhError::Failed(TIMED_OUT.to_string()),
+                    WaitFailure::Cancelled => GhError::Failed("cancelled".to_string()),
+                    WaitFailure::Io(e) => GhError::Failed(e),
+                },
+            )?;
         if done.status.success() {
             return Ok(done.stdout);
         }
@@ -249,7 +253,7 @@ impl Budget {
         }
     }
 
-    fn left(&self) -> Option<Duration> {
+    pub(super) fn left(&self) -> Option<Duration> {
         self.deadline
             .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())

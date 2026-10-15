@@ -10,11 +10,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::Connection;
 use serde::Serialize;
 
 use super::store::{self, StoredCommit};
-use super::{gh, pr_heads, split_records, Limits, RawCommit};
+use super::{gh, pr_heads, split_records, CancelCheck, Limits, PatchPipe, RawCommit};
 use crate::session_store::SessionStore;
 
 /// Commits read and written per transaction.
@@ -40,7 +39,8 @@ pub enum SyncStep {
 }
 
 /// How a running sync tells the outside world what it does, and how the
-/// outside world stops it.
+/// outside world stops it. `cancelled` is also asked while git runs, so it
+/// must be cheap.
 pub(super) trait Reporter: Sync {
     fn progress(&self, step: SyncStep, done: u64, total: u64);
     fn cancelled(&self) -> bool;
@@ -59,7 +59,7 @@ pub struct Estimate {
     pub stored_commits: u64,
     /// First-parent entries of the window: what the PR derivation walks.
     pub first_parent: u64,
-    /// Merged PRs of the window on GitHub; `None` when gh cannot say.
+    /// Merged and closed PRs of the window on GitHub; `None` when gh cannot say.
     pub prs: Option<u64>,
 }
 
@@ -78,17 +78,19 @@ fn parse_total_count(text: &str) -> Option<u64> {
         .as_u64()
 }
 
-/// Merged PRs of `slug` in `from..=to`, from the search API (one call, no
-/// 1000 row limit). `None` when the call fails or the reply is unreadable.
-fn count_merged_prs(
+/// PRs of `slug` closed in `from..=to` (merged ones are closed too), from the
+/// search API: one call, no 1000 row limit. `None` when the call fails, the
+/// budget is spent or the reply is unreadable.
+fn count_closed_prs(
     github: &dyn gh::GhRunner,
     root: &Path,
     slug: &str,
     from: i64,
     to: i64,
+    budget: &gh::Budget,
 ) -> Option<u64> {
     let query = format!(
-        "q=repo:{slug} is:pr is:merged merged:{}..{}",
+        "q=repo:{slug} is:pr is:closed closed:{}..{}",
         super::epoch_to_iso(from),
         super::epoch_to_iso(to)
     );
@@ -102,56 +104,66 @@ fn count_merged_prs(
         "-f",
         "per_page=1",
     ];
+    let timeout = budget.left()?.min(SEARCH_TIMEOUT);
     github
-        .run(root, &args, SEARCH_TIMEOUT)
+        .run(root, &args, timeout)
         .ok()
         .and_then(|text| parse_total_count(&text))
 }
 
 /// Counts what syncing `from..=to` of `head` involves. Reads hashes and one
 /// GitHub count only, never a diff. `repo` is `None` for a repository the store
-/// does not know yet.
+/// does not know yet. The database is touched for one short read; git and gh
+/// run with no lock held.
 pub(super) fn estimate(
     root: &Path,
     head: &str,
     from: i64,
     to: i64,
-    conn_read: &Connection,
+    store: &SessionStore,
     repo: Option<i64>,
     github: &dyn gh::GhRunner,
 ) -> Result<Estimate, String> {
-    let since = format!("--since=@{from}");
-    let until = format!("--until=@{to}");
-    let range = [since.as_str(), until.as_str(), head, "--"];
-
     let (commits, stored_commits) = match repo {
         Some(repo) => {
-            let mut args = vec!["rev-list", "--no-merges"];
-            args.extend(range);
-            let listed = super::git(root, args)?;
-            let hashes: Vec<String> = listed
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect();
-            let stored = store::stored_hashes(conn_read, repo, &hashes)?;
+            let hashes = store::listed_hashes(root, head, from, to, &["--no-merges"])?;
+            let stored = store.with_read_conn(|conn| store::stored_hashes(conn, repo, &hashes))?;
             (hashes.len() as u64, stored.len() as u64)
         }
         None => {
-            let mut args = vec!["rev-list", "--count", "--no-merges"];
-            args.extend(range);
+            let since = format!("--since=@{from}");
+            let until = format!("--until=@{to}");
+            let args = [
+                "rev-list",
+                "--count",
+                "--no-merges",
+                since.as_str(),
+                until.as_str(),
+                head,
+                "--",
+            ];
             (rev_list_count(root, &args)?, 0)
         }
     };
-    let mut args = vec!["rev-list", "--count", "--first-parent"];
-    args.extend(range);
-    let first_parent = rev_list_count(root, &args)?;
+    let since = format!("--since=@{from}");
+    let until = format!("--until=@{to}");
+    let first_parent = rev_list_count(
+        root,
+        &[
+            "rev-list",
+            "--count",
+            "--first-parent",
+            since.as_str(),
+            until.as_str(),
+            head,
+            "--",
+        ],
+    )?;
 
     let budget = gh::Budget::new(ESTIMATE_BUDGET);
     let prs = gh::gh_status(github, root, &budget)
         .ok()
-        .and_then(|slug| count_merged_prs(github, root, &slug, from, to));
+        .and_then(|slug| count_closed_prs(github, root, &slug, from, to, &budget));
 
     Ok(Estimate {
         commits,
@@ -171,7 +183,8 @@ pub(super) struct IngestOutcome {
     pub written: u64,
     /// Written without files because they touched more than the per-commit cap.
     pub oversized: u64,
-    /// Stopped between batches because the reporter asked to.
+    /// Stopped because the reporter asked to: between batches, or by killing
+    /// the git process of the batch that was running (nothing of it is kept).
     pub cancelled: bool,
 }
 
@@ -213,6 +226,7 @@ fn ingest_with(
     let pending: Vec<String> = unique.into_iter().filter(|h| !stored.contains(h)).collect();
     let total = pending.len() as u64;
 
+    let cancel = || reporter.cancelled();
     let mut outcome = IngestOutcome::default();
     let mut done = 0u64;
     for batch in pending.chunks(batch_size.max(1)) {
@@ -220,7 +234,10 @@ fn ingest_with(
             outcome.cancelled = true;
             return Ok(outcome);
         }
-        let commits = read_batch(root, batch, limits)?;
+        let Some(commits) = read_batch(root, batch, limits, &cancel)? else {
+            outcome.cancelled = true;
+            return Ok(outcome);
+        };
         let oversized = commits.iter().filter(|c| c.oversized).count() as u64;
         {
             // The lock covers this write only, never the git work above.
@@ -237,13 +254,18 @@ fn ingest_with(
     Ok(outcome)
 }
 
-/// Reads one batch from git: files, identities and patch ids.
-fn read_batch(root: &Path, batch: &[String], limits: &Limits) -> Result<Vec<StoredCommit>, String> {
-    let mut patches = HashMap::new();
-    patch_ids_of(root, batch, limits, &mut patches)?;
-
+/// Reads one batch from git: files and identities first, then patch ids for
+/// the commits that kept their files (a commit over the file cap is stored
+/// without a patch id and never costs a pass over its diff). `None` when
+/// `cancel` killed the git process.
+fn read_batch(
+    root: &Path,
+    batch: &[String],
+    limits: &Limits,
+    cancel: CancelCheck,
+) -> Result<Option<Vec<StoredCommit>>, String> {
     let input = batch.iter().map(|h| format!("{h}\n")).collect::<String>();
-    let output = pr_heads::run_git(
+    let ran = pr_heads::run_git(
         root,
         &[
             "log",
@@ -260,44 +282,57 @@ fn read_batch(root: &Path, batch: &[String], limits: &Limits) -> Result<Vec<Stor
         Some(input),
         BATCH_TIMEOUT,
         &[],
-    )?;
-    let mut commits = Vec::with_capacity(batch.len());
-    for record in split_records(&output) {
-        let Some((parsed, capped)) = super::parse_record(&record, limits.max_files_per_commit)
-        else {
-            continue;
-        };
-        commits.push(StoredCommit {
-            patch_id: patches.remove(&parsed.hash),
-            reverts: super::reverted_commit(&parsed.subject, &parsed.body),
-            oversized: capped,
-            commit: RawCommit {
-                pr_id: None,
-                hash: parsed.hash,
-                subject: parsed.subject,
-                author: parsed.author,
-                committer: parsed.committer,
-                authored_at: parsed.authored_at,
-                committed_at: parsed.committed_at,
-                co_authors: parsed.co_authors,
-                files: if capped { Vec::new() } else { parsed.files },
-            },
-        });
+        Some(cancel),
+    );
+    let output = match ran {
+        Err(error) if error == pr_heads::CANCELLED => return Ok(None),
+        other => other?,
+    };
+    let parsed: Vec<_> = split_records(&output)
+        .iter()
+        .filter_map(|record| super::parse_record(record, limits.max_files_per_commit))
+        .collect();
+
+    let feed: Vec<String> = parsed
+        .iter()
+        .filter(|(_, capped)| !capped)
+        .map(|(commit, _)| commit.hash.clone())
+        .collect();
+    let mut patches = HashMap::new();
+    if !patch_ids_of(root, &feed, limits, cancel, &mut patches)? {
+        return Ok(None);
     }
-    Ok(commits)
+
+    Ok(Some(
+        parsed
+            .into_iter()
+            .map(|(parsed, capped)| StoredCommit {
+                patch_id: patches.remove(&parsed.hash),
+                reverts: super::reverted_commit(&parsed.subject, &parsed.body),
+                oversized: capped,
+                commit: RawCommit {
+                    pr_id: None,
+                    hash: parsed.hash,
+                    subject: parsed.subject,
+                    author: parsed.author,
+                    committer: parsed.committer,
+                    authored_at: parsed.authored_at,
+                    committed_at: parsed.committed_at,
+                    co_authors: parsed.co_authors,
+                    files: if capped { Vec::new() } else { parsed.files },
+                },
+            })
+            .collect(),
+    ))
 }
 
-/// Patch ids of `hashes` into `out`. A set whose patch text exceeds the byte
-/// cap is split in halves; a single commit that is still too big gets none.
-fn patch_ids_of(
+/// One pass of the patch-id pipe over `hashes`.
+fn run_patch_pipe(
     root: &Path,
     hashes: &[String],
-    limits: &Limits,
-    out: &mut HashMap<String, String>,
-) -> Result<(), String> {
-    if hashes.is_empty() {
-        return Ok(());
-    }
+    max_bytes: usize,
+    cancel: Option<CancelCheck>,
+) -> Result<PatchPipe, String> {
     let mut log = super::git_command(root);
     log.args([
         "log",
@@ -309,16 +344,33 @@ fn patch_ids_of(
         "--no-textconv",
         "--no-show-signature",
     ]);
-    match super::pipe_patch_ids(root, log, Some(hashes), limits.max_patch_bytes)? {
-        Some(pairs) => {
+    super::pipe_patch_ids(root, log, Some(hashes), max_bytes, cancel)
+}
+
+/// Patch ids of `hashes` into `out`. A set whose patch text exceeds the byte
+/// cap is split in halves; a single commit that is still too big gets none.
+/// `Ok(false)` when `cancel` killed the pipe.
+fn patch_ids_of(
+    root: &Path,
+    hashes: &[String],
+    limits: &Limits,
+    cancel: CancelCheck,
+    out: &mut HashMap<String, String>,
+) -> Result<bool, String> {
+    if hashes.is_empty() {
+        return Ok(true);
+    }
+    match run_patch_pipe(root, hashes, limits.max_patch_bytes, Some(cancel))? {
+        PatchPipe::Ids(pairs) => {
             out.extend(pairs.into_iter().map(|(patch, commit)| (commit, patch)));
-            Ok(())
+            Ok(true)
         }
-        None if hashes.len() == 1 => Ok(()),
-        None => {
+        PatchPipe::Cancelled => Ok(false),
+        PatchPipe::TooBig if hashes.len() == 1 => Ok(true),
+        PatchPipe::TooBig => {
             let (left, right) = hashes.split_at(hashes.len() / 2);
-            patch_ids_of(root, left, limits, out)?;
-            patch_ids_of(root, right, limits, out)
+            Ok(patch_ids_of(root, left, limits, cancel, out)?
+                && patch_ids_of(root, right, limits, cancel, out)?)
         }
     }
 }
@@ -327,10 +379,13 @@ fn patch_ids_of(
 mod tests {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     use super::super::gh::{FakeGh, GhError, Unavailable};
     use super::super::tests::{TestRepo, ALICE};
+    use super::super::{pipe_patch_ids, wait_with_deadline_or_cancel, WaitFailure};
     use super::*;
 
     const EPOCH_DATE: &str = "2026-01-01T00:00:00+0000";
@@ -461,9 +516,7 @@ mod tests {
         id: Option<i64>,
         github: &dyn gh::GhRunner,
     ) -> Estimate {
-        store
-            .with_read_conn(|conn| estimate(repo.path(), "main", WIDE.0, WIDE.1, conn, id, github))
-            .unwrap()
+        estimate(repo.path(), "main", WIDE.0, WIDE.1, store, id, github).unwrap()
     }
 
     fn with_origin(repo: &TestRepo) {
@@ -514,16 +567,21 @@ mod tests {
         let (store, id) = setup(&repo);
         let from = super::super::parse_iso_epoch("2026-02-05T00:00:00Z").unwrap();
         let to = super::super::parse_iso_epoch("2026-02-20T00:00:00Z").unwrap();
-        let got = store
-            .with_read_conn(|conn| {
-                estimate(repo.path(), "main", from, to, conn, Some(id), &Unavailable)
-            })
-            .unwrap();
+        let got = estimate(
+            repo.path(),
+            "main",
+            from,
+            to,
+            &store,
+            Some(id),
+            &Unavailable,
+        )
+        .unwrap();
         assert_eq!((got.commits, got.first_parent), (1, 1));
     }
 
     #[test]
-    fn estimate_reads_the_pr_count_from_the_search_api() {
+    fn estimate_counts_closed_prs_with_one_search() {
         let repo = TestRepo::new();
         repo.commit(&[("a", "1")], "a", ALICE, "2026-02-01T10:00:00+0000");
         with_origin(&repo);
@@ -537,6 +595,16 @@ mod tests {
         });
         let got = estimate_of(&repo, &store, Some(id), &github);
         assert_eq!(got.prs, Some(42));
+        assert_eq!(
+            github
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c[0] == "api")
+                .count(),
+            1
+        );
 
         let calls = github.calls.lock().unwrap();
         let api = calls.iter().find(|c| c[0] == "api").unwrap();
@@ -544,7 +612,7 @@ mod tests {
         assert!(api.contains(&"search/issues".to_string()));
         let query = api.iter().find(|a| a.starts_with("q=")).unwrap();
         assert!(
-            query.starts_with("q=repo:acme/widgets is:pr is:merged merged:2001-09-09T01:46:40Z.."),
+            query.starts_with("q=repo:acme/widgets is:pr is:closed closed:2001-09-09T01:46:40Z.."),
             "{query}"
         );
     }
@@ -702,8 +770,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!((outcome.written, outcome.oversized), (2, 1));
-        let conn = store.lock_conn().unwrap();
         let flags = |hash: &str| -> (String, bool) {
+            let conn = store.lock_conn().unwrap();
             conn.query_row(
                 "SELECT files_json, oversized FROM contrib_commits
                  WHERE repo_id = ?1 AND hash = ?2",
@@ -716,6 +784,10 @@ mod tests {
         let (files, flagged) = flags(&small);
         assert!(!flagged);
         assert!(files.contains("s.txt"));
+        // A commit over the file cap is never fed to the patch pipe: it has no
+        // patch id although its diff is far below the byte cap.
+        assert_eq!(patch_of(&store, id, &big), None);
+        assert!(patch_of(&store, id, &small).is_some());
     }
 
     #[test]
@@ -732,11 +804,33 @@ mod tests {
             })
             .collect();
         let (store, id) = setup(&repo);
-        // One patch is about 150 bytes; three of them do not fit.
+        // One patch is a few hundred bytes; the six together do not fit.
         let limits = Limits {
             max_patch_bytes: 400,
             ..Limits::DEFAULT
         };
+        assert!(
+            matches!(
+                run_patch_pipe(repo.path(), &hashes, limits.max_patch_bytes, None).unwrap(),
+                PatchPipe::TooBig
+            ),
+            "the whole batch must exceed the cap"
+        );
+        for hash in &hashes {
+            assert!(
+                matches!(
+                    run_patch_pipe(
+                        repo.path(),
+                        std::slice::from_ref(hash),
+                        limits.max_patch_bytes,
+                        None
+                    )
+                    .unwrap(),
+                    PatchPipe::Ids(_)
+                ),
+                "one commit must fit the cap"
+            );
+        }
         let outcome = ingest_with(
             &store,
             id,
@@ -856,5 +950,160 @@ mod tests {
         let outcome = ingest_commits(&store, id, repo.path(), &doubled, &reporter).unwrap();
         assert_eq!(outcome.written, 3);
         assert_eq!(reporter.done_counts(), vec![3]);
+    }
+
+    /// Reports whether the database lock was free each time it is asked or told.
+    struct LockProbe<'a> {
+        store: &'a SessionStore,
+        locked_at_some_point: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    impl LockProbe<'_> {
+        fn check(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.store.conn_is_free() {
+                self.locked_at_some_point.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl Reporter for LockProbe<'_> {
+        fn progress(&self, _: SyncStep, _: u64, _: u64) {
+            self.check();
+        }
+
+        fn cancelled(&self) -> bool {
+            self.check();
+            false
+        }
+    }
+
+    #[test]
+    fn ingest_does_not_hold_the_database_lock_while_git_runs() {
+        let (repo, hashes) = bulk_repo(5);
+        let (store, id) = setup(&repo);
+        let probe = LockProbe {
+            store: &store,
+            locked_at_some_point: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        };
+        // Two batches. `cancelled` is asked between batches and while each git
+        // process runs, so every probe call is made during or around git work.
+        let outcome = ingest_with(
+            &store,
+            id,
+            repo.path(),
+            &hashes,
+            &probe,
+            3,
+            &Limits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(outcome.written, 5);
+        assert!(probe.calls.load(Ordering::SeqCst) >= 6);
+        assert!(!probe.locked_at_some_point.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn estimate_does_not_hold_the_database_lock_while_gh_runs() {
+        let repo = TestRepo::new();
+        repo.commit(&[("a", "1")], "a", ALICE, "2026-02-01T10:00:00+0000");
+        with_origin(&repo);
+        let (store, id) = setup(&repo);
+        let store = Arc::new(store);
+        let held = Arc::new(AtomicBool::new(false));
+        let github = {
+            let (store, held) = (store.clone(), held.clone());
+            FakeGh::new(move |_| {
+                if !store.conn_is_free() {
+                    held.store(true, Ordering::SeqCst);
+                }
+                Ok(r#"{"total_count": 1}"#.to_string())
+            })
+        };
+        let got = estimate_of(&repo, &store, Some(id), &github);
+        assert_eq!(got.prs, Some(1));
+        assert!(!github.calls.lock().unwrap().is_empty());
+        assert!(!held.load(Ordering::SeqCst));
+    }
+
+    /// Cancels the batch that is running (not the one before it).
+    struct MidBatch {
+        progressed: AtomicUsize,
+        asked_since: AtomicUsize,
+        done: Mutex<Vec<u64>>,
+    }
+
+    impl Reporter for MidBatch {
+        fn progress(&self, _: SyncStep, done: u64, _: u64) {
+            self.progressed.fetch_add(1, Ordering::SeqCst);
+            self.asked_since.store(0, Ordering::SeqCst);
+            self.done.lock().unwrap().push(done);
+        }
+
+        fn cancelled(&self) -> bool {
+            // After the first batch: the first question is the check between
+            // batches (no), the next one comes from inside the running git call.
+            self.progressed.load(Ordering::SeqCst) > 0
+                && self.asked_since.fetch_add(1, Ordering::SeqCst) >= 1
+        }
+    }
+
+    #[test]
+    fn cancel_during_a_batch_kills_git_and_writes_none_of_it() {
+        let (repo, hashes) = bulk_repo(4);
+        let (store, id) = setup(&repo);
+        let reporter = MidBatch {
+            progressed: AtomicUsize::new(0),
+            asked_since: AtomicUsize::new(0),
+            done: Mutex::new(Vec::new()),
+        };
+        let outcome = ingest_with(
+            &store,
+            id,
+            repo.path(),
+            &hashes,
+            &reporter,
+            2,
+            &Limits::DEFAULT,
+        )
+        .unwrap();
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.written, 2);
+        assert_eq!(*reporter.done.lock().unwrap(), vec![2]);
+        assert_eq!(row_count(&store, id), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_kills_a_child_that_is_still_running() {
+        let started = Instant::now();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let cancel = || started.elapsed() > Duration::from_millis(150);
+        let result =
+            wait_with_deadline_or_cancel(&mut child, Duration::from_secs(60), Some(&cancel));
+        assert!(matches!(result, Err(WaitFailure::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(child.try_wait().unwrap().is_some(), "child was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_kills_both_children_of_the_patch_pipe() {
+        let repo = TestRepo::new();
+        repo.commit(&[("a", "1")], "a", ALICE, "2026-02-01T10:00:00+0000");
+        let mut log = Command::new("sleep");
+        log.arg("30");
+        let started = Instant::now();
+        let cancel = || started.elapsed() > Duration::from_millis(150);
+        let result = pipe_patch_ids(repo.path(), log, None, 1 << 20, Some(&cancel)).unwrap();
+        assert!(matches!(result, PatchPipe::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

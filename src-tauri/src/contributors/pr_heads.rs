@@ -18,6 +18,9 @@ const LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 const TIMED_OUT: &str = "git timed out";
 
+/// What `run_git` returns when its cancel check killed the process.
+pub(super) const CANCELLED: &str = "git cancelled";
+
 /// One commit of a PR branch, read from the local repository.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct LocalCommit {
@@ -44,6 +47,7 @@ pub(super) fn run_git(
     input: Option<String>,
     timeout: Duration,
     envs: &[(&str, &str)],
+    cancel: Option<CancelCheck>,
 ) -> Result<String, String> {
     let mut child = git_command(root)
         .args(args)
@@ -63,10 +67,14 @@ pub(super) fn run_git(
             let _ = stdin.write_all(input.as_bytes());
         });
     }
-    let done = wait_with_deadline(&mut child, timeout).map_err(|failure| match failure {
-        WaitFailure::TimedOut => TIMED_OUT.to_string(),
-        WaitFailure::Io(e) => e,
-    })?;
+    let done =
+        wait_with_deadline_or_cancel(&mut child, timeout, cancel).map_err(
+            |failure| match failure {
+                WaitFailure::TimedOut => TIMED_OUT.to_string(),
+                WaitFailure::Cancelled => CANCELLED.to_string(),
+                WaitFailure::Io(e) => e,
+            },
+        )?;
     if done.status.success() {
         return Ok(done.stdout);
     }
@@ -85,7 +93,7 @@ pub(super) fn run_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, String> {
-    run_git(root, args, None, timeout, &[])
+    run_git(root, args, None, timeout, &[], None)
 }
 
 /// A local object lookup: `LOCAL_TIMEOUT` at most (`timeout` when it is
@@ -96,7 +104,7 @@ fn run_offline(
     input: Option<String>,
     timeout: Duration,
 ) -> Result<String, String> {
-    run_git(root, args, input, timeout.min(LOCAL_TIMEOUT), OFFLINE)
+    run_git(root, args, input, timeout.min(LOCAL_TIMEOUT), OFFLINE, None)
 }
 
 /// Parses `<sha>\trefs/pull/<N>/head` lines; anything else is skipped.
