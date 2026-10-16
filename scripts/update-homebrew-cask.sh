@@ -3,9 +3,10 @@
 #
 # usage: update-homebrew-cask.sh <cask-file> <version> <sha256>
 #
-# Prints "updated" when the file changed and "unchanged" when it already held
-# these values (exit 0 in both cases). Any problem exits non-zero and leaves
-# the cask untouched. Uses awk plus a temp file instead of `sed -i`, whose
+# Prints "updated" when the file changed, "unchanged" when it already held
+# these values, and "skipped, cask is newer" when the cask pins a higher
+# version than the one requested (a cask is never downgraded). All three exit 0.
+# Any problem exits non-zero and leaves the cask untouched. Uses awk plus a temp file instead of `sed -i`, whose
 # in-place flag differs between BSD (macOS) and GNU (Linux) sed.
 set -euo pipefail
 
@@ -47,8 +48,20 @@ for key in version sha256; do
   fi
 done
 
+CURRENT=$(sed -n -E 's/^[[:space:]]*version "([^"]*)"[[:space:]]*$/\1/p' "$CASK")
+if [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CURRENT" != "$VERSION" ]]; then
+  HIGHEST=$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -V | tail -n 1)
+  if [[ "$HIGHEST" == "$CURRENT" ]]; then
+    echo "skipped, cask is newer ($CURRENT > $VERSION)"
+    exit 0
+  fi
+fi
+
+# cp -p gives the temp file the cask's mode (mktemp makes it 0600); the awk
+# redirect below then truncates and rewrites it without changing that mode.
 TMP=$(mktemp "${CASK}.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
+cp -p "$CASK" "$TMP"
 
 awk -v version="$VERSION" -v sha="$SHA" '
   /^[[:space:]]*version "[^"]*"[[:space:]]*$/ {
@@ -69,9 +82,7 @@ if cmp -s "$CASK" "$TMP"; then
   exit 0
 fi
 
-# Keep the original file mode, then move into place (same directory, so the
-# rename is atomic).
-chmod --reference="$CASK" "$TMP" 2>/dev/null || chmod "$(stat -f '%Lp' "$CASK" 2>/dev/null || echo 644)" "$TMP"
+# Same directory, so the rename is atomic.
 mv "$TMP" "$CASK"
 trap - EXIT
 echo "updated"

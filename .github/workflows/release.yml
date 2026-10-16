@@ -7,7 +7,9 @@
 # that latest.json points at. HOMEBREW_TAP_TOKEN is a fine-grained personal
 # access token with Contents read/write on hhoangg/homebrew-monoptah only; the
 # homebrew job uses it to bump the cask after the release is published, and
-# skips the bump (without failing the release) when it is not set. There is no
+# skips the bump (without failing the release) when it is not set. Fine-grained
+# tokens expire: if the tap checkout fails, the likely cause is an expired
+# HOMEBREW_TAP_TOKEN, so create a new one and update the secret. There is no
 # Apple signing, notarization, or R2 upload here.
 #
 # tauri.linux.conf.json and tauri.windows.conf.json set createUpdaterArtifacts
@@ -273,13 +275,20 @@ jobs:
             --notes-file "$RUNNER_TEMP/release-notes.md"
 
   # Bumps the Homebrew cask to the version just published. It runs only after
-  # the release exists, never fails the release when the tap cannot be
-  # updated, and skips pre-release tags (any "-" in the tag). The cask pins
-  # the sha256 published next to the zip, so that asset is the source of truth.
+  # the release exists and skips pre-release tags (any "-" in the tag). The
+  # release is already published by the time this job starts, so a tap failure
+  # (for example an expired HOMEBREW_TAP_TOKEN) only turns the workflow run
+  # red; it cannot undo or block the release. The cask pins the sha256
+  # published next to the zip, so that asset is the source of truth. Runs are
+  # serialized and the script never lowers the version, so re-running an old
+  # tag or two tags finishing out of order cannot downgrade the cask.
   homebrew:
     name: Update Homebrew cask
     needs: [release]
     if: ${{ !contains(github.ref_name, '-') }}
+    concurrency:
+      group: homebrew-tap
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -324,6 +333,8 @@ jobs:
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
+      # If this step fails, the likely cause is an expired HOMEBREW_TAP_TOKEN
+      # (fine-grained tokens have an expiry date).
       - name: Check out Homebrew tap
         if: steps.gate.outputs.enabled == 'true'
         uses: actions/checkout@v4
@@ -350,7 +361,17 @@ jobs:
           git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
           git add Casks/monoptah.rb
           git commit -m "Update Monoptah to $V"
-          git push origin HEAD:main
+          # Rebase onto the tap's main before pushing, and retry once when the
+          # push is rejected because someone else pushed in between.
+          for attempt in 1 2; do
+            git pull --rebase origin main
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt), retrying." >&2
+          done
+          echo "Could not push the cask update to the tap." >&2
+          exit 1
 
   host:
     name: Standalone host packages

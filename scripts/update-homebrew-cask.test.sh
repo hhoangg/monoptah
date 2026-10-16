@@ -84,6 +84,41 @@ else
   bad "second run reports unchanged (rc=$rc out=$out)"
 fi
 
+# 2b. An older requested version is skipped and leaves the file untouched.
+cp "$CASK" "$WORK/before.rb"
+out=$(bash "$SCRIPT" "$CASK" 0.23.9 "$OLD_SHA" 2>&1); rc=$?
+if (( rc == 0 )) && [[ "$out" == skipped,\ cask\ is\ newer* ]] && cmp -s "$CASK" "$WORK/before.rb"; then
+  ok "older version is skipped and file is unchanged"
+else
+  bad "older version is skipped and file is unchanged (rc=$rc out=$out)"
+fi
+
+# 2c. Version ordering is numeric, not lexical (0.9.5 is older than 0.24.0).
+out=$(bash "$SCRIPT" "$CASK" 0.9.5 "$OLD_SHA" 2>&1); rc=$?
+if (( rc == 0 )) && [[ "$out" == skipped,\ cask\ is\ newer* ]] && cmp -s "$CASK" "$WORK/before.rb"; then
+  ok "0.9.5 is treated as older than 0.24.0"
+else
+  bad "0.9.5 is treated as older than 0.24.0 (rc=$rc out=$out)"
+fi
+
+# 2d. Equal version with the same sha reports no change.
+out=$(bash "$SCRIPT" "$CASK" 0.24.0 "$NEW_SHA" 2>&1); rc=$?
+if (( rc == 0 )) && [[ "$out" == "unchanged" ]] && cmp -s "$CASK" "$WORK/before.rb"; then
+  ok "equal version reports unchanged"
+else
+  bad "equal version reports unchanged (rc=$rc out=$out)"
+fi
+
+# 2e. A newer version after a skip still updates, and the file mode is kept.
+chmod 644 "$CASK"
+out=$(bash "$SCRIPT" "$CASK" 0.25.0 "$OLD_SHA" 2>&1); rc=$?
+mode=$(ls -l "$CASK" | cut -c1-10)
+if (( rc == 0 )) && [[ "$out" == "updated" ]] && grep -qx '  version "0.25.0"' "$CASK" && [[ "$mode" == "-rw-r--r--" ]]; then
+  ok "newer version updates and keeps file mode"
+else
+  bad "newer version updates and keeps file mode (rc=$rc out=$out mode=$mode)"
+fi
+
 # 3. Missing lines fail.
 write_fixture "$WORK/missing-version.rb"
 grep -v '^  version ' "$WORK/missing-version.rb" > "$WORK/mv.tmp" && mv "$WORK/mv.tmp" "$WORK/missing-version.rb"
