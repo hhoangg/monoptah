@@ -3141,6 +3141,7 @@ function Workspace({
       const workdir = cwd || terminalCwd;
       if (!isLocalProject(projectCwdRef.current) || !isLocalProject(workdir))
         return;
+      setContributorsProject(null);
       if (openProjectTerminal(workdir)) return;
 
       if (asWorkspaceTab || !activeTab) {
@@ -4390,6 +4391,7 @@ function Workspace({
             : ((await resolveOpenablePath(diffCwd, path)) ?? path)
           : undefined;
         if (resolved) rememberOpenedFile(diffCwd, resolved);
+        setContributorsProject(null);
         setTabs((prev) =>
           prev.map((tab) => {
             if (tab.id !== activeTabId) return tab;
@@ -4461,6 +4463,7 @@ function Workspace({
   /** Stack one section's working-tree changes in one review, whatever the diff-view setting. */
   const onOpenAllChanges = useCallback(
     (kind: GitFileDiffKind) => {
+      setContributorsProject(null);
       setTabs((prev) =>
         prev.map((tab) =>
           tab.id === activeTabId
@@ -4481,6 +4484,7 @@ function Workspace({
 
   const onOpenCommit = useCallback(
     (commit: GitHistoryCommit, pin?: boolean) => {
+      setContributorsProject(null);
       setTabs((prev) =>
         prev.map((tab) =>
           tab.id === activeTabId
@@ -6804,6 +6808,7 @@ function Workspace({
           (entry) => entry.id === activeTabIdRef.current,
         );
         if (!tab) return;
+        setContributorsProject(null);
         const file = newFileTab(
           resolved,
           fileCwd,

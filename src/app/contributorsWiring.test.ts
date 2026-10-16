@@ -292,3 +292,58 @@ it("the footer sync indicator sits before the Terminal item and opens Contributo
     "onOpenContributors={onOpenContributors}",
   );
 });
+
+// A handler's source: from its `const name =` line to the next top-level
+// `const` of the component body.
+const handlerBody = (name: string) => {
+  const start = lines.findIndex((l) => l.startsWith(`  const ${name} =`));
+  expect(start, name).toBeGreaterThan(-1);
+  const end = lines.findIndex((l, i) => i > start && /^ {2}const \w/.test(l));
+  return lines.slice(start, end).join("\n");
+};
+
+it("opening a file from the sidebar closes the Contributors page", () => {
+  // The Files tab stays visible beside the page, so an open that did not close
+  // it would land in a workspace the page is hiding. It closes after the tab
+  // guard, so an open that cannot proceed leaves the page alone.
+  expect(handlerBody("onOpenFile")).toMatch(
+    /if \(!tab\) return;\s*setContributorsProject\(null\);/,
+  );
+});
+
+it("opening a terminal from the sidebar closes the Contributors page", () => {
+  // After the remote-project guard: a terminal that cannot open keeps the page.
+  expect(handlerBody("onOpenTerminal")).toMatch(
+    /isLocalProject\(workdir\)\)\s*return;\s*setContributorsProject\(null\);/,
+  );
+});
+
+it("opening a diff from the sidebar closes the Contributors page", () => {
+  // After the path is resolved, so a failed lookup leaves the page alone.
+  expect(handlerBody("onOpenDiff")).toMatch(
+    /if \(resolved\) rememberOpenedFile\(diffCwd, resolved\);\s*setContributorsProject\(null\);\s*setTabs\(/,
+  );
+});
+
+it("opening all changes or a commit from the sidebar closes the Contributors page", () => {
+  for (const name of ["onOpenAllChanges", "onOpenCommit"]) {
+    expect(handlerBody(name), name).toMatch(
+      /\) => \{\s*setContributorsProject\(null\);\s*setTabs\(/,
+    );
+  }
+});
+
+it("the footer, project terminal dock and menu bar are not reachable while Contributors is open", () => {
+  // Why onNewTerminal, onShowTerminal and onSelectProjectTerminal need no
+  // close of their own: the footer is not rendered for the page, and the dock
+  // and menu bar sit in the inert wrapper.
+  const footerGate = lines.findIndex(
+    (l, i) =>
+      l.includes("contributorsViewOpen ||") &&
+      lines[i + 2]?.includes("monoCovers ? null : ("),
+  );
+  expect(footerGate).toBeGreaterThan(-1);
+  expect(lines.slice(footerGate + 2, footerGate + 4).join("\n")).toContain(
+    "<UsageFooter",
+  );
+});
