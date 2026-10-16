@@ -1,10 +1,16 @@
 # Fork-local release workflow (Monoptah). Pushing a v* tag builds an ad-hoc
 # signed macOS app plus Linux, Windows, and standalone host packages, and
 # attaches them all to one GitHub Release (the macOS zip is what a Homebrew
-# cask pins). The only secrets read are the two updater signing secrets,
-# TAURI_SIGNING_PRIVATE_KEY and its password, plus the automatic GITHUB_TOKEN.
-# Those sign the updater bundles that latest.json points at. There is no Apple
-# signing, notarization, or R2 upload here.
+# cask pins). The secrets read are the two updater signing secrets,
+# TAURI_SIGNING_PRIVATE_KEY and its password, plus the automatic GITHUB_TOKEN,
+# and the optional HOMEBREW_TAP_TOKEN. The updater secrets sign the bundles
+# that latest.json points at. HOMEBREW_TAP_TOKEN is a fine-grained personal
+# access token with Contents read/write on hhoangg/homebrew-monoptah only; the
+# homebrew job uses it to bump the cask after the release is published, and
+# skips the bump (without failing the release) when it is not set. Fine-grained
+# tokens expire: if the tap checkout fails, the likely cause is an expired
+# HOMEBREW_TAP_TOKEN, so create a new one and update the secret. There is no
+# Apple signing, notarization, or R2 upload here.
 #
 # tauri.linux.conf.json and tauri.windows.conf.json set createUpdaterArtifacts
 # to false so a plain local build needs no key. The Linux and Windows jobs
@@ -267,6 +273,105 @@ jobs:
             --verify-tag \
             --title "Monoptah $VERSION" \
             --notes-file "$RUNNER_TEMP/release-notes.md"
+
+  # Bumps the Homebrew cask to the version just published. It runs only after
+  # the release exists and skips pre-release tags (any "-" in the tag). The
+  # release is already published by the time this job starts, so a tap failure
+  # (for example an expired HOMEBREW_TAP_TOKEN) only turns the workflow run
+  # red; it cannot undo or block the release. The cask pins the sha256
+  # published next to the zip, so that asset is the source of truth. Runs are
+  # serialized and the script never lowers the version, so re-running an old
+  # tag or two tags finishing out of order cannot downgrade the cask.
+  homebrew:
+    name: Update Homebrew cask
+    needs: [release]
+    if: ${{ !contains(github.ref_name, '-') }}
+    concurrency:
+      group: homebrew-tap
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check Homebrew tap token
+        id: gate
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
+            echo "::notice::Homebrew tap was not updated: the HOMEBREW_TAP_TOKEN secret is not set. To enable it, add a fine-grained personal access token with Contents read/write on hhoangg/homebrew-monoptah only as a repository secret named HOMEBREW_TAP_TOKEN. Until then, bump Casks/monoptah.rb by hand."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+
+      - name: Read published sha256
+        id: sha
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"
+          DIR="$RUNNER_TEMP/tap-sha"
+          mkdir -p "$DIR"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "Monoptah_${V}_aarch64.zip.sha256" \
+            --dir "$DIR"
+          SHA=$(awk 'NR == 1 { print $1 }' "$DIR/Monoptah_${V}_aarch64.zip.sha256")
+          if [[ ! "$SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Published sha256 is not 64 lowercase hex characters: $SHA" >&2
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      # If this step fails, the likely cause is an expired HOMEBREW_TAP_TOKEN
+      # (fine-grained tokens have an expiry date).
+      - name: Check out Homebrew tap
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: hhoangg/homebrew-monoptah
+          ref: main
+          path: homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update cask and push
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"
+          bash scripts/update-homebrew-cask.sh homebrew-tap/Casks/monoptah.rb "$V" "$SHA"
+          cd homebrew-tap
+          if git diff --quiet; then
+            echo "Cask already pins $V, nothing to push."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add Casks/monoptah.rb
+          git commit -m "Update Monoptah to $V"
+          # Rebase onto the tap's main before pushing, and retry once when the
+          # push is rejected because someone else pushed in between.
+          for attempt in 1 2; do
+            git pull --rebase origin main
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt), retrying." >&2
+          done
+          echo "Could not push the cask update to the tap." >&2
+          exit 1
 
   host:
     name: Standalone host packages

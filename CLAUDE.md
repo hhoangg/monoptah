@@ -83,6 +83,15 @@ then push the tag. Pushing a `v*` tag runs `.github/workflows/release.yml`, whic
 macOS, Linux and Windows, signs the updater bundles with the `TAURI_SIGNING_PRIVATE_KEY`
 secret, and publishes a GitHub Release with `latest.json`.
 
+The same tag also bumps the Homebrew cask in `hhoangg/homebrew-monoptah` (the `homebrew`
+job) when the `HOMEBREW_TAP_TOKEN` secret is set. Pre-release tags (containing `-`) are
+skipped, and the script never lowers the cask version, so re-running an old tag is safe.
+If the secret is missing the job only prints a notice, so bump `Casks/monoptah.rb` by hand
+with `scripts/update-homebrew-cask.sh <cask-file> <version> <sha256>`, taking the sha from
+the release's `Monoptah_<version>_aarch64.zip.sha256` asset. The token is a fine-grained PAT
+and expires: if the job fails at the tap checkout, the likely cause is an expired
+`HOMEBREW_TAP_TOKEN`, so create a new one and update the secret.
+
 The updater private key lives at `~/.config/monoptah/updater.key` and is **not** in this
 repo. Losing it means no further updates can be published to installed apps — they only
 trust that one key, so a replacement key would strand them.
