@@ -1350,6 +1350,7 @@ mod tests {
 
     use super::super::gh::{FakeGh, GhError, Unavailable};
     use super::super::tests::{TestRepo, ALICE, BOB};
+    #[cfg(unix)]
     use super::super::{pipe_patch_ids, wait_with_deadline_or_cancel, WaitFailure};
     use super::*;
 
