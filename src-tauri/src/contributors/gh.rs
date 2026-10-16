@@ -623,8 +623,11 @@ fn is_bot_author(author: &GhCommitAuthor) -> bool {
 /// insensitive), when those authors can only be the PR author: none carries a
 /// login (the login match already failed, so a login belongs to someone else)
 /// and every name is the PR author's `name` or `login` (case insensitive).
-/// `None` when they differ, when one of them has no email, or when there is no
-/// such author.
+/// Only the first entry of each commit's `authors` (the git author) is judged;
+/// co-authors are ignored, since a `Co-Authored-By` trailer says who helped,
+/// not who wrote the commit. A commit whose author is a bot is skipped.
+/// `None` when the authors differ, when one of them has no email, or when there
+/// is no such author.
 fn sole_email<'a>(commits: &'a [GhCommit], name: &str, login: &str) -> Option<&'a str> {
     let is_pr_author = |author: &GhCommitAuthor| {
         non_empty(&author.login).is_none()
@@ -637,7 +640,7 @@ fn sole_email<'a>(commits: &'a [GhCommit], name: &str, login: &str) -> Option<&'
     let mut found: Option<&str> = None;
     for author in commits
         .iter()
-        .flat_map(|c| c.authors.iter())
+        .filter_map(|c| c.authors.first())
         .filter(|a| !is_bot_author(a))
     {
         if !is_pr_author(author) {
@@ -657,8 +660,9 @@ fn sole_email<'a>(commits: &'a [GhCommit], name: &str, login: &str) -> Option<&'
 /// same login (first non-empty one). Commits read from local git only know a
 /// login for noreply addresses, so without a match by login the email is the
 /// one all non-bot commit authors share, if there is exactly one and they are
-/// named like the PR author (see `sole_email`). Otherwise it stays empty and the
-/// TypeScript side resolves the person through `gh:<login>`.
+/// named like the PR author (see `sole_email`; co-authors are ignored there).
+/// Otherwise it stays empty and the TypeScript side resolves the person through
+/// `gh:<login>`.
 fn pr_author(actor: &Option<GhActor>, commits: &[GhCommit]) -> GitIdentity {
     let login = author_login(actor);
     let name = actor
@@ -3243,8 +3247,13 @@ mod tests {
         ];
         assert_eq!(pr_author(&actor, &two).email, "");
 
-        // An author without an email breaks the "all share" rule.
-        let unknown = vec![commit_by_emails(&[("ann@example.com", false), ("", false)])];
+        // A commit author without an email breaks the "all share" rule. (A
+        // co-author without one does not: see
+        // `co_authors_do_not_stop_the_author_from_getting_their_email`.)
+        let unknown = vec![
+            commit_by_emails(&[("ann@example.com", false)]),
+            commit_by_emails(&[("", false)]),
+        ];
         assert_eq!(pr_author(&actor, &unknown).email, "");
 
         // A match by login still wins over the fallback.
@@ -3301,6 +3310,60 @@ mod tests {
         assert_eq!(pr_author(&bob, &by_name).email, "bob@example.com");
         let by_login = vec![by("Bob", None, "bob@home.example")];
         assert_eq!(pr_author(&bob, &by_login).email, "bob@home.example");
+    }
+
+    #[test]
+    fn co_authors_do_not_stop_the_author_from_getting_their_email() {
+        let person = |name: &str, email: &str| GhCommitAuthor {
+            name: Some(name.into()),
+            email: Some(email.into()),
+            login: None,
+            is_bot: false,
+        };
+        let commit = |authors: Vec<GhCommitAuthor>| GhCommit {
+            authors,
+            ..GhCommit::default()
+        };
+        let hoang = Some(GhActor {
+            login: Some("hhoangg".into()),
+            name: Some("Hoang".into()),
+            ..GhActor::default()
+        });
+        let claude = || person("Claude Opus 5.5", "noreply@anthropic.com");
+
+        // Local git: the commit author first, then the Co-Authored-By identity.
+        let co_authored = vec![
+            commit(vec![person("hhoangg", "hoang@example.com"), claude()]),
+            commit(vec![person("hhoangg", "hoang@example.com"), claude()]),
+        ];
+        assert_eq!(pr_author(&hoang, &co_authored).email, "hoang@example.com");
+
+        // A co-author without an email, or with a different one, changes nothing.
+        let odd_co_authors = vec![
+            commit(vec![
+                person("hhoangg", "hoang@example.com"),
+                person("Alice", ""),
+            ]),
+            commit(vec![
+                person("hhoangg", "hoang@example.com"),
+                person("Alice", "alice@example.com"),
+            ]),
+        ];
+        assert_eq!(
+            pr_author(&hoang, &odd_co_authors).email,
+            "hoang@example.com"
+        );
+
+        // One commit written by someone else: still nobody to give the email to.
+        let mixed = vec![
+            commit(vec![person("hhoangg", "hoang@example.com"), claude()]),
+            commit(vec![person("Alice", "alice@example.com"), claude()]),
+        ];
+        assert_eq!(pr_author(&hoang, &mixed).email, "");
+
+        // A co-author never supplies the email: the commit author has none.
+        let no_primary_email = vec![commit(vec![person("hhoangg", ""), claude()])];
+        assert_eq!(pr_author(&hoang, &no_primary_email).email, "");
     }
 
     #[test]
