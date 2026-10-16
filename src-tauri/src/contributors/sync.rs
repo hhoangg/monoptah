@@ -582,6 +582,8 @@ struct Month {
     derived: Derived,
     /// Every review of the month's GitHub PRs, whenever it was submitted.
     reviews: Vec<RawReview>,
+    /// The merge walk hit its git call cap, so PRs of the month may be missing.
+    walk_cut: bool,
 }
 
 /// How the GitHub step went for one month.
@@ -929,17 +931,30 @@ fn cancelled(state: &str, note: Option<String>) -> SyncOutcome {
 }
 
 const SURVIVAL_CUT_NOTE: &str = "Survival sampling was cut short.";
+const WALK_CUT_NOTE: &str = "The merge walk was cut short, so some pull requests may be missing.";
 
-/// The note of a coverage row: GitHub's, and survival's when it was cut short.
-fn compose_note(github: Option<String>, survival_cut: bool) -> Option<String> {
-    match (github, survival_cut) {
-        (note, false) => note,
-        (None, true) => Some(SURVIVAL_CUT_NOTE.to_string()),
-        (Some(note), true) => Some(format!("{note} {SURVIVAL_CUT_NOTE}")),
+/// The note of a coverage row: GitHub's, then what was cut short (the merge
+/// walk, survival sampling).
+fn compose_note(github: Option<String>, walk_cut: bool, survival_cut: bool) -> Option<String> {
+    let mut parts: Vec<String> = github.into_iter().collect();
+    if walk_cut {
+        parts.push(WALK_CUT_NOTE.to_string());
     }
+    if survival_cut {
+        parts.push(SURVIVAL_CUT_NOTE.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn run_steps(req: &SyncRequest, reporter: &dyn Reporter) -> Result<SyncOutcome, String> {
+    run_steps_with(req, reporter, &Limits::DEFAULT)
+}
+
+fn run_steps_with(
+    req: &SyncRequest,
+    reporter: &dyn Reporter,
+    limits: &Limits,
+) -> Result<SyncOutcome, String> {
     let stop = || reporter.cancelled();
     let dir = store::git_common_dir(req.root)?;
     let repo = {
@@ -954,6 +969,7 @@ fn run_steps(req: &SyncRequest, reporter: &dyn Reporter) -> Result<SyncOutcome, 
         req,
         repo,
         cancel: &stop,
+        limits,
     };
 
     // Counting: exact totals for every later step.
@@ -1018,12 +1034,13 @@ fn run_steps(req: &SyncRequest, reporter: &dyn Reporter) -> Result<SyncOutcome, 
             if reporter.cancelled() {
                 return Ok(cancelled("complete", None));
             }
-            let derived = run.derive_month(&item.task.head, *chunk, &dropped, &used)?;
+            let (derived, walk_cut) = run.derive_month(&item.task.head, *chunk, &dropped, &used)?;
             used.extend(derived.drafts.iter().map(|d| d.pr.id.clone()));
             months.push(Month {
                 chunk: *chunk,
                 derived,
                 reviews: Vec::new(),
+                walk_cut,
             });
             entries_done += entries;
             reporter.progress(SyncStep::PullRequests, entries_done, entry_total);
@@ -1104,7 +1121,7 @@ fn run_steps(req: &SyncRequest, reporter: &dyn Reporter) -> Result<SyncOutcome, 
                 &item.task.head,
                 candidates,
                 now,
-                &Limits::DEFAULT,
+                limits,
                 Some(&stop),
             )
         } else {
@@ -1114,7 +1131,8 @@ fn run_steps(req: &SyncRequest, reporter: &dyn Reporter) -> Result<SyncOutcome, 
             return Ok(cancelled(worst.0, worst.1));
         }
         let (state, note) = tally.state();
-        let note = compose_note(note, cut);
+        let walk_cut = months.iter().any(|m| m.walk_cut);
+        let note = compose_note(note, walk_cut, cut);
         run.finish(&item.task, &samples, state, note.clone())?;
         if gh_rank(state) > gh_rank(worst.0)
             || (worst.1.is_none() && gh_rank(state) == gh_rank(worst.0))
@@ -1139,6 +1157,7 @@ struct Run<'a> {
     req: &'a SyncRequest<'a>,
     repo: i64,
     cancel: CancelCheck<'a>,
+    limits: &'a Limits,
 }
 
 impl Run<'_> {
@@ -1184,7 +1203,7 @@ impl Run<'_> {
         chunk: (i64, i64),
         dropped: &HashSet<String>,
         used: &HashSet<String>,
-    ) -> Result<Derived, String> {
+    ) -> Result<(Derived, bool), String> {
         let req = self.req;
         let hashes = store::listed_hashes_cancellable(
             req.root,
@@ -1210,17 +1229,19 @@ impl Run<'_> {
             })
             .collect();
         let window = Window::from_epochs(chunk.0, chunk.1);
-        super::derive_prs_known(
+        let mut walk_cut = false;
+        let derived = super::derive_prs_known(
             req.root,
             head,
             &window,
             known,
             dropped,
-            &Limits::DEFAULT,
+            self.limits,
             used.clone(),
             Some(self.cancel),
-            &mut false,
-        )
+            &mut walk_cut,
+        )?;
+        Ok((derived, walk_cut))
     }
 
     /// Overlays GitHub's PRs of the month on the ones git derived and keeps
@@ -3332,14 +3353,80 @@ mod tests {
 
     #[test]
     fn a_cut_short_survival_is_said_in_the_note() {
-        assert_eq!(compose_note(None, false), None);
+        assert_eq!(compose_note(None, false, false), None);
         assert_eq!(
-            compose_note(Some("gh said no".to_string()), false).as_deref(),
+            compose_note(Some("gh said no".to_string()), false, false).as_deref(),
             Some("gh said no")
         );
-        assert_eq!(compose_note(None, true).as_deref(), Some(SURVIVAL_CUT_NOTE));
-        let both = compose_note(Some("gh said no".to_string()), true).unwrap();
+        assert_eq!(
+            compose_note(None, false, true).as_deref(),
+            Some(SURVIVAL_CUT_NOTE)
+        );
+        let both = compose_note(Some("gh said no".to_string()), false, true).unwrap();
         assert!(both.starts_with("gh said no") && both.ends_with(SURVIVAL_CUT_NOTE));
+    }
+
+    #[test]
+    fn a_cut_short_merge_walk_is_said_in_the_note() {
+        assert_eq!(
+            compose_note(None, true, false).as_deref(),
+            Some(WALK_CUT_NOTE)
+        );
+        let all = compose_note(Some("gh said no".to_string()), true, true).unwrap();
+        assert!(all.starts_with("gh said no"));
+        assert!(all.contains(WALK_CUT_NOTE) && all.ends_with(SURVIVAL_CUT_NOTE));
+    }
+
+    #[test]
+    fn a_sync_whose_merge_walk_hits_the_cap_records_it_in_the_coverage_note() {
+        utc();
+        let h = history();
+        let (store, _) = setup(&h.repo);
+        let head = head_of(&h.repo);
+        let (from, to) = jan_feb();
+        let cache = gh::CommitCache::new();
+        let req = SyncRequest {
+            store: &store,
+            root: h.repo.path(),
+            branch: "main",
+            head: &head,
+            from,
+            to,
+            mode: SyncMode::Full,
+            gh: &Unavailable,
+            commit_cache: &cache,
+        };
+        // One git call is the first-parent log itself; the walk behind it is
+        // cut off.
+        let tight = Limits {
+            max_walk_git_calls: 1,
+            ..Limits::DEFAULT
+        };
+        let outcome = run_steps_with(&req, &Recorder::new(), &tight).unwrap();
+        assert!(!outcome.cancelled);
+        let rows = coverage_rows(&h, &store);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            let note = row.gh_note.as_deref().unwrap_or_default();
+            assert!(note.contains(WALK_CUT_NOTE), "no walk note: {note:?}");
+        }
+        assert!(outcome
+            .gh_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains(WALK_CUT_NOTE));
+
+        // With the real cap the same sync is not cut.
+        let (store, _) = setup(&h.repo);
+        let req = SyncRequest {
+            store: &store,
+            ..req
+        };
+        run_steps_with(&req, &Recorder::new(), &Limits::DEFAULT).unwrap();
+        for row in coverage_rows(&h, &store) {
+            let note = row.gh_note.as_deref().unwrap_or_default();
+            assert!(!note.contains(WALK_CUT_NOTE), "{note:?}");
+        }
     }
 
     #[test]

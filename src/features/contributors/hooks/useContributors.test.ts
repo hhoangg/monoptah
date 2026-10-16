@@ -318,6 +318,28 @@ describe("useContributors", () => {
     expect(api.refreshing).toBe(false);
   });
 
+  it("never shows a stale 'not synced' when a job ended while the page was closed", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockImplementation(async () => unsyncedFixture());
+    await mount(cwd);
+    expect(api.sync.state).toBe("notSynced");
+    const estimates = vi.mocked(syncEstimate).mock.calls.length;
+    await act(async () => root.unmount());
+    root = createRoot(container);
+
+    // The sync finishes with no page mounted.
+    await emit(syncEvent(cwd, { state: "done" }));
+
+    const gate = deferred<LoadResponse>();
+    vi.mocked(loadStored).mockReturnValueOnce(gate.promise);
+    await mount(cwd);
+    expect(api.sync.state).toBe("loading");
+    expect(vi.mocked(syncEstimate).mock.calls.length).toBe(estimates);
+
+    await act(async () => gate.resolve(loadFixture()));
+    expect(api.sync.state).toBe("synced");
+  });
+
   it("surfaces a load failure and recovers on a forced retry", async () => {
     vi.mocked(loadStored).mockRejectedValueOnce("git exploded");
     await mount(nextCwd());

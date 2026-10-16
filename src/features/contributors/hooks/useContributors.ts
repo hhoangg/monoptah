@@ -132,6 +132,24 @@ function saveState(cwd: string): SaveState {
   return state;
 }
 
+/**
+ * What a job stored is not in the cached loads of its project: one that said
+ * "not synced" would flash "No data" (and re-run the estimate) when the page
+ * is opened again, until the fresh read returned. This runs for the whole
+ * app, so it also covers jobs that end while no page is mounted. Key format:
+ * `cwd`, branch, since and until, joined with NUL.
+ */
+function forgetLoadsOf(root: string) {
+  const prefix = `${root}\u0000`;
+  for (const cache of [loadCache, inFlight]) {
+    for (const key of [...cache.keys()]) {
+      if (key.startsWith(prefix)) cache.delete(key);
+    }
+  }
+}
+
+onSyncJobEnded((event) => forgetLoadsOf(event.root));
+
 /** Test hook: forget everything cached. */
 export function resetContributorsCache() {
   metaCache.clear();

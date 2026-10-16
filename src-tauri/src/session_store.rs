@@ -984,15 +984,6 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             params![now_millis()],
         )?;
     }
-    if current < 20 {
-        // Contributors keeps processed commits, PRs and reviews here. The
-        // tables themselves are created in the unconditional block below, so
-        // a database that recorded another build's version 20 gets them too.
-        conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (20, ?1)",
-            params![now_millis()],
-        )?;
-    }
     // Create even when a version row already exists (another build may have
     // used the same numbers, or a previous run recorded the version without
     // the table). Restore writes into these; missing tables look like a
@@ -2384,7 +2375,7 @@ mod tests {
                        ON sessions (cwd, has_user_message, updated_at DESC, id, harness,
                                     model, runtime_mode, title, provider_session_id,
                                     created_at, branch, archived, pinned, linked_work_item_json);
-                     DELETE FROM schema_migrations WHERE version IN (16, 17, 18, 19, 20);",
+                     DELETE FROM schema_migrations WHERE version IN (16, 17, 18, 19);",
                 )
                 .unwrap();
                 migrate(&conn).unwrap();

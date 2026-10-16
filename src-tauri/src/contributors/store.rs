@@ -536,8 +536,9 @@ fn gh_rank(state: &str) -> u8 {
 }
 
 /// Adds an interval. Stored intervals that overlap or touch it and carry the
-/// same GitHub state are folded in (the most recently synced of them supplies
-/// head, time and note; the new row wins a tie). Intervals with another state
+/// same GitHub state are folded in (the one that ends last supplies head, time
+/// and note, so the live edge of the row stays with its sync; the newer row wins
+/// a tie). Intervals with another state
 /// are never merged, so a window synced without GitHub keeps saying so: where
 /// the new interval overlaps one of them, that one is cut back to make room.
 pub(super) fn add_coverage(
@@ -567,7 +568,13 @@ pub(super) fn add_coverage(
                 merged.from_epoch.min(other.from_epoch),
                 merged.to_epoch.max(other.to_epoch),
             );
-            if other.synced_at > merged.synced_at {
+            // The merged row keeps the sync that reaches furthest (the newer
+            // one on a tie): its moment and head say how far the row is known
+            // to be current. Taking the newest moment alone would pair it
+            // with another row's older end and lose a live edge.
+            if other.to_epoch > merged.to_epoch
+                || (other.to_epoch == merged.to_epoch && other.synced_at > merged.synced_at)
+            {
                 merged = other;
             }
             merged.from_epoch = from;
@@ -1028,7 +1035,19 @@ fn load_in(
         .iter()
         .max_by_key(|r| (gh_rank(&r.gh_state), r.synced_at));
     let oldest = overlapping.iter().min_by_key(|r| r.synced_at);
-    let gh_state = worst.map(|r| r.gh_state.clone());
+    // A window that mixes rows without GitHub (a small top-up while gh was
+    // offline) with rows that have it still has GitHub data: report it as
+    // partial, with the unavailable row's note, so the reviews that were
+    // synced are not thrown away. Only a window with no GitHub data at all is
+    // unavailable.
+    let has_github_rows = overlapping.iter().any(|r| r.gh_state != "unavailable");
+    let gh_state = worst.map(|r| {
+        if r.gh_state == "unavailable" && has_github_rows {
+            "partial".to_string()
+        } else {
+            r.gh_state.clone()
+        }
+    });
 
     Ok(Loaded {
         raw: RawData {
@@ -1303,7 +1322,29 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
         assert_eq!(tables, 7);
-        assert!(version >= 20);
+        // The fork records no schema version of its own: upstream owns the
+        // numbers, and the tables come from `ensure_tables`.
+        assert_eq!(version, 19);
+    }
+
+    #[test]
+    fn a_fresh_database_gets_the_tables_and_stays_at_version_19() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.lock_conn().unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'contrib_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(tables, 7);
+        assert_eq!(version, 19);
     }
 
     #[test]
@@ -1316,6 +1357,11 @@ mod tests {
         {
             // Another build used version 20 for something else.
             let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (20, 0)",
+                [],
+            )
+            .unwrap();
             conn.execute_batch(
                 "DROP TABLE contrib_repos; DROP TABLE contrib_commits; DROP TABLE contrib_prs;
                  DROP TABLE contrib_commit_prs; DROP TABLE contrib_reviews;
@@ -1491,20 +1537,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(100, 200), (400, 500)]
         );
-        // Adjacent (201 follows 200): merged, newest head and time win.
+        // Adjacent (201 follows 200): merged, the row that ends last wins.
         add(coverage_row(201, 300, "h3", 30));
         let rows = read("main");
         assert_eq!(rows.len(), 2);
         assert_eq!((rows[0].from_epoch, rows[0].to_epoch), (100, 300));
         assert_eq!(rows[0].head, "h3");
         assert_eq!(rows[0].synced_at, 30);
-        // Overlaps both: everything folds into one, an older row never wins.
+        // Overlaps both: everything folds into one, and the row that ends
+        // last (400..500) gives its head and time, even though h3 is newer.
         add(coverage_row(250, 450, "h0", 5));
         let rows = read("main");
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].from_epoch, rows[0].to_epoch), (100, 500));
-        assert_eq!(rows[0].head, "h3");
-        assert_eq!(rows[0].synced_at, 30);
+        assert_eq!(rows[0].head, "h2");
+        assert_eq!(rows[0].synced_at, 20);
         // A branch has its own intervals.
         assert!(read("other").is_empty());
     }
@@ -1567,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn newest_coverage_wins_over_an_older_one_it_merges_with() {
+    fn the_row_that_ends_last_wins_when_coverage_merges() {
         let store = SessionStore::open_in_memory().unwrap();
         let id = {
             let conn = store.lock_conn().unwrap();
@@ -1582,6 +1629,25 @@ mod tests {
         let rows = coverage(&conn, id, "main").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].from_epoch, rows[0].to_epoch), (100, 300));
+        assert_eq!(rows[0].head, "old");
+        assert_eq!(rows[0].synced_at, 10);
+    }
+
+    #[test]
+    fn the_newer_row_wins_when_merged_rows_end_together() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let id = {
+            let conn = store.lock_conn().unwrap();
+            repo_id(&conn, "/r/.git", None).unwrap()
+        };
+        write(&store, |tx| {
+            add_coverage(tx, id, "main", &coverage_row(100, 300, "new", 50))?;
+            add_coverage(tx, id, "main", &coverage_row(150, 300, "old", 10))
+        })
+        .unwrap();
+        let conn = store.lock_conn().unwrap();
+        let rows = coverage(&conn, id, "main").unwrap();
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].head, "new");
         assert_eq!(rows[0].synced_at, 50);
     }
@@ -2044,11 +2110,12 @@ mod tests {
         assert!(feb_only.covered);
         assert_eq!(feb_only.gh_state.as_deref(), Some("complete"));
         assert!(feb_only.raw.gh_available);
-        // January and February together are only as good as January.
+        // January and February together still have GitHub data for February:
+        // partial, with January's note, never unavailable.
         let both = load_between(&f, &f.hashes[2], jan, mar - 1);
         assert!(both.covered);
-        assert_eq!(both.gh_state.as_deref(), Some("unavailable"));
-        assert!(!both.raw.gh_available);
+        assert_eq!(both.gh_state.as_deref(), Some("partial"));
+        assert!(both.raw.gh_available);
         assert_eq!(both.raw.gh_note.as_deref(), Some("unavailable note"));
         assert_eq!(both.synced_at, Some(100));
         // Complete plus partial reports the partial row and its note.
@@ -2056,6 +2123,69 @@ mod tests {
         assert_eq!(late.gh_state.as_deref(), Some("partial"));
         assert!(late.raw.gh_available);
         assert_eq!(late.raw.gh_note.as_deref(), Some("partial note"));
+    }
+
+    #[test]
+    fn a_complete_row_with_an_unavailable_top_up_reports_partial() {
+        let f = synced_fixture();
+        {
+            let conn = f.store.lock_conn().unwrap();
+            conn.execute("DELETE FROM contrib_coverage WHERE repo_id = ?1", [f.id])
+                .unwrap();
+        }
+        let (jan, feb, mar) = (
+            epoch("2026-01-01T00:00:00Z"),
+            epoch("2026-02-01T00:00:00Z"),
+            epoch("2026-03-01T00:00:00Z"),
+        );
+        write(&f.store, |tx| {
+            add_coverage(tx, f.id, "main", &state_row(jan, feb - 1, "complete", 100))?;
+            add_coverage(
+                tx,
+                f.id,
+                "main",
+                &state_row(feb, mar - 1, "unavailable", 200),
+            )
+        })
+        .unwrap();
+        let loaded = load_between(&f, &f.hashes[2], jan, mar - 1);
+        assert_eq!(loaded.gh_state.as_deref(), Some("partial"));
+        assert!(loaded.raw.gh_available);
+        assert_eq!(loaded.raw.gh_note.as_deref(), Some("unavailable note"));
+    }
+
+    #[test]
+    fn rows_that_are_all_unavailable_report_unavailable() {
+        let f = synced_fixture();
+        {
+            let conn = f.store.lock_conn().unwrap();
+            conn.execute("DELETE FROM contrib_coverage WHERE repo_id = ?1", [f.id])
+                .unwrap();
+        }
+        let (jan, feb, mar) = (
+            epoch("2026-01-01T00:00:00Z"),
+            epoch("2026-02-01T00:00:00Z"),
+            epoch("2026-03-01T00:00:00Z"),
+        );
+        write(&f.store, |tx| {
+            // Two rows that stay apart (there is a gap between them).
+            add_coverage(
+                tx,
+                f.id,
+                "main",
+                &state_row(jan, jan + 99, "unavailable", 100),
+            )?;
+            add_coverage(
+                tx,
+                f.id,
+                "main",
+                &state_row(feb, mar - 1, "unavailable", 200),
+            )
+        })
+        .unwrap();
+        let loaded = load_between(&f, &f.hashes[2], jan, mar - 1);
+        assert_eq!(loaded.gh_state.as_deref(), Some("unavailable"));
+        assert!(!loaded.raw.gh_available);
     }
 
     #[test]

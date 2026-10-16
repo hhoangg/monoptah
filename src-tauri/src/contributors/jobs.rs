@@ -107,7 +107,12 @@ pub(super) struct JobSpec {
 impl JobSpec {
     /// Two requests for the same work: running both would only repeat it.
     fn same_work(&self, other: &JobSpec) -> bool {
-        self.branch == other.branch
+        // The worktree counts: a page reads the events of its own folder, so a
+        // job running for another worktree would leave it without progress.
+        // The second job finds everything covered and finishes fast.
+        self.root == other.root
+            && self.cwd == other.cwd
+            && self.branch == other.branch
             && self.from == other.from
             && self.to == other.to
             && self.mode == other.mode
@@ -827,6 +832,37 @@ mod tests {
     }
 
     #[test]
+    fn identical_work_from_two_worktrees_gives_two_jobs_with_their_own_events() {
+        let h = Harness::new();
+        let mut first = spec("repo", "a");
+        first.root = PathBuf::from("/worktree/one");
+        first.cwd = PathBuf::from("/page/one");
+        let mut second = first.clone();
+        second.root = PathBuf::from("/worktree/two");
+        second.cwd = PathBuf::from("/page/two");
+
+        h.jobs.start(first).unwrap();
+        h.sink.wait_state("a", JobState::Running);
+        h.jobs.start(second).unwrap();
+        let states: Vec<_> = h.jobs.status().iter().map(|e| e.state).collect();
+        assert_eq!(states, vec![JobState::Running, JobState::Queued]);
+
+        h.ctl.release("a");
+        h.sink.wait("both done", |events| {
+            events.iter().filter(|e| e.state == JobState::Done).count() == 2
+        });
+        for page in ["/page/one", "/page/two"] {
+            assert!(
+                h.sink
+                    .all()
+                    .iter()
+                    .any(|e| e.root == page && e.state == JobState::Done),
+                "no events for {page}"
+            );
+        }
+    }
+
+    #[test]
     fn same_branch_with_another_period_or_mode_is_a_different_request() {
         let h = Harness::new();
         h.jobs.start(spec("repo", "a")).unwrap();
@@ -1510,10 +1546,11 @@ mod tests {
     }
 
     #[test]
-    fn a_row_merged_into_a_newer_sync_does_not_cover_the_present() {
-        // Scenario B: the current month synced up to the present, then an
-        // older stretch synced later; the two rows merge into one whose end is
-        // the first sync's moment but whose time is the second sync's.
+    fn a_row_merged_with_an_older_stretch_still_covers_the_present() {
+        // The current month synced up to the present, then an older stretch
+        // synced later; the two rows merge. The merged row keeps the first
+        // sync's moment and head, since that sync reaches furthest, so the
+        // present stays covered.
         let repo = repo_with_commits();
         let (store, head) = stored_commits_only(&repo);
         let first = at("2026-01-25T12:00:00Z");
@@ -1539,13 +1576,94 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows.len(), 1, "the rows must have merged: {rows:?}");
-        assert_eq!(rows[0].synced_at, second);
+        assert_eq!(rows[0].synced_at, first);
+        assert_eq!(rows[0].to_epoch, first);
 
         let loaded = load_response(
             &store,
             repo.path(),
             None,
             "2026-01-01T00:00:00Z",
+            "2099-01-01T00:00:00Z",
+            first + 60,
+        )
+        .unwrap();
+        assert!(loaded.covered);
+        assert!(!loaded.has_gaps);
+    }
+
+    #[test]
+    fn syncing_an_older_month_after_the_current_one_keeps_the_current_one_covered() {
+        // Sync the current month (its row starts a month back and ends at the
+        // sync), then go back one month and sync that: a Full sync writes the
+        // month before. Coming back to the current month must not show gaps.
+        let repo = repo_with_commits();
+        let (store, head) = stored_commits_only(&repo);
+        let t1 = at("2026-01-25T12:00:00Z");
+        let t2 = at("2026-01-26T12:00:00Z");
+        set_coverage(
+            &store,
+            &repo,
+            &head,
+            &[
+                (at("2025-12-01T00:00:00Z"), t1, t1),
+                (at("2025-11-01T00:00:00Z"), at("2025-11-30T23:59:59Z"), t2),
+            ],
+        );
+        let loaded = load_response(
+            &store,
+            repo.path(),
+            None,
+            "2026-01-01T00:00:00Z",
+            "2099-01-01T00:00:00Z",
+            t2,
+        )
+        .unwrap();
+        assert!(loaded.covered);
+        assert!(!loaded.has_gaps);
+    }
+
+    #[test]
+    fn a_merge_whose_newest_end_is_in_the_past_does_not_cover_the_present() {
+        // Two rows that both end in the past, the later-synced one ending
+        // earlier: the merged row ends at the furthest past end and carries
+        // that sync's moment, so it does not reach the present.
+        let repo = repo_with_commits();
+        let (store, head) = stored_commits_only(&repo);
+        let first = at("2026-01-25T12:00:00Z");
+        let second = at("2026-01-28T12:00:00Z");
+        set_coverage(
+            &store,
+            &repo,
+            &head,
+            &[
+                (
+                    at("2026-01-01T00:00:00Z"),
+                    at("2026-01-20T23:59:59Z"),
+                    first,
+                ),
+                (
+                    at("2025-10-01T00:00:00Z"),
+                    at("2025-12-31T23:59:59Z"),
+                    second,
+                ),
+            ],
+        );
+        let rows = store
+            .with_read_conn(|conn| {
+                let dir = store::git_common_dir(repo.path())?;
+                let id = store::find_repo_id(conn, &dir)?.unwrap();
+                store::coverage(conn, id, "main")
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the rows must have merged: {rows:?}");
+        assert_eq!(rows[0].synced_at, first);
+
+        let loaded = load_response(
+            &store,
+            repo.path(),
+            None,
+            "2026-01-18T00:00:00Z",
             "2099-01-01T00:00:00Z",
             second,
         )
