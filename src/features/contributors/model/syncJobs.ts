@@ -247,6 +247,12 @@ export async function cancelSyncJobs(cwd: string): Promise<void> {
   }
 }
 
+/** Drops a failed job's entry once the user has seen it. A job that still runs is left alone. */
+export function dismissSyncJob(event: SyncEvent) {
+  const key = eventKey(event);
+  if (jobs[key]?.state === "error") remove(key);
+}
+
 /** Forgets every entry of a project, e.g. after its synced data was cleared. */
 export function forgetSyncJobs(root: string) {
   const prefix = `${root}\u0000`;

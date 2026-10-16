@@ -1060,6 +1060,16 @@ describe("useContributors sync store states", () => {
     expect(api.sync.job?.state).toBe("queued");
   });
 
+  it("the sync error can be dismissed, and the store forgets it", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(cwd);
+    await emit(syncEvent(cwd, { state: "error", error: "git exploded" }));
+    expect(api.sync.jobError).toBe("git exploded");
+    await act(async () => api.sync.dismissJobError());
+    expect(api.sync.jobError).toBeUndefined();
+  });
+
   it("a rejected start is reported as the job error", async () => {
     vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
     vi.mocked(startSync).mockRejectedValueOnce("Could not start the sync");

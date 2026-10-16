@@ -14126,6 +14126,7 @@ function Workspace({
                   providers={usageProviders}
                   session={usageSession}
                   project={active?.cwd ?? projectCwd}
+                  onOpenContributors={onOpenContributors}
                   onSelectAccount={onSelectProviderAccount}
                   onManageAccounts={() =>
                     openSettings("providers", "provider-accounts")

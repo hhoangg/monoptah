@@ -28,6 +28,7 @@ import {
   Sparkles,
   Trophy,
   Users,
+  X,
 } from "../../../shared/ui/icons";
 import { lazySurface } from "../../../shared/ui/lazySurface";
 import { Popover } from "../../../shared/ui/Popover";
@@ -134,9 +135,11 @@ function Alert({
   onRetry,
   retrying = false,
   actionLabel = "Retry",
+  onDismiss,
 }: {
   children: string;
   onRetry?: () => void;
+  onDismiss?: () => void;
   retrying?: boolean;
   actionLabel?: string;
 }) {
@@ -152,6 +155,17 @@ function Alert({
           <RefreshCw className="size-3" strokeWidth={1.75} />
           {actionLabel}
         </SecondaryButton>
+      ) : null}
+      {onDismiss ? (
+        <button
+          type="button"
+          aria-label="Dismiss"
+          title="Dismiss"
+          onClick={onDismiss}
+          className="mt-0.5 shrink-0 rounded text-red-400/70 hover:text-red-400 focus-visible:outline-2 focus-visible:outline-accent"
+        >
+          <X className="size-3.5" strokeWidth={1.75} />
+        </button>
       ) : null}
     </div>
   );
@@ -460,7 +474,9 @@ export function ContributorsView({
               <Alert>{`Could not save ${CONFIG_PATH}: ${data.saveError}`}</Alert>
             ) : null}
             {sync.jobError ? (
-              <Alert>{`The sync stopped: ${sync.jobError}`}</Alert>
+              <Alert onDismiss={sync.dismissJobError}>
+                {`The sync stopped: ${sync.jobError}`}
+              </Alert>
             ) : null}
             {sync.actionError ? <Alert>{sync.actionError}</Alert> : null}
 

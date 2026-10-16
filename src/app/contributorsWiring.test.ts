@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 import app from "./App.tsx?raw";
+import footer from "./shell/UsageFooter.tsx?raw";
 
 // App.tsx is too large to mount in a test, so the wiring is checked on the
 // source: a missed opener leaves two views mounted at once.
@@ -276,4 +277,18 @@ it("the retired one-shot collect command is not invoked or registered anywhere",
   expect(lib).not.toContain(RETIRED);
   expect(lib).toContain("contributors::contributors_load");
   expect(lib).toContain("contributors::contributors_sync_start");
+});
+
+it("the footer sync indicator sits before the Terminal item and opens Contributors", () => {
+  const group = footer.indexOf("ml-auto flex shrink-0 items-center gap-2");
+  expect(group).toBeGreaterThan(-1);
+  const indicator = footer.indexOf("<SyncIndicator", group);
+  const chip = footer.indexOf("<RunningTerminalChip", group);
+  expect(indicator).toBeGreaterThan(-1);
+  expect(indicator).toBeLessThan(chip);
+  const start = lines.findIndex((l) => l.includes("<UsageFooter"));
+  expect(start).toBeGreaterThan(-1);
+  expect(lines.slice(start, start + 30).join("\n")).toContain(
+    "onOpenContributors={onOpenContributors}",
+  );
 });

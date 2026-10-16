@@ -7,6 +7,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { UsageFooter } from "./UsageFooter";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// These tests count `invoke` calls; the footer's contributors sync store
+// would add its own status query and focus checks.
+vi.mock("../../features/contributors/model/syncJobs", () => ({
+  ensureSyncJobs: vi.fn(),
+  useSyncJobs: () => ({}),
+  dismissSyncJob: vi.fn(),
+}));
 let container: HTMLDivElement;
 let root: Root;
 const quota = (percent: number) => ({

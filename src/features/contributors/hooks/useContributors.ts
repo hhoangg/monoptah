@@ -45,6 +45,7 @@ import { isLive } from "../model/syncEvents";
 import {
   cancelSyncJobs,
   ensureSyncJobs,
+  dismissSyncJob,
   forgetSyncJobs,
   jobKey,
   onSyncJobEnded,
@@ -595,6 +596,10 @@ export function useContributors(cwd: string) {
 
   const startFullSync = useCallback(() => begin("full"), [begin]);
   const retryGithub = useCallback(() => begin("github"), [begin]);
+  const failedJob = thisJob?.state === "error" ? thisJob : undefined;
+  const dismissJobError = useCallback(() => {
+    if (failedJob) dismissSyncJob(failedJob);
+  }, [failedJob]);
   const cancelSync = useCallback(async () => {
     if (!cwd) return;
     try {
@@ -707,6 +712,7 @@ export function useContributors(cwd: string) {
       /** The queued or running job of this period, or null. */
       job: liveJob,
       jobError,
+      dismissJobError,
       actionError,
     },
     startSync: startFullSync,

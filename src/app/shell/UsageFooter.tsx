@@ -1,4 +1,4 @@
-import { RefreshCw, Terminal } from "../../shared/ui/icons";
+import { Analytics, RefreshCw, Terminal } from "../../shared/ui/icons";
 import {
   useCallback,
   useEffect,
@@ -33,6 +33,12 @@ import {
   runningTerminalChipLabel,
   type RunningTerminal,
 } from "../../features/terminal/model/terminalTab";
+import { summarizeSync } from "../../features/contributors/model/syncIndicator";
+import {
+  dismissSyncJob,
+  ensureSyncJobs,
+  useSyncJobs,
+} from "../../features/contributors/model/syncJobs";
 import { MOD } from "../../platform/tauri/platform";
 import {
   USAGE_REFRESH_CLASSES,
@@ -75,6 +81,7 @@ export function UsageFooter({
   onNewTerminal,
   onShowTerminal,
   projectTerminalActive = false,
+  onOpenContributors,
   onSelectAccount,
   onManageAccounts,
 }: {
@@ -87,12 +94,20 @@ export function UsageFooter({
   onNewTerminal?: () => void;
   onShowTerminal?: () => void;
   projectTerminalActive?: boolean;
+  /** Opens the Contributors page of the project at `path`. */
+  onOpenContributors?: (path: string) => void;
   onSelectAccount?: (
     provider: ProviderAccountProvider,
     accountId: string,
   ) => void;
   onManageAccounts?: (provider: ProviderAccountProvider) => void;
 }) {
+  const syncSummary = summarizeSync(useSyncJobs());
+  // Listens once for the whole app, so a sync started on the Contributors
+  // page is still visible here, and one that survived a reload is picked up.
+  useEffect(() => {
+    void ensureSyncJobs();
+  }, []);
   const opencode = useCachedRateLimits("opencode");
   const showUsage =
     providers.some((provider) => provider !== "opencode") ||
@@ -105,13 +120,14 @@ export function UsageFooter({
   const onTerminalClick = projectTerminalActive
     ? (onShowTerminal ?? onNewTerminal)
     : (onNewTerminal ?? onShowTerminal);
-  const ariaLabel = showUsage || session?.harness === "pi"
-    ? "Provider usage"
-    : showTerminals || showTerminalButton
-      ? "Terminals"
-      : session
-        ? "Session"
-        : undefined;
+  const ariaLabel =
+    showUsage || session?.harness === "pi"
+      ? "Provider usage"
+      : showTerminals || showTerminalButton
+        ? "Terminals"
+        : session
+          ? "Session"
+          : undefined;
 
   return (
     <footer
@@ -133,8 +149,14 @@ export function UsageFooter({
           ) : null
         }
       />
-      {showTerminals || showTerminalButton ? (
+      {syncSummary || showTerminals || showTerminalButton ? (
         <div className="ml-auto flex shrink-0 items-center gap-2">
+          {syncSummary ? (
+            <SyncIndicator
+              summary={syncSummary}
+              onOpenContributors={onOpenContributors}
+            />
+          ) : null}
           {showTerminals ? (
             <RunningTerminalChip
               terminals={terminals}
@@ -504,6 +526,44 @@ export function UsageChips({
         />
       </button>
     </>
+  );
+}
+
+/**
+ * Progress of the running Contributors syncs while another view is open:
+ * the analytics icon and the percent. A failed sync turns it red and keeps
+ * it until the click, which opens the project's page and dismisses it.
+ */
+function SyncIndicator({
+  summary,
+  onOpenContributors,
+}: {
+  summary: NonNullable<ReturnType<typeof summarizeSync>>;
+  onOpenContributors?: (path: string) => void;
+}) {
+  const { failed, percent, target, title } = summary;
+  const label = failed
+    ? "Contributors sync stopped"
+    : `Syncing contributors ${percent ?? 0}%`;
+  return (
+    <button
+      type="button"
+      data-testid="contributors-sync"
+      className={`inline-flex h-5 shrink-0 items-center gap-1.5 whitespace-nowrap rounded px-1.5 hover:bg-content/10 ${
+        failed ? "text-red-400" : "text-accent"
+      }`}
+      aria-label={label}
+      title={title}
+      onClick={() => {
+        onOpenContributors?.(target.root);
+        if (failed) dismissSyncJob(failed);
+      }}
+    >
+      <Analytics className="size-3.5" strokeWidth={1.75} aria-hidden />
+      {percent === null ? null : (
+        <span className="tabular-nums">{percent}%</span>
+      )}
+    </button>
   );
 }
 

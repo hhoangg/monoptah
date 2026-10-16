@@ -13,6 +13,7 @@ import { cancelSync, startSync, syncStatus } from "./api";
 import type { SyncEvent } from "./syncEvents";
 import {
   cancelSyncJobs,
+  dismissSyncJob,
   ensureSyncJobs,
   eventKey,
   forgetSyncJobs,
@@ -261,5 +262,15 @@ describe("sync jobs store", () => {
     expect(Object.keys(getSyncJobs())).toEqual([
       jobKey("/work/other", "main", secs(FROM), secs(TO)),
     ]);
+  });
+
+  it("dismisses a failure but never a running job", async () => {
+    await ensureSyncJobs();
+    emit(event({ from: 1, to: 2, state: "error", error: "boom" }));
+    emit(event());
+    dismissSyncJob(event());
+    expect(getSyncJobs()[keyOf()]).toBeDefined();
+    dismissSyncJob(event({ from: 1, to: 2 }));
+    expect(getSyncJobs()[keyOf({ from: 1, to: 2 })]).toBeUndefined();
   });
 });
