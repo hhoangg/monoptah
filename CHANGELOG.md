@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-10-16
+
+### Added
+
+- **All time** in the Contributors period picker, after Year. It covers everything from the first commit of the branch to today, for both Stats and Leaderboard. There is no earlier period to compare with, so KPI changes and rank movement are hidden. The chart groups by month, or by year when the history is longer than four years.
+- Releases now update the Homebrew cask in `hhoangg/homebrew-monoptah` automatically when the `HOMEBREW_TAP_TOKEN` secret is set. Pre-release tags are skipped, and the cask is never moved to an older version.
+
+### Fixed
+
+- The Leaderboard no longer lists the same person twice when their commits carry a `Co-Authored-By` trailer (for example an AI agent). The pull request author is now matched to their commits by the commit author only. Data synced before this fix keeps the split until you run **Clear synced data** and **Sync** again.
+
 ## [0.23.0] - 2026-10-16
 
 ### Changed
