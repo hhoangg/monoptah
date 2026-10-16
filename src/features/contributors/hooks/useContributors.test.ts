@@ -1471,6 +1471,56 @@ describe("useContributors All time", () => {
     expect(firstCommit).toHaveBeenCalledTimes(2);
   });
 
+  it("reads the first commit again when the branch head moves, not when it stays", async () => {
+    const withHead = (head: string) =>
+      loadFixture({ raw: makeRaw({ head }), coverageHead: head, head });
+    vi.mocked(loadStored).mockImplementation(async () => withHead("h1"));
+    await mount(nextCwd());
+    await selectAll();
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(firstCommit).toHaveBeenCalledTimes(1);
+
+    // A merge of an older unrelated history moves the start.
+    vi.mocked(loadStored).mockImplementation(async () => withHead("h2"));
+    vi.mocked(firstCommit).mockResolvedValue(
+      new Date(2019, 0, 9).toISOString(),
+    );
+    await act(async () => api.refresh(false));
+    expect(firstCommit).toHaveBeenCalledTimes(2);
+    expect(api.period.start).toEqual(new Date(2019, 0, 9));
+    expect(vi.mocked(loadStored).mock.calls.at(-1)![1].since).toBe(
+      isoSeconds(new Date(2019, 0, 9)),
+    );
+    await act(async () => api.refresh(false));
+    expect(firstCommit).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the newer answer when an older read finishes last", async () => {
+    const slow = deferred<string | null>();
+    vi.mocked(firstCommit).mockReturnValueOnce(slow.promise);
+    await mount(nextCwd());
+    await selectAll();
+    // The forced refresh asks again and gets the newer answer first.
+    vi.mocked(firstCommit).mockResolvedValueOnce(
+      new Date(2019, 0, 9).toISOString(),
+    );
+    await act(async () => api.refresh(true));
+    expect(api.period.start).toEqual(new Date(2019, 0, 9));
+    await act(async () => slow.resolve(new Date(2023, 4, 17).toISOString()));
+    expect(api.period.start).toEqual(new Date(2019, 0, 9));
+  });
+
+  it("shows the error state, not the empty one, for a date it cannot read", async () => {
+    vi.mocked(firstCommit).mockResolvedValue("not a date");
+    localStorage.setItem(RANGE_KEY, "all");
+    await mount(nextCwd());
+    expect(api.status).toBe("error");
+    expect(api.error).toContain("not a date");
+    expect(loadStored).not.toHaveBeenCalled();
+  });
+
   it("covers today only for a repository without commits", async () => {
     vi.mocked(firstCommit).mockResolvedValue(null);
     await mount(nextCwd());

@@ -266,7 +266,9 @@ export function LeaderboardTab({
           <div className="flex flex-col items-center gap-2 border-t border-stroke px-4 py-8 text-center">
             <Users className="size-5 text-content/35" strokeWidth={1.75} />
             <p className="text-[13px] font-medium">
-              {`No scored activity in ${model.period.label}`}
+              {model.period.kind === "all"
+                ? "No scored activity of all time"
+                : `No scored activity in ${model.period.label}`}
             </p>
             <p className="text-[12px] text-content/50">
               Merged pull requests, commits and reviews in the period appear

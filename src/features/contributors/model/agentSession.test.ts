@@ -36,6 +36,12 @@ describe("contributorsSessionTitle", () => {
     );
   });
 
+  it("reads the all-time snapshot as all time", () => {
+    expect(contributorsSessionTitle("contributors-all.json")).toBe(
+      "Contributors all time",
+    );
+  });
+
   it("falls back to a plain title for other names", () => {
     expect(contributorsSessionTitle("notes.json")).toBe("Contributors");
     expect(contributorsSessionTitle("contributors-.json")).toBe("Contributors");

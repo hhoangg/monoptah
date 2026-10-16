@@ -101,6 +101,10 @@ const toppedUp = new Set<string>();
  */
 const firstCommitCache = new Map<string, string | null>();
 const firstCommitInFlight = new Map<string, Promise<string | null>>();
+/** Sequence number of the latest first-commit read started for a key. */
+const firstCommitStartedAt = new Map<string, number>();
+/** The branch head the cached first commit was last checked against, per key. */
+const firstCommitHead = new Map<string, string>();
 const saves = new Map<string, SaveState>();
 /** One read of a project's files at a time, so a remount does not repeat it. */
 const metaInFlight = new Map<
@@ -164,6 +168,8 @@ export function resetContributorsCache() {
   inFlight.clear();
   firstCommitCache.clear();
   firstCommitInFlight.clear();
+  firstCommitStartedAt.clear();
+  firstCommitHead.clear();
   metaInFlight.clear();
   saves.clear();
   startedAt.clear();
@@ -261,7 +267,9 @@ function loadPeriod(
 
 /**
  * Reads where All time starts. A plain read joins one already running; a fresh
- * one (a forced refresh) never does. The answer is cached whatever it is.
+ * one (a forced refresh, or a moved branch head) never does. Whichever read
+ * started last decides what is cached, and an answer that is not a date is an
+ * error, not an empty repository.
  */
 function loadFirstCommit(
   cwd: string,
@@ -271,8 +279,18 @@ function loadFirstCommit(
 ): Promise<string | null> {
   const joined = fresh ? undefined : firstCommitInFlight.get(key);
   if (joined) return joined;
+  const seq = (requestSeq += 1);
+  firstCommitStartedAt.set(key, seq);
   const request = firstCommit(cwd, branch)
     .then((iso) => {
+      if (iso !== null && Number.isNaN(Date.parse(iso))) {
+        throw new Error(`Could not read the first commit date: ${iso}`);
+      }
+      // A read started after this one was asked for: its answer is newer.
+      if ((firstCommitStartedAt.get(key) ?? 0) > seq) {
+        if (!firstCommitCache.has(key)) remember(firstCommitCache, key, iso);
+        return firstCommitCache.get(key) ?? iso;
+      }
       remember(firstCommitCache, key, iso);
       return iso;
     })
@@ -384,11 +402,14 @@ export function useContributors(cwd: string) {
   const wantsAll = pick.kind === "all";
   const firstIso = wantsAll ? recall(firstCommitCache, firstKey) : undefined;
   // undefined: not known yet; null: the repository has no commits.
-  const firstDate = useMemo(() => {
-    if (firstIso === undefined || firstIso === null) return firstIso;
-    const date = new Date(firstIso);
-    return Number.isNaN(date.getTime()) ? null : date;
-  }, [firstIso]);
+  // Only dates that parse are cached.
+  const firstDate = useMemo(
+    () =>
+      firstIso === undefined || firstIso === null
+        ? firstIso
+        : new Date(firstIso),
+    [firstIso],
+  );
   const awaitingFirst = wantsAll && firstDate === undefined;
   // A pick without an id follows the current period as the days pass.
   const period = useMemo(
@@ -669,6 +690,16 @@ export function useContributors(cwd: string) {
     toppedUp.add(once);
     void begin("full");
   }, [cwd, key, loaded, repair, liveJob, begin]);
+
+  // A merge of an older unrelated history moves the start of All time, and it
+  // arrives as a new branch head: read the first commit again when it changes.
+  const head = loaded?.head;
+  useEffect(() => {
+    if (!wantsAll || !head) return;
+    const seen = firstCommitHead.get(firstKey);
+    firstCommitHead.set(firstKey, head);
+    if (seen !== undefined && seen !== head) void fetchFirst(true);
+  }, [wantsAll, head, firstKey, fetchFirst]);
 
   const select = useCallback((next: PeriodPick) => {
     writePeriodPick(next);

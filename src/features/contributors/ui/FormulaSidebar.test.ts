@@ -198,9 +198,9 @@ describe("FormulaSidebar period wording", () => {
   it("names All time by its label", async () => {
     const all = currentPeriod("all", NOW, new Date(2026, 8, 1));
     await render(leaderboardModel({ period: all }));
-    expect(text()).toContain("Your score over All time:");
+    expect(text()).toContain("Your score of all time:");
     await render(leaderboardModel({ period: all, user: undefined }));
-    expect(text()).toContain("No activity for you over All time yet");
+    expect(text()).toContain("No activity for you in all time yet");
   });
 
   it("names a quarter and a year by their labels", async () => {

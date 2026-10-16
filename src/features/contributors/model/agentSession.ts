@@ -13,9 +13,13 @@ export function utf8ToBase64(text: string): string {
   return btoa(binary);
 }
 
-/** `contributors-2026-10.json` becomes "Contributors 2026-10". */
+/**
+ * `contributors-2026-10.json` becomes "Contributors 2026-10"; the All time
+ * snapshot, `contributors-all.json`, becomes "Contributors all time".
+ */
 export function contributorsSessionTitle(fileName: string): string {
   const id = /^contributors-(.+)\.json$/.exec(fileName)?.[1];
+  if (id === "all") return "Contributors all time";
   return id ? `Contributors ${id}` : "Contributors";
 }
 

@@ -277,12 +277,15 @@ export function FormulaSidebar({
   const { config, raw } = model;
   const me = model.leaderboard.rows.find((r) => r.isMe);
   const reason = raw.ghNote?.trim().replace(/[.\s]+$/, "");
+  const allTime = model.period.kind === "all";
+  // "Your score of all time" but "No activity for you in all time yet".
   const periodWord =
     model.period.kind === "7d"
       ? "in the last 7 days"
-      : model.period.kind === "all"
-        ? `over ${model.period.label}`
+      : allTime
+        ? "of all time"
         : `in ${model.period.label}`;
+  const quietWord = allTime ? "in all time" : periodWord;
   const customWeights = WEIGHT_FIELDS.filter(
     ({ key }) => config.weights[key] !== 1,
   );
@@ -328,7 +331,7 @@ export function FormulaSidebar({
         {me ? (
           <Breakdown row={me} weights={config.weights} />
         ) : (
-          <p>{`No activity for you ${periodWord} yet`}</p>
+          <p>{`No activity for you ${quietWord} yet`}</p>
         )}
         {customWeights.length > 0 ? (
           <p>

@@ -2138,7 +2138,9 @@ fn read_git_user(cwd: &Path) -> Result<GitUser, String> {
 /// The committer date (ISO 8601, in the commit's own zone) of the oldest root
 /// commit reachable from `branch`, or None for a repository without commits.
 /// A root has no parent; several exist when unrelated histories were merged,
-/// so the oldest of them wins. Cheap: it does not walk the whole history.
+/// so the oldest of them wins. `rev-list` still visits every commit reachable
+/// from the branch, but it reads no trees or diffs, so it is far cheaper than
+/// collecting the history.
 fn first_commit(cwd: &Path, branch: Option<&str>) -> Result<Option<String>, String> {
     let root = repo_root(cwd)?;
     let head = match resolve_branch(&root, branch) {

@@ -372,6 +372,13 @@ describe("LeaderboardTab empty", () => {
     expect(container.querySelector("[data-podium]")).toBeNull();
     expect(container.textContent).toContain("How is the score calculated?");
   });
+
+  it("words the empty board of All time as of all time", async () => {
+    const all = currentPeriod("all", NOW, new Date(2026, 8, 1));
+    await render(leaderboardModel({ period: all, raw: makeRaw() }));
+    expect(container.textContent).toContain("No scored activity of all time");
+    expect(container.textContent).not.toContain("in All time");
+  });
 });
 
 describe("LeaderboardTab summary line", () => {
