@@ -619,12 +619,13 @@ fn is_bot_author(author: &GhCommitAuthor) -> bool {
         || non_empty(&author.login).is_some_and(|l| l.to_ascii_lowercase().ends_with("[bot]"))
 }
 
-/// The one email every non-bot commit author of the PR shares (case
-/// insensitive), when those authors can only be the PR author: none carries a
-/// login (the login match already failed, so a login belongs to someone else)
-/// and every name is the PR author's `name` or `login` (case insensitive).
-/// Only the first entry of each commit's `authors` (the git author) is judged;
-/// co-authors are ignored, since a `Co-Authored-By` trailer says who helped,
+/// The one email the primary author (the first entry of `authors`, the git
+/// author) of every non-bot commit of the PR shares (case insensitive), when
+/// those authors can only be the PR author: none carries a login (the login
+/// match already failed, so a login belongs to someone else) and every name is
+/// the PR author's `name` or `login` (case insensitive).
+/// Only that first entry of each commit is judged; co-authors are ignored,
+/// since a `Co-Authored-By` trailer says who helped,
 /// not who wrote the commit. A commit whose author is a bot is skipped.
 /// `None` when the authors differ, when one of them has no email, or when there
 /// is no such author.
@@ -3255,6 +3256,21 @@ mod tests {
             commit_by_emails(&[("", false)]),
         ];
         assert_eq!(pr_author(&actor, &unknown).email, "");
+
+        // A commit whose primary author is a bot is skipped, not disqualifying.
+        let bot_first = vec![
+            GhCommit {
+                authors: vec![GhCommitAuthor {
+                    name: Some("dependabot[bot]".into()),
+                    email: Some("49699333+dependabot[bot]@users.noreply.github.com".into()),
+                    login: Some("dependabot[bot]".into()),
+                    is_bot: true,
+                }],
+                ..GhCommit::default()
+            },
+            commit_by_emails(&[("ann@example.com", false)]),
+        ];
+        assert_eq!(pr_author(&actor, &bot_first).email, "ann@example.com");
 
         // A match by login still wins over the fallback.
         let matched = vec![GhCommit {
