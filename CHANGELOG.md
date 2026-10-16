@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-16
+
+### Changed
+
+- **Contributors syncs on demand and keeps what it read.** Commits, pull requests, reviews and survival are stored in the app database once, so any period opens from there without reading git or GitHub again. A period that was never synced shows an estimate of the work and a **Sync** button, and nothing runs until you press it. Syncing a period also syncs the one before it, for comparisons. Large repositories no longer hit "The history was too large", because the work runs in small batches and GitHub is read one month at a time.
+- Sync shows progress with real counts and can be cancelled. Work that already finished is kept, and the next Sync continues from there. A sync keeps running when you leave the page, and the footer shows its progress next to the Terminal button. Click it to go back.
+- A synced period updates itself in the background when the branch moves, including merges that bring in older commits.
+- Periods are now **7d**, **Month**, **Quarter** and **Year**, and you can step back to any month, quarter or year. Stats and Leaderboard use the same period, and the leaderboard ranks that period. KPI changes compare against the same number of elapsed days of the previous period.
+- "Clear synced data" in the page menu removes everything stored for a repository.
+
+### Fixed
+
+- Opening a file, a terminal or a diff from the sidebar while Contributors is open now closes the page.
+- A gh test no longer trips the newer clippy `useless_format` lint, so CI is green on every platform.
+
 ## [0.22.0] - 2026-10-15
 
 ### Changed
