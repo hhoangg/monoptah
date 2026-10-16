@@ -5,9 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { formatScore } from "../model/format";
 import type { LeaderboardRow } from "../model/leaderboard";
 import type { ContributorsModel } from "../model/pipeline";
-import { currentPeriod, previousPeriod } from "../model/period";
-import { makeRaw } from "../model/testFixtures";
-import { leaderboardModel, NOW } from "./leaderboardFixture";
+import { currentPeriod } from "../model/period";
+import { makeRaw, priorOf } from "../model/testFixtures";
+import { leaderboardModel, leaderboardRaw, NOW } from "./leaderboardFixture";
 import { LeaderboardTab, type LeaderboardTabProps } from "./LeaderboardTab";
 
 let container: HTMLDivElement;
@@ -201,6 +201,23 @@ describe("LeaderboardTab movement", () => {
     expect(glyphs[3][1]).toBe("Not ranked in the previous period");
   });
 
+  it("shows no movement at all for All time, which has no previous period", async () => {
+    const all = currentPeriod("all", NOW, new Date(2026, 8, 1));
+    const model = leaderboardModel({
+      period: all,
+      raw: leaderboardRaw({ since: all.start.toISOString() }),
+    });
+    expect(model.previousPeriod).toBeNull();
+    await render(model);
+    expect(rows()).toHaveLength(4);
+    expect(rows().map((r) => cells(r)[0])).toEqual(["1", "2", "3", "4"]);
+    for (const row of rows()) {
+      expect(row.querySelector("[title]")).toBeNull();
+    }
+    expect(container.textContent).not.toContain("previous period");
+    expect(container.textContent).not.toMatch(/[▲▼]/);
+  });
+
   it("pluralizes a bigger move", async () => {
     await render(withMovement(leaderboardModel(), 1, 2));
     const el = rows()[1].querySelector<HTMLElement>("[title]");
@@ -330,7 +347,7 @@ describe("LeaderboardTab period", () => {
 
   it("titles the board with the ranked period", async () => {
     await render(
-      leaderboardModel({ period: previousPeriod(currentPeriod("month", NOW)) }),
+      leaderboardModel({ period: priorOf(currentPeriod("month", NOW)) }),
     );
     expect(container.textContent).toContain("period: Sep 2026");
     expect(container.textContent).not.toContain("resets monthly");
@@ -354,6 +371,13 @@ describe("LeaderboardTab empty", () => {
     expect(container.querySelector("table")).toBeNull();
     expect(container.querySelector("[data-podium]")).toBeNull();
     expect(container.textContent).toContain("How is the score calculated?");
+  });
+
+  it("words the empty board of All time as of all time", async () => {
+    const all = currentPeriod("all", NOW, new Date(2026, 8, 1));
+    await render(leaderboardModel({ period: all, raw: makeRaw() }));
+    expect(container.textContent).toContain("No scored activity of all time");
+    expect(container.textContent).not.toContain("in All time");
   });
 });
 

@@ -87,9 +87,10 @@ export function AskAgentDialog({
     () => askContextChips(model, project, scope),
     [model, project, scope],
   );
+  const hasPrevious = model.previousPeriod !== null;
   const suggestions = useMemo(
-    () => suggestedQuestions(scope, name),
-    [scope, name],
+    () => suggestedQuestions(scope, name, { hasPrevious }),
+    [scope, name, hasPrevious],
   );
   const canStart = question.trim().length > 0 && !starting;
 

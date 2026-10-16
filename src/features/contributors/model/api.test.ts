@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   cancelSync,
   clearSynced,
+  firstCommit,
   gitUser,
   listBranches,
   loadStored,
@@ -162,6 +163,23 @@ describe("contributors api", () => {
     });
     expect(mocked).toHaveBeenCalledWith("contributors_git_user", {
       cwd: "/repo",
+    });
+  });
+
+  it("reads the first commit date of a branch, null for none", async () => {
+    mocked.mockResolvedValueOnce("2023-05-17T15:40:00+02:00");
+    await expect(firstCommit("/repo", "dev")).resolves.toBe(
+      "2023-05-17T15:40:00+02:00",
+    );
+    expect(mocked).toHaveBeenLastCalledWith("contributors_first_commit", {
+      cwd: "/repo",
+      branch: "dev",
+    });
+    mocked.mockResolvedValueOnce(null);
+    await expect(firstCommit("/repo")).resolves.toBeNull();
+    expect(mocked).toHaveBeenLastCalledWith("contributors_first_commit", {
+      cwd: "/repo",
+      branch: null,
     });
   });
 

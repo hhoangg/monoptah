@@ -15,18 +15,20 @@ import {
   previousPeriod,
   syncWindow,
 } from "./period";
+import { priorOf } from "./testFixtures";
 
 const NOW = new Date(2026, 8, 15, 14, 30); // Tue 2026-09-15
 
 const ymd = (d: Date) => [d.getFullYear(), d.getMonth() + 1, d.getDate()];
 
 describe("kinds", () => {
-  it("lists the four kinds and defaults to 7d", () => {
+  it("lists the five kinds, All time last, and defaults to 7d", () => {
     expect(PERIOD_KINDS).toEqual([
       { value: "7d", label: "7d" },
       { value: "month", label: "Month" },
       { value: "quarter", label: "Quarter" },
       { value: "year", label: "Year" },
+      { value: "all", label: "All time" },
     ]);
     expect(DEFAULT_PERIOD_KIND).toBe("7d");
   });
@@ -89,21 +91,21 @@ describe("currentPeriod", () => {
 
 describe("previousPeriod", () => {
   it("7d is the 7 days before", () => {
-    const prev = previousPeriod(currentPeriod("7d", NOW));
+    const prev = priorOf(currentPeriod("7d", NOW));
     expect(prev.kind).toBe("7d");
     expect(ymd(prev.start)).toEqual([2026, 9, 2]);
     expect(ymd(prev.end)).toEqual([2026, 9, 9]);
   });
 
   it("month rolls Jan back to the previous December", () => {
-    const prev = previousPeriod(currentPeriod("month", new Date(2027, 0, 10)));
+    const prev = priorOf(currentPeriod("month", new Date(2027, 0, 10)));
     expect(prev.id).toBe("2026-12");
     expect(prev.label).toBe("Dec 2026");
     expect(ymd(prev.end)).toEqual([2027, 1, 1]);
   });
 
   it("quarter rolls Q1 back to Q4 of the previous year", () => {
-    const prev = previousPeriod(currentPeriod("quarter", new Date(2027, 1, 1)));
+    const prev = priorOf(currentPeriod("quarter", new Date(2027, 1, 1)));
     expect(prev.id).toBe("2026-Q4");
     expect(prev.label).toBe("Q4 2026");
     expect(ymd(prev.start)).toEqual([2026, 10, 1]);
@@ -111,14 +113,14 @@ describe("previousPeriod", () => {
   });
 
   it("year is the year before", () => {
-    const prev = previousPeriod(currentPeriod("year", NOW));
+    const prev = priorOf(currentPeriod("year", NOW));
     expect(prev.id).toBe("2025");
     expect(ymd(prev.start)).toEqual([2025, 1, 1]);
   });
 
   it("walks back over a leap February", () => {
     const mar = currentPeriod("month", new Date(2028, 2, 5));
-    const feb = previousPeriod(mar);
+    const feb = priorOf(mar);
     expect(feb.id).toBe("2028-02");
     expect(ymd(feb.end)).toEqual([2028, 3, 1]);
   });
@@ -132,11 +134,11 @@ describe("nextPeriod", () => {
   });
 
   it("steps forward from a past period", () => {
-    const aug = previousPeriod(currentPeriod("month", NOW));
+    const aug = priorOf(currentPeriod("month", NOW));
     expect(nextPeriod(aug, NOW)?.id).toBe("2026-09");
-    const q2 = previousPeriod(currentPeriod("quarter", NOW));
+    const q2 = priorOf(currentPeriod("quarter", NOW));
     expect(nextPeriod(q2, NOW)?.id).toBe("2026-Q3");
-    const y = previousPeriod(currentPeriod("year", NOW));
+    const y = priorOf(currentPeriod("year", NOW));
     expect(nextPeriod(y, NOW)?.id).toBe("2026");
   });
 
@@ -157,12 +159,14 @@ describe("nextPeriod", () => {
 describe("periodFromId", () => {
   it("round trips every kind", () => {
     for (const { value } of PERIOD_KINDS) {
+      // All time has no id to pin; it is covered in its own block.
+      if (value === "all") continue;
       const p = currentPeriod(value, NOW);
       const back = periodFromId(value, p.id, NOW);
       expect(back?.id).toBe(p.id);
       expect(back?.start.getTime()).toBe(p.start.getTime());
       expect(back?.end.getTime()).toBe(p.end.getTime());
-      const prev = previousPeriod(p);
+      const prev = priorOf(p);
       expect(periodFromId(value, prev.id, NOW)?.start.getTime()).toBe(
         value === "7d" ? p.start.getTime() : prev.start.getTime(),
       );
@@ -201,7 +205,7 @@ describe("pickOf and resolvePick", () => {
         id: null,
       });
     }
-    const aug = previousPeriod(currentPeriod("month", NOW));
+    const aug = priorOf(currentPeriod("month", NOW));
     expect(pickOf(aug, NOW)).toEqual({ kind: "month", id: "2026-08" });
   });
 
@@ -238,7 +242,7 @@ describe("syncWindow", () => {
   });
 
   it("ends a past period at its own end", () => {
-    const aug = previousPeriod(currentPeriod("month", NOW));
+    const aug = priorOf(currentPeriod("month", NOW));
     const w = syncWindow(aug, NOW);
     expect(ymd(w.from)).toEqual([2026, 7, 1]);
     expect(ymd(w.to)).toEqual([2026, 9, 1]);
@@ -261,9 +265,9 @@ describe("previousComparableSpan", () => {
   });
 
   it("is the whole previous period for a complete past period", () => {
-    const quarter = previousPeriod(currentPeriod("quarter", NOW));
+    const quarter = priorOf(currentPeriod("quarter", NOW));
     const span = previousComparableSpan(quarter, NOW);
-    const before = previousPeriod(quarter);
+    const before = priorOf(quarter);
     expect(span.start.getTime()).toBe(before.start.getTime());
     expect(span.end.getTime()).toBe(before.end.getTime());
   });
@@ -349,7 +353,7 @@ describe("localDayKey and isWeekend", () => {
 
 describe("periodDayKeys", () => {
   it("lists every day of a past period", () => {
-    const aug = previousPeriod(currentPeriod("month", NOW));
+    const aug = priorOf(currentPeriod("month", NOW));
     const keys = periodDayKeys(aug, NOW);
     expect(keys).toHaveLength(31);
     expect(keys[0]).toBe("2026-08-01");
@@ -407,7 +411,7 @@ describe("daylight saving time", () => {
     // The week that ends on the change day still has 7 keys.
     const sunday = new Date(2026, 2, 29, 12);
     expect(periodDayKeys(currentPeriod("7d", sunday), sunday)).toHaveLength(7);
-    expect(periodDayKeys(previousPeriod(p), now)).toHaveLength(7);
+    expect(periodDayKeys(priorOf(p), now)).toHaveLength(7);
   });
 
   it("keeps month boundaries at local midnight across a DST change", (ctx) => {
@@ -420,6 +424,84 @@ describe("daylight saving time", () => {
     expect(nov.start.getHours()).toBe(0);
     expect(nov.end.getHours()).toBe(0);
     expect(periodDayKeys(nov, new Date(2026, 11, 20))).toHaveLength(30);
-    expect(previousPeriod(nov).id).toBe("2026-10");
+    expect(priorOf(nov).id).toBe("2026-10");
+  });
+});
+
+describe("all time", () => {
+  const FIRST = new Date(2023, 4, 17, 15, 40); // Wed 2023-05-17 15:40
+
+  it("starts on the local day of the first commit and ends tomorrow 00:00", () => {
+    const p = currentPeriod("all", NOW, FIRST);
+    expect(p.kind).toBe("all");
+    expect(p.id).toBe("all");
+    expect(p.label).toBe("All time");
+    expect(p.start.getTime()).toBe(new Date(2023, 4, 17).getTime());
+    expect(p.end.getTime()).toBe(new Date(2026, 8, 16).getTime());
+  });
+
+  it("covers today only until the first commit is known, or when there is none", () => {
+    for (const unknown of [undefined, null]) {
+      const p = currentPeriod("all", NOW, unknown);
+      expect(p.start.getTime()).toBe(new Date(2026, 8, 15).getTime());
+      expect(p.end.getTime()).toBe(new Date(2026, 8, 16).getTime());
+    }
+  });
+
+  it("never starts after today, even for a first commit dated in the future", () => {
+    const p = currentPeriod("all", NOW, new Date(2027, 0, 5));
+    expect(p.start.getTime()).toBe(new Date(2026, 8, 15).getTime());
+  });
+
+  it("has no previous period and no next one", () => {
+    const p = currentPeriod("all", NOW, FIRST);
+    expect(previousPeriod(p)).toBeNull();
+    expect(nextPeriod(p, NOW)).toBeNull();
+  });
+
+  it("syncs exactly [start, tomorrow), without a doubled window", () => {
+    const p = currentPeriod("all", NOW, FIRST);
+    const w = syncWindow(p, NOW);
+    expect(w.from.getTime()).toBe(new Date(2023, 4, 17).getTime());
+    expect(w.to.getTime()).toBe(new Date(2026, 8, 16).getTime());
+  });
+
+  it("has nothing to compare with", () => {
+    expect(
+      previousComparableSpan(currentPeriod("all", NOW, FIRST), NOW),
+    ).toBeNull();
+  });
+
+  it("has no id to pin: the id never resolves to a period", () => {
+    expect(periodFromId("all", "all", NOW)).toBeUndefined();
+    expect(pickOf(currentPeriod("all", NOW, FIRST), NOW)).toEqual({
+      kind: "all",
+      id: null,
+    });
+  });
+
+  it("resolves a pick of all through the first commit", () => {
+    const p = resolvePick({ kind: "all", id: null }, NOW, FIRST);
+    expect(p.start.getTime()).toBe(new Date(2023, 4, 17).getTime());
+    expect(p.label).toBe("All time");
+  });
+
+  it("counts its day keys from the first day to today", () => {
+    const first = new Date(2026, 8, 12, 9);
+    expect(periodDayKeys(currentPeriod("all", NOW, first), NOW)).toEqual([
+      "2026-09-12",
+      "2026-09-13",
+      "2026-09-14",
+      "2026-09-15",
+    ]);
+  });
+
+  it("contains commits from the first day on and none after tomorrow", () => {
+    const p = currentPeriod("all", NOW, FIRST);
+    expect(isInPeriod(p, new Date(2023, 4, 17, 0, 1).toISOString())).toBe(true);
+    expect(isInPeriod(p, new Date(2023, 4, 16, 23, 59).toISOString())).toBe(
+      false,
+    );
+    expect(isInPeriod(p, NOW.toISOString())).toBe(true);
   });
 });

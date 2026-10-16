@@ -156,10 +156,13 @@ function Podium({
 function RankingRow({
   row,
   colors,
+  compared,
   onAskAgent,
 }: {
   row: LeaderboardRow;
   colors: Record<string, string>;
+  /** False when there is no previous period (All time): no rank movement to show. */
+  compared: boolean;
   onAskAgent?: (scope: SnapshotScope) => void;
 }) {
   const move = movementView(row.movement);
@@ -173,13 +176,15 @@ function RankingRow({
     >
       <td className={`${TD} whitespace-nowrap`}>
         <span className="font-semibold tabular-nums">{row.rank}</span>
-        <span
-          title={move.title}
-          className={`ml-1.5 inline-block w-7 text-[11px] ${move.tone}`}
-        >
-          <span aria-hidden>{move.glyph}</span>
-          <span className="sr-only">{move.title}</span>
-        </span>
+        {compared ? (
+          <span
+            title={move.title}
+            className={`ml-1.5 inline-block w-7 text-[11px] ${move.tone}`}
+          >
+            <span aria-hidden>{move.glyph}</span>
+            <span className="sr-only">{move.title}</span>
+          </span>
+        ) : null}
       </td>
       <td className={TD}>
         <div className="flex items-center gap-2">
@@ -261,7 +266,9 @@ export function LeaderboardTab({
           <div className="flex flex-col items-center gap-2 border-t border-stroke px-4 py-8 text-center">
             <Users className="size-5 text-content/35" strokeWidth={1.75} />
             <p className="text-[13px] font-medium">
-              {`No scored activity in ${model.period.label}`}
+              {model.period.kind === "all"
+                ? "No scored activity of all time"
+                : `No scored activity in ${model.period.label}`}
             </p>
             <p className="text-[12px] text-content/50">
               Merged pull requests, commits and reviews in the period appear
@@ -308,6 +315,7 @@ export function LeaderboardTab({
                     key={row.personId}
                     row={row}
                     colors={model.colors}
+                    compared={model.previousPeriod !== null}
                     onAskAgent={onAskAgent}
                   />
                 ))}

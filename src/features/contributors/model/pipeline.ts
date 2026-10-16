@@ -27,10 +27,13 @@ export type ContributorsModel = {
   resolver: Resolver;
   /** The selected period; Stats and the Leaderboard both show it. */
   period: Period;
-  /** The period of the same kind right before; KPI deltas and rank movement compare with it. */
-  previousPeriod: Period;
+  /**
+   * The period of the same kind right before; KPI deltas and rank movement
+   * compare with it. Null for All time: there is nothing to compare with.
+   */
+  previousPeriod: Period | null;
   current: PeriodScores;
-  previous: PeriodScores;
+  previous: PeriodScores | null;
   leaderboard: Leaderboard;
   stats: Stats;
   unmapped: UnmappedIdentity[];
@@ -65,13 +68,9 @@ export function buildContributorsModel(input: {
   });
   const before = previousPeriod(period);
   const current = scorePeriod({ raw, config, resolver, period, now });
-  const previous = scorePeriod({
-    raw,
-    config,
-    resolver,
-    period: before,
-    now,
-  });
+  const previous = before
+    ? scorePeriod({ raw, config, resolver, period: before, now })
+    : null;
 
   // Only an identity seen in the data resolves, so the resolver does not grow
   // a person for a git user who never committed here.
@@ -84,7 +83,7 @@ export function buildContributorsModel(input: {
   const colors = personColorMap([
     ...personRows({ raw, config, resolver }).map((p) => p.id),
     ...current.people.map((p) => p.personId),
-    ...previous.people.map((p) => p.personId),
+    ...(previous?.people ?? []).map((p) => p.personId),
   ]);
   const stats = buildStats({
     raw,

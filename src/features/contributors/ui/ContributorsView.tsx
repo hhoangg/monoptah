@@ -280,9 +280,13 @@ export function ContributorsView({
     );
     if (confirmed) await data.clearSyncedData();
   };
-  // "Last 7 days" reads wrong in "No data for ... yet"; the others name themselves.
+  // "Last 7 days" and "All time" read wrong in "No data for ... yet"; the others name themselves.
   const periodName =
-    data.period.kind === "7d" ? "the last 7 days" : data.period.label;
+    data.period.kind === "7d"
+      ? "the last 7 days"
+      : data.period.kind === "all"
+        ? "all time"
+        : data.period.label;
 
   const onTabKey = (e: KeyboardEvent<HTMLDivElement>) => {
     const index = TABS.findIndex((t) => t.id === tab);
@@ -369,7 +373,7 @@ export function ContributorsView({
                 options={PERIOD_KINDS}
                 onChange={data.setKind}
               />
-              {data.period.kind !== "7d" ? (
+              {data.period.kind !== "7d" && data.period.kind !== "all" ? (
                 <div
                   role="group"
                   aria-label="Period navigation"

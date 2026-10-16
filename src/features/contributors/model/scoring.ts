@@ -110,7 +110,7 @@ export type PeriodScores = {
   people: PersonScore[];
   unattributed: { prs: number; commits: number };
   ghAvailable: boolean;
-  /** People whose first activity in the data falls inside the period (empty when the data does not reach the previous period). */
+  /** People whose first activity in the data falls inside the period (empty when the data does not reach the previous period, and for All time). */
   newcomers: string[];
 };
 
@@ -208,11 +208,26 @@ export function streakOf(
   period: Period,
   now: Date,
 ): number {
+  return streakOver(activeDayKeys, workingDayKeys(period, now));
+}
+
+/**
+ * The Mon-Fri day keys of the period, oldest first. Built once per scoring
+ * run and shared by every person: for a long period (All time) building it
+ * per person costs thousands of dates and strings each.
+ */
+function workingDayKeys(period: Period, now: Date): string[] {
+  return periodDayKeys(period, now).filter((key) => !isWeekend(key));
+}
+
+function streakOver(
+  activeDayKeys: Iterable<string>,
+  workingDays: string[],
+): number {
   const active = new Set(activeDayKeys);
   let run = 0;
   let best = 0;
-  for (const key of periodDayKeys(period, now)) {
-    if (isWeekend(key)) continue;
+  for (const key of workingDays) {
     if (active.has(key)) {
       run += 1;
       best = Math.max(best, run);
@@ -671,8 +686,9 @@ export function scorePeriod(input: {
     }
   }
 
+  const workingDays = workingDayKeys(period, now);
   const people = Array.from(accs.values()).map((a) =>
-    finishPerson(a, config, resolver, period, now),
+    finishPerson(a, config, resolver, workingDays),
   );
   people.sort(
     (a, b) =>
@@ -681,8 +697,10 @@ export function scorePeriod(input: {
       a.personId.localeCompare(b.personId),
   );
 
+  // Without a period before it (All time) nobody can be told apart as new.
+  const before = previousPeriod(period);
   const dataReachesPreviousPeriod =
-    Date.parse(raw.since) <= previousPeriod(period).start.getTime();
+    before !== null && Date.parse(raw.since) <= before.start.getTime();
   const newcomers = dataReachesPreviousPeriod
     ? people
         .map((p) => p.personId)
@@ -703,8 +721,7 @@ function finishPerson(
   a: Acc,
   config: ContributorsConfig,
   resolver: Resolver,
-  period: Period,
-  now: Date,
+  workingDays: string[],
 ): PersonScore {
   const survival = a.written > 0 ? a.alive / a.written : null;
   const quality = qualityFactor(survival);
@@ -713,7 +730,7 @@ function finishPerson(
     .sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))
     .slice(0, SCORING.MODULE_CAP)
     .map(([module]) => module);
-  const streak = streakOf(a.days, period, now);
+  const streak = streakOver(a.days, workingDays);
   const breadth = SCORING.MODULE_PTS * modules.length;
   const consistency =
     SCORING.ACTIVE_DAY * a.days.size +

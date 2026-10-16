@@ -29,7 +29,7 @@ describe("contributors prefs", () => {
   });
 
   it("stores a kind that follows the current period as the bare kind", () => {
-    for (const kind of ["7d", "month", "quarter", "year"] as const) {
+    for (const kind of ["7d", "month", "quarter", "year", "all"] as const) {
       writePeriodPick({ kind, id: null });
       expect(localStorage.getItem(RANGE_KEY)).toBe(kind);
       expect(readPeriodPick(NOW)).toEqual({ kind, id: null });
@@ -54,11 +54,20 @@ describe("contributors prefs", () => {
       "30d",
       "90d",
       "1y",
-      "all",
+      "forever",
       "custom",
       "custom:2026-10-01:2026-10-10",
     ]) {
       localStorage.setItem(RANGE_KEY, removed);
+      expect(readPeriodPick(NOW)).toEqual({ kind: "7d", id: null });
+    }
+  });
+
+  it("reads all as All time, which has no id to pin", () => {
+    localStorage.setItem(RANGE_KEY, "all");
+    expect(readPeriodPick(NOW)).toEqual({ kind: "all", id: null });
+    for (const pinned of ["all:all", "all:2026", "all:"]) {
+      localStorage.setItem(RANGE_KEY, pinned);
       expect(readPeriodPick(NOW)).toEqual({ kind: "7d", id: null });
     }
   });

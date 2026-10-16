@@ -56,10 +56,13 @@ function Kpi({ label, children }: { label: string; children: ReactNode }) {
 
 export function KpiCards({ model }: { model: ContributorsModel }) {
   const { kpis } = model.stats;
+  // Without a previous period every delta is null, so no suffix is ever shown.
   const versus =
-    model.period.kind === "7d"
-      ? "vs prev 7d"
-      : `vs ${model.previousPeriod.label}`;
+    model.previousPeriod === null
+      ? undefined
+      : model.period.kind === "7d"
+        ? "vs prev 7d"
+        : `vs ${model.previousPeriod.label}`;
   const commitsDelta = kpis.commits.delta;
   const linesDelta = kpis.lines.delta;
   const prsDelta = kpis.prsMerged.delta;

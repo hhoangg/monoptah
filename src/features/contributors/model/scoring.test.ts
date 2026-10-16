@@ -1602,4 +1602,14 @@ describe("scorePeriod: period kinds", () => {
     });
     expect(scoreIn(short, week, now).newcomers).toEqual([]);
   });
+
+  it("flags nobody as a newcomer in All time, which has no period before it", () => {
+    const now = new Date(2026, 9, 20, 10);
+    const all = currentPeriod("all", now, new Date(2026, 8, 1));
+    const raw = makeRaw({
+      since: new Date(2026, 7, 1).toISOString(),
+      commits: [commit("a", oct(15))],
+    });
+    expect(scoreIn(raw, all, now).newcomers).toEqual([]);
+  });
 });

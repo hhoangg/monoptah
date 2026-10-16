@@ -15,6 +15,7 @@ vi.mock("../model/api", () => ({
   clearSynced: vi.fn(),
   listBranches: vi.fn(),
   gitUser: vi.fn(),
+  firstCommit: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -53,6 +54,7 @@ import { ask as askDialog } from "@tauri-apps/plugin-dialog";
 import {
   cancelSync,
   clearSynced,
+  firstCommit,
   gitUser,
   listBranches,
   loadStored,
@@ -66,10 +68,17 @@ import {
 import { resetContributorsCache } from "../hooks/useContributors";
 import { REMOTE_PROJECT_PREFIX } from "../../projects/model/recents";
 import { RANGE_KEY } from "../model/prefs";
-import { currentPeriod, previousPeriod, syncWindow } from "../model/period";
+import { currentPeriod, syncWindow } from "../model/period";
 import type { SyncEvent } from "../model/syncEvents";
 import type { LoadResponse, RawData } from "../model/types";
-import { ANA, BOB, file, makeCommit, makeRaw } from "../model/testFixtures";
+import {
+  ANA,
+  BOB,
+  file,
+  makeCommit,
+  makeRaw,
+  priorOf,
+} from "../model/testFixtures";
 import { deferUnhandledEscape } from "../../workspace/model/tabKeys";
 import { ContributorsView } from "./ContributorsView";
 
@@ -231,6 +240,9 @@ beforeEach(() => {
     name: "Ana",
     email: "ana@example.com",
   });
+  vi.mocked(firstCommit).mockResolvedValue(
+    new Date(Date.now() - 400 * 86_400_000).toISOString(),
+  );
   vi.mocked(loadStored).mockImplementation(async () => stored(liveRaw()));
   vi.mocked(syncEstimate).mockResolvedValue({
     commits: 120,
@@ -452,14 +464,14 @@ describe("ContributorsView", () => {
     expect(byText("button", "Ask Agent")).toBeUndefined();
   });
 
-  it("offers 7d, Month, Quarter and Year, with no arrows for 7d", async () => {
+  it("offers 7d, Month, Quarter, Year and All time, with no arrows for 7d", async () => {
     await mount();
     const labels = Array.from(
       container.querySelectorAll(
         '[role="radiogroup"][aria-label="Period"] button',
       ),
     ).map((b) => b.textContent);
-    expect(labels).toEqual(["7d", "Month", "Quarter", "Year"]);
+    expect(labels).toEqual(["7d", "Month", "Quarter", "Year", "All time"]);
     expect(periodButton("7d")?.getAttribute("aria-checked")).toBe("true");
     expect(
       container.querySelector('[aria-label="Period navigation"]'),
@@ -501,7 +513,7 @@ describe("ContributorsView", () => {
     for (const saved of [
       "30d",
       "90d",
-      "all",
+      "all:all",
       "custom:2026-10-01:2026-10-09",
       "x",
     ]) {
@@ -514,7 +526,7 @@ describe("ContributorsView", () => {
   });
 
   it("restores a saved period", async () => {
-    const aug = previousPeriod(currentPeriod("month", new Date()));
+    const aug = priorOf(currentPeriod("month", new Date()));
     localStorage.setItem(RANGE_KEY, `month:${aug.id}`);
     await mount();
     expect(periodButton("Month")?.getAttribute("aria-checked")).toBe("true");
@@ -535,7 +547,7 @@ describe("ContributorsView", () => {
       await mount();
       await act(async () => periodButton("Month")?.click());
       await act(async () => arrow("Previous period")?.click());
-      const previous = previousPeriod(currentPeriod("month", now()));
+      const previous = priorOf(currentPeriod("month", now()));
       expect(periodLabel()).toBe(previous.label);
       expect(localStorage.getItem(RANGE_KEY)).toBe(`month:${previous.id}`);
       const window = syncWindow(previous, now());
@@ -568,12 +580,94 @@ describe("ContributorsView", () => {
     });
   });
 
+  describe("All time", () => {
+    const pickAll = async () => {
+      await mount();
+      await act(async () => periodButton("All time")?.click());
+      await act(async () => {});
+    };
+
+    it("is selectable, remembered, and has no arrows to step with", async () => {
+      await pickAll();
+      expect(periodButton("All time")?.getAttribute("aria-checked")).toBe(
+        "true",
+      );
+      expect(localStorage.getItem(RANGE_KEY)).toBe("all");
+      expect(
+        container.querySelector('[aria-label="Period navigation"]'),
+      ).toBeNull();
+      expect(arrow("Previous period")).toBeNull();
+      expect(arrow("Next period")).toBeNull();
+    });
+
+    it("restores a saved all", async () => {
+      localStorage.setItem(RANGE_KEY, "all");
+      await mount();
+      await act(async () => {});
+      expect(periodButton("All time")?.getAttribute("aria-checked")).toBe(
+        "true",
+      );
+    });
+
+    it("reads the store from the first commit to tomorrow", async () => {
+      await pickAll();
+      const first = new Date(Date.now() - 400 * 86_400_000);
+      const options = vi.mocked(loadStored).mock.calls.at(-1)![1];
+      expect(Date.parse(options.since)).toBe(
+        new Date(
+          first.getFullYear(),
+          first.getMonth(),
+          first.getDate(),
+        ).getTime(),
+      );
+      expect(Date.parse(options.until)).toBe(
+        currentPeriod("7d", new Date()).end.getTime(),
+      );
+    });
+
+    it("shows the numbers without any comparison copy", async () => {
+      await pickAll();
+      expect(container.querySelector('[role="tablist"]')).not.toBeNull();
+      expect(container.textContent).toContain("Commits");
+      expect(container.textContent).not.toContain("vs ");
+      expect(container.textContent).not.toMatch(/[▲▼]/);
+    });
+
+    it("shows loading until the first commit is known", async () => {
+      localStorage.setItem(RANGE_KEY, "all");
+      vi.mocked(firstCommit).mockReturnValueOnce(new Promise(() => {}));
+      await mount();
+      expect(container.querySelector('[role="status"]')?.textContent).toContain(
+        "Loading synced data",
+      );
+      expect(loadStored).not.toHaveBeenCalled();
+    });
+
+    it("shows the empty state for a repository without commits", async () => {
+      vi.mocked(firstCommit).mockResolvedValue(null);
+      vi.mocked(loadStored).mockImplementation(async () =>
+        stored(makeRaw({ since: recent(70) })),
+      );
+      await pickAll();
+      expect(container.textContent).toContain("No commits in this period");
+    });
+
+    it("asks to sync all time when the store has nothing yet", async () => {
+      vi.mocked(loadStored).mockImplementation(async () => unsynced());
+      await pickAll();
+      expect(container.textContent).toContain("No data for all time yet");
+      expect(vi.mocked(syncEstimate).mock.calls.at(-1)![1].from).toBe(
+        vi.mocked(loadStored).mock.calls.at(-1)![1].since,
+      );
+    });
+  });
+
   it("shows how the previous period is compared", async () => {
     await mount();
     expect(container.textContent).toContain("vs prev 7d");
     await act(async () => periodButton("Month")?.click());
     await act(async () => {});
-    const previous = previousPeriod(currentPeriod("month", new Date()));
+    const previous = priorOf(currentPeriod("month", new Date()));
     // The mocked data starts 70 days back, so it covers the previous month.
     expect(container.textContent).toContain(`vs ${previous.label}`);
   });
