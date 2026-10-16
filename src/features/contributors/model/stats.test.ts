@@ -37,7 +37,7 @@ const config: ContributorsConfig = withConfig({
 
 function stats(
   raw: RawData,
-  extra: { previous?: { start: Date; end: Date } } = {},
+  extra: { previous?: { start: Date; end: Date } | null } = {},
   cfg: ContributorsConfig = config,
 ) {
   return buildStats({
@@ -328,6 +328,89 @@ describe("bucketGranularity", () => {
     expect(bucketGranularity(currentPeriod("quarter", now))).toBe("week");
     expect(bucketGranularity(currentPeriod("year", now))).toBe("month");
   });
+
+  it("is month for All time up to 48 months and year beyond", () => {
+    const now = new Date(2026, 9, 20);
+    const all = (first: Date) =>
+      bucketGranularity(currentPeriod("all", now, first));
+    // Jan 2023 .. Oct 2026 is 46 months, Oct 2022 .. Oct 2026 is 49.
+    expect(all(new Date(2023, 0, 1))).toBe("month");
+    expect(all(new Date(2026, 9, 20))).toBe("month");
+    expect(all(new Date(2022, 9, 3))).toBe("year");
+    expect(all(new Date(2010, 0, 1))).toBe("year");
+  });
+
+  it("keeps month at exactly 48 months and switches at 49", () => {
+    const now = new Date(2026, 9, 20);
+    const all = (first: Date) =>
+      bucketGranularity(currentPeriod("all", now, first));
+    expect(all(new Date(2022, 11, 31))).toBe("month"); // Dec 2022 .. Oct 2026 = 47
+    expect(all(new Date(2022, 10, 1))).toBe("month"); // Nov 2022 .. Oct 2026 = 48
+    expect(all(new Date(2022, 9, 31))).toBe("year"); // Oct 2022 .. Oct 2026 = 49
+  });
+
+  it("counts the month of the last day, not of tomorrow", () => {
+    // Today is Oct 31, so the period ends Nov 1 00:00 but touches only October.
+    const now = new Date(2026, 9, 31, 10);
+    const all = (first: Date) =>
+      bucketGranularity(currentPeriod("all", now, first));
+    expect(all(new Date(2022, 10, 1))).toBe("month"); // Nov 2022 .. Oct 2026 = 48
+    expect(all(new Date(2022, 9, 31))).toBe("year");
+  });
+});
+
+describe("buildStats: year buckets", () => {
+  it("makes one bucket per local calendar year and labels it with the year", () => {
+    const raw = makeRaw({
+      commits: [
+        makeCommit("a", ANA, new Date(2020, 5, 10, 12).toISOString()),
+        makeCommit("b", BOB, new Date(2022, 0, 1, 0, 30).toISOString()),
+        makeCommit("c", ANA, new Date(2022, 11, 31, 23, 30).toISOString()),
+      ],
+    });
+    const { buckets, granularity } = buildStats({
+      raw,
+      config,
+      resolver: makeResolver(raw, config),
+      rangeStart: new Date(2020, 5, 10),
+      rangeEnd: new Date(2023, 3, 2),
+      previous: null,
+      granularity: "year",
+    });
+    expect(granularity).toBe("year");
+    expect(buckets.map((b) => b.start)).toEqual([
+      "2020-01-01",
+      "2021-01-01",
+      "2022-01-01",
+      "2023-01-01",
+    ]);
+    expect(buckets.map((b) => b.label)).toEqual([
+      "2020",
+      "2021",
+      "2022",
+      "2023",
+    ]);
+    expect(buckets.map((b) => b.short)).toEqual([
+      "2020",
+      "2021",
+      "2022",
+      "2023",
+    ]);
+    expect(buckets[0].byPerson).toEqual({ "p-ana": 1 });
+    expect(buckets[2].byPerson).toEqual({ "bob@example.com": 1, "p-ana": 1 });
+    expect(buckets[3].byPerson).toEqual({});
+  });
+});
+
+describe("buildStats: no previous range", () => {
+  it("reports no deltas and no newcomers, whatever the data holds", () => {
+    const { kpis } = stats(sample(), { previous: null });
+    expect(kpis.commits.value).toBe(4);
+    expect(kpis.commits.delta).toBeNull();
+    expect(kpis.lines.delta).toBeNull();
+    expect(kpis.prsMerged.delta).toBeNull();
+    expect(kpis.contributors.newcomers).toBe(0);
+  });
 });
 
 describe("buildStats: day and month buckets", () => {
@@ -335,7 +418,7 @@ describe("buildStats: day and month buckets", () => {
     raw: RawData,
     start: Date,
     end: Date,
-    granularity: "day" | "week" | "month",
+    granularity: "day" | "week" | "month" | "year",
   ) =>
     buildStats({
       raw,

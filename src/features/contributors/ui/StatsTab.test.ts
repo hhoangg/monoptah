@@ -174,6 +174,18 @@ describe("StatsTab", () => {
     await render(model({ period: currentPeriod("year", NOW) }));
     expect(container.textContent).toContain("vs 2025");
   });
+
+  it("hides every comparison for All time, which has no previous period", async () => {
+    const all = currentPeriod("all", NOW, new Date(2026, 8, 1));
+    const m = model({ period: all });
+    expect(m.previousPeriod).toBeNull();
+    await render(m);
+    const text = container.textContent ?? "";
+    expect(text).toContain("Commits");
+    expect(text).not.toContain("vs ");
+    expect(text).not.toMatch(/[▲▼]/);
+    expect(text).not.toContain(" new");
+  });
 });
 
 describe("CommitChart", () => {

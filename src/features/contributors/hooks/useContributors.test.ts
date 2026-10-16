@@ -15,6 +15,7 @@ vi.mock("../model/api", () => ({
   clearSynced: vi.fn(),
   listBranches: vi.fn(),
   gitUser: vi.fn(),
+  firstCommit: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
@@ -22,6 +23,7 @@ import { listen } from "@tauri-apps/api/event";
 import {
   cancelSync,
   clearSynced,
+  firstCommit,
   gitUser,
   listBranches,
   loadStored,
@@ -37,9 +39,9 @@ import type { SyncEvent } from "../model/syncEvents";
 import type { LoadResponse } from "../model/types";
 import { DEFAULT_CONFIG, serializeConfig } from "../model/config";
 import { RANGE_KEY } from "../model/prefs";
-import { currentPeriod, previousPeriod, syncWindow } from "../model/period";
+import { currentPeriod, syncWindow } from "../model/period";
 import type { Period } from "../model/period";
-import { ANA, file, makeCommit, makeRaw } from "../model/testFixtures";
+import { ANA, file, makeCommit, makeRaw, priorOf } from "../model/testFixtures";
 import {
   contributorsCacheSize,
   resetContributorsCache,
@@ -58,7 +60,7 @@ const isoSeconds = (date: Date) => date.toISOString().replace(".000Z", "Z");
 /** The month `n` months before the current one. */
 const monthBack = (n: number): Period => {
   let p = currentPeriod("month", new Date());
-  for (let i = 0; i < n; i += 1) p = previousPeriod(p);
+  for (let i = 0; i < n; i += 1) p = priorOf(p);
   return p;
 };
 const MONTH_A = monthBack(3);
@@ -132,6 +134,18 @@ const unsyncedFixture = (over: Partial<LoadResponse> = {}) =>
     ...over,
   });
 
+/** Where All time starts in the tests: the local day of this commit. */
+const FIRST_COMMIT = new Date(2023, 4, 17, 15, 40);
+const FIRST_DAY = new Date(2023, 4, 17);
+const today = () => {
+  const d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+};
+const tomorrow = () => {
+  const d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+};
+
 const ESTIMATE = { commits: 40, storedCommits: 0, firstParent: 30, prs: 9 };
 
 // The mocked `listen` keeps every handler so a test can push events.
@@ -190,6 +204,7 @@ beforeEach(() => {
     name: "Ana",
     email: "ana@example.com",
   });
+  vi.mocked(firstCommit).mockResolvedValue(FIRST_COMMIT.toISOString());
   vi.mocked(loadStored).mockImplementation(async () => loadFixture());
   vi.mocked(syncEstimate).mockResolvedValue(ESTIMATE);
   listed = [];
@@ -287,12 +302,7 @@ describe("useContributors", () => {
     localStorage.setItem(RANGE_KEY, saved(MONTH_A));
     await mount(nextCwd());
     expect(api.period.id).toBe(MONTH_A.id);
-    for (const removed of [
-      "1y",
-      "30d",
-      "custom:2026-10-01:2026-10-09",
-      "all",
-    ]) {
+    for (const removed of ["1y", "30d", "custom:2026-10-01:2026-10-09"]) {
       await act(async () => root.unmount());
       root = createRoot(container);
       localStorage.setItem(RANGE_KEY, removed);
@@ -850,14 +860,12 @@ describe("useContributors period", () => {
     await act(async () => api.setKind("quarter"));
     const current = currentPeriod("quarter", new Date());
     await act(async () => api.goPrevious());
-    expect(api.period.id).toBe(previousPeriod(current).id);
-    expect(api.model?.period.id).toBe(previousPeriod(current).id);
-    expect(api.model?.previousPeriod.id).toBe(
-      previousPeriod(previousPeriod(current)).id,
-    );
+    expect(api.period.id).toBe(priorOf(current).id);
+    expect(api.model?.period.id).toBe(priorOf(current).id);
+    expect(api.model?.previousPeriod.id).toBe(priorOf(priorOf(current)).id);
     expect(api.hasNext).toBe(true);
     expect(localStorage.getItem(RANGE_KEY)).toBe(
-      `quarter:${previousPeriod(current).id}`,
+      `quarter:${priorOf(current).id}`,
     );
     await act(async () => api.goNext());
     expect(api.period.id).toBe(current.id);
@@ -1373,5 +1381,182 @@ describe("useContributors GitHub state and clearing", () => {
       "A sync of this repository is running. Cancel it first.",
     );
     expect(api.model).toBeDefined();
+  });
+});
+
+describe("useContributors All time", () => {
+  const selectAll = () => act(async () => api.setKind("all"));
+
+  it("reads the first commit and loads from its day to tomorrow, with no previous period", async () => {
+    const cwd = nextCwd();
+    await mount(cwd);
+    await selectAll();
+    expect(firstCommit).toHaveBeenCalledTimes(1);
+    expect(firstCommit).toHaveBeenCalledWith(cwd, undefined);
+    const args = vi.mocked(loadStored).mock.calls.at(-1)![1];
+    expect(args.since).toBe(isoSeconds(FIRST_DAY));
+    expect(args.until).toBe(isoSeconds(tomorrow()));
+    expect(api.period.kind).toBe("all");
+    expect(api.period.label).toBe("All time");
+    expect(api.status).toBe("ready");
+    expect(api.model?.period.id).toBe("all");
+    expect(api.model?.previousPeriod).toBeNull();
+    expect(localStorage.getItem(RANGE_KEY)).toBe("all");
+  });
+
+  it("restores a saved all, and shows loading without loading the store until the first commit is known", async () => {
+    localStorage.setItem(RANGE_KEY, "all");
+    const gate = deferred<string | null>();
+    vi.mocked(firstCommit).mockReturnValueOnce(gate.promise);
+    await mount(nextCwd());
+    expect(api.period.kind).toBe("all");
+    expect(api.status).toBe("loading");
+    expect(api.model).toBeUndefined();
+    expect(loadStored).not.toHaveBeenCalled();
+    expect(syncEstimate).not.toHaveBeenCalled();
+
+    await act(async () => gate.resolve(FIRST_COMMIT.toISOString()));
+    expect(api.status).toBe("ready");
+    expect(loadStored).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(loadStored).mock.calls[0][1].since).toBe(
+      isoSeconds(FIRST_DAY),
+    );
+  });
+
+  it("keeps the page that was showing, dimmed, while the first commit loads", async () => {
+    await mount(nextCwd());
+    const before = api.model;
+    expect(before).toBeDefined();
+    const gate = deferred<string | null>();
+    vi.mocked(firstCommit).mockReturnValueOnce(gate.promise);
+    await selectAll();
+    expect(api.stale).toBe(true);
+    expect(api.model).toBe(before);
+    await act(async () => gate.resolve(FIRST_COMMIT.toISOString()));
+    expect(api.stale).toBe(false);
+    expect(api.model?.period.kind).toBe("all");
+  });
+
+  it("does not ask for the first commit for any other period", async () => {
+    await mount(nextCwd());
+    await act(async () => api.setKind("year"));
+    expect(firstCommit).not.toHaveBeenCalled();
+  });
+
+  it("asks once per project and branch, however often All time is picked", async () => {
+    const cwd = nextCwd();
+    await mount(cwd);
+    await selectAll();
+    await act(async () => api.setKind("month"));
+    await selectAll();
+    expect(firstCommit).toHaveBeenCalledTimes(1);
+
+    await act(async () => api.setBranch("dev"));
+    expect(firstCommit).toHaveBeenCalledTimes(2);
+    expect(firstCommit).toHaveBeenLastCalledWith(cwd, "dev");
+
+    // The checked-out branch is the same key as the first call.
+    await act(async () => api.setBranch("main"));
+    expect(firstCommit).toHaveBeenCalledTimes(2);
+  });
+
+  it("asks again on a forced refresh, not on a focus revalidation", async () => {
+    await mount(nextCwd());
+    await selectAll();
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(firstCommit).toHaveBeenCalledTimes(1);
+    await act(async () => api.refresh(true));
+    expect(firstCommit).toHaveBeenCalledTimes(2);
+  });
+
+  it("covers today only for a repository without commits", async () => {
+    vi.mocked(firstCommit).mockResolvedValue(null);
+    await mount(nextCwd());
+    await selectAll();
+    const args = vi.mocked(loadStored).mock.calls.at(-1)![1];
+    expect(args.since).toBe(isoSeconds(today()));
+    expect(args.until).toBe(isoSeconds(tomorrow()));
+    expect(api.status).toBe("ready");
+  });
+
+  it("reports a failed lookup and recovers on a forced retry", async () => {
+    vi.mocked(firstCommit).mockRejectedValueOnce("git is not responding");
+    localStorage.setItem(RANGE_KEY, "all");
+    await mount(nextCwd());
+    expect(api.status).toBe("error");
+    expect(api.error).toBe("git is not responding");
+    expect(loadStored).not.toHaveBeenCalled();
+    await act(async () => api.refresh(true));
+    expect(api.error).toBeUndefined();
+    expect(api.status).toBe("ready");
+  });
+
+  it("has no arrows to follow: previous and next do nothing", async () => {
+    await mount(nextCwd());
+    await selectAll();
+    const calls = vi.mocked(loadStored).mock.calls.length;
+    expect(api.hasNext).toBe(false);
+    await act(async () => api.goPrevious());
+    await act(async () => api.goNext());
+    expect(api.period.kind).toBe("all");
+    expect(vi.mocked(loadStored).mock.calls.length).toBe(calls);
+    expect(localStorage.getItem(RANGE_KEY)).toBe("all");
+  });
+
+  it("estimates and syncs the window from the first commit to tomorrow", async () => {
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    await mount(nextCwd());
+    await selectAll();
+    expect(vi.mocked(syncEstimate).mock.calls.at(-1)![1]).toEqual({
+      from: isoSeconds(FIRST_DAY),
+      to: isoSeconds(tomorrow()),
+      branch: undefined,
+    });
+    await act(async () => api.startSync());
+    expect(vi.mocked(startSync).mock.calls[0][1]).toEqual({
+      from: isoSeconds(FIRST_DAY),
+      to: isoSeconds(tomorrow()),
+      branch: undefined,
+      mode: "full",
+    });
+  });
+
+  it("tops up from the coverage head when the branch head moved", async () => {
+    vi.mocked(loadStored).mockResolvedValue(
+      loadFixture({ coverageHead: "old1", head: "new2" }),
+    );
+    await mount(nextCwd());
+    expect(startSync).toHaveBeenCalledTimes(1);
+    await selectAll();
+    const topups = vi
+      .mocked(startSync)
+      .mock.calls.filter(([, args]) => args.from === isoSeconds(FIRST_DAY));
+    expect(topups).toHaveLength(1);
+    expect(topups[0][1]).toEqual({
+      from: isoSeconds(FIRST_DAY),
+      to: isoSeconds(tomorrow()),
+      branch: undefined,
+      mode: "topup",
+      oldHead: "old1",
+    });
+  });
+
+  it("matches the job of its own window, so progress shows on the page", async () => {
+    const cwd = nextCwd();
+    vi.mocked(loadStored).mockResolvedValue(unsyncedFixture());
+    localStorage.setItem(RANGE_KEY, "all");
+    await mount(cwd);
+    await act(async () => api.startSync());
+    expect(api.sync.job?.state).toBe("queued");
+    // A job of another window of the same project is not this page's job.
+    await emit(
+      syncEvent(cwd, {
+        state: "running",
+        ...windowOf(currentPeriod("7d", new Date())),
+      }),
+    );
+    expect(api.sync.job?.state).toBe("queued");
   });
 });

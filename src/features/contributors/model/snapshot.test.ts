@@ -9,6 +9,7 @@ import {
   suggestedQuestions,
 } from "./snapshot";
 import type { SnapshotScope } from "./snapshot";
+import { currentPeriod } from "./period";
 import { buildStats } from "./stats";
 import {
   ANA,
@@ -96,6 +97,14 @@ describe("snapshotFileName", () => {
   it("names the file after the period", () => {
     expect(snapshotFileName(PERIOD)).toBe("contributors-2026-10.json");
   });
+
+  it("names the file of All time", () => {
+    expect(
+      snapshotFileName(
+        currentPeriod("all", new Date(2026, 9, 20), new Date(2024, 0, 5)),
+      ),
+    ).toBe("contributors-all.json");
+  });
 });
 
 describe("suggestedQuestions", () => {
@@ -125,6 +134,27 @@ describe("suggestedQuestions", () => {
       "Show Tuan Nguyen's PRs with the most iteration and what slowed them down.",
       "Is Tuan Nguyen's Delivery low because of review or mentoring work?",
     ]);
+  });
+
+  it("drops the questions about a previous period when there is none", () => {
+    const none = { hasPrevious: false };
+    const team = suggestedQuestions({ kind: "team" }, undefined, none);
+    expect(team).toHaveLength(4);
+    expect(team.join("\n")).not.toMatch(/last 3|previous period/);
+    const me = suggestedQuestions(
+      { kind: "me", personId: "x" },
+      undefined,
+      none,
+    );
+    expect(me).toHaveLength(3);
+    expect(me.join("\n")).not.toMatch(/last 3|previous period/);
+    // Nothing changes for a person, or when a previous period exists.
+    expect(
+      suggestedQuestions({ kind: "person", personId: "x" }, "Tuan", none),
+    ).toEqual(suggestedQuestions({ kind: "person", personId: "x" }, "Tuan"));
+    expect(
+      suggestedQuestions({ kind: "team" }, undefined, { hasPrevious: true }),
+    ).toEqual(suggestedQuestions({ kind: "team" }));
   });
 
   it("falls back to a neutral name", () => {
@@ -215,6 +245,43 @@ describe("buildSnapshot", () => {
     });
     expect(snap.scope).toEqual({ kind: "team" });
     expect(snap.ghAvailable).toBe(true);
+  });
+
+  it("labels All time and says how periods and rank movement work", () => {
+    const raw = sample();
+    const all = currentPeriod("all", PERIOD_NOW, new Date(2026, 8, 1));
+    const resolver = makeResolver(raw, DEFAULT_CONFIG);
+    const scores = scorePeriod({
+      raw,
+      config: DEFAULT_CONFIG,
+      resolver,
+      period: all,
+      now: PERIOD_NOW,
+    });
+    const snap = buildSnapshot({
+      project: "monoptah",
+      branch: "main",
+      period: all,
+      scores,
+      leaderboard: buildLeaderboard(scores, null, {}),
+      config: DEFAULT_CONFIG,
+      scope: { kind: "team" },
+      include: { perPr: false, rawCommits: false },
+      raw,
+      ghAvailable: raw.ghAvailable,
+      resolver,
+      now: NOW,
+    });
+    expect(snap.period).toEqual({
+      kind: "all",
+      id: "all",
+      label: "All time",
+      start: new Date(2026, 8, 1).toISOString(),
+      end: all.end.toISOString(),
+    });
+    const notes = snap.formula.description.join(" ");
+    expect(notes).toContain("all time");
+    expect(notes).toContain("no rank movement");
   });
 
   it("carries the formula in use", () => {

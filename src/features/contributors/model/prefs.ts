@@ -32,7 +32,7 @@ export function serializePick(pick: PeriodPick): string {
 
 /**
  * The pick a saved text stands for, or undefined when it is not one. That
- * covers the removed ranges (`30d`, `custom:...`, `90d`, `1y`, `all`), a
+ * covers the removed ranges (`30d`, `custom:...`, `90d`, `1y`), a
  * pinned id that does not parse, and one that starts after today.
  */
 export function parsePick(
@@ -44,8 +44,9 @@ export function parsePick(
   const kind = at < 0 ? value : value.slice(0, at);
   if (!isKind(kind)) return undefined;
   if (at < 0) return { kind, id: null };
-  // The last 7 days always end today, so there is nothing to pin.
-  if (kind === "7d") return undefined;
+  // The last 7 days always end today and All time always starts at the first
+  // commit, so there is nothing to pin.
+  if (kind === "7d" || kind === "all") return undefined;
   const id = value.slice(at + 1);
   return periodFromId(kind, id, now) ? { kind, id } : undefined;
 }

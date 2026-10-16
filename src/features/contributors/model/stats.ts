@@ -21,9 +21,16 @@ export type StatsRow = {
   color: string;
 };
 
-export type BucketGranularity = "day" | "week" | "month";
+export type BucketGranularity = "day" | "week" | "month" | "year";
 
-/** Chart buckets for a period: days for 7d and month, weeks for a quarter, months for a year. */
+/** The most months All time keeps on a monthly axis; longer spans switch to years. */
+const MAX_MONTH_BUCKETS = 48;
+
+/**
+ * Chart buckets for a period: days for 7d and month, weeks for a quarter,
+ * months for a year. All time uses months while they fit on the axis
+ * (MAX_MONTH_BUCKETS) and years beyond that.
+ */
 export function bucketGranularity(period: Period): BucketGranularity {
   switch (period.kind) {
     case "7d":
@@ -33,15 +40,34 @@ export function bucketGranularity(period: Period): BucketGranularity {
       return "week";
     case "year":
       return "month";
+    case "all":
+      return calendarMonthsTouched(period) <= MAX_MONTH_BUCKETS
+        ? "month"
+        : "year";
   }
 }
 
+/** How many calendar months the period touches, first and last included. */
+function calendarMonthsTouched(period: Period): number {
+  // `end` is exclusive: step back to the last day the period covers.
+  const last = new Date(
+    period.end.getFullYear(),
+    period.end.getMonth(),
+    period.end.getDate() - 1,
+  );
+  return (
+    (last.getFullYear() - period.start.getFullYear()) * 12 +
+    (last.getMonth() - period.start.getMonth()) +
+    1
+  );
+}
+
 export type Bucket = {
-  /** Local day key of the first day of the day, week (Monday) or month. */
+  /** Local day key of the first day of the day, week (Monday), month or year. */
   start: string;
-  /** Tooltip text: "Oct 5, 2026", "Week of Oct 5, 2026" or "Oct 2026". */
+  /** Tooltip text: "Oct 5, 2026", "Week of Oct 5, 2026", "Oct 2026" or "2026". */
   label: string;
-  /** Axis text: "Oct 5" or "Oct 2026". */
+  /** Axis text: "Oct 5", "Oct 2026" or "2026". */
   short: string;
   byPerson: Record<string, number>;
 };
@@ -87,8 +113,12 @@ export function buildStats(input: {
   resolver: Resolver;
   rangeStart: Date;
   rangeEnd: Date;
-  /** Defaults to the period of equal length right before `rangeStart`. */
-  previous?: Range;
+  /**
+   * The range the deltas compare with. Defaults to the period of equal length
+   * right before `rangeStart`; null when there is nothing before (no deltas,
+   * no newcomers).
+   */
+  previous?: Range | null;
   /** Chart buckets: calendar weeks (default), days or calendar months. */
   granularity?: BucketGranularity;
   /** Shared person colors; an id missing from it gets its hashed color. */
@@ -98,10 +128,13 @@ export function buildStats(input: {
   const granularity = input.granularity ?? "week";
   const range: Range = { start: input.rangeStart, end: input.rangeEnd };
   const length = range.end.getTime() - range.start.getTime();
-  const previous: Range = input.previous ?? {
-    start: new Date(range.start.getTime() - length),
-    end: range.start,
-  };
+  const previous: Range | null =
+    input.previous === undefined
+      ? {
+          start: new Date(range.start.getTime() - length),
+          end: range.start,
+        }
+      : input.previous;
   // Rule: every commit count here is of commits credited to a person, so the
   // KPI total equals the sum of the contributors table. Commits nobody can be
   // credited for (agent work with no human) are left out everywhere.
@@ -127,8 +160,11 @@ export function buildStats(input: {
   };
 
   const now = periodOf(range);
-  const earlier = periodOf(previous);
-  const previousCovered = Date.parse(raw.since) <= previous.start.getTime();
+  const earlier: Totals = previous
+    ? periodOf(previous)
+    : { commits: 0, added: 0, deleted: 0, prs: 0 };
+  const previousCovered =
+    previous !== null && Date.parse(raw.since) <= previous.start.getTime();
 
   const inside = commits.filter((c) => inRange(range, c.commit.committedAt));
   const byPerson = new Map<string, AttributedCommit[]>();
@@ -258,6 +294,14 @@ function bucketAt(start: Date, granularity: BucketGranularity): Bucket {
   const month = MONTHS[start.getMonth()];
   const year = start.getFullYear();
   const day = start.getDate();
+  if (granularity === "year") {
+    return {
+      start: dayKeyOf(start),
+      label: String(year),
+      short: String(year),
+      byPerson: {},
+    };
+  }
   if (granularity === "month") {
     return {
       start: dayKeyOf(start),
@@ -283,6 +327,7 @@ function buildBuckets(
   granularity: BucketGranularity,
 ): Bucket[] {
   const startOf = (date: Date) => {
+    if (granularity === "year") return new Date(date.getFullYear(), 0, 1);
     if (granularity === "month") {
       return new Date(date.getFullYear(), date.getMonth(), 1);
     }
@@ -291,6 +336,7 @@ function buildBuckets(
       : mondayOf(date);
   };
   const next = (date: Date) => {
+    if (granularity === "year") return new Date(date.getFullYear() + 1, 0, 1);
     if (granularity === "month") {
       return new Date(date.getFullYear(), date.getMonth() + 1, 1);
     }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "./config";
 import { buildContributorsModel } from "./pipeline";
-import { currentPeriod, previousPeriod, syncWindow } from "./period";
+import { currentPeriod, syncWindow } from "./period";
 import type { Period } from "./period";
 import {
   ANA,
@@ -12,6 +12,7 @@ import {
   makePr,
   makeRaw,
   oct,
+  priorOf,
   withConfig,
 } from "./testFixtures";
 
@@ -50,6 +51,77 @@ describe("buildContributorsModel", () => {
     expect(model.leaderboard.rows.length).toBeGreaterThan(0);
     expect(model.stats.kpis.commits.value).toBe(3);
     expect(model.hasActivity).toBe(true);
+  });
+
+  describe("All time", () => {
+    const FIRST = new Date(2026, 7, 3);
+    const all = () => currentPeriod("all", NOW, FIRST);
+    const data = () =>
+      makeRaw({
+        since: syncWindow(all(), NOW).from.toISOString(),
+        commits: [
+          makeCommit("old", ANA, new Date(2026, 7, 3, 9).toISOString(), {
+            files: [file("src/a.ts", 4)],
+          }),
+          makeCommit("new", BOB, oct(14), { files: [file("src/b.ts", 6)] }),
+        ],
+        prs: [makePr("1", ANA, oct(8))],
+      });
+    const build = () =>
+      buildContributorsModel({
+        raw: data(),
+        config: DEFAULT_CONFIG,
+        mailmap: [],
+        merge: true,
+        period: all(),
+        now: NOW,
+      });
+
+    it("has no previous period or scores, and compares nothing", () => {
+      const model = build();
+      expect(model.period.id).toBe("all");
+      expect(model.previousPeriod).toBeNull();
+      expect(model.previous).toBeNull();
+      const { kpis } = model.stats;
+      expect(kpis.commits.value).toBe(2);
+      expect(kpis.commits.delta).toBeNull();
+      expect(kpis.lines.delta).toBeNull();
+      expect(kpis.prsMerged.value).toBe(1);
+      expect(kpis.prsMerged.delta).toBeNull();
+      expect(kpis.contributors.newcomers).toBe(0);
+    });
+
+    it("ranks everyone without a rank movement or a newcomer badge", () => {
+      const { rows } = build().leaderboard;
+      expect(rows.length).toBe(2);
+      for (const row of rows) {
+        expect(row.movement).toBeNull();
+        expect(row.badges.map((b) => b.id)).not.toContain("newcomer");
+      }
+    });
+
+    it("buckets the chart by month and counts the whole history", () => {
+      const model = build();
+      expect(model.stats.granularity).toBe("month");
+      expect(model.stats.buckets.map((b) => b.start)).toEqual([
+        "2026-08-01",
+        "2026-09-01",
+        "2026-10-01",
+      ]);
+      expect(model.hasActivity).toBe(true);
+    });
+
+    it("still gives a period without activity an empty state", () => {
+      const model = buildContributorsModel({
+        raw: makeRaw({ since: syncWindow(all(), NOW).from.toISOString() }),
+        config: DEFAULT_CONFIG,
+        mailmap: [],
+        merge: true,
+        period: all(),
+        now: NOW,
+      });
+      expect(model.hasActivity).toBe(false);
+    });
   });
 
   it("merges identities through config people only when merge is on", () => {
@@ -261,7 +333,7 @@ describe("buildContributorsModel", () => {
     });
 
     it("re-scores an older month from the same raw data", () => {
-      const model = build(previousPeriod(MONTH));
+      const model = build(priorOf(MONTH));
       expect(model.period.id).toBe("2026-09");
       expect(model.previousPeriod.id).toBe("2026-08");
       expect(model.current.period.id).toBe("2026-09");
@@ -345,7 +417,7 @@ describe("buildContributorsModel", () => {
           makeCommit("q2d", ANA, at(5, 29), { files: [file("src/a.ts", 4)] }),
         ],
       });
-      const q2 = previousPeriod(previousPeriod(currentPeriod("quarter", NOW)));
+      const q2 = priorOf(priorOf(currentPeriod("quarter", NOW)));
       expect(q2.id).toBe("2026-Q2");
       const model = buildContributorsModel({
         raw: data,
@@ -375,7 +447,7 @@ describe("buildContributorsModel", () => {
 
     it("has no activity for a period with no commits", () => {
       expect(build(currentPeriod("7d", NOW)).hasActivity).toBe(true);
-      const empty = build(previousPeriod(previousPeriod(MONTH)));
+      const empty = build(priorOf(priorOf(MONTH)));
       expect(empty.hasActivity).toBe(false);
     });
   });
@@ -432,7 +504,7 @@ describe("buildContributorsModel", () => {
     it("keeps a person's color across periods", () => {
       const base = build().colors;
       expect(build({ period: currentPeriod("7d", NOW) }).colors).toEqual(base);
-      expect(build({ period: previousPeriod(MONTH) }).colors).toEqual(base);
+      expect(build({ period: priorOf(MONTH) }).colors).toEqual(base);
     });
 
     it("keeps colors of people outside the period distinct too", () => {

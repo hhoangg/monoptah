@@ -4,10 +4,10 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../model/config";
 import { formatScore } from "../model/format";
-import { currentPeriod, previousPeriod } from "../model/period";
+import { currentPeriod } from "../model/period";
 import type { ContributorsModel } from "../model/pipeline";
 import { SCORING } from "../model/scoring";
-import { withConfig } from "../model/testFixtures";
+import { priorOf, withConfig } from "../model/testFixtures";
 import { FormulaSidebar, type FormulaSidebarProps } from "./FormulaSidebar";
 import { NOW, leaderboardModel } from "./leaderboardFixture";
 
@@ -174,7 +174,7 @@ describe("FormulaSidebar breakdown", () => {
 
   it("names an older month by its label", async () => {
     await render(
-      leaderboardModel({ period: previousPeriod(currentPeriod("month", NOW)) }),
+      leaderboardModel({ period: priorOf(currentPeriod("month", NOW)) }),
     );
     expect(text()).toContain("Your score in Sep 2026:");
   });
@@ -193,6 +193,14 @@ describe("FormulaSidebar period wording", () => {
   it("says the last 7 days for the 7d period", async () => {
     await render(leaderboardModel({ period: currentPeriod("7d", NOW) }));
     expect(text()).toContain("Your score in the last 7 days");
+  });
+
+  it("names All time by its label", async () => {
+    const all = currentPeriod("all", NOW, new Date(2026, 8, 1));
+    await render(leaderboardModel({ period: all }));
+    expect(text()).toContain("Your score over All time:");
+    await render(leaderboardModel({ period: all, user: undefined }));
+    expect(text()).toContain("No activity for you over All time yet");
   });
 
   it("names a quarter and a year by their labels", async () => {

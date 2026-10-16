@@ -503,6 +503,7 @@ pub fn run() {
             contributors::contributors_sync_status,
             contributors::contributors_clear,
             contributors::contributors_git_user,
+            contributors::contributors_first_commit,
             fs::create_path,
             fs::rename_path,
             fs::delete_path,

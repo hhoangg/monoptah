@@ -2135,6 +2135,45 @@ fn read_git_user(cwd: &Path) -> Result<GitUser, String> {
     })
 }
 
+/// The committer date (ISO 8601, in the commit's own zone) of the oldest root
+/// commit reachable from `branch`, or None for a repository without commits.
+/// A root has no parent; several exist when unrelated histories were merged,
+/// so the oldest of them wins. Cheap: it does not walk the whole history.
+fn first_commit(cwd: &Path, branch: Option<&str>) -> Result<Option<String>, String> {
+    let root = repo_root(cwd)?;
+    let head = match resolve_branch(&root, branch) {
+        Ok((_, head)) => head,
+        // No branch was asked for and the current one has nothing yet.
+        Err(_) if branch.map(str::trim).filter(|b| !b.is_empty()).is_none() => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let roots = git(&root, ["rev-list", "--max-parents=0", head.as_str()])?;
+    let roots: Vec<&str> = roots
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let dates = git(
+        &root,
+        ["log", "--no-walk", "--format=%ct %cI"]
+            .into_iter()
+            .chain(roots),
+    )?;
+    Ok(dates
+        .lines()
+        .filter_map(|line| {
+            let (epoch, iso) = line.trim().split_once(' ')?;
+            Some((epoch.parse::<i64>().ok()?, iso.to_string()))
+        })
+        .min_by_key(|(epoch, _)| *epoch)
+        .map(|(_, iso)| iso))
+}
+
 // ---------------------------------------------------------------------------
 // commands
 // ---------------------------------------------------------------------------
@@ -2165,6 +2204,18 @@ pub async fn contributors_branches(cwd: String) -> Result<ContributorsBranches, 
     tauri::async_runtime::spawn_blocking(move || list_branches(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn contributors_first_commit(
+    cwd: String,
+    branch: Option<String>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        first_commit(&expand_home(&cwd), branch.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -3396,6 +3447,125 @@ pub(super) mod tests {
         let branches = list_branches(repo.path()).unwrap();
         assert_eq!(branches.current, "alpha");
         assert_eq!(branches.branches, ["alpha", "main", "zeta"]);
+    }
+
+    /// Newer git prints a UTC date as `Z`, older as `+00:00`.
+    fn first_commit_utc(repo: &TestRepo, branch: Option<&str>) -> Option<String> {
+        first_commit(repo.path(), branch)
+            .unwrap()
+            .map(|iso| iso.replace("+00:00", "Z"))
+    }
+
+    #[test]
+    fn first_commit_is_the_root_commit_date() {
+        let repo = TestRepo::new();
+        repo.commit(
+            &[("a.txt", "a\n")],
+            "Init",
+            ALICE,
+            "2026-01-05T09:00:00+0000",
+        );
+        repo.commit(
+            &[("a.txt", "b\n")],
+            "Second",
+            BOB,
+            "2026-02-01T10:00:00+0000",
+        );
+        assert_eq!(
+            first_commit_utc(&repo, None).as_deref(),
+            Some("2026-01-05T09:00:00Z")
+        );
+    }
+
+    #[test]
+    fn first_commit_takes_the_oldest_of_several_roots() {
+        let repo = TestRepo::new();
+        repo.commit(
+            &[("a.txt", "a\n")],
+            "Main root",
+            ALICE,
+            "2026-03-01T09:00:00+0000",
+        );
+        // An unrelated history that is older than the main root, merged in.
+        repo.run(
+            &["checkout", "-q", "--orphan", "other"],
+            ALICE,
+            "2026-03-02T00:00:00+0000",
+        );
+        repo.commit(
+            &[("b.txt", "b\n")],
+            "Other root",
+            BOB,
+            "2026-01-10T08:00:00+0000",
+        );
+        repo.checkout("main");
+        repo.run(
+            &[
+                "merge",
+                "-q",
+                "--allow-unrelated-histories",
+                "-m",
+                "Join",
+                "other",
+            ],
+            ALICE,
+            "2026-03-05T00:00:00+0000",
+        );
+        assert_eq!(
+            first_commit_utc(&repo, None).as_deref(),
+            Some("2026-01-10T08:00:00Z")
+        );
+    }
+
+    #[test]
+    fn first_commit_follows_the_selected_branch() {
+        let repo = TestRepo::new();
+        repo.commit(
+            &[("a.txt", "a\n")],
+            "Main root",
+            ALICE,
+            "2026-03-01T09:00:00+0000",
+        );
+        repo.run(
+            &["checkout", "-q", "--orphan", "other"],
+            ALICE,
+            "2026-03-02T00:00:00+0000",
+        );
+        repo.commit(
+            &[("b.txt", "b\n")],
+            "Other root",
+            BOB,
+            "2026-01-10T08:00:00+0000",
+        );
+        repo.checkout("main");
+        // `main` does not reach the older root; `other` does.
+        assert_eq!(
+            first_commit_utc(&repo, Some("main")).as_deref(),
+            Some("2026-03-01T09:00:00Z")
+        );
+        assert_eq!(
+            first_commit_utc(&repo, Some("other")).as_deref(),
+            Some("2026-01-10T08:00:00Z")
+        );
+    }
+
+    #[test]
+    fn first_commit_of_a_repo_without_commits_is_none() {
+        let repo = TestRepo::new();
+        assert_eq!(first_commit(repo.path(), None).unwrap(), None);
+    }
+
+    #[test]
+    fn first_commit_rejects_an_unknown_branch() {
+        let repo = TestRepo::new();
+        repo.commit(
+            &[("a.txt", "a\n")],
+            "Init",
+            ALICE,
+            "2026-01-05T09:00:00+0000",
+        );
+        assert!(first_commit(repo.path(), Some("nope")).is_err());
+        assert!(first_commit(repo.path(), Some("--all")).is_err());
     }
 
     #[test]

@@ -8,6 +8,7 @@ import {
 } from "react";
 import {
   clearSynced,
+  firstCommit,
   gitUser,
   listBranches,
   loadStored,
@@ -94,6 +95,12 @@ const loadCache = new Map<string, LoadResponse>();
 const inFlight = new Map<string, Promise<LoadResponse>>();
 /** Auto top-ups already started, per period and branch head: one per head. */
 const toppedUp = new Set<string>();
+/**
+ * Where All time starts, per project and branch: the committer date of the
+ * first commit, or null for a repository without commits.
+ */
+const firstCommitCache = new Map<string, string | null>();
+const firstCommitInFlight = new Map<string, Promise<string | null>>();
 const saves = new Map<string, SaveState>();
 /** One read of a project's files at a time, so a remount does not repeat it. */
 const metaInFlight = new Map<
@@ -155,6 +162,8 @@ export function resetContributorsCache() {
   metaCache.clear();
   loadCache.clear();
   inFlight.clear();
+  firstCommitCache.clear();
+  firstCommitInFlight.clear();
   metaInFlight.clear();
   saves.clear();
   startedAt.clear();
@@ -250,6 +259,32 @@ function loadPeriod(
   return request;
 }
 
+/**
+ * Reads where All time starts. A plain read joins one already running; a fresh
+ * one (a forced refresh) never does. The answer is cached whatever it is.
+ */
+function loadFirstCommit(
+  cwd: string,
+  branch: string | undefined,
+  key: string,
+  fresh: boolean,
+): Promise<string | null> {
+  const joined = fresh ? undefined : firstCommitInFlight.get(key);
+  if (joined) return joined;
+  const request = firstCommit(cwd, branch)
+    .then((iso) => {
+      remember(firstCommitCache, key, iso);
+      return iso;
+    })
+    .finally(() => {
+      if (firstCommitInFlight.get(key) === request) {
+        firstCommitInFlight.delete(key);
+      }
+    });
+  firstCommitInFlight.set(key, request);
+  return request;
+}
+
 function sameLoad(a: LoadResponse, b: LoadResponse): boolean {
   return (
     a.covered === b.covered &&
@@ -341,8 +376,25 @@ export function useContributors(cwd: string) {
   const [, bump] = useReducer((n: number) => n + 1, 0);
 
   const branch = picked.cwd === cwd ? picked.branch : undefined;
+  // All time starts at the first commit of the branch shown, which is known
+  // only once the branch list is: an unpicked branch is the checked-out one.
+  const metaReady = recall(metaCache, cwd) !== undefined;
+  const firstKey = `${cwd}\u0000${branch ?? recall(metaCache, cwd)?.branches.current ?? ""}`;
+  const firstScope = `first\u0000${firstKey}`;
+  const wantsAll = pick.kind === "all";
+  const firstIso = wantsAll ? recall(firstCommitCache, firstKey) : undefined;
+  // undefined: not known yet; null: the repository has no commits.
+  const firstDate = useMemo(() => {
+    if (firstIso === undefined || firstIso === null) return firstIso;
+    const date = new Date(firstIso);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }, [firstIso]);
+  const awaitingFirst = wantsAll && firstDate === undefined;
   // A pick without an id follows the current period as the days pass.
-  const period = useMemo(() => resolvePick(pick, now), [pick, now]);
+  const period = useMemo(
+    () => resolvePick(pick, now, firstDate),
+    [pick, now, firstDate],
+  );
   // The store is read from the start of the previous period (rank movement and
   // deltas compare with it) to the end of the selected one; Rust clips an end
   // in the future to now.
@@ -419,25 +471,58 @@ export function useContributors(cwd: string) {
           fail(metaScope, errorText(error));
         },
       );
-      const raw = loadPeriod(cwd, branch, since, until, key, fresh).then(
-        () => {
-          clearFailure(key);
-        },
-        (error) => {
-          fail(key, errorText(error));
-        },
-      );
+      // The window of All time is unknown until its first commit is; the
+      // project files above are still read, they tell which branch it is.
+      const raw = awaitingFirst
+        ? Promise.resolve()
+        : loadPeriod(cwd, branch, since, until, key, fresh).then(
+            () => {
+              clearFailure(key);
+            },
+            (error) => {
+              fail(key, errorText(error));
+            },
+          );
       await Promise.all([meta, raw]);
       running.current -= 1;
       if (running.current === 0) setRefreshing(false);
       bump();
     },
-    [cwd, branch, since, until, key, metaScope, fail, clearFailure],
+    [
+      cwd,
+      awaitingFirst,
+      branch,
+      since,
+      until,
+      key,
+      metaScope,
+      fail,
+      clearFailure,
+    ],
   );
 
   useEffect(() => {
     void load(false);
   }, [load]);
+
+  const fetchFirst = useCallback(
+    (fresh: boolean) =>
+      loadFirstCommit(cwd, branch, firstKey, fresh).then(
+        () => {
+          clearFailure(firstScope);
+          bump();
+        },
+        (error) => {
+          fail(firstScope, errorText(error));
+        },
+      ),
+    [cwd, branch, firstKey, firstScope, fail, clearFailure],
+  );
+  useEffect(() => {
+    if (!cwd || !wantsAll || !metaReady) return;
+    if (firstCommitCache.has(firstKey)) return;
+    void fetchFirst(false);
+  }, [cwd, wantsAll, metaReady, firstKey, fetchFirst]);
 
   // Listen to the sync jobs, and read what a job that ended stored.
   const reloadRef = useRef<() => void>(() => undefined);
@@ -490,7 +575,7 @@ export function useContributors(cwd: string) {
   }, [now]);
 
   const meta = recall(metaCache, cwd);
-  const loaded = recall(loadCache, key);
+  const loaded = awaitingFirst ? undefined : recall(loadCache, key);
   // A synced period that lacks some commits (a merge brought older ones in)
   // keeps its stored numbers on screen while a background sync repairs it.
   const repair =
@@ -510,7 +595,10 @@ export function useContributors(cwd: string) {
   // stays with the data until the new request answers.
   const shownPeriod = loaded ? period : (previouslyShown?.period ?? period);
   if (shown) lastShown.current = { cwd, raw: shown, period: shownPeriod };
-  const failed = failures[key] ?? failures[metaScope];
+  const failed =
+    failures[key] ??
+    failures[metaScope] ??
+    (awaitingFirst ? failures[firstScope] : undefined);
   const status: "loading" | "ready" | "error" =
     meta && (loaded || shown) ? "ready" : failed ? "error" : "loading";
 
@@ -591,8 +679,8 @@ export function useContributors(cwd: string) {
     [select],
   );
   const goPrevious = useCallback(() => {
-    if (period.kind === "7d") return;
-    select(pickOf(previousPeriod(period), now));
+    const before = period.kind === "7d" ? null : previousPeriod(period);
+    if (before) select(pickOf(before, now));
   }, [period, now, select]);
   const goNext = useCallback(() => {
     const next = nextPeriod(period, now);
@@ -610,7 +698,17 @@ export function useContributors(cwd: string) {
     },
     [cwd],
   );
-  const refresh = useCallback((force: boolean) => load(force), [load]);
+  const refresh = useCallback(
+    (force: boolean) => {
+      // The first commit moves only with a rewrite of history; a retry reads it again.
+      if (force && wantsAll && metaReady) {
+        clearFailure(firstScope);
+        void fetchFirst(true);
+      }
+      return load(force);
+    },
+    [load, wantsAll, metaReady, clearFailure, firstScope, fetchFirst],
+  );
 
   const startFullSync = useCallback(() => begin("full"), [begin]);
   const retryGithub = useCallback(() => begin("github"), [begin]);

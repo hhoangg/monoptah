@@ -156,10 +156,13 @@ function Podium({
 function RankingRow({
   row,
   colors,
+  compared,
   onAskAgent,
 }: {
   row: LeaderboardRow;
   colors: Record<string, string>;
+  /** False when there is no previous period (All time): no rank movement to show. */
+  compared: boolean;
   onAskAgent?: (scope: SnapshotScope) => void;
 }) {
   const move = movementView(row.movement);
@@ -173,13 +176,15 @@ function RankingRow({
     >
       <td className={`${TD} whitespace-nowrap`}>
         <span className="font-semibold tabular-nums">{row.rank}</span>
-        <span
-          title={move.title}
-          className={`ml-1.5 inline-block w-7 text-[11px] ${move.tone}`}
-        >
-          <span aria-hidden>{move.glyph}</span>
-          <span className="sr-only">{move.title}</span>
-        </span>
+        {compared ? (
+          <span
+            title={move.title}
+            className={`ml-1.5 inline-block w-7 text-[11px] ${move.tone}`}
+          >
+            <span aria-hidden>{move.glyph}</span>
+            <span className="sr-only">{move.title}</span>
+          </span>
+        ) : null}
       </td>
       <td className={TD}>
         <div className="flex items-center gap-2">
@@ -308,6 +313,7 @@ export function LeaderboardTab({
                     key={row.personId}
                     row={row}
                     colors={model.colors}
+                    compared={model.previousPeriod !== null}
                     onAskAgent={onAskAgent}
                   />
                 ))}

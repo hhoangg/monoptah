@@ -109,7 +109,7 @@ function formulaDescription(): string[] {
     `Breadth: ${s.MODULE_PTS} points for each module (first two folders of a path) with at least ${s.MODULE_MIN_EFF} effective lines of the person's own PRs, at most ${s.MODULE_CAP} modules.`,
     "Co-authors: with human Co-authored-by trailers the PR author gets 60% and the others share 40%. Agents never take a share.",
     "AI agents: work co-authored by an agent counts fully for the human behind it. Agent-authored work goes to the PR author, then the committer, then the identity mapping. AI-assisted % is informational and never changes a score.",
-    "Periods are the last 7 days or a calendar month, quarter or year in local time, and days are bucketed by committer date. Rank movement is the previous rank minus the current rank.",
+    "Periods are the last 7 days, a calendar month, quarter or year, or all time (from the first commit to today), in local time, and days are bucketed by committer date. Rank movement is the previous rank minus the current rank; all time has no previous period, so it shows no rank movement and no comparison.",
   ];
 }
 
@@ -302,25 +302,49 @@ export function buildSnapshot(input: {
   };
 }
 
+// These two compare with a previous period, which All time does not have.
+const TREND_QUESTION =
+  "Compare this period with the last 3 and explain the trend.";
+const MOVEMENT_QUESTION = "Why did my rank change since the previous period?";
+
 const TEAM_QUESTIONS = [
   "Summarize this period: who drove what, and where are the risks?",
   "Which modules depend on a single person (bus factor)?",
-  "Compare this period with the last 3 and explain the trend.",
+  TREND_QUESTION,
   "Are any scores inflated by generated code or huge PRs?",
 ];
 
 const ME_QUESTIONS = [
-  "Why did my rank change since the previous period?",
+  MOVEMENT_QUESTION,
   "What would raise my Quality factor?",
   "Which of my PRs had the most rework, and why?",
 ];
 
+/** What is asked in place of a question that needs a previous period. */
+const WITHOUT_PREVIOUS = new Map([
+  [
+    TREND_QUESTION,
+    "How has activity changed over the years, and who carried each stretch?",
+  ],
+  [
+    MOVEMENT_QUESTION,
+    "Where do my contributions stand compared with the rest of the team?",
+  ],
+]);
+
+/**
+ * `hasPrevious` is false for All time: the questions that compare with an
+ * earlier period are replaced by ones that make sense without it.
+ */
 export function suggestedQuestions(
   scope: SnapshotScope,
   name?: string,
+  { hasPrevious = true }: { hasPrevious?: boolean } = {},
 ): string[] {
-  if (scope.kind === "team") return [...TEAM_QUESTIONS];
-  if (scope.kind === "me") return [...ME_QUESTIONS];
+  const fit = (questions: string[]) =>
+    questions.map((q) => (hasPrevious ? q : (WITHOUT_PREVIOUS.get(q) ?? q)));
+  if (scope.kind === "team") return fit(TEAM_QUESTIONS);
+  if (scope.kind === "me") return fit(ME_QUESTIONS);
   const who = name ?? "this person";
   return [
     `Summarize ${who}'s contributions this period.`,

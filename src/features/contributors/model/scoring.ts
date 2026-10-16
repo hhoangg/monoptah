@@ -110,7 +110,7 @@ export type PeriodScores = {
   people: PersonScore[];
   unattributed: { prs: number; commits: number };
   ghAvailable: boolean;
-  /** People whose first activity in the data falls inside the period (empty when the data does not reach the previous period). */
+  /** People whose first activity in the data falls inside the period (empty when the data does not reach the previous period, and for All time). */
   newcomers: string[];
 };
 
@@ -681,8 +681,10 @@ export function scorePeriod(input: {
       a.personId.localeCompare(b.personId),
   );
 
+  // Without a period before it (All time) nobody can be told apart as new.
+  const before = previousPeriod(period);
   const dataReachesPreviousPeriod =
-    Date.parse(raw.since) <= previousPeriod(period).start.getTime();
+    before !== null && Date.parse(raw.since) <= before.start.getTime();
   const newcomers = dataReachesPreviousPeriod
     ? people
         .map((p) => p.personId)

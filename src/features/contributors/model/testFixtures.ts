@@ -2,7 +2,7 @@
 import { DEFAULT_CONFIG } from "./config";
 import { buildResolver } from "./identity";
 import { observedIdentities } from "./scoring";
-import { currentPeriod } from "./period";
+import { currentPeriod, previousPeriod } from "./period";
 import type { Period } from "./period";
 import type {
   ContributorsConfig,
@@ -20,6 +20,13 @@ export const oct = (day: number, hour = 12) =>
 
 /** October 2026 as a period. */
 export const PERIOD: Period = currentPeriod("month", new Date(2026, 9, 15));
+
+/** The period before `p`; a test that needs one fails loudly when there is none. */
+export function priorOf(p: Period): Period {
+  const before = previousPeriod(p);
+  if (!before) throw new Error(`${p.id} has no previous period`);
+  return before;
+}
 
 /** The last day of `PERIOD`, so every day of it counts as elapsed. */
 export const PERIOD_NOW = new Date(2026, 9, 31, 12);

@@ -280,7 +280,9 @@ export function FormulaSidebar({
   const periodWord =
     model.period.kind === "7d"
       ? "in the last 7 days"
-      : `in ${model.period.label}`;
+      : model.period.kind === "all"
+        ? `over ${model.period.label}`
+        : `in ${model.period.label}`;
   const customWeights = WEIGHT_FIELDS.filter(
     ({ key }) => config.weights[key] !== 1,
   );

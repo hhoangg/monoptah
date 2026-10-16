@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AskAgentRequest, AskScope } from "../model/askAgent";
 import { AskAgentDialog } from "./AskAgentDialog";
 import type { AskAgentDialogProps } from "./AskAgentDialog";
-import { leaderboardModel } from "./leaderboardFixture";
+import { currentPeriod } from "../model/period";
+import { leaderboardModel, NOW } from "./leaderboardFixture";
 
 const model = leaderboardModel();
 const ana = model.leaderboard.rows.find((r) => r.name === "Ana")!;
@@ -272,6 +273,23 @@ describe("AskAgentDialog suggestions and question", () => {
     await mount({ scope: { kind: "person", personId: bob.personId } });
     const person = all("[data-suggestion]").map((b) => b.textContent);
     expect(person).toContain("Summarize Bob's contributions this period.");
+  });
+
+  it("leaves out the questions about a previous period for All time", async () => {
+    const allTime = leaderboardModel({
+      period: currentPeriod("all", NOW, new Date(2026, 8, 1)),
+    });
+    await mount({ model: allTime });
+    const team = all("[data-suggestion]").map((b) => b.textContent);
+    expect(team).toHaveLength(4);
+    expect(team.join("\n")).not.toContain("previous period");
+    expect(team.join("\n")).not.toContain("the last 3");
+    await mount({
+      model: allTime,
+      scope: { kind: "me", personId: ana.personId },
+    });
+    const me = all("[data-suggestion]").map((b) => b.textContent);
+    expect(me.join("\n")).not.toContain("previous period");
   });
 
   it("disables Start session while the question is empty or blank", async () => {

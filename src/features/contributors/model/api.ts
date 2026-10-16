@@ -94,3 +94,17 @@ export function listBranches(cwd: string): Promise<ContributorsBranches> {
 export function gitUser(cwd: string): Promise<GitUser> {
   return invoke<GitUser>("contributors_git_user", { cwd });
 }
+
+/**
+ * Committer date (ISO 8601) of the oldest root commit reachable from the
+ * branch, or null for a repository without commits. Where All time starts.
+ */
+export function firstCommit(
+  cwd: string,
+  branch?: string,
+): Promise<string | null> {
+  return invoke<string | null>("contributors_first_commit", {
+    cwd,
+    branch: branch ?? null,
+  });
+}
