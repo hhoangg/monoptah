@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-18
+
 Carries the upstream MonoCode 0.14.0 changes below.
 
 ### Added
