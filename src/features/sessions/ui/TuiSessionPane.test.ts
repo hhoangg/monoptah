@@ -43,6 +43,8 @@ vi.mock("@xterm/xterm", () => ({
       onBufferChange: () => ({ dispose() {} }),
     };
     open() {}
+    /** Accept addon registration without activating addons in the terminal mock. */
+    loadAddon() {}
     focus() {}
     dispose() {}
     writeln() {}

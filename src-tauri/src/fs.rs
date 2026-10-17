@@ -16,6 +16,7 @@ use crate::dirs_home;
 pub(crate) const MAX_TEXT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_ATTACHMENT_EMBED_BYTES: u64 = 20 * 1024 * 1024;
 pub(crate) const MAX_PREVIEW_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_DOCUMENT_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_GENERATED_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_GENERATED_IMAGE_DATA_BYTES: u64 = MAX_GENERATED_IMAGE_BYTES * 4 / 3 + 4;
 const GENERATED_IMAGE_DIR: &str = "generated-images";
@@ -1815,16 +1816,35 @@ fn git_diff_stats_for(root: &Path) -> GitDiffStats {
     let mut files: HashMap<String, FileAcc> = HashMap::new();
     if let Some(text) = git_run(
         root,
-        &["diff", "--no-ext-diff", "--numstat", "HEAD", "--", "."],
+        &[
+            "diff",
+            "-z",
+            "--no-ext-diff",
+            "--numstat",
+            "HEAD",
+            "--",
+            ".",
+        ],
     ) {
         add_numstat_map(&text, &mut files);
     } else {
-        if let Some(text) = git_run(root, &["diff", "--no-ext-diff", "--numstat", "--", "."]) {
+        if let Some(text) = git_run(
+            root,
+            &["diff", "-z", "--no-ext-diff", "--numstat", "--", "."],
+        ) {
             add_numstat_map(&text, &mut files);
         }
         if let Some(text) = git_run(
             root,
-            &["diff", "--no-ext-diff", "--cached", "--numstat", "--", "."],
+            &[
+                "diff",
+                "-z",
+                "--no-ext-diff",
+                "--cached",
+                "--numstat",
+                "--",
+                ".",
+            ],
         ) {
             add_numstat_map(&text, &mut files);
         }
@@ -1869,6 +1889,7 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
         root,
         &[
             "diff",
+            "-z",
             "--relative",
             "--no-ext-diff",
             "--numstat",
@@ -1882,6 +1903,7 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
             root,
             &[
                 "diff",
+                "-z",
                 "--relative",
                 "--no-ext-diff",
                 "--name-status",
@@ -1898,6 +1920,7 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
             root,
             &[
                 "diff",
+                "-z",
                 "--relative",
                 "--no-ext-diff",
                 "--numstat",
@@ -1911,6 +1934,7 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
             root,
             &[
                 "diff",
+                "-z",
                 "--relative",
                 "--no-ext-diff",
                 "--cached",
@@ -1925,6 +1949,7 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
             root,
             &[
                 "diff",
+                "-z",
                 "--relative",
                 "--no-ext-diff",
                 "--name-status",
@@ -1939,6 +1964,7 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
             root,
             &[
                 "diff",
+                "-z",
                 "--relative",
                 "--no-ext-diff",
                 "--cached",
@@ -2003,12 +2029,29 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
 }
 
 fn add_numstat_map(text: &str, files: &mut HashMap<String, FileAcc>) {
-    for line in text.lines() {
-        let mut parts = line.splitn(3, '\t');
+    // `git diff -z --numstat` ends each record with NUL. A rename is
+    // `add <TAB> del <TAB> <NUL> old <NUL> new <NUL>`; every other record is
+    // `add <TAB> del <TAB> path <NUL>`. The path itself may contain spaces,
+    // quotes, tabs, or non-ASCII bytes, which a newline listing would C-quote.
+    let mut fields = text.split('\0');
+    while let Some(record) = fields.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let mut parts = record.splitn(3, '\t');
         let Some(add) = parts.next() else { continue };
         let Some(del) = parts.next() else { continue };
         let Some(path) = parts.next() else { continue };
-        let relative = normalize_diff_path(path);
+        let path = if path.is_empty() {
+            let _previous = fields.next();
+            match fields.next() {
+                Some(destination) if !destination.is_empty() => destination,
+                _ => continue,
+            }
+        } else {
+            path
+        };
+        let relative = literal_diff_path(path);
         if relative.is_empty() {
             continue;
         }
@@ -2021,9 +2064,14 @@ fn add_numstat_map(text: &str, files: &mut HashMap<String, FileAcc>) {
 }
 
 fn add_name_status(text: &str, statuses: &mut HashMap<String, &'static str>) {
-    for line in text.lines() {
-        let Some((code, rest)) = line.split_once('\t') else {
+    // `--no-renames -z` is `status <NUL> path <NUL>`, repeated.
+    let mut fields = text.split('\0');
+    while let Some(code) = fields.next() {
+        if code.is_empty() {
             continue;
+        }
+        let Some(path) = fields.next() else {
+            break;
         };
         let status = match code.as_bytes().first() {
             Some(b'A') => "added",
@@ -2031,10 +2079,19 @@ fn add_name_status(text: &str, statuses: &mut HashMap<String, &'static str>) {
             Some(b'M' | b'T') => "modified",
             _ => continue,
         };
-        let relative = normalize_diff_path(rest);
+        let relative = literal_diff_path(path);
         if !relative.is_empty() {
             statuses.insert(relative, status);
         }
+    }
+}
+
+fn literal_diff_path(path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        String::new()
+    } else {
+        path_to_js(Path::new(path))
     }
 }
 
@@ -2103,6 +2160,7 @@ fn mark_cached_and_unstaged(root: &Path, files: &mut HashMap<String, FileAcc>) {
         root,
         &[
             "diff",
+            "-z",
             "--relative",
             "--cached",
             "--name-only",
@@ -2111,8 +2169,8 @@ fn mark_cached_and_unstaged(root: &Path, files: &mut HashMap<String, FileAcc>) {
             ".",
         ],
     ) {
-        for line in names.lines() {
-            let relative = normalize_diff_path(line);
+        for line in names.split('\0') {
+            let relative = literal_diff_path(line);
             if !relative.is_empty() {
                 files.entry(relative).or_default().staged = true;
             }
@@ -2122,6 +2180,7 @@ fn mark_cached_and_unstaged(root: &Path, files: &mut HashMap<String, FileAcc>) {
         root,
         &[
             "diff",
+            "-z",
             "--relative",
             "--name-only",
             "--no-renames",
@@ -2129,8 +2188,8 @@ fn mark_cached_and_unstaged(root: &Path, files: &mut HashMap<String, FileAcc>) {
             ".",
         ],
     ) {
-        for line in names.lines() {
-            let relative = normalize_diff_path(line);
+        for line in names.split('\0') {
+            let relative = literal_diff_path(line);
             if !relative.is_empty() {
                 files.entry(relative).or_default().unstaged = true;
             }
@@ -2388,6 +2447,7 @@ fn git_commit_files_for(root: &Path, sha: &str) -> Result<Vec<GitChangedFile>, S
         root,
         &[
             "diff-tree",
+            "-z",
             "--no-commit-id",
             "-r",
             "--root",
@@ -2402,6 +2462,7 @@ fn git_commit_files_for(root: &Path, sha: &str) -> Result<Vec<GitChangedFile>, S
         root,
         &[
             "diff-tree",
+            "-z",
             "--no-commit-id",
             "-r",
             "--root",
@@ -4686,9 +4747,13 @@ pub(crate) fn resolve_repo_path(root: &Path, relative: &str) -> Result<String, S
     Ok(relative)
 }
 
+/// Any git can start a filter: in an LFS repo `status`, `diff`, `add`, and
+/// checkouts all run `git-lfs`, which a Finder launch's bare PATH lacks. The
+/// cached search path finds it without waiting on the login shell.
 fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
     crate::hide_window_console(&mut cmd);
+    cmd.env("PATH", crate::harness::cached_gui_search_path());
     cmd
 }
 
@@ -4699,7 +4764,7 @@ fn git_cmd_for_args_with_path(args: &[&str], gui_path: impl FnOnce() -> String) 
         args.first().copied(),
         Some("commit" | "push" | "pull" | "fetch" | "clone")
     ) {
-        // Signers, hooks, credential helpers, and git-lfs may need the login-shell PATH.
+        // Signers, hooks, and credential helpers may only be on the login-shell PATH.
         cmd.env("PATH", gui_path());
     }
     cmd
@@ -5830,6 +5895,66 @@ fn read_binary_file_sync(path: &str) -> Result<Vec<u8>, String> {
     std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Read an image that a Markdown document in a project shows.
+///
+/// The document is untrusted, so `path` must be relative to `root` and the
+/// file must resolve inside it with symlinks followed: a README cannot pull in
+/// a file from elsewhere on disk. The caller sniffs the bytes, as for
+/// `read_binary_file`.
+#[tauri::command]
+pub async fn read_project_image(
+    root: String,
+    path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        read_project_image_sync(Path::new(&root), Path::new(&path))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+fn read_project_image_sync(root: &Path, path: &Path) -> Result<Vec<u8>, String> {
+    use std::path::Component;
+    if !path
+        .components()
+        .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err("Image path must stay inside the project".into());
+    }
+    let root = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let joined = root.join(path);
+    let file = std::fs::canonicalize(&joined).map_err(|e| format!("{}: {e}", joined.display()))?;
+    if !file.starts_with(&root) {
+        return Err("Image is outside the project".into());
+    }
+    let handle = std::fs::File::open(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let meta = handle
+        .metadata()
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    if !meta.is_file() {
+        return Err("Not a file".into());
+    }
+    let too_large = || {
+        format!(
+            "Image is too large to show (maximum {} MB).",
+            MAX_DOCUMENT_IMAGE_BYTES / 1024 / 1024
+        )
+    };
+    if meta.len() > MAX_DOCUMENT_IMAGE_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    handle
+        .take(MAX_DOCUMENT_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    if bytes.len() as u64 > MAX_DOCUMENT_IMAGE_BYTES {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
 /// Persist a pasted blob so non-image attachments have a real path.
 #[tauri::command]
 pub async fn write_attachment(name: String, data: String) -> Result<String, String> {
@@ -6813,6 +6938,53 @@ mod tests {
     }
 
     #[test]
+    fn project_images_read_only_inside_the_project() {
+        let dir = tmp("project-image");
+        let root = dir.0.join("repo");
+        std::fs::create_dir_all(root.join(".github/readme")).unwrap();
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        std::fs::write(root.join(".github/readme/hero.png"), png).unwrap();
+        std::fs::write(dir.0.join("secret.png"), b"secret").unwrap();
+
+        let read = |path: &str| read_project_image_sync(&root, Path::new(path));
+        assert_eq!(read(".github/readme/hero.png").unwrap(), png);
+        assert_eq!(read("./.github/readme/hero.png").unwrap(), png);
+        assert!(read("../secret.png").is_err());
+        assert!(read(".github/../../secret.png").is_err());
+        assert!(read(&dir.0.join("secret.png").to_string_lossy()).is_err());
+        assert!(read(".github").is_err());
+        assert!(read("").is_err());
+        assert!(read("missing.png").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_images_refuse_symlinks_out_of_the_project() {
+        let dir = tmp("project-image-link");
+        let root = dir.0.join("repo");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(dir.0.join("secret.png"), b"secret").unwrap();
+        std::fs::write(root.join("docs/inside.png"), b"inside").unwrap();
+        std::os::unix::fs::symlink(dir.0.join("secret.png"), root.join("leak.png")).unwrap();
+        std::os::unix::fs::symlink(&dir.0, root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("docs/inside.png"), root.join("alias.png")).unwrap();
+
+        let read = |path: &str| read_project_image_sync(&root, Path::new(path));
+        assert!(read("leak.png").is_err());
+        assert!(read("outside/secret.png").is_err());
+        assert_eq!(read("alias.png").unwrap(), b"inside");
+    }
+
+    #[test]
+    fn project_images_refuse_oversized_files() {
+        let dir = tmp("project-image-size");
+        let file = std::fs::File::create(dir.0.join("huge.png")).unwrap();
+        file.set_len(MAX_DOCUMENT_IMAGE_BYTES + 1).unwrap();
+        let error = read_project_image_sync(&dir.0, Path::new("huge.png")).unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+    }
+
+    #[test]
     fn inspect_paths_reports_files_and_directories() {
         let dir = tmp("inspect-paths");
         let file = dir.0.join("notes.md");
@@ -7599,6 +7771,41 @@ mod tests {
         assert_eq!(untracked.status, "untracked");
         assert_eq!(untracked.additions, 2);
         assert_eq!(untracked.deletions, 0);
+    }
+
+    #[test]
+    fn git_diff_index_keeps_literal_non_ascii_paths() {
+        let dir = tmp("git-diff-quoted-path");
+        if !init_git_commit(&dir.0, &[("한글.md", "before\n"), ("my file.txt", "one\n")]) {
+            return;
+        }
+        // Default quoting would otherwise hand the Changes view a C-escaped name.
+        assert!(git(&dir.0, &["config", "core.quotePath", "true"]));
+        std::fs::write(dir.0.join("한글.md"), "before\nafter\n").unwrap();
+        std::fs::write(dir.0.join("my file.txt"), "one\ntwo\n").unwrap();
+
+        let index = git_diff_index_for(&dir.0);
+        let hangul = index
+            .files
+            .iter()
+            .find(|file| file.relative == "한글.md")
+            .unwrap();
+        assert_eq!(hangul.status, "modified");
+        assert_eq!(hangul.additions, 1);
+        assert!(hangul.unstaged);
+        assert!(!hangul.relative.contains('\\'));
+
+        let spaced = index
+            .files
+            .iter()
+            .find(|file| file.relative == "my file.txt")
+            .unwrap();
+        assert_eq!(spaced.status, "modified");
+        assert_eq!(spaced.additions, 1);
+
+        let diff = git_file_diff_for(&dir.0, "한글.md", false).unwrap();
+        assert_eq!(diff.relative, "한글.md");
+        assert!(diff.current.contains("after"));
     }
 
     #[test]
@@ -9585,22 +9792,35 @@ filename f.txt\n\
         assert!(!head.is_empty());
     }
 
-    #[test]
-    fn read_only_git_cmd_uses_inherited_path() {
-        assert!(!git_cmd()
+    fn git_cmd_path(cmd: &Command) -> Vec<PathBuf> {
+        let path = cmd
             .get_envs()
-            .any(|(key, _)| key == std::ffi::OsStr::new("PATH")));
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .expect("git should get an explicit PATH");
+        std::env::split_paths(path).collect()
+    }
+
+    /// git-lfs and other filters live in Homebrew dirs a Finder launch lacks.
+    #[test]
+    fn read_only_git_cmd_path_adds_fixed_dirs_to_inherited_path() {
+        let path = git_cmd_path(&git_cmd());
+        assert!(path.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(path.contains(&PathBuf::from("/usr/local/bin")));
+        if let Some(inherited) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&inherited) {
+                assert!(path.contains(&dir), "missing inherited {dir:?}");
+            }
+        }
     }
 
     #[test]
-    fn read_only_git_never_resolves_login_shell_path() {
-        for action in ["status", "diff", "rev-parse", "ls-files", "cat-file"] {
+    fn local_git_never_resolves_login_shell_path() {
+        for action in ["status", "diff", "add", "restore", "cat-file"] {
             let cmd = git_cmd_for_args_with_path(&[action], || {
-                panic!("read-only git must not resolve the login-shell PATH")
+                panic!("local git must not resolve the login-shell PATH")
             });
-            assert!(!cmd
-                .get_envs()
-                .any(|(key, _)| key == std::ffi::OsStr::new("PATH")));
+            assert!(git_cmd_path(&cmd).contains(&PathBuf::from("/opt/homebrew/bin")));
         }
     }
 
