@@ -1154,10 +1154,18 @@ mod tests {
 
     /// Takes one from `left` and says whether there was one to take.
     fn take_one(left: &AtomicUsize) -> bool {
-        left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            (n > 0).then(|| n.saturating_sub(1))
-        })
-        .is_ok()
+        // A compare-exchange loop rather than `fetch_update`, which newer
+        // toolchains deprecate in favour of a method older ones lack.
+        let mut n = left.load(Ordering::SeqCst);
+        loop {
+            if n == 0 {
+                return false;
+            }
+            match left.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(current) => n = current,
+            }
+        }
     }
 
     impl FakeHttp {
