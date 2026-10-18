@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-10-18
+
+### Added
+
+- **Ticket Contributors**, a new view in the sidebar that ranks ClickUp users by the work they delivered, with no repository needed. Pick a ClickUp workspace and a month, quarter, year or all time; the view fetches the period's tickets and shows each member's points, delivered tickets, scoring coverage, difficulty mix and active work.
+- **AI ticket scoring.** Each delivered ticket is judged once on five criteria (ambiguity, investigation, system scope, risk, coordination), summed into a level from XS to XL that earns points. Assignee names and emails are hidden from the AI. Choose Claude Code (your subscription) or an Anthropic API key and the model under **Settings > Ticket scoring**. Before scoring you see how many tickets the period has, how many are scored, and an estimate of the tokens a run will use; pick a coverage percentage to control the spend. Any level can be changed by hand, and edited tickets are never re-scored.
+- **Delivered statuses.** Done and closed statuses count by default; add your own, such as "ready for testing", under Scope. Subtasks count, and a parent with subtasks does not. Tickets in a working status appear as Active and are never scored. When ClickUp's Total time in Status ClickApp is off, delivery dates of custom statuses use the last update and are marked approximate.
+- **Exclude members** from the board, for example managers or people who left. Their solo tickets drop out of the totals and are never scored; shared tickets split their points between the remaining assignees.
+- **Export report.** Saves a self-contained HTML report for managers: summary tiles, points by member, difficulty mix, trend, delivered and active work, a member table, the hardest tickets with the AI's reason, and how the score works. Quarter and year reports add a month-by-month table and expandable details per month. The comparison with the previous period only appears when that period was fully fetched.
+
 ## [0.24.0] - 2026-10-18
 
 Carries the upstream MonoCode 0.14.0 changes below.
