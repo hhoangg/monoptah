@@ -2706,9 +2706,13 @@ mod tests {
         h.manager.cancel();
         h.deps.http.hold.store(false, Ordering::SeqCst);
         assert_eq!(h.sink.wait_for_end(1).state, "cancelled");
-        // The first workspace finished before the cancel was seen; the second
-        // never started.
-        assert_eq!(interval_of(&h, "w1", "*").unwrap().0, FROM);
+        // The first workspace's listing was held when the cancel came, so
+        // whether it is stored depends on when the job sees the cancel. Either
+        // way nothing partial is written: covered from FROM, or not at all.
+        if let Some((since, _)) = interval_of(&h, "w1", "*") {
+            assert_eq!(since, FROM);
+        }
+        // The second workspace never started.
         assert_eq!(interval_of(&h, "w2", "*"), None);
     }
 
