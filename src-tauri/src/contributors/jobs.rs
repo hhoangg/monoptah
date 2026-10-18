@@ -693,6 +693,19 @@ mod tests {
         fn started(&self, branch: &str) -> bool {
             self.log().contains(&format!("start {branch}"))
         }
+
+        /// Waits until the runner has entered the job. A Running event is
+        /// emitted before the runner starts, so it does not prove this.
+        fn wait_started(&self, branch: &str) {
+            let deadline = Instant::now() + WAIT;
+            while !self.started(branch) {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {branch} to start"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
     }
 
     fn outcome(cancelled: bool) -> SyncOutcome {
@@ -798,8 +811,8 @@ mod tests {
         let h = Harness::new();
         h.jobs.start(spec("one", "a")).unwrap();
         h.jobs.start(spec("two", "b")).unwrap();
-        h.sink.wait_state("a", JobState::Running);
-        h.sink.wait_state("b", JobState::Running);
+        h.ctl.wait_started("a");
+        h.ctl.wait_started("b");
         h.ctl.release("a");
         h.ctl.release("b");
         h.sink.wait_state("a", JobState::Done);
