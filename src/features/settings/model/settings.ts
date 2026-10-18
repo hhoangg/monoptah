@@ -503,6 +503,13 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     keywords: "api token tasks spaces workspace connect",
   },
   {
+    id: "ticket-scoring",
+    section: "inbox",
+    label: "Ticket scoring",
+    keywords:
+      "contributors leaderboard clickup ai runner claude code anthropic api key model haiku opus",
+  },
+  {
     id: "linear",
     section: "inbox",
     label: "Linear",

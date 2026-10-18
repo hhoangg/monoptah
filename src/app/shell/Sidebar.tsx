@@ -24,6 +24,7 @@ import {
   Inbox,
   ListFilter,
   Mail,
+  ChartBreakoutSquare,
   PanelLeft,
   Pin,
   Plus,
@@ -324,12 +325,14 @@ type Props = {
   onOpenNotes?: () => void;
   onOpenAutomations?: () => void;
   onOpenMail?: () => void;
+  onOpenTicketContributors?: () => void;
   onGoToFile?: () => void;
   searchActive?: boolean;
   inboxActive?: boolean;
   notesActive?: boolean;
   automationsActive?: boolean;
   mailActive?: boolean;
+  ticketContributorsActive?: boolean;
   /** Unread mail over enabled sources; 0 draws no badge. */
   mailUnread?: number;
   notesEnabled?: boolean;
@@ -425,12 +428,14 @@ function SidebarComponent({
   onOpenNotes,
   onOpenAutomations,
   onOpenMail,
+  onOpenTicketContributors,
   onGoToFile,
   searchActive = false,
   inboxActive = false,
   notesActive = false,
   automationsActive = false,
   mailActive = false,
+  ticketContributorsActive = false,
   mailUnread = 0,
   notesEnabled = true,
   onToggleProjectRail,
@@ -804,6 +809,7 @@ function SidebarComponent({
     notesActive ||
     automationsActive ||
     mailActive ||
+    ticketContributorsActive ||
     settingsOpen;
   // A remembered Mono sits underneath these views; select it only while visible.
   const railMonos = monos
@@ -1758,11 +1764,13 @@ function SidebarComponent({
               onOpenNotes={notesEnabled ? onOpenNotes : undefined}
               onOpenAutomations={onOpenAutomations}
               onOpenMail={onOpenMail}
+              onOpenTicketContributors={onOpenTicketContributors}
               searchActive={searchActive}
               inboxActive={inboxActive}
               notesActive={notesActive}
               automationsActive={automationsActive}
               mailActive={mailActive}
+              ticketContributorsActive={ticketContributorsActive}
               mailUnread={mailUnread}
               inboxUnseen={inboxUnseen}
             />
@@ -2285,7 +2293,9 @@ function SidebarComponent({
           onOpenAutomations={onOpenAutomations}
           automationsActive={automationsActive}
           onOpenMail={onOpenMail}
+          onOpenTicketContributors={onOpenTicketContributors}
           mailActive={mailActive}
+          ticketContributorsActive={ticketContributorsActive}
           mailUnread={mailUnread}
           onOpenSettings={onOpenSettings}
           onTogglePanel={onToggleProjectRail}
@@ -2319,7 +2329,9 @@ function SidebarComponent({
           onOpenAutomations={onOpenAutomations}
           automationsActive={automationsActive}
           onOpenMail={onOpenMail}
+          onOpenTicketContributors={onOpenTicketContributors}
           mailActive={mailActive}
+          ticketContributorsActive={ticketContributorsActive}
           mailUnread={mailUnread}
           onTogglePanel={onToggleProjectRail}
           onSelectProject={onSelectProject}
@@ -2404,11 +2416,13 @@ function SidebarProjectPicker({
   onOpenNotes,
   onOpenAutomations,
   onOpenMail,
+  onOpenTicketContributors,
   searchActive = false,
   inboxActive = false,
   notesActive = false,
   automationsActive = false,
   mailActive = false,
+  ticketContributorsActive = false,
   mailUnread = 0,
   inboxUnseen = false,
 }: {
@@ -2426,11 +2440,13 @@ function SidebarProjectPicker({
   onOpenNotes?: () => void;
   onOpenAutomations?: () => void;
   onOpenMail?: () => void;
+  onOpenTicketContributors?: () => void;
   searchActive?: boolean;
   inboxActive?: boolean;
   notesActive?: boolean;
   automationsActive?: boolean;
   mailActive?: boolean;
+  ticketContributorsActive?: boolean;
   mailUnread?: number;
   inboxUnseen?: boolean;
 }) {
@@ -2526,6 +2542,15 @@ function SidebarProjectPicker({
             </span>
           </IconButton>
         ) : null}
+        {onOpenTicketContributors ? (
+          <IconButton
+            label="Ticket Contributors"
+            active={ticketContributorsActive}
+            onClick={onOpenTicketContributors}
+          >
+            <ChartBreakoutSquare className="size-3.5" strokeWidth={1.75} />
+          </IconButton>
+        ) : null}
       </div>
       {inboxMenu ? (
         <InboxNotificationMenu
@@ -2566,8 +2591,10 @@ function CompactProjectRail({
   notesActive,
   onOpenAutomations,
   onOpenMail,
+  onOpenTicketContributors,
   automationsActive,
   mailActive,
+  ticketContributorsActive,
   mailUnread,
   onOpenSettings,
   onTogglePanel,
@@ -2599,8 +2626,10 @@ function CompactProjectRail({
   notesActive: boolean;
   onOpenAutomations?: () => void;
   onOpenMail?: () => void;
+  onOpenTicketContributors?: () => void;
   automationsActive: boolean;
   mailActive: boolean;
+  ticketContributorsActive: boolean;
   mailUnread: number;
   onOpenSettings?: () => void;
   onTogglePanel?: () => void;
@@ -2644,6 +2673,7 @@ function CompactProjectRail({
     !notesActive &&
     !automationsActive &&
     !mailActive &&
+    !ticketContributorsActive &&
     !monoViewActive;
   const openWorkspaceTab = (nextTab: SidebarTab) => {
     if (!workspaceActive) onLeaveActive?.();
@@ -2784,6 +2814,14 @@ function CompactProjectRail({
             active={mailActive}
             count={mailUnread}
             onClick={action(mailActive, onOpenMail)}
+          />
+        ) : null}
+        {onOpenTicketContributors ? (
+          <CompactRailAction
+            label="Ticket Contributors"
+            icon={ChartBreakoutSquare}
+            active={ticketContributorsActive}
+            onClick={action(ticketContributorsActive, onOpenTicketContributors)}
           />
         ) : null}
       </div>

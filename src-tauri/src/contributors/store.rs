@@ -16,7 +16,7 @@ use super::{
 };
 
 /// How many `?` placeholders one `IN (...)` list may hold.
-const CHUNK: usize = 400;
+pub(super) const CHUNK: usize = 400;
 
 /// Hard stop for a hash listing that a cancel check can stop.
 const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -107,7 +107,8 @@ CREATE TABLE IF NOT EXISTS contrib_coverage (
 
 /// Creates the Contributors tables. Safe to run on every start.
 pub(crate) fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA)
+    conn.execute_batch(SCHEMA)?;
+    super::ticket_store::ensure_schema(conn)
 }
 
 /// A commit as sync stores it. `commit.pr_id` stays `None`: the commit to PR
@@ -148,21 +149,21 @@ pub(super) struct Loaded {
     pub gh_state: Option<String>,
 }
 
-fn sql(error: rusqlite::Error) -> String {
+pub(super) fn sql(error: rusqlite::Error) -> String {
     error.to_string()
 }
 
-fn json<T: serde::Serialize>(value: &T) -> Result<String, String> {
+pub(super) fn json<T: serde::Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string(value).map_err(|e| e.to_string())
 }
 
-fn unjson<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+pub(super) fn unjson<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
     serde_json::from_str(text).map_err(|e| format!("Corrupt Contributors data: {e}"))
 }
 
 /// Runs `query` once per chunk of `items`. `query` holds `{in}` where the
 /// `IN (...)` placeholders go; `lead` are the parameters before them.
-fn query_in<T>(
+pub(super) fn query_in<T>(
     conn: &Connection,
     query: &str,
     lead: &[&dyn ToSql],
@@ -1321,7 +1322,7 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
-        assert_eq!(tables, 7);
+        assert_eq!(tables, 11);
         // The fork records no schema version of its own: upstream owns the
         // numbers, and the tables come from `ensure_tables`.
         assert_eq!(version, 19);
@@ -1343,7 +1344,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(tables, 7);
+        assert_eq!(tables, 11);
         assert_eq!(version, 19);
     }
 
@@ -1389,7 +1390,7 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
-        assert_eq!(tables, 7);
+        assert_eq!(tables, 11);
     }
 
     // repo identity

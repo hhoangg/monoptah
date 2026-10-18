@@ -36,7 +36,9 @@ export default defineConfig(async ({ mode }) => {
             }
           : undefined,
       watch: {
-        ignored: stable ? ["**/*"] : ["**/src-tauri/**"],
+        // .monoptah/ holds config the app itself writes (Contributors); a
+        // change there must not make the Tailwind plugin reload the page.
+        ignored: stable ? ["**/*"] : ["**/src-tauri/**", "**/.monoptah/**"],
       },
     },
   };
