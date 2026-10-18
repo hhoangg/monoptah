@@ -6,6 +6,7 @@ import {
   Internet,
   Inbox,
   Mail,
+  ChartBreakoutSquare,
   MoreHorizontal,
   Pin,
   PinOff,
@@ -111,6 +112,8 @@ type Props = {
   automationsActive?: boolean;
   onOpenMail?: () => void;
   mailActive?: boolean;
+  onOpenTicketContributors?: () => void;
+  ticketContributorsActive?: boolean;
   /** Unread mail over enabled sources; 0 draws no badge. */
   mailUnread?: number;
   onTogglePanel?: () => void;
@@ -153,8 +156,10 @@ export function ProjectRail({
   notesActive = false,
   onOpenAutomations,
   onOpenMail,
+  onOpenTicketContributors,
   automationsActive = false,
   mailActive = false,
+  ticketContributorsActive = false,
   mailUnread = 0,
   onTogglePanel,
   onSelectProject,
@@ -345,6 +350,7 @@ export function ProjectRail({
     notesActive ||
     automationsActive ||
     mailActive ||
+    ticketContributorsActive ||
     !!monos?.activeId;
   const pinnedIds = sections.pinned.map((item) => item.path);
   const projectIds = groupedProjectSections.ungrouped.map((item) => item.path);
@@ -438,6 +444,15 @@ export function ProjectRail({
                 ariaLabel={
                   mailUnread > 0 ? `Mail, ${mailUnread} unread` : "Mail"
                 }
+              />
+            ) : null}
+            {onOpenTicketContributors ? (
+              <RailAction
+                label="Ticket Contributors"
+                icon={ChartBreakoutSquare}
+                onClick={onOpenTicketContributors}
+                active={ticketContributorsActive}
+                ariaLabel="Ticket Contributors"
               />
             ) : null}
           </div>

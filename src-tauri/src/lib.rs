@@ -292,6 +292,7 @@ pub fn run() {
             harness::reap_orphaned_harness_processes();
             session_store::init(app.handle())?;
             app.manage(contributors::new_jobs(app.handle().clone()));
+            app.manage(contributors::new_ticket_jobs(app.handle().clone()));
             control::init(app.handle())?;
             tui_hook::init(app.handle())?;
             reminders::init(app.handle());
@@ -517,6 +518,17 @@ pub fn run() {
             contributors::contributors_clear,
             contributors::contributors_git_user,
             contributors::contributors_first_commit,
+            contributors::contributors_tickets_fetch,
+            contributors::contributors_tickets_assess,
+            contributors::contributors_tickets_estimate,
+            contributors::contributors_tickets_cancel,
+            contributors::contributors_tickets_status,
+            contributors::contributors_tickets_window_covered,
+            contributors::contributors_tickets_load,
+            contributors::contributors_ticket_override,
+            contributors::contributors_ai_config_get,
+            contributors::contributors_ai_config_set,
+            contributors::contributors_clickup_spaces,
             fs::create_path,
             fs::rename_path,
             fs::delete_path,

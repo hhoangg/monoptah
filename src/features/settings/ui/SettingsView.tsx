@@ -42,6 +42,7 @@ import { Popover } from "../../../shared/ui/Popover";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
 import { JiraSettings } from "./JiraSettings";
 import { ClickUpSettings } from "./ClickUpSettings";
+import { TicketScoringSettings } from "./TicketScoringSettings";
 import { GradientBlurBackground } from "./GradientBlurBackground";
 import { McpSettings } from "./McpSettings";
 import { MailSettings } from "./MailSettings";
@@ -1313,6 +1314,14 @@ function InboxPage({
         description="ClickUp tasks from the spaces you pick."
       >
         <ClickUpSettings />
+      </Group>
+
+      <Group
+        id="ticket-scoring"
+        title="Ticket scoring"
+        description="The AI runner that scores closed ClickUp tickets."
+      >
+        <TicketScoringSettings />
       </Group>
 
       <Group

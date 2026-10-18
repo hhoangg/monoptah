@@ -21,7 +21,9 @@ const COMMENT_PAGE_SIZE: usize = 25;
 const MAX_COMMENT_PAGES: usize = 5;
 const DEFAULT_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(120);
-const RATE_LIMITED: &str = "ClickUp rate limited, retry shortly";
+/// The error every ClickUp call returns while a rate-limit backoff is running.
+/// Recognise it with `is_rate_limited`, not by matching text.
+pub(crate) const RATE_LIMITED: &str = "ClickUp rate limited, retry shortly";
 
 // Shared by every command so a 429 pauses background Inbox polling too.
 static RATE_LIMIT_BACKOFF: Mutex<Option<Instant>> = Mutex::new(None);
@@ -37,9 +39,9 @@ pub struct ClickUpStatus {
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct ClickUpConfig {
-    token: String,
-    team_id: String,
+pub(crate) struct ClickUpConfig {
+    pub(crate) token: String,
+    pub(crate) team_id: String,
     team_name: String,
     // Cached from `GET /user` so the status check stays offline.
     #[serde(default)]
@@ -55,7 +57,7 @@ pub struct ClickUpWorkspace {
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct ClickUpSpace {
+pub(crate) struct ClickUpSpace {
     pub id: String,
     pub name: String,
 }
@@ -360,13 +362,17 @@ fn tasks_path(
 }
 
 fn fetch_spaces(config: &ClickUpConfig) -> Result<Vec<ClickUpSpace>, String> {
+    fetch_spaces_for(&config.token, &config.team_id)
+}
+
+pub(crate) fn fetch_spaces_for(token: &str, team_id: &str) -> Result<Vec<ClickUpSpace>, String> {
     parse_clickup_spaces(&clickup_get(
-        &config.token,
-        &format!("/team/{}/space?archived=false", config.team_id),
+        token,
+        &format!("/team/{team_id}/space?archived=false"),
     )?)
 }
 
-fn clickup_get(token: &str, path: &str) -> Result<Value, String> {
+pub(crate) fn clickup_get(token: &str, path: &str) -> Result<Value, String> {
     wait_for_backoff()?;
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
     let result = agent
@@ -389,6 +395,12 @@ fn clickup_post(token: &str, path: &str, body: &Value) -> Result<Value, String> 
         .set("Content-Type", "application/json")
         .send_string(&payload);
     read_clickup_response(result)
+}
+
+/// Whether `error` came from a ClickUp rate limit (a 429, or a call made while
+/// the backoff after one is running). Such an error is transient.
+pub(crate) fn is_rate_limited(error: &str) -> bool {
+    error == RATE_LIMITED
 }
 
 fn wait_for_backoff() -> Result<(), String> {
@@ -524,7 +536,7 @@ fn select_workspace(
     }
 }
 
-fn parse_clickup_spaces(data: &Value) -> Result<Vec<ClickUpSpace>, String> {
+pub(crate) fn parse_clickup_spaces(data: &Value) -> Result<Vec<ClickUpSpace>, String> {
     let spaces = data
         .get("spaces")
         .and_then(Value::as_array)
@@ -915,7 +927,7 @@ fn code_span(text: &str) -> String {
     format!("{fence}{pad}{text}{pad}{fence}")
 }
 
-fn task_url(task_id: &str) -> String {
+pub(crate) fn task_url(task_id: &str) -> String {
     format!("https://app.clickup.com/t/{task_id}")
 }
 
@@ -948,7 +960,7 @@ fn issue_number(custom_id: &str) -> i64 {
 }
 
 /// ClickUp timestamps are epoch milliseconds in a string; the app uses ISO-8601 UTC.
-fn epoch_ms_to_iso(value: &str) -> String {
+pub(crate) fn epoch_ms_to_iso(value: &str) -> String {
     let Ok(ms) = value.trim().parse::<i64>() else {
         return String::new();
     };
@@ -1052,7 +1064,7 @@ fn read_config(app: &AppHandle) -> Result<Option<ClickUpConfig>, String> {
     }
 }
 
-fn require_config(app: &AppHandle) -> Result<ClickUpConfig, String> {
+pub(crate) fn require_config(app: &AppHandle) -> Result<ClickUpConfig, String> {
     read_config(app)?.ok_or_else(|| "Connect ClickUp in Settings".to_string())
 }
 
@@ -1074,7 +1086,7 @@ fn delete_config(app: &AppHandle) -> Result<(), String> {
     }
 }
 
-fn write_secret_file(path: &Path, value: &str) -> Result<(), String> {
+pub(crate) fn write_secret_file(path: &Path, value: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -1361,6 +1373,13 @@ mod tests {
         );
         assert!(clickup_http_error(403, "").contains("denied access"));
         assert_eq!(clickup_http_error(500, ""), "ClickUp request failed (500)");
+    }
+
+    #[test]
+    fn rate_limit_errors_are_recognised_by_their_constant() {
+        assert!(is_rate_limited(RATE_LIMITED));
+        assert!(!is_rate_limited("ClickUp could not find that item"));
+        assert!(!is_rate_limited("Could not reach ClickUp"));
     }
 
     #[test]

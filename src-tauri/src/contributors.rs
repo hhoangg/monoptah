@@ -9,11 +9,16 @@
 //! from git and before survival and reverts are computed, so those use the
 //! final PR list. The result is cached as a whole.
 
+mod assessor;
+mod clickup_tickets;
 mod gh;
 mod jobs;
 mod pr_heads;
+mod rubric;
 pub(crate) mod store;
 mod sync;
+mod ticket_jobs;
+mod ticket_store;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -2236,6 +2241,15 @@ pub(crate) fn new_jobs(app: AppHandle) -> jobs::JobManager {
     )
 }
 
+/// The job manager of the ticket scoring: fetches closed ClickUp tickets and
+/// has the AI assess them, and tells the webview on `contributors://tickets`.
+pub(crate) fn new_ticket_jobs(app: AppHandle) -> ticket_jobs::TicketJobManager {
+    ticket_jobs::TicketJobManager::new(
+        Arc::new(ticket_jobs::AppDeps(app.clone())),
+        Arc::new(ticket_jobs::TauriSink(app)),
+    )
+}
+
 /// A period read from the store. Starts no git or GitHub work beyond listing
 /// the period's commit hashes.
 #[tauri::command]
@@ -2352,6 +2366,246 @@ pub async fn contributors_clear(
     tauri::async_runtime::spawn_blocking(move || {
         let store = app.state::<SessionStore>();
         jobs::clear_repo(&jobs, &store, &expand_home(&cwd))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// ticket commands
+// ---------------------------------------------------------------------------
+
+/// A period given as the webview's date strings, as epoch seconds with both
+/// edges inclusive (a bare end date means the last second of its day).
+fn ticket_period(from: &str, to: &str) -> Result<(i64, i64), String> {
+    let from =
+        window_epoch(from.trim(), false).ok_or_else(|| format!("Invalid start date: {from}"))?;
+    let to = window_epoch(to.trim(), true).ok_or_else(|| format!("Invalid end date: {to}"))?;
+    if from > to {
+        return Err("The start date is after the end date.".to_string());
+    }
+    Ok((from, to))
+}
+
+/// ClickUp ids go into request paths, so only their usual characters pass.
+fn clickup_id(id: &str) -> Result<&str, String> {
+    let id = id.trim();
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!("Invalid ClickUp id: {id}"));
+    }
+    Ok(id)
+}
+
+/// Queues a fetch of the tickets of each link updated since `from`, whatever
+/// their status. `to` only validates the period: there is no upper bound.
+/// Returns the job id at once; progress comes as `contributors://tickets`.
+#[tauri::command]
+pub async fn contributors_tickets_fetch(
+    jobs: State<'_, ticket_jobs::TicketJobManager>,
+    links: Vec<clickup_tickets::TicketLink>,
+    from: String,
+    to: String,
+) -> Result<u64, String> {
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (from, _) = ticket_period(&from, &to)?;
+        for link in &links {
+            clickup_id(&link.workspace_id)?;
+            for space in link.space_ids.iter().flatten() {
+                clickup_id(space)?;
+            }
+        }
+        jobs.start(ticket_jobs::TicketJob::Fetch { links, from })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Queues an assessment of the tickets among `ids` that need one (all of them
+/// with `force`, except the ones with a manual level).
+#[tauri::command]
+pub async fn contributors_tickets_assess(
+    jobs: State<'_, ticket_jobs::TicketJobManager>,
+    ids: Vec<String>,
+    force: bool,
+) -> Result<u64, String> {
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        jobs.start(ticket_jobs::TicketJob::Assess { ids, force })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// A rough size of assessing the tickets among `ids`: how many would really
+/// be assessed and the input tokens that would take. Calls nothing.
+#[tauri::command]
+pub async fn contributors_tickets_estimate(
+    app: AppHandle,
+    ids: Vec<String>,
+) -> Result<ticket_jobs::TicketEstimate, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = app.state::<SessionStore>();
+        store.with_read_conn(|conn| ticket_jobs::estimate(conn, &ids))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Stops the running ticket job and drops the ones queued behind it.
+#[tauri::command]
+pub async fn contributors_tickets_cancel(
+    jobs: State<'_, ticket_jobs::TicketJobManager>,
+) -> Result<(), String> {
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.cancel())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The last event of the running (or next queued) ticket job, for a page that
+/// was opened or reloaded after it started, with the number of fetch jobs
+/// queued or running.
+#[tauri::command]
+pub async fn contributors_tickets_status(
+    jobs: State<'_, ticket_jobs::TicketJobManager>,
+) -> Result<ticket_jobs::TicketJobStatus, String> {
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jobs.status_with_pending())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Whether the stored tickets of the workspace's spaces (`space_ids` of `None`
+/// or empty means every space) are complete for the window `from`..`to`: the
+/// completed fetches cover it from its start up to its end, or up to now when
+/// the window has not ended. A fetch covers only the span from its start to
+/// the moment its listing began, and a fetch of narrowed spaces only those
+/// spaces (a fetch of every space satisfies any set).
+#[tauri::command]
+pub async fn contributors_tickets_window_covered(
+    app: AppHandle,
+    workspace_id: String,
+    space_ids: Option<Vec<String>>,
+    from: String,
+    to: String,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (from, to) = ticket_period(&from, &to)?;
+        let store = app.state::<SessionStore>();
+        store.with_read_conn(|conn| {
+            ticket_store::window_covered(
+                conn,
+                &workspace_id,
+                space_ids.as_deref(),
+                from,
+                to.min(now_epoch()),
+            )
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The stored tickets of the workspaces updated since the start of the period
+/// (every status, subtasks included), with their assessments and manual levels.
+/// There is no upper bound: a ticket delivered in the period and edited after it
+/// still has to be loaded. Fetches nothing.
+#[tauri::command]
+pub async fn contributors_tickets_load(
+    app: AppHandle,
+    workspace_ids: Vec<String>,
+    since: String,
+) -> Result<Vec<ticket_store::TicketRecord>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let since = window_epoch(since.trim(), false)
+            .ok_or_else(|| format!("Invalid start date: {since}"))?;
+        let store = app.state::<SessionStore>();
+        store.with_read_conn(|conn| ticket_store::load_records(conn, &workspace_ids, since))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Sets (or with `level` of `None` clears) the manual level of a ticket.
+#[tauri::command]
+pub async fn contributors_ticket_override(
+    app: AppHandle,
+    ticket_id: String,
+    level: Option<String>,
+    note: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let note = note
+            .as_deref()
+            .map(str::trim)
+            .filter(|note| !note.is_empty());
+        let store = app.state::<SessionStore>();
+        let conn = store.lock_conn()?;
+        ticket_store::set_override(&conn, &ticket_id, level.as_deref(), note)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The AI settings without the key: the webview learns only whether one is set.
+#[tauri::command]
+pub async fn contributors_ai_config_get(
+    app: AppHandle,
+) -> Result<assessor::AiConfigStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(assessor::read_ai_config(&app)?.status()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Saves the AI settings. `api_key` of `None` keeps the stored key, `Some("")`
+/// deletes it and any other value replaces it.
+#[tauri::command]
+pub async fn contributors_ai_config_set(
+    app: AppHandle,
+    runner: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<assessor::AiConfigStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Keeping the stored key needs the stored settings: if they cannot be
+        // read, say so rather than save over them and lose the key. When a new
+        // key is given (or the old one is being deleted) an unreadable file is
+        // replaced, so the user is never locked out of fixing it.
+        let mut config = match assessor::read_ai_config(&app) {
+            Ok(config) => config,
+            Err(error) if api_key.is_none() => return Err(error),
+            Err(_) => assessor::AiConfig::default(),
+        };
+        config.runner = runner;
+        config.model = model;
+        match api_key {
+            None => {}
+            Some(key) if key.trim().is_empty() => config.api_key = None,
+            Some(key) => config.api_key = Some(key),
+        }
+        assessor::write_ai_config(&app, &config)?;
+        Ok(assessor::read_ai_config(&app)?.status())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The spaces of a ClickUp workspace, for narrowing a project's link. Uses the
+/// stored ClickUp token.
+#[tauri::command]
+pub async fn contributors_clickup_spaces(
+    app: AppHandle,
+    team_id: String,
+) -> Result<Vec<crate::clickup::ClickUpSpace>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let team_id = clickup_id(&team_id)?;
+        let config = crate::clickup::require_config(&app)?;
+        crate::clickup::fetch_spaces_for(&config.token, team_id)
     })
     .await
     .map_err(|e| e.to_string())?
