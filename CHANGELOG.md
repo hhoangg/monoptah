@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Carries the upstream MonoCode 0.15.0 changes below.
+## [0.26.0] - 2026-10-18
+
+Carries the upstream MonoCode 0.15.0 changes below. Mail, Ticket Contributors and Contributors also open in the New layout.
 
 ### Added
 
