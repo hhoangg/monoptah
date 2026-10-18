@@ -52,6 +52,8 @@ type Sheet =
   | { kind: "edit"; folder: FolderRow };
 
 type Props = {
+  /** Drops the view's own header: the new layout's title bar carries the chrome. */
+  tabbed?: boolean;
   besideRail?: boolean;
   compactRail?: boolean;
   onClose: () => void;
@@ -97,6 +99,7 @@ const FOLDER_COLUMN_WIDTH = 232;
  * list, thread list and reader fill them in.
  */
 export function MailView({
+  tabbed = false,
   besideRail = false,
   compactRail = false,
   onClose,
@@ -325,6 +328,33 @@ export function MailView({
       ?.focus();
   }, [cursorId, readerOnly]);
 
+  const actionButtons = (
+    <div className="flex shrink-0 items-center gap-1.5 pr-2">
+      <SecondaryButton
+        danger={unconfirmed > 0}
+        aria-label={outboxLabel(total, unconfirmed)}
+        onClick={() => setOutboxOpen(true)}
+      >
+        <Send className="size-3" />
+        Outbox
+        {total > 0 ? (
+          <span className="tabular-nums text-content/50">{total}</span>
+        ) : null}
+        {unconfirmed > 0 ? (
+          <span className="tabular-nums">{unconfirmed} to check</span>
+        ) : null}
+      </SecondaryButton>
+      <SecondaryButton
+        onPointerEnter={preloadMailEditor}
+        onFocus={preloadMailEditor}
+        onClick={() => openCompose({ kind: "new" })}
+      >
+        <MessageSquarePlus className="size-3" />
+        Compose
+      </SecondaryButton>
+    </div>
+  );
+
   return (
     <div
       ref={rootRef}
@@ -333,48 +363,32 @@ export function MailView({
       data-app-mail
       className="flex min-h-0 min-w-0 flex-1 flex-col text-content"
     >
-      <div
-        className="flex h-10 shrink-0 select-none items-center border-b border-stroke"
-        data-tauri-drag-region="deep"
-      >
-        {IS_MAC && compactRail ? <div className="w-4 shrink-0" /> : null}
-        {IS_MAC && !besideRail ? <div className="w-[78px] shrink-0" /> : null}
-        {besideRail ? null : (
-          <OverlayNav onBack={onClose} onToggleSidebar={onToggleSidebar} />
-        )}
-        <div className="flex min-w-0 flex-1 items-center gap-2 px-3 text-[13px]">
-          <Mail
-            className="size-3.5 shrink-0 text-content/45"
-            strokeWidth={1.75}
-          />
-          <span className="min-w-0 truncate text-content">Mail</span>
+      {tabbed ? (
+        <div className="flex h-10 shrink-0 items-center justify-end border-b border-stroke">
+          {actionButtons}
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 pr-2">
-          <SecondaryButton
-            danger={unconfirmed > 0}
-            aria-label={outboxLabel(total, unconfirmed)}
-            onClick={() => setOutboxOpen(true)}
-          >
-            <Send className="size-3" />
-            Outbox
-            {total > 0 ? (
-              <span className="tabular-nums text-content/50">{total}</span>
-            ) : null}
-            {unconfirmed > 0 ? (
-              <span className="tabular-nums">{unconfirmed} to check</span>
-            ) : null}
-          </SecondaryButton>
-          <SecondaryButton
-            onPointerEnter={preloadMailEditor}
-            onFocus={preloadMailEditor}
-            onClick={() => openCompose({ kind: "new" })}
-          >
-            <MessageSquarePlus className="size-3" />
-            Compose
-          </SecondaryButton>
+      ) : (
+        <div
+          data-app-view-header
+          className="flex h-10 shrink-0 select-none items-center border-b border-stroke"
+          data-tauri-drag-region="deep"
+        >
+          {IS_MAC && compactRail ? <div className="w-4 shrink-0" /> : null}
+          {IS_MAC && !besideRail ? <div className="w-[78px] shrink-0" /> : null}
+          {besideRail ? null : (
+            <OverlayNav onBack={onClose} onToggleSidebar={onToggleSidebar} />
+          )}
+          <div className="flex min-w-0 flex-1 items-center gap-2 px-3 text-[13px]">
+            <Mail
+              className="size-3.5 shrink-0 text-content/45"
+              strokeWidth={1.75}
+            />
+            <span className="min-w-0 truncate text-content">Mail</span>
+          </div>
+          {actionButtons}
+          {IS_MAC ? null : <WindowControls />}
         </div>
-        {IS_MAC ? null : <WindowControls />}
-      </div>
+      )}
       <div className="flex min-h-0 min-w-0 flex-1">
         <aside
           aria-label="Folders"

@@ -25,6 +25,7 @@ toml = "0.9.12"
 mail-parser = "0.11"
 mail-builder = "0.4"
 ammonia = "4"
+tokio = { version = "1", features = ["sync"] }
 sha2 = "0.10"
 hmac = "0.12"
 zstd = "0.13"

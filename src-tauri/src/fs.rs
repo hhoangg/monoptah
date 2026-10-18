@@ -637,7 +637,7 @@ pub struct ProjectFile {
 /// index-backed); otherwise a bounded walk that never descends into vendor dirs.
 #[tauri::command]
 pub async fn list_project_files(cwd: String) -> Result<Vec<ProjectFile>, String> {
-    tauri::async_runtime::spawn_blocking(move || list_project_files_sync(&cwd))
+    crate::background_work::read(move || list_project_files_sync(&cwd))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -840,7 +840,7 @@ pub struct GitDiffStats {
 /// plus untracked (gitignore-aware) files counted as additions.
 #[tauri::command]
 pub async fn git_diff_stats(cwd: String) -> Result<GitDiffStats, String> {
-    tauri::async_runtime::spawn_blocking(move || git_diff_stats_for(&expand_home(&cwd)))
+    crate::background_work::read(move || git_diff_stats_for(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())
 }
@@ -877,7 +877,7 @@ pub struct GitDiffIndex {
 /// Changed files in the opened folder, with per-file line counts and status.
 #[tauri::command]
 pub async fn git_diff_index(cwd: String) -> Result<GitDiffIndex, String> {
-    tauri::async_runtime::spawn_blocking(move || git_diff_index_for(&expand_home(&cwd)))
+    crate::background_work::read(move || git_diff_index_for(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())
 }
@@ -885,7 +885,7 @@ pub async fn git_diff_index(cwd: String) -> Result<GitDiffIndex, String> {
 /// Changed files and counts without branch/upstream synchronization metadata.
 #[tauri::command]
 pub async fn git_diff_files(cwd: String) -> Result<GitDiffIndex, String> {
-    tauri::async_runtime::spawn_blocking(move || git_diff_files_for(&expand_home(&cwd)))
+    crate::background_work::read(move || git_diff_files_for(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())
 }
@@ -910,11 +910,9 @@ pub async fn git_file_diff(
     relative: String,
     staged: bool,
 ) -> Result<GitFileDiff, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        git_file_diff_for(&expand_home(&cwd), &relative, staged)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    crate::background_work::read(move || git_file_diff_for(&expand_home(&cwd), &relative, staged))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 const GIT_HISTORY_DEFAULT: u32 = 200;
@@ -951,7 +949,7 @@ pub struct GitHistory {
 /// branch. Newest first, with parent SHAs for the graph.
 #[tauri::command]
 pub async fn git_history(cwd: String, limit: Option<u32>) -> Result<GitHistory, String> {
-    tauri::async_runtime::spawn_blocking(move || git_history_for(&expand_home(&cwd), limit))
+    crate::background_work::read(move || git_history_for(&expand_home(&cwd), limit))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -959,7 +957,7 @@ pub async fn git_history(cwd: String, limit: Option<u32>) -> Result<GitHistory, 
 /// Files changed in one commit (first parent / root).
 #[tauri::command]
 pub async fn git_commit_files(cwd: String, sha: String) -> Result<Vec<GitChangedFile>, String> {
-    tauri::async_runtime::spawn_blocking(move || git_commit_files_for(&expand_home(&cwd), &sha))
+    crate::background_work::read(move || git_commit_files_for(&expand_home(&cwd), &sha))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -971,7 +969,7 @@ pub async fn git_commit_file_diff(
     sha: String,
     relative: String,
 ) -> Result<GitFileDiff, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::background_work::read(move || {
         git_commit_file_diff_for(&expand_home(&cwd), &sha, &relative)
     })
     .await
@@ -4752,6 +4750,7 @@ pub(crate) fn resolve_repo_path(root: &Path, relative: &str) -> Result<String, S
 /// cached search path finds it without waiting on the login shell.
 fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
+    crate::background_work::configure_child(&mut cmd);
     crate::hide_window_console(&mut cmd);
     cmd.env("PATH", crate::harness::cached_gui_search_path());
     cmd

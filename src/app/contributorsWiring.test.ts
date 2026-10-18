@@ -175,8 +175,8 @@ it("starting a Contributors session creates a chat, submits and closes the page"
 
 it("hands the Contributors page the session starter for its own project", () => {
   expect(app).toContain("onStartAgentSession={(request) =>");
-  expect(app).toContain(
-    "onStartContributorsSession(contributorsProject, request)",
+  expect(app).toMatch(
+    /onStartContributorsSession\(\s*contributorsProject,\s*request,?\s*\)/,
   );
 });
 
@@ -248,10 +248,19 @@ it("the title-bar tabs are inert while Contributors is open", () => {
   const head = lines.slice(wrapper - 12, wrapper + 25).join("\n");
   expect(head.match(/contributorsViewOpen/g)?.length).toBeGreaterThanOrEqual(3);
   const titleBar = lines.findIndex((l) =>
-    l.includes("{compactTitleBar ? null : workspaceTitleBar}"),
+    l.includes("{titleBarInBody ? workspaceTitleBar : null}"),
   );
   expect(titleBar).toBeGreaterThan(wrapper);
   expect(app).toContain("IS_MAC && compactRailActive && !chromeSurfaceOpen");
+  // The inset layout keeps its tabs across the whole window, outside that
+  // wrapper, so picking one of them has to close Contributors itself.
+  const select = lines.findIndex((l) =>
+    l.includes("const onSelectTitleTab = useCallback("),
+  );
+  expect(select).toBeGreaterThan(-1);
+  expect(lines.slice(select, select + 40).join("\n")).toContain(
+    "setContributorsProject(null);",
+  );
   expect(app).toMatch(/const chromeSurfaceOpen =[^;]*contributorsViewOpen;/);
 });
 
@@ -337,13 +346,79 @@ it("the footer, project terminal dock and menu bar are not reachable while Contr
   // Why onNewTerminal, onShowTerminal and onSelectProjectTerminal need no
   // close of their own: the footer is not rendered for the page, and the dock
   // and menu bar sit in the inert wrapper.
-  const footerGate = lines.findIndex(
-    (l, i) =>
-      l.includes("contributorsViewOpen ||") &&
-      lines[i + 2]?.includes("monoCovers ? null : ("),
-  );
+  const footerGate = lines.findIndex((l) => l.includes("const usageFooter ="));
   expect(footerGate).toBeGreaterThan(-1);
-  expect(lines.slice(footerGate + 2, footerGate + 4).join("\n")).toContain(
+  expect(lines.slice(footerGate + 1, footerGate + 3).join("\n")).toContain(
+    "chromeSurfaceOpen",
+  );
+  expect(lines.slice(footerGate, footerGate + 8).join("\n")).toContain(
     "<UsageFooter",
   );
+});
+
+// The new layout draws a tab strip, a Mono tab and a right panel around the
+// workspace. The three fork views have no tab, so each of those has to treat
+// them like upstream's app views.
+const bodyAfter = (marker: string, length: number) => {
+  const start = lines.findIndex((l) => l.includes(marker));
+  expect(start, marker).toBeGreaterThan(-1);
+  return lines.slice(start, start + length).join("\n");
+};
+
+it("opening Mail, Ticket Contributors or Contributors puts a Mono's view away", () => {
+  for (const name of [
+    "onOpenMail",
+    "onOpenTicketContributors",
+    "onOpenContributors",
+  ]) {
+    expect(bodyAfter(`const ${name} =`, 14), name).toContain(
+      "closeMonoView();",
+    );
+  }
+});
+
+it("closing the visible tab closes an open fork view before a Mono or app view", () => {
+  const body = bodyAfter("const onCloseVisibleTab = useCallback", 14);
+  const fork = body.indexOf("forkViewOpen");
+  expect(fork).toBeGreaterThan(-1);
+  expect(fork).toBeLessThan(body.indexOf("monoCovers"));
+  for (const close of [
+    "setMailViewOpen(false);",
+    "setTicketContributorsOpen(false);",
+    "setContributorsProject(null);",
+  ]) {
+    expect(body).toContain(close);
+  }
+});
+
+it("the right panel and Back treat an open fork view like an app view", () => {
+  expect(app).toMatch(
+    /const forkViewOpen =\s*mailViewOpen \|\| ticketContributorsOpen \|\| contributorsViewOpen;/,
+  );
+  expect(bodyAfter("const insetRightPanelShown =", 8)).toContain(
+    "!forkViewOpen",
+  );
+  expect(bodyAfter("rightPanelToggleRef.current =", 6)).toContain(
+    "!forkViewOpen",
+  );
+  expect(app).toContain(
+    "rightPanelUnavailable={!!activeAppView || forkViewOpen}",
+  );
+  expect(app).toMatch(
+    /canGoBack=\{!!monoViewId \|\| tabVisitNav\.canBack \|\| forkViewOpen\}/,
+  );
+});
+
+it("the fork views drop their own header in the new layout", () => {
+  for (const tag of [
+    "MailView",
+    "TicketContributorsView",
+    "ContributorsView",
+  ]) {
+    const start = lines.findIndex((l) => l.includes(`<${tag}`));
+    expect(start, tag).toBeGreaterThan(-1);
+    expect(lines.slice(start, start + 6).join("\n"), tag).toContain(
+      "tabbed={insetLayout}",
+    );
+  }
 });

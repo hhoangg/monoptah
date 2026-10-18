@@ -252,7 +252,8 @@ export function TerminalView({
       fontSize: 13,
       lineHeight: 1,
       letterSpacing: 0,
-      scrollback: 5000,
+      // About 12 bytes per cell, retained for every open terminal.
+      scrollback: 2000,
       allowTransparency: true,
       smoothScrollDuration: 0,
       theme: terminalTheme(isLightScheme()),

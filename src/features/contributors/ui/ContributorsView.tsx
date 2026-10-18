@@ -71,6 +71,8 @@ const TABS: { id: TabId; label: string }[] = [
 type Props = {
   /** Path of the local project whose history is shown. */
   project: string;
+  /** Drops the view's own header: the new layout's title bar carries the chrome. */
+  tabbed?: boolean;
   besideRail?: boolean;
   compactRail?: boolean;
   onClose: () => void;
@@ -173,6 +175,7 @@ function Alert({
 
 export function ContributorsView({
   project,
+  tabbed = false,
   besideRail = false,
   compactRail = false,
   onClose,
@@ -311,30 +314,33 @@ export function ContributorsView({
       onClickCapture={onClickCapture}
       className="flex min-h-0 min-w-0 flex-1 flex-col text-content"
     >
-      <div
-        className="flex h-10 shrink-0 select-none items-center border-b border-stroke"
-        data-tauri-drag-region="deep"
-      >
-        {IS_MAC && compactRail ? <div className="w-4 shrink-0" /> : null}
-        {IS_MAC && !besideRail ? <div className="w-[78px] shrink-0" /> : null}
-        {besideRail ? null : (
-          <OverlayNav onBack={onClose} onToggleSidebar={onToggleSidebar} />
-        )}
-        <div className="flex min-w-0 flex-1 items-center gap-2 px-3 text-[13px]">
-          <Trophy
-            className="size-3.5 shrink-0 text-content/45"
-            strokeWidth={1.75}
-          />
-          <span className="min-w-0 truncate text-content/45">
-            {projectName(project)}
-          </span>
-          <span aria-hidden className="shrink-0 text-content/25">
-            /
-          </span>
-          <span className="min-w-0 truncate text-content">Contributors</span>
+      {!tabbed ? (
+        <div
+          data-app-view-header
+          className="flex h-10 shrink-0 select-none items-center border-b border-stroke"
+          data-tauri-drag-region="deep"
+        >
+          {IS_MAC && compactRail ? <div className="w-4 shrink-0" /> : null}
+          {IS_MAC && !besideRail ? <div className="w-[78px] shrink-0" /> : null}
+          {besideRail ? null : (
+            <OverlayNav onBack={onClose} onToggleSidebar={onToggleSidebar} />
+          )}
+          <div className="flex min-w-0 flex-1 items-center gap-2 px-3 text-[13px]">
+            <Trophy
+              className="size-3.5 shrink-0 text-content/45"
+              strokeWidth={1.75}
+            />
+            <span className="min-w-0 truncate text-content/45">
+              {projectName(project)}
+            </span>
+            <span aria-hidden className="shrink-0 text-content/25">
+              /
+            </span>
+            <span className="min-w-0 truncate text-content">Contributors</span>
+          </div>
+          {IS_MAC ? null : <WindowControls />}
         </div>
-        {IS_MAC ? null : <WindowControls />}
-      </div>
+      ) : null}
 
       <div className="relative flex min-h-0 flex-1 flex-col">
         <div
@@ -358,6 +364,11 @@ export function ContributorsView({
             >
               <h1 className="mr-auto text-[20px] font-semibold leading-tight">
                 Contributors
+                {tabbed ? (
+                  <span className="ml-2 text-[13px] font-normal text-content/45">
+                    {projectName(project)}
+                  </span>
+                ) : null}
               </h1>
               {branchOptions.length > 0 ? (
                 <Select

@@ -92,7 +92,8 @@ function projectMenuExtraItems(
   notificationReady: boolean,
   externalEditors: ExternalEditor[] | null,
   projectGroups: ProjectGroup[],
-  currentProjectGroupId?: string,
+  currentProjectGroupId: string | undefined,
+  railOptions: boolean,
   canOpenContributors = false,
 ): TabGroupMenuExtraItem[] {
   const groupSubmenu: ExplorerMenuItem[] = [
@@ -118,15 +119,19 @@ function projectMenuExtraItems(
       label: "Background image",
       icon: ImagePlus,
     },
-    {
-      id: "project-group",
-      label: "Move to group",
-      icon: FolderTree,
-      submenu: groupSubmenu,
-    },
-    pinned
-      ? { id: "unpin", label: "Unpin project", icon: PinOff }
-      : { id: "pin", label: "Pin project", icon: Pin },
+    ...(railOptions
+      ? [
+          {
+            id: "project-group",
+            label: "Move to group",
+            icon: FolderTree,
+            submenu: groupSubmenu,
+          },
+          pinned
+            ? { id: "unpin", label: "Unpin project", icon: PinOff }
+            : { id: "pin", label: "Pin project", icon: Pin },
+        ]
+      : []),
     { id: "reveal", label: REVEAL_LABEL, icon: FolderOpen },
     {
       id: "external-editor",
@@ -195,6 +200,9 @@ type Options = {
   onOpenContributors?: (projectPath: string) => void;
   /** Called when a project or group menu opens, so hosts can close sibling menus. */
   onOpen?: () => void;
+  /** Groups and pins only arrange the project rail; layouts without one
+   * leave them out. */
+  railOptions?: boolean;
 };
 
 /**
@@ -208,6 +216,7 @@ export function useProjectMenu({
   onOpenNotificationSettings,
   onOpenContributors,
   onOpen,
+  railOptions = true,
 }: Options) {
   const [projectMenu, setProjectMenu] = useState<
     (Point & { path: string; projectKey: string }) | null
@@ -460,6 +469,7 @@ export function useProjectMenu({
             projectMenu.path,
             loadProjectGroupAssignments(),
           ),
+          railOptions,
           Boolean(onOpenContributors) && !isRemoteProjectPath(projectMenu.path),
         )}
         footer={

@@ -27,6 +27,8 @@ import { listWorkspaceSpaces } from "../model/ticketsApi";
 import type { AiConfigStatus, TicketJobEvent } from "../model/ticketsApi";
 
 export type TicketContributorsViewProps = {
+  /** Drops the view's own header: the new layout's title bar carries the chrome. */
+  tabbed?: boolean;
   besideRail: boolean;
   compactRail: boolean;
   onClose(): void;
@@ -932,6 +934,7 @@ function Leaderboard({ m }: { m: Model }) {
  * loaded ticket window is wider than the period and is never counted here.
  */
 export function TicketContributorsView({
+  tabbed = false,
   besideRail,
   compactRail,
   onClose,
@@ -1010,26 +1013,29 @@ export function TicketContributorsView({
       data-app-ticket-contributors
       className="flex min-h-0 min-w-0 flex-1 flex-col text-content"
     >
-      <div
-        className="flex h-10 shrink-0 select-none items-center border-b border-stroke"
-        data-tauri-drag-region="deep"
-      >
-        {IS_MAC && compactRail ? <div className="w-4 shrink-0" /> : null}
-        {IS_MAC && !besideRail ? <div className="w-[78px] shrink-0" /> : null}
-        {besideRail ? null : (
-          <OverlayNav onBack={onClose} onToggleSidebar={onToggleSidebar} />
-        )}
-        <div className="flex min-w-0 flex-1 items-center gap-2 px-3 text-[13px]">
-          <ChartBreakoutSquare
-            className="size-3.5 shrink-0 text-content/45"
-            strokeWidth={1.75}
-          />
-          <span className="min-w-0 truncate text-content">
-            Ticket Contributors
-          </span>
+      {!tabbed ? (
+        <div
+          data-app-view-header
+          className="flex h-10 shrink-0 select-none items-center border-b border-stroke"
+          data-tauri-drag-region="deep"
+        >
+          {IS_MAC && compactRail ? <div className="w-4 shrink-0" /> : null}
+          {IS_MAC && !besideRail ? <div className="w-[78px] shrink-0" /> : null}
+          {besideRail ? null : (
+            <OverlayNav onBack={onClose} onToggleSidebar={onToggleSidebar} />
+          )}
+          <div className="flex min-w-0 flex-1 items-center gap-2 px-3 text-[13px]">
+            <ChartBreakoutSquare
+              className="size-3.5 shrink-0 text-content/45"
+              strokeWidth={1.75}
+            />
+            <span className="min-w-0 truncate text-content">
+              Ticket Contributors
+            </span>
+          </div>
+          {IS_MAC ? null : <WindowControls />}
         </div>
-        {IS_MAC ? null : <WindowControls />}
-      </div>
+      ) : null}
 
       <div className="@container/ticket min-h-0 flex-1 overflow-y-auto overscroll-none">
         <div className="mx-auto w-full max-w-5xl px-5 py-6 pb-16 @min-[560px]/ticket:px-8">

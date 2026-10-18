@@ -157,6 +157,7 @@ struct LiveChild {
     cwd: PathBuf,
     stdin: Mutex<ChildStdin>,
     pid: u32,
+    identity: Option<String>,
     account: Option<HarnessAccount>,
 }
 
@@ -213,6 +214,19 @@ impl HarnessHost {
 
     fn get(&self, session_id: &str) -> Option<Arc<LiveChild>> {
         self.lock_inner().children.get(session_id).cloned()
+    }
+
+    pub(crate) fn process_roots(&self) -> Vec<crate::resources::ProcessRoot> {
+        self.lock_inner()
+            .children
+            .iter()
+            .map(|(id, child)| crate::resources::ProcessRoot {
+                session_id: id.clone(),
+                pid: child.pid,
+                identity: child.identity.clone(),
+                cwd: child.cwd.to_string_lossy().into_owned(),
+            })
+            .collect()
     }
 
     /// Stamp this spawn and drop any child already registered under the id.
@@ -984,6 +998,7 @@ pub fn harness_spawn(
         cwd: workdir.clone(),
         stdin: Mutex::new(stdin),
         pid,
+        identity: crate::resources::identity(pid),
         account,
     });
     if let Some(rejected) = host.install_spawn(session_id.clone(), epoch, kill_all, live) {
@@ -1582,6 +1597,7 @@ const SPAWN_CANCELLED: &str = "Harness start was cancelled";
 /// harness spawn goes through here, probes included: a `--help` probe that
 /// hangs is a `node` process too, and an unmarked one is unreapable.
 fn isolate_child(cmd: &mut Command) {
+    crate::background_work::configure_child(cmd);
     cmd.env(HARNESS_PARENT_ENV, std::process::id().to_string());
     #[cfg(unix)]
     {
@@ -3225,6 +3241,7 @@ mod tests {
                 cwd: PathBuf::from("/test"),
                 stdin: Mutex::new(stdin),
                 pid,
+                identity: crate::resources::identity(pid),
                 account: None,
             }),
             child,
@@ -3386,6 +3403,7 @@ mod tests {
                 cwd: PathBuf::from("/test"),
                 stdin: Mutex::new(stdin),
                 pid,
+                identity: crate::resources::identity(pid),
                 account: None,
             }),
             child,
