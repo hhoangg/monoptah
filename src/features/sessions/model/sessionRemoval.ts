@@ -63,6 +63,8 @@ type SessionRemovalOptions = {
   /** Keep file and terminal panes open when removing a session through the CLI. */
   preserveOpenFiles?: boolean;
   scope?: WorkspaceTabCloseScope;
+  /** Also delete the Claude Code / Codex session files. Delete mode only. */
+  deleteProviderFiles?: boolean;
   replacement: ReplacementSeed;
   workspace: {
     snapshot(): Workspace;
@@ -165,7 +167,9 @@ async function removeSession(
       block.role === "image" && block.image ? [block.image.path] : [],
     ) ?? [];
     await orchestrator.deleteSession(sessionId, () =>
-      deleteSession(sessionId, imagePaths),
+      deleteSession(sessionId, imagePaths, {
+        deleteProviderFiles: options.deleteProviderFiles === true,
+      }),
     );
     options.workspace.apply({
       type: "orchestrationReleased",

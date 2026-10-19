@@ -145,6 +145,8 @@ import { MenuBar } from "./shell/MenuBar";
 import { FilePicker } from "../features/files/ui/FilePicker";
 import {
   DeleteSessionDialog,
+  providerFilesKind,
+  type ProviderFilesKind,
   type SessionDeleteChoice,
 } from "../features/sessions/ui/DeleteSessionDialog";
 import {
@@ -1212,7 +1214,9 @@ function Workspace({
   );
   const [sessionDeleteDialog, setSessionDeleteDialog] = useState<{
     title: string;
-    unusedWorktree: string;
+    count: number;
+    unusedWorktrees: string[];
+    providerFiles?: ProviderFilesKind;
     resolve: (choice: SessionDeleteChoice) => void;
   }>();
   const [newSessionPrompt, setNewSessionPrompt] = useState<{
@@ -6005,12 +6009,53 @@ function Workspace({
     ],
   );
 
+  /**
+   * The seed's worktree when only `sessionIds` still use it, so deleting them
+   * leaves it unused and safe to offer for removal.
+   */
+  const findUnusedWorktree = useCallback(
+    async (
+      seed: { cwd: string; worktreeCwd?: string },
+      sessionIds: ReadonlySet<string>,
+      listed?: Map<string, ReturnType<typeof listWorktrees>>,
+    ): Promise<string | undefined> => {
+      if (!seed.worktreeCwd) return undefined;
+      try {
+        let pending = listed?.get(seed.cwd);
+        if (!pending) {
+          pending = listWorktrees(seed.cwd);
+          listed?.set(seed.cwd, pending);
+        }
+        const { worktrees } = await pending;
+        const tree = worktrees.find(
+          (entry) => pathKey(entry.path) === pathKey(seed.worktreeCwd!),
+        );
+        if (
+          tree &&
+          !tree.isMain &&
+          !tree.locked &&
+          tree.branch &&
+          worktreeSessionIds(tree, sessionsRef.current).every((id) =>
+            sessionIds.has(id),
+          )
+        )
+          return tree.path;
+      } catch {
+        // A failed lookup must never offer filesystem cleanup.
+      }
+      return undefined;
+    },
+    [sessionsRef],
+  );
+
   const onRemoveHistorySession = useCallback(
     async (
       sessionId: string,
       mode: "archive" | "delete",
       skipDeleteConfirm = false,
       origin: "ui" | "cli" = "ui",
+      /** A choice already made by the bulk dialog, so this session is not prompted again. */
+      preset?: { deleteWorktreePath?: string; deleteProviderFiles: boolean },
     ): Promise<boolean> => {
       if (
         removingSessionIds.current.has(sessionId) ||
@@ -6028,34 +6073,27 @@ function Workspace({
         : "this session";
       removingSessionIds.current.add(sessionId);
       let deleteWorktreePath: string | undefined;
-      if (mode === "delete" && !skipDeleteConfirm) {
+      let deleteProviderFiles = false;
+      if (mode === "delete" && preset) {
+        deleteWorktreePath = preset.deleteWorktreePath;
+        deleteProviderFiles = preset.deleteProviderFiles;
+      } else if (mode === "delete" && !skipDeleteConfirm) {
         deleteConfirmationPending.current = true;
-        let unusedWorktree: string | undefined;
-        if (seed?.worktreeCwd) {
-          try {
-            const { worktrees } = await listWorktrees(seed.cwd);
-            const tree = worktrees.find(
-              (entry) => pathKey(entry.path) === pathKey(seed.worktreeCwd!),
-            );
-            if (
-              tree &&
-              !tree.isMain &&
-              !tree.locked &&
-              tree.branch &&
-              worktreeSessionIds(tree, sessionsRef.current).every(
-                (id) => id === sessionId,
-              )
-            )
-              unusedWorktree = tree.path;
-          } catch {
-            // A failed lookup must never offer filesystem cleanup.
-          }
-        }
-        if (!unusedWorktree) {
+        const unusedWorktree = seed
+          ? await findUnusedWorktree(seed, new Set([sessionId]))
+          : undefined;
+        const providerFiles = seed ? providerFilesKind(seed) : undefined;
+        if (!unusedWorktree && !providerFiles) {
           deleteConfirmationPending.current = false;
         } else {
           const choice = await new Promise<SessionDeleteChoice>((resolve) => {
-            setSessionDeleteDialog({ title: label, unusedWorktree, resolve });
+            setSessionDeleteDialog({
+              title: label,
+              count: 1,
+              unusedWorktrees: unusedWorktree ? [unusedWorktree] : [],
+              providerFiles,
+              resolve,
+            });
           });
           deleteConfirmationPending.current = false;
           if (!choice.confirmed) {
@@ -6063,6 +6101,7 @@ function Workspace({
             return false;
           }
           if (choice.deleteWorktree) deleteWorktreePath = unusedWorktree;
+          deleteProviderFiles = choice.deleteProviderFiles;
         }
       }
       invalidateLoadedSession(sessionId);
@@ -6072,6 +6111,7 @@ function Workspace({
           mode,
           preserveOpenFiles: origin === "cli",
           scope: tabCloseScope,
+          deleteProviderFiles,
           replacement: {
             harness: seed?.harness ?? "cursor",
             cwd: seed?.cwd ?? sidebarCwd,
@@ -6228,6 +6268,7 @@ function Workspace({
     [
       activateTab,
       history,
+      findUnusedWorktree,
       invalidateLoadedSession,
       refreshHistory,
       sidebarCwd,
@@ -6465,17 +6506,74 @@ function Workspace({
   const onDeleteHistorySessions = useCallback(
     async (sessionIds: readonly string[]) => {
       if (sessionIds.length === 0) return;
-      if (
-        !window.confirm(
-          `Delete ${sessionIds.length} selected conversations? This can’t be undone.`,
-        )
-      )
-        return;
+      if (deleteConfirmationPending.current) return;
+      deleteConfirmationPending.current = true;
+      let choice: SessionDeleteChoice;
+      const worktreeBySession = new Map<string, string>();
+      const providerBySession = new Set<string>();
+      try {
+        const selected = new Set(sessionIds);
+        const listed = new Map<string, ReturnType<typeof listWorktrees>>();
+        const kinds = new Set<"claude" | "codex">();
+        for (const sessionId of sessionIds) {
+          const seed =
+            sessionsRef.current.find((session) => session.id === sessionId) ??
+            history.find((entry) => entry.id === sessionId);
+          if (!seed) continue;
+          const kind = providerFilesKind(seed);
+          if (kind) {
+            kinds.add(kind);
+            providerBySession.add(sessionId);
+          }
+          const worktree = await findUnusedWorktree(seed, selected, listed);
+          if (worktree) worktreeBySession.set(sessionId, worktree);
+        }
+        choice = await new Promise<SessionDeleteChoice>((resolve) => {
+          setSessionDeleteDialog({
+            title: "",
+            count: sessionIds.length,
+            unusedWorktrees: [...new Set(worktreeBySession.values())],
+            providerFiles:
+              kinds.size === 0
+                ? undefined
+                : kinds.size > 1
+                  ? "mixed"
+                  : [...kinds][0],
+            resolve,
+          });
+        });
+      } finally {
+        deleteConfirmationPending.current = false;
+      }
+      if (!choice.confirmed) return;
+      // Sessions sharing a worktree are deleted in order, so only the last
+      // one removes it, once nothing else is using it.
+      const lastBySession = new Map<string, string>();
+      for (const [sessionId, path] of worktreeBySession) {
+        lastBySession.set(pathKey(path), sessionId);
+      }
       for (const sessionId of sessionIds) {
-        if (!(await onRemoveHistorySession(sessionId, "delete", true))) break;
+        const worktree = worktreeBySession.get(sessionId);
+        const removed = await onRemoveHistorySession(
+          sessionId,
+          "delete",
+          true,
+          "ui",
+          {
+            deleteWorktreePath:
+              choice.deleteWorktree &&
+              worktree &&
+              lastBySession.get(pathKey(worktree)) === sessionId
+                ? worktree
+                : undefined,
+            deleteProviderFiles:
+              choice.deleteProviderFiles && providerBySession.has(sessionId),
+          },
+        );
+        if (!removed) break;
       }
     },
-    [onRemoveHistorySession],
+    [findUnusedWorktree, history, onRemoveHistorySession, sessionsRef],
   );
 
   const sessionIdsInTitleTab = useCallback((tabId: string): string[] => {
@@ -15535,7 +15633,9 @@ function Workspace({
             {sessionDeleteDialog && (
               <DeleteSessionDialog
                 title={sessionDeleteDialog.title}
-                unusedWorktree={sessionDeleteDialog.unusedWorktree}
+                count={sessionDeleteDialog.count}
+                unusedWorktrees={sessionDeleteDialog.unusedWorktrees}
+                providerFiles={sessionDeleteDialog.providerFiles}
                 onClose={(choice) => {
                   sessionDeleteDialog.resolve(choice);
                   setSessionDeleteDialog(undefined);

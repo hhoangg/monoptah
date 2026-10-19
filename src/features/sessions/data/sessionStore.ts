@@ -820,6 +820,7 @@ export function backfillCodexShellCommands(blocks: Block[]): Block[] {
 export async function deleteSession(
   sessionId: string,
   imagePaths: string[] = [],
+  options: { deleteProviderFiles?: boolean } = {},
 ): Promise<void> {
   deletedSessionIds.add(sessionId);
   try {
@@ -834,7 +835,11 @@ export async function deleteSession(
       .map(([, pending]) => pending);
     if (pendingWrites.length > 0) await Promise.all(pendingWrites);
     await enqueueSessionWrite(sessionId, () =>
-      invoke<void>("session_delete", { sessionId, imagePaths }),
+      invoke<void>("session_delete", {
+        sessionId,
+        imagePaths,
+        ...(options.deleteProviderFiles ? { deleteProviderFiles: true } : {}),
+      }),
     );
     monoSavedBlocks.delete(sessionId);
     const tombstone = setTimeout(

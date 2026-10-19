@@ -22,7 +22,11 @@ function deferred() {
   return { promise, resolve };
 }
 
-function fixture(mode: "archive" | "delete", preserveOpenFiles = false) {
+function fixture(
+  mode: "archive" | "delete",
+  preserveOpenFiles = false,
+  deleteProviderFiles?: boolean,
+) {
   const closing: Session = {
     ...newSession("cursor", "/tmp/project"),
     busy: true,
@@ -65,6 +69,7 @@ function fixture(mode: "archive" | "delete", preserveOpenFiles = false) {
       const remover = createSessionRemover({
         mode,
         preserveOpenFiles,
+        deleteProviderFiles,
         replacement: { cwd: "/tmp/project", harness: "cursor" },
         workspace: {
           snapshot: () => state,
@@ -277,4 +282,33 @@ it("archives the flushed transcript after cancellation, with streaming stopped",
     "session_upsert",
     "session_set_archived",
   ]);
+});
+
+describe("provider session files", () => {
+  const deleteCall = () =>
+    mocks.invoke.mock.calls.find(([command]) => command === "session_delete");
+
+  it("asks the backend to delete them only when delete mode requests it", async () => {
+    const f = fixture("delete", false, true);
+    expect(await f.run()).toBe(true);
+    expect(deleteCall()?.[1]).toMatchObject({
+      sessionId: f.closing.id,
+      deleteProviderFiles: true,
+    });
+  });
+
+  it("keeps them by default when deleting", async () => {
+    const f = fixture("delete");
+    expect(await f.run()).toBe(true);
+    expect(deleteCall()?.[1]).not.toHaveProperty("deleteProviderFiles");
+  });
+
+  it("never touches them when archiving", async () => {
+    const f = fixture("archive", false, true);
+    expect(await f.run()).toBe(true);
+    expect(deleteCall()).toBeUndefined();
+    expect(
+      mocks.invoke.mock.calls.some(([, args]) => args?.deleteProviderFiles),
+    ).toBe(false);
+  });
 });

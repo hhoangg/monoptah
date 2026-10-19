@@ -183,7 +183,7 @@ fn transfer_codex(from: &Path, to: &Path, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn descendant_threads(sqlite_home: &Path, id: &str) -> Result<Vec<String>, String> {
+pub(crate) fn descendant_threads(sqlite_home: &Path, id: &str) -> Result<Vec<String>, String> {
     let Some(path) = state_db(sqlite_home)? else {
         return Ok(Vec::new());
     };

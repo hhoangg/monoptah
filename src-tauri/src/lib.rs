@@ -51,6 +51,7 @@ mod notifications;
 mod pasteboard;
 mod pi_usage;
 mod project_logo;
+mod provider_session_cleanup;
 mod provider_session_transfer;
 mod pty;
 #[cfg(target_os = "macos")]

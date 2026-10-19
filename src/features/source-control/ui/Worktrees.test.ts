@@ -978,13 +978,13 @@ it.each(["partial", "rejected", "worktree", "refresh"] as const)(
   },
 );
 
-it("offers to keep or delete the last session's worktree", async () => {
+it("offers to keep or delete the last session's worktree, checked by default", async () => {
   const onClose = vi.fn();
   await act(async () =>
     root.render(
       createElement(DeleteSessionDialog, {
         title: "Feature",
-        unusedWorktree: tree.path,
+        unusedWorktrees: [tree.path],
         onClose,
       }),
     ),
@@ -992,17 +992,19 @@ it("offers to keep or delete the last session's worktree", async () => {
   const checkbox = document.querySelector<HTMLInputElement>(
     'input[type="checkbox"]',
   )!;
-  expect(checkbox.checked).toBe(false);
+  expect(checkbox.checked).toBe(true);
   await act(async () => button("Delete session").click());
   expect(onClose).toHaveBeenLastCalledWith({
     confirmed: true,
-    deleteWorktree: false,
+    deleteWorktree: true,
+    deleteProviderFiles: false,
   });
   await act(async () => checkbox.click());
   await act(async () => button("Delete session").click());
   expect(onClose).toHaveBeenLastCalledWith({
     confirmed: true,
-    deleteWorktree: true,
+    deleteWorktree: false,
+    deleteProviderFiles: false,
   });
 });
 

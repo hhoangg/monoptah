@@ -559,14 +559,23 @@ pub fn session_delete(
     store: State<'_, SessionStore>,
     session_id: String,
     mut image_paths: Vec<String>,
+    delete_provider_files: Option<bool>,
 ) -> Result<(), String> {
     validate_id(&session_id, "session")?;
     let conn = store.conn.lock().map_err(|_| "Session store is locked")?;
-    let persisted_paths = get_session(&conn, &session_id)
-        .ok()
-        .flatten()
+    let record = get_session(&conn, &session_id).ok().flatten();
+    let persisted_paths = record
+        .as_ref()
         .map(|record| generated_image_paths(&record.blocks))
         .unwrap_or_default();
+    let cleanup = record.as_ref().and_then(|record| {
+        crate::provider_session_cleanup::cleanup_request(
+            delete_provider_files.unwrap_or(false),
+            &record.harness,
+            record.provider_session_id.as_deref(),
+            &record.blocks,
+        )
+    });
     image_paths.extend(persisted_paths);
     image_paths.extend(
         crate::mono_transcript::generated_image_paths(&conn, &session_id)
@@ -578,6 +587,13 @@ pub fn session_delete(
         if let Err(error) = crate::fs::delete_generated_images_sync(&app, &image_paths) {
             eprintln!("Generated image cleanup will need a retry: {error}");
         }
+    }
+    if let Some(request) = cleanup {
+        // The sqlite busy timeout can take seconds; keep it off the command thread.
+        let app = app.clone();
+        std::thread::spawn(move || {
+            crate::provider_session_cleanup::run_cleanup(&app, &request);
+        });
     }
     let _ = app.emit(crate::reminders::CHANGED, ());
     Ok(())
