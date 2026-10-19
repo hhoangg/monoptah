@@ -52,6 +52,7 @@ beforeEach(() => {
     onSelectProject: vi.fn(),
     onOpenProject: vi.fn(),
     onOpenContributors: vi.fn(),
+    contributorsActive: false,
   };
   container = document.createElement("div");
   document.body.append(container);
@@ -66,11 +67,17 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function menuButton(label: string) {
-  return [...document.querySelectorAll("button")].find(
-    (item) => (item.getAttribute("aria-label") ?? item.textContent) === label,
+// Only the context menu's own items: the sidebar has a Contributors entry too.
+function menuItem(label: string) {
+  return [...document.querySelectorAll('[role="menuitem"]')].find((item) =>
+    (item.textContent ?? "").startsWith(label),
   );
 }
+
+const entry = () =>
+  container.querySelector<HTMLButtonElement>(
+    'button[aria-label="Contributors"]',
+  );
 
 function openMenu(target: Element) {
   act(() =>
@@ -85,53 +92,65 @@ function openMenu(target: Element) {
   );
 }
 
-describe("Contributors project menu entry", () => {
-  const layouts = [
-    ["full rail", { projectRailOpen: true, compactProjectRail: false }],
-    ["compact rail", { projectRailOpen: false, compactProjectRail: true }],
-    ["project picker", { projectRailOpen: false, compactProjectRail: false }],
-  ] as const;
+const layouts = [
+  ["full rail", { projectRailOpen: true, compactProjectRail: false }],
+  ["compact rail", { projectRailOpen: false, compactProjectRail: true }],
+  ["project picker", { projectRailOpen: false, compactProjectRail: false }],
+] as const;
+
+function openProjectMenu(layout: (typeof layouts)[number][1]) {
+  if (layout.projectRailOpen) {
+    openMenu(
+      container.querySelector('button[aria-label="other"]') ??
+        container.querySelector('button[aria-current="true"]')!,
+    );
+  } else {
+    const trigger = container.querySelector<HTMLButtonElement>(
+      '[aria-label^="Switch project"]',
+    )!;
+    act(() => trigger.click());
+    openMenu(document.querySelector('button[title="/workspace/other"]')!);
+  }
+}
+
+describe("Contributors sidebar entry", () => {
+  it.each(layouts)("is labelled Contributors (%s)", async (_name, layout) => {
+    props = { ...props, ...layout };
+    await act(async () => root.render(createElement(Sidebar, props)));
+    expect(entry()).not.toBeNull();
+    expect(
+      container.querySelector('button[aria-label="Ticket Contributors"]'),
+    ).toBeNull();
+    expect(container.textContent).not.toContain("Ticket Contributors");
+  });
+
+  it.each(layouts)("opens the page (%s)", async (_name, layout) => {
+    props = { ...props, ...layout };
+    await act(async () => root.render(createElement(Sidebar, props)));
+    act(() => entry()!.click());
+    expect(props.onOpenContributors).toHaveBeenCalledTimes(1);
+  });
 
   it.each(layouts)(
-    "passes onOpenContributors to the project menu (%s)",
-    async (_name, layout) => {
-      props = { ...props, ...layout };
-      await act(async () => root.render(createElement(Sidebar, props)));
-      if (layout.projectRailOpen) {
-        openMenu(
-          container.querySelector('button[aria-label="other"]') ??
-            container.querySelector('button[aria-current="true"]')!,
-        );
-      } else {
-        const trigger = container.querySelector<HTMLButtonElement>(
-          '[aria-label^="Switch project"]',
-        )!;
-        act(() => trigger.click());
-        openMenu(document.querySelector('button[title="/workspace/other"]')!);
-      }
-      const item = menuButton("Contributors");
-      expect(item).toBeDefined();
-      act(() => item!.click());
-      expect(props.onOpenContributors).toHaveBeenCalledTimes(1);
-    },
-  );
-
-  it.each(layouts)(
-    "shows no Contributors entry without a callback (%s)",
+    "is absent without an opener (%s)",
     async (_name, layout) => {
       props = { ...props, ...layout, onOpenContributors: undefined };
       await act(async () => root.render(createElement(Sidebar, props)));
-      if (layout.projectRailOpen) {
-        openMenu(container.querySelector('button[aria-current="true"]')!);
-      } else {
-        const trigger = container.querySelector<HTMLButtonElement>(
-          '[aria-label^="Switch project"]',
-        )!;
-        act(() => trigger.click());
-        openMenu(document.querySelector('button[title="/workspace/other"]')!);
-      }
-      expect(menuButton("Open in editor")).toBeDefined();
-      expect(menuButton("Contributors")).toBeUndefined();
+      expect(entry()).toBeNull();
+    },
+  );
+});
+
+describe("Contributors project menu entry", () => {
+  it.each(layouts)(
+    "is gone from the project menu (%s)",
+    async (_name, layout) => {
+      props = { ...props, ...layout };
+      await act(async () => root.render(createElement(Sidebar, props)));
+      openProjectMenu(layout);
+      expect(menuItem("Open in editor")).toBeDefined();
+      expect(menuItem("Contributors")).toBeUndefined();
+      expect(props.onOpenContributors).not.toHaveBeenCalled();
     },
   );
 });

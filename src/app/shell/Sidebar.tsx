@@ -375,14 +375,14 @@ type Props = {
   onOpenNotes?: () => void;
   onOpenAutomations?: () => void;
   onOpenMail?: () => void;
-  onOpenTicketContributors?: () => void;
+  onOpenContributors?: () => void;
   onGoToFile?: () => void;
   searchActive?: boolean;
   inboxActive?: boolean;
   notesActive?: boolean;
   automationsActive?: boolean;
   mailActive?: boolean;
-  ticketContributorsActive?: boolean;
+  contributorsActive?: boolean;
   /** Unread mail over enabled sources; 0 draws no badge. */
   mailUnread?: number;
   notesEnabled?: boolean;
@@ -414,7 +414,6 @@ type Props = {
   settingsSection?: SettingsSectionId;
   onOpenSettings?: () => void;
   onOpenNotificationSettings?: (projectPath?: string) => void;
-  onOpenContributors?: (projectPath: string) => void;
   onSelectSettingsSection?: (section: SettingsSectionId) => void;
   onCloseSettings?: () => void;
   updateNotice?: InstalledUpdate | null;
@@ -494,14 +493,14 @@ function SidebarComponent({
   onOpenNotes,
   onOpenAutomations,
   onOpenMail,
-  onOpenTicketContributors,
+  onOpenContributors,
   onGoToFile,
   searchActive = false,
   inboxActive = false,
   notesActive = false,
   automationsActive = false,
   mailActive = false,
-  ticketContributorsActive = false,
+  contributorsActive = false,
   mailUnread = 0,
   notesEnabled = true,
   onToggleProjectRail,
@@ -517,7 +516,6 @@ function SidebarComponent({
   settingsSection = "general",
   onOpenSettings,
   onOpenNotificationSettings,
-  onOpenContributors,
   onSelectSettingsSection,
   onCloseSettings,
   updateNotice = null,
@@ -1000,7 +998,7 @@ function SidebarComponent({
     notesActive ||
     automationsActive ||
     mailActive ||
-    ticketContributorsActive ||
+    contributorsActive ||
     settingsOpen;
   // A remembered Mono sits underneath these views; select it only while visible.
   const railMonos = monos
@@ -2146,7 +2144,6 @@ function SidebarComponent({
   const headerProjectMenu = useProjectMenu({
     onRemoveProject,
     onOpenNotificationSettings,
-    onOpenContributors,
     // Only the inset layout uses this menu, and it has no project rail.
     railOptions: false,
   });
@@ -2458,11 +2455,11 @@ function SidebarComponent({
           ariaLabel: mailLabel(mailUnread),
           onClick: onOpenMail,
         },
-        onOpenTicketContributors && {
-          label: "Ticket Contributors",
+        onOpenContributors && {
+          label: "Contributors",
           icon: ChartBreakoutSquare,
-          active: ticketContributorsActive,
-          onClick: onOpenTicketContributors,
+          active: contributorsActive,
+          onClick: onOpenContributors,
         },
       ]}
     />
@@ -2608,17 +2605,16 @@ function SidebarComponent({
               onSearch={onSearch}
               onOpenInbox={onOpenInbox}
               onOpenNotificationSettings={onOpenNotificationSettings}
-              onOpenContributors={onOpenContributors}
               onOpenNotes={notesEnabled ? onOpenNotes : undefined}
               onOpenAutomations={onOpenAutomations}
               onOpenMail={onOpenMail}
-              onOpenTicketContributors={onOpenTicketContributors}
+              onOpenContributors={onOpenContributors}
               searchActive={searchActive}
               inboxActive={inboxActive}
               notesActive={notesActive}
               automationsActive={automationsActive}
               mailActive={mailActive}
-              ticketContributorsActive={ticketContributorsActive}
+              contributorsActive={contributorsActive}
               mailUnread={mailUnread}
               inboxUnseen={inboxUnseen}
             />
@@ -3213,15 +3209,14 @@ function SidebarComponent({
           onOpenInbox={onOpenInbox}
           inboxActive={inboxActive}
           onOpenNotificationSettings={onOpenNotificationSettings}
-          onOpenContributors={onOpenContributors}
           onOpenNotes={notesEnabled ? onOpenNotes : undefined}
           notesActive={notesActive}
           onOpenAutomations={onOpenAutomations}
           automationsActive={automationsActive}
           onOpenMail={onOpenMail}
-          onOpenTicketContributors={onOpenTicketContributors}
+          onOpenContributors={onOpenContributors}
           mailActive={mailActive}
-          ticketContributorsActive={ticketContributorsActive}
+          contributorsActive={contributorsActive}
           mailUnread={mailUnread}
           onOpenSettings={onOpenSettings}
           onTogglePanel={onToggleProjectRail}
@@ -3258,9 +3253,9 @@ function SidebarComponent({
           onOpenAutomations={onOpenAutomations}
           automationsActive={automationsActive}
           onOpenMail={onOpenMail}
-          onOpenTicketContributors={onOpenTicketContributors}
+          onOpenContributors={onOpenContributors}
           mailActive={mailActive}
-          ticketContributorsActive={ticketContributorsActive}
+          contributorsActive={contributorsActive}
           mailUnread={mailUnread}
           onTogglePanel={onToggleProjectRail}
           onSelectProject={onSelectProject}
@@ -3270,7 +3265,6 @@ function SidebarComponent({
           settingsSection={settingsSection}
           onOpenSettings={onOpenSettings}
           onOpenNotificationSettings={onOpenNotificationSettings}
-          onOpenContributors={onOpenContributors}
           onSelectSettingsSection={onSelectSettingsSection}
           onCloseSettings={onCloseSettings}
           updateNotice={updateNotice}
@@ -3369,7 +3363,6 @@ export const Sidebar = memo(SidebarComponent);
 function SearchableProjectPickerWithMenu({
   onRemoveProject,
   onOpenNotificationSettings,
-  onOpenContributors,
   ...pickerProps
 }: Omit<
   ComponentProps<typeof SearchableProjectPicker>,
@@ -3377,12 +3370,10 @@ function SearchableProjectPickerWithMenu({
 > & {
   onRemoveProject?: Props["onRemoveProject"];
   onOpenNotificationSettings?: (projectPath?: string) => void;
-  onOpenContributors?: (projectPath: string) => void;
 }) {
   const projectMenu = useProjectMenu({
     onRemoveProject,
     onOpenNotificationSettings,
-    onOpenContributors,
   });
   return (
     <>
@@ -3407,17 +3398,16 @@ function SidebarProjectPicker({
   onSearch,
   onOpenInbox,
   onOpenNotificationSettings,
-  onOpenContributors,
   onOpenNotes,
   onOpenAutomations,
   onOpenMail,
-  onOpenTicketContributors,
+  onOpenContributors,
   searchActive = false,
   inboxActive = false,
   notesActive = false,
   automationsActive = false,
   mailActive = false,
-  ticketContributorsActive = false,
+  contributorsActive = false,
   mailUnread = 0,
   inboxUnseen = false,
 }: {
@@ -3431,17 +3421,16 @@ function SidebarProjectPicker({
   onSearch?: () => void;
   onOpenInbox?: () => void;
   onOpenNotificationSettings?: (projectPath?: string) => void;
-  onOpenContributors?: (projectPath: string) => void;
   onOpenNotes?: () => void;
   onOpenAutomations?: () => void;
   onOpenMail?: () => void;
-  onOpenTicketContributors?: () => void;
+  onOpenContributors?: () => void;
   searchActive?: boolean;
   inboxActive?: boolean;
   notesActive?: boolean;
   automationsActive?: boolean;
   mailActive?: boolean;
-  ticketContributorsActive?: boolean;
+  contributorsActive?: boolean;
   mailUnread?: number;
   inboxUnseen?: boolean;
 }) {
@@ -3463,7 +3452,6 @@ function SidebarProjectPicker({
         onOpenProject={onOpenProject}
         onRemoveProject={onRemoveProject}
         onOpenNotificationSettings={onOpenNotificationSettings}
-        onOpenContributors={onOpenContributors}
       />
       <div className="ml-auto flex items-center">
         {onNew ? (
@@ -3537,11 +3525,11 @@ function SidebarProjectPicker({
             </span>
           </IconButton>
         ) : null}
-        {onOpenTicketContributors ? (
+        {onOpenContributors ? (
           <IconButton
-            label="Ticket Contributors"
-            active={ticketContributorsActive}
-            onClick={onOpenTicketContributors}
+            label="Contributors"
+            active={contributorsActive}
+            onClick={onOpenContributors}
           >
             <ChartBreakoutSquare className="size-3.5" strokeWidth={1.75} />
           </IconButton>
@@ -3584,15 +3572,14 @@ function CompactProjectRail({
   onOpenInbox,
   inboxActive,
   onOpenNotificationSettings,
-  onOpenContributors,
   onOpenNotes,
   notesActive,
   onOpenAutomations,
   onOpenMail,
-  onOpenTicketContributors,
+  onOpenContributors,
   automationsActive,
   mailActive,
-  ticketContributorsActive,
+  contributorsActive,
   mailUnread,
   onOpenSettings,
   onTogglePanel,
@@ -3623,15 +3610,14 @@ function CompactProjectRail({
   onOpenInbox?: () => void;
   inboxActive: boolean;
   onOpenNotificationSettings?: (projectPath?: string) => void;
-  onOpenContributors?: (projectPath: string) => void;
   onOpenNotes?: () => void;
   notesActive: boolean;
   onOpenAutomations?: () => void;
   onOpenMail?: () => void;
-  onOpenTicketContributors?: () => void;
+  onOpenContributors?: () => void;
   automationsActive: boolean;
   mailActive: boolean;
-  ticketContributorsActive: boolean;
+  contributorsActive: boolean;
   mailUnread: number;
   onOpenSettings?: () => void;
   onTogglePanel?: () => void;
@@ -3675,7 +3661,7 @@ function CompactProjectRail({
     !notesActive &&
     !automationsActive &&
     !mailActive &&
-    !ticketContributorsActive &&
+    !contributorsActive &&
     !monoViewActive;
   const openWorkspaceTab = (nextTab: SidebarTab) => {
     if (!workspaceActive) onLeaveActive?.();
@@ -3756,7 +3742,6 @@ function CompactProjectRail({
             onOpenProject={onOpenProject}
             onRemoveProject={onRemoveProject}
             onOpenNotificationSettings={onOpenNotificationSettings}
-            onOpenContributors={onOpenContributors}
             monos={pickerMonos}
           />
         ) : null}
@@ -3837,12 +3822,12 @@ function CompactProjectRail({
             onClick={action(mailActive, onOpenMail)}
           />
         ) : null}
-        {onOpenTicketContributors ? (
+        {onOpenContributors ? (
           <CompactRailAction
-            label="Ticket Contributors"
+            label="Contributors"
             icon={ChartBreakoutSquare}
-            active={ticketContributorsActive}
-            onClick={action(ticketContributorsActive, onOpenTicketContributors)}
+            active={contributorsActive}
+            onClick={action(contributorsActive, onOpenContributors)}
           />
         ) : null}
       </div>

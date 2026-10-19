@@ -111,6 +111,7 @@ export function Segmented<T extends string>({
   options,
   onChange,
   optionIdPrefix,
+  tabPanelId,
 }: {
   label: string;
   value: T;
@@ -126,10 +127,12 @@ export function Segmented<T extends string>({
   }[];
   onChange: (value: T) => void;
   optionIdPrefix?: string;
+  /** Makes the control a tablist that switches the panel with this id. */
+  tabPanelId?: string;
 }) {
   return (
     <div
-      role="radiogroup"
+      role={tabPanelId ? "tablist" : "radiogroup"}
       aria-label={label}
       className="inline-grid max-w-full shrink-0 gap-0.5 rounded-md border border-content/10 p-0.5 text-[12px]"
       style={{
@@ -145,8 +148,14 @@ export function Segmented<T extends string>({
           }
           key={option.value}
           type="button"
-          role="radio"
-          aria-checked={value === option.value}
+          role={tabPanelId ? "tab" : "radio"}
+          {...(tabPanelId
+            ? {
+                "aria-selected": value === option.value,
+                "aria-controls": tabPanelId,
+                tabIndex: value === option.value ? 0 : -1,
+              }
+            : { "aria-checked": value === option.value })}
           aria-label={option.icon ? option.label : undefined}
           title={option.title}
           onClick={() => onChange(option.value)}

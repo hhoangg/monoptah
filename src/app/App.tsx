@@ -220,6 +220,7 @@ import {
   prepareAttachments,
 } from "../features/sessions/model/attachments";
 import type { AskAgentRequest } from "../features/contributors/model/askAgent";
+import type { ContributorsPageTab } from "../features/contributors/ui/ContributorsPage";
 import {
   composeSessionPrompt,
   contributorsSessionTitle,
@@ -939,19 +940,15 @@ const MailView = lazySurface(
   { suspense: false },
 );
 
-const TicketContributorsView = lazySurface(
-  async () => {
-    const module =
-      await import("../features/ticket-contributors/ui/TicketContributorsView");
-    return { default: module.TicketContributorsView };
-  },
-  { suspense: false },
-);
+type ContributorsViewState = {
+  tab: ContributorsPageTab;
+  project: string | null;
+};
 
-const ContributorsView = lazySurface(
+const ContributorsPage = lazySurface(
   async () => {
-    const module = await import("../features/contributors/ui/ContributorsView");
-    return { default: module.ContributorsView };
+    const module = await import("../features/contributors/ui/ContributorsPage");
+    return { default: module.ContributorsPage };
   },
   { suspense: false },
 );
@@ -1386,16 +1383,14 @@ function Workspace({
   const [notesViewOpen, setNotesViewOpen] = useState(false);
   const [automationsViewOpen, setAutomationsViewOpen] = useState(false);
   const [mailViewOpen, setMailViewOpen] = useState(false);
-  const [ticketContributorsOpen, setTicketContributorsOpen] = useState(false);
-  // The page is scoped to one project; null means it is closed.
-  const [contributorsProject, setContributorsProject] = useState<string | null>(
-    null,
-  );
-  const contributorsViewOpen = contributorsProject !== null;
-  // Mail, Ticket Contributors and Contributors are full views of their own,
-  // beside upstream's app views, so the new layout's chrome has to know them.
-  const forkViewOpen =
-    mailViewOpen || ticketContributorsOpen || contributorsViewOpen;
+  // The Contributors page: null means it is closed. `project` is the one the
+  // GitHub tab shows; null leaves it to the page's default.
+  const [contributorsView, setContributorsView] =
+    useState<ContributorsViewState | null>(null);
+  const contributorsViewOpen = contributorsView !== null;
+  // Mail and Contributors are full views of their own, beside upstream's app
+  // views, so the new layout's chrome has to know them.
+  const forkViewOpen = mailViewOpen || contributorsViewOpen;
   const [openAppViews, setOpenAppViews] = useState<AppView[]>([]);
   // Monos open as title tabs in the inset layout, by Mono id.
   const [openMonoTabs, setOpenMonoTabs] = useState<string[]>([]);
@@ -1534,8 +1529,7 @@ function Workspace({
     notes: false,
     automations: false,
     mail: false,
-    ticketContributors: false,
-    contributors: null as string | null,
+    contributors: null as ContributorsViewState | null,
   });
   const [updateNotice, setUpdateNotice] = useState(installedUpdate);
   const [whatsNewVersion, setWhatsNewVersion] = useState<string | null>(null);
@@ -1784,7 +1778,6 @@ function Workspace({
       !inboxViewOpen &&
       !notesViewOpen &&
       !automationsViewOpen &&
-      !ticketContributorsOpen &&
       !mailViewOpen &&
       !contributorsViewOpen &&
       !settingsOpen &&
@@ -1794,7 +1787,6 @@ function Workspace({
       : !searchViewOpen &&
           !notesViewOpen &&
           !automationsViewOpen &&
-          !ticketContributorsOpen &&
           !mailViewOpen &&
           !contributorsViewOpen &&
           !settingsOpen
@@ -1805,7 +1797,6 @@ function Workspace({
       !searchViewOpen &&
       !notesViewOpen &&
       !automationsViewOpen &&
-      !ticketContributorsOpen &&
       !contributorsViewOpen &&
       !settingsOpen
         ? shownMonoSessionId
@@ -1817,10 +1808,8 @@ function Workspace({
   automationsViewOpenRef.current = automationsViewOpen;
   const mailViewOpenRef = useRef(mailViewOpen);
   mailViewOpenRef.current = mailViewOpen;
-  const ticketContributorsOpenRef = useRef(ticketContributorsOpen);
-  ticketContributorsOpenRef.current = ticketContributorsOpen;
-  const contributorsProjectRef = useRef(contributorsProject);
-  contributorsProjectRef.current = contributorsProject;
+  const contributorsViewRef = useRef(contributorsView);
+  contributorsViewRef.current = contributorsView;
   const settingsOpenRef = useRef(settingsOpen);
   settingsOpenRef.current = settingsOpen;
   const sessionNavigationIdsRef = useRef<readonly string[]>([]);
@@ -1881,8 +1870,7 @@ function Workspace({
         listAutomations,
         ...(notesEnabled ? [NotesView.preload, loadNotes] : []),
         ...(mailEnabled ? [MailView.preload] : []),
-        ContributorsView.preload,
-        TicketContributorsView.preload,
+        ContributorsPage.preload,
       ]),
     [notesEnabled, mailEnabled],
   );
@@ -2575,9 +2563,8 @@ function Workspace({
             !inboxViewOpenRef.current &&
             !notesViewOpenRef.current &&
             !automationsViewOpenRef.current &&
-            !ticketContributorsOpenRef.current &&
             !mailViewOpenRef.current &&
-            contributorsProjectRef.current === null &&
+            contributorsViewRef.current === null &&
             !settingsOpenRef.current
           ) {
             setComposerFocused(true);
@@ -2616,7 +2603,6 @@ function Workspace({
     searchViewOpen,
     notesViewOpen,
     automationsViewOpen,
-    ticketContributorsOpen,
     mailViewOpen,
     contributorsViewOpen,
     settingsOpen,
@@ -3161,8 +3147,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       const session = newWorkspaceSession(
         cwd,
         sessionDefaults?.runtimeMode,
@@ -3207,8 +3192,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       const existing = findRemoteSessionTab(
         tabsRef.current,
         sessionsRef.current,
@@ -3241,8 +3225,7 @@ function Workspace({
         setNotesViewOpen(false);
         setAutomationsViewOpen(false);
         setMailViewOpen(false);
-        setTicketContributorsOpen(false);
-        setContributorsProject(null);
+        setContributorsView(null);
         const cwd =
           item.projectPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
         setSidebarTab("sessions", cwd);
@@ -3287,8 +3270,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       const cwd =
         (card.sourceCwd && looksLikeProject(card.sourceCwd)
           ? card.sourceCwd
@@ -3448,7 +3430,7 @@ function Workspace({
       const workdir = cwd || terminalCwd;
       if (!isLocalProject(projectCwdRef.current) || !isLocalProject(workdir))
         return;
-      setContributorsProject(null);
+      setContributorsView(null);
       if (openProjectTerminal(workdir)) return;
 
       if (asWorkspaceTab || !activeTab) {
@@ -4774,7 +4756,7 @@ function Workspace({
             : ((await resolveOpenablePath(diffCwd, path)) ?? path)
           : undefined;
         if (resolved) rememberOpenedFile(diffCwd, resolved);
-        setContributorsProject(null);
+        setContributorsView(null);
         setTabs((prev) =>
           prev.map((tab) => {
             if (tab.id !== activeTabId) return tab;
@@ -4845,7 +4827,7 @@ function Workspace({
   /** Stack one section's working-tree changes in one review, whatever the diff-view setting. */
   const onOpenAllChanges = useCallback(
     (kind: GitFileDiffKind) => {
-      setContributorsProject(null);
+      setContributorsView(null);
       setTabs((prev) =>
         prev.map((tab) =>
           tab.id === activeTabId
@@ -4866,7 +4848,7 @@ function Workspace({
 
   const onOpenCommit = useCallback(
     (commit: GitHistoryCommit, pin?: boolean) => {
-      setContributorsProject(null);
+      setContributorsView(null);
       setTabs((prev) =>
         prev.map((tab) =>
           tab.id === activeTabId
@@ -5439,8 +5421,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       setMonoViewId(session.id);
       if (insetLayoutRef.current) {
         setOpenMonoTabs((current) =>
@@ -5568,7 +5549,7 @@ function Workspace({
       workspaceNavigation.cancel();
       let session = await ensureOpenSession(sessionId);
       if (!session || session.inboxAsk) return;
-      setContributorsProject(null);
+      setContributorsView(null);
       const mono = monoForSession(session.id);
       if (mono) {
         await onOpenMono(mono.id);
@@ -5588,8 +5569,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       if (looksLikeProject(session.cwd))
         setProjectCwd(normalizeProjectPath(session.cwd));
       const linkedUpdate = linkedSessionUpdatesRef.current.get(session.id);
@@ -5676,8 +5656,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       setSettingsOpen(false);
       setFilePickerOpen(false);
       setSidebarTab("sessions", session.cwd);
@@ -6319,9 +6298,8 @@ function Workspace({
             inboxViewOpenRef.current ||
             notesViewOpenRef.current ||
             automationsViewOpenRef.current ||
-            ticketContributorsOpenRef.current ||
             mailViewOpenRef.current ||
-            contributorsProjectRef.current !== null ||
+            contributorsViewRef.current !== null ||
             settingsOpenRef.current ||
             filePickerOpenRef.current ||
             whatsNewVersionRef.current,
@@ -6922,7 +6900,7 @@ function Workspace({
   const onSelectWorkspace = useCallback(
     (focus?: WorktreeFocus) => {
       closeMonoView();
-      setContributorsProject(null);
+      setContributorsView(null);
       setProjectCwd(sidebarCwdRef.current);
       workspaceNavigation.selectWorkspace(sidebarCwdRef.current, focus);
     },
@@ -6957,8 +6935,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
 
       // At most one folder can take the blank session, and it keeps the
       // retargeting rules `onCwdChange` already owns.
@@ -7076,20 +7053,22 @@ function Workspace({
         );
       }
       setRecents(remaining);
-      // The Contributors page is scoped to its own project and can outlive a
-      // switch to another one, so removal has to close it explicitly.
-      if (
-        contributorsProjectRef.current !== null &&
-        sameProjectPath(contributorsProjectRef.current, normalized)
-      ) {
-        setContributorsProject(null);
-      }
+      // The Contributors page can outlive a switch to another project and
+      // only lists known ones, so a removed project must not stay chosen.
+      setContributorsView((view) =>
+        view?.project && sameProjectPath(view.project, normalized)
+          ? { ...view, project: null }
+          : view,
+      );
       const returnContributors = settingsReturnViewRef.current.contributors;
       if (
-        returnContributors !== null &&
-        sameProjectPath(returnContributors, normalized)
+        returnContributors?.project &&
+        sameProjectPath(returnContributors.project, normalized)
       ) {
-        settingsReturnViewRef.current.contributors = null;
+        settingsReturnViewRef.current.contributors = {
+          ...returnContributors,
+          project: null,
+        };
       }
 
       const tabs = tabsRef.current;
@@ -7327,7 +7306,7 @@ function Workspace({
           (entry) => entry.id === activeTabIdRef.current,
         );
         if (!tab) return;
-        setContributorsProject(null);
+        setContributorsView(null);
         const file = newFileTab(
           resolved,
           fileCwd,
@@ -9470,8 +9449,7 @@ function Workspace({
           setNotesViewOpen(false);
           setAutomationsViewOpen(false);
           setMailViewOpen(false);
-          setTicketContributorsOpen(false);
-          setContributorsProject(null);
+          setContributorsView(null);
           setSidebarTab("sessions", session.cwd);
         }
 
@@ -9694,8 +9672,7 @@ function Workspace({
             setNotesViewOpen(false);
             setAutomationsViewOpen(false);
             setMailViewOpen(false);
-            setTicketContributorsOpen(false);
-            setContributorsProject(null);
+            setContributorsView(null);
             setSidebarTab("sessions", cwd);
           },
           submit: (id, text, attachments, options) =>
@@ -11260,9 +11237,9 @@ function Workspace({
 
   useEffect(() => {
     const onEscape = (event: KeyboardEvent) => {
-      // The Contributors page closes itself on Escape; the turn running in a
-      // tab behind it must not be stopped by the same key.
-      if (contributorsProjectRef.current !== null) return;
+      // The Contributors page closes itself on Escape, on either tab; the turn
+      // running in a tab behind it must not be stopped by the same key.
+      if (contributorsViewRef.current !== null) return;
       const focusedBusySessionId = () => {
         const agentId = monoViewIdRef.current;
         if (agentId) {
@@ -12474,8 +12451,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       onOpenApprovalSession(sessionId);
     },
     [onOpenApprovalSession],
@@ -12713,8 +12689,7 @@ function Workspace({
     setNotesViewOpen(false);
     setAutomationsViewOpen(false);
     setMailViewOpen(false);
-    setTicketContributorsOpen(false);
-    setContributorsProject(null);
+    setContributorsView(null);
     setFilePickerInitialQuery("");
     setFilePickerResetToken((token) => token + 1);
     setFilePickerOpen(true);
@@ -12725,8 +12700,7 @@ function Workspace({
     setNotesViewOpen(false);
     setAutomationsViewOpen(false);
     setMailViewOpen(false);
-    setTicketContributorsOpen(false);
-    setContributorsProject(null);
+    setContributorsView(null);
     setFilePickerInitialQuery(">");
     setFilePickerResetToken((token) => token + 1);
     setFilePickerOpen(true);
@@ -12744,8 +12718,7 @@ function Workspace({
     setNotesViewOpen(false);
     setAutomationsViewOpen(false);
     setMailViewOpen(false);
-    setTicketContributorsOpen(false);
-    setContributorsProject(null);
+    setContributorsView(null);
     setSidebarTab("files");
     setFilesSearchOpen(true);
     setSearchFocusToken((token) => token + 1);
@@ -12764,8 +12737,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       setSearchViewOpen(true);
       setSearchViewFocusToken((token) => token + 1);
     });
@@ -12786,8 +12758,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       setInboxViewOpen(true);
     });
   }, []);
@@ -12802,8 +12773,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       setInboxViewOpen(false);
       const cwd =
         sessionsRef.current.find((session) => session.id === sessionId)?.cwd ??
@@ -12890,8 +12860,7 @@ function Workspace({
       setInboxViewOpen(false);
       setNotesViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       setSearchViewOpen(false);
       setSidebarTab("sessions", cwd);
       await onSelectHistorySession(session.id);
@@ -12968,7 +12937,7 @@ function Workspace({
           "The agent did not accept the message. Try again in a moment.",
         );
       }
-      setContributorsProject(null);
+      setContributorsView(null);
       setSidebarTab("sessions", project);
       try {
         await onSelectHistorySession(session.id);
@@ -12991,8 +12960,7 @@ function Workspace({
       setInboxViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       setNotesViewOpen(true);
     });
   }, []);
@@ -13012,8 +12980,7 @@ function Workspace({
       setInboxViewOpen(false);
       setNotesViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       setAutomationsViewOpen(true);
     });
   }, []);
@@ -13033,8 +13000,7 @@ function Workspace({
       setInboxViewOpen(false);
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
-      setContributorsProject(null);
-      setTicketContributorsOpen(false);
+      setContributorsView(null);
       setMailViewOpen(true);
     });
   }, []);
@@ -13043,32 +13009,11 @@ function Workspace({
     setMailViewOpen(false);
   }, []);
 
-  const onOpenTicketContributors = useCallback(() => {
-    workspaceNavigation.cancel();
-    startTransition(() => {
-      closeMonoView();
-      setFilePickerOpen(false);
-      setSettingsOpen(false);
-      setSearchViewOpen(false);
-      setInboxViewOpen(false);
-      setNotesViewOpen(false);
-      setAutomationsViewOpen(false);
-      setMailViewOpen(false);
-      setContributorsProject(null);
-      setTicketContributorsOpen(true);
-    });
-  }, []);
-
-  const onLeaveTicketContributors = useCallback(() => {
-    setTicketContributorsOpen(false);
-  }, []);
-
-  const onOpenContributors = useCallback(
-    (path: string) => {
+  const openContributors = useCallback(
+    (
+      next: (current: ContributorsViewState | null) => ContributorsViewState,
+    ) => {
       workspaceNavigation.cancel();
-      if (!path || isRemoteProjectPath(path)) return;
-      // The page is scoped to `path`; it never changes the current project,
-      // tabs, recents or the back stack.
       startTransition(() => {
         closeMonoView();
         setFilePickerOpen(false);
@@ -13078,16 +13023,43 @@ function Workspace({
         setNotesViewOpen(false);
         setAutomationsViewOpen(false);
         setMailViewOpen(false);
-        setTicketContributorsOpen(false);
-        setContributorsProject(path);
+        setContributorsView(next);
       });
     },
     [closeMonoView, workspaceNavigation.cancel],
   );
 
+  // Opening it again keeps the tab and project already chosen.
+  const onOpenContributors = useCallback(
+    () =>
+      openContributors(
+        (current) => current ?? { tab: "ticket", project: null },
+      ),
+    [openContributors],
+  );
+
+  const onOpenProjectContributors = useCallback(
+    (path: string) => {
+      if (!path || isRemoteProjectPath(path)) return;
+      // The page shows `path` on its GitHub tab; it never changes the current
+      // project, tabs, recents or the back stack.
+      openContributors(() => ({ tab: "github", project: path }));
+    },
+    [openContributors],
+  );
+
   const onLeaveContributors = useCallback(() => {
-    setContributorsProject(null);
+    setContributorsView(null);
   }, []);
+
+  // The projects the page's selector lists: the ones the rail shows.
+  const contributorsProjects = useMemo(
+    () =>
+      contributorsViewOpen
+        ? projectRailItems(recents, sidebarCwd).map((item) => item.path)
+        : [],
+    [contributorsViewOpen, recents, sidebarCwd],
+  );
 
   const onOpenAutomationSession = useCallback(
     async (sessionId: string) => {
@@ -13096,8 +13068,7 @@ function Workspace({
         throw new Error("This conversation is no longer available.");
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       setSearchViewOpen(false);
       setInboxViewOpen(false);
       setNotesViewOpen(false);
@@ -13121,8 +13092,7 @@ function Workspace({
           notes: notesViewOpenRef.current,
           automations: automationsViewOpenRef.current,
           mail: mailViewOpenRef.current,
-          ticketContributors: ticketContributorsOpenRef.current,
-          contributors: contributorsProjectRef.current,
+          contributors: contributorsViewRef.current,
         };
       }
       startTransition(() => {
@@ -13132,8 +13102,7 @@ function Workspace({
         setNotesViewOpen(false);
         setAutomationsViewOpen(false);
         setMailViewOpen(false);
-        setTicketContributorsOpen(false);
-        setContributorsProject(null);
+        setContributorsView(null);
         if (section) {
           setSettingsSection(section);
           saveSettingsSection(section);
@@ -13192,14 +13161,14 @@ function Workspace({
     setNotesViewOpen(returnView.notes && loadNotesEnabled());
     setAutomationsViewOpen(returnView.automations);
     setMailViewOpen(returnView.mail && loadMailEnabled());
-    setTicketContributorsOpen(returnView.ticketContributors);
     // The project may have been archived or deleted while Settings was open.
     const contributors = returnView.contributors;
-    setContributorsProject(
+    setContributorsView(
       contributors !== null &&
-        isKnownProject(contributors, projectCwdRef.current)
-        ? contributors
-        : null,
+        contributors.project !== null &&
+        !isKnownProject(contributors.project, projectCwdRef.current)
+        ? { ...contributors, project: null }
+        : contributors,
     );
     setSettingsOpen(false);
   }, []);
@@ -13243,11 +13212,7 @@ function Workspace({
       return;
     }
     if (contributorsViewOpen) {
-      setContributorsProject(null);
-      return;
-    }
-    if (ticketContributorsOpen) {
-      setTicketContributorsOpen(false);
+      setContributorsView(null);
       return;
     }
     if (monoViewIdRef.current) {
@@ -13265,7 +13230,6 @@ function Workspace({
     inboxViewOpen,
     notesViewOpen,
     automationsViewOpen,
-    ticketContributorsOpen,
     mailViewOpen,
     contributorsViewOpen,
   ]);
@@ -13277,8 +13241,7 @@ function Workspace({
     setNotesViewOpen(false);
     setAutomationsViewOpen(false);
     setMailViewOpen(false);
-    setTicketContributorsOpen(false);
-    setContributorsProject(null);
+    setContributorsView(null);
     onVisitForward();
   }, [onVisitForward]);
 
@@ -13436,8 +13399,7 @@ function Workspace({
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
       activateTab(id);
     },
     [
@@ -13583,8 +13545,7 @@ function Workspace({
     // rather than the pane or Mono hidden underneath it.
     if (insetLayout && forkViewOpen) {
       setMailViewOpen(false);
-      setTicketContributorsOpen(false);
-      setContributorsProject(null);
+      setContributorsView(null);
     } else if (insetLayout && monoCovers && monoViewTabId)
       closeViewTab(monoViewTabId);
     else if (insetLayout && activeAppView) onCloseAppView(activeAppView);
@@ -13819,9 +13780,8 @@ function Workspace({
             inboxViewOpenRef.current ||
             notesViewOpenRef.current ||
             automationsViewOpenRef.current ||
-            ticketContributorsOpenRef.current ||
             mailViewOpenRef.current ||
-            contributorsProjectRef.current !== null ||
+            contributorsViewRef.current !== null ||
             settingsOpenRef.current ||
             filePickerOpenRef.current ||
             Boolean(whatsNewVersionRef.current);
@@ -13912,9 +13872,8 @@ function Workspace({
         !inboxViewOpenRef.current &&
         !notesViewOpenRef.current &&
         !automationsViewOpenRef.current &&
-        !ticketContributorsOpenRef.current &&
         !mailViewOpenRef.current &&
-        contributorsProjectRef.current === null &&
+        contributorsViewRef.current === null &&
         !(
           e.target instanceof Element &&
           e.target.closest("[data-session-drop], [data-agent-tab]")
@@ -14621,7 +14580,6 @@ function Workspace({
     inboxViewOpen ||
     notesViewOpen ||
     automationsViewOpen ||
-    ticketContributorsOpen ||
     mailViewOpen ||
     contributorsViewOpen;
   const compactProjectRail = collapsedProjectRailMode === "compact";
@@ -14878,7 +14836,6 @@ function Workspace({
         inboxViewOpen ||
         notesViewOpen ||
         automationsViewOpen ||
-        ticketContributorsOpen ||
         mailViewOpen ||
         contributorsViewOpen
       }
@@ -14913,8 +14870,7 @@ function Workspace({
       onOpenAutomations={onOpenAutomations}
       onOpenMail={mailEnabled ? onOpenMail : undefined}
       onOpenContributors={onOpenContributors}
-      onOpenTicketContributors={onOpenTicketContributors}
-      ticketContributorsActive={ticketContributorsOpen}
+      contributorsActive={contributorsViewOpen}
       onGoToFile={onGoToFile}
       searchActive={searchViewOpen}
       inboxActive={inboxViewOpen}
@@ -14953,7 +14909,7 @@ function Workspace({
         providers={usageProviders}
         session={usageSession}
         project={usageSource?.cwd ?? projectCwd}
-        onOpenContributors={onOpenContributors}
+        onOpenContributors={onOpenProjectContributors}
         onSelectAccount={onSelectProviderAccount}
         onManageAccounts={() => openSettings("providers", "provider-accounts")}
         // A Mono in full view has no terminal of its own.
@@ -15031,7 +14987,6 @@ function Workspace({
                         inboxViewOpen ||
                         notesViewOpen ||
                         automationsViewOpen ||
-                        ticketContributorsOpen ||
                         mailViewOpen ||
                         contributorsViewOpen
                           ? "hidden"
@@ -15043,7 +14998,6 @@ function Workspace({
                         inboxViewOpen ||
                         notesViewOpen ||
                         automationsViewOpen ||
-                        ticketContributorsOpen ||
                         mailViewOpen ||
                         contributorsViewOpen
                       }
@@ -15053,7 +15007,6 @@ function Workspace({
                         inboxViewOpen ||
                         notesViewOpen ||
                         automationsViewOpen ||
-                        ticketContributorsOpen ||
                         mailViewOpen ||
                         contributorsViewOpen ||
                         undefined
@@ -15348,7 +15301,6 @@ function Workspace({
                                   !inboxViewOpen &&
                                   !notesViewOpen &&
                                   !automationsViewOpen &&
-                                  !ticketContributorsOpen &&
                                   !mailViewOpen &&
                                   !contributorsViewOpen &&
                                   !monoViewId &&
@@ -15500,35 +15452,31 @@ function Workspace({
                         onToggleSidebar={onToggleSidebar}
                       />
                     ) : null}
-                    {ticketContributorsOpen ? (
-                      <TicketContributorsView
+                    {contributorsView !== null ? (
+                      <ContributorsPage
                         tabbed={insetLayout}
-                        besideRail={
-                          insetLayout || projectRailOpen || compactProjectRail
+                        tab={contributorsView.tab}
+                        onTabChange={(tab) =>
+                          setContributorsView((view) =>
+                            view ? { ...view, tab } : view,
+                          )
                         }
-                        compactRail={!insetLayout && compactRailActive}
-                        onClose={onLeaveTicketContributors}
-                        onToggleSidebar={onToggleSidebar}
-                        onOpenSettings={onOpenClickUpSettings}
-                      />
-                    ) : null}
-                    {contributorsProject !== null ? (
-                      <ContributorsView
-                        key={contributorsProject}
-                        project={contributorsProject}
-                        tabbed={insetLayout}
+                        project={contributorsView.project}
+                        onProjectChange={(project) =>
+                          setContributorsView((view) =>
+                            view ? { ...view, project } : view,
+                          )
+                        }
+                        projects={contributorsProjects}
+                        activeProject={sidebarCwd}
                         besideRail={
                           insetLayout || projectRailOpen || compactProjectRail
                         }
                         compactRail={!insetLayout && compactRailActive}
                         onClose={onLeaveContributors}
                         onToggleSidebar={onToggleSidebar}
-                        onStartAgentSession={(request) =>
-                          onStartContributorsSession(
-                            contributorsProject,
-                            request,
-                          )
-                        }
+                        onOpenSettings={onOpenClickUpSettings}
+                        onStartAgentSession={onStartContributorsSession}
                       />
                     ) : null}
                     {settingsOpen ? (

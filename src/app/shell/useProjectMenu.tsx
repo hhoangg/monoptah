@@ -10,7 +10,6 @@ import {
   PinOff,
   Settings,
   Trash2,
-  Trophy,
 } from "../../shared/ui/icons";
 import {
   basename,
@@ -22,7 +21,6 @@ import {
 import { IS_MAC, IS_WIN } from "../../platform/tauri/platform";
 import { projectKey, projectName } from "../../shared/lib/paths";
 import {
-  isRemoteProjectPath,
   loadPinnedProjects,
   sameProjectPath,
   subscribeProjectPathsChanged,
@@ -94,7 +92,6 @@ function projectMenuExtraItems(
   projectGroups: ProjectGroup[],
   currentProjectGroupId: string | undefined,
   railOptions: boolean,
-  canOpenContributors = false,
 ): TabGroupMenuExtraItem[] {
   const groupSubmenu: ExplorerMenuItem[] = [
     { kind: "item", id: "project-group:new", label: "New group…" },
@@ -163,9 +160,6 @@ function projectMenuExtraItems(
                 },
               ],
     },
-    ...(canOpenContributors
-      ? [{ id: "contributors", label: "Contributors", icon: Trophy }]
-      : []),
     {
       id: "notifications-mute",
       label: "Mute notifications",
@@ -196,8 +190,6 @@ type Point = { x: number; y: number };
 type Options = {
   onRemoveProject?: (path: string, options: { purgeData: boolean }) => void;
   onOpenNotificationSettings?: (projectPath?: string) => void;
-  /** Opens the Contributors page; only local projects get the menu item. */
-  onOpenContributors?: (projectPath: string) => void;
   /** Called when a project or group menu opens, so hosts can close sibling menus. */
   onOpen?: () => void;
   /** Groups and pins only arrange the project rail; layouts without one
@@ -214,7 +206,6 @@ type Options = {
 export function useProjectMenu({
   onRemoveProject,
   onOpenNotificationSettings,
-  onOpenContributors,
   onOpen,
   railOptions = true,
 }: Options) {
@@ -388,8 +379,6 @@ export function useProjectMenu({
       return false;
     } else if (action === "notifications-settings") {
       onOpenNotificationSettings?.(path);
-    } else if (action === "contributors") {
-      onOpenContributors?.(path);
     } else if (action === "pin" || action === "unpin") {
       toggleProjectPin(path);
     } else if (action === "background") {
@@ -470,7 +459,6 @@ export function useProjectMenu({
             loadProjectGroupAssignments(),
           ),
           railOptions,
-          Boolean(onOpenContributors) && !isRemoteProjectPath(projectMenu.path),
         )}
         footer={
           menuError ? (

@@ -21,17 +21,17 @@ it("every site that closes Mail also closes Contributors", () => {
     )
       return false;
     const near = lines.slice(i - 6, i + 6).join("\n");
-    // Contributors' own opener sets the project right after.
-    if (near.includes("setContributorsProject(path);")) return false;
-    return !near.includes("setContributorsProject(null);");
+    // Contributors' own opener sets the view right after.
+    if (near.includes("setContributorsView(next);")) return false;
+    return !near.includes("setContributorsView(null);");
   });
   expect(missing.map((i) => i + 1)).toEqual([]);
 });
 
-it("opening Contributors closes every other view and rejects remote projects", () => {
-  const start = lines.findIndex((l) => l.includes("const onOpenContributors"));
+it("opening Contributors closes every other view", () => {
+  const start = lines.findIndex((l) => l.includes("const openContributors"));
   expect(start).toBeGreaterThan(-1);
-  const body = lines.slice(start, start + 28).join("\n");
+  const body = lines.slice(start, start + 20).join("\n");
   for (const setter of [
     "setFilePickerOpen",
     "setSettingsOpen",
@@ -43,9 +43,22 @@ it("opening Contributors closes every other view and rejects remote projects", (
   ]) {
     expect(body).toContain(`${setter}(false);`);
   }
-  expect(body).toContain("isRemoteProjectPath(path)");
-  expect(body).toContain("setContributorsProject(path);");
+  expect(body).toContain("setContributorsView(next);");
+});
+
+it("the sidebar opens Contributors on the Ticket tab and keeps an open page as it is", () => {
+  const body = handlerBody("onOpenContributors");
+  expect(body).toContain(
+    '(current) => current ?? { tab: "ticket", project: null }',
+  );
   expect(app).toContain("onOpenContributors={onOpenContributors}");
+  expect(app).toContain("contributorsActive={contributorsViewOpen}");
+});
+
+it("opening a project's Contributors shows its GitHub tab and rejects remote projects", () => {
+  const body = handlerBody("onOpenProjectContributors");
+  expect(body).toContain("isRemoteProjectPath(path)");
+  expect(body).toContain('({ tab: "github", project: path })');
 });
 
 it("every opener of another view closes Contributors", () => {
@@ -59,20 +72,25 @@ it("every opener of another view closes Contributors", () => {
     const start = lines.findIndex((l) => l.includes(`const ${name} =`));
     expect(start, name).toBeGreaterThan(-1);
     const body = lines.slice(start, start + 16).join("\n");
-    expect(body, name).toContain("setContributorsProject(null);");
+    expect(body, name).toContain("setContributorsView(null);");
   }
 });
 
-it("mounts ContributorsView only while open, per project", () => {
+it("mounts ContributorsPage only while open, with its tab and project", () => {
   expect(app).toMatch(
-    /\{contributorsProject !== null \? \(\s*<ContributorsView\s+key=\{contributorsProject\}\s+project=\{contributorsProject\}/,
+    /\{contributorsView !== null \? \(\s*<ContributorsPage\s+tabbed=\{insetLayout\}\s+tab=\{contributorsView\.tab\}/,
   );
+  expect(app).toContain("project={contributorsView.project}");
   expect(app).toContain("onClose={onLeaveContributors}");
-  expect(app).toContain("ContributorsView.preload");
+  expect(app).toContain("onOpenSettings={onOpenClickUpSettings}");
+  expect(app).toContain("ContributorsPage.preload");
+  // Merged into one page: neither old view is mounted from App any more.
+  expect(app).not.toMatch(/<ContributorsView[\s>]/);
+  expect(app).not.toMatch(/<TicketContributorsView[\s>]/);
 });
 
 it("Settings remembers and restores the open Contributors page", () => {
-  expect(app).toContain("contributors: contributorsProjectRef.current,");
+  expect(app).toContain("contributors: contributorsViewRef.current,");
   expect(app).toContain("const contributors = returnView.contributors;");
 });
 
@@ -80,7 +98,7 @@ it("the back button closes the Contributors page", () => {
   const start = lines.findIndex((l) => l.includes("const onRailBack"));
   const body = lines.slice(start, start + 50).join("\n");
   expect(body).toMatch(
-    /if \(contributorsViewOpen\) \{\s*setContributorsProject\(null\);\s*return;/,
+    /if \(contributorsViewOpen\) \{\s*setContributorsView\(null\);\s*return;/,
   );
 });
 
@@ -100,13 +118,13 @@ it("every list of open views that names Mail also names Contributors", () => {
   );
   expect(missingFlag.map((i) => i + 1)).toEqual([]);
   const missingRef = refSites.filter(
-    (i) => !lines[i + 1].includes("contributorsProjectRef.current"),
+    (i) => !lines[i + 1].includes("contributorsViewRef.current"),
   );
   expect(missingRef.map((i) => i + 1)).toEqual([]);
 });
 
 it("opening Contributors leaves workspace selection alone", () => {
-  const start = lines.findIndex((l) => l.includes("const onOpenContributors"));
+  const start = lines.findIndex((l) => l.includes("const openContributors"));
   const end = lines.findIndex(
     (l, i) => i > start && l.includes("const onLeaveContributors"),
   );
@@ -123,22 +141,24 @@ it("opening Contributors leaves workspace selection alone", () => {
   }
 });
 
-it("removing a project closes its Contributors page and its Settings return", () => {
+it("removing a project unchooses it on the Contributors page and its Settings return", () => {
   const start = lines.findIndex((l) => l.includes("const onRemoveProject"));
   const body = lines.slice(start, start + 40).join("\n");
   expect(body).toMatch(
-    /contributorsProjectRef\.current !== null &&\s*sameProjectPath\(contributorsProjectRef\.current, normalized\)\s*\) \{\s*setContributorsProject\(null\);/,
+    /setContributorsView\(\(view\) =>\s*view\?\.project && sameProjectPath\(view\.project, normalized\)\s*\? \{ \.\.\.view, project: null \}\s*: view,/,
   );
   expect(body).toMatch(
-    /sameProjectPath\(returnContributors, normalized\)\s*\) \{\s*settingsReturnViewRef\.current\.contributors = null;/,
+    /sameProjectPath\(returnContributors\.project, normalized\)\s*\) \{\s*settingsReturnViewRef\.current\.contributors = \{\s*\.\.\.returnContributors,\s*project: null,/,
   );
 });
 
 it("closing Settings only restores a Contributors project that still exists", () => {
   const start = lines.findIndex((l) => l.includes("const onCloseSettings"));
   const body = lines.slice(start, start + 20).join("\n");
-  expect(body).toContain("isKnownProject(contributors, projectCwdRef.current)");
-  expect(body).not.toContain("setContributorsProject(returnView.contributors)");
+  expect(body).toContain(
+    "!isKnownProject(contributors.project, projectCwdRef.current)",
+  );
+  expect(body).not.toContain("setContributorsView(returnView.contributors)");
 });
 
 it("starting a Contributors session creates a chat, submits and closes the page", () => {
@@ -168,15 +188,15 @@ it("starting a Contributors session creates a chat, submits and closes the page"
   );
   // Only an accepted submit closes the page and opens the session.
   const submit = body.indexOf("onSubmit(session.id");
-  expect(body.indexOf("setContributorsProject(null);")).toBeGreaterThan(submit);
+  expect(body.indexOf("setContributorsView(null);")).toBeGreaterThan(submit);
   expect(body).toContain('setSidebarTab("sessions", project);');
   expect(body).toContain("await onSelectHistorySession(session.id);");
 });
 
-it("hands the Contributors page the session starter for its own project", () => {
-  expect(app).toContain("onStartAgentSession={(request) =>");
-  expect(app).toMatch(
-    /onStartContributorsSession\(\s*contributorsProject,\s*request,?\s*\)/,
+it("hands the Contributors page the session starter, which gets the page's project", () => {
+  expect(app).toContain("onStartAgentSession={onStartContributorsSession}");
+  expect(handlerBody("onStartContributorsSession")).toContain(
+    "async (project: string, request: AskAgentRequest)",
   );
 });
 
@@ -200,7 +220,7 @@ it("a running agent turn is never stopped by Escape while the Contributors page 
   const start = lines.findIndex((l) => l.includes("const onEscape = ("));
   expect(start).toBeGreaterThan(-1);
   const body = lines.slice(start, start + 12).join("\n");
-  expect(body).toContain("contributorsProjectRef.current !== null");
+  expect(body).toContain("contributorsViewRef.current !== null");
 });
 
 it("a failed navigation after an accepted submit is not reported as a failed start", () => {
@@ -228,7 +248,7 @@ it("selecting a session from the sidebar closes the Contributors page", () => {
   // After the load guard, so a session that cannot open leaves the page alone,
   // and before the first branch that returns with the session already shown.
   expect(body).toMatch(
-    /if \(!session \|\| session\.inboxAsk\) return;\s*setContributorsProject\(null\);/,
+    /if \(!session \|\| session\.inboxAsk\) return;\s*setContributorsView\(null\);/,
   );
 });
 
@@ -236,7 +256,7 @@ it("switching workspace from the sidebar closes the Contributors page", () => {
   const start = lines.findIndex((l) => l.includes("const onSelectWorkspace"));
   expect(start).toBeGreaterThan(-1);
   const body = lines.slice(start, start + 8).join("\n");
-  expect(body).toContain("setContributorsProject(null);");
+  expect(body).toContain("setContributorsView(null);");
 });
 
 it("the title-bar tabs are inert while Contributors is open", () => {
@@ -259,7 +279,7 @@ it("the title-bar tabs are inert while Contributors is open", () => {
   );
   expect(select).toBeGreaterThan(-1);
   expect(lines.slice(select, select + 40).join("\n")).toContain(
-    "setContributorsProject(null);",
+    "setContributorsView(null);",
   );
   expect(app).toMatch(/const chromeSurfaceOpen =[^;]*contributorsViewOpen;/);
 });
@@ -298,7 +318,7 @@ it("the footer sync indicator sits before the Terminal item and opens Contributo
   const start = lines.findIndex((l) => l.includes("<UsageFooter"));
   expect(start).toBeGreaterThan(-1);
   expect(lines.slice(start, start + 30).join("\n")).toContain(
-    "onOpenContributors={onOpenContributors}",
+    "onOpenContributors={onOpenProjectContributors}",
   );
 });
 
@@ -316,28 +336,28 @@ it("opening a file from the sidebar closes the Contributors page", () => {
   // it would land in a workspace the page is hiding. It closes after the tab
   // guard, so an open that cannot proceed leaves the page alone.
   expect(handlerBody("onOpenFile")).toMatch(
-    /if \(!tab\) return;\s*setContributorsProject\(null\);/,
+    /if \(!tab\) return;\s*setContributorsView\(null\);/,
   );
 });
 
 it("opening a terminal from the sidebar closes the Contributors page", () => {
   // After the remote-project guard: a terminal that cannot open keeps the page.
   expect(handlerBody("onOpenTerminal")).toMatch(
-    /isLocalProject\(workdir\)\)\s*return;\s*setContributorsProject\(null\);/,
+    /isLocalProject\(workdir\)\)\s*return;\s*setContributorsView\(null\);/,
   );
 });
 
 it("opening a diff from the sidebar closes the Contributors page", () => {
   // After the path is resolved, so a failed lookup leaves the page alone.
   expect(handlerBody("onOpenDiff")).toMatch(
-    /if \(resolved\) rememberOpenedFile\(diffCwd, resolved\);\s*setContributorsProject\(null\);\s*setTabs\(/,
+    /if \(resolved\) rememberOpenedFile\(diffCwd, resolved\);\s*setContributorsView\(null\);\s*setTabs\(/,
   );
 });
 
 it("opening all changes or a commit from the sidebar closes the Contributors page", () => {
   for (const name of ["onOpenAllChanges", "onOpenCommit"]) {
     expect(handlerBody(name), name).toMatch(
-      /\) => \{\s*setContributorsProject\(null\);\s*setTabs\(/,
+      /\) => \{\s*setContributorsView\(null\);\s*setTabs\(/,
     );
   }
 });
@@ -357,7 +377,7 @@ it("the footer, project terminal dock and menu bar are not reachable while Contr
 });
 
 // The new layout draws a tab strip, a Mono tab and a right panel around the
-// workspace. The three fork views have no tab, so each of those has to treat
+// workspace. The two fork views have no tab, so each of those has to treat
 // them like upstream's app views.
 const bodyAfter = (marker: string, length: number) => {
   const start = lines.findIndex((l) => l.includes(marker));
@@ -365,12 +385,8 @@ const bodyAfter = (marker: string, length: number) => {
   return lines.slice(start, start + length).join("\n");
 };
 
-it("opening Mail, Ticket Contributors or Contributors puts a Mono's view away", () => {
-  for (const name of [
-    "onOpenMail",
-    "onOpenTicketContributors",
-    "onOpenContributors",
-  ]) {
+it("opening Mail or Contributors puts a Mono's view away", () => {
+  for (const name of ["onOpenMail", "openContributors"]) {
     expect(bodyAfter(`const ${name} =`, 14), name).toContain(
       "closeMonoView();",
     );
@@ -384,16 +400,15 @@ it("closing the visible tab closes an open fork view before a Mono or app view",
   expect(fork).toBeLessThan(body.indexOf("monoCovers"));
   for (const close of [
     "setMailViewOpen(false);",
-    "setTicketContributorsOpen(false);",
-    "setContributorsProject(null);",
+    "setContributorsView(null);",
   ]) {
     expect(body).toContain(close);
   }
 });
 
 it("the right panel and Back treat an open fork view like an app view", () => {
-  expect(app).toMatch(
-    /const forkViewOpen =\s*mailViewOpen \|\| ticketContributorsOpen \|\| contributorsViewOpen;/,
+  expect(app).toContain(
+    "const forkViewOpen = mailViewOpen || contributorsViewOpen;",
   );
   expect(bodyAfter("const insetRightPanelShown =", 8)).toContain(
     "!forkViewOpen",
@@ -410,11 +425,7 @@ it("the right panel and Back treat an open fork view like an app view", () => {
 });
 
 it("the fork views drop their own header in the new layout", () => {
-  for (const tag of [
-    "MailView",
-    "TicketContributorsView",
-    "ContributorsView",
-  ]) {
+  for (const tag of ["MailView", "ContributorsPage"]) {
     const start = lines.findIndex((l) => l.includes(`<${tag}`));
     expect(start, tag).toBeGreaterThan(-1);
     expect(lines.slice(start, start + 6).join("\n"), tag).toContain(

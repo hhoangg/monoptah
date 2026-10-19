@@ -132,8 +132,8 @@ type Props = {
   automationsActive?: boolean;
   onOpenMail?: () => void;
   mailActive?: boolean;
-  onOpenTicketContributors?: () => void;
-  ticketContributorsActive?: boolean;
+  onOpenContributors?: () => void;
+  contributorsActive?: boolean;
   /** Unread mail over enabled sources; 0 draws no badge. */
   mailUnread?: number;
   onTogglePanel?: () => void;
@@ -147,7 +147,6 @@ type Props = {
   settingsSection?: SettingsSectionId;
   onOpenSettings?: () => void;
   onOpenNotificationSettings?: (projectPath?: string) => void;
-  onOpenContributors?: (projectPath: string) => void;
   onSelectSettingsSection?: (section: SettingsSectionId) => void;
   onCloseSettings?: () => void;
   updateNotice?: InstalledUpdate | null;
@@ -178,10 +177,10 @@ export function ProjectRail({
   notesActive = false,
   onOpenAutomations,
   onOpenMail,
-  onOpenTicketContributors,
+  onOpenContributors,
   automationsActive = false,
   mailActive = false,
-  ticketContributorsActive = false,
+  contributorsActive = false,
   mailUnread = 0,
   onTogglePanel,
   onSelectProject,
@@ -194,7 +193,6 @@ export function ProjectRail({
   settingsSection = "general",
   onOpenSettings,
   onOpenNotificationSettings,
-  onOpenContributors,
   onSelectSettingsSection,
   onCloseSettings,
   updateNotice = null,
@@ -253,7 +251,6 @@ export function ProjectRail({
   const projectMenu = useProjectMenu({
     onRemoveProject,
     onOpenNotificationSettings,
-    onOpenContributors,
     onOpen: () => setInboxMenu(null),
   });
   useEffect(() => {
@@ -382,7 +379,7 @@ export function ProjectRail({
     notesActive ||
     automationsActive ||
     mailActive ||
-    ticketContributorsActive ||
+    contributorsActive ||
     !!monos?.activeId;
   const pinnedIds = sections.pinned.map((item) => item.path);
   const projectIds = groupedProjectSections.ungrouped.map((item) => item.path);
@@ -480,13 +477,13 @@ export function ProjectRail({
                 }
               />
             ) : null}
-            {onOpenTicketContributors ? (
+            {onOpenContributors ? (
               <RailAction
-                label="Ticket Contributors"
+                label="Contributors"
                 icon={ChartBreakoutSquare}
-                onClick={onOpenTicketContributors}
-                active={ticketContributorsActive}
-                ariaLabel="Ticket Contributors"
+                onClick={onOpenContributors}
+                active={contributorsActive}
+                ariaLabel="Contributors"
               />
             ) : null}
           </div>
