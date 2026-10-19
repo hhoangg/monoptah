@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-10-19
+
+### Changed
+
+- **Ticket Contributors** and the project **Contributors** page are now one **Contributors** page, opened from the sidebar. Its **Ticket** tab shows the ClickUp ranking as before, and its **GitHub** tab shows repository contributors with a project selector that starts on the active project. The Contributors item in the project context menu is gone.
+- Escape closes the Contributors page from either tab without stopping a running agent.
+
 ## [0.27.0] - 2026-10-19
 
 ### Added
