@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-10-19
+
+### Added
+
+- Deleting a Claude or Codex session now offers to **delete its session files on this computer** too, so old transcripts no longer pile up on disk. The option is checked by default, and an unused worktree checkbox, also checked by default, appears next to it when there is one. Codex subagent threads are removed with their session, while a thread another conversation continues from is kept.
+
+### Changed
+
+- Deleting several selected sessions from the sidebar opens the same dialog instead of a plain confirmation, and can also delete their unused worktrees.
+
 ## [0.26.0] - 2026-10-18
 
 Carries the upstream MonoCode 0.15.0 changes below. Mail, Ticket Contributors and Contributors also open in the New layout.
