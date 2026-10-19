@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Carries the upstream MonoCode 0.16.0 changes below.
+
+### Added
+
+- Pair an iPhone from **Settings → Connections → Your phones** to browse projects and conversations, start and continue sessions, follow streamed replies, stop responses, and view code changes. The iPhone companion is upstream MonoCode's app and is currently an **invite-only TestFlight beta**.
+- Swipe between projects in the new sidebar.
+- Project and Inbox actions have keyboard-accessible context menus in the new sidebar.
+
+### Fixed
+
+- The new sidebar keeps **Open project** and **Settings** available before a project is selected.
+- The empty conversation view no longer scrolls a few pixels around the message input.
+- The message input's blurred background stays within its rounded corners on Windows.
+- Phone connections on Windows accept both IPv4 and IPv6.
+- Sessions and Mono conversations started from a phone always open as chat, even when the provider is set to open in a terminal.
+
 ## [0.28.0] - 2026-10-19
 
 ### Changed

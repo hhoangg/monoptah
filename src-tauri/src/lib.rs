@@ -42,6 +42,8 @@ mod mail_sync;
 mod mail_thread;
 mod mcp;
 mod menu;
+mod mobile_access;
+mod mobile_router;
 mod mono;
 #[cfg(target_os = "macos")]
 mod mono_chat;
@@ -300,6 +302,7 @@ pub fn run() {
             app.manage(contributors::new_ticket_jobs(app.handle().clone()));
             control::init(app.handle())?;
             tui_hook::init(app.handle())?;
+            mobile_access::init(app.handle())?;
             reminders::init(app.handle());
             checkpoint::init(app.handle())?;
             mail::init(app.handle());
@@ -331,6 +334,14 @@ pub fn run() {
             menu::dispatch(app, event.id().as_ref());
         })
         .invoke_handler(tauri::generate_handler![
+            mobile_access::mobile_status,
+            mobile_access::mobile_configure,
+            mobile_access::mobile_invite,
+            mobile_access::mobile_cancel_invite,
+            mobile_access::mobile_revoke,
+            mobile_access::mobile_publish,
+            mobile_access::mobile_reply,
+            mobile_access::mobile_push,
             remote::remote_machines,
             remote::remote_connect,
             remote::remote_disconnect,
@@ -555,6 +566,8 @@ pub fn run() {
             fs::save_generated_image,
             fs::delete_generated_images,
             fs::read_text_file,
+            fs::mobile_list_dir,
+            fs::mobile_read_text_file,
             fs::omp_session_interjections,
             fs::omp_active_assistant_texts,
             fs::claude_shell_commands,

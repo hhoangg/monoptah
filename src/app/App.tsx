@@ -1,4 +1,13 @@
 import { sessionConversationPage } from "../features/agent-app/model/sessionConversation";
+import { useMobileWorkspace } from "../features/mobile/hooks/useMobileWorkspace";
+import { hasMobileAttachments, mobileAttachments } from "../features/mobile/model/mobileAttachments";
+import {
+  applyMobileChoice,
+  mobileWorkspaceChoice,
+  mobileChoice,
+  mobileNewSession,
+  mobileProjectId,
+} from "../features/mobile/model/mobileWorkspace";
 import { readMonoConversation } from "../features/monos/model/monoConversation";
 import {
   resumeMonoUsageLimit,
@@ -471,6 +480,7 @@ import {
   lastProjectPath,
   loadRecents,
   isKnownProject,
+  loadPinnedProjects,
   isLocalProject,
   isRemoteProjectPath,
   looksLikeProject,
@@ -973,6 +983,8 @@ type SubmitOptions = ComposerTurnOptions & {
   managed?: boolean;
   orchestrationRetry?: OrchestrationProposal;
   appRequestId?: string;
+  /** An app request that may arrive mid-turn, steering or queuing as one typed here would. */
+  followsUp?: boolean;
   monoSessionCompletion?: Block["monoSessionCompletion"];
   onSettled?: (outcome: ControlOutcome) => void;
   /** Generate a fresh title even when this is not the session's first turn. */
@@ -7684,7 +7696,8 @@ function Workspace({
       )
         return false;
       const storedCurrent = sessionsRef.current.find((s) => s.id === sessionId);
-      if (options?.appRequestId && storedCurrent?.busy) return false;
+      if (options?.appRequestId && !options.followsUp && storedCurrent?.busy)
+        return false;
       if (
         options?.ciRepair &&
         storedCurrent &&
@@ -7998,7 +8011,8 @@ function Workspace({
                     queuedMessages: [
                       ...(s.queuedMessages ?? []),
                       {
-                        id: crypto.randomUUID(),
+                        // An app request's ID, so a retried request finds it queued.
+                        id: options?.appRequestId ?? crypto.randomUUID(),
                         text,
                         attachments,
                         noteCard,
@@ -8039,7 +8053,12 @@ function Workspace({
           if (options?.queuedMessageId) {
             next = dequeueQueuedMessage(next, options.queuedMessageId);
           }
-          return appendSteerUser(next, submittedText, visible, cards);
+          return appendSteerUser(next, submittedText, visible, {
+            ...cards,
+            ...(options?.appRequestId
+              ? { appRequestId: options.appRequestId }
+              : {}),
+          });
         });
         sessionsRef.current = nextSessions;
         setSessions(nextSessions);
@@ -9705,6 +9724,103 @@ function Workspace({
   saveDraftRef.current = onSaveDraft;
   const ensureOpenSessionRef = useRef(ensureOpenSession);
   ensureOpenSessionRef.current = ensureOpenSession;
+
+  useMobileWorkspace({
+    sessions,
+    defaultRuntimeMode: sessionDefaults?.runtimeMode,
+    command: async (method, params, commandId) => {
+      const text = typeof params.text === "string" ? params.text.trim() : "";
+      if (
+        (method === "session.start" || method === "conversation.send") &&
+        ((!text && !hasMobileAttachments(params.attachments)) || text.length > 100_000)
+      )
+        throw new Error("Enter a message under 100,000 characters");
+      if (method === "session.start") {
+        const paths = [...loadRecents().map((project) => project.path), ...loadPinnedProjects(), ...listMonos().flatMap((mono) => mono.projects)];
+        const cwd = paths.find((path) => mobileProjectId(path) === params.projectId);
+        if (!cwd) throw new Error("Project is no longer available");
+        const id = String(params.sessionId ?? "");
+        if (!id) throw new Error("Missing mobile session ID");
+        const existing = sessionsRef.current.find(current => current.id === id) ?? await getSession(id);
+        if (existing?.blocks.some(block => block.appRequestId === commandId)) return { sessionId: id };
+        // Staged before the session exists, so a bad file leaves nothing behind.
+        const attachments = await mobileAttachments(params.attachments);
+        const session = existing ?? {
+          ...applyMobileChoice(mobileNewSession(cwd, sessionDefaults?.runtimeMode), params),
+          ...(await mobileWorkspaceChoice(cwd, params)),
+        };
+        // A placeholder title, so the first send seeds and generates one as the composer does.
+        session.id = id;
+        if (!existing) session.title = HARNESS_LABEL[session.harness];
+        if (!sessionsRef.current.some(current => current.id === id))
+          updateSessionState(sessionsRef, setSessions, (current) => [...current, session]);
+        if (!submitSessionRef.current(session.id, text, attachments, { appRequestId: commandId }))
+          throw new Error("Desktop could not start this session");
+        await upsertSession(sessionsRef.current.find((current) => current.id === session.id) ?? session);
+        return { sessionId: session.id };
+      }
+      const conversationId = String(params.conversationId ?? "");
+      const mono = conversationId.startsWith("mono:") ? findMono(conversationId.slice(5)) : undefined;
+      if (conversationId.startsWith("mono:") && !mono) throw new Error("Mono is no longer available");
+      if (method === "session.rename") {
+        // As the sidebar's rename, which also renames a session that isn't open.
+        const title = typeof params.title === "string" ? params.title.trim() : "";
+        if (!title || title.length > 200) throw new Error("Enter a title under 200 characters");
+        if (mono) throw new Error("A Mono's conversation can't be renamed");
+        await onRenameHistorySession(conversationId, title);
+        return { sessionId: conversationId };
+      }
+      if (method === "session.delete" || method === "session.archive") {
+        // As the CLI's delete and archive: no desktop dialogs, and the worktree stays.
+        const mode = method === "session.archive" ? "archive" : "delete";
+        const verb = mode === "archive" ? "archived" : "deleted";
+        const target = mono ? undefined : await ensureOpenSessionRef.current(conversationId);
+        if (!target || target.orchestrationLeadId || isMonoSession(target.id) || isHabitRun(target.id))
+          throw new Error(`This session can't be ${verb} from the phone`);
+        if (!(await onRemoveHistorySession(target.id, mode, true, "cli")))
+          throw new Error(`Session could not be ${verb}; another session operation is in progress`);
+        return { sessionId: target.id };
+      }
+      const monoSession = mono ? await ensureMonoSession(mono.id, {
+        home: homeDir,
+        load: ensureOpenSessionRef.current,
+        create: (path) => newDefaultSession(path, undefined, { surface: "chat" }),
+        add: (created) => updateSessionState(sessionsRef, setSessions, (current) => [...current, created]),
+      }) : undefined;
+      const sessionId = monoSession?.id ?? conversationId;
+      const session = monoSession ?? await ensureOpenSessionRef.current(sessionId);
+      if (!session) throw new Error("Session is no longer available");
+      if (method === "session.cancel") {
+        await onStop(session.id);
+        return { sessionId: session.id };
+      }
+      if (method === "session.configure") {
+        // The phone's model sheet, through the same paths as the composer's
+        // pickers, so a provider switch hands off on the next send as here.
+        const choice = mobileChoice(params);
+        if (choice.harness && choice.model && (choice.harness !== session.harness || choice.model !== session.model))
+          onModelChange(session.id, choice.harness, choice.model);
+        if (choice.modelSettings) {
+          const resolved = resolveModel(choice.harness ?? session.harness, choice.model ?? session.model);
+          onModelSettingsChange(session.id, mergeModelSettings(resolved, choice.modelSettings));
+        }
+        if (choice.runtimeMode) onRuntimeModeChange(session.id, choice.runtimeMode);
+        return { sessionId: session.id };
+      }
+      if (method !== "conversation.send") throw new Error("Unsupported mobile command");
+      if (
+        session.blocks.some((block) => block.appRequestId === commandId) ||
+        session.queuedMessages?.some((message) => message.id === commandId)
+      )
+        return { sessionId: session.id };
+      const attachments = await mobileAttachments(params.attachments);
+      // Mid-turn it steers or queues, as a message typed in the composer would.
+      if (!submitSessionRef.current(session.id, text, attachments, { appRequestId: commandId, followsUp: true }))
+        throw new Error("Desktop could not accept the message. Wait for the current turn to finish and try again.");
+      await upsertSession(sessionsRef.current.find(current => current.id === session.id) ?? session);
+      return { sessionId: session.id };
+    },
+  });
 
   const appReceipts = useRef(
     new Map<string, { signature: string; promise: Promise<unknown> }>(),
