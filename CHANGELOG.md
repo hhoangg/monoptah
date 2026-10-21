@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-10-22
+
 ### Added
 
 - Monos and their habit runs can start a session with `completionDelivery: "each"` to get its report as soon as it stops, instead of waiting for the whole turn.
