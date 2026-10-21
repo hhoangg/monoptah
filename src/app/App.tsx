@@ -22,7 +22,9 @@ import {
   enqueueMonoSessionCompletion,
   monoSessionCompletionResult,
   MonoSessionCompletionBatches,
+  type CompletionDelivery,
 } from "../features/monos/model/monoSessionCompletion";
+import { createMonoLaunchRegistry } from "../features/monos/model/monoLaunches";
 import { acceptQuickLaunch } from "./model/quickLaunchSession";
 import { useWorkspaceNavigation } from "./hooks/useWorkspaceNavigation";
 import { useIdleSessionDetach } from "./hooks/useIdleSessionDetach";
@@ -37,6 +39,7 @@ import {
 import {
   handleAgentApp,
   canAccessAgentAppProject,
+  completionChatId,
   type AppSessionListing,
   type AppSessionPlacement,
 } from "../features/agent-app/model/agentApp";
@@ -1127,6 +1130,8 @@ function filesInWorkspaceTabs(tabs: readonly WorkspaceTab[]): FilePaneTab[] {
 
 /** Stable empty tab list for the title bar while a Mono is in full view. */
 const NO_TITLE_TABS: [] = [];
+/** Which Mono started each session through the app, for parent checks. Lost on restart. */
+const appLaunchRegistry = createMonoLaunchRegistry();
 
 /** Native sheet. `window.confirm` is swallowed when a macOS menu accelerator fires. */
 function confirmDiscardUnsaved(message: string): Promise<boolean> {
@@ -9206,6 +9211,30 @@ function Workspace({
       );
       setSessions(sessionsRef.current);
     },
+    stop: async (id, monoSessionId) => {
+      const target = sessionsRef.current.find((session) => session.id === id);
+      if (!target) throw new Error("The session is not open");
+      if (
+        removingSessionIds.current.has(id) ||
+        switchingWorktrees.current.has(id)
+      )
+        throw new Error("The session is being removed or changing worktrees");
+      if (target.orchestrationLeadId || isMonoSession(id) || isHabitRun(id))
+        throw new Error("The session cannot be stopped from a habit");
+      await flushSync(() => stopSessionRef.current(id));
+      flushHarnessEvents();
+      // Its report would announce a session the user just stopped.
+      monoCompletionBatches.current?.dismissSession(monoSessionId, id);
+      flushSync(() =>
+        setSessions((previous) =>
+          previous.map((session) =>
+            session.id === monoSessionId
+              ? dismissQueuedMonoSessionCompletion(session, id)
+              : session,
+          ),
+        ),
+      );
+    },
     post: (monoId, habit, text, name, artifacts, launches) =>
       appendToMono(
         monoId,
@@ -11928,11 +11957,14 @@ function Workspace({
           ? groupMonoTurns(source.blocks)
           : [];
         const sourceTurnId = sourceTurns[sourceTurns.length - 1]?.[0]?.id;
-        const rememberSession = (entry: MonoSpawnedSession) => {
+        const rememberSession = (
+          entry: MonoSpawnedSession,
+          started = false,
+        ) => {
           // A habit run is thrown away when it ends; its launches go on the
           // report it posts to the Mono's chat instead.
           if (isHabitRun(source.id)) {
-            noteHabitRunLaunch(source.id, entry);
+            noteHabitRunLaunch(source.id, entry, started);
             return;
           }
           if (!sourceTurnId) return;
@@ -11956,12 +11988,13 @@ function Workspace({
           requestId: string,
           project: string,
           prompt: string,
+          delivery?: CompletionDelivery,
         ) => {
           const settle = monoCompletionBatches.current!.watch(
             { monoId, turn: sourceTurn },
             requestId,
             sessionId,
-            { awaitAcceptance: true },
+            { awaitAcceptance: true, delivery },
           );
           return Object.assign(
             (outcome: ControlOutcome) =>
@@ -11980,13 +12013,19 @@ function Workspace({
             { accept: settle.accept, discard: settle.discard },
           );
         };
+        // A habit run's launches report to the chat of the Mono it works for.
+        const reportChatId = completionChatId(source.id, {
+          isMono: isMonoSession,
+          isHabitRun,
+          monoOf: () => sourceMono,
+        });
         const dismissCompletion = (sessionId: string) => {
-          if (!isMonoSession(source.id)) return;
-          monoCompletionBatches.current!.dismissSession(source.id, sessionId);
+          if (!reportChatId) return;
+          monoCompletionBatches.current!.dismissSession(reportChatId, sessionId);
           flushSync(() =>
             setSessions((previous) =>
               previous.map((session) =>
-                session.id === source.id
+                session.id === reportChatId
                   ? dismissQueuedMonoSessionCompletion(session, sessionId)
                   : session,
               ),
@@ -11999,20 +12038,23 @@ function Workspace({
           payload.action,
           payload.input,
           {
-            start: async (launch, id, placement, notifyMonoId) => {
-              const rememberLaunch = () => {
+            start: async (launch, id, placement, notifyMonoId, delivery) => {
+              const rememberLaunch = (started = false) => {
                 const created =
                   sessionsRef.current.find((session) => session.id === id) ??
                   existing;
-                rememberSession({
-                  sessionId: id,
-                  cwd: created?.cwd ?? launch.cwd,
-                  title: created?.title ?? launch.prompt.trim().slice(0, 300),
-                  harness: created?.harness ?? launch.harness,
-                  model:
-                    created?.model ??
-                    resolveModel(launch.harness, launch.model).id,
-                });
+                rememberSession(
+                  {
+                    sessionId: id,
+                    cwd: created?.cwd ?? launch.cwd,
+                    title: created?.title ?? launch.prompt.trim().slice(0, 300),
+                    harness: created?.harness ?? launch.harness,
+                    model:
+                      created?.model ??
+                      resolveModel(launch.harness, launch.model).id,
+                  },
+                  started,
+                );
               };
               const open = sessionsRef.current.find(
                 (session) => session.id === id,
@@ -12030,7 +12072,8 @@ function Workspace({
                   throw new Error(
                     "Request ID was already used for another session launch",
                   );
-                rememberLaunch();
+                // A retry of a request this run made earlier.
+                rememberLaunch(true);
                 return;
               }
               if (
@@ -12050,6 +12093,7 @@ function Workspace({
                     id,
                     launch.cwd,
                     launch.prompt,
+                    delivery,
                   )
                 : undefined;
               try {
@@ -12064,7 +12108,7 @@ function Workspace({
                   onSettled,
                   !!placement || (!isMonoSession(source.id) && launch.reveal),
                 );
-                rememberLaunch();
+                rememberLaunch(true);
                 onSettled?.accept();
               } catch (error) {
                 onSettled?.discard();
@@ -12119,7 +12163,7 @@ function Workspace({
               isMonoSession(target.id)
                 ? readMonoConversation(target, options)
                 : sessionConversationPage(target, options),
-            send: async (id, prompt, requestId, notifyMonoId) => {
+            send: async (id, prompt, requestId, notifyMonoId, delivery) => {
               const target = await ensureOpenSessionRef.current(id);
               if (
                 !target ||
@@ -12166,6 +12210,7 @@ function Workspace({
                     requestId,
                     target.cwd,
                     prompt,
+                    delivery,
                   )
                 : undefined;
               const accepted = onSettled
@@ -12309,6 +12354,7 @@ function Workspace({
             },
             isMono: (id) => isMonoSession(id),
             isHabitRun: (id) => isHabitRun(id),
+            launches: appLaunchRegistry,
             monoOf: (id) => {
               const mono =
                 monoForSession(id) ?? findMono(habitRunMono(id) ?? "");
@@ -12316,6 +12362,8 @@ function Workspace({
                 mono && {
                   id: mono.id,
                   projects: mono.projects,
+                  sessionId: mono.sessionId,
+                  color: mono.color,
                   showStartedSessionsInSidebar:
                     mono.showStartedSessionsInSidebar,
                   ...(mono.useSidebarFolders

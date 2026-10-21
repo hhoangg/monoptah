@@ -116,7 +116,10 @@ function completionMessage(
 }
 
 export type MonoCompletionOrigin = { monoId: string; turn: number };
+/** "group" waits for the launching turn and its siblings; "each" releases per session. */
+export type CompletionDelivery = "group" | "each";
 type CompletionBatch = {
+  key: string;
   origin: MonoCompletionOrigin;
   id: string;
   closed: boolean;
@@ -147,15 +150,20 @@ export class MonoSessionCompletionBatches {
     origin: MonoCompletionOrigin,
     requestId: string,
     sessionId = requestId,
-    options: { awaitAcceptance?: boolean } = {},
+    options: { awaitAcceptance?: boolean; delivery?: CompletionDelivery } = {},
   ) {
-    const key = `${origin.monoId}:${origin.turn}`;
+    const each = options.delivery === "each";
+    const key = each
+      ? `${origin.monoId}:each:${requestId}`
+      : `${origin.monoId}:${origin.turn}`;
     let batch = this.batches.get(key);
     if (!batch) {
       batch = {
+        key,
         origin,
         id: `mono-completion-batch-${crypto.randomUUID()}`,
-        closed: false,
+        // An each batch has no launching turn to wait for.
+        closed: each,
         results: new Map(),
       };
       this.batches.set(key, batch);
@@ -205,7 +213,7 @@ export class MonoSessionCompletionBatches {
       for (const [requestId, result] of batch.results) {
         if (result.sessionId === sessionId) batch.results.delete(requestId);
       }
-      this.release(`${monoId}:${batch.origin.turn}`, batch);
+      this.release(batch.key, batch);
     }
   }
 

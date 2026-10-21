@@ -18,6 +18,7 @@ import {
 import {
   addSessionToFolder,
   createFolderWithSessions,
+  folderContaining,
   loadSessionFolders,
   placeSessionInFolder,
   saveSessionFolders,
@@ -47,6 +48,8 @@ import {
   parseCard,
   type MonoCard,
 } from "../../monos/model/monoCards";
+import type { CompletionDelivery } from "../../monos/model/monoSessionCompletion";
+import type { MonoLaunchRegistry } from "../../monos/model/monoLaunches";
 import {
   HABITS_MAX,
   checkHabitsNow,
@@ -97,6 +100,7 @@ export type AgentAppHost = {
     id: string,
     placement?: AppSessionPlacement,
     notifyMonoId?: string,
+    delivery?: CompletionDelivery,
   ): Promise<void>;
   sessions(cwd: string): Promise<AppSessionListing[]>;
   session(id: string): Promise<Session | null>;
@@ -106,6 +110,7 @@ export type AgentAppHost = {
     prompt: string,
     requestId: string,
     notifyMonoId?: string,
+    delivery?: CompletionDelivery,
   ): Promise<{ alreadySubmitted: boolean }>;
   draft(
     id: string,
@@ -140,7 +145,13 @@ export type AgentAppHost = {
     showStartedSessionsInSidebar?: boolean;
     /** Files the sessions it starts into a folder named after it. */
     folder?: { name: string; color: string };
+    /** The Mono's own chat session, which receives completion reports. */
+    sessionId?: string;
+    /** The Mono's color, given to folders it creates. */
+    color?: string;
   } | undefined;
+  /** Who launched each session through the app, to check parent ownership. */
+  launches?: MonoLaunchRegistry;
   /** A hidden run of one of a Mono's habits: it may remember, not schedule. */
   isHabitRun?(sessionId: string): boolean;
   /** Puts a card in the Mono's chat, or holds it for a habit run's report. */
@@ -172,7 +183,10 @@ const FIELDS = new Map<string, readonly string[]>([
   ["models.list", []],
   ["sessions.list", ["project"]],
   ["sessions.read", ["sessionId", "before", "limit", "maxChars", "project"]],
-  ["sessions.send", ["sessionId", "prompt", "project", "notifyOnComplete"]],
+  [
+    "sessions.send",
+    ["sessionId", "prompt", "project", "notifyOnComplete", "completionDelivery"],
+  ],
   ["sessions.draft", ["sessionId", "prompt", "project"]],
   ["sessions.stop", ["sessionId", "project"]],
   ["sessions.archive", ["sessionId", "project"]],
@@ -195,6 +209,10 @@ const FIELDS = new Map<string, readonly string[]>([
       "besideSessionId",
       "project",
       "notifyOnComplete",
+      "completionDelivery",
+      "parentSessionId",
+      "folderName",
+      "folderId",
     ],
   ],
   ["worktrees.list", ["project"]],
@@ -245,6 +263,17 @@ function agentPrompt(value: unknown): string {
   return prompt;
 }
 
+/** The Mono chat that gets a caller's completion reports: its own, or its habit run's Mono. */
+export function completionChatId(
+  sourceId: string,
+  host: Pick<AgentAppHost, "isMono" | "isHabitRun" | "monoOf">,
+): string | undefined {
+  if (host.isMono(sourceId)) return sourceId;
+  return host.isHabitRun?.(sourceId)
+    ? host.monoOf?.(sourceId)?.sessionId
+    : undefined;
+}
+
 function completionRecipient(
   source: Session,
   input: Record<string, unknown>,
@@ -254,16 +283,38 @@ function completionRecipient(
   const requested = input.notifyOnComplete;
   if (requested !== undefined && typeof requested !== "boolean")
     throw new Error("notifyOnComplete must be a boolean");
-  const isMono = host.isMono(source.id);
-  if (!(requested ?? (defaultForMono && isMono && !input.draft)))
+  const recipient = completionChatId(source.id, host);
+  if (!(requested ?? (defaultForMono && !!recipient && !input.draft)))
     return undefined;
-  if (!isMono)
+  if (!recipient)
     throw new Error(
       "Completion notifications are only available in a Mono's chat",
     );
   if (input.draft === true)
     throw new Error("An unsent draft cannot send a completion notification");
-  return source.id;
+  return recipient;
+}
+
+/** Habit runs have no turn to group by, so each launch reports on its own. */
+function completionDelivery(
+  source: Session,
+  input: Record<string, unknown>,
+  host: AgentAppHost,
+): CompletionDelivery {
+  const requested = input.completionDelivery;
+  if (requested !== undefined && requested !== "group" && requested !== "each")
+    throw new Error('completionDelivery must be "group" or "each"');
+  if (!host.isMono(source.id) && host.isHabitRun?.(source.id)) return "each";
+  return requested ?? "group";
+}
+
+/** The delivery argument is passed to the host only when it is not the default. */
+function notifyArgs(
+  notifyMonoId: string | undefined,
+  delivery: CompletionDelivery,
+): [] | [string] | [string, CompletionDelivery] {
+  if (!notifyMonoId) return [];
+  return delivery === "each" ? [notifyMonoId, delivery] : [notifyMonoId];
 }
 
 function optionalString(
@@ -391,6 +442,83 @@ function fileInMonoFolder(
     cwd,
     setFolderCustomColor(created.folders, created.id, folder.color),
   );
+}
+
+type FolderChoice =
+  | { kind: "existing"; folderId: string }
+  | { kind: "new"; name: string };
+
+/**
+ * Where the request asks to file a launch. An existing folder wins over the
+ * name, which only names a new folder when the id is unknown or absent.
+ */
+function folderChoice(
+  cwd: string,
+  input: Record<string, unknown>,
+): FolderChoice | undefined {
+  const folderId = optionalString(input.folderId, "folderId", 256);
+  const folderName = optionalString(input.folderName, "folderName", 100);
+  if (folderId && loadSessionFolders(cwd).some((entry) => entry.id === folderId))
+    return { kind: "existing", folderId };
+  if (folderName) return { kind: "new", name: folderName };
+  if (folderId) throw new Error("Folder was not found in this project");
+  return undefined;
+}
+
+/** Files a launch into the folder the request chose; returns where it landed. */
+function fileLaunchInFolder(
+  cwd: string,
+  sessionId: string,
+  choice: FolderChoice,
+  color?: string,
+): { id: string; name: string } | undefined {
+  const folders = loadSessionFolders(cwd);
+  if (choice.kind === "existing") {
+    const next = placeSessionInFolder(folders, sessionId, choice);
+    saveSessionFolders(cwd, next);
+    return folderContaining(next, sessionId);
+  }
+  // A retried launch is already in the folder it made; never make a second.
+  const current = folderContaining(folders, sessionId);
+  if (current?.name === choice.name) return current;
+  const created = createFolderWithSessions(folders, [sessionId], choice.name);
+  const next = color
+    ? setFolderCustomColor(created.folders, created.id, color)
+    : created.folders;
+  saveSessionFolders(cwd, next);
+  return folderContaining(next, sessionId);
+}
+
+/**
+ * The session a new launch nests under, if the request names one. Only a Mono
+ * (or its habit run) may, and only under a direct launch of its own.
+ */
+async function startParent(
+  source: Session,
+  input: Record<string, unknown>,
+  host: AgentAppHost,
+): Promise<string | undefined> {
+  if (input.parentSessionId === undefined) return undefined;
+  const parent = requiredString(input.parentSessionId, "parentSessionId", 256);
+  const mono = owningMono(source, host);
+  if (!mono)
+    throw new Error("parentSessionId is only available to a Mono");
+  const launch = host.launches?.get(parent);
+  if (launch?.monoId !== mono.id)
+    throw new Error("parentSessionId must be a session this Mono started");
+  await projectSession(source, parent, input, host);
+  if (launch.parented)
+    throw new Error(
+      "parentSessionId cannot be a session started under another one; a child of a child is not allowed",
+    );
+  return parent;
+}
+
+/** The Mono a caller works for, if the caller is its chat or one of its habit runs. */
+function owningMono(source: Session, host: AgentAppHost) {
+  return host.isMono(source.id) || host.isHabitRun?.(source.id)
+    ? host.monoOf?.(source.id)
+    : undefined;
 }
 
 function startLaunch(
@@ -1008,6 +1136,7 @@ export async function handleAgentApp(
       const id = requiredString(input.sessionId, "sessionId", 256);
       const prompt = agentPrompt(input.prompt);
       const notifyMonoId = completionRecipient(source, input, host);
+      const delivery = completionDelivery(source, input, host);
       if (id === source.id)
         throw new Error(
           "Use the current conversation to continue this session",
@@ -1019,7 +1148,7 @@ export async function handleAgentApp(
         id,
         prompt,
         `app-${source.id}-${requestId}`,
-        ...(notifyMonoId ? [notifyMonoId] : []),
+        ...notifyArgs(notifyMonoId, delivery),
       );
       return {
         sessionId: id,
@@ -1076,6 +1205,17 @@ export async function handleAgentApp(
         );
       const launch = startLaunch(source, input, host);
       const notifyMonoId = completionRecipient(source, input, host, true);
+      const delivery = completionDelivery(source, input, host);
+      if (launch.workspaceMode === "worktree") {
+        // A worktree is cut from HEAD, which a repository without commits lacks.
+        const main = (await host.worktrees(launch.cwd)).worktrees.find(
+          (tree) => tree.isMain,
+        );
+        if (main && /^0+$/.test(main.head))
+          throw new Error(
+            "This project has no commits yet; make an initial commit before using workspaceMode worktree",
+          );
+      }
       if (input.worktreeCwd !== undefined) {
         const chosen = (await host.worktrees(launch.cwd)).worktrees.find(
           (tree) =>
@@ -1101,19 +1241,38 @@ export async function handleAgentApp(
           ? undefined
           : (optionalString(input.besideSessionId, "besideSessionId", 256) ??
             source.id);
-      const id = `app-${source.id}-${requestId}`;
+      const parent = await startParent(source, input, host);
+      const id = `app-${parent ?? source.id}-${requestId}`;
+      // A session ID is also a directory name, which macOS limits to 255 bytes.
+      if (parent && id.length > 255)
+        throw new Error(
+          "The new session ID would exceed 255 characters; use a shorter request ID",
+        );
+      const choice = folderChoice(launch.cwd, input);
+      const mono = owningMono(source, host);
+      const defaultFolder = host.monoOf?.(source.id)?.folder;
+      const notify = notifyArgs(notifyMonoId, delivery);
       if (besideSessionId)
         await host.start(
           launch,
           id,
           { direction: placement as SplitDir, besideSessionId },
-          ...(notifyMonoId ? [notifyMonoId] : []),
+          ...notify,
         );
-      else if (notifyMonoId) await host.start(launch, id, undefined, notifyMonoId);
+      else if (notifyMonoId) await host.start(launch, id, undefined, ...notify);
       else await host.start(launch, id);
-      const folder = host.monoOf?.(source.id)?.folder;
-      if (folder && !launch.sidebarHidden)
-        fileInMonoFolder(launch.cwd, id, folder);
+      if (mono) host.launches?.record(id, mono.id, !!parent);
+      let filed: { id: string; name: string } | undefined;
+      if (!launch.sidebarHidden) {
+        if (choice)
+          filed = fileLaunchInFolder(
+            launch.cwd,
+            id,
+            choice,
+            mono?.color ?? mono?.folder?.color,
+          );
+        else if (defaultFolder) fileInMonoFolder(launch.cwd, id, defaultFolder);
+      }
       return {
         id,
         cwd: launch.cwd,
@@ -1122,6 +1281,7 @@ export async function handleAgentApp(
         submitted: !launch.draft,
         draft: !!launch.draft,
         ...(notifyMonoId ? { notifyOnComplete: true } : {}),
+        ...(filed ? { folderId: filed.id, folderName: filed.name } : {}),
       };
     }
     case "worktrees.list":

@@ -1,5 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Clock, Pause, Play, Trash2, Zap } from "../../../shared/ui/icons";
+import {
+  Clock,
+  Pause,
+  Play,
+  Square,
+  Trash2,
+  Zap,
+} from "../../../shared/ui/icons";
 import { mascotPath } from "../../projects/model/projectMascots";
 import type { MonoState } from "../model/mono";
 import { subscribeMonoFiles } from "../model/monoFiles";
@@ -15,6 +22,7 @@ import {
   type Habit,
 } from "../model/monoHabits";
 import { RunningFor, useHabitRunning } from "./HabitPage";
+import { stopHabit, useHabitStopping } from "./habitStop";
 import { Empty, Section } from "./monoPanelParts";
 
 /** Each Mono's habits as last loaded, so switching back shows them at once. */
@@ -105,6 +113,7 @@ export function HabitRow({
 }) {
   const runningSince = useHabitRunning(habit.id);
   const running = runningSince != null;
+  const stopping = useHabitStopping(habit.id);
   const starting = !running && habitStarting(habit);
   return (
     <li
@@ -162,6 +171,19 @@ export function HabitRow({
         >
           <Zap className="size-3.5" strokeWidth={1.75} />
         </HabitButton>
+        {running ? (
+          <HabitButton
+            label={stopping ? "Stopping…" : "Stop"}
+            disabled={stopping}
+            onClick={() =>
+              void stopHabit(habit).catch((error) =>
+                console.warn("Could not ask how to stop the habit", error),
+              )
+            }
+          >
+            <Square className="size-3.5" strokeWidth={1.75} />
+          </HabitButton>
+        ) : null}
         <HabitButton
           label={habit.enabled ? "Pause" : "Resume"}
           onClick={() => actions.toggle(habit.id)}

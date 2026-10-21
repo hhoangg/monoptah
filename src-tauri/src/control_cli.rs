@@ -137,6 +137,8 @@ Actions:
                   A busy session is rejected. Reuse --request-id on retries.
                   Optional notifyOnComplete:true asks for a completion report
                   in the calling Mono's chat. It waits until that Mono is idle.
+                  Add completionDelivery:"each" to get that report as soon as
+                  the session stops (default "group"; see sessions.start).
   sessions.draft {"sessionId":"...","prompt":"..."}
                   Save an unsent draft in an idle project session. Existing
                   drafts are preserved; send or remove one in Monoptah first.
@@ -145,7 +147,9 @@ Actions:
                   "effort":"high","reveal":false,
                   "workspaceMode":"current","worktreeCwd":"<path>","draft":false,
                   "placement":"right",
-                  "besideSessionId":"<visible session ID>"}
+                  "besideSessionId":"<visible session ID>",
+                  "completionDelivery":"each","parentSessionId":"<session ID>",
+                  "folderName":"<name>","folderId":"<folder ID>"}
                   Start a session with the prompt. It waits in the sidebar,
                   under the calling session, until the user opens it. Set
                   reveal:true or placement right or down only when the user
@@ -163,6 +167,27 @@ Actions:
                   Sessions monitored during the same Mono turn form one group:
                   their results arrive together after every session stops.
                   The Mono reviews the whole group and gives one combined report.
+                  Set completionDelivery:"each" (here or on sessions.send) to
+                  get that session's report as soon as it stops, without
+                  waiting for the turn or sibling sessions; it arrives as a
+                  new turn once the Mono is idle. Habit runs always use
+                  "each", and their sessions report to the Mono's chat, not to
+                  the run. Ignored for drafts and notifyOnComplete:false.
+                  parentSessionId nests the new session under a session this
+                  Mono (or its habit runs) started in this project since the
+                  app launched, one level deep (a child cannot be a parent).
+                  The ID becomes app-<parentSessionId>-<requestId> and must
+                  stay within 255 characters, so use a short --request-id.
+                  The report still goes to the Mono; the child has no app
+                  access. folderName (max 100) or folderId files the new
+                  session in a folder: an existing folderId wins and is never
+                  renamed; an unknown folderId with folderName creates a
+                  folder, without it the call fails; folderName alone always
+                  creates a new folder. The result has folderId and
+                  folderName. Nesting and folders show only when the Mono's
+                  "Show sessions in sidebar" setting is on; nesting is drawn
+                  only in the inset sidebar layout. Avoid hyphens in the
+                  --request-id when using parentSessionId.
                   Rejected launches or follow-ups return a CLI error without
                   a later completion report. When a Mono successfully stops,
                   archives or deletes a monitored session, its pending report

@@ -6,6 +6,7 @@ import {
 } from "../../sessions/model/messageQueue";
 import { newSession, type Session } from "../../sessions/model/session";
 import {
+  dismissQueuedMonoSessionCompletion,
   enqueueMonoSessionCompletion,
   monoSessionCompletionResult,
   MonoSessionCompletionBatches,
@@ -417,5 +418,148 @@ describe("Mono completion batches", () => {
       ),
     ).toBe(true);
     expect(message.text.length).toBeLessThan(60_000);
+  });
+
+  describe("each delivery", () => {
+    it("releases a session as soon as it stops, without waiting for the turn or siblings", () => {
+      const ready = vi.fn();
+      const batches = new MonoSessionCompletionBatches(ready);
+      const sibling = batches.watch(origin, "sibling");
+      const a = batches.watch(origin, "a", "a", {
+        awaitAcceptance: true,
+        delivery: "each",
+      });
+      a.accept();
+      // The launching turn is still active and the sibling has not stopped.
+      batches.closeInactive(() => true);
+      a(result("a"));
+      expect(ready).toHaveBeenCalledOnce();
+      const [monoId, message] = ready.mock.calls[0];
+      expect(monoId).toBe("mono");
+      expect(message.id).toBe("mono-completion-a");
+      expect(message.monoSessionCompletion).toMatchObject({ sessionId: "a" });
+      expect(message.text).toContain("Result a");
+      expect(message.text).not.toContain("Result sibling");
+      sibling(result("sibling"));
+      batches.closeInactive(() => false);
+      expect(ready).toHaveBeenCalledTimes(2);
+      expect(ready.mock.calls[1][1].id).toBe("mono-completion-sibling");
+    });
+
+    it("waits for acceptance and releases nothing when the launch is discarded", () => {
+      const ready = vi.fn();
+      const batches = new MonoSessionCompletionBatches(ready);
+      const accepted = batches.watch(origin, "ok", "ok", {
+        awaitAcceptance: true,
+        delivery: "each",
+      });
+      accepted(result("ok"));
+      expect(ready).not.toHaveBeenCalled();
+      accepted.accept();
+      expect(ready).toHaveBeenCalledOnce();
+
+      const rejected = batches.watch(origin, "no", "no", {
+        awaitAcceptance: true,
+        delivery: "each",
+      });
+      rejected(result("no", "failed"));
+      rejected.discard();
+      rejected.accept();
+      batches.closeInactive(() => false);
+      expect(ready).toHaveBeenCalledOnce();
+    });
+
+    it("drops a dismissed session before its result arrives", () => {
+      const ready = vi.fn();
+      const batches = new MonoSessionCompletionBatches(ready);
+      const a = batches.watch(origin, "request", "worker", {
+        delivery: "each",
+      });
+      batches.dismissSession(origin.monoId, "worker");
+      a(result("worker", "cancelled"));
+      batches.closeInactive(() => false);
+      expect(ready).not.toHaveBeenCalled();
+    });
+
+    it("does not leak a private batch after dismissal", () => {
+      const ready = vi.fn();
+      const batches = new MonoSessionCompletionBatches(ready);
+      const first = batches.watch(origin, "request", "worker", {
+        delivery: "each",
+      });
+      batches.dismissSession(origin.monoId, "worker");
+      first(result("worker"));
+      // A fresh watch with the same request id starts clean.
+      const again = batches.watch(origin, "request", "worker", {
+        delivery: "each",
+      });
+      again(result("worker"));
+      expect(ready).toHaveBeenCalledOnce();
+    });
+
+    it("delivers once when the settle callback is called twice", () => {
+      const ready = vi.fn();
+      const batches = new MonoSessionCompletionBatches(ready);
+      const a = batches.watch(origin, "a", "a", { delivery: "each" });
+      a(result("a"));
+      a(result("a"));
+      a.accept();
+      batches.closeInactive(() => false);
+      expect(ready).toHaveBeenCalledOnce();
+    });
+
+    it("keeps separate each sessions apart and unaffected by group batches", () => {
+      const ready = vi.fn();
+      const batches = new MonoSessionCompletionBatches(ready);
+      const group = batches.watch(origin, "g");
+      const a = batches.watch(origin, "a", "a", { delivery: "each" });
+      const b = batches.watch(origin, "b", "b", { delivery: "each" });
+      b(result("b"));
+      a(result("a"));
+      expect(ready.mock.calls.map((call) => call[1].id)).toEqual([
+        "mono-completion-b",
+        "mono-completion-a",
+      ]);
+      group(result("g"));
+      batches.closeInactive(() => false);
+      expect(ready).toHaveBeenCalledTimes(3);
+    });
+
+    it("applies the size caps to an each report", () => {
+      const ready = vi.fn();
+      const batches = new MonoSessionCompletionBatches(ready);
+      batches.watch(origin, "big", "big", { delivery: "each" })({
+        ...result("big"),
+        result: "x".repeat(12_000),
+      });
+      const message = ready.mock.calls[0][1];
+      expect(JSON.parse(message.text.split("\n\n")[1]).result).toHaveLength(
+        12_000,
+      );
+    });
+
+    it("drops a habit run's pending and queued report when it is dismissed under the Mono chat ID", () => {
+      const ready = vi.fn();
+      const batches = new MonoSessionCompletionBatches(ready);
+      // A habit run's launches are watched under the Mono's chat session.
+      const pending = batches.watch({ monoId: "mono", turn: 0 }, "stale", "stale", {
+        delivery: "each",
+      });
+      batches.dismissSession("mono", "stale");
+      pending(result("stale"));
+      expect(ready).not.toHaveBeenCalled();
+
+      batches.watch({ monoId: "mono", turn: 0 }, "queued", "queued", {
+        delivery: "each",
+      })(result("queued"));
+      const mono = enqueueMonoSessionCompletion(
+        { ...newSession("claude", "/home/mono"), id: "mono" },
+        ready.mock.calls[0][1],
+      );
+      expect(mono.queuedMessages).toHaveLength(1);
+      expect(
+        dismissQueuedMonoSessionCompletion(mono, "queued").queuedMessages,
+      ).toHaveLength(0);
+    });
   });
 });

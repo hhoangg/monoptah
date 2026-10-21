@@ -12,7 +12,8 @@ import {
 import type { Note } from "../../notes";
 import type { Artifact } from "../../artifacts/artifacts";
 import type { Worktree } from "../../source-control/model/worktrees";
-import { handleAgentApp, notePreview, canAccessAgentAppProject, type AgentAppHost } from "./agentApp";
+import type { MonoLaunch } from "../../monos/model/monoLaunches";
+import { handleAgentApp, notePreview, canAccessAgentAppProject, completionChatId, type AgentAppHost } from "./agentApp";
 
 vi.mock("../../../integrations/harness/core/availability", () => ({
   isHarnessAvailable: (id: string) => id === "codex",
@@ -774,6 +775,53 @@ describe("agent app commands", () => {
     expect(result).toMatchObject({ id: "app-lead-request-1", submitted: true });
   });
 
+  describe("a project with no commits", () => {
+    const unborn = (host: AgentAppHost, cwd: string) => {
+      host.worktrees = vi.fn(async () => ({
+        worktrees: [
+          { ...featureWorktree, path: cwd, isMain: true, branch: "main", head: "0".repeat(40) },
+        ],
+        defaultRoot: "/tmp/project-worktrees",
+      }));
+    };
+
+    it("rejects a worktree launch before starting anything, filing a folder or recording it", async () => {
+      const { source, host } = fixture();
+      unborn(host, source.cwd);
+      const record = vi.fn();
+      host.launches = { get: () => undefined, record };
+      await expect(
+        handleAgentApp(
+          source,
+          "no-commit",
+          "sessions.start",
+          {
+            prompt: "Add a file",
+            workspaceMode: "worktree",
+            folderName: "Tickets",
+          },
+          host,
+        ),
+      ).rejects.toThrow("has no commits yet");
+      expect(host.start).not.toHaveBeenCalled();
+      expect(record).not.toHaveBeenCalled();
+      expect(loadSessionFolders(source.cwd)).toEqual([]);
+    });
+
+    it("still starts in the current checkout", async () => {
+      const { source, host } = fixture();
+      unborn(host, source.cwd);
+      await handleAgentApp(
+        source,
+        "current",
+        "sessions.start",
+        { prompt: "Add a file", workspaceMode: "current" },
+        host,
+      );
+      expect(host.start).toHaveBeenCalledOnce();
+    });
+  });
+
   it("lists project worktrees and starts on a selected existing checkout", async () => {
     const { source, host } = fixture();
     source.worktreeCwd = "/tmp/project-worktrees/other";
@@ -1513,5 +1561,723 @@ describe("agent app commands", () => {
         host,
       ),
     ).rejects.toThrow("body is required");
+  });
+});
+
+function listSessions(host: AgentAppHost, cwd: string, ids: string[]) {
+  const listing = (id: string) => ({
+    id,
+    title: id,
+    harness: "codex" as const,
+    model: "codex:test",
+    busy: false,
+    hasDraft: false,
+    archived: false,
+  });
+  host.sessions = vi.fn(async () => ids.map(listing));
+  host.session = vi.fn(async (id) =>
+    ids.includes(id) ? { ...newSession("codex", cwd), id } : null,
+  );
+}
+
+function monoFixture(
+  mono: Partial<NonNullable<ReturnType<NonNullable<AgentAppHost["monoOf"]>>>> = {},
+) {
+  const { source, host } = fixture();
+  host.isMono = (id) => id === source.id;
+  host.monoOf = () => ({
+    id: "mono",
+    projects: [source.cwd],
+    showStartedSessionsInSidebar: true,
+    ...mono,
+  });
+  const launches = new Map<string, MonoLaunch>();
+  host.launches = {
+    record: vi.fn((sessionId, monoId, parented) => {
+      launches.set(sessionId, { monoId, parented });
+    }),
+    get: (sessionId) => launches.get(sessionId),
+  };
+  return { source, host, launches };
+}
+
+function habitFixture(sessionId: string | null = "mono-chat") {
+  const { source, host } = fixture();
+  source.id = "run";
+  host.isHabitRun = (id) => id === source.id;
+  host.monoOf = () => ({
+    id: "mono",
+    projects: [source.cwd],
+    showStartedSessionsInSidebar: true,
+    ...(sessionId ? { sessionId } : {}),
+  });
+  return { source, host };
+}
+
+describe("habit runs reporting to their Mono", () => {
+  it("reports a habit run's launches to the Mono's chat, one by one", async () => {
+    const { source, host } = habitFixture();
+    const result = await handleAgentApp(
+      source,
+      "r1",
+      "sessions.start",
+      { prompt: "Fix the ticket" },
+      host,
+    );
+    expect(result).toMatchObject({ id: "app-run-r1", notifyOnComplete: true });
+    expect(host.start).toHaveBeenCalledWith(
+      expect.objectContaining({ prompt: "Fix the ticket" }),
+      "app-run-r1",
+      undefined,
+      "mono-chat",
+      "each",
+    );
+  });
+
+  it("gives a habit run per-session delivery even when it asks for a group", async () => {
+    const { source, host } = habitFixture();
+    await handleAgentApp(
+      source,
+      "r1",
+      "sessions.start",
+      { prompt: "Fix", completionDelivery: "group" },
+      host,
+    );
+    expect(host.start).toHaveBeenCalledWith(
+      expect.anything(),
+      "app-run-r1",
+      undefined,
+      "mono-chat",
+      "each",
+    );
+  });
+
+  it("leaves an explicit opt-out and a draft of a habit run unmonitored", async () => {
+    const { source, host } = habitFixture();
+    const optedOut = await handleAgentApp(
+      source,
+      "r1",
+      "sessions.start",
+      { prompt: "Fix", notifyOnComplete: false },
+      host,
+    );
+    const draft = await handleAgentApp(
+      source,
+      "r2",
+      "sessions.start",
+      { prompt: "Fix", draft: true },
+      host,
+    );
+    expect(optedOut).not.toHaveProperty("notifyOnComplete");
+    expect(draft).not.toHaveProperty("notifyOnComplete");
+    expect(host.start).toHaveBeenNthCalledWith(1, expect.anything(), "app-run-r1");
+    expect(host.start).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ draft: true }),
+      "app-run-r2",
+    );
+  });
+
+  it("treats a habit run with no Mono chat as unable to be notified", async () => {
+    const { source, host } = habitFixture(null);
+    const result = await handleAgentApp(
+      source,
+      "r1",
+      "sessions.start",
+      { prompt: "Fix" },
+      host,
+    );
+    expect(result).not.toHaveProperty("notifyOnComplete");
+    expect(host.start).toHaveBeenCalledWith(expect.anything(), "app-run-r1");
+    for (const action of ["sessions.start", "sessions.send"])
+      await expect(
+        handleAgentApp(
+          source,
+          "r2",
+          action,
+          {
+            prompt: "Fix",
+            notifyOnComplete: true,
+            ...(action === "sessions.send" ? { sessionId: "other" } : {}),
+          },
+          host,
+        ),
+      ).rejects.toThrow("only available in a Mono");
+    expect(host.start).toHaveBeenCalledTimes(1);
+    expect(host.send).not.toHaveBeenCalled();
+  });
+
+  it("reports a habit run's follow-up only when asked, to the Mono's chat", async () => {
+    const { source, host } = habitFixture();
+    await handleAgentApp(
+      source,
+      "s1",
+      "sessions.send",
+      { sessionId: "other", prompt: "Go on", notifyOnComplete: true },
+      host,
+    );
+    expect(host.send).toHaveBeenLastCalledWith(
+      "other",
+      "Go on",
+      "app-run-s1",
+      "mono-chat",
+      "each",
+    );
+    const plain = await handleAgentApp(
+      source,
+      "s2",
+      "sessions.send",
+      { sessionId: "other", prompt: "Go on" },
+      host,
+    );
+    expect(plain).not.toHaveProperty("notifyOnComplete");
+    expect(host.send).toHaveBeenLastCalledWith("other", "Go on", "app-run-s2");
+  });
+});
+
+describe("per-session completion delivery", () => {
+  it("passes each as the fifth argument on start and send", async () => {
+    const { source, host } = monoFixture();
+    await handleAgentApp(
+      source,
+      "s",
+      "sessions.start",
+      { prompt: "Review", completionDelivery: "each" },
+      host,
+    );
+    expect(host.start).toHaveBeenLastCalledWith(
+      expect.anything(),
+      "app-lead-s",
+      undefined,
+      "lead",
+      "each",
+    );
+    await handleAgentApp(
+      source,
+      "split",
+      "sessions.start",
+      { prompt: "Review", completionDelivery: "each", placement: "right" },
+      host,
+    );
+    expect(host.start).toHaveBeenLastCalledWith(
+      expect.anything(),
+      "app-lead-split",
+      { direction: "right", besideSessionId: "lead" },
+      "lead",
+      "each",
+    );
+    await handleAgentApp(
+      source,
+      "m",
+      "sessions.send",
+      { sessionId: "other", prompt: "Fix", notifyOnComplete: true, completionDelivery: "each" },
+      host,
+    );
+    expect(host.send).toHaveBeenLastCalledWith(
+      "other",
+      "Fix",
+      "app-lead-m",
+      "lead",
+      "each",
+    );
+  });
+
+  it.each([undefined, "group"])(
+    "keeps the old argument lists when completionDelivery is %s",
+    async (completionDelivery) => {
+      const { source, host } = monoFixture();
+      const extra = completionDelivery ? { completionDelivery } : {};
+      await handleAgentApp(source, "s", "sessions.start", { prompt: "Review", ...extra }, host);
+      expect(host.start).toHaveBeenLastCalledWith(
+        expect.anything(),
+        "app-lead-s",
+        undefined,
+        "lead",
+      );
+      await handleAgentApp(
+        source,
+        "m",
+        "sessions.send",
+        { sessionId: "other", prompt: "Fix", notifyOnComplete: true, ...extra },
+        host,
+      );
+      expect(host.send).toHaveBeenLastCalledWith("other", "Fix", "app-lead-m", "lead");
+    },
+  );
+
+  it.each(["sessions.start", "sessions.send"])(
+    "rejects an invalid completionDelivery for %s before submission",
+    async (action) => {
+      const { source, host } = monoFixture();
+      for (const completionDelivery of ["batch", 1, true, null])
+        await expect(
+          handleAgentApp(
+            source,
+            "bad",
+            action,
+            {
+              prompt: "Review",
+              completionDelivery,
+              ...(action === "sessions.send" ? { sessionId: "other" } : {}),
+            },
+            host,
+          ),
+        ).rejects.toThrow('completionDelivery must be "group" or "each"');
+      expect(host.start).not.toHaveBeenCalled();
+      expect(host.send).not.toHaveBeenCalled();
+    },
+  );
+
+  it("ignores a valid completionDelivery when nothing is monitored", async () => {
+    const { source, host } = monoFixture();
+    await handleAgentApp(
+      source,
+      "d",
+      "sessions.start",
+      { prompt: "Review", draft: true, completionDelivery: "each" },
+      host,
+    );
+    expect(host.start).toHaveBeenLastCalledWith(
+      expect.objectContaining({ draft: true }),
+      "app-lead-d",
+    );
+    await handleAgentApp(
+      source,
+      "n",
+      "sessions.start",
+      { prompt: "Review", notifyOnComplete: false, completionDelivery: "each" },
+      host,
+    );
+    expect(host.start).toHaveBeenLastCalledWith(expect.anything(), "app-lead-n");
+    await handleAgentApp(
+      source,
+      "sn",
+      "sessions.send",
+      { sessionId: "other", prompt: "Fix", completionDelivery: "each" },
+      host,
+    );
+    expect(host.send).toHaveBeenLastCalledWith("other", "Fix", "app-lead-sn");
+  });
+});
+
+describe("starting a session under another session", () => {
+  const ids = ["app-lead-dev"];
+
+  function parentFixture() {
+    const fx = monoFixture();
+    fx.launches.set("app-lead-dev", { monoId: "mono", parented: false });
+    listSessions(fx.host, fx.source.cwd, ids);
+    return fx;
+  }
+
+  it("nests the id under the parent and records the launch", async () => {
+    const { source, host } = parentFixture();
+    const result = await handleAgentApp(
+      source,
+      "rev",
+      "sessions.start",
+      { prompt: "Review the PR", parentSessionId: "app-lead-dev" },
+      host,
+    );
+    expect(result).toMatchObject({
+      id: "app-app-lead-dev-rev",
+      notifyOnComplete: true,
+    });
+    expect(host.start).toHaveBeenCalledWith(
+      expect.anything(),
+      "app-app-lead-dev-rev",
+      undefined,
+      "lead",
+    );
+    expect(host.launches!.record).toHaveBeenCalledWith(
+      "app-app-lead-dev-rev",
+      "mono",
+      true,
+    );
+  });
+
+  it("records plain launches as unparented and ignores a missing registry", async () => {
+    const { source, host } = parentFixture();
+    await handleAgentApp(source, "dev2", "sessions.start", { prompt: "Fix" }, host);
+    expect(host.launches!.record).toHaveBeenCalledWith("app-lead-dev2", "mono", false);
+    delete host.launches;
+    await handleAgentApp(source, "dev3", "sessions.start", { prompt: "Fix" }, host);
+  });
+
+  it("does not record a launch whose start failed", async () => {
+    const { source, host } = parentFixture();
+    host.start = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    await expect(
+      handleAgentApp(source, "dev2", "sessions.start", { prompt: "Fix" }, host),
+    ).rejects.toThrow("boom");
+    expect(host.launches!.record).not.toHaveBeenCalled();
+  });
+
+  it("gives a retry with the same request ID the same nested ID", async () => {
+    const { source, host } = parentFixture();
+    const input = { prompt: "Review", parentSessionId: "app-lead-dev" };
+    const first = await handleAgentApp(source, "rev", "sessions.start", input, host);
+    const second = await handleAgentApp(source, "rev", "sessions.start", input, host);
+    expect(second).toMatchObject({ id: (first as { id: string }).id });
+  });
+
+  it("lets a habit run parent a session under a launch it made earlier", async () => {
+    const { source, host } = habitFixture();
+    const launches = new Map<string, MonoLaunch>([
+      ["app-gone-dev", { monoId: "mono", parented: false }],
+    ]);
+    host.launches = {
+      record: vi.fn((s, m, p) => void launches.set(s, { monoId: m, parented: p })),
+      get: (s) => launches.get(s),
+    };
+    listSessions(host, source.cwd, ["app-gone-dev"]);
+    const result = await handleAgentApp(
+      source,
+      "rev",
+      "sessions.start",
+      { prompt: "Review", parentSessionId: "app-gone-dev" },
+      host,
+    );
+    expect(result).toMatchObject({ id: "app-app-gone-dev-rev" });
+    expect(host.launches.record).toHaveBeenCalledWith("app-app-gone-dev-rev", "mono", true);
+  });
+
+  it("rejects a caller that is not a Mono", async () => {
+    const { source, host } = fixture();
+    host.launches = {
+      record: vi.fn(),
+      get: () => ({ monoId: "mono", parented: false }),
+    };
+    listSessions(host, source.cwd, ["other"]);
+    await expect(
+      handleAgentApp(
+        source,
+        "rev",
+        "sessions.start",
+        { prompt: "Review", parentSessionId: "other" },
+        host,
+      ),
+    ).rejects.toThrow("only available to a Mono");
+    expect(host.start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a session the user started", "user-session"],
+    ["the Mono's own chat", "lead"],
+    ["an unknown session", "nope"],
+    ["a session another Mono started", "app-other-dev"],
+  ])("rejects %s as a parent", async (_name, parent) => {
+    const { source, host, launches } = parentFixture();
+    launches.set("app-other-dev", { monoId: "other-mono", parented: false });
+    listSessions(host, source.cwd, [...ids, "user-session", "app-other-dev", "lead"]);
+    await expect(
+      handleAgentApp(
+        source,
+        "rev",
+        "sessions.start",
+        { prompt: "Review", parentSessionId: parent },
+        host,
+      ),
+    ).rejects.toThrow("must be a session this Mono started");
+    expect(host.start).not.toHaveBeenCalled();
+    expect(host.launches!.record).not.toHaveBeenCalled();
+  });
+
+  it("rejects a parent that is not listed in the project", async () => {
+    const { source, host } = parentFixture();
+    listSessions(host, source.cwd, []);
+    await expect(
+      handleAgentApp(
+        source,
+        "rev",
+        "sessions.start",
+        { prompt: "Review", parentSessionId: "app-lead-dev" },
+        host,
+      ),
+    ).rejects.toThrow("Session was not found in this project");
+    expect(host.start).not.toHaveBeenCalled();
+  });
+
+  it("rejects a parent that was itself started under a parent", async () => {
+    const { source, host, launches } = parentFixture();
+    launches.set("app-app-lead-dev-rev", { monoId: "mono", parented: true });
+    listSessions(host, source.cwd, [...ids, "app-app-lead-dev-rev"]);
+    await expect(
+      handleAgentApp(
+        source,
+        "deep",
+        "sessions.start",
+        { prompt: "Review", parentSessionId: "app-app-lead-dev-rev" },
+        host,
+      ),
+    ).rejects.toThrow("child of a child");
+    expect(host.start).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed or oversized parent and an oversized resulting ID", async () => {
+    const { source, host, launches } = parentFixture();
+    for (const parentSessionId of [7, "", "x".repeat(257)])
+      await expect(
+        handleAgentApp(
+          source,
+          "rev",
+          "sessions.start",
+          { prompt: "Review", parentSessionId },
+          host,
+        ),
+      ).rejects.toThrow("parentSessionId must be a non-empty string");
+    const parent = "p".repeat(200);
+    launches.set(parent, { monoId: "mono", parented: false });
+    listSessions(host, source.cwd, [parent]);
+    await expect(
+      handleAgentApp(
+        source,
+        "r".repeat(100),
+        "sessions.start",
+        { prompt: "Review", parentSessionId: parent },
+        host,
+      ),
+    ).rejects.toThrow("exceed 255 characters");
+    expect(host.start).not.toHaveBeenCalled();
+  });
+
+  it("allows a resulting ID of 255 characters and rejects 256, the longest a directory name can be", async () => {
+    const { source, host, launches } = parentFixture();
+    const parent = "p".repeat(200);
+    launches.set(parent, { monoId: "mono", parented: false });
+    listSessions(host, source.cwd, [parent]);
+    // "app-" + parent + "-" + request
+    const fits = "r".repeat(255 - 4 - parent.length - 1);
+    await expect(
+      handleAgentApp(
+        source,
+        `${fits}x`,
+        "sessions.start",
+        { prompt: "Review", parentSessionId: parent },
+        host,
+      ),
+    ).rejects.toThrow("exceed 255 characters");
+    expect(host.start).not.toHaveBeenCalled();
+    const result = (await handleAgentApp(
+      source,
+      fits,
+      "sessions.start",
+      { prompt: "Review", parentSessionId: parent },
+      host,
+    )) as { id: string };
+    expect(result.id).toHaveLength(255);
+    expect(host.start).toHaveBeenCalledOnce();
+  });
+});
+
+describe("the chat that receives a caller's completion reports", () => {
+  const monoOf = (id: string) =>
+    id === "run" ? { sessionId: "mono-chat" } : { sessionId: undefined };
+
+  it("is the Mono's own chat for a Mono, and the Mono's chat for its habit run", () => {
+    const host = {
+      isMono: (id: string) => id === "mono-chat",
+      isHabitRun: (id: string) => id === "run",
+      monoOf,
+    };
+    expect(completionChatId("mono-chat", host)).toBe("mono-chat");
+    expect(completionChatId("run", host)).toBe("mono-chat");
+  });
+
+  it("is nothing for a regular session or a habit run whose Mono chat is unknown", () => {
+    const host = {
+      isMono: () => false,
+      isHabitRun: (id: string) => id === "run" || id === "orphan",
+      monoOf,
+    };
+    expect(completionChatId("plain", host)).toBeUndefined();
+    expect(completionChatId("orphan", host)).toBeUndefined();
+  });
+});
+
+describe("choosing a folder when starting a session", () => {
+  const folder = (id: string, name: string, sessionIds: string[] = ["old"]) => ({
+    id,
+    name,
+    sessionIds,
+    collapsed: false,
+  });
+
+  it("files into an existing folder without renaming it", async () => {
+    const { source, host } = monoFixture();
+    saveSessionFolders(source.cwd, [folder("f1", "Ticket 1")]);
+    const result = await handleAgentApp(
+      source,
+      "dev",
+      "sessions.start",
+      { prompt: "Fix", folderId: "f1", folderName: "Something else" },
+      host,
+    );
+    expect(result).toMatchObject({ folderId: "f1", folderName: "Ticket 1" });
+    expect(loadSessionFolders(source.cwd)).toEqual([
+      expect.objectContaining({ id: "f1", name: "Ticket 1", sessionIds: ["old", "app-lead-dev"] }),
+    ]);
+  });
+
+  it("creates a folder with the given name for an unknown folderId", async () => {
+    const { source, host } = monoFixture();
+    const result = await handleAgentApp(
+      source,
+      "dev",
+      "sessions.start",
+      { prompt: "Fix", folderId: "gone", folderName: "Ticket 2" },
+      host,
+    );
+    expect(loadSessionFolders(source.cwd)).toEqual([
+      expect.objectContaining({ name: "Ticket 2", sessionIds: ["app-lead-dev"] }),
+    ]);
+    expect(result).toMatchObject({
+      folderId: loadSessionFolders(source.cwd)[0].id,
+      folderName: "Ticket 2",
+    });
+  });
+
+  it("rejects an unknown folderId alone before starting", async () => {
+    const { source, host } = monoFixture();
+    await expect(
+      handleAgentApp(
+        source,
+        "dev",
+        "sessions.start",
+        { prompt: "Fix", folderId: "gone" },
+        host,
+      ),
+    ).rejects.toThrow("Folder was not found in this project");
+    expect(host.start).not.toHaveBeenCalled();
+  });
+
+  it("never merges launches that share a folderName", async () => {
+    const { source, host } = monoFixture();
+    for (const request of ["a", "b"])
+      await handleAgentApp(
+        source,
+        request,
+        "sessions.start",
+        { prompt: "Fix", folderName: "Ticket 7 (2026-10-21)" },
+        host,
+      );
+    const folders = loadSessionFolders(source.cwd);
+    expect(folders).toHaveLength(2);
+    expect(folders.map((entry) => entry.name)).toEqual([
+      "Ticket 7 (2026-10-21)",
+      "Ticket 7 (2026-10-21)",
+    ]);
+    expect(folders[0].id).not.toBe(folders[1].id);
+  });
+
+  it("keeps a retried launch in the folder it made", async () => {
+    const { source, host } = monoFixture();
+    const input = { prompt: "Fix", folderName: "Ticket 9" };
+    const first = (await handleAgentApp(source, "dev", "sessions.start", input, host)) as {
+      folderId: string;
+    };
+    saveSessionFolders(source.cwd, [
+      ...loadSessionFolders(source.cwd).map((entry) => ({
+        ...entry,
+        sessionIds: [...entry.sessionIds, "app-lead-rev"],
+      })),
+    ]);
+    const second = await handleAgentApp(source, "dev", "sessions.start", input, host);
+    expect(second).toMatchObject({ folderId: first.folderId, folderName: "Ticket 9" });
+    expect(loadSessionFolders(source.cwd)).toEqual([
+      expect.objectContaining({ sessionIds: ["app-lead-dev", "app-lead-rev"] }),
+    ]);
+  });
+
+  it.each([
+    ["folderName over 100 characters", { folderName: "n".repeat(101) }],
+    ["an empty folderName", { folderName: "" }],
+    ["a blank folderName", { folderName: "   " }],
+    ["a non-string folderName", { folderName: 5 }],
+    ["a non-string folderId", { folderId: 5 }],
+  ])("rejects %s before starting", async (_name, fields) => {
+    const { source, host } = monoFixture();
+    await expect(
+      handleAgentApp(source, "dev", "sessions.start", { prompt: "Fix", ...fields }, host),
+    ).rejects.toThrow("must be a non-empty string");
+    expect(host.start).not.toHaveBeenCalled();
+    expect(loadSessionFolders(source.cwd)).toEqual([]);
+  });
+
+  it("colors a new folder with the Mono's color, falling back to its folder color", async () => {
+    const colored = monoFixture({ color: "#112233", folder: { name: "Jack", color: "#aabbcc" } });
+    await handleAgentApp(colored.source, "a", "sessions.start", { prompt: "Fix", folderName: "T" }, colored.host);
+    expect(loadSessionFolders(colored.source.cwd)[0]).toMatchObject({ customColor: "#112233" });
+    localStorage.clear();
+    const fallback = monoFixture({ folder: { name: "Jack", color: "#aabbcc" } });
+    await handleAgentApp(fallback.source, "a", "sessions.start", { prompt: "Fix", folderName: "T" }, fallback.host);
+    expect(loadSessionFolders(fallback.source.cwd)[0]).toMatchObject({ name: "T", customColor: "#aabbcc" });
+  });
+
+  it("creates an uncolored folder for a caller that is not a Mono", async () => {
+    const { source, host } = fixture();
+    const result = await handleAgentApp(
+      source,
+      "dev",
+      "sessions.start",
+      { prompt: "Fix", folderName: "Mine" },
+      host,
+    );
+    const [created] = loadSessionFolders(source.cwd);
+    expect(created).toMatchObject({ name: "Mine", sessionIds: ["app-lead-dev"] });
+    expect(created.customColor).toBeUndefined();
+    expect(result).toMatchObject({ folderId: created.id, folderName: "Mine" });
+  });
+
+  it("neither files nor creates a folder for a hidden launch, but still validates", async () => {
+    const { source, host } = monoFixture({ showStartedSessionsInSidebar: false });
+    const result = await handleAgentApp(
+      source,
+      "dev",
+      "sessions.start",
+      { prompt: "Fix", folderName: "Ticket" },
+      host,
+    );
+    expect(loadSessionFolders(source.cwd)).toEqual([]);
+    expect(result).not.toHaveProperty("folderId");
+    await expect(
+      handleAgentApp(
+        source,
+        "dev2",
+        "sessions.start",
+        { prompt: "Fix", folderId: "gone" },
+        host,
+      ),
+    ).rejects.toThrow("Folder was not found in this project");
+    expect(host.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the Mono's default folder when no folder field is given", async () => {
+    const { source, host } = monoFixture({ folder: { name: "Captain Jack", color: "#5b8def" } });
+    const result = await handleAgentApp(source, "dev", "sessions.start", { prompt: "Fix" }, host);
+    expect(loadSessionFolders(source.cwd)).toEqual([
+      expect.objectContaining({ name: "Captain Jack", sessionIds: ["app-lead-dev"] }),
+    ]);
+    expect(result).not.toHaveProperty("folderId");
+    expect(result).not.toHaveProperty("folderName");
+  });
+
+  it("files a nested reviewer into the folder of its dev", async () => {
+    const { source, host, launches } = monoFixture();
+    saveSessionFolders(source.cwd, [folder("f1", "Ticket 1", ["app-lead-dev"])]);
+    launches.set("app-lead-dev", { monoId: "mono", parented: false });
+    listSessions(host, source.cwd, ["app-lead-dev"]);
+    await handleAgentApp(
+      source,
+      "rev",
+      "sessions.start",
+      { prompt: "Review", parentSessionId: "app-lead-dev", folderId: "f1" },
+      host,
+    );
+    expect(loadSessionFolders(source.cwd)).toEqual([
+      expect.objectContaining({ sessionIds: ["app-lead-dev", "app-app-lead-dev-rev"] }),
+    ]);
   });
 });

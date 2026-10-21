@@ -6,11 +6,7 @@ import {
   type MonoSpawnedSession,
   type Session,
 } from "../../features/sessions/model/session";
-import {
-  findMono,
-  listMonos,
-  monoLook,
-} from "../../features/monos/model/mono";
+import { findMono, listMonos, monoLook } from "../../features/monos/model/mono";
 import { loadMonoFiles } from "../../features/monos/model/monoFiles";
 import {
   artifactCards,
@@ -20,11 +16,14 @@ import {
   afterRun,
   claimHabit,
   clearHabitRun,
+  clearHabitStop,
   dueHabits,
   HABIT_APPROVAL_WAIT_MS,
   HABIT_RUN_TIMEOUT_MS,
   habitReport,
   habitRunLaunches,
+  habitRunStarted,
+  habitStopRequest,
   isRelayed,
   habitRunPrompt,
   loadHabits,
@@ -55,6 +54,11 @@ export type MonoHabitHost = {
   run(sessionId: string, prompt: string): Promise<ControlOutcome>;
   /** Stops a session if it is busy, then deletes it. */
   remove(sessionId: string): Promise<void>;
+  /**
+   * Stops a session a run started and drops its pending completion report.
+   * Does nothing when the session is not open.
+   */
+  stop(sessionId: string, monoSessionId: string): Promise<void>;
   /** Adds a message to the Mono's chat and lets the user know. */
   post(
     monoSessionId: string,
@@ -76,6 +80,7 @@ export type MonoHabitHost = {
 };
 
 const POLL_MS = 2_000;
+const STOPPED_BY_USER = "Stopped by the user.";
 
 /** The last thing the run said, which is its message to the user. */
 function finalReply(session: Session | undefined): string {
@@ -116,6 +121,8 @@ async function watchRun(
   while (!settled) {
     await Promise.race([turn, new Promise((r) => setTimeout(r, POLL_MS))]);
     if (settled) break;
+    if (habitStopRequest(habit.id))
+      return { status: "cancelled", text: "", error: STOPPED_BY_USER };
     const pending =
       host
         .sessions()
@@ -193,6 +200,8 @@ export function useMonoHabits(host: MonoHabitHost, enabled = true) {
       };
       markHabitRun(run.id, monoId);
       setHabitRunning(habit.id, now);
+      // A request made before this run started was meant for an earlier one.
+      clearHabitStop(habit.id);
       host.add(run);
       let outcome: ControlOutcome;
       try {
@@ -214,27 +223,66 @@ export function useMonoHabits(host: MonoHabitHost, enabled = true) {
       const artifacts = artifactCards(
         host.sessions().find((s) => s.id === run.id)?.blocks ?? [],
       );
-      const launches = habitRunLaunches(run.id);
       host.endApprovals(run.id);
       await host.remove(run.id).catch(() => undefined);
+      // Read after the removal, so a session started meanwhile is included.
+      const launches = habitRunLaunches(run.id);
+      const started = habitRunStarted(run.id);
       clearHabitRun(run.id);
+      // Read once, as late as possible: the user may have chosen as the run
+      // was finishing, and the choice still applies to its sessions.
+      const stopMode = habitStopRequest(habit.id);
+      const userStopped = outcome.status === "cancelled" && !!stopMode;
+      const stoppedIds = new Set<string>();
+      const stuck: MonoSpawnedSession[] = [];
+      // Only sessions the run created: ones it merely messaged are not its to stop.
+      if (stopMode === "all")
+        for (const launched of started)
+          try {
+            await host.stop(launched.sessionId, monoSessionId);
+            stoppedIds.add(launched.sessionId);
+          } catch (error) {
+            stuck.push(launched);
+            console.warn(`Could not stop session ${launched.sessionId}`, error);
+          }
+      clearHabitStop(habit.id);
       setHabitRunning(habit.id);
 
       const report =
         outcome.status === "completed" ? habitReport(reply) : undefined;
+      const remaining = launches.filter(
+        (launched) => !stoppedIds.has(launched.sessionId),
+      );
       // Sessions it started are listed only through the Mono's chat, so a
       // run that started one posts even when it has nothing else to say.
-      if (report || launches.length)
+      // A run the user stopped has nothing to report, but sessions it left
+      // running still need to be findable.
+      const text = userStopped
+        ? stopMode === "run" && started.length
+          ? `Stopped. Started ${started.length} ${
+              started.length === 1 ? "session that keeps" : "sessions that keep"
+            } running.`
+          : undefined
+        : (report ??
+          (remaining.length
+            ? remaining.length === 1
+              ? "Started a session."
+              : `Started ${remaining.length} sessions.`
+            : undefined));
+      const notStopped = stuck.length
+        ? `Could not stop ${stuck.length} ${
+            stuck.length === 1 ? "session" : "sessions"
+          }: ${stuck.map((launched) => launched.sessionId).join(", ")}.`
+        : undefined;
+      const post = [text, notStopped].filter(Boolean).join(" ");
+      if (post)
         host.post(
           monoSessionId,
           habit,
-          report ??
-            (launches.length === 1
-              ? "Started a session."
-              : `Started ${launches.length} sessions.`),
+          post,
           look.name,
           artifacts,
-          launches,
+          userStopped ? (stopMode === "run" ? launches : stuck) : remaining,
         );
       await updateHabits(monoId, (habits) => ({
         habits: habits.map((entry) =>

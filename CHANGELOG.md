@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-10-22
+
+### Added
+
+- Monos and their habit runs can start a session with `completionDelivery: "each"` to get its report as soon as it stops, instead of waiting for the whole turn.
+- Sessions started by a habit run now report to the Mono's chat, even after the run has ended.
+- Monos can start a session nested under one of their own sessions with `parentSessionId` (inset sidebar layout).
+- Monos can file a new session in a folder on launch with `folderName` or `folderId`, and the result returns the folder.
+- A running habit has a Stop button. A confirmation lets you stop only the run, or the run and the sessions it started.
+- In the new sidebar layout, the rail of sessions a thread started stays open until you close it, so several can be open at once. Hover a thread and use its chevron to open or close the rail.
+
+### Fixed
+
+- Sessions a habit run started stay in the Mono's Sessions panel after the app restarts.
+- Starting a session with `workspaceMode: "worktree"` in a project with no commits now fails right away with a clear error, instead of starting a session that dies with "fatal: Needed a single revision".
+
 ## [0.29.0] - 2026-10-20
 
 Carries the upstream MonoCode 0.16.0 changes below.

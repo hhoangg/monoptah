@@ -5,9 +5,10 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
-import { Pause, Play, Trash2, Zap } from "../../../shared/ui/icons";
+import { Pause, Play, Square, Trash2, Zap } from "../../../shared/ui/icons";
 import { IconButton } from "../../../app/shell/TitleBar";
 import { PageHeader } from "./monoPanelParts";
+import { stopHabit, useHabitStopping } from "./habitStop";
 import { AgentMarkdown } from "../../sessions/ui/AgentMarkdown";
 import {
   habitRunningSince,
@@ -75,6 +76,7 @@ export function HabitPage({
 }) {
   const runningSince = useHabitRunning(habit.id);
   const starting = runningSince == null && habitStarting(habit);
+  const stopping = useHabitStopping(habit.id);
   const runs = habit.runs ?? [];
   return (
     <div
@@ -96,6 +98,19 @@ export function HabitPage({
         >
           <Zap className="size-3.5" strokeWidth={1.75} />
         </IconButton>
+        {runningSince != null ? (
+          <IconButton
+            label={stopping ? "Stopping…" : "Stop"}
+            disabled={stopping}
+            onClick={() =>
+              void stopHabit(habit).catch((error) =>
+                console.warn("Could not ask how to stop the habit", error),
+              )
+            }
+          >
+            <Square className="size-3.5" strokeWidth={1.75} />
+          </IconButton>
+        ) : null}
         <IconButton
           label={habit.enabled ? "Pause" : "Resume"}
           onClick={onToggle}

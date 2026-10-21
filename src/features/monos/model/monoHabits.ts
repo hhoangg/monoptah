@@ -312,6 +312,29 @@ export function habitRunningSince(habitId: string): number | undefined {
   return active.get(habitId);
 }
 
+/**
+ * What the user asked for when they stopped a running habit: end only the run
+ * and leave the sessions it started going, or end those too. In memory only,
+ * like the run it belongs to.
+ */
+export type HabitStopMode = "run" | "all";
+
+const stops = new Map<string, HabitStopMode>();
+
+export function requestHabitStop(habitId: string, mode: HabitStopMode): void {
+  stops.set(habitId, mode);
+  window.dispatchEvent(new CustomEvent(ACTIVE_CHANGED));
+}
+
+export function habitStopRequest(habitId: string): HabitStopMode | undefined {
+  return stops.get(habitId);
+}
+
+export function clearHabitStop(habitId: string): void {
+  if (stops.delete(habitId))
+    window.dispatchEvent(new CustomEvent(ACTIVE_CHANGED));
+}
+
 const CHECK_NOW = "monocode:mono-habits-check-now";
 
 /** Ask the scheduler to look for due habits now rather than at its next minute. */
@@ -358,7 +381,7 @@ You are running one of your habits on your own; the user did not just message yo
 Habit: ${habit.name}
 ${habit.instructions.trim()}
 
-Do the work now with your tools and the app CLI. Then reply with exactly the message you would send the user in your chat: short, in your own voice, only what they would want to know, with no preamble about running a habit. If there is nothing worth telling them, reply with exactly ${QUIET_MARKER} and nothing else; silence is the right answer more often than not. Save anything worth remembering with the memory actions before you reply.
+Do the work now with your tools and the app CLI. Then reply with exactly the message you would send the user in your chat: short, in your own voice, only what they would want to know, with no preamble about running a habit. If there is nothing worth telling them, reply with exactly ${QUIET_MARKER} and nothing else; silence is the right answer more often than not. Save anything worth remembering with the memory actions before you reply. Sessions you start with app sessions.start report to your chat, not to this run, and their reports still arrive after this run has ended. So once you have started them, hand the work off and finish this run: do not wait for them or poll, and do not do their work yourself. Mention in your reply what you started.
 </habit_run>`;
 }
 
@@ -459,6 +482,8 @@ const runs = new Map<string, string>();
  * run itself is thrown away, and without this they would be listed nowhere.
  */
 const launches = new Map<string, MonoSpawnedSession[]>();
+/** Which of a run's launches it created itself, by session id. */
+const startedLaunches = new Map<string, Set<string>>();
 
 export function markHabitRun(sessionId: string, monoId: string): void {
   runs.set(sessionId, monoId);
@@ -476,13 +501,25 @@ export function habitRunMono(sessionId: string): string | undefined {
 export function clearHabitRun(sessionId: string): void {
   runs.delete(sessionId);
   launches.delete(sessionId);
+  startedLaunches.delete(sessionId);
 }
 
+/**
+ * Notes a session the run launched or sent a follow-up to. `started` marks the
+ * ones the run itself created, as opposed to sessions it only messaged, which
+ * may belong to someone else.
+ */
 export function noteHabitRunLaunch(
   sessionId: string,
   launched: MonoSpawnedSession,
+  started = false,
 ): void {
   if (!runs.has(sessionId)) return;
+  if (started) {
+    const ids = startedLaunches.get(sessionId) ?? new Set<string>();
+    ids.add(launched.sessionId);
+    startedLaunches.set(sessionId, ids);
+  }
   const known = launches.get(sessionId) ?? [];
   if (known.some((entry) => entry.sessionId === launched.sessionId)) return;
   launches.set(sessionId, [...known, launched]);
@@ -490,6 +527,14 @@ export function noteHabitRunLaunch(
 
 export function habitRunLaunches(sessionId: string): MonoSpawnedSession[] {
   return launches.get(sessionId) ?? [];
+}
+
+/** The launches the run created itself, leaving out sessions it only messaged. */
+export function habitRunStarted(sessionId: string): MonoSpawnedSession[] {
+  const ids = startedLaunches.get(sessionId);
+  return habitRunLaunches(sessionId).filter((entry) =>
+    ids?.has(entry.sessionId),
+  );
 }
 
 /**
