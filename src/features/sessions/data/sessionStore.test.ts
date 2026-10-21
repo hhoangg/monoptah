@@ -373,6 +373,40 @@ describe("sanitizeSessionForPersist", () => {
       }).blocks,
     ).toEqual(saved.blocks);
   });
+  it("persists launches on habit posts only, not on other assistant blocks", () => {
+    const launch = {
+      sessionId: "habit-review",
+      cwd: "/repo",
+      title: "Review",
+      harness: "codex" as const,
+      model: "gpt-6",
+    };
+    const session = newSession("codex", "/repo");
+    session.blocks = [
+      {
+        id: "habit-post",
+        role: "assistant",
+        text: "Started a review",
+        monoHabit: { id: "habit", name: "Morning check", at: 1_000 },
+        monoSpawnedSessions: [launch],
+      },
+      {
+        id: "plain",
+        role: "assistant",
+        text: "Started",
+        monoSpawnedSessions: [launch],
+      },
+    ];
+    const saved = sanitizeSessionForPersist(session);
+    expect(saved.blocks[0].monoSpawnedSessions).toEqual([launch]);
+    expect(saved.blocks[1].monoSpawnedSessions).toBeUndefined();
+    expect(
+      sanitizeSessionForPersist({
+        ...session,
+        blocks: JSON.parse(JSON.stringify(saved.blocks)),
+      }).blocks,
+    ).toEqual(saved.blocks);
+  });
   it("keeps the stripped /operator turn marker for later turns", () => {
     const submitted = appendUser(
       newSession("codex", "/repo"),

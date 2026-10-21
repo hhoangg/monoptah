@@ -1027,7 +1027,12 @@ function sanitizeBlock(
   if (block.role === "user" && block.internal && completion)
     next.monoSessionCompletion = completion;
   const spawned = sanitizeMonoSpawnedSessions(block.monoSpawnedSessions);
-  if (block.role === "user" && spawned.length)
+  // Habit posts carry the sessions their run started; other assistant blocks
+  // never do, so the field stays off them.
+  if (
+    spawned.length &&
+    (block.role === "user" || (block.role === "assistant" && next.monoHabit))
+  )
     next.monoSpawnedSessions = spawned;
   const turnMetrics = sanitizeTurnMetrics(block.turnMetrics);
   if (block.role === "user" && turnMetrics) next.turnMetrics = turnMetrics;

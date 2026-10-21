@@ -12,6 +12,7 @@ import {
   loadMonoFiles,
   MEMORY_MAX_LINES,
   memoryWithinBudget,
+  MONO_PROMPT_VERSION,
   planAgentContext,
   monoContext,
   monoTurn,
@@ -165,6 +166,34 @@ it("says how to keep memory and update the soul only at the user's request", () 
     memory: false,
   });
   expect(alone).toContain("has not given you any projects yet");
+});
+
+it("describes per-session delivery, nesting and folders for launched sessions", () => {
+  const look = {
+    name: "Skull",
+    mascot: "skull",
+    color: "#fff",
+    projects: [{ path: "/code/monocode", name: "monocode" }],
+  };
+  const full = monoContext(look, files(), { soul: true, memory: true });
+  expect(MONO_PROMPT_VERSION).toBe(19);
+  expect(full).toContain('"completionDelivery":"each"');
+  expect(full).toContain("as soon as that session stops");
+  expect(full).toContain("without waiting for the turn or sibling sessions");
+  expect(full).toContain("habit run always reports this way");
+  expect(full).toContain("parentSessionId");
+  expect(full).toContain("nested under that parent in the sidebar");
+  expect(full).toContain("only one level deep");
+  expect(full).toContain("lost when Monoptah restarts");
+  expect(full).toContain("folderName");
+  expect(full).toContain("folderId");
+  expect(full).toContain("never renamed");
+  expect(full).toContain("always creates a new folder");
+  expect(full).toContain("Folder was not found in this project");
+  expect(full).toContain('"Show sessions in sidebar"');
+  expect(full).toContain('"Group in a folder"');
+  expect(full).toContain("inset sidebar layout");
+  expect(full).toContain("request ids without hyphens");
 });
 
 it("seeds SOUL.md once, moving the old instructions into it", async () => {

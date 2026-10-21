@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Habit } from "../../features/monos/model/monoHabits";
 import type { Block, Session } from "../../features/sessions/model/session";
 
@@ -59,8 +59,14 @@ vi.mock("../../features/monos/model/monoFiles", async (original) => {
 const { useMonoHabits } = await import("./useMonoHabits");
 const { shouldPersistSession } =
   await import("../../features/sessions/data/sessionStore");
-const { checkHabitsNow, noteHabitRunLaunch, relayApproval } =
-  await import("../../features/monos/model/monoHabits");
+const {
+  checkHabitsNow,
+  clearHabitStop,
+  habitStopRequest,
+  noteHabitRunLaunch,
+  relayApproval,
+  requestHabitStop,
+} = await import("../../features/monos/model/monoHabits");
 const { loadMonoFiles } = await import("../../features/monos/model/monoFiles");
 
 let root: Root;
@@ -70,6 +76,7 @@ beforeEach(() => {
   fileVersion = 0;
   extraRoots = [];
   vi.clearAllMocks();
+  clearHabitStop("h1");
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const values = new Map<string, string>();
   vi.stubGlobal("localStorage", {
@@ -159,6 +166,7 @@ function makeHost(reply: string, approve?: { wait: Promise<void> }) {
       return { status: "completed" as const, text: reply };
     }),
     remove: vi.fn(async () => {}),
+    stop: vi.fn(async () => {}),
     post: vi.fn(),
     // Like the app: the request is relayed, so later polls skip it.
     askApproval: vi.fn(
@@ -490,4 +498,176 @@ it("uses a waiting habit's latest instructions when it launches", async () => {
     "Inspect only the release branch.",
   );
   await vi.waitFor(() => expect(stored[1].lastOutcome).toBe("quiet"));
+});
+
+describe("stopping a running habit", () => {
+  const launch = (sessionId: string) => ({
+    sessionId,
+    cwd: "/code/app",
+    title: `Work on ${sessionId}`,
+    harness: "claude" as const,
+    model: "claude:x",
+  });
+
+  /** A run that has started the given sessions and then never finishes. */
+  async function startHanging(sessionIds: string[], messaged: string[] = []) {
+    vi.useFakeTimers();
+    const host = setup("never reported");
+    host.run.mockImplementationOnce(async (id: string) => {
+      for (const sessionId of messaged)
+        noteHabitRunLaunch(id, launch(sessionId));
+      for (const sessionId of sessionIds)
+        noteHabitRunLaunch(id, launch(sessionId), true);
+      return new Promise<never>(() => {});
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(host.run).toHaveBeenCalledTimes(1);
+    return host;
+  }
+
+  async function stopWith(mode: "run" | "all") {
+    requestHabitStop("h1", mode);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("ends the run, keeps its sessions and says where they are", async () => {
+    const host = await startHanging(["app-1", "app-2"]);
+    await stopWith("run");
+    expect(host.remove).toHaveBeenCalledTimes(1);
+    expect(host.stop).not.toHaveBeenCalled();
+    expect(host.post).toHaveBeenCalledTimes(1);
+    const [monoId, habit, text, , , launches] = host.post.mock.calls[0];
+    expect([monoId, habit.id]).toEqual(["mono", "h1"]);
+    expect(text).toBe("Stopped. Started 2 sessions that keep running.");
+    expect(
+      launches.map((entry: { sessionId: string }) => entry.sessionId),
+    ).toEqual(["app-1", "app-2"]);
+    expect(stored[0]).toMatchObject({
+      lastOutcome: "failed",
+      lastError: "Stopped by the user.",
+    });
+    expect(habitStopRequest("h1")).toBeUndefined();
+  });
+
+  it("posts nothing when it stops a run that started no sessions", async () => {
+    const host = await startHanging([]);
+    await stopWith("run");
+    expect(host.remove).toHaveBeenCalledTimes(1);
+    expect(host.stop).not.toHaveBeenCalled();
+    expect(host.post).not.toHaveBeenCalled();
+    expect(stored[0]).toMatchObject({
+      lastOutcome: "failed",
+      lastError: "Stopped by the user.",
+    });
+    expect(habitStopRequest("h1")).toBeUndefined();
+  });
+
+  it("names a single kept session in the singular", async () => {
+    const host = await startHanging(["app-1"]);
+    await stopWith("run");
+    expect(host.post.mock.calls[0][2]).toBe(
+      "Stopped. Started 1 session that keeps running.",
+    );
+  });
+
+  it("stops the sessions it started too, and says which would not stop", async () => {
+    const host = await startHanging(["app-1", "app-2", "app-3"]);
+    host.stop.mockImplementation(async (sessionId: string) => {
+      if (sessionId === "app-2") throw new Error("already gone");
+    });
+    await stopWith("all");
+    expect(host.remove).toHaveBeenCalledTimes(1);
+    expect(host.stop.mock.calls).toEqual([
+      ["app-1", "mono"],
+      ["app-2", "mono"],
+      ["app-3", "mono"],
+    ]);
+    // Only the one it could not stop is left to find.
+    expect(host.post).toHaveBeenCalledTimes(1);
+    const [, , text, , , launches] = host.post.mock.calls[0];
+    expect(text).toBe("Could not stop 1 session: app-2.");
+    expect(
+      launches.map((entry: { sessionId: string }) => entry.sessionId),
+    ).toEqual(["app-2"]);
+    expect(stored[0]).toMatchObject({
+      lastOutcome: "failed",
+      lastError: "Stopped by the user.",
+    });
+    expect(habitStopRequest("h1")).toBeUndefined();
+  });
+
+  it("stops only the sessions the run started, not ones it messaged", async () => {
+    const host = await startHanging(["app-1"], ["reviewer"]);
+    await stopWith("all");
+    expect(host.stop.mock.calls).toEqual([["app-1", "mono"]]);
+    expect(host.post).not.toHaveBeenCalled();
+  });
+
+  it("does not count a session it only messaged as one that keeps running", async () => {
+    const host = await startHanging(["app-1"], ["reviewer"]);
+    await stopWith("run");
+    expect(host.stop).not.toHaveBeenCalled();
+    expect(host.post.mock.calls[0][2]).toBe(
+      "Stopped. Started 1 session that keeps running.",
+    );
+  });
+
+  it("stops the sessions even when the run finished as the user chose", async () => {
+    vi.useFakeTimers();
+    const host = setup("CI is red.");
+    const run = host.run.getMockImplementation()!;
+    host.run.mockImplementationOnce(async (id, prompt) => {
+      noteHabitRunLaunch(id, launch("app-1"), true);
+      requestHabitStop("h1", "all");
+      return run(id, prompt);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(host.stop.mock.calls).toEqual([["app-1", "mono"]]);
+    // It finished by itself, so its findings still reach the user.
+    expect(host.post.mock.calls[0][2]).toBe("CI is red.");
+    expect(stored[0].lastOutcome).toBe("posted");
+    expect(habitStopRequest("h1")).toBeUndefined();
+  });
+
+  it("lists a session started while the run is being removed", async () => {
+    vi.useFakeTimers();
+    const host = setup("NOTHING_TO_REPORT");
+    host.remove.mockImplementationOnce(async (id: string) => {
+      noteHabitRunLaunch(id, launch("late-1"), true);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(host.post.mock.calls[0][2]).toBe("Started a session.");
+    expect(host.post.mock.calls[0][5]).toEqual([launch("late-1")]);
+  });
+
+  it("ignores a stop request left over from before the run started", async () => {
+    vi.useFakeTimers();
+    requestHabitStop("h1", "all");
+    const host = setup("CI is red.");
+    const run = host.run.getMockImplementation()!;
+    // Long enough for the run to be polled, where a stale request would bite.
+    host.run.mockImplementationOnce(async (id, prompt) => {
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      return run(id, prompt);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(host.post.mock.calls[0][2]).toBe("CI is red.");
+    expect(host.stop).not.toHaveBeenCalled();
+    expect(stored[0].lastOutcome).toBe("posted");
+    expect(habitStopRequest("h1")).toBeUndefined();
+  });
 });

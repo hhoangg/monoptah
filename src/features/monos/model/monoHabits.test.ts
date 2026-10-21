@@ -7,6 +7,7 @@ import {
   nextHabitAfterToday,
   habitStarting,
   setHabitRunning,
+  subscribeHabitsRunning,
   afterRun,
   dropRelays,
   isRelayed,
@@ -15,6 +16,15 @@ import {
   dueHabits,
   habitPostsContext,
   habitReport,
+  habitRunPrompt,
+  habitStopRequest,
+  habitRunLaunches,
+  habitRunStarted,
+  noteHabitRunLaunch,
+  markHabitRun,
+  clearHabitRun,
+  clearHabitStop,
+  requestHabitStop,
   habitSchedule,
   MISSED_RUN_GRACE_MS,
   newHabit,
@@ -269,4 +279,90 @@ it("starts a new habit enabled and due at its next scheduled time", () => {
     nextRunAt: at(7, 9),
   });
   expect(created.id).toBeTruthy();
+});
+
+it("tells a habit run that sessions it starts report to the Mono's chat", () => {
+  const prompt = habitRunPrompt(
+    {
+      name: "Skull",
+      mascot: "skull",
+      color: "#fff",
+      projects: [{ path: "/code/monocode", name: "monocode" }],
+    },
+    {
+      id: "agent",
+      dir: "/data/agents/agent",
+      soul: "# Soul",
+      soulHash: "s1",
+      memory: "",
+      memoryHash: "m1",
+      memoryPath: "/data/agents/agent/MEMORY.md",
+      topics: [],
+    },
+    habit(),
+    at(5, 9),
+  );
+  const run = prompt.slice(prompt.indexOf("<habit_run>"));
+  expect(run).toContain("report to your chat, not to this run");
+  expect(run).toContain("still arrive after this run has ended");
+  expect(run).toContain("hand the work off and finish");
+  expect(run).toContain("do not wait for them or poll");
+});
+
+it("remembers a stop request per habit until it is cleared", () => {
+  expect(habitStopRequest("h1")).toBeUndefined();
+  requestHabitStop("h1", "run");
+  requestHabitStop("h2", "all");
+  expect(habitStopRequest("h1")).toBe("run");
+  expect(habitStopRequest("h2")).toBe("all");
+  clearHabitStop("h1");
+  expect(habitStopRequest("h1")).toBeUndefined();
+  expect(habitStopRequest("h2")).toBe("all");
+  clearHabitStop("h2");
+});
+
+it("tells subscribers when a stop is requested or cleared", () => {
+  let calls = 0;
+  const off = subscribeHabitsRunning(() => calls++);
+  requestHabitStop("h1", "run");
+  clearHabitStop("h1");
+  off();
+  expect(calls).toBe(2);
+});
+
+it("tells the sessions a run started from the ones it only messaged", () => {
+  const entry = (sessionId: string) => ({
+    sessionId,
+    cwd: "/code/app",
+    title: sessionId,
+    harness: "claude" as const,
+    model: "claude:x",
+  });
+  markHabitRun("run-1", "mono-1");
+  noteHabitRunLaunch("run-1", entry("messaged"));
+  noteHabitRunLaunch("run-1", entry("started"), true);
+  // Messaging a session it started earlier must not demote it.
+  noteHabitRunLaunch("run-1", entry("started"));
+  // Starting a session it had only messaged counts as started.
+  noteHabitRunLaunch("run-1", entry("late"));
+  noteHabitRunLaunch("run-1", entry("late"), true);
+  expect(habitRunLaunches("run-1").map((e) => e.sessionId)).toEqual([
+    "messaged",
+    "started",
+    "late",
+  ]);
+  expect(habitRunStarted("run-1").map((e) => e.sessionId)).toEqual([
+    "started",
+    "late",
+  ]);
+  // The entries stay plain Mono sessions, so they can go on a chat block.
+  expect(Object.keys(habitRunLaunches("run-1")[1]).sort()).toEqual([
+    "cwd",
+    "harness",
+    "model",
+    "sessionId",
+    "title",
+  ]);
+  clearHabitRun("run-1");
+  expect(habitRunStarted("run-1")).toEqual([]);
 });

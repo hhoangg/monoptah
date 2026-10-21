@@ -46,6 +46,14 @@ import {
 import { createPortal } from "react-dom";
 import { useProjectSwipe } from "./useProjectSwipe";
 import {
+  EMPTY_STARTED_RAIL,
+  startedRailOpen,
+  startedRailSets,
+  syncStartedRail,
+  toggleStartedRail,
+  type StartedRailState,
+} from "./startedRail";
+import {
   Fragment,
   memo,
   useCallback,
@@ -1915,21 +1923,55 @@ function SidebarComponent({
     for (const session of listedSessions) motion.seen.add(session.id);
   });
 
+  // Which started-session rails are open: kept once opened, until collapsed.
+  // Orchestrators keep their own derived expansion.
+  const [startedRail, setStartedRail] =
+    useState<StartedRailState>(EMPTY_STARTED_RAIL);
+  const previousHighlighted = useRef(highlightedSessionId);
+  const startedViewing = (id: string) =>
+    id === highlightedSessionId || selectedSessionIds.has(id);
+  const startedInPlay = (id: string) =>
+    startedViewing(id) || listedBusySessionIds.has(id);
+  const orchestratorIds = new Set(
+    visibleSessions.filter((s) => s.orchestration).map((s) => s.id),
+  );
+  const startedSets = startedRailSets(startedSessions.byParent, {
+    skip: (id) => orchestratorIds.has(id),
+    inView: startedViewing,
+    busy: (id) => listedBusySessionIds.has(id),
+    highlighted: highlightedSessionId,
+    previousHighlighted: previousHighlighted.current,
+  });
+  useEffect(() => {
+    previousHighlighted.current = highlightedSessionId;
+    setStartedRail((current) => syncStartedRail(current, startedSets));
+  });
+  const startedAutoRef = useRef(startedSets.auto);
+  startedAutoRef.current = startedSets.auto;
+  const toggleStarted = useCallback(
+    (id: string) =>
+      setStartedRail((current) =>
+        toggleStartedRail(current, id, startedAutoRef.current.has(id)),
+      ),
+    [],
+  );
+
   // A session row, with the sessions it started hanging off a rail below it.
   const renderSessionCard = (session: SessionSummary, compact = false) => {
     const started = startedSessions.byParent.get(session.id);
     if (!started?.length) return renderSessionRow(session, compact);
-    // Open while the thread or one of its sessions is the one in view, chosen
-    // or working, as an orchestrator's agents are.
-    const inPlay = (id: string) =>
-      id === highlightedSessionId ||
-      selectedSessionIds.has(id) ||
-      listedBusySessionIds.has(id);
-    const open =
-      inPlay(session.id) || started.some((child) => inPlay(child.id));
+    const open = session.orchestration
+      ? startedInPlay(session.id) ||
+        started.some((child) => startedInPlay(child.id))
+      : startedRailOpen(
+          startedRail,
+          session.id,
+          startedSets.auto.has(session.id),
+        );
     const card = renderSessionRow(session, compact, {
       startedCount: started.length,
       startedOpen: open,
+      onToggleStarted: session.orchestration ? undefined : toggleStarted,
       startedInView: started.some(
         (child) =>
           child.id === highlightedSessionId || selectedSessionIds.has(child.id),
@@ -1974,11 +2016,13 @@ function SidebarComponent({
       startedCount = 0,
       startedOpen = false,
       startedInView = false,
+      onToggleStarted,
     }: {
       nested?: boolean;
       startedCount?: number;
       startedOpen?: boolean;
       startedInView?: boolean;
+      onToggleStarted?: (sessionId: string) => void;
     } = {},
   ) =>
     renamingSessionId === session.id && onRenameSession ? (
@@ -2008,6 +2052,7 @@ function SidebarComponent({
         startedCount={startedCount}
         startedOpen={startedOpen}
         startedInView={startedInView}
+        onToggleStarted={onToggleStarted}
         now={now}
         onSelect={cardActions.select}
         onOpenWorkItem={
@@ -4973,6 +5018,7 @@ export const SessionCard = memo(function SessionCard({
   startedCount = 0,
   startedOpen = false,
   startedInView = false,
+  onToggleStarted,
   modelInFooter = false,
   statusLabel,
   project,
@@ -5010,6 +5056,8 @@ export const SessionCard = memo(function SessionCard({
   /** One of those sessions is the one in view or chosen, so this row keeps
    * its hover fill as the group's head. */
   startedInView?: boolean;
+  /** Opens or collapses that rail from the row's chevron. */
+  onToggleStarted?: (sessionId: string) => void;
   /** Shows the model as its provider's mark beside the branch, so the title
    * shares its row with the time and the card is a line shorter. */
   modelInFooter?: boolean;
@@ -5071,11 +5119,14 @@ export const SessionCard = memo(function SessionCard({
   const orchestrationExpanded =
     !!orchestration && (isActive || isSelected || busy);
   // An orchestrator or /operator thread opens a rail of work below it.
+  const startedToggle =
+    dense && !nested && !orchestration && startedCount > 0 && !!onToggleStarted;
   const expandable =
     dense &&
     !nested &&
     ((!!orchestration && !orchestrationExpanded) ||
-      (startedCount > 0 && !startedOpen));
+      (startedCount > 0 && !startedOpen) ||
+      startedToggle);
   const markHover = expandable ? " group-hover:hidden" : "";
   // Marked on the right like a linked issue or PR, in its mode's colour.
   const modeStyle = orchestration
@@ -5454,7 +5505,32 @@ export const SessionCard = memo(function SessionCard({
                 {/* A collapsed orchestrator or /operator thread shows a
                     chevron in its mark's place on hover: selecting it opens
                     the rail below. */}
-                {expandable ? (
+                {startedToggle ? (
+                  <span
+                    role="button"
+                    aria-label={
+                      startedOpen
+                        ? "Collapse started sessions"
+                        : "Expand started sessions"
+                    }
+                    aria-expanded={startedOpen}
+                    // Keep the card from capturing the pointer, which would
+                    // retarget this click to the card and select the thread.
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onToggleStarted?.(session.id);
+                    }}
+                    className="hidden size-4 shrink-0 cursor-pointer place-items-center rounded-sm text-content/60 hover:text-content group-hover:grid"
+                  >
+                    <ChevronDown
+                      className={`size-3.5 transition-transform ${
+                        startedOpen ? "rotate-180" : ""
+                      }`}
+                      strokeWidth={1.75}
+                    />
+                  </span>
+                ) : expandable ? (
                   <span className="hidden size-4 shrink-0 place-items-center text-content/60 group-hover:grid">
                     <ChevronDown className="size-3.5" strokeWidth={1.75} />
                   </span>
