@@ -694,10 +694,20 @@ import {
 } from "../features/monos/model/monoFiles";
 import { finalReply, useMonoHabits } from "./hooks/useMonoHabits";
 import {
+  resumeWorkflowRun,
   useMonoWorkflows,
   type MonoWorkflowHost,
 } from "./hooks/useMonoWorkflows";
 import { useWorkflowDriver } from "./hooks/workflowDriver";
+import { liveRunRegistry } from "./hooks/workflowLiveRuns";
+import {
+  checkWorkflowsNow,
+  loadRuns,
+  loadWorkflows,
+  stopWorkflowRun,
+  updateWorkflows,
+  workflowRunningId,
+} from "../features/workflows/model/workflowStore";
 import { ASK_TIMEOUT_MS } from "./hooks/workflowRunner";
 import { startWorkflowSession } from "./model/workflowSessionStart";
 import { useFloatingMono } from "./hooks/useFloatingMono";
@@ -12573,6 +12583,18 @@ function Workspace({
               );
             },
             habits: { load: loadHabits, update: updateHabits },
+            workflows: {
+              load: loadWorkflows,
+              update: updateWorkflows,
+              runs: loadRuns,
+              // A run may be going in another window, which the registry knows.
+              running: (workflowId) =>
+                workflowRunningId(workflowId) ??
+                liveRunRegistry()?.freshRunOf(workflowId),
+              stop: stopWorkflowRun,
+              resumeRun: resumeWorkflowRun,
+              checkNow: checkWorkflowsNow,
+            },
             agentFiles: (monoId) => loadMonoFiles(monoId),
             readAgentFile: (monoId, path) => readAgentFile(monoId, path),
             writeAgentFile: (monoId, path, text, hash) =>

@@ -82,7 +82,7 @@ const ACTIONS: [&str; 12] = [
     "list", "delegate", "get", "steer", "message", "retry", "cancel", "wait", "review", "finish",
     "respond", "answer",
 ];
-const APP_ACTIONS: [&str; 32] = [
+const APP_ACTIONS: [&str; 46] = [
     "models.list",
     "sessions.list",
     "sessions.read",
@@ -114,6 +114,20 @@ const APP_ACTIONS: [&str; 32] = [
     "habits.update",
     "habits.run",
     "habits.remove",
+    "workflows.list",
+    "workflows.get",
+    "workflows.add",
+    "workflows.update",
+    "workflows.setInputs",
+    "workflows.run",
+    "workflows.stop",
+    "workflows.pause",
+    "workflows.resume",
+    "workflows.resumeRun",
+    "workflows.remove",
+    "workflows.export",
+    "workflows.import",
+    "workflows.runs",
     "chat.card",
 ];
 const APP_USAGE: &str = r#"Monoptah app access — use in a thread enabled by /operator.
@@ -283,6 +297,33 @@ Actions:
                   "schedule":{...},"enabled":false}  Change or pause one.
   habits.run     {"id":"..."}  Run one within a minute, to try it out.
   habits.remove  {"id":"..."}
+  workflows.list {}  Mono only. Your workflows: trigger, next run, whether one is
+                  running and how the last run went.
+  workflows.get  {"id":"wf-..."}  The full definition, any problems with it, and
+                  the last 5 runs.
+  workflows.add  {"workflow":{"name":"...","description":"...","inputs":{
+                  "project":{"type":"project"}},"inputValues":{"project":"<path
+                  or name>"},"nodes":[...],"edges":[{"from":"a","to":"b"}]}}
+                  or {"yaml":"<exported file>","values":{...}}. Add only after
+                  the user saw the steps and agreed. Node types: schedule
+                  (schedule as in habits.add) or manual, session (project is
+                  "{{inputs.<name>}}", prompt, checkout root | newWorktree |
+                  {"worktreeOf":"<nodeId>"}, output fields), command, askMono
+                  (question, answers), if (condition or decide "mono"), forEach
+                  (in, as, maxParallel; its child nodes have "parent") and one
+                  report. Saved enabled only when "issues" is empty, else paused.
+  workflows.update {"id":"...","workflow":{...}}  Replace the definition; the id,
+                  inputValues, enabled state and run state are kept unless given.
+  workflows.setInputs {"id":"...","values":{"project":"..."}}  Set input values.
+  workflows.run  {"id":"..."}  Run one now. workflows.stop {"id":"..."} ends the
+                  run that is going.
+  workflows.pause / workflows.resume {"id":"..."}  Switch its trigger off or on.
+  workflows.resumeRun {"id":"...","runId":"..."}  Continue an interrupted run.
+  workflows.remove {"id":"..."}
+  workflows.export {"id":"..."}  The workflow as shareable YAML. workflows.import
+                  {"yaml":"...","values":{...}} saves one paused, with its commands.
+  workflows.runs {"id":"...","limit":5}  Run history with each node's status per
+                  branch.
   chat.card      Mono or habit only. Post a card to the Mono's chat:
                   {"type":"pr","repo":"owner/repo","number":123,"note":"..."}
                   {"type":"session","sessionId":"...","note":"..."}
@@ -657,6 +698,44 @@ mod tests {
         assert_eq!(quoted("/Users/a\\b/MonoCode"), "'/Users/a\\b/MonoCode'");
         assert_eq!(quoted("/Users/it's/MonoCode"), r"'/Users/it'\''s/MonoCode'");
     }
+    #[test]
+    fn app_mode_exposes_workflow_actions() {
+        let actions: Vec<&str> = APP_ACTIONS
+            .iter()
+            .copied()
+            .filter(|action| action.starts_with("workflows."))
+            .collect();
+        for action in [
+            "list",
+            "get",
+            "add",
+            "update",
+            "setInputs",
+            "run",
+            "stop",
+            "pause",
+            "resume",
+            "resumeRun",
+            "remove",
+            "export",
+            "import",
+            "runs",
+        ] {
+            let name = format!("workflows.{action}");
+            assert!(
+                actions.contains(&name.as_str()),
+                "{name} is not an app action"
+            );
+            assert!(app_help().contains(&name), "{name} is not in the app help");
+            assert!(matches!(
+                parse_args_for(&args(&[&name]), true),
+                Ok(Parsed::Call(_, _, _))
+            ));
+            assert!(parse_args_for(&args(&[&name]), false).is_err());
+        }
+        assert_eq!(actions.len(), 14);
+    }
+
     #[test]
     fn app_mode_exposes_only_app_actions_and_safe_request_ids() {
         assert!(matches!(

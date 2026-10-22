@@ -176,7 +176,7 @@ it("describes per-session delivery, nesting and folders for launched sessions", 
     projects: [{ path: "/code/monocode", name: "monocode" }],
   };
   const full = monoContext(look, files(), { soul: true, memory: true });
-  expect(MONO_PROMPT_VERSION).toBe(20);
+  expect(MONO_PROMPT_VERSION).toBe(21);
   expect(full).toContain('"kind":"interval"');
   expect(full).toContain('"completionDelivery":"each"');
   expect(full).toContain("as soon as that session stops");
@@ -269,4 +269,28 @@ it("puts what the app adds ahead of the user's message, marked as its own", () =
     turn.indexOf("what is this"),
   );
   expect(turn.endsWith("</monocode_context>\n\nwhat is this")).toBe(true);
+});
+
+it("monoContext includes workflows_rules", () => {
+  const look = {
+    name: "Skull",
+    mascot: "skull",
+    color: "#fff",
+    projects: [{ path: "/code/monocode", name: "monocode" }],
+  };
+  const full = monoContext(look, files(), { soul: true, memory: true });
+  expect(full).toContain("<workflows_rules>");
+  expect(full).toContain("</workflows_rules>");
+  expect(full).toContain("{{nodeId.field}}");
+  expect(full).toContain("{{run.round}}");
+  expect(full).toContain("Projects are always inputs, never paths.");
+  expect(full).toContain("`workflows.resumeRun`");
+  expect(full).toContain("show them the steps first");
+  expect(full.indexOf("</habits_rules>")).toBeLessThan(
+    full.indexOf("<workflows_rules>"),
+  );
+  // Only the soul turn carries the rules, like the habits rules.
+  expect(
+    monoContext(look, files(), { soul: false, memory: true }),
+  ).not.toContain("<workflows_rules>");
 });

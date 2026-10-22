@@ -61,6 +61,13 @@ import {
   nextHabitRunAt,
   type Habit,
 } from "../../monos/model/monoHabits";
+import type { WorkflowRun } from "../../workflows/model/workflow";
+import type {
+  checkWorkflowsNow,
+  loadWorkflows,
+  updateWorkflows,
+} from "../../workflows/model/workflowStore";
+import { WORKFLOW_FIELDS, handleWorkflows } from "./agentAppWorkflows";
 import {
   memoryWithinBudget,
   MonoFileConflict,
@@ -164,6 +171,17 @@ export type AgentAppHost = {
       change: (habits: Habit[]) => { habits: Habit[]; result: T },
     ): Promise<T>;
   };
+  /** A Mono's workflows. Runs are driven by one window; the rest asks it through the files. */
+  workflows?: {
+    load: typeof loadWorkflows;
+    update: typeof updateWorkflows;
+    runs(monoId: string, workflowId: string): Promise<WorkflowRun[]>;
+    /** The id of the workflow's run going in any window, if one is. */
+    running(workflowId: string): string | undefined;
+    stop(monoId: string, workflowId: string): Promise<void>;
+    resumeRun(monoId: string, workflowId: string, runId: string): Promise<void>;
+    checkNow: typeof checkWorkflowsNow;
+  };
   agentFiles(monoId: string): Promise<MonoFiles>;
   readAgentFile(
     monoId: string,
@@ -251,6 +269,7 @@ const FIELDS = new Map<string, readonly string[]>([
   ["habits.update", ["id", "name", "instructions", "schedule", "enabled"]],
   ["habits.run", ["id"]],
   ["habits.remove", ["id"]],
+  ...WORKFLOW_FIELDS,
   ["chat.card", [...CARD_FIELDS]],
 ]);
 
@@ -1201,6 +1220,8 @@ export async function handleAgentApp(
     return handleMemory(source, action, input, host);
   if (action.startsWith("habits."))
     return handleHabits(source, action, input, host);
+  if (action.startsWith("workflows."))
+    return handleWorkflows(source, action, input, host);
   if (action === "chat.card") {
     if (
       !host.postCard ||
