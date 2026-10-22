@@ -4,6 +4,9 @@ import { SearchableSelect } from "../../../shared/ui/SearchableSelect";
 import { AUTOMATION_WEEKDAYS } from "../../automations/model/automations";
 import {
   addHabit,
+  anchorSchedule,
+  INTERVAL_HOURS_MAX,
+  INTERVAL_HOURS_MIN,
   nextHabitRunAt,
   type HabitSchedule,
 } from "../model/monoHabits";
@@ -15,7 +18,21 @@ const KINDS = [
   { value: "weekdays", label: "Weekdays" },
   { value: "weekly", label: "Weekly" },
   { value: "hourly", label: "Hourly" },
+  { value: "interval", label: "Every N hours" },
 ] as const;
+
+const DEFAULT_INTERVAL_HOURS = 4;
+
+const HOURS = Array.from(
+  { length: INTERVAL_HOURS_MAX - INTERVAL_HOURS_MIN + 1 },
+  (_, i) => {
+    const value = INTERVAL_HOURS_MIN + i;
+    return {
+      value: String(value),
+      label: value === 1 ? "1 hour" : `${value} hours`,
+    };
+  },
+);
 
 const DAYS = AUTOMATION_WEEKDAYS.map((label, value) => ({
   value: String(value),
@@ -114,7 +131,9 @@ export function NewHabitPage({
             <ScheduleFields schedule={schedule} onChange={setSchedule} />
           </Property>
           <Property label="Next">
-            {when(nextHabitRunAt(schedule, Date.now()))}
+            {when(
+              nextHabitRunAt(anchorSchedule(schedule, Date.now()), Date.now()),
+            )}
           </Property>
         </dl>
 
@@ -149,13 +168,32 @@ function ScheduleFields({
         options={KINDS}
         variant="pill"
         searchable={false}
-        onChange={(value) =>
-          onChange({
-            ...schedule,
-            scheduleKind: value as HabitSchedule["scheduleKind"],
-          })
-        }
+        onChange={(value) => {
+          const { intervalHours, ...rest } = schedule;
+          const scheduleKind = value as HabitSchedule["scheduleKind"];
+          onChange(
+            scheduleKind === "interval"
+              ? {
+                  ...rest,
+                  scheduleKind,
+                  intervalHours: intervalHours ?? DEFAULT_INTERVAL_HOURS,
+                }
+              : { ...rest, scheduleKind },
+          );
+        }}
       />
+      {kind === "interval" ? (
+        <SearchableSelect
+          label="Hours between runs"
+          value={String(schedule.intervalHours ?? DEFAULT_INTERVAL_HOURS)}
+          options={HOURS}
+          variant="pill"
+          searchable={false}
+          onChange={(value) =>
+            onChange({ ...schedule, intervalHours: Number(value) })
+          }
+        />
+      ) : null}
       {kind === "weekly" ? (
         <>
           <span className="text-content/45">on</span>
@@ -171,7 +209,9 @@ function ScheduleFields({
           />
         </>
       ) : null}
-      <span className="text-content/45">at</span>
+      <span className="text-content/45">
+        {kind === "interval" ? "from" : "at"}
+      </span>
       {kind === "hourly" ? (
         <SearchableSelect
           label="Minute"

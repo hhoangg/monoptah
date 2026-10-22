@@ -21,14 +21,40 @@ import {
  * nothing worth saying posts nothing at all.
  */
 export type HabitSchedule = {
-  scheduleKind: AutomationScheduleKind;
+  scheduleKind: HabitScheduleKind;
   /** Minute past the hour, for hourly habits. */
   minute: number;
-  /** "HH:MM", local time. */
+  /** "HH:MM", local time. The anchor, for interval habits. */
   time: string;
   /** 0 is Sunday, for weekly habits. */
   dayOfWeek: number;
+  /** 1 to 24, for interval habits: a run every this many hours from `time`. */
+  intervalHours?: number;
+  /**
+   * Local date ("YYYY-MM-DD") on which `time` first starts an interval habit's
+   * runs. Set by the app when the schedule is made, not by the CLI.
+   */
+  intervalFrom?: string;
 };
+
+/** The automation kinds, plus one that automations do not have. */
+export type HabitScheduleKind = AutomationScheduleKind | "interval";
+
+export const INTERVAL_HOURS_MIN = 1;
+export const INTERVAL_HOURS_MAX = 24;
+
+export function isIntervalHours(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= INTERVAL_HOURS_MIN &&
+    value <= INTERVAL_HOURS_MAX
+  );
+}
+
+function isHabitScheduleKind(value: string): value is HabitScheduleKind {
+  return value === "interval" || isScheduleKind(value);
+}
 
 export type Habit = {
   id: string;
@@ -78,11 +104,91 @@ export const HABIT_APPROVAL_WAIT_MS = 12 * 60 * 60 * 1000;
 export const HABITS_MAX = 20;
 
 export function habitScheduleLabel(schedule: HabitSchedule): string {
-  return automationScheduleLabel(schedule);
+  if (schedule.scheduleKind === "interval") {
+    const hours = schedule.intervalHours ?? INTERVAL_HOURS_MAX;
+    return `Every ${hours === 1 ? "hour" : `${hours} hours`} from ${schedule.time}`;
+  }
+  return automationScheduleLabel({
+    ...schedule,
+    scheduleKind: schedule.scheduleKind,
+  });
 }
 
 export function nextHabitRunAt(schedule: HabitSchedule, after: number): number {
-  return nextAutomationRunAt(schedule, after);
+  if (schedule.scheduleKind === "interval")
+    return nextIntervalRunAt(schedule, after);
+  return nextAutomationRunAt(
+    { ...schedule, scheduleKind: schedule.scheduleKind },
+    after,
+  );
+}
+
+const CLOCK = /^([01]\d|2[0-3]):[0-5]\d$/;
+const LOCAL_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+function localDate(at: number): string {
+  const date = new Date(at);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/**
+ * An interval schedule pinned to the day it was made, so that its first run
+ * falls on the anchor time whatever `hours` is. Other schedules pass through.
+ */
+export function anchorSchedule(
+  schedule: HabitSchedule,
+  now: number,
+): HabitSchedule {
+  if (schedule.scheduleKind !== "interval") return schedule;
+  return { ...schedule, intervalFrom: localDate(now) };
+}
+
+/**
+ * The first slot strictly after `after` of a run every `hours` from the
+ * anchor `time` on the day `from`. Slots are counted on the local wall clock,
+ * so they carry on across midnight, and a clock change does not move them.
+ * When `hours` does not divide 24 the slots drift against the days, and the
+ * anchor time itself comes round every lcm(hours, 24) hours.
+ */
+function nextIntervalRunAt(schedule: HabitSchedule, after: number): number {
+  const hours = schedule.intervalHours ?? INTERVAL_HOURS_MAX;
+  const [h, m] = (CLOCK.test(schedule.time) ? schedule.time : "00:00")
+    .split(":")
+    .map(Number);
+  const [y, mo, d] = (
+    schedule.intervalFrom && LOCAL_DATE.test(schedule.intervalFrom)
+      ? schedule.intervalFrom
+      : "1970-01-01"
+  )
+    .split("-")
+    .map(Number);
+  const first = Date.UTC(y, mo - 1, d) / 60_000 + h * 60 + m;
+  const step = hours * 60;
+  const date = new Date(after);
+  const now =
+    Date.UTC(
+      date.getFullYear(),
+      date.getMonth(),
+      date.getDate(),
+      date.getHours(),
+      date.getMinutes(),
+    ) / 60_000;
+  let slot = Math.floor((now - first) / step) + 1;
+  // A slot in an hour the clock skips lands on the next one, so it can fall
+  // at or before `after`; move on rather than go back.
+  for (let tries = 0; tries < 3; tries++, slot++) {
+    const at = new Date((first + slot * step) * 60_000);
+    const local = new Date(
+      at.getUTCFullYear(),
+      at.getUTCMonth(),
+      at.getUTCDate(),
+      at.getUTCHours(),
+      at.getUTCMinutes(),
+    ).getTime();
+    if (local > after) return local;
+  }
+  return after + step * 60_000;
 }
 
 function field<T>(
@@ -116,7 +222,13 @@ export function parseHabits(text: string | null | undefined): Habit[] {
     const instructions = field(value, "instructions", isString);
     const kind = schedule && field(schedule, "scheduleKind", isString);
     if (!id || !name || !instructions || !schedule || !kind) continue;
-    if (!isScheduleKind(kind)) continue;
+    if (!isHabitScheduleKind(kind)) continue;
+    const intervalHours = schedule.intervalHours;
+    // An interval habit with unusable hours is left out rather than guessed.
+    if (kind === "interval" && !isIntervalHours(intervalHours)) continue;
+    const time = field(schedule, "time", isString) ?? "09:00";
+    if (kind === "interval" && !CLOCK.test(time)) continue;
+    const intervalFrom = field(schedule, "intervalFrom", isString);
     const outcome = value.lastOutcome;
     habits.push({
       id,
@@ -125,8 +237,16 @@ export function parseHabits(text: string | null | undefined): Habit[] {
       schedule: {
         scheduleKind: kind,
         minute: field(schedule, "minute", isNumber) ?? 0,
-        time: field(schedule, "time", isString) ?? "09:00",
+        time,
         dayOfWeek: field(schedule, "dayOfWeek", isNumber) ?? 1,
+        ...(kind === "interval" && isIntervalHours(intervalHours)
+          ? {
+              intervalHours,
+              ...(intervalFrom && LOCAL_DATE.test(intervalFrom)
+                ? { intervalFrom }
+                : {}),
+            }
+          : {}),
       },
       enabled: value.enabled !== false,
       createdAt: field(value, "createdAt", isNumber) ?? 0,
@@ -178,10 +298,12 @@ export function habitSchedule(value: unknown): HabitSchedule {
     );
   const input = value as Record<string, unknown>;
   const kind = input.kind;
-  if (typeof kind !== "string" || !isScheduleKind(kind))
-    throw new Error("schedule.kind must be hourly, daily, weekdays or weekly");
-  const time = input.time ?? "09:00";
-  if (typeof time !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time))
+  if (typeof kind !== "string" || !isHabitScheduleKind(kind))
+    throw new Error(
+      "schedule.kind must be hourly, daily, weekdays, weekly or interval",
+    );
+  const time = input.time ?? (kind === "interval" ? "00:00" : "09:00");
+  if (typeof time !== "string" || !CLOCK.test(time))
     throw new Error('schedule.time must be 24-hour "HH:MM"');
   const minute = input.minute ?? 0;
   if (
@@ -198,15 +320,26 @@ export function habitSchedule(value: unknown): HabitSchedule {
   )
     throw new Error("schedule.dayOfWeek must be 0 (Sunday) to 6");
   const unknown = Object.keys(input).filter(
-    (key) => !["kind", "time", "minute", "dayOfWeek"].includes(key),
+    (key) => !["kind", "time", "minute", "dayOfWeek", "hours"].includes(key),
   );
   if (unknown.length)
     throw new Error(`Unknown schedule fields: ${unknown.join(", ")}`);
+  if (kind !== "interval" && input.hours !== undefined)
+    throw new Error('schedule.hours only applies to kind "interval"');
+  if (kind === "interval" && input.hours === undefined)
+    throw new Error(
+      `schedule.hours is required for kind "interval": an integer from ${INTERVAL_HOURS_MIN} to ${INTERVAL_HOURS_MAX}`,
+    );
+  if (kind === "interval" && !isIntervalHours(input.hours))
+    throw new Error(
+      `schedule.hours must be an integer from ${INTERVAL_HOURS_MIN} to ${INTERVAL_HOURS_MAX}`,
+    );
   return {
     scheduleKind: kind,
     time,
     minute: minute as number,
     dayOfWeek: dayOfWeek as number,
+    ...(kind === "interval" ? { intervalHours: input.hours as number } : {}),
   };
 }
 
@@ -215,12 +348,14 @@ export type HabitDraft = Pick<Habit, "name" | "instructions" | "schedule">;
 
 /** A new, enabled habit first due at its next time after `now`. */
 export function newHabit(draft: HabitDraft, now: number): Habit {
+  const schedule = anchorSchedule(draft.schedule, now);
   return {
     id: crypto.randomUUID(),
     ...draft,
+    schedule,
     enabled: true,
     createdAt: now,
-    nextRunAt: nextHabitRunAt(draft.schedule, now),
+    nextRunAt: nextHabitRunAt(schedule, now),
   };
 }
 

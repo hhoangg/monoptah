@@ -171,6 +171,41 @@ it("lets the Mono add, pause, try and remove its habits", async () => {
   await expect(run("habits.remove", { id })).rejects.toThrow("No habit");
 });
 
+it("lets the Mono schedule a habit every N hours", async () => {
+  const { run, habits } = habitsFixture();
+  const added = (await run("habits.add", {
+    name: "CI watch",
+    instructions: "Tell me if CI is red.",
+    schedule: { kind: "interval", hours: 4, time: "09:00" },
+  })) as { habit: { id: string; schedule: string } };
+  expect(added.habit.schedule).toBe("Every 4 hours from 09:00");
+  // The fixture's clock is 08:00, so the first slot is the 09:00 anchor.
+  expect(habits()[0].nextRunAt).toBe(new Date(2026, 9, 5, 9).getTime());
+  await run("habits.update", {
+    id: added.habit.id,
+    schedule: { kind: "interval", hours: 5, time: "09:00" },
+  });
+  expect(habits()[0].schedule).toMatchObject({
+    scheduleKind: "interval",
+    intervalHours: 5,
+    intervalFrom: "2026-10-05",
+  });
+  expect(habits()[0].nextRunAt).toBe(new Date(2026, 9, 5, 9).getTime());
+  await expect(
+    run("habits.add", {
+      name: "Too often",
+      instructions: "x",
+      schedule: { kind: "interval", hours: 25 },
+    }),
+  ).rejects.toThrow("schedule.hours");
+  // Back to a plain kind drops the interval.
+  await run("habits.update", {
+    id: added.habit.id,
+    schedule: { kind: "daily", time: "08:30" },
+  });
+  expect(habits()[0].schedule).not.toHaveProperty("intervalHours");
+});
+
 it("keeps habits to the Mono's own conversation", async () => {
   await expect(habitsFixture(false).run("habits.list")).rejects.toThrow(
     "Only a Mono",

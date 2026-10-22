@@ -176,7 +176,8 @@ it("describes per-session delivery, nesting and folders for launched sessions", 
     projects: [{ path: "/code/monocode", name: "monocode" }],
   };
   const full = monoContext(look, files(), { soul: true, memory: true });
-  expect(MONO_PROMPT_VERSION).toBe(19);
+  expect(MONO_PROMPT_VERSION).toBe(20);
+  expect(full).toContain('"kind":"interval"');
   expect(full).toContain('"completionDelivery":"each"');
   expect(full).toContain("as soon as that session stops");
   expect(full).toContain("without waiting for the turn or sibling sessions");

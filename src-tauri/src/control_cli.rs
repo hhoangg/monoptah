@@ -271,8 +271,12 @@ Actions:
   habits.add     {"name":"Morning CI check","instructions":"...",
                   "schedule":{"kind":"weekdays","time":"09:00"}}
                   Add only after the user agreed to it in this chat. kind is
-                  hourly (with "minute"), daily, weekdays or weekly (with
-                  "dayOfWeek", 0 = Sunday); time is local 24-hour HH:MM.
+                  hourly (with "minute"), daily, weekdays, weekly (with
+                  "dayOfWeek", 0 = Sunday) or interval (with "hours", 1 to 24:
+                  {"kind":"interval","hours":4,"time":"09:00"} runs at 09:00,
+                  13:00, 17:00, 21:00, 01:00, 05:00 and on across days; time is
+                  the anchor, default "00:00"). time is local 24-hour HH:MM.
+                  A run missed while the app was closed is made up at most once.
                   Each run is a hidden session that posts to this chat only
                   when it has something worth saying.
   habits.update  {"id":"...","name":"...","instructions":"...",
