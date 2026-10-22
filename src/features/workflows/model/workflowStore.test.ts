@@ -343,3 +343,16 @@ it("updateRuns keeps run entries it cannot read", async () => {
   }));
   expect((JSON.parse(saved[0]) as { id: string }[]).map((r) => r.id)).toEqual(["b", "a", "run-odd"]);
 });
+
+it("updateWorkflows drops a duplicate-id leftover together with the removed workflow", async () => {
+  const twin = { id: "wf-abcd1234", name: "Twin", nodes: "broken" };
+  const other = { id: "wf-other000", nodes: "broken" };
+  const saved = serve(JSON.stringify([workflow(), twin, other]));
+  await updateWorkflows("mono-1", () => ({ workflows: [], result: null }));
+  // The unreadable entry with another id stays; the twin of the removed workflow goes.
+  expect(JSON.parse(saved[0])).toEqual([other]);
+  // While the readable one stays, so does its twin.
+  const kept = serve(JSON.stringify([workflow(), twin]));
+  await updateWorkflows("mono-1", (list) => ({ workflows: list, result: null }));
+  expect(JSON.parse(kept[0])).toEqual([workflow(), twin]);
+});

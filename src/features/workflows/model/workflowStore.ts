@@ -68,11 +68,18 @@ export async function updateWorkflows<T>(
           `workflows.json already has an entry with the id "${w.id}" that could not be read; fix or remove it first`,
         );
     }
+    // A leftover that repeats the id of a workflow the edit removed would come back as that
+    // workflow on the next read, so it goes with it.
+    const kept = new Set(workflows.map((w) => w.id));
+    const leftovers = current.unreadable.filter((raw) => {
+      const id = idOf(raw);
+      return id === undefined || !known.has(id) || kept.has(id);
+    });
     try {
       await writeAgentFile(
         monoId,
         "workflows.json",
-        serializeWorkflows(workflows, current.unreadable),
+        serializeWorkflows(workflows, leftovers),
         file.hash,
       );
       return result;
