@@ -530,7 +530,10 @@ export function habitReport(text: string): string | undefined {
   return trimmed.replace(new RegExp(`\\s*${QUIET_MARKER}\\s*$`), "").trim();
 }
 
-/** The habit posts that the Mono's own session has not seen yet. */
+/**
+ * The habit posts that the Mono's own session has not seen yet. Workflow reports are left out
+ * on purpose: the report is already in the chat and the run page has the detail.
+ */
 export function unseenHabitPosts(blocks: readonly Block[]): Block[] {
   const posts: Block[] = [];
   for (let i = blocks.length - 1; i >= 0; i--) {

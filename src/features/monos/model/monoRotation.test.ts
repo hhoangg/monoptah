@@ -174,3 +174,21 @@ it("keeps long messages bounded", () => {
   expect(text.length).toBeLessThan(6_000);
   expect(text).toContain("[…]");
 });
+
+it("remembers a workflow report as a post of its own, not the answer to the user's last message", () => {
+  const blocks: Block[] = [
+    ...turn("How is CI?", "Green on main.", T0),
+    {
+      id: "wf-report",
+      role: "assistant",
+      text: "## Ship it · completed\n\nPR #12 opened.",
+      monoWorkflow: { id: "wf-abcd1234", name: "Ship it", runId: "r1", at: T0 + HOUR },
+    },
+  ];
+  const text = planRotation(blocks, undefined, "context", T0 + 2 * HOUR).brief(
+    "mono",
+  );
+  expect(text).toContain("How is CI?\n\nYou:\nGreen on main.");
+  expect(text).toContain('from your workflow "Ship it"');
+  expect(text).toContain("PR #12 opened.");
+});
