@@ -120,7 +120,8 @@ export function shellTemplateProblems(text: string): string[] {
   return problems;
 }
 
-function lookup(scope: TemplateScope, path: string): unknown {
+/** Own-property path lookup (`a.b.c`); never reads the prototype chain. */
+export function lookup(scope: TemplateScope, path: string): unknown {
   let cur: unknown = scope;
   for (const key of path.split(".")) {
     if (cur === null || typeof cur !== "object" || !Object.prototype.hasOwnProperty.call(cur, key)) return undefined;
