@@ -12,7 +12,10 @@ const ANY_VAR = new RegExp(`\\{\\{#if\\s+(${PATH})\\s*\\}\\}|\\{\\{\\s*(${PATH})
  * POSIX single-quote quoting: the value always reaches the shell as one literal word.
  * Quoting only protects against word splitting, expansion and operators. A value that a
  * command later feeds to eval, bash -c, (( )), [[ ]], let, declare -i or an array subscript is
- * still interpreted by the shell, so command authors must not pass variables to those.
+ * still interpreted by the shell, so command authors must not pass variables to those. The same
+ * holds for declare -a / typeset -a (a quoted '(...)' value is re-parsed as a compound
+ * assignment) and for zsh glob qualifiers such as `ls /tmp({{x}})` (an `e:cmd:` qualifier runs
+ * even when the value was quoted).
  */
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -53,6 +56,8 @@ function usesUnquotableSyntax(text: string): boolean {
   const literal = text.replace(VAR, "X");
   if (literal.includes("`") || literal.includes("$(") || literal.includes("$'")) return true;
   if (literal.includes("$[") || literal.includes("<<")) return true;
+  // zsh and ksh do not treat quotes inside (( )) as quotes, which desyncs the tracker.
+  if (literal.includes("((")) return true;
   // A `#` at the start of a word starts a comment that can swallow quotes.
   return /(^|[\s;&|()])#/.test(literal);
 }
@@ -63,13 +68,15 @@ function usesUnquotableSyntax(text: string): boolean {
  * Covers quoting context only. The app single-quotes every value, so a variable written
  * inside the author's own quotes would be wrapped twice and could break out of them. Values
  * passed to eval, bash -c, (( )), [[ ]], let, declare -i or array subscripts are still
- * interpreted by the shell, so command authors must not feed variables to those.
+ * interpreted by the shell, so command authors must not feed variables to those. The same holds
+ * for declare -a / typeset -a (a quoted '(...)' value is re-parsed as a compound assignment) and
+ * for zsh glob qualifiers such as `ls /tmp({{x}})` (an `e:cmd:` qualifier runs even when the
+ * value was quoted).
  *
  * Deliberately conservative: this is a simple quote tracker, not a shell parser. A variable is
  * accepted only in a clearly bare context. If the text uses syntax the tracker cannot follow
- * (backticks, `$(`, `$'`, `$[`, `${`, heredocs, comments, line continuations, `$` or a
- * backslash before a variable),
- * every variable is reported instead. Conditionals are rejected outright: whether an #if body
+ * (backticks, `$(`, `$'`, `$[`, `${`, `((`, heredocs, comments, line continuations, `$` or a
+ * backslash before a variable), every variable is reported instead. Conditionals are rejected outright: whether an #if body
  * renders changes the surrounding quote state, so no static check can cover both branches.
  */
 export function shellTemplateProblems(text: string): string[] {

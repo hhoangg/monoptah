@@ -104,6 +104,9 @@ describe("workflowTemplate", () => {
       ["A: line continuation hides $[", "echo $\\\n[1+{{x}}]"],
       ["A: CRLF line continuation", "echo $\\\r\n{{x}}"],
       ["A: line continuation joins $ and a quote", "echo $\\\n'\\' {{x}} '"],
+      ["C: arithmetic command desyncs quotes in zsh and ksh (single)", "(( 1 ' )) ; echo ' {{x}} '"],
+      ["C: arithmetic command after ||", "true || (( 1 ' )) ; echo ' {{x}} '"],
+      ["C: arithmetic command (double)", '(( 1 " )) ; echo " {{x}} "'],
       ["B: nested double quotes inside a parameter expansion", 'echo "${y:-"}{{x}}"}"'],
     ])("flags every var when the text has syntax it cannot follow (%s)", (_name, tpl) => {
       const problems = shellTemplateProblems(tpl);
