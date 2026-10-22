@@ -133,6 +133,17 @@ describe("workflowTemplate", () => {
       expect(shellTemplateProblems(tpl).some((p) => p.includes("{{x}}"))).toBe(true);
     });
 
+    it("flags a zsh glob qualifier written as word(", () => {
+      expect(shellTemplateProblems("ls /tmp({{x}})").some((p) => p.includes("{{x}}"))).toBe(true);
+      expect(shellTemplateProblems("ls /tmp/*.log(e:{{x}}:)").some((p) => p.includes("{{x}}"))).toBe(true);
+    });
+
+    it("allows parentheses that are not glob qualifiers", () => {
+      expect(shellTemplateProblems("(cd sub && ls) {{x}}")).toEqual([]);
+      expect(shellTemplateProblems('git commit -m "fix(parser): done" {{x}}')).toEqual([]);
+      expect(shellTemplateProblems("true && (echo hi) ; echo {{x}}")).toEqual([]);
+    });
+
     it("does not mistake other words for let, declare, typeset or eval", () => {
       expect(shellTemplateProblems("npm run evaluate {{x}}")).toEqual([]);
       expect(shellTemplateProblems("echo outlet {{x}}")).toEqual([]);
@@ -198,6 +209,27 @@ describe("workflowTemplate", () => {
       expect(shellDashProblems("ssh {{inputs.ok}}", scope)).toEqual([]);
       expect(shellDashProblems("ssh {{empty}} {{missing}}", scope)).toEqual([]);
       expect(shellDashProblems("echo a-{{x}} --opt={{x}}", scope)).toEqual([]);
+    });
+
+    it("sees through empty values and empty quotes glued before the variable", () => {
+      const glued = { a: "", b: "-oProxyCommand=x", c: "-x" };
+      expect(shellDashProblems("ssh {{a}}{{b}}", glued)).toHaveLength(1);
+      expect(shellDashProblems("ssh ''{{b}}", glued)).toHaveLength(1);
+      expect(shellDashProblems('ssh ""{{b}}', glued)).toHaveLength(1);
+      expect(shellDashProblems("ssh {{a}}{{a}}{{b}}", glued)).toHaveLength(1);
+      // A non-empty prefix means the word does not start with a dash.
+      expect(shellDashProblems("ssh x{{b}}", glued)).toEqual([]);
+      expect(shellDashProblems("ssh '-'{{b}}", glued)).toEqual([]);
+      expect(shellDashProblems("ssh 'a b'{{c}}", glued)).toEqual([]);
+      expect(shellDashProblems("ssh -- ''{{b}}", glued)).toEqual([]);
+      // Only the first variable of a word that starts with a dash is reported.
+      expect(shellDashProblems("ssh {{c}}{{b}}", glued)).toHaveLength(1);
+    });
+
+    it("suggests both remedies", () => {
+      const [message] = shellDashProblems("ssh {{x}}", scope);
+      expect(message).toContain('put "--" before it');
+      expect(message).toContain("--option={{x}}");
     });
 
     it("reports each offending occurrence once per occurrence", () => {

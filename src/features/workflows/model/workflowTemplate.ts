@@ -49,6 +49,9 @@ const IF_MESSAGE = "conditionals ({{#if}}) are not supported in command template
 // `let`, `declare`, `typeset` and `eval` as whole words, not inside `evaluate`, `outlet` or `eval-all`.
 const RE_PARSING_WORD = /(^|[^\w./-])(let|declare|typeset|eval)(?![\w./-])/;
 
+const QUOTED = /'[^']*'|"(?:\\.|[^"\\])*"/g;
+const GLUED_PAREN = /[^\s;&|()<>]\(/;
+
 /** True when the literal text uses shell syntax this check cannot reason about. */
 function usesUnquotableSyntax(text: string): boolean {
   // A backslash would escape the quote the app adds; a `$` would turn it into `$'...'`.
@@ -68,6 +71,9 @@ function usesUnquotableSyntax(text: string): boolean {
   // and a zsh glob qualifier (`*(e:cmd:)`) runs it.
   if (literal.includes("[[") || literal.includes("*(") || literal.includes("?(")) return true;
   if (RE_PARSING_WORD.test(literal)) return true;
+  // A `(` glued to the word before it is a zsh glob qualifier (`ls /tmp({{x}})`, `*.log(e:cmd:)`).
+  // Quoted text is not globbed, so `-m "fix(parser)"` is left alone.
+  if (GLUED_PAREN.test(literal.replace(QUOTED, "''"))) return true;
   // A `#` at the start of a word starts a comment that can swallow quotes.
   return /(^|[\s;&|()])#/.test(literal);
 }
@@ -79,7 +85,8 @@ function usesUnquotableSyntax(text: string): boolean {
  * inside the author's own quotes would be wrapped twice and could break out of them. Quoting
  * does not help when the shell parses a value a second time, so a template that uses any of
  * these is rejected for every variable: `eval`, `(( ))`, `[[ ]]`, `let`, `declare`, `typeset` and
- * zsh glob qualifiers such as `ls /tmp/*(e:cmd:)` (`*(` and `?(`). `bash -c` and array
+ * zsh glob qualifiers such as `ls /tmp/*(e:cmd:)` or `ls /tmp({{x}})` (a `(` glued to the word
+ * before it, outside quotes). `bash -c` and array
  * subscripts cannot be told apart from ordinary arguments, so command authors must not feed
  * variables to those. A value that starts with `-` is checked separately, against its rendered
  * value (see shellDashProblems).
@@ -150,22 +157,76 @@ function stringify(value: unknown): string {
 }
 
 /**
- * Problems with rendered values that start with `-`: a command that gets such a value as a word
- * of its own reads it as an option (`ssh {{host}}` with `-oProxyCommand=...`). A value is fine
- * after a standalone `--` earlier in the same simple command. A variable that is only part of a
- * word (`--flag={{x}}`) cannot become an option, so it is not reported.
+ * Problems with rendered values that start with `-`: a command that gets such a value as the
+ * start of a word reads it as an option (`ssh {{host}}` with `-oProxyCommand=...`). It looks at
+ * the word as the shell will see it, so an empty value or an empty `''` in front of the variable
+ * does not hide it (`ssh {{a}}{{b}}`). A value is fine after a standalone `--` earlier in the
+ * same simple command. A variable that follows other text in its word (`--flag={{x}}`, `a-{{x}}`)
+ * cannot become an option, so it is not reported.
  */
 export function shellDashProblems(text: string, scope: TemplateScope): string[] {
   const problems: string[] = [];
-  for (const m of text.matchAll(VAR)) {
-    if (m[1].startsWith("/") || !stringify(lookup(scope, m[1])).startsWith("-")) continue;
-    const before = text.slice(0, m.index);
-    if (before !== "" && !/[\s;&|(]$/.test(before)) continue;
-    const command = before.split(/[;&|\n]/).pop() ?? "";
-    if (/(^|\s)--(\s|$)/.test(command)) continue;
-    problems.push(
-      `{{${m[1]}}}: the value starts with "-" and would be read as an option; put "--" before it`,
-    );
+  let word = ""; // the current word as rendered so far
+  let inWord = false;
+  let plain = true; // no variable in the word yet
+  let endOfOptions = false;
+  let quote: string | null = null;
+  const endWord = () => {
+    if (inWord && plain && word === "--") endOfOptions = true;
+    word = "";
+    inWord = false;
+    plain = true;
+  };
+  const add = (chars: string) => {
+    word += chars;
+    inWord = true;
+  };
+  let i = 0;
+  while (i < text.length) {
+    if (text.startsWith("{{", i)) {
+      VAR_AT.lastIndex = i;
+      const m = VAR_AT.exec(text);
+      if (m) {
+        i = VAR_AT.lastIndex;
+        if (m[1].startsWith("/")) continue;
+        const value = stringify(lookup(scope, m[1]));
+        if (word === "" && value.startsWith("-") && !endOfOptions) {
+          problems.push(
+            `{{${m[1]}}}: the value starts with "-" and would be read as an option; ` +
+              `put "--" before it, or use the --option={{${m[1]}}} form`,
+          );
+        }
+        add(value);
+        plain = false;
+        continue;
+      }
+    }
+    const ch = text[i];
+    if (quote === null) {
+      if (ch === "\\") {
+        add(text.startsWith("{{", i + 1) ? "" : (text[i + 1] ?? ""));
+        i += text.startsWith("{{", i + 1) ? 1 : 2;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        inWord = true;
+      } else if (/\s/.test(ch) || ";&|()<>".includes(ch)) {
+        endWord();
+        if (ch === "\n" || ";&|(".includes(ch)) endOfOptions = false;
+      } else {
+        add(ch);
+      }
+    } else if (ch === quote) {
+      quote = null;
+    } else if (ch === "\\" && quote === '"' && !text.startsWith("{{", i + 1)) {
+      add(text[i + 1] ?? "");
+      i += 2;
+      continue;
+    } else {
+      add(ch);
+    }
+    i++;
   }
   return problems;
 }
