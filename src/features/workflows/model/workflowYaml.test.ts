@@ -5,6 +5,7 @@ import {
   exportPathProblem,
   exportWorkflow,
   finishImport,
+  inputValueProblems,
   previewImport,
   type ImportPreview,
 } from "./workflowYaml";
@@ -487,5 +488,31 @@ describe("finishImport", () => {
     const preview = ok(exportWorkflow(example()));
     const w = finishImport(preview, { project: "/p", clickupList: "x", stray: "y" }, 1);
     expect(w.inputValues).toEqual({ project: "/p", clickupList: "x" });
+  });
+});
+
+describe("inputValueProblems", () => {
+  const inputs = {
+    project: { type: "project" as const },
+    count: { type: "number" as const },
+  };
+  it("accepts matching values", () => {
+    expect(inputValueProblems(inputs, { project: "/p", count: 2 })).toEqual([]);
+  });
+  it("reports missing, mistyped, empty and undeclared values", () => {
+    expect(inputValueProblems(inputs, {})).toEqual([
+      'Missing a value for input "project"',
+      'Missing a value for input "count"',
+    ]);
+    expect(inputValueProblems(inputs, { project: " ", count: "2", extra: 1 })).toEqual([
+      'Input "project" needs a project',
+      'Input "count" must be a number',
+      'Unknown input "extra"; the workflow declares no such input',
+    ]);
+  });
+  it("does not read inherited keys as values", () => {
+    expect(inputValueProblems({ toString: { type: "string" } }, {})).toEqual([
+      'Missing a value for input "toString"',
+    ]);
   });
 });

@@ -305,13 +305,16 @@ Actions:
                   "project":{"type":"project"}},"inputValues":{"project":"<path
                   or name>"},"nodes":[...],"edges":[{"from":"a","to":"b"}]}}
                   or {"yaml":"<exported file>","values":{...}}. Add only after
-                  the user saw the steps and agreed. Node types: schedule
+                  the user saw the steps and agreed. A yaml file is always saved
+                  paused, like workflows.import, and the result lists its
+                  commands and prompts to review before workflows.resume. Node types: schedule
                   (schedule as in habits.add) or manual, session (project is
                   "{{inputs.<name>}}", prompt, checkout root | newWorktree |
                   {"worktreeOf":"<nodeId>"}, output fields), command, askMono
                   (question, answers), if (condition or decide "mono"), forEach
                   (in, as, maxParallel; its child nodes have "parent") and one
-                  report. Saved enabled only when "issues" is empty, else paused.
+                  report. A workflow object is saved enabled only when "issues" is
+                  empty (including every input having a valid value), else paused.
   workflows.update {"id":"...","workflow":{...}}  Replace the definition; the id,
                   inputValues, enabled state and run state are kept unless given.
   workflows.setInputs {"id":"...","values":{"project":"..."}}  Set input values.

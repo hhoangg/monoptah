@@ -27,6 +27,7 @@ import {
   exportPathProblem,
   exportWorkflow,
   finishImport,
+  inputValueProblems,
   previewImport,
 } from "../../workflows/model/workflowYaml";
 import type { AgentAppHost } from "./agentApp";
@@ -69,6 +70,8 @@ type Values = Workflow["inputValues"];
 type Definition = Pick<Workflow, "name" | "inputs" | "nodes" | "edges"> &
   Partial<Pick<Workflow, "description">>;
 
+const has = (obj: object, key: string) =>
+  Object.prototype.hasOwnProperty.call(obj, key);
 const isRec = (value: unknown): value is Rec =>
   !!value && typeof value === "object" && !Array.isArray(value);
 
@@ -115,6 +118,13 @@ function inputValues(value: unknown, name: string): Values {
   return values;
 }
 
+/** An interval schedule counts from the day it was created. */
+function anchorNode(node: WorkflowNode, now: number): WorkflowNode {
+  return node.type === "schedule" && !node.schedule.intervalFrom
+    ? { ...node, schedule: anchorSchedule(node.schedule, now) }
+    : node;
+}
+
 function definitionFrom(
   raw: unknown,
   now: number,
@@ -145,10 +155,7 @@ function definitionFrom(
         `nodes[${index}]${id ? ` ("${id}")` : ""} has an unknown type, lacks a required field or has one of the wrong type`,
       );
     }
-    // An interval counts from the day it was created.
-    return node.type === "schedule" && !node.schedule.intervalFrom
-      ? { ...node, schedule: anchorSchedule(node.schedule, now) }
-      : node;
+    return anchorNode(node, now);
   });
   if (raw.edges !== undefined && !Array.isArray(raw.edges))
     throw new Error("workflow.edges must be a list");
@@ -166,7 +173,7 @@ function definitionFrom(
   if (raw.inputs !== undefined) {
     if (!isRec(raw.inputs)) throw new Error("workflow.inputs must be an object");
     inputs = parseInputs(raw.inputs);
-    const lost = Object.keys(raw.inputs).filter((key) => !(key in inputs));
+    const lost = Object.keys(raw.inputs).filter((key) => !has(inputs, key));
     if (lost.length)
       throw new Error(
         `Invalid inputs: ${lost.join(", ")} (use letters, digits and underscores, and a type of project, string, number or boolean)`,
@@ -186,14 +193,12 @@ function definitionFrom(
   };
 }
 
-/** Problems that keep a workflow from running: its graph, and inputs without a value. */
+/** Problems that keep a workflow from running: its graph, and its input values. */
 function problems(w: Workflow): WorkflowIssue[] {
-  const missing = Object.keys(w.inputs)
-    .filter((name) => !Object.prototype.hasOwnProperty.call(w.inputValues, name))
-    .map((name) => ({
-      message: `Input "${name}" has no value; set it with workflows.setInputs`,
-    }));
-  return [...validateWorkflow(w), ...missing];
+  return [
+    ...validateWorkflow(w),
+    ...inputValueProblems(w.inputs, w.inputValues).map((message) => ({ message })),
+  ];
 }
 
 function scheduleOf(w: Workflow): HabitSchedule | undefined {
@@ -318,9 +323,11 @@ export async function handleWorkflows(
     case "workflows.add": {
       if ((input.workflow === undefined) === (input.yaml === undefined))
         throw new Error("Pass either workflow (an object) or yaml (text), not both");
+      const fromYaml = input.yaml !== undefined;
       let definition: Definition;
       let values: Values = {};
-      if (input.workflow !== undefined) {
+      let review: { commands: unknown[]; prompts: unknown[] } | undefined;
+      if (!fromYaml) {
         if (input.values !== undefined)
           throw new Error("values goes with yaml; put inputValues in the workflow");
         const parsed = definitionFrom(input.workflow, now, DEFINITION_FIELDS);
@@ -329,7 +336,11 @@ export async function handleWorkflows(
       } else {
         const preview = previewImport(text(input.yaml, "yaml", DEFINITION_MAX_BYTES));
         if (!preview.ok) throw new Error(preview.error);
-        definition = preview.preview.workflow;
+        definition = {
+          ...preview.preview.workflow,
+          nodes: preview.preview.workflow.nodes.map((node) => anchorNode(node, now)),
+        };
+        review = preview.preview;
         if (input.values !== undefined) values = inputValues(input.values, "values");
       }
       return change((list) => {
@@ -343,10 +354,23 @@ export async function handleWorkflows(
           createdAt: now,
         };
         const issues = problems(draft);
-        const created = scheduled({ ...draft, enabled: !issues.length }, now);
+        // A file from elsewhere is saved paused, like an import, so its commands and prompts are
+        // reviewed first. A definition written here is enabled once it is clean.
+        const created = scheduled({ ...draft, enabled: !fromYaml && !issues.length }, now);
         return {
           list: [...list, created],
-          result: { id: created.id, enabled: created.enabled, issues },
+          result: {
+            id: created.id,
+            enabled: created.enabled,
+            issues,
+            ...(review
+              ? {
+                  commands: review.commands,
+                  prompts: review.prompts,
+                  note: "Saved paused. Check the commands and prompts, then workflows.resume to enable it.",
+                }
+              : {}),
+          },
         };
       });
     }
@@ -388,24 +412,17 @@ export async function handleWorkflows(
       const values = inputValues(input.values, "values");
       return change((list) => {
         const current = find(list);
-        const undeclared = Object.keys(values).filter((key) => !(key in current.inputs));
-        if (undeclared.length)
+        // Only the values given are checked here; the rest may still be missing.
+        const given = Object.fromEntries(
+          Object.keys(values)
+            .filter((key) => has(current.inputs, key))
+            .map((key) => [key, current.inputs[key]]),
+        );
+        const bad = inputValueProblems(given, values);
+        if (bad.length)
           throw new Error(
-            `The workflow has no input named ${undeclared.join(", ")}; declared inputs: ${Object.keys(current.inputs).join(", ") || "none"}`,
+            `${bad.join("; ")}. Declared inputs: ${Object.keys(current.inputs).join(", ") || "none"}`,
           );
-        for (const [key, value] of Object.entries(values)) {
-          const type = current.inputs[key].type;
-          const ok =
-            type === "number"
-              ? typeof value === "number"
-              : type === "boolean"
-                ? typeof value === "boolean"
-                : typeof value === "string" && (type !== "project" || !!value.trim());
-          if (!ok)
-            throw new Error(
-              `Input "${key}" must be ${type === "number" ? "a number" : type === "boolean" ? "true or false" : type === "project" ? "a project path or name" : "text"}`,
-            );
-        }
         const next = { ...current, inputValues: { ...current.inputValues, ...values } };
         return {
           list: replace(list, next),

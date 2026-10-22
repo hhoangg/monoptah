@@ -151,7 +151,7 @@ describe("workflows.add", () => {
     const { inputValues: _values, ...bare } = definition();
     const result = (await call("workflows.add", { workflow: bare })) as Added;
     expect(result.enabled).toBe(false);
-    expect(result.issues[0].message).toContain('Input "project" has no value');
+    expect(result.issues[0].message).toBe('Missing a value for input "project"');
   });
 
   it("explains a node it cannot read and enforces limits", async () => {
@@ -171,7 +171,7 @@ describe("workflows.add", () => {
     );
   });
 
-  it("accepts a YAML file and keeps the values it is given", async () => {
+  it("saves a YAML file paused with the commands to review, and keeps the values it is given", async () => {
     const source = fixture();
     const { id } = (await source.call("workflows.add", { workflow: definition() })) as Added;
     const { yaml } = (await source.call("workflows.export", { id })) as { yaml: string };
@@ -179,9 +179,49 @@ describe("workflows.add", () => {
     const result = (await other.call("workflows.add", {
       yaml,
       values: { project: "/code/other" },
-    })) as Added;
-    expect(result).toMatchObject({ enabled: true, issues: [] });
-    expect(other.stored()[0].inputValues).toEqual({ project: "/code/other" });
+    })) as Added & { commands: unknown[]; prompts: { nodeId: string }[] };
+    expect(result).toMatchObject({ enabled: false, issues: [], commands: [] });
+    expect(result.prompts[0].nodeId).toBe("fetch");
+    expect(other.stored()[0]).toMatchObject({
+      enabled: false,
+      inputValues: { project: "/code/other" },
+    });
+    expect(other.stored()[0].nextRunAt).toBeUndefined();
+  });
+
+  it("anchors an interval schedule the same way from YAML and from JSON", async () => {
+    const interval = { kind: "interval", hours: 4, time: "09:00" };
+    const withInterval = definition({
+      nodes: definition().nodes.map((node) =>
+        node.type === "schedule" ? { ...node, schedule: interval } : node,
+      ),
+    });
+    const json = fixture();
+    const { id } = (await json.call("workflows.add", { workflow: withInterval })) as Added;
+    const { yaml } = (await json.call("workflows.export", { id })) as { yaml: string };
+    const fromYaml = fixture();
+    await fromYaml.call("workflows.add", { yaml, values: { project: "/code/app" } });
+    for (const store of [json, fromYaml])
+      expect(store.stored()[0].nodes[0]).toMatchObject({
+        schedule: { scheduleKind: "interval", intervalHours: 4, intervalFrom: "2026-10-22" },
+      });
+  });
+
+  it("turns bad, mistyped and undeclared input values into issues and saves paused", async () => {
+    const { call, stored } = fixture();
+    const cases: [Record<string, unknown>, RegExp][] = [
+      [{ project: "" }, /needs a project/],
+      [{ project: 7 }, /needs a project/],
+      [{ project: "/code/app", stray: "x" }, /Unknown input "stray"/],
+    ];
+    for (const [inputValues, message] of cases) {
+      const result = (await call("workflows.add", {
+        workflow: definition({ inputValues }),
+      })) as Added;
+      expect(result.enabled).toBe(false);
+      expect(result.issues.map((issue) => issue.message).join(" ")).toMatch(message);
+    }
+    expect(stored().every((w) => !w.enabled && w.nextRunAt === undefined)).toBe(true);
   });
 
   it("only a Mono's own conversation may manage workflows", async () => {
@@ -250,6 +290,25 @@ describe("workflows.update", () => {
     expect(result.enabled).toBe(false);
     expect(result.issues.length).toBeGreaterThan(0);
     expect(stored()[0].enabled).toBe(false);
+  });
+
+  it("pauses an update whose input values are bad, mistyped or undeclared", async () => {
+    const { call, stored } = fixture();
+    const { id } = (await call("workflows.add", { workflow: definition() })) as Added;
+    for (const inputValues of [{ project: "" }, { project: 7 }, { project: "/p", stray: 1 }]) {
+      await call("workflows.update", {
+        id,
+        workflow: definition({ inputValues: { project: "/code/app" }, enabled: true }),
+      });
+      expect(stored()[0].enabled).toBe(true);
+      const result = (await call("workflows.update", {
+        id,
+        workflow: definition({ inputValues }),
+      })) as Added;
+      expect(result.enabled).toBe(false);
+      expect(result.issues.length).toBeGreaterThan(0);
+      expect(stored()[0].enabled).toBe(false);
+    }
   });
 
   it("refuses an unknown id and runtime fields", async () => {
@@ -411,8 +470,18 @@ describe("pause, resume, setInputs, remove, get and runs", () => {
       call("workflows.setInputs", { id, values: { count: "x" } }),
     ).rejects.toThrow(/must be a number/);
     await expect(call("workflows.setInputs", { id, values: { nope: 1 } })).rejects.toThrow(
-      /no input named nope/,
+      /Unknown input "nope"/,
     );
+    await expect(call("workflows.setInputs", { id, values: { project: "" } })).rejects.toThrow(
+      /needs a project/,
+    );
+    await expect(call("workflows.setInputs", { id, values: { project: 7 } })).rejects.toThrow(
+      /needs a project/,
+    );
+    await expect(
+      call("workflows.setInputs", { id, values: { toString: "x" } }),
+    ).rejects.toThrow(/Unknown input "toString"/);
+    expect(stored()[0].inputValues).toEqual({ project: "/code/app", count: 3 });
   });
 
   it("removes a workflow unless it is running", async () => {

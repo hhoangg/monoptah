@@ -323,26 +323,42 @@ export function previewImport(
   return { ok: true, preview: { workflow, commands, prompts, issues } };
 }
 
-function checkInputValue(name: string, input: WorkflowInput, value: unknown): void {
-  if (value === undefined) throw new Error(`Missing a value for input "${name}"`);
+const has = (obj: object, key: string) => Object.prototype.hasOwnProperty.call(obj, key);
+
+/** What is wrong with one input's value, if anything. */
+function inputValueProblem(name: string, input: WorkflowInput, value: unknown): string | undefined {
+  if (value === undefined) return `Missing a value for input "${name}"`;
   switch (input.type) {
     case "project":
-      if (typeof value !== "string" || !value.trim()) {
-        throw new Error(`Input "${name}" needs a project`);
-      }
-      return;
+      return typeof value !== "string" || !value.trim() ? `Input "${name}" needs a project` : undefined;
     case "string":
-      if (typeof value !== "string") throw new Error(`Input "${name}" must be text`);
-      return;
+      return typeof value !== "string" ? `Input "${name}" must be text` : undefined;
     case "number":
-      if (typeof value !== "number" || !Number.isFinite(value)) {
-        throw new Error(`Input "${name}" must be a number`);
-      }
-      return;
+      return typeof value !== "number" || !Number.isFinite(value)
+        ? `Input "${name}" must be a number`
+        : undefined;
     case "boolean":
-      if (typeof value !== "boolean") throw new Error(`Input "${name}" must be true or false`);
-      return;
+      return typeof value !== "boolean" ? `Input "${name}" must be true or false` : undefined;
   }
+}
+
+/**
+ * Every way `values` does not fit the declared `inputs`: a declared input with no value or one
+ * of the wrong type (an empty project counts), and a value for an input that is not declared.
+ * The one rule behind imports, `workflows.setInputs` and validating a workflow before it is enabled.
+ */
+export function inputValueProblems(
+  inputs: Record<string, WorkflowInput>,
+  values: Workflow["inputValues"],
+): string[] {
+  const problems: string[] = [];
+  for (const [name, input] of Object.entries(inputs)) {
+    const problem = inputValueProblem(name, input, has(values, name) ? values[name] : undefined);
+    if (problem) problems.push(problem);
+  }
+  for (const name of Object.keys(values))
+    if (!has(inputs, name)) problems.push(`Unknown input "${name}"; the workflow declares no such input`);
+  return problems;
 }
 
 /**
@@ -355,14 +371,12 @@ export function finishImport(
   inputValues: Workflow["inputValues"],
   now: number,
 ): Workflow {
+  // Values for inputs the file does not declare are dropped, not an error.
   const values: Workflow["inputValues"] = {};
-  for (const [name, input] of Object.entries(preview.workflow.inputs)) {
-    const value = Object.prototype.hasOwnProperty.call(inputValues, name)
-      ? inputValues[name]
-      : undefined;
-    checkInputValue(name, input, value);
-    values[name] = value as string | number | boolean;
-  }
+  for (const name of Object.keys(preview.workflow.inputs))
+    if (has(inputValues, name)) values[name] = inputValues[name];
+  const [problem] = inputValueProblems(preview.workflow.inputs, values);
+  if (problem) throw new Error(problem);
   const { name, description, inputs, nodes, edges } = structuredClone(preview.workflow);
   return {
     id: newWorkflowId(),
