@@ -166,11 +166,11 @@ async function removeSession(
     const imagePaths = stopped?.blocks.flatMap((block) =>
       block.role === "image" && block.image ? [block.image.path] : [],
     ) ?? [];
-    await orchestrator.deleteSession(sessionId, () =>
-      deleteSession(sessionId, imagePaths, {
+    await orchestrator.deleteSession(sessionId, async () => {
+      await deleteSession(sessionId, imagePaths, {
         deleteProviderFiles: options.deleteProviderFiles === true,
-      }),
-    );
+      });
+    });
     options.workspace.apply({
       type: "orchestrationReleased",
       leadId: sessionId,

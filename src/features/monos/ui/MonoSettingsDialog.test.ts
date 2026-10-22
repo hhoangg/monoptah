@@ -63,7 +63,10 @@ afterEach(() => {
 async function render(
   runtimeMode: RuntimeMode = "auto",
   busy = false,
-  onReset?: () => Promise<void>,
+  onReset?: (options: {
+    deleteProviderFiles: boolean;
+  }) => Promise<string | void>,
+  providerFiles?: { label: string; hasFiles: boolean; note?: string },
 ) {
   await act(async () =>
     root.render(
@@ -81,6 +84,7 @@ async function render(
         onModelSettingsChange: vi.fn(),
         onRuntimeModeChange,
         onReset,
+        providerFiles,
         onClose,
       }),
     ),
@@ -172,6 +176,75 @@ it("resets once after confirmation", async () => {
   await act(async () => confirmButton("Reset conversation").click());
   expect(reset).toHaveBeenCalledOnce();
   expect(confirmButton("Cancel")).toBeUndefined();
+});
+
+const filesBox = () =>
+  document.querySelector<HTMLInputElement>(
+    '[role="dialog"]:not(:has([data-mono-settings])) input[type="checkbox"]',
+  );
+
+it("offers to delete the provider's session files, checked by default", async () => {
+  const reset = vi.fn(async () => {});
+  await render("auto", false, reset, { label: "Claude Code", hasFiles: true });
+  act(() => button("Reset", dialog()).click());
+  const confirm = confirmButton("Cancel").closest('[role="dialog"]')!;
+  expect(confirm.textContent).toContain(
+    "Also delete the Claude Code session files on this computer",
+  );
+  expect(confirm.textContent).toContain("They can't be recovered.");
+  expect(filesBox()!.checked).toBe(true);
+  await act(async () => confirmButton("Reset conversation").click());
+  expect(reset).toHaveBeenCalledExactlyOnceWith({ deleteProviderFiles: true });
+});
+
+it("resets exactly as before when the files box is unticked", async () => {
+  const reset = vi.fn(async () => {});
+  await render("auto", false, reset, { label: "Codex", hasFiles: true });
+  act(() => button("Reset", dialog()).click());
+  act(() => filesBox()!.click());
+  await act(async () => confirmButton("Reset conversation").click());
+  expect(reset).toHaveBeenCalledExactlyOnceWith({ deleteProviderFiles: false });
+});
+
+it("disables the files box and says why when there is nothing to delete", async () => {
+  const reset = vi.fn(async () => {});
+  await render("auto", false, reset, {
+    label: "Cursor",
+    hasFiles: false,
+    note: "Monoptah can't delete Cursor session files yet.",
+  });
+  act(() => button("Reset", dialog()).click());
+  const confirm = confirmButton("Cancel").closest('[role="dialog"]')!;
+  expect(filesBox()!.checked).toBe(false);
+  expect(filesBox()!.disabled).toBe(true);
+  expect(confirm.textContent).toContain(
+    "Monoptah can't delete Cursor session files yet.",
+  );
+  await act(async () => confirmButton("Reset conversation").click());
+  expect(reset).toHaveBeenCalledExactlyOnceWith({ deleteProviderFiles: false });
+});
+
+it("leaves out the files box when the Mono gives no provider files", async () => {
+  await render(
+    "auto",
+    false,
+    vi.fn(async () => {}),
+  );
+  act(() => button("Reset", dialog()).click());
+  expect(filesBox()).toBeNull();
+});
+
+it("shows the message the reset returns once the dialog has closed", async () => {
+  const reset = vi.fn(
+    async () => "Conversation reset. Could not delete some files.",
+  );
+  await render("auto", false, reset, { label: "Codex", hasFiles: true });
+  act(() => button("Reset", dialog()).click());
+  await act(async () => confirmButton("Reset conversation").click());
+  expect(confirmButton("Cancel")).toBeUndefined();
+  expect(dialog().querySelector('[role="status"]')!.textContent).toBe(
+    "Conversation reset. Could not delete some files.",
+  );
 });
 
 it("lets the user choose every permission mode and reflects the saved choice", async () => {

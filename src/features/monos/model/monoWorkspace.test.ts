@@ -206,6 +206,148 @@ it("keeps the original chat and context if deletion fails", async () => {
   expect(replace).not.toHaveBeenCalled();
 });
 
+const UUID_A = "11111111-1111-4111-8111-111111111111";
+const UUID_B = "22222222-2222-4222-8222-222222222222";
+
+/** A Mono chat on Claude Code whose context rotation already retired UUID_B. */
+function claudeMono() {
+  const current = {
+    ...newSession("claude", "/project"),
+    id: "resident",
+    providerSessionId: UUID_A,
+  };
+  const monoId = monoFor(current.cwd, current.id);
+  saveMonoRotation(current.id, {
+    at: 1,
+    reason: "context",
+    earlier: [],
+    retired: [{ harness: "claude", id: UUID_B }],
+  });
+  return { current, monoId };
+}
+
+it("passes the provider sessions to remove when asked, reading them before the record is forgotten", async () => {
+  const { current } = claudeMono();
+  const stop = vi.fn(async () => current);
+  const remove = vi.fn(async () => {
+    expect(loadMonoRotation(current.id)).toBeDefined();
+    return [] as string[];
+  });
+  const warn = vi.fn();
+  await resetMonoSession(
+    current,
+    { stop, remove, replace: vi.fn(), warn },
+    { deleteProviderFiles: true },
+  );
+  expect(remove).toHaveBeenCalledExactlyOnceWith(current, {
+    sessions: [
+      { harness: "claude", id: UUID_A },
+      { harness: "claude", id: UUID_B },
+    ],
+  });
+  expect(warn).not.toHaveBeenCalled();
+  expect(loadMonoRotation(current.id)).toBeUndefined();
+});
+
+it("uses the live stopped session's provider id, not the stale one", async () => {
+  const { current } = claudeMono();
+  const stopped = { ...current, providerSessionId: undefined };
+  const remove = vi.fn(async () => [] as string[]);
+  await resetMonoSession(
+    current,
+    { stop: async () => stopped, remove, replace: vi.fn() },
+    { deleteProviderFiles: true },
+  );
+  expect(remove).toHaveBeenCalledExactlyOnceWith(stopped, {
+    sessions: [{ harness: "claude", id: UUID_B }],
+  });
+});
+
+it("calls remove with one argument when the option is off or missing", async () => {
+  for (const options of [undefined, {}, { deleteProviderFiles: false }]) {
+    const { current } = claudeMono();
+    const remove = vi.fn(async () => {});
+    const warn = vi.fn();
+    await resetMonoSession(
+      current,
+      { stop: async () => current, remove, replace: vi.fn(), warn },
+      options,
+    );
+    expect(remove).toHaveBeenCalledExactlyOnceWith(current);
+    expect(warn).not.toHaveBeenCalled();
+  }
+});
+
+it("reports provider file problems after the reset without throwing", async () => {
+  const { current, monoId } = claudeMono();
+  const order: string[] = [];
+  const remove = vi.fn(async () => ["Could not delete one file"]);
+  const replace = vi.fn(() => order.push("replace"));
+  const warn = vi.fn(() => order.push("warn"));
+  const fresh = await resetMonoSession(
+    current,
+    { stop: async () => current, remove, replace, warn },
+    { deleteProviderFiles: true },
+  );
+  expect(order).toEqual(["replace", "warn"]);
+  expect(warn).toHaveBeenCalledExactlyOnceWith(["Could not delete one file"]);
+  expect(sessionOf(monoId)).toBe(fresh.id);
+  expect(loadMonoRotation(current.id)).toBeUndefined();
+});
+
+it("does not need a warn handler to survive provider file problems", async () => {
+  const { current } = claudeMono();
+  await expect(
+    resetMonoSession(
+      current,
+      {
+        stop: async () => current,
+        remove: async () => ["Could not delete one file"],
+        replace: vi.fn(),
+      },
+      { deleteProviderFiles: true },
+    ),
+  ).resolves.toBeDefined();
+});
+
+it("does not pass a provider list when the harness is unsupported and nothing was retired", async () => {
+  const current = {
+    ...newSession("cursor", "/project"),
+    id: "resident",
+    providerSessionId: UUID_A,
+  };
+  monoFor(current.cwd, current.id);
+  const remove = vi.fn(async () => [] as string[]);
+  await resetMonoSession(
+    current,
+    { stop: async () => current, remove, replace: vi.fn() },
+    { deleteProviderFiles: true },
+  );
+  expect(remove).toHaveBeenCalledExactlyOnceWith(current);
+});
+
+it("still aborts the reset when removal fails with provider files requested", async () => {
+  const { current, monoId } = claudeMono();
+  const replace = vi.fn();
+  const warn = vi.fn();
+  await expect(
+    resetMonoSession(
+      current,
+      {
+        stop: async () => current,
+        remove: vi.fn().mockRejectedValue(new Error("Storage unavailable")),
+        replace,
+        warn,
+      },
+      { deleteProviderFiles: true },
+    ),
+  ).rejects.toThrow("Storage unavailable");
+  expect(replace).not.toHaveBeenCalled();
+  expect(warn).not.toHaveBeenCalled();
+  expect(sessionOf(monoId)).toBe(current.id);
+  expect(loadMonoRotation(current.id)?.retired).toHaveLength(1);
+});
+
 it("does not delete a conversation when stopping it fails", async () => {
   const current = chat("resident");
   const monoId = monoFor(current.cwd, current.id);

@@ -52,6 +52,7 @@ import type { SessionSurface } from "../../providers/model/providerSurface";
 import { restoreOrchestrationProposal } from "../../orchestration/model/orchestrationPlan";
 
 import type { OrchestrationSummary } from "../../orchestration/model/orchestrationSummary";
+import type { ProviderSessionRef } from "../../monos/model/monoProviderFiles";
 
 export type SessionSummary = {
   sidebarHidden?: boolean;
@@ -820,8 +821,12 @@ export function backfillCodexShellCommands(blocks: Block[]): Block[] {
 export async function deleteSession(
   sessionId: string,
   imagePaths: string[] = [],
-  options: { deleteProviderFiles?: boolean } = {},
-): Promise<void> {
+  options: {
+    deleteProviderFiles?: boolean;
+    /** A Mono reset: also remove these provider sessions' own files. */
+    monoReset?: { sessions: ProviderSessionRef[] };
+  } = {},
+): Promise<string[]> {
   deletedSessionIds.add(sessionId);
   try {
     // A lead with workers still has writes in flight. Finish those before
@@ -834,11 +839,12 @@ export async function deleteSession(
       )
       .map(([, pending]) => pending);
     if (pendingWrites.length > 0) await Promise.all(pendingWrites);
-    await enqueueSessionWrite(sessionId, () =>
-      invoke<void>("session_delete", {
+    const problems = await enqueueSessionWrite(sessionId, () =>
+      invoke<string[] | undefined>("session_delete", {
         sessionId,
         imagePaths,
         ...(options.deleteProviderFiles ? { deleteProviderFiles: true } : {}),
+        ...(options.monoReset ? { monoReset: options.monoReset } : {}),
       }),
     );
     monoSavedBlocks.delete(sessionId);
@@ -847,6 +853,7 @@ export async function deleteSession(
       60_000,
     );
     if (typeof tombstone === "object") tombstone.unref();
+    return Array.isArray(problems) ? problems : [];
   } catch (error) {
     deletedSessionIds.delete(sessionId);
     throw error;

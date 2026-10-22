@@ -703,8 +703,13 @@ import {
   updateHabits,
 } from "../features/monos/model/monoHabits";
 import {
+  monoProviderFiles,
+  providerFilesProblemMessage,
+} from "../features/monos/model/monoProviderFiles";
+import {
   loadMonoRotation,
   planRotation,
+  retiredProviderSessions,
   rotationReason,
   saveMonoRotation,
 } from "../features/monos/model/monoRotation";
@@ -5489,7 +5494,10 @@ function Workspace({
   );
 
   const onResetMono = useCallback(
-    async (sessionId: string): Promise<void> => {
+    async (
+      sessionId: string,
+      options?: { deleteProviderFiles?: boolean },
+    ): Promise<string | void> => {
       const current = sessionsRef.current.find(
         (session) => session.id === sessionId,
       );
@@ -5501,6 +5509,8 @@ function Workspace({
       removingSessionIds.current.add(sessionId);
       pendingPersist.current.delete(sessionId);
       invalidateLoadedSession(sessionId);
+      let message: string | undefined;
+      let providerLabel = "";
       try {
         await resetMonoSession(current, {
           stop: async (id) => {
@@ -5515,7 +5525,12 @@ function Workspace({
             setSessions(sessionsRef.current);
             return stopped;
           },
-          remove: async (stopped) => {
+          remove: async (stopped, provider) => {
+            // Read before the reset forgets the rotation record.
+            providerLabel = monoProviderFiles(
+              stopped,
+              retiredProviderSessions(sessionId),
+            ).label;
             await Promise.all(
               sessionChildHarnesses(stopped).map((harness) =>
                 forgetHarnessSession(harness, sessionId),
@@ -5525,8 +5540,21 @@ function Workspace({
             const imagePaths = stopped.blocks.flatMap((block) =>
               block.role === "image" && block.image ? [block.image.path] : [],
             );
-            await orchestrator.deleteSession(sessionId, () =>
-              deleteSession(sessionId, imagePaths),
+            let problems: string[] = [];
+            await orchestrator.deleteSession(sessionId, async () => {
+              problems = await deleteSession(
+                sessionId,
+                imagePaths,
+                provider ? { monoReset: provider } : undefined,
+              );
+            });
+            return problems;
+          },
+          warn: (problems) => {
+            console.error("Mono reset left provider session files:", problems);
+            message = providerFilesProblemMessage(
+              providerLabel,
+              problems.length,
             );
           },
           replace: (fresh) => {
@@ -5553,7 +5581,8 @@ function Workspace({
               setComposerFocusToken((token) => token + 1);
             }
           },
-        });
+        }, options);
+        return message;
       } finally {
         removingSessionIds.current.delete(sessionId);
       }
@@ -8172,6 +8201,8 @@ function Workspace({
             loadMonoRotation(sessionId),
             monoRotationReason,
             Date.now(),
+            // The rotation leaves this provider session's files on disk.
+            { harness: current.harness, id: current.providerSessionId },
           )
         : undefined;
 
@@ -14494,6 +14525,26 @@ function Workspace({
     () => (monoViewBlocks ? artifactCards(monoViewBlocks) : []),
     [monoViewBlocks],
   );
+  // Rotation retires provider sessions in storage; read them only while the
+  // settings dialog is open and the conversation's provider session changes.
+  const monoSettingsOpen = monoSettingsFor !== null;
+  const monoViewSessionId = monoViewSession?.id;
+  const monoViewHarness = monoViewSession?.harness;
+  const monoViewProviderId = monoViewSession?.providerSessionId;
+  const monoProviderFilesInfo = useMemo(() => {
+    if (!monoSettingsOpen || !monoViewSessionId || !monoViewHarness)
+      return undefined;
+    const files = monoProviderFiles(
+      { harness: monoViewHarness, providerSessionId: monoViewProviderId },
+      retiredProviderSessions(monoViewSessionId),
+    );
+    return { label: files.label, hasFiles: files.supported, note: files.note };
+  }, [
+    monoSettingsOpen,
+    monoViewSessionId,
+    monoViewHarness,
+    monoViewProviderId,
+  ]);
   const monoActivityView =
     monoViewSession && selectedMonoActivity ? (
       <MonoActivityView
@@ -14680,7 +14731,8 @@ function Workspace({
         onRuntimeModeChange={(mode) =>
           onRuntimeModeChange(monoViewSession.id, mode)
         }
-        onReset={() => onResetMono(monoViewSession.id)}
+        onReset={(options) => onResetMono(monoViewSession.id, options)}
+        providerFiles={monoProviderFilesInfo}
         onClose={() => setMonoSettingsFor(null)}
       />
     ) : null;
