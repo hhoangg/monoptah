@@ -209,6 +209,11 @@ export type NodeRun = {
   status: NodeStatus;
   round: number;
   sessionId?: string;
+  /**
+   * The loop session (round 2 or later) of a node that was interrupted while running, so a
+   * resumed run continues in it instead of opening a new session and worktree.
+   */
+  reuseSessionId?: string;
   output?: Record<string, unknown>;
   error?: string;
   decision?: { value: string; reason?: string };

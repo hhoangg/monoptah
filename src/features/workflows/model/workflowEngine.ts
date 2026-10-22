@@ -695,8 +695,8 @@ export function nextActions(run: WorkflowRun): EngineAction[] {
           branch: r.branch,
           round: r.round,
           prompt: instruction ? `${prompt}\n\n${instruction}` : prompt,
-          ...(node.reuseSession !== false && r.round > 1 && r.sessionId
-            ? { reuseSessionId: r.sessionId }
+          ...(node.reuseSession !== false && r.round > 1 && (r.sessionId ?? r.reuseSessionId)
+            ? { reuseSessionId: r.sessionId ?? r.reuseSessionId }
             : {}),
         });
         break;
@@ -793,6 +793,7 @@ export function applyEvent(run: WorkflowRun, event: EngineEvent): WorkflowRun {
         r.status = "running";
         r.startedAt = event.at;
         delete r.endedAt;
+        delete r.reuseSessionId;
         if (event.sessionId !== undefined) r.sessionId = event.sessionId;
       } else if (openLoop(d.g, r)) {
         // The loop question went out: the node stays finished but is no longer to be re-asked.
@@ -845,7 +846,10 @@ export function applyEvent(run: WorkflowRun, event: EngineEvent): WorkflowRun {
   return d.run;
 }
 
-/** Running nodes go back to pending; finished nodes stay finished. */
+/**
+ * Running nodes go back to pending; finished nodes stay finished. A node in loop round 2 or later
+ * keeps its session as `reuseSessionId`, so resuming continues it.
+ */
 export function markInterrupted(run: WorkflowRun): WorkflowRun {
   if (run.status !== "running") return run;
   const g = graphOf(run.definition);
@@ -858,8 +862,10 @@ export function markInterrupted(run: WorkflowRun): WorkflowRun {
       if (g.byId.get(n.nodeId)?.type === "forEach") return n;
       // Waiting on the Mono about a loop: the node itself had finished, only the question is lost.
       if (isAsking(n)) return { ...n, status: "done" };
-      const { sessionId: _sessionId, startedAt: _startedAt, ...rest } = n;
-      return { ...rest, status: "pending" };
+      const { sessionId, reuseSessionId, startedAt: _startedAt, ...rest } = n;
+      // From round 2 on the node continues the loop session; a first round starts fresh.
+      const keep = n.round > 1 ? (sessionId ?? reuseSessionId) : undefined;
+      return { ...rest, status: "pending", ...(keep !== undefined ? { reuseSessionId: keep } : {}) };
     }),
   };
 }

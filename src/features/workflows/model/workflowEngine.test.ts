@@ -833,6 +833,46 @@ describe("workflowEngine", () => {
     expect(applyEvent(hurt, { kind: "nodeFinished", nodeId: "dev", branch: "each#0", output: {}, at })).toBe(hurt);
   });
 
+  describe("resuming a node that was mid-session", () => {
+    const startAction = (run: WorkflowRun) => {
+      const [action] = sessions(nextActions(run));
+      if (action?.kind !== "startSession") throw new Error("no startSession");
+      return action;
+    };
+
+    it("reuses the loop session of round 2 or later", () => {
+      let run = startRun(devReview("mono"), "manual", at, "r");
+      run = complete(started(run, "dev", "", "s-dev"), "dev", { pr_url: "p1" });
+      run = complete(run, "review", { verdict: "no" });
+      run = started(run, "review");
+      run = decided(run, "review", "loop");
+      run = started(run, "dev", "", "s-dev-2"); // dev is running round 2
+      const resumed = resumeRun(markInterrupted(run));
+      expect(nodeOf(resumed, "dev").sessionId).toBeUndefined();
+      expect(startAction(resumed)).toMatchObject({ nodeId: "dev", round: 2, reuseSessionId: "s-dev-2" });
+      // Interrupted again before it restarted: the id is not lost.
+      expect(startAction(resumeRun(markInterrupted(resumed)))).toMatchObject({ reuseSessionId: "s-dev-2" });
+    });
+
+    it("does not reuse when the node opted out of reuse", () => {
+      let run = startRun(devReview("mono", 3, false), "manual", at, "r");
+      run = complete(started(run, "dev", "", "s-dev"), "dev", {});
+      run = complete(run, "review", {});
+      run = started(run, "review");
+      run = decided(run, "review", "loop");
+      run = started(run, "dev", "", "s-dev-2");
+      expect(startAction(resumeRun(markInterrupted(run))).reuseSessionId).toBeUndefined();
+    });
+
+    it("re-runs a round 1 session fresh", () => {
+      let run = startRun(devReview("mono"), "manual", at, "r");
+      run = started(run, "dev", "", "s-dev");
+      const action = startAction(resumeRun(markInterrupted(run)));
+      expect(action.round).toBe(1);
+      expect(action.reuseSessionId).toBeUndefined();
+    });
+  });
+
   it("resumeRun never re-emits a done node", () => {
     let run = startRun(fanOut(), "manual", at, "r");
     run = complete(run, "fetch", { tickets: TICKETS });
