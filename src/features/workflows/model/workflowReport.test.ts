@@ -124,6 +124,45 @@ describe("composeReport", () => {
     expect(text).not.toContain("https://x/old-ok");
   });
 
+  it("lists a failed archived branch at an index the current list no longer has", () => {
+    const run = runOf(
+      fanOut(),
+      [
+        nodeRun({ nodeId: "dev", branch: "each#0", output: { pr_url: "https://x/1" }, endedAt: 9 }),
+        nodeRun({ nodeId: "dev", branch: "each#0@r1", output: { pr_url: "https://x/old" }, endedAt: 4 }),
+        nodeRun({ nodeId: "dev", branch: "each#1@r1", status: "failed", error: "lost in round 1" }),
+      ],
+      {
+        status: "doneWithFailures",
+        items: { each: [{ title: "A" }], "each@r1": [{ title: "A" }, { title: "B" }] },
+      },
+    );
+    const { text } = composeReport(run);
+    expect(text).toContain("### B · round 1\n- Status: failed");
+    expect(text).toContain("Error in dev: lost in round 1");
+    expect(text).not.toContain("### B\n");
+    expect(text).not.toContain("A · round 1");
+  });
+
+  it("still lists archived failures when the For each never expanded again", () => {
+    const d = fanOut();
+    const run = runOf(
+      d,
+      [
+        nodeRun({ nodeId: "dev", branch: "each#0@r1", status: "failed", error: "boom" }),
+        nodeRun({ nodeId: "dev", branch: "each#1@r1" }),
+      ],
+      { status: "doneWithFailures", items: { "each@r1": [{ title: "A" }, { title: "B" }] } },
+    );
+    const { text } = composeReport(run);
+    expect(text).toContain("### A · round 1\n- Status: failed");
+    expect(text).toContain("Error in dev: boom");
+    expect(text).not.toContain("B · round 1");
+    // Without the old item list the title falls back to the place.
+    const bare = runOf(d, [run.nodes[0]], { status: "doneWithFailures", items: {} });
+    expect(composeReport(bare).text).toContain("### #1 · round 1");
+  });
+
   it("lists an archived branch that hit max rounds", () => {
     const d = fanOut();
     const run = runOf(

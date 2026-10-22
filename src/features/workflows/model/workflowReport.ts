@@ -3,6 +3,7 @@
 import {
   archivedBranch,
   archivedItemsKey,
+  parseBranch,
   type NodeId,
   type NodeRun,
   type OutputField,
@@ -148,13 +149,29 @@ function nodeType(run: WorkflowRun, nodeId: NodeId): string {
   return run.definition.nodes.find((n) => n.id === nodeId)?.type ?? "";
 }
 
-/** The loop rounds of a For each whose branches were archived, oldest first. */
-function archivedRounds(run: WorkflowRun, groupId: NodeId): number[] {
+/**
+ * The indices of a For each's archived branches by loop round, from the branches the run has and
+ * from the item lists it archived. A round is known by either, so a group whose current list is
+ * gone or shorter still reports what failed in an earlier round.
+ */
+function archivedIndices(run: WorkflowRun, groupId: NodeId): Map<number, Set<number>> {
+  const rounds = new Map<number, Set<number>>();
+  const add = (round: number, index: number) => {
+    const known = rounds.get(round) ?? new Set<number>();
+    known.add(index);
+    rounds.set(round, known);
+  };
+  for (const n of run.nodes) {
+    const parts = parseBranch(n.branch);
+    if (parts?.round !== undefined && parts.groupId === groupId) add(parts.round, parts.index);
+  }
   const prefix = `${groupId}@r`;
-  return Object.keys(run.items)
-    .filter((key) => key.startsWith(prefix) && /^\d+$/.test(key.slice(prefix.length)))
-    .map((key) => Number(key.slice(prefix.length)))
-    .sort((a, b) => a - b);
+  for (const [key, list] of Object.entries(run.items)) {
+    if (!key.startsWith(prefix) || !/^\d+$/.test(key.slice(prefix.length))) continue;
+    const round = Number(key.slice(prefix.length));
+    for (let index = 0; index < list.length; index++) add(round, index);
+  }
+  return rounds;
 }
 
 /** Branch results in report order, plus the For each nodes that had nothing to run. */
@@ -164,13 +181,19 @@ function collect(run: WorkflowRun): { results: BranchResult[]; empty: string[]; 
   const empty: string[] = [];
   for (const group of groups) {
     const items = run.items[group.id];
-    if (items === undefined) continue;
-    if (items.length === 0) empty.push(nodeLabel(run, group.id));
-    const rounds = archivedRounds(run, group.id);
-    items.forEach((item, index) => {
-      results.push(resultOf(run, `${group.id}#${index}`, itemLabel(item, index)));
+    const archived = archivedIndices(run, group.id);
+    if (items === undefined && archived.size === 0) continue;
+    if (items?.length === 0) empty.push(nodeLabel(run, group.id));
+    const rounds = [...archived.keys()].sort((a, b) => a - b);
+    const current = items ?? [];
+    const last = Math.max(current.length - 1, ...[...archived.values()].flatMap((set) => [...set]));
+    for (let index = 0; index <= last; index++) {
+      if (index < current.length) {
+        results.push(resultOf(run, `${group.id}#${index}`, itemLabel(current[index], index)));
+      }
       // Earlier loop rounds are archived. They only matter when something went wrong in them.
       for (const round of rounds) {
+        if (!archived.get(round)?.has(index)) continue;
         const old = run.items[archivedItemsKey(group.id, round)]?.[index];
         const earlier = resultOf(
           run,
@@ -181,7 +204,7 @@ function collect(run: WorkflowRun): { results: BranchResult[]; empty: string[]; 
           results.push(earlier);
         }
       }
-    });
+    }
   }
   // Work outside any For each. With no For each at all this is the whole run.
   // Next to a For each it also lists the outputs of steps before or after it (e.g. a summary).
