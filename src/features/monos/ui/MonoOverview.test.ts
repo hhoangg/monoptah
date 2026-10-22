@@ -2,6 +2,9 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { WORKFLOWS_MAX, type Workflow } from "../../workflows/model/workflow";
+import { exportWorkflow } from "../../workflows/model/workflowYaml";
+import { workflow } from "../../workflows/ui/workflowUiFixtures";
 import { MonoOverview, type MonoOverviewTab } from "./MonoOverview";
 
 vi.mock("../model/monoHabits", async (original) => ({
@@ -9,9 +12,20 @@ vi.mock("../model/monoHabits", async (original) => ({
   loadHabits: async () => [],
 }));
 
+const saved = vi.hoisted(() => ({ workflows: [] as Workflow[] }));
+
 vi.mock("../../workflows/model/workflowStore", async (original) => ({
   ...(await original<object>()),
-  loadWorkflows: async () => [],
+  loadWorkflows: async () => [...saved.workflows],
+  updateWorkflows: async (
+    _monoId: string,
+    edit: (list: Workflow[]) => { workflows: Workflow[]; result: unknown },
+  ) => {
+    const { workflows, result } = edit([...saved.workflows]);
+    saved.workflows = workflows;
+    window.dispatchEvent(new CustomEvent("monocode:mono-files-changed"));
+    return result;
+  },
 }));
 
 vi.mock("./MonoChangesView", () => ({
@@ -39,6 +53,7 @@ let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
+  saved.workflows = [];
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal(
     "ResizeObserver",
@@ -287,7 +302,7 @@ it("offers New and Import workflow only on Workflows, and says how to fill it", 
   ).toContain("Ask Broski to chain sessions into a workflow, or create one with +.");
 });
 
-it("opens the board from New, and a placeholder from Import until its page arrives", async () => {
+it("opens the board from New, and the import page from Import", async () => {
   vi.stubGlobal(
     "DOMMatrixReadOnly",
     class {
@@ -316,6 +331,56 @@ it("opens the board from New, and a placeholder from Import until its page arriv
       .querySelector<HTMLButtonElement>('[aria-label="Import workflow"]')!
       .click(),
   );
-  expect(container.querySelector("[data-workflow-placeholder]")).not.toBeNull();
-  expect(container.textContent).toContain("Not available yet");
+  expect(container.querySelector("[data-import-workflow]")).not.toBeNull();
+  expect(container.textContent).toContain("Import workflow");
+});
+
+it("opens the imported workflow after the import page", async () => {
+  await render("workflows");
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="Import workflow"]')!
+      .click(),
+  );
+  const area = container.querySelector<HTMLTextAreaElement>(
+    "textarea[aria-label='Workflow file text']",
+  )!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )!.set!.call(
+      area,
+      exportWorkflow(workflow({ name: "Brought in", enabled: true })),
+    );
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>("button[data-import-paused]")!
+      .click(),
+  );
+  expect(saved.workflows).toHaveLength(1);
+  expect(saved.workflows[0].enabled).toBe(false);
+  const page = container.querySelector(
+    `[data-workflow-page="${saved.workflows[0].id}"]`,
+  );
+  expect(page).not.toBeNull();
+  expect(page!.textContent).toContain("Brought in");
+  expect(page!.textContent).toContain("Paused");
+});
+
+it("turns Import off at the workflow limit, as it does New", async () => {
+  saved.workflows = Array.from({ length: WORKFLOWS_MAX }, (_, i) =>
+    workflow({ id: `wf-full${i}`, name: `Flow ${i}` }),
+  );
+  await render("workflows");
+  const label = `At most ${WORKFLOWS_MAX} workflows`;
+  const buttons = [
+    ...container.querySelectorAll<HTMLButtonElement>(`[aria-label="${label}"]`),
+  ];
+  expect(buttons).toHaveLength(2);
+  expect(
+    buttons.every((button) => button.getAttribute("aria-disabled") === "true"),
+  ).toBe(true);
 });

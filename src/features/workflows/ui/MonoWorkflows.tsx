@@ -16,7 +16,7 @@ import {
 } from "../../monos/model/monoHabits";
 import { RunningFor } from "../../monos/ui/HabitPage";
 import { HabitButton } from "../../monos/ui/MonoHabits";
-import { Hint, PageHeader, Empty } from "../../monos/ui/monoPanelParts";
+import { Hint, Empty } from "../../monos/ui/monoPanelParts";
 import {
   triggerOf,
   type Workflow,
@@ -416,27 +416,6 @@ export function WorkflowsList({
           />
         ))}
       </ul>
-    </div>
-  );
-}
-
-/**
- * A page whose editor has not arrived yet: the board, a new workflow and an import open
- * here until their own pages replace it.
- */
-export function WorkflowPlaceholderPage({
-  title,
-  onBack,
-}: {
-  title: string;
-  onBack: () => void;
-}) {
-  return (
-    <div className="flex min-h-0 flex-1 flex-col" data-workflow-placeholder>
-      <PageHeader title={title} onBack={onBack} />
-      <div className="min-h-0 flex-1 overflow-y-auto overscroll-none">
-        <Empty>Not available yet</Empty>
-      </div>
     </div>
   );
 }

@@ -13,6 +13,11 @@ import type {
 } from "../../features/workflows/model/workflow";
 import { validateWorkflow } from "../../features/workflows/model/workflowParse";
 import {
+  exportWorkflow,
+  finishImport,
+  previewImport,
+} from "../../features/workflows/model/workflowYaml";
+import {
   markInterrupted,
   startRun,
 } from "../../features/workflows/model/workflowEngine";
@@ -386,6 +391,40 @@ describe("useMonoWorkflows", () => {
     expect(stored()[0].runRequested).toBeUndefined();
     // A requested run leaves the schedule where it was.
     expect(stored()[0].nextRunAt).toBeGreaterThan(Date.now() + 3_000_000);
+  });
+
+  it("an imported manual workflow runs on request and posts its report", async () => {
+    const source = workflow(
+      [
+        { id: "trigger", type: "manual" },
+        session("dev", { summary: { type: "string", inReport: true } }),
+        report,
+      ],
+      [
+        { from: "trigger", to: "dev" },
+        { from: "dev", to: "report" },
+      ],
+      { nextRunAt: undefined },
+    );
+    const read = previewImport(exportWorkflow(source));
+    if (!read.ok) throw new Error(read.error);
+    const imported = finishImport(read.preview, { repo: "/code/app" }, Date.now());
+    expect(imported.enabled).toBe(false);
+    save([{ ...imported, id: WF, runRequested: true }]);
+    const host = makeHost({ replies: [fenced({ summary: "echoed" })] });
+    mount(host);
+    await vi.waitFor(() => expect(host.post).toHaveBeenCalled());
+    const [, , , title, text] = host.post.mock.calls[0];
+    expect(title).toBe("Ship it · completed");
+    expect(text).toContain("echoed");
+    await vi.waitFor(() => expect(storedRuns()[0]?.status).toBe("done"));
+    expect(storedRuns()[0].trigger).toBe("manual");
+    expect(storedRuns()[0].nodes.find((n) => n.nodeId === "dev")).toMatchObject({
+      status: "done",
+      output: { summary: "echoed" },
+    });
+    // A manual workflow stays paused; only the request ran it.
+    expect(stored()[0].enabled).toBe(false);
   });
 
   it("skips a tick while previous run is running", async () => {

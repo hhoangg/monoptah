@@ -22,10 +22,10 @@ import { WORKFLOWS_MAX } from "../../workflows/model/workflow";
 import {
   useWorkflows,
   workflowActions,
-  WorkflowPlaceholderPage,
   WorkflowsList,
 } from "../../workflows/ui/MonoWorkflows";
 import { WorkflowBoard } from "../../workflows/ui/board/WorkflowBoard";
+import { ImportWorkflowPage } from "../../workflows/ui/ImportWorkflowPage";
 import { WorkflowPage } from "../../workflows/ui/WorkflowPage";
 import { WorkflowRunPage } from "../../workflows/ui/WorkflowRunPage";
 import { HabitPage } from "./HabitPage";
@@ -155,6 +155,8 @@ export function MonoOverview({
   const workflows = useWorkflows(monoId, state.status);
   const workflowOps = workflowActions(monoId);
   const [routes, setRoutes] = useState<Route[]>([]);
+  // An imported workflow opens once the list has it, in place of the import page.
+  const [opening, setOpening] = useState<string>();
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<SessionSidebarFilters>(
     DEFAULT_SESSION_SIDEBAR_FILTERS,
@@ -174,6 +176,15 @@ export function MonoOverview({
     setQuery("");
     setFilters(DEFAULT_SESSION_SIDEBAR_FILTERS);
   }, [monoId]);
+  useEffect(() => {
+    if (!opening || !workflows?.some((entry) => entry.id === opening)) return;
+    setOpening(undefined);
+    setRoutes((current) =>
+      current[current.length - 1]?.kind === "import-workflow"
+        ? [...current.slice(0, -1), { kind: "workflow", id: opening }]
+        : current,
+    );
+  }, [opening, workflows]);
   const push = (route: Route) => setRoutes((current) => [...current, route]);
   const back = () => setRoutes((current) => current.slice(0, -1));
 
@@ -204,7 +215,14 @@ export function MonoOverview({
         {
           key: "import-workflow",
           node: (
-            <WorkflowPlaceholderPage title="Import workflow" onBack={back} />
+            <ImportWorkflowPage
+              monoId={monoId}
+              color={agent.color}
+              projects={agent.projects}
+              workflowCount={workflows?.length}
+              onBack={back}
+              onImported={setOpening}
+            />
           ),
         },
       ];
@@ -374,7 +392,12 @@ export function MonoOverview({
               {tab === "workflows" ? (
                 <>
                   <IconButton
-                    label="Import workflow"
+                    label={
+                      workflows && workflows.length >= WORKFLOWS_MAX
+                        ? `At most ${WORKFLOWS_MAX} workflows`
+                        : "Import workflow"
+                    }
+                    disabled={workflowsFull}
                     onClick={() => push({ kind: "import-workflow" })}
                   >
                     <Download className="size-3.5" strokeWidth={1.75} />
