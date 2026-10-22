@@ -642,6 +642,7 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
         break;
       }
       case "report": {
+        if (node.parent !== undefined) add("The Report node cannot be inside a For each", node.id);
         if (node.template) {
           // A report may quote the branches inside a For each it follows.
           const inner = [...ancestors(node.id)].flatMap((a) =>
@@ -657,6 +658,7 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
   }
 
   // --- edges -----------------------------------------------------------------------------
+  const loopSources = new Set<NodeId>();
   for (const e of w.edges) {
     const from = g.byId.get(e.from);
     const to = g.byId.get(e.to);
@@ -666,8 +668,21 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
     if (from?.type === "if" && !e.loop && e.handle !== "true" && e.handle !== "false") {
       add(`Edge ${e.from} -> ${e.to} leaves an If node without a "true" or "false" handle`, e.from);
     }
+    if (from?.type === "report" && !e.loop) {
+      add(`Edge ${e.from} -> ${e.to} leaves the Report node; the Report node must be the end`, e.from);
+    }
     if (!e.loop || !from || !to) continue;
 
+    if (from.type !== "session" && from.type !== "command" && from.type !== "askMono") {
+      add(
+        `Loop edge ${e.from} -> ${e.to}: a loop can only start from a session, command or Ask Mono node`,
+        e.from,
+      );
+    }
+    if (w.edges.filter((o) => o.loop && o.from === e.from).length > 1 && !loopSources.has(e.from)) {
+      loopSources.add(e.from);
+      add(`Node "${e.from}" is the source of more than one loop edge; only one is allowed`, e.from);
+    }
     if (!ancestors(e.from).has(e.to)) {
       add(`Loop edge ${e.from} -> ${e.to}: "${e.to}" must be an ancestor of "${e.from}"`, e.from);
     }

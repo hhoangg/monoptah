@@ -434,6 +434,66 @@ describe("workflowEngine", () => {
     expect(statusOf(run, "each")).toBe("done");
   });
 
+  it("if inside a loop body runs the other side in round 2", () => {
+    const w = def(
+      [
+        trigger,
+        session("dev"),
+        { id: "gate", type: "if", condition: "{{dev.ok}} == true" },
+        session("review"),
+        session("escalate"),
+        report,
+      ],
+      [
+        { from: "trigger", to: "dev" },
+        { from: "dev", to: "gate" },
+        { from: "gate", to: "review", handle: "true" },
+        { from: "gate", to: "escalate", handle: "false" },
+        { from: "review", to: "report" },
+        { from: "escalate", to: "report" },
+        { from: "review", to: "dev", loop: { maxRounds: 3, decide: "mono" } },
+      ],
+    );
+    let run = complete(startRun(w, "manual", at, "r"), "dev", { ok: true });
+    expect(statusOf(run, "escalate")).toBe("skipped");
+    run = complete(run, "review", {});
+    run = decided(run, "review", "loop");
+    expect(statusOf(run, "escalate")).toBe("pending");
+    run = complete(run, "dev", { ok: false });
+    expect(statusOf(run, "review")).toBe("skipped");
+    expect(nextActions(run).map((a) => a.kind === "startSession" && a.nodeId)).toEqual(["escalate"]);
+    run = complete(run, "escalate", {});
+    expect(nextActions(run)).toEqual([{ kind: "postReport" }]);
+    expect(statusOf(run, "escalate")).toBe("done");
+  });
+
+  it("does not mutate the input run after a loop reset or a For each expansion", () => {
+    let run = startRun(devReview("mono"), "manual", at, "r");
+    run = complete(run, "dev", { pr_url: "p" });
+    run = complete(run, "review", { verdict: "no" });
+    const before = JSON.stringify(run);
+    const after = decided(run, "review", "loop");
+    expect(JSON.stringify(run)).toBe(before);
+    expect(after).not.toBe(run);
+
+    let fan = startRun(fanOut(), "manual", at, "r");
+    fan = started(fan, "fetch");
+    const snap = JSON.stringify(fan);
+    const expanded = finished(fan, "fetch", { tickets: TICKETS });
+    expect(JSON.stringify(fan)).toBe(snap);
+    expect(expanded.nodes.length).toBeGreaterThan(fan.nodes.length);
+  });
+
+  it("snapshots the definition at startRun", () => {
+    const w = devReview("mono");
+    const run = startRun(w, "manual", at, "r");
+    (w.nodes[1] as { prompt: string }).prompt = "changed";
+    w.nodes.pop();
+    expect(run.definition).not.toBe(w);
+    expect((run.definition.nodes[1] as { prompt: string }).prompt).toContain("Implement round");
+    expect(nextActions(run)[0]).toMatchObject({ nodeId: "dev" });
+  });
+
   it("if true/false skips the other side", () => {
     const w = def(
       [

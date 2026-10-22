@@ -198,6 +198,36 @@ describe("validateWorkflow", () => {
     expect(flags(w, "same For each")).toBe(true);
   });
 
+  it("flags a loop edge that starts at a node that cannot loop", () => {
+    const w = example();
+    w.edges = w.edges.filter((e) => !e.loop);
+    w.edges.push({ from: "each", to: "fetch", loop: { maxRounds: 3, decide: "mono" } });
+    expect(flags(w, "session, command or Ask Mono")).toBe(true);
+    const t = example();
+    t.edges = t.edges.filter((e) => !e.loop);
+    t.edges.push({ from: "trigger", to: "trigger", loop: { maxRounds: 3, decide: "mono" } });
+    expect(flags(t, "session, command or Ask Mono")).toBe(true);
+  });
+
+  it("flags a node that is the source of two loop edges", () => {
+    const w = example();
+    w.edges.push({ from: "review", to: "dev", loop: { maxRounds: 2, decide: "mono" } });
+    expect(messages(w).filter((m) => m.includes("more than one loop edge"))).toHaveLength(1);
+  });
+
+  it("flags a Report node with outgoing edges or a parent", () => {
+    const w = example();
+    w.nodes.push({
+      id: "after",
+      type: "command",
+      project: "{{inputs.project}}",
+      command: "true",
+    });
+    w.edges.push({ from: "report", to: "after" });
+    expect(flags(w, "leaves the Report node")).toBe(true);
+    expect(flags(patchNode(example(), "report", { parent: "each" }), "cannot be inside a For each")).toBe(true);
+  });
+
   it("flags maxRounds 11", () => {
     const w = example();
     w.edges = w.edges.map((e) => (e.loop ? { ...e, loop: { maxRounds: 11, decide: "mono" } } : e));

@@ -2,6 +2,9 @@
 // the actions it returns.
 //
 // Contract with the runner:
+// - A node that is `running` with `endedAt` set is not running anything: it has finished and the
+//   Mono is being asked whether to loop (see `isAsking`). The runner must not apply a session or
+//   command timeout to it and must not run it again.
 // - `startRun`, `applyEvent`, `resumeRun` return a run that is already "settled": every step the
 //   engine can take by itself (triggers, If conditions, For each expansion, skipping untaken
 //   sides, failing a branch, condition loops, the final status) has been applied.
@@ -203,7 +206,7 @@ function openLoop(g: Graph, r: NodeRun): boolean {
 }
 
 /** A finished node whose loop edge is being put to the Mono (the node itself is not running). */
-function isAsking(r: NodeRun): boolean {
+export function isAsking(r: NodeRun): boolean {
   return r.status === "running" && r.endedAt !== undefined;
 }
 
@@ -377,6 +380,15 @@ function resetLoop(d: Draft, from: NodeRun, to: NodeId): void {
     delete r.endedAt;
     delete r.reasked;
     if (d.g.byId.get(id)?.type === "forEach") dropped.add(id);
+  }
+  // Anything downstream of `to` that an earlier round skipped (the untaken side of an If) gets
+  // another chance; the gate logic skips it again when it is still dead.
+  for (const id of reach(to, (x) => d.g.outgoing.get(x) ?? [])) {
+    const r = d.index.get(slot(id, from.branch));
+    if (!r || r.status !== "skipped" || d.g.byId.get(id)?.type === "report") continue;
+    r.status = "pending";
+    r.round = round;
+    delete r.endedAt;
   }
   if (dropped.size === 0) return;
   // A For each inside the loop body expands again next round, with a fresh item list.
@@ -679,7 +691,7 @@ export function nextActions(run: WorkflowRun): EngineAction[] {
           branch: r.branch,
           purpose: "askMono",
           question: renderTemplate(node.question, scope),
-          answers: node.answers,
+          answers: [...node.answers],
           context: contextFor(d.run, r, before),
         });
         break;
