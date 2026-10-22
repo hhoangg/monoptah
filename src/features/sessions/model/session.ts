@@ -399,6 +399,8 @@ export type Block = {
   statusKey?: string;
   /** Posted to a Mono's chat by one of its habits, outside any turn. */
   monoHabit?: { id: string; name: string; at: number };
+  /** Posted to a Mono's chat by one of its workflow runs, outside any turn. */
+  monoWorkflow?: { id: import("../../workflows/model/workflow").WorkflowId; name: string; runId: string; at: number };
   /** A card a Mono put in its chat; see `features/monos/model/monoCards`. */
   monoCard?: import("../../monos/model/monoCards").MonoCard;
   /**

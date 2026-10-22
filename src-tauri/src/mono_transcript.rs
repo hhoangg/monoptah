@@ -143,6 +143,7 @@ fn insert_blocks(
             || after_handoff
             || (!internal && matches!(role, "user" | "handoff"))
             || block.get("monoHabit").is_some()
+            || block.get("monoWorkflow").is_some()
         {
             turn_insert.execute(params![id, seq])?;
         }
