@@ -81,6 +81,25 @@ describe("workflowTemplate", () => {
       expect(shellTemplateProblems("echo `{{x}}`")).toHaveLength(1);
     });
 
+    it("keeps bare usage unflagged", () => {
+      expect(shellTemplateProblems("git commit -m {{msg}}")).toEqual([]);
+      expect(shellTemplateProblems("git -C {{dir}} log --format='%h' {{ref}}")).toEqual([]);
+    });
+
+    it.each([
+      ["a: comment with an apostrophe", "# don't\necho '{{x}}'"],
+      ["b: nested quotes in a substitution", 'echo "$(echo "{{x}}")"'],
+      ["c: backslash before a var inside quotes", 'echo "a\\{{x}}"'],
+      ["c: backslash before a bare var", "echo \\{{x}}"],
+      ["d: unquoted heredoc", "cat <<EOF\n{{x}}\nEOF"],
+      ["e: ANSI-C string with an escaped quote", "echo $'\\' {{x}} '"],
+      ["quote only inside an #if body", "echo {{#if a}}'{{/if}} {{x}}"],
+      ["backslash only inside an #if body", "echo {{#if a}}\\{{/if}} {{x}}"],
+    ])("flags every var when the text has syntax it cannot follow (%s)", (_name, tpl) => {
+      const problems = shellTemplateProblems(tpl);
+      expect(problems.some((p) => p.includes("{{x}}"))).toBe(true);
+    });
+
     it("does not flag a bare var", () => {
       expect(shellTemplateProblems("echo {{x}}")).toEqual([]);
     });

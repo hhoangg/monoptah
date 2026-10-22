@@ -29,15 +29,44 @@ const IF_OPEN_AT = new RegExp(`\\{\\{#if\\s+${PATH}\\s*\\}\\}`, "y");
 const QUOTE_NAMES: Record<string, string> = {
   "'": "single quotes",
   '"': "double quotes",
-  "`": "backticks",
 };
+
+const UNSAFE_MESSAGE =
+  "the command uses shell syntax that cannot be quoted safely around variables; " +
+  "move the variable to a simple argument or pass it differently";
+
+/** True when the literal text uses shell syntax this check cannot reason about. */
+function usesUnquotableSyntax(text: string): boolean {
+  // Backslash right before a variable would escape the quote the app adds.
+  if (/\\\{\{/.test(text)) return true;
+  // A quote or backslash inside an #if body can change quote state only when it renders.
+  for (const m of text.matchAll(IF_BLOCK)) {
+    if (/["'`\\]/.test(m[2])) return true;
+  }
+  // Check the remaining literal text with variables and #if tags removed.
+  const literal = text.replace(IF_BLOCK, "$2").replace(VAR, "X").replace(/\{\{[#/]if[^}]*\}\}/g, "");
+  if (literal.includes("`") || literal.includes("$(") || literal.includes("$'")) return true;
+  if (literal.includes("<<")) return true;
+  // An unquoted-looking `#` at the start of a word may start a comment that swallows quotes.
+  return /(^|[\s;&|(])#/.test(literal);
+}
 
 /**
  * Problems with using `text` as a shell command template: one message per `{{var}}` that sits
  * inside quotes in the literal text. The app quotes every value itself, so a variable written
  * inside quotes would be wrapped twice and its value could break out of the author's quotes.
+ *
+ * Deliberately conservative: this is a simple quote tracker, not a shell parser. A variable is
+ * accepted only in a clearly bare context. If the text uses syntax the tracker cannot follow
+ * (backticks, `$(`, `$'`, heredocs, comments, a backslash before a variable, quotes inside an
+ * #if body), every variable is reported instead.
  */
 export function shellTemplateProblems(text: string): string[] {
+  if (usesUnquotableSyntax(text)) {
+    return [...text.matchAll(VAR)]
+      .filter((m) => !m[1].startsWith("/"))
+      .map((m) => `{{${m[1]}}}: ${UNSAFE_MESSAGE}`);
+  }
   const problems: string[] = [];
   let quote: string | null = null;
   let i = 0;
@@ -62,11 +91,12 @@ export function shellTemplateProblems(text: string): string[] {
     }
     const ch = text[i];
     if (ch === "\\" && quote !== "'") {
-      i += 2;
+      // Never let the escape consume the start of a `{{` token.
+      i += text.startsWith("{{", i + 1) ? 1 : 2;
       continue;
     }
     if (quote === null) {
-      if (ch === "'" || ch === '"' || ch === "`") quote = ch;
+      if (ch === "'" || ch === '"') quote = ch;
     } else if (ch === quote) {
       quote = null;
     }
