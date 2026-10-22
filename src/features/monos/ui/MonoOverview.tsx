@@ -9,6 +9,8 @@ import {
   MessageMultiple,
   Plus,
   Search,
+  Workflow,
+  Download,
 } from "../../../shared/ui/icons";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import { artifactLabel, type ArtifactCard } from "../../artifacts/artifacts";
@@ -16,6 +18,15 @@ import type { SessionSummary } from "../../sessions/data/sessionStore";
 import type { MonoSpawnedSession, Session } from "../../sessions/model/session";
 import type { MonoLook, MonoState } from "../model/mono";
 import { HABITS_MAX } from "../model/monoHabits";
+import { WORKFLOWS_MAX } from "../../workflows/model/workflow";
+import {
+  useWorkflows,
+  workflowActions,
+  WorkflowPlaceholderPage,
+  WorkflowsList,
+} from "../../workflows/ui/MonoWorkflows";
+import { WorkflowPage } from "../../workflows/ui/WorkflowPage";
+import { WorkflowRunPage } from "../../workflows/ui/WorkflowRunPage";
 import { HabitPage } from "./HabitPage";
 import { NewHabitPage } from "./NewHabitPage";
 import { habitActions, HabitsList, useHabits } from "./MonoHabits";
@@ -40,7 +51,7 @@ import type { SessionChangeTotals } from "../../sessions/ui/SessionReview";
 import { MonoChangesView, type MonoChangesRequest } from "./MonoChangesView";
 
 export type MonoOverviewTab =
-  "activity" | "sessions" | "habits" | "documents" | "changes";
+  "activity" | "sessions" | "habits" | "workflows" | "documents" | "changes";
 
 // Activity sits apart, beside the panel toggle, since it follows the chat.
 const TABS: {
@@ -51,6 +62,7 @@ const TABS: {
   { id: "sessions", label: "Sessions", icon: MessageMultiple },
   { id: "documents", label: "Documents", icon: File },
   { id: "habits", label: "Habits", icon: Clock },
+  { id: "workflows", label: "Workflows", icon: Workflow },
   { id: "changes", label: "Changes", icon: FileDiff },
 ];
 
@@ -66,7 +78,14 @@ export type MonoOverviewChanges = {
   projects: readonly string[];
 };
 
-type Route = { kind: "new-habit" } | { kind: "habit"; id: string };
+type Route =
+  | { kind: "new-habit" }
+  | { kind: "habit"; id: string }
+  | { kind: "workflow"; id: string }
+  | { kind: "workflow-run"; id: string; runId: string }
+  | { kind: "workflow-board"; id: string }
+  | { kind: "new-workflow" }
+  | { kind: "import-workflow" };
 
 type Props = {
   open: boolean;
@@ -132,6 +151,8 @@ export function MonoOverview({
   const lock = useLockOverscroll<HTMLDivElement>();
   const habits = useHabits(monoId, state.status);
   const actions = habitActions(monoId);
+  const workflows = useWorkflows(monoId, state.status);
+  const workflowOps = workflowActions(monoId);
   const [routes, setRoutes] = useState<Route[]>([]);
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<SessionSidebarFilters>(
@@ -163,6 +184,83 @@ export function MonoOverview({
           node: <NewHabitPage monoId={monoId} onBack={back} onCreated={back} />,
         },
       ];
+    if (route.kind === "new-workflow")
+      return [
+        {
+          key: "new-workflow",
+          node: <WorkflowPlaceholderPage title="New workflow" onBack={back} />,
+        },
+      ];
+    if (route.kind === "import-workflow")
+      return [
+        {
+          key: "import-workflow",
+          node: (
+            <WorkflowPlaceholderPage title="Import workflow" onBack={back} />
+          ),
+        },
+      ];
+    if (
+      route.kind === "workflow" ||
+      route.kind === "workflow-run" ||
+      route.kind === "workflow-board"
+    ) {
+      // A workflow removed while open closes its pages.
+      const workflow = workflows?.find((entry) => entry.id === route.id);
+      if (!workflow) return [];
+      if (route.kind === "workflow-board")
+        return [
+          {
+            key: `workflow-board:${route.id}:${depth}`,
+            node: (
+              <WorkflowPlaceholderPage
+                title={`${workflow.name} board`}
+                onBack={back}
+              />
+            ),
+          },
+        ];
+      if (route.kind === "workflow-run")
+        return [
+          {
+            key: `workflow-run:${route.id}:${route.runId}:${depth}`,
+            node: (
+              <WorkflowRunPage
+                monoId={monoId}
+                workflowId={workflow.id}
+                runId={route.runId}
+                current={workflow}
+                color={agent.color}
+                onBack={back}
+                onOpenSession={onOpenSession}
+              />
+            ),
+          },
+        ];
+      return [
+        {
+          key: `workflow:${route.id}:${depth}`,
+          node: (
+            <WorkflowPage
+              monoId={monoId}
+              workflow={workflow}
+              color={agent.color}
+              projects={agent.projects}
+              actions={workflowOps}
+              onBack={back}
+              onEditBoard={() => push({ kind: "workflow-board", id: route.id })}
+              onOpenRun={(runId) =>
+                push({ kind: "workflow-run", id: route.id, runId })
+              }
+              onRemove={() => {
+                void workflowOps.remove(workflow.id);
+                back();
+              }}
+            />
+          ),
+        },
+      ];
+    }
     // A habit removed while open closes its page.
     const habit = habits?.find((entry) => entry.id === route.id);
     if (!habit) return [];
@@ -222,9 +320,11 @@ export function MonoOverview({
     });
 
   const habitsFull = !habits || habits.length >= HABITS_MAX;
+  const workflowsFull = !workflows || workflows.length >= WORKFLOWS_MAX;
   const counts: Record<(typeof TABS)[number]["id"], number | undefined> = {
     sessions: launches.length,
     habits: habits?.length,
+    workflows: workflows?.length,
     documents: documents.length,
     changes: changes?.totals?.files,
   };
@@ -259,6 +359,27 @@ export function MonoOverview({
                 >
                   <Plus className="size-3.5" strokeWidth={1.75} />
                 </IconButton>
+              ) : null}
+              {tab === "workflows" ? (
+                <>
+                  <IconButton
+                    label="Import workflow"
+                    onClick={() => push({ kind: "import-workflow" })}
+                  >
+                    <Download className="size-3.5" strokeWidth={1.75} />
+                  </IconButton>
+                  <IconButton
+                    label={
+                      workflows && workflows.length >= WORKFLOWS_MAX
+                        ? `At most ${WORKFLOWS_MAX} workflows`
+                        : "New workflow"
+                    }
+                    disabled={workflowsFull}
+                    onClick={() => push({ kind: "new-workflow" })}
+                  >
+                    <Plus className="size-3.5" strokeWidth={1.75} />
+                  </IconButton>
+                </>
               ) : null}
               <TabButton
                 label="Activity"
@@ -353,6 +474,19 @@ export function MonoOverview({
                 <EmptyState icon={Clock}>
                   Ask {agent.name} to put recurring work on a schedule, like a
                   morning digest or a weekly report.
+                </EmptyState>
+              }
+            />
+          ) : tab === "workflows" ? (
+            <WorkflowsList
+              monoId={monoId}
+              workflows={workflows}
+              actions={workflowOps}
+              onOpen={(id) => push({ kind: "workflow", id })}
+              empty={
+                <EmptyState icon={Workflow}>
+                  Ask {agent.name} to chain sessions into a workflow, or create
+                  one with +.
                 </EmptyState>
               }
             />

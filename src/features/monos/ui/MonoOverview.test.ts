@@ -9,6 +9,11 @@ vi.mock("../model/monoHabits", async (original) => ({
   loadHabits: async () => [],
 }));
 
+vi.mock("../../workflows/model/workflowStore", async (original) => ({
+  ...(await original<object>()),
+  loadWorkflows: async () => [],
+}));
+
 vi.mock("./MonoChangesView", () => ({
   MonoChangesView: () => createElement("p", { "data-changes-view": "" }),
 }));
@@ -105,11 +110,12 @@ it("names only the open tab, with its count, and switches tabs", async () => {
   const labels = tabs().map((tab) =>
     tab.querySelector("[data-tab-label]")!.getAttribute("data-tab-label"),
   );
-  expect(labels).toEqual(["open", "closed", "closed", "closed"]);
+  expect(labels).toEqual(["open", "closed", "closed", "closed", "closed"]);
   expect(tabs().map((tab) => tab.getAttribute("aria-label"))).toEqual([
     "Sessions",
     "Documents",
     "Habits",
+    "Workflows",
     "Changes",
   ]);
   expect(tabs()[0].textContent).toBe("Sessions2");
@@ -166,7 +172,7 @@ const changes = (totals: unknown) => ({
 
 it("always offers a Changes tab and keeps its view mounted once opened", async () => {
   await render("sessions", vi.fn(), changes(null));
-  expect(tabs()[3].getAttribute("aria-label")).toBe("Changes");
+  expect(tabs()[4].getAttribute("aria-label")).toBe("Changes");
   expect(container.querySelector("[data-changes-view]")).toBeNull();
   const onTabChange = vi.fn();
   await render(
@@ -174,11 +180,11 @@ it("always offers a Changes tab and keeps its view mounted once opened", async (
     onTabChange,
     changes({ files: 3, additions: 12, deletions: 4 }),
   );
-  expect(tabs()[3].textContent).toBe("Changes3");
+  expect(tabs()[4].textContent).toBe("Changes3");
   expect(container.querySelector("[data-changes-view]")).not.toBeNull();
   // Another tab keeps the view mounted, hidden, so a commit draft survives.
   await render("sessions", onTabChange, changes(null));
-  expect(tabs()[3].getAttribute("aria-label")).toBe("Changes");
+  expect(tabs()[4].getAttribute("aria-label")).toBe("Changes");
   expect(
     container.querySelector("[data-changes-view]")!.closest("[hidden]"),
   ).not.toBeNull();
@@ -186,20 +192,20 @@ it("always offers a Changes tab and keeps its view mounted once opened", async (
 
 it("dots the folded Changes icon while there are changes", async () => {
   await render("sessions", vi.fn(), changes(null));
-  expect(tabs()[3].querySelector("[data-changes-dot]")).toBeNull();
+  expect(tabs()[4].querySelector("[data-changes-dot]")).toBeNull();
   await render(
     "sessions",
     vi.fn(),
     changes({ files: 2, additions: 3, deletions: 1 }),
   );
-  expect(tabs()[3].querySelector("[data-changes-dot]")).not.toBeNull();
+  expect(tabs()[4].querySelector("[data-changes-dot]")).not.toBeNull();
   // Open, the tab names its count instead.
   await render(
     "changes",
     vi.fn(),
     changes({ files: 2, additions: 3, deletions: 1 }),
   );
-  expect(tabs()[3].querySelector("[data-changes-dot]")).toBeNull();
+  expect(tabs()[4].querySelector("[data-changes-dot]")).toBeNull();
 });
 
 it("lists every session it started, newest first", async () => {
@@ -265,4 +271,28 @@ it("opens a document over its tab with a way back", async () => {
     page.querySelector<HTMLButtonElement>('button[aria-label="Back"]')!.click(),
   );
   expect(onBackFromDocument).toHaveBeenCalledOnce();
+});
+
+it("offers New and Import workflow only on Workflows, and says how to fill it", async () => {
+  await render("habits");
+  expect(container.querySelector('[aria-label="New workflow"]')).toBeNull();
+  await render("workflows");
+  expect(container.querySelector('[aria-label="New workflow"]')).not.toBeNull();
+  expect(
+    container.querySelector('[aria-label="Import workflow"]'),
+  ).not.toBeNull();
+  expect(
+    container.querySelector('[data-mono-overview="workflows"]')!.textContent,
+  ).toContain("Ask Broski to chain sessions into a workflow, or create one with +.");
+});
+
+it("opens a placeholder page from New and Import until their editors arrive", async () => {
+  await render("workflows");
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="New workflow"]')!
+      .click(),
+  );
+  expect(container.querySelector("[data-workflow-placeholder]")).not.toBeNull();
+  expect(container.textContent).toContain("Not available yet");
 });

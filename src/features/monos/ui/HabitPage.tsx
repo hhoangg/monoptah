@@ -41,7 +41,7 @@ export function when(at: number, now = Date.now()): string {
     : dateTime.format(at);
 }
 
-function duration(ms: number): string {
+export function duration(ms: number): string {
   const seconds = Math.max(1, Math.round(ms / 1000));
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
