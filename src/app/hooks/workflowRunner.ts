@@ -34,13 +34,17 @@ import {
 } from "../../features/workflows/model/workflowReport";
 import {
   clearWorkflowStop,
+  loadWorkflows,
+  requestWorkflowStop,
   setWorkflowRunning,
   subscribeWorkflowsRunning,
   updateRuns,
+  updateWorkflows,
   workflowStopRequested,
 } from "../../features/workflows/model/workflowStore";
 import { renderTemplate } from "../../features/workflows/model/workflowTemplate";
 import { finalReply } from "./useMonoHabits";
+import { LIVE_RUN_REFRESH_MS, liveRunRegistry } from "./workflowLiveRuns";
 
 export type SessionRequest = {
   /** A project path of the Mono. */
@@ -112,6 +116,8 @@ export type MonoWorkflowHost = {
 };
 
 const POLL_MS = 2_000;
+/** How often a run looks in the workflow file for a stop asked for in another window. */
+const STOP_CHECK_MS = 5_000;
 const SESSION_TIMEOUT_MINUTES = 120;
 const COMMAND_TIMEOUT_MINUTES = 10;
 /** How long the Mono has to answer a decision request. */
@@ -696,6 +702,41 @@ export async function executeRun(
   };
   const unsubscribe = subscribeWorkflowsRunning(listen);
 
+  // A run is its window's to look after for as long as it lives, whatever that window's place
+  // in the election: it tells the others it is going, and applies a stop written to the file.
+  const registry = liveRunRegistry();
+  const beat = () => {
+    if (live()) registry?.touch(run.id, workflowId);
+  };
+  let looking = false;
+  const lookForStop = async () => {
+    if (!live() || looking) return;
+    looking = true;
+    try {
+      const asked = (await loadWorkflows(monoId)).find(
+        (w) => w.id === workflowId,
+      )?.stopRequested;
+      if (!asked || !live()) return;
+      requestWorkflowStop(workflowId);
+      await updateWorkflows(monoId, (list) => ({
+        workflows: list.map((w) => {
+          const { stopRequested: _stop, ...rest } = w;
+          return w.id === workflowId ? rest : w;
+        }),
+        result: undefined,
+      }));
+    } catch (error) {
+      console.warn("Could not check for a workflow stop request", error);
+    } finally {
+      looking = false;
+    }
+  };
+  const timers = [
+    setInterval(beat, LIVE_RUN_REFRESH_MS),
+    setInterval(() => void lookForStop(), STOP_CHECK_MS),
+  ];
+  beat();
+
   try {
     // The record exists before anything runs, so a failure to save is known up front.
     await save();
@@ -733,10 +774,12 @@ export async function executeRun(
     }
   } finally {
     unsubscribe();
+    for (const timer of timers) clearInterval(timer);
     await stopTask;
     await writing;
     for (const n of run.nodes)
       if (n.sessionId) getHost().endApprovals(n.sessionId);
+    registry?.remove(run.id);
     setWorkflowRunning(workflowId, null);
     clearWorkflowStop(workflowId);
   }

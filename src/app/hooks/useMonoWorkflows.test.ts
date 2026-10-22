@@ -26,8 +26,6 @@ const MONO = {
   projects: ["/code/app"],
 };
 const fileFailures = { runs: false };
-/** Lets a test change the world while a workflows.json read is under way. */
-const fileHooks: { onWorkflowsRead?: () => void } = {};
 /** Run-file writes in flight, to show saves never overlap. */
 const runWrites = { delayMs: 0, inflight: 0, max: 0, texts: [] as string[] };
 
@@ -47,7 +45,6 @@ vi.mock("../../features/monos/model/monoFiles", async (original) => {
         text: file?.text ?? null,
         hash: String(file?.hash ?? 0),
       };
-      if (path === "workflows.json") fileHooks.onWorkflowsRead?.();
       return result;
     }),
     writeAgentFile: vi.fn(
@@ -73,6 +70,7 @@ vi.mock("../../features/monos/model/monoFiles", async (original) => {
 });
 
 const { useWorkflowDriver } = await import("./workflowDriver");
+const { createLiveRunRegistry } = await import("./workflowLiveRuns");
 const { useMonoWorkflows, resumeWorkflowRun } =
   await import("./useMonoWorkflows");
 const { checkWorkflowsNow, requestWorkflowStop, workflowRunningId } =
@@ -81,6 +79,7 @@ const {
   setWorkflowRunning,
   clearWorkflowStop,
   stopWorkflowRun,
+  takeWorkflowRequests,
   workflowStopRequested,
 } = await import("../../features/workflows/model/workflowStore");
 const { relayApproval, dropRelays } =
@@ -292,7 +291,6 @@ beforeEach(() => {
   Object.assign(runWrites, { delayMs: 0, inflight: 0, max: 0, texts: [] });
   release = [];
   localStorage.clear();
-  fileHooks.onWorkflowsRead = undefined;
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   root = createRoot(document.createElement("div"));
 });
@@ -892,28 +890,7 @@ describe("useMonoWorkflows", () => {
     expect(workflowRunningId(WF)).toBeUndefined();
   });
 
-  it("a stop written by another window reaches the driver's run", async () => {
-    save([simple()]);
-    const script: Script = { replies: ["ok"] };
-    hold(script);
-    const host = makeHost(script);
-    mount(host);
-    await vi.waitFor(() => expect(host.startSession).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() =>
-      expect(
-        storedRuns()[0]?.nodes.find((n) => n.nodeId === "dev")?.sessionId,
-      ).toBe("s1"),
-    );
-    // Only the file is shared between windows.
-    save([{ ...stored()[0], stopRequested: true }]);
-    checkWorkflowsNow();
-    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("stopped"));
-    expect(host.stop).toHaveBeenCalledWith("s1");
-    expect(host.post).toHaveBeenCalledTimes(1);
-    await vi.waitFor(() => expect(stored()[0].stopRequested).toBeUndefined());
-  });
-
-  it("looks for a stop request every few seconds while a run is going", async () => {
+  it("a window that lost the lease still tells the others its run is live and applies a stop from the file", async () => {
     vi.useFakeTimers({
       toFake: [
         "setTimeout",
@@ -927,17 +904,103 @@ describe("useMonoWorkflows", () => {
     const script: Script = { replies: ["ok"] };
     hold(script);
     const host = makeHost(script);
-    mount(host);
+    mount(host, true);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
     expect(host.startSession).toHaveBeenCalledTimes(1);
+    const runId = storedRuns()[0].id;
+    const entry = () =>
+      JSON.parse(localStorage.getItem("monocode.workflowLiveRuns") ?? "{}")[
+        runId
+      ];
+    expect(entry()).toMatchObject({ workflowId: WF });
+    const first = entry().at;
+
+    // The lease goes to another window: this hook is switched off, the run is not.
+    mount(host, false);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(12_000);
+    });
+    expect(entry().at).toBeGreaterThan(first);
+    expect(workflowRunningId(WF)).toBe(runId);
+
+    // The new driver can only write the request; the run's own window applies it and clears it.
     save([{ ...stored()[0], stopRequested: true }]);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(6_000);
     });
     expect(storedRuns()[0].status).toBe("stopped");
     expect(host.stop).toHaveBeenCalledWith("s1");
+    expect(stored()[0].stopRequested).toBeUndefined();
+    expect(entry()).toBeUndefined();
+  });
+
+  it("leaves alone a run another window is still driving", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const def = simple({}, { stopRequested: true });
+    save([def]);
+    const running = startRun(def, "manual", 1_000, "run-a");
+    saveRuns([running]);
+    // Window A lost the lease but its run is live: it refreshed its entry just now.
+    createLiveRunRegistry({ storage: localStorage, owner: "window-a" }).touch(
+      "run-a",
+      WF,
+    );
+    const host = makeHost({ replies: ["ok"] });
+    mount(host);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+    });
+    // Not swept to interrupted, and the due schedule did not start a second run.
+    expect(storedRuns()[0].status).toBe("running");
+    expect(host.startSession).not.toHaveBeenCalled();
+    expect(stored()[0].nextRunAt).toBeGreaterThan(Date.now());
+    // The stop written for A's run is still there for A to apply.
+    expect(stored()[0].stopRequested).toBe(true);
+
+    // A Resume is refused while A is driving the run (here as if it had been marked interrupted).
+    saveRuns([markInterrupted(running)]);
+    await resumeWorkflowRun("mono-1", WF, "run-a");
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+    });
+    expect(host.startSession).not.toHaveBeenCalled();
+    expect(storedRuns()[0].status).toBe("interrupted");
+    expect(stored()[0].resumeRunId).toBeUndefined();
+    // Taking the resume request did not take the stop request meant for A's live run.
+    expect(stored()[0].stopRequested).toBe(true);
+  });
+
+  it("takes a run over once its window stopped refreshing it", async () => {
+    const def = simple({}, { enabled: false });
+    save([def]);
+    saveRuns([startRun(def, "manual", 1_000, "run-a")]);
+    // Last refreshed 31 s ago: that window is gone.
+    createLiveRunRegistry({
+      storage: localStorage,
+      owner: "window-a",
+      now: () => Date.now() - 31_000,
+    }).touch("run-a", WF);
+    const host = makeHost({ replies: ["ok"] });
+    mount(host);
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("interrupted"));
+    await resumeWorkflowRun("mono-1", WF, "run-a");
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("done"));
+    expect(host.startSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives each resume request to exactly one of several drivers", async () => {
+    save([simple({}, { enabled: false, resumeRunId: "run-old" })]);
+    const results = await Promise.all([
+      takeWorkflowRequests("mono-1", () => false),
+      takeWorkflowRequests("mono-1", () => false),
+      takeWorkflowRequests("mono-1", () => false),
+    ]);
+    expect(results.flat()).toEqual([
+      { monoId: "mono-1", workflowId: WF, runId: "run-old" },
+    ]);
+    expect(stored()[0].resumeRunId).toBeUndefined();
   });
 
   it("stopWorkflowRun writes the request for the driver and stops at once only where the run is", async () => {
@@ -950,34 +1013,6 @@ describe("useMonoWorkflows", () => {
     setWorkflowRunning(WF, "run-x");
     await stopWorkflowRun("mono-1", WF);
     expect(workflowStopRequested(WF)).toBe(true);
-  });
-
-  it("leaves a stop request alone when a different run started while it was read", async () => {
-    save([simple({}, { enabled: false, stopRequested: true })]);
-    setWorkflowRunning(WF, "run-a");
-    const host = makeHost({ replies: [] });
-    mount(host);
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 50));
-    });
-    // The first look (this tick's own read) saw the same run before and after: it is stopped.
-    expect(workflowStopRequested(WF)).toBe(true);
-    expect(stored()[0].stopRequested).toBeUndefined();
-    clearWorkflowStop(WF);
-
-    save([{ ...stored()[0], stopRequested: true }]);
-    let reads = 0;
-    fileHooks.onWorkflowsRead = () => {
-      // The tick reads once, then applySignals reads: the run changes during that second read.
-      if (++reads === 2) setWorkflowRunning(WF, "run-b");
-    };
-    checkWorkflowsNow();
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 50));
-    });
-    expect(workflowRunningId(WF)).toBe("run-b");
-    expect(workflowStopRequested(WF)).toBe(false);
-    expect(stored()[0].stopRequested).toBe(true);
   });
 
   it("clears a stop request when no run is live", async () => {

@@ -270,6 +270,31 @@ describe("closing a busy window", () => {
     }
   });
 
+  it("asks about running work, not chats, when only a workflow run would be cut short", async () => {
+    const session = newSession("cursor", "C:/test");
+    const tab = newTab(session.id);
+    const release = setQuitWorkspace(
+      () => [session],
+      () => [tab],
+      () => tab.id,
+      () => session.cwd,
+      () => [],
+      () => new Map(),
+      vi.fn(),
+    );
+    vi.stubGlobal("window", new EventTarget());
+    setWorkflowRunning("wf-abcd1234", "run-1");
+    try {
+      await closeBusyWindow();
+      expect(vi.mocked(ask).mock.calls[0][0]).toContain("running work");
+      expect(vi.mocked(ask).mock.calls[0][0]).not.toContain("chats");
+    } finally {
+      setWorkflowRunning("wf-abcd1234", null);
+      vi.unstubAllGlobals();
+      release();
+    }
+  });
+
   it("leaves the window and sessions running when closing is cancelled", async () => {
     const { release } = workspace();
     vi.mocked(ask).mockResolvedValue(false);

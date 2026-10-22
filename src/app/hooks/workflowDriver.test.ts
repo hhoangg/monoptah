@@ -135,6 +135,22 @@ describe("useWorkflowDriver", () => {
     act(() => second.root.unmount());
   });
 
+  it("is simply not the driver when localStorage is unusable", () => {
+    vi.spyOn(window, "localStorage", "get").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    let drives: boolean | undefined;
+    function Probe() {
+      drives = useWorkflowDriver();
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    expect(() => act(() => root.render(createElement(Probe)))).not.toThrow();
+    expect(drives).toBe(false);
+    act(() => root.unmount());
+    vi.restoreAllMocks();
+  });
+
   it("frees the lease when the page is going away", () => {
     function Probe() {
       useWorkflowDriver();

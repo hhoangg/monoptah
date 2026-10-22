@@ -500,9 +500,12 @@ async function confirmAndCloseWindow(
   quitDialogOpen = true;
   try {
     const refs = inFlightRefs(sessions, tabs);
-    if (refs.length > 0) {
+    const workflowRuns = liveWorkflowRuns().size;
+    if (refs.length > 0 || workflowRuns > 0) {
       const ok = await ask(
-        "Close this window and stop its running chats? Other windows will stay open.",
+        workflowRuns > 0
+          ? "Close this window and stop its running work? Other windows will stay open."
+          : "Close this window and stop its running chats? Other windows will stay open.",
         { title: "Monoptah", kind: "warning", okLabel: "Close window" },
       );
       if (!ok) return;

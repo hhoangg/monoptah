@@ -144,6 +144,36 @@ export function workflowRunningId(workflowId: WorkflowId): string | undefined {
   return running.get(workflowId);
 }
 
+export type ResumeRequest = {
+  monoId: string;
+  workflowId: WorkflowId;
+  runId: string;
+};
+
+/**
+ * Takes the requests other windows left in the workflow files, clearing them in the same
+ * hash-checked save, so of several drivers looking at once exactly one gets each resume.
+ * A stop request is cleared only when `isRunning` says no window has a run of that workflow
+ * (it is stale); one for a run that is going stays for the window driving it to apply.
+ */
+export function takeWorkflowRequests(
+  monoId: string,
+  isRunning: (workflowId: WorkflowId) => boolean,
+): Promise<ResumeRequest[]> {
+  return updateWorkflows(monoId, (list) => {
+    const resumes: ResumeRequest[] = [];
+    const workflows = list.map((w) => {
+      const { stopRequested, resumeRunId, ...rest } = w;
+      if (resumeRunId)
+        resumes.push({ monoId, workflowId: w.id, runId: resumeRunId });
+      // A stop from before a resume was meant for the run that was interrupted.
+      const keepStop = stopRequested && isRunning(w.id);
+      return { ...rest, ...(keepStop ? { stopRequested } : {}) };
+    });
+    return { workflows, result: resumes };
+  });
+}
+
 /** A copy of the runs in flight in this window, by workflow. */
 export function liveWorkflowRuns(): ReadonlyMap<WorkflowId, string> {
   return new Map(running);

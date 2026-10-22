@@ -72,7 +72,13 @@ export function createDriverLease(options: {
 export function useWorkflowDriver(): boolean {
   const [drives, setDrives] = useState(false);
   useEffect(() => {
-    const lease = createDriverLease({ storage: localStorage });
+    // No usable localStorage (missing, or access throws): this window cannot be elected.
+    let lease: DriverLease;
+    try {
+      lease = createDriverLease({ storage: localStorage });
+    } catch {
+      return;
+    }
     const check = () => setDrives(lease.claim());
     const release = () => lease.release();
     check();
