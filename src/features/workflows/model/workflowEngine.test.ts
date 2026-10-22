@@ -494,6 +494,80 @@ describe("workflowEngine", () => {
     expect(nextActions(run)[0]).toMatchObject({ nodeId: "dev" });
   });
 
+  describe("failed branches do not loop", () => {
+    /** The probe: lint fails while review runs; merge was skipped by the failure. */
+    const probe = () =>
+      def(
+        [trigger, session("dev"), session("lint"), session("review"), session("merge"), report],
+        [
+          { from: "trigger", to: "dev" },
+          { from: "trigger", to: "lint" },
+          { from: "dev", to: "review" },
+          { from: "review", to: "merge" },
+          { from: "lint", to: "merge" },
+          { from: "merge", to: "report" },
+          { from: "review", to: "dev", loop: { maxRounds: 3, decide: "mono" } },
+        ],
+      );
+
+    it("exits instead of asking when the branch already failed", () => {
+      let run = startRun(probe(), "manual", at, "r");
+      run = complete(run, "dev", {});
+      run = started(run, "lint");
+      run = started(run, "review");
+      run = failed(run, "lint", "boom");
+      expect(statusOf(run, "merge")).toBe("skipped");
+      run = finished(run, "review", {});
+      expect(nodeOf(run, "review").decision).toEqual({ value: "exit", reason: "branch failed" });
+      expect(statusOf(run, "merge")).toBe("skipped");
+      expect(nodeOf(run, "dev").round).toBe(1);
+      expect(nextActions(run)).toEqual([{ kind: "postReport" }]);
+    });
+
+    it("turns a loop answer that arrives after a failure into an exit", () => {
+      let run = startRun(probe(), "manual", at, "r");
+      run = complete(run, "dev", {});
+      run = started(run, "lint");
+      run = complete(run, "review", {});
+      expect(nextActions(run)).toEqual([expect.objectContaining({ purpose: "loop" })]);
+      run = started(run, "review"); // question in flight
+      run = failed(run, "lint", "boom");
+      run = decided(run, "review", "loop");
+      expect(statusOf(run, "review")).toBe("done");
+      expect(nodeOf(run, "review").decision).toEqual({ value: "exit", reason: "branch failed" });
+      expect(statusOf(run, "dev")).toBe("done");
+      expect(statusOf(run, "merge")).toBe("skipped");
+      expect(nextActions(run)).toEqual([{ kind: "postReport" }]);
+    });
+
+    it("a failed For each branch does not stop another branch from looping", () => {
+      const w = fanOut({
+        maxParallel: 2,
+        children: [
+          session("dev", { parent: "each" }),
+          session("review", { parent: "each" }),
+        ],
+        edges: [
+          { from: "dev", to: "review" },
+          { from: "review", to: "dev", loop: { maxRounds: 3, decide: "mono" } },
+        ],
+      });
+      let run = complete(startRun(w, "manual", at, "r"), "fetch", { tickets: [1, 2] });
+      run = started(run, "dev", "each#0");
+      run = failed(run, "dev", "boom", "each#0");
+      run = complete(run, "dev", {}, "each#1");
+      run = complete(run, "review", {}, "each#1");
+      expect(nextActions(run)).toEqual([
+        expect.objectContaining({ kind: "askMono", purpose: "loop", branch: "each#1" }),
+      ]);
+      run = started(run, "review", "each#1");
+      run = decided(run, "review", "loop", "each#1");
+      expect(nodeOf(run, "dev", "each#1").round).toBe(2);
+      expect(statusOf(run, "dev", "each#1")).toBe("pending");
+      expect(statusOf(run, "review", "each#0")).toBe("skipped");
+    });
+  });
+
   it("if true/false skips the other side", () => {
     const w = def(
       [

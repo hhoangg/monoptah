@@ -79,6 +79,7 @@ export type EngineEvent =
 
 const DEFAULT_MAX_PARALLEL = 3;
 const MAX_ROUNDS_REASON = "max rounds reached";
+const BRANCH_FAILED_REASON = "branch failed";
 
 // --- graph ----------------------------------------------------------------------------------
 
@@ -341,6 +342,11 @@ function gateOf(d: Draft, r: NodeRun): Gate {
 
 // --- state changes the engine makes by itself --------------------------------------------------
 
+/** A failed node ends its branch for good: it must not start another loop round. */
+function branchFailed(d: Draft, branch: BranchKey): boolean {
+  return d.run.nodes.some((n) => n.branch === branch && n.status === "failed");
+}
+
 /** Fails the node and skips whatever is still pending in its branch (other branches go on). */
 function failNode(d: Draft, r: NodeRun, error: string): void {
   r.status = "failed";
@@ -409,7 +415,11 @@ function resetLoop(d: Draft, from: NodeRun, to: NodeId): void {
 function decideLoop(d: Draft, r: NodeRun, value: string, reason?: string): void {
   const spec = d.g.loops.get(r.nodeId);
   if (!spec) return;
-  if (value === "loop" && r.round < spec.loop.maxRounds) {
+  if (value === "loop" && branchFailed(d, r.branch)) {
+    // The question was already in flight when a node of the branch failed.
+    r.status = "done";
+    r.decision = { value: "exit", reason: BRANCH_FAILED_REASON };
+  } else if (value === "loop" && r.round < spec.loop.maxRounds) {
     r.status = "done";
     resetLoop(d, r, spec.to);
   } else if (value === "exit" || value === "loop") {
@@ -478,7 +488,10 @@ function pass(d: Draft): boolean {
 
     if (openLoop(d.g, r)) {
       const spec = d.g.loops.get(r.nodeId) as LoopEdge;
-      if (r.round >= spec.loop.maxRounds) {
+      if (branchFailed(d, r.branch)) {
+        r.decision = { value: "exit", reason: BRANCH_FAILED_REASON };
+        changed = true;
+      } else if (r.round >= spec.loop.maxRounds) {
         r.decision = { value: "exit", reason: MAX_ROUNDS_REASON };
         changed = true;
       } else if (spec.loop.decide !== "mono") {
