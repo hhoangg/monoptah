@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useState, type CSSProperties } from "react";
 import { resumeWorkflowRun } from "../../../app/hooks/useMonoWorkflows";
 import { IconButton } from "../../../app/shell/TitleBar";
 import { Play, Square } from "../../../shared/ui/icons";
@@ -15,7 +15,7 @@ import {
 } from "../model/workflow";
 import { isAsking } from "../model/workflowEngine";
 import { stopWorkflowRun } from "../model/workflowStore";
-import { useWorkflowRuns } from "./MonoWorkflows";
+import { liveRunOf, useWorkflowRuns, WorkflowNotice } from "./MonoWorkflows";
 
 /** Dot colours reuse the habit page's: the Mono's colour, red for trouble, grey for rest. */
 export const RUN_STATUS: Record<RunStatus, { label: string; dot: string }> = {
@@ -164,7 +164,7 @@ function NodeChip({
           type="button"
           data-node={node.nodeId}
           className={`${chip} hover:bg-content/5`}
-          onClick={() => void onOpenSession(node.sessionId as string)}
+          onClick={() => onOpenSession(node.sessionId as string)}
         >
           {body}
         </button>
@@ -197,8 +197,29 @@ export function WorkflowRunPage({
   onOpenSession: (sessionId: string) => void | Promise<void>;
 }) {
   const runs = useWorkflowRuns(monoId, workflowId);
+  const [notice, setNotice] = useState<string>();
   const run = runs?.find((entry) => entry.id === runId);
   const status = run ? RUN_STATUS[run.status] : undefined;
+  const openSession = (sessionId: string) => {
+    setNotice(undefined);
+    const failed = () => setNotice("Could not open this session.");
+    try {
+      void Promise.resolve(onOpenSession(sessionId)).catch(failed);
+    } catch {
+      failed();
+    }
+  };
+  const resume = () => {
+    // Two runs of one workflow would race over its files; this one waits for the other.
+    if (liveRunOf(workflowId))
+      return setNotice(
+        "Another run of this workflow is going. Resume this one when it ends.",
+      );
+    setNotice(undefined);
+    void resumeWorkflowRun(monoId, workflowId, runId).catch((error) =>
+      console.warn("Could not resume the run", error),
+    );
+  };
   return (
     <div
       className="flex min-h-0 flex-1 flex-col"
@@ -221,11 +242,7 @@ export function WorkflowRunPage({
         {run?.status === "interrupted" ? (
           <IconButton
             label="Resume"
-            onClick={() =>
-              void resumeWorkflowRun(monoId, workflowId, runId).catch((error) =>
-                console.warn("Could not resume the run", error),
-              )
-            }
+            onClick={resume}
           >
             <Play className="size-3.5" strokeWidth={1.75} />
           </IconButton>
@@ -233,6 +250,7 @@ export function WorkflowRunPage({
       </PageHeader>
 
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-none">
+        <WorkflowNotice>{notice}</WorkflowNotice>
         {run && status ? (
           <>
             <dl className="flex flex-col gap-0.5 px-4 py-3">
@@ -275,7 +293,7 @@ export function WorkflowRunPage({
                         key={node.nodeId}
                         run={run}
                         node={node}
-                        onOpenSession={onOpenSession}
+                        onOpenSession={openSession}
                       />
                     ))}
                   </ul>

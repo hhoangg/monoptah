@@ -52,6 +52,7 @@ import {
   parseWorkspaceSnapshot,
 } from "../../features/workspace/model/workspaceSnapshot";
 import { liveWorkflowRuns } from "../../features/workflows/model/workflowStore";
+import { liveRunRegistry } from "../hooks/workflowLiveRuns";
 import { loadWindowTransfer } from "./windowTransferBootstrap";
 import type { WindowTransferPayload } from "./windowTransfer";
 import {
@@ -134,6 +135,14 @@ export function setQuitWorkspace(
  * Exiting is `confirm_quit`'s job, once every window has reported ready.
  */
 export async function handleQuitRequested(): Promise<boolean> {
+  const saved = await persistForQuit();
+  // The app exits without a pagehide, so this window's workflow runs would stay on the
+  // registry until they went stale; the next driver should not have to wait that out.
+  if (saved) liveRunRegistry()?.removeOwned();
+  return saved;
+}
+
+async function persistForQuit(): Promise<boolean> {
   if (liveWorkspace) {
     liveWorkspace.flush();
     quitting = true;

@@ -3,6 +3,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { NodeRun, Workflow, WorkflowRun } from "../model/workflow";
+import { setWorkflowRunning } from "../model/workflowStore";
 import { WorkflowRunPage } from "./WorkflowRunPage";
 import { MANUAL, REPORT, run, workflow } from "./workflowUiFixtures";
 
@@ -146,6 +147,26 @@ it("opens a node's session from its chip", async () => {
   ).toHaveLength(0);
 });
 
+it("says so when a node's session cannot be opened", async () => {
+  stored = [laneRun()];
+  const onOpenSession = vi.fn(async () => {
+    throw new Error("gone");
+  });
+  const unhandled = vi.fn();
+  process.on("unhandledRejection", unhandled);
+  await renderPage(definition, onOpenSession);
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>("[data-lane='each#0'] button[data-node]")!
+      .click(),
+  );
+  process.off("unhandledRejection", unhandled);
+  expect(container.querySelector("[data-workflow-notice]")?.textContent).toBe(
+    "Could not open this session.",
+  );
+  expect(unhandled).not.toHaveBeenCalled();
+});
+
 it("running run offers Stop run", async () => {
   stored = [laneRun()];
   await renderPage();
@@ -163,6 +184,18 @@ it("interrupted run shows Resume", async () => {
     "mono-1",
     "wf-aaaaaaaa",
     "run-1",
+  );
+});
+
+it("Resume is refused while another run of the workflow is going", async () => {
+  stored = [laneRun({ status: "interrupted" })];
+  await renderPage();
+  act(() => setWorkflowRunning("wf-aaaaaaaa", "run-2"));
+  await act(async () => button("Resume")!.click());
+  act(() => setWorkflowRunning("wf-aaaaaaaa", null));
+  expect(resumeWorkflowRun).not.toHaveBeenCalled();
+  expect(container.querySelector("[data-workflow-notice]")?.textContent).toMatch(
+    /Another run of this workflow is going/,
   );
 });
 

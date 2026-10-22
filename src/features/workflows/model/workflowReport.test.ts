@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { NodeRun, RunStatus, Workflow, WorkflowEdge, WorkflowNode, WorkflowRun } from "./workflow";
 import type { EngineAction } from "./workflowEngine";
-import { askMonoPrompt, composeReport, parseMonoDecision } from "./workflowReport";
+import { askMonoPrompt, composeReport, fieldInReport, parseMonoDecision } from "./workflowReport";
 
 const PROJECT = "{{inputs.project}}";
 
@@ -331,5 +331,18 @@ describe("parseMonoDecision", () => {
     expect(parseMonoDecision("yes", ["yes"]).ok).toBe(false);
     expect(parseMonoDecision(reply('{"answer":1}'), ["1"]).ok).toBe(false);
     expect(parseMonoDecision(reply('{"reason":"x"}'), ["yes"]).ok).toBe(false);
+  });
+});
+
+describe("fieldInReport", () => {
+  it("defaults to on for strings and off for the rest", () => {
+    expect(fieldInReport({ type: "string" })).toBe(true);
+    expect(fieldInReport({ type: "number" })).toBe(false);
+    expect(fieldInReport({ type: "boolean" })).toBe(false);
+  });
+
+  it("follows an explicit inReport", () => {
+    expect(fieldInReport({ type: "string", inReport: false })).toBe(false);
+    expect(fieldInReport({ type: "number", inReport: true })).toBe(true);
   });
 });

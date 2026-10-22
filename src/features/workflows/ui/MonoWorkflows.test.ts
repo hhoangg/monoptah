@@ -178,6 +178,59 @@ it("Remove takes the workflow out of the file", async () => {
   expect(saved()).toEqual([]);
 });
 
+it("Remove also empties the workflow's run history", async () => {
+  save([workflow()]);
+  files.set("workflow-runs/wf-aaaaaaaa.json", '[{"id":"run-1"}]');
+  await renderPanel();
+  await act(async () => button("Remove").click());
+  expect(saved()).toEqual([]);
+  expect(files.get("workflow-runs/wf-aaaaaaaa.json")).toBe("[]\n");
+});
+
+it("Remove is refused while a run is going", async () => {
+  save([workflow()]);
+  files.set("workflow-runs/wf-aaaaaaaa.json", '[{"id":"run-1"}]');
+  act(() => setWorkflowRunning("wf-aaaaaaaa", "run-live"));
+  await renderPanel();
+  await act(async () => button("Remove").click());
+  act(() => setWorkflowRunning("wf-aaaaaaaa", null));
+  expect(saved()).toHaveLength(1);
+  expect(files.get("workflow-runs/wf-aaaaaaaa.json")).toBe('[{"id":"run-1"}]');
+  expect(container.querySelector("[data-workflow-notice]")?.textContent).toMatch(
+    /Stop the workflow before removing it/,
+  );
+});
+
+it("Resume by the user ends the review a CLI import was waiting for", async () => {
+  save([scheduled({ enabled: false, nextRunAt: undefined, needsReview: true })]);
+  await renderPanel();
+  await act(async () => button("Resume").click());
+  expect(saved()[0].enabled).toBe(true);
+  expect(saved()[0].needsReview).toBeUndefined();
+});
+
+it("Resume that is refused keeps the review pending", async () => {
+  save([workflow({ enabled: false, nodes: [], edges: [], needsReview: true })]);
+  await renderPanel();
+  await act(async () => button("Resume").click());
+  expect(saved()[0].needsReview).toBe(true);
+});
+
+it("Run now by the user ends the review a CLI import was waiting for", async () => {
+  save([workflow({ enabled: false, needsReview: true })]);
+  await renderPanel();
+  await act(async () => button("Run now").click());
+  expect(saved()[0].runRequested).toBe(true);
+  expect(saved()[0].needsReview).toBeUndefined();
+});
+
+it("Pause leaves a pending review alone", async () => {
+  save([workflow({ needsReview: true })]);
+  await renderPanel();
+  await act(async () => button("Pause").click());
+  expect(saved()[0]).toMatchObject({ enabled: false, needsReview: true });
+});
+
 it("refreshes when the Mono changes the workflows file", async () => {
   save([workflow({ name: "First" })]);
   await renderPanel();

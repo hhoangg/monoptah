@@ -135,6 +135,7 @@ export function WorkflowPage({
   onBack: () => void;
   onEditBoard: () => void;
   onOpenRun: (runId: string) => void;
+  /** Called once the workflow is removed, to close its page. */
   onRemove: () => void;
 }) {
   const [notice, setNotice] = useState<string>();
@@ -207,7 +208,15 @@ export function WorkflowPage({
         >
           <Share className="size-3.5" strokeWidth={1.75} />
         </IconButton>
-        <IconButton label="Remove" onClick={onRemove}>
+        <IconButton
+          label="Remove"
+          onClick={() =>
+            void actions.remove(workflow.id).then((refused) => {
+              if (refused) setNotice(refused);
+              else onRemove();
+            })
+          }
+        >
           <Trash2 className="size-3.5" strokeWidth={1.75} />
         </IconButton>
       </PageHeader>

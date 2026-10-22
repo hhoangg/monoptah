@@ -170,6 +170,23 @@ it("saves a valid workflow, keeping the fields the app manages", async () => {
   expect(button("Save").disabled).toBe(true);
 });
 
+it("saving a flagged workflow enabled counts as the user's review, saving it paused does not", async () => {
+  const rename = async () => {
+    const name = container.querySelector<HTMLInputElement>("input[aria-label='Workflow name']")!;
+    await act(async () => type(name, "Renamed"));
+    await act(async () => button("Save").click());
+  };
+  await renderBoard(ticketWorkflow({ enabled: true, needsReview: true }));
+  await rename();
+  expect(stored()[0].needsReview).toBeUndefined();
+
+  act(() => root.unmount());
+  root = createRoot(container);
+  await renderBoard(ticketWorkflow({ enabled: false, needsReview: true }));
+  await rename();
+  expect(stored()[0]).toMatchObject({ enabled: false, needsReview: true });
+});
+
 it("leaving with unsaved changes asks to save or discard", async () => {
   const onBack = vi.fn();
   await renderBoard(ticketWorkflow(), { onBack });

@@ -58,6 +58,7 @@ function fixture(kind: "mono" | "session" = "mono") {
   const checkNow = vi.fn();
   const stop = vi.fn(async () => {});
   const resumeRun = vi.fn(async () => {});
+  const clearRuns = vi.fn(async (_monoId: string, _workflowId: string) => {});
   const host = {
     isMono: (id: string) => kind === "mono" && id === source.id,
     monoOf: () => ({ id: "mono-1", projects: [] }),
@@ -76,6 +77,7 @@ function fixture(kind: "mono" | "session" = "mono") {
       running: (workflowId: string) => live.get(workflowId),
       stop,
       resumeRun,
+      clearRuns,
       checkNow,
     },
   } as unknown as AgentAppHost;
@@ -91,6 +93,7 @@ function fixture(kind: "mono" | "session" = "mono") {
     checkNow,
     stop,
     resumeRun,
+    clearRuns,
   };
 }
 
@@ -102,7 +105,7 @@ describe("workflows.add", () => {
     await expect(call("workflows.add", { workflow: definition({ extra: 1 }) })).rejects.toThrow(
       /Unknown workflow fields: extra/,
     );
-    for (const field of ["id", "createdAt", "runRequested", "stopRequested", "resumeRunId", "nextRunAt", "lastRunId"])
+    for (const field of ["id", "createdAt", "runRequested", "stopRequested", "resumeRunId", "nextRunAt", "lastRunId", "needsReview"])
       await expect(
         call("workflows.add", { workflow: definition({ [field]: "x" }) }),
       ).rejects.toThrow(`Unknown workflow fields: ${field}`);
@@ -597,5 +600,87 @@ describe("pause, resume, setInputs, remove, get and runs", () => {
       ((await call("workflows.runs", { id, limit: 2 })) as { runs: unknown[] }).runs,
     ).toHaveLength(2);
     await expect(call("workflows.runs", { id, limit: 0 })).rejects.toThrow(/limit/);
+  });
+});
+
+describe("a workflow the CLI created from yaml needs the user's review", () => {
+  const REVIEW = /imported through the CLI.*enable it in the Workflows panel/;
+
+  async function imported() {
+    const f = fixture();
+    const { id } = (await f.call("workflows.add", { workflow: definition() })) as Added;
+    const { yaml } = (await f.call("workflows.export", { id })) as { yaml: string };
+    await f.call("workflows.remove", { id });
+    return { ...f, yaml };
+  }
+
+  it("marks workflows.add with yaml and workflows.import, but not a definition written here", async () => {
+    const { call, stored, yaml } = await imported();
+    await call("workflows.add", { yaml, values: { project: "/code/app" } });
+    await call("workflows.import", { yaml, values: { project: "/code/app" } });
+    await call("workflows.add", { workflow: definition({ name: "Written here" }) });
+    expect(stored().map((w) => [w.name, w.needsReview])).toEqual([
+      ["Ticket review", true],
+      ["Ticket review", true],
+      ["Written here", undefined],
+    ]);
+  });
+
+  it("refuses resume, run and update with enabled true", async () => {
+    const { call, stored, checkNow, yaml } = await imported();
+    const { id } = (await call("workflows.add", {
+      yaml,
+      values: { project: "/code/app" },
+    })) as Added;
+    await expect(call("workflows.resume", { id })).rejects.toThrow(REVIEW);
+    await expect(call("workflows.run", { id })).rejects.toThrow(REVIEW);
+    await expect(
+      call("workflows.update", { id, workflow: { ...definition(), enabled: true } }),
+    ).rejects.toThrow(REVIEW);
+    expect(stored()[0]).toMatchObject({ enabled: false, needsReview: true });
+    expect(stored()[0].runRequested).toBeUndefined();
+    expect(checkNow).not.toHaveBeenCalled();
+  });
+
+  it("still lets the Mono pause it, set inputs and update it paused, keeping the mark", async () => {
+    const { call, stored, yaml } = await imported();
+    const { id } = (await call("workflows.add", {
+      yaml,
+      values: { project: "/code/app" },
+    })) as Added;
+    await call("workflows.pause", { id });
+    await call("workflows.setInputs", { id, values: { project: "/code/other" } });
+    await call("workflows.update", { id, workflow: definition({ name: "Renamed" }) });
+    expect(stored()[0]).toMatchObject({ name: "Renamed", enabled: false, needsReview: true });
+  });
+
+  it("update keeps the mark on a reviewed-then-flagged workflow and never takes it as input", async () => {
+    const { call, yaml } = await imported();
+    const { id } = (await call("workflows.add", { yaml })) as Added;
+    await expect(
+      call("workflows.update", { id, workflow: definition({ needsReview: false }) }),
+    ).rejects.toThrow("Unknown workflow fields: needsReview");
+  });
+
+  it("removing a workflow clears its run history, and a failure there does not block it", async () => {
+    const { call, stored, clearRuns } = fixture();
+    const { id } = (await call("workflows.add", { workflow: definition() })) as Added;
+    await call("workflows.remove", { id });
+    expect(stored()).toEqual([]);
+    expect(clearRuns).toHaveBeenCalledWith("mono-1", id);
+
+    clearRuns.mockRejectedValueOnce(new Error("disk"));
+    const second = (await call("workflows.add", { workflow: definition() })) as Added;
+    await expect(call("workflows.remove", { id: second.id })).resolves.toEqual({
+      removed: "Ticket review",
+    });
+  });
+
+  it("a refused removal leaves the history alone", async () => {
+    const { call, live, clearRuns } = fixture();
+    const { id } = (await call("workflows.add", { workflow: definition() })) as Added;
+    live.set(id, "run-1");
+    await expect(call("workflows.remove", { id })).rejects.toThrow(/Stop the workflow/);
+    expect(clearRuns).not.toHaveBeenCalled();
   });
 });

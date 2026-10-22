@@ -281,10 +281,7 @@ export function MonoOverview({
               onOpenRun={(runId) =>
                 push({ kind: "workflow-run", id: route.id, runId })
               }
-              onRemove={() => {
-                void workflowOps.remove(workflow.id);
-                back();
-              }}
+              onRemove={back}
             />
           ),
         },

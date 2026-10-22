@@ -19,6 +19,7 @@ import {
   subscribeWorkflowsRunning,
   updateRuns,
   updateWorkflows,
+  WORKFLOWS_FILE_BUDGET,
   workflowRunningId,
   workflowStopRequested,
 } from "./workflowStore";
@@ -230,4 +231,21 @@ it("check-now reaches subscribers", () => {
   off();
   checkWorkflowsNow();
   expect(listener).toHaveBeenCalledTimes(1);
+});
+
+it("updateWorkflows refuses a list that would pass the file cap, with a clear message", async () => {
+  const saved: unknown[] = [];
+  native.invoke.mockImplementation(async (command: string) => {
+    if (command === "mono_read") return { text: "[]", hash: "h1" };
+    saved.push(command);
+    return "new-hash";
+  });
+  const big = workflow({ description: "x".repeat(WORKFLOWS_FILE_BUDGET) });
+  const error = await updateWorkflows("mono-1", () => ({
+    workflows: [big],
+    result: null,
+  })).catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).toMatch(/too large to save/);
+  expect(saved).toEqual([]);
 });

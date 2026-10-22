@@ -44,6 +44,8 @@ const DEFINITION_FIELDS = [
 const NAME_MAX = 80;
 const DESCRIPTION_MAX = 1_000;
 const DEFINITION_MAX_BYTES = 512 * 1024;
+const NEEDS_REVIEW =
+  "This workflow was imported through the CLI. Ask the user to review it and enable it in the Workflows panel.";
 const RUNS_DEFAULT = 5;
 const RUNS_MAX = 20;
 
@@ -353,6 +355,8 @@ export async function handleWorkflows(
           inputValues: values,
           enabled: false,
           createdAt: now,
+          // Only the user, in the panel, may enable what came from a file.
+          ...(fromYaml ? { needsReview: true } : {}),
         };
         const issues = problems(draft);
         // A file from elsewhere is saved paused, like an import, so its commands and prompts are
@@ -368,7 +372,7 @@ export async function handleWorkflows(
               ? {
                   commands: review.commands,
                   prompts: review.prompts,
-                  note: "Saved paused. Check the commands and prompts, then workflows.resume to enable it.",
+                  note: "Saved paused. Check the commands and prompts with the user; only the user can enable it, in the Workflows panel.",
                 }
               : {}),
           },
@@ -385,6 +389,7 @@ export async function handleWorkflows(
         throw new Error("enabled must be true or false");
       return change((list) => {
         const current = find(list);
+        if (current.needsReview && wanted === true) throw new Error(NEEDS_REVIEW);
         // Only the definition is replaced; the id, creation time and run state stay.
         const { description: _old, ...kept } = current;
         const draft: Workflow = {
@@ -435,15 +440,17 @@ export async function handleWorkflows(
     }
     case "workflows.run": {
       const current = find(await workflows.load(monoId));
+      if (current.needsReview) throw new Error(NEEDS_REVIEW);
       if (running(current.id))
         throw new Error("That workflow is already running; its report is posted here when it ends");
       const issues = problems(current);
       if (issues.length)
         throw new Error(`The workflow cannot run yet: ${issuesText(issues)}`);
-      await change((list) => ({
-        list: replace(list, { ...find(list), runRequested: true }),
-        result: undefined,
-      }));
+      await change((list) => {
+        const latest = find(list);
+        if (latest.needsReview) throw new Error(NEEDS_REVIEW);
+        return { list: replace(list, { ...latest, runRequested: true }), result: undefined };
+      });
       workflows.checkNow();
       return {
         id: current.id,
@@ -464,6 +471,7 @@ export async function handleWorkflows(
     case "workflows.resume":
       return change((list) => {
         const current = find(list);
+        if (current.needsReview) throw new Error(NEEDS_REVIEW);
         const issues = problems(current);
         if (issues.length)
           throw new Error(`The workflow cannot be resumed yet: ${issuesText(issues)}`);
@@ -491,6 +499,8 @@ export async function handleWorkflows(
         list: list.filter((entry) => entry.id !== current.id),
         result: undefined,
       }));
+      // The history of a workflow that is gone is of no use; losing the cleanup is harmless.
+      await workflows.clearRuns(monoId, current.id).catch(() => {});
       return { removed: current.name };
     }
     case "workflows.export": {
@@ -505,7 +515,12 @@ export async function handleWorkflows(
       const values =
         input.values === undefined ? {} : inputValues(input.values, "values");
       const finished = finishImport(preview.preview, values, now);
-      const created = { ...finished, nodes: finished.nodes.map((node) => anchorNode(node, now)) };
+      const created: Workflow = {
+        ...finished,
+        nodes: finished.nodes.map((node) => anchorNode(node, now)),
+        // Only the user, in the panel, may enable what came from a file.
+        needsReview: true,
+      };
       await change((list) => {
         if (list.length >= WORKFLOWS_MAX)
           throw new Error(`A Mono can have at most ${WORKFLOWS_MAX} workflows`);
@@ -518,7 +533,7 @@ export async function handleWorkflows(
         issues: problems(created),
         commands: preview.preview.commands,
         prompts: preview.preview.prompts,
-        note: "Saved paused. Check the commands and prompts, then workflows.resume to enable it.",
+        note: "Saved paused. Check the commands and prompts with the user; only the user can enable it, in the Workflows panel.",
       };
     }
     case "workflows.runs": {

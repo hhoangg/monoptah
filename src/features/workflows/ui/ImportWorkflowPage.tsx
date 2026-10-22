@@ -66,10 +66,13 @@ function valuesOf(
 
 /**
  * The text with the characters that change how it reads or what it looks like, without
- * showing, made visible as <U+XXXX>: bidirectional controls, which can reorder what the
- * eye reads, and zero-width characters, which hide. What is reviewed is then what runs.
+ * showing, made visible as <U+XXXX>: every format character (bidirectional controls,
+ * zero-width characters, tag characters, soft hyphens), the line and paragraph separators,
+ * a carriage return that is not half of a line break, and the other control characters.
+ * What is reviewed is then what runs. The `u` flag matches whole code points, so a character
+ * outside the BMP is one marker with its full number.
  */
-const HIDDEN = /[\u202A-\u202E\u2066-\u2069\u200B-\u200D\u2060\uFEFF]/g;
+const HIDDEN = /[\p{Cf}\u2028\u2029]|\r(?!\n)|(?![\n\t\r])\p{Cc}/gu;
 function visible(text: string): string {
   return text.replace(
     HIDDEN,
@@ -155,11 +158,15 @@ function ImportInput({
   projects: readonly MonoProject[];
   onChange: (value: string | boolean | undefined) => void;
 }) {
+  // What the file names these with is shown as it is, hidden characters made visible.
+  const shown = visible(name);
+  const described: WorkflowInput =
+    input.description === undefined ? input : { ...input, description: visible(input.description) };
   if (input.type === "project" || input.type === "boolean")
     return (
       <InputField
-        name={name}
-        input={input}
+        name={shown}
+        input={described}
         value={value}
         projects={projects}
         onSave={(next) => onChange(next as string | boolean | undefined)}
@@ -167,10 +174,10 @@ function ImportInput({
     );
   return (
     <input
-      aria-label={name}
+      aria-label={shown}
       value={typeof raw === "string" ? raw : ""}
       inputMode={input.type === "number" ? "decimal" : undefined}
-      placeholder={input.description ?? name}
+      placeholder={described.description ?? shown}
       spellCheck={false}
       onChange={(event) => onChange(event.target.value)}
       className={FIELD}
@@ -447,7 +454,7 @@ export function ImportWorkflowPage({
               <Section title="Inputs">
                 <dl className="flex flex-col gap-0.5 px-2">
                   {names.map((name) => (
-                    <Property key={name} label={name}>
+                    <Property key={name} label={visible(name)}>
                       <span className="flex min-w-0 flex-1 flex-col gap-1 py-0.5">
                         <ImportInput
                           name={name}

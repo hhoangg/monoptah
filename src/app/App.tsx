@@ -702,6 +702,7 @@ import { useWorkflowDriver } from "./hooks/workflowDriver";
 import { liveRunRegistry } from "./hooks/workflowLiveRuns";
 import {
   checkWorkflowsNow,
+  clearWorkflowRuns,
   loadRuns,
   loadWorkflows,
   stopWorkflowRun,
@@ -12593,6 +12594,7 @@ function Workspace({
                 liveRunRegistry()?.freshRunOf(workflowId),
               stop: stopWorkflowRun,
               resumeRun: resumeWorkflowRun,
+              clearRuns: clearWorkflowRuns,
               checkNow: checkWorkflowsNow,
             },
             agentFiles: (monoId) => loadMonoFiles(monoId),

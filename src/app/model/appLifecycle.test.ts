@@ -54,6 +54,10 @@ vi.mock("../../integrations/harness/core/registry", () => ({
   isLiveHarness: vi.fn(),
   forgetHarnessSession: vi.fn().mockResolvedValue(undefined),
 }));
+const registry = vi.hoisted(() => ({ removeOwned: vi.fn() }));
+vi.mock("../hooks/workflowLiveRuns", () => ({
+  liveRunRegistry: () => registry,
+}));
 vi.mock("../../integrations/harness/core/child", () => ({
   killAllChildren: vi.fn().mockResolvedValue(undefined),
 }));
@@ -135,6 +139,28 @@ describe("project choices through lifecycle saves", () => {
             ([command]) => command === "workspace_set_snapshot",
           ),
       ).toHaveLength(2);
+    } finally {
+      release();
+    }
+  });
+
+  it("takes this window's workflow runs off the registry once the quit is saved", async () => {
+    const state = workspace();
+    const { handleQuitRequested, setQuitWorkspace } =
+      await import("./appLifecycle");
+    registry.removeOwned.mockClear();
+    const release = setQuitWorkspace(
+      () => state.sessions,
+      () => state.tabs,
+      () => state.activeTabId,
+      () => state.projectCwd,
+      () => [],
+      () => state.memory,
+      vi.fn(),
+    );
+    try {
+      await expect(handleQuitRequested()).resolves.toBe(true);
+      expect(registry.removeOwned).toHaveBeenCalledTimes(1);
     } finally {
       release();
     }

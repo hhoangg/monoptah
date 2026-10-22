@@ -246,6 +246,7 @@ function parseWorkflow(raw: unknown): Workflow | undefined {
     ...opt("resumeRunId", str(raw, "resumeRunId")),
     ...opt("lastRunId", str(raw, "lastRunId")),
     ...opt("importedFrom", str(raw, "importedFrom")),
+    ...(raw.needsReview === true ? { needsReview: true } : {}),
   };
 }
 

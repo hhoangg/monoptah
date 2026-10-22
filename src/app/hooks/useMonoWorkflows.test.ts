@@ -735,6 +735,36 @@ describe("useMonoWorkflows", () => {
     ).toContain("timed out");
   });
 
+  it("a command the host refuses fails its node with the host's message", async () => {
+    const def = workflow(
+      [
+        trigger,
+        {
+          id: "cmd",
+          type: "command",
+          project: "{{inputs.repo}}",
+          command: "echo hi",
+        },
+        report,
+      ],
+      [
+        { from: "trigger", to: "cmd" },
+        { from: "cmd", to: "report" },
+      ],
+    );
+    save([def]);
+    const host = makeHost({ replies: [] });
+    // Tauri rejects with a bare string, as the Windows build does for command nodes.
+    host.runCommand.mockRejectedValueOnce(
+      "Command nodes are not supported on Windows yet",
+    );
+    mount(host);
+    await vi.waitFor(() => expect(storedRuns()[0]?.status).toBe("failed"));
+    expect(
+      storedRuns()[0].nodes.find((n) => n.nodeId === "cmd")!.error,
+    ).toContain("Command nodes are not supported on Windows yet");
+  });
+
   it("truncates long output strings before storing them", async () => {
     save([simple({ summary: { type: "string" } })]);
     const host = makeHost({

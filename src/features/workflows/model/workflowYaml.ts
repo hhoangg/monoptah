@@ -162,6 +162,7 @@ export function exportWorkflow(w: Workflow): string {
  */
 export function exportPathProblem(w: Workflow): string | undefined {
   const problem = findPathField(exportDocument(w), "");
+  if (problem === TOO_DEEP) return problem;
   return problem ? `${problem}; use a project input or a relative path` : undefined;
 }
 
@@ -209,21 +210,28 @@ function parseFile(text: string): Parsed {
   }
 }
 
-/** The first string anywhere in `value` that reads as an absolute path, with where it sits. */
-function findPathField(value: unknown, label: string): string | undefined {
-  if (value instanceof Scalar) return findPathField(value.value, label);
+const NESTING_MAX = 64;
+const TOO_DEEP = "The workflow file is nested too deeply";
+
+/**
+ * The first string anywhere in `value` that reads as an absolute path, with where it sits.
+ * Nesting past 64 levels is reported as `TOO_DEEP` rather than followed.
+ */
+function findPathField(value: unknown, label: string, depth = 0): string | undefined {
+  if (depth > NESTING_MAX) return TOO_DEEP;
+  if (value instanceof Scalar) return findPathField(value.value, label, depth);
   if (typeof value === "string") {
     const found = findAbsolutePath(value);
     return found ? `${label} contains an absolute path ("${found}")` : undefined;
   }
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
-      const hit = findPathField(value[i], `${label}[${i}]`);
+      const hit = findPathField(value[i], `${label}[${i}]`, depth + 1);
       if (hit) return hit;
     }
   } else if (isRec(value)) {
     for (const [key, item] of Object.entries(value)) {
-      const hit = findPathField(item, label ? `${label}.${key}` : key);
+      const hit = findPathField(item, label ? `${label}.${key}` : key, depth + 1);
       if (hit) return hit;
     }
   }
@@ -252,6 +260,7 @@ export function previewImport(
   }
   const pathProblem = findPathField(file, "");
   if (pathProblem) {
+    if (pathProblem === TOO_DEEP) return fail(TOO_DEEP);
     return fail(`${pathProblem}; use a project input or a relative path`);
   }
 

@@ -42,6 +42,8 @@ const FILE_MAX: usize = 256 * 1024;
 /// A workflow's runs file holds up to 20 runs, each with a definition snapshot and node
 /// outputs, so it gets a larger cap than the other files.
 const RUNS_FILE_MAX: usize = 4 * 1024 * 1024;
+/// `workflows.json` holds up to 20 definitions, and the CLI allows each to be 512 KiB.
+const WORKFLOWS_FILE_MAX: usize = 2 * 1024 * 1024;
 pub const CONFLICT: &str = "conflict";
 
 /// Serializes index updates, so two Monos opening at once cannot both read
@@ -310,6 +312,8 @@ fn save(
 ) -> Result<String, String> {
     let max = if relative.starts_with("workflow-runs/") {
         RUNS_FILE_MAX
+    } else if relative == WORKFLOWS_FILE {
+        WORKFLOWS_FILE_MAX
     } else {
         FILE_MAX
     };
@@ -441,7 +445,14 @@ mod tests {
             None
         )
         .is_ok());
-        let err = save(&root, "m", None, WORKFLOWS_FILE, &big, None).unwrap_err();
+        // The workflows file has its own cap, between the default and the runs cap.
+        assert!(save(&root, "m", None, WORKFLOWS_FILE, &big, None).is_ok());
+        let over_default = "x".repeat(FILE_MAX + 1);
+        assert!(save(&root, "m", None, WORKFLOWS_FILE, &over_default, None).is_ok());
+        let err = save(&root, "m", None, SOUL_FILE, &over_default, None).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        let over_workflows = "x".repeat(WORKFLOWS_FILE_MAX + 1);
+        let err = save(&root, "m", None, WORKFLOWS_FILE, &over_workflows, None).unwrap_err();
         assert!(err.contains("too large"), "{err}");
         let huge = "x".repeat(RUNS_FILE_MAX + 1);
         assert!(save(

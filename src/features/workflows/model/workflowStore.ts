@@ -18,8 +18,17 @@ export async function loadWorkflows(monoId: string): Promise<Workflow[]> {
   );
 }
 
+/** Stay under the 2 MiB cap `mono.rs` puts on workflows.json. */
+export const WORKFLOWS_FILE_BUDGET = 2 * 1024 * 1024;
+
 function serializeWorkflows(workflows: Workflow[]): string {
-  return `${JSON.stringify(workflows, null, 2)}\n`;
+  const text = `${JSON.stringify(workflows, null, 2)}\n`;
+  // Say so here rather than let the host fail with a raw "is too large".
+  if (new TextEncoder().encode(text).length > WORKFLOWS_FILE_BUDGET)
+    throw new Error(
+      "The workflows are too large to save (over 2 MiB in total). Remove a workflow or shorten its steps.",
+    );
+  return text;
 }
 
 /**
@@ -121,6 +130,21 @@ export async function updateRuns<T>(
     } catch (error) {
       if (!(error instanceof MonoFileConflict) || attempt >= 2) throw error;
     }
+  }
+}
+
+/**
+ * Empties the run history of a workflow that was removed, so nothing of it stays on disk.
+ * Failing to is harmless, so it never rejects.
+ */
+export async function clearWorkflowRuns(
+  monoId: string,
+  workflowId: WorkflowId,
+): Promise<void> {
+  try {
+    await writeAgentFile(monoId, runsPath(workflowId), "[]\n");
+  } catch (error) {
+    console.warn("Could not clear the runs of a removed workflow", error);
   }
 }
 

@@ -26,6 +26,7 @@ import {
 import { validateWorkflow, type WorkflowIssue } from "../model/workflowParse";
 import {
   checkWorkflowsNow,
+  clearWorkflowRuns,
   loadRuns,
   loadWorkflows,
   stopWorkflowRun,
@@ -191,13 +192,22 @@ function refusal(verb: string, issues: WorkflowIssue[]): string {
   return `Can't ${verb} yet: ${reason}${rest.length ? ` (and ${rest.length} more)` : ""}.`;
 }
 
+/**
+ * The user acting on a workflow from the panel is the review a CLI import was waiting for.
+ */
+function withoutReview(workflow: Workflow): Workflow {
+  const { needsReview: _reviewed, ...rest } = workflow;
+  return rest;
+}
+
 export type WorkflowActions = {
   /** Resolves to why the workflow cannot run yet, if it cannot. */
   runNow(id: string): Promise<string | undefined>;
   stop(id: string): Promise<void>;
   /** Resolves to why a paused workflow cannot be resumed yet, if it cannot. */
   toggle(id: string): Promise<string | undefined>;
-  remove(id: string): Promise<void>;
+  /** Resolves to why the workflow cannot be removed, if it cannot. */
+  remove(id: string): Promise<string | undefined>;
 };
 
 /** Edits to the Mono's workflows from the panel, saved over what was read. */
@@ -228,7 +238,7 @@ export function workflowActions(monoId: string): WorkflowActions {
         const issues = validateWorkflow(workflow);
         return issues.length
           ? { next: workflow, notice: refusal("run", issues) }
-          : { next: { ...workflow, runRequested: true } };
+          : { next: withoutReview({ ...workflow, runRequested: true }) };
       });
       if (!notice) checkWorkflowsNow();
       return notice;
@@ -247,17 +257,21 @@ export function workflowActions(monoId: string): WorkflowActions {
           return { next: workflow, notice: refusal("resume", issues) };
         const trigger = triggerOf(workflow);
         return {
-          next: {
+          next: withoutReview({
             ...workflow,
             enabled: true,
             ...(trigger?.type === "schedule"
               ? { nextRunAt: nextHabitRunAt(trigger.schedule, Date.now()) }
               : {}),
-          },
+          }),
         };
       }),
     remove: async (id) => {
-      await change(id, () => ({ next: null }));
+      // A run left going would keep posting its report with nothing to stop it.
+      if (liveRunOf(id)) return "Stop the workflow before removing it.";
+      const notice = await change(id, () => ({ next: null }));
+      if (!notice) await clearWorkflowRuns(monoId, id);
+      return notice;
     },
   };
 }
@@ -374,7 +388,7 @@ export function WorkflowRow({
         </HabitButton>
         <HabitButton
           label="Remove"
-          onClick={() => void actions.remove(workflow.id)}
+          onClick={() => void actions.remove(workflow.id).then(notify)}
         >
           <Trash2 className="size-3.5" strokeWidth={1.75} />
         </HabitButton>

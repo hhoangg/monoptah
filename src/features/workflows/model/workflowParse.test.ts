@@ -131,6 +131,26 @@ describe("parseWorkflows", () => {
   });
 });
 
+describe("needsReview", () => {
+  const entry = (extra: Record<string, unknown>) =>
+    JSON.stringify([
+      {
+        id: "wf-abcd1234",
+        name: "x",
+        nodes: [{ id: "trigger", type: "manual" }],
+        edges: [],
+        ...extra,
+      },
+    ]);
+
+  it("is kept when true and dropped otherwise", () => {
+    expect(parseWorkflows(entry({ needsReview: true }))[0].needsReview).toBe(true);
+    expect("needsReview" in parseWorkflows(entry({ needsReview: false }))[0]).toBe(false);
+    expect("needsReview" in parseWorkflows(entry({ needsReview: "yes" }))[0]).toBe(false);
+    expect("needsReview" in parseWorkflows(entry({}))[0]).toBe(false);
+  });
+});
+
 describe("workflow ids", () => {
   it("newWorkflowId is wf- plus 8 base36 chars", () => {
     expect(newWorkflowId()).toMatch(/^wf-[a-z0-9]{8}$/);

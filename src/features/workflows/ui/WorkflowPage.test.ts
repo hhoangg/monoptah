@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Workflow, WorkflowRun } from "../model/workflow";
 import { WorkflowPage } from "./WorkflowPage";
+import { setWorkflowRunning } from "../model/workflowStore";
 import { workflowActions } from "./MonoWorkflows";
 import { run, workflow } from "./workflowUiFixtures";
 
@@ -49,7 +50,7 @@ afterEach(() => {
 
 const stored = (): Workflow[] => JSON.parse(files.get("workflows.json") ?? "[]");
 
-async function renderPage(w: Workflow, onOpenRun = vi.fn()) {
+async function renderPage(w: Workflow, onOpenRun = vi.fn(), onRemove = vi.fn()) {
   files.set("workflows.json", JSON.stringify([w]));
   await act(async () =>
     root.render(
@@ -65,7 +66,7 @@ async function renderPage(w: Workflow, onOpenRun = vi.fn()) {
         onBack: () => {},
         onEditBoard: () => {},
         onOpenRun,
-        onRemove: () => {},
+        onRemove,
       }),
     ),
   );
@@ -138,4 +139,23 @@ it("edits an input value after checking its type", async () => {
   await act(async () => set("7"));
   expect(stored()[0].inputValues.limit).toBe(7);
   expect(notice()).toBeNull();
+});
+
+it("Remove closes the page once the workflow is gone", async () => {
+  const onRemove = vi.fn();
+  await renderPage(workflow(), vi.fn(), onRemove);
+  await act(async () => button("Remove").click());
+  expect(stored()).toEqual([]);
+  expect(onRemove).toHaveBeenCalledTimes(1);
+});
+
+it("Remove is refused with a notice while a run is going", async () => {
+  const onRemove = vi.fn();
+  await renderPage(workflow(), vi.fn(), onRemove);
+  act(() => setWorkflowRunning("wf-aaaaaaaa", "run-live"));
+  await act(async () => button("Remove").click());
+  act(() => setWorkflowRunning("wf-aaaaaaaa", null));
+  expect(stored()).toHaveLength(1);
+  expect(onRemove).not.toHaveBeenCalled();
+  expect(notice()?.textContent).toMatch(/Stop the workflow before removing it/);
 });

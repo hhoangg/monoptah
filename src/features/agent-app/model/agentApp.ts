@@ -180,6 +180,8 @@ export type AgentAppHost = {
     running(workflowId: string): string | undefined;
     stop(monoId: string, workflowId: string): Promise<void>;
     resumeRun(monoId: string, workflowId: string, runId: string): Promise<void>;
+    /** Empties the run history of a workflow that was removed. Never rejects. */
+    clearRuns(monoId: string, workflowId: string): Promise<void>;
     checkNow: typeof checkWorkflowsNow;
   };
   agentFiles(monoId: string): Promise<MonoFiles>;

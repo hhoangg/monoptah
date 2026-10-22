@@ -1,6 +1,7 @@
 import { useRef, useState, type ReactNode } from "react";
 import { IconButton } from "../../../../app/shell/TitleBar";
 import { basename } from "../../../../platform/tauri/fs";
+import { IS_WIN } from "../../../../platform/tauri/platform";
 import { ChevronLeft, Plus, Trash2, X } from "../../../../shared/ui/icons";
 import { SearchableSelect } from "../../../../shared/ui/SearchableSelect";
 import type { MonoProject } from "../../../monos/model/mono";
@@ -22,6 +23,7 @@ import type {
   WorkflowInput,
   WorkflowNode,
 } from "../../model/workflow";
+import { fieldInReport } from "../../model/workflowReport";
 import { inputValueProblems } from "../../model/workflowYaml";
 import { FIELD, InputField } from "../WorkflowPage";
 import { has, projectInputFor } from "./boardModel";
@@ -280,11 +282,11 @@ function OutputFields({
               />
               <button
                 type="button"
-                aria-pressed={!!field.inReport}
+                aria-pressed={fieldInReport(field)}
                 title="Include this field in the report"
-                onClick={() => set(key, { inReport: !field.inReport })}
+                onClick={() => set(key, { inReport: !fieldInReport(field) })}
                 className={`h-7 shrink-0 rounded-md px-2 text-[11px] ${
-                  field.inReport
+                  fieldInReport(field)
                     ? "bg-content/15 text-content"
                     : "text-content/45 hover:bg-content/8"
                 }`}
@@ -568,6 +570,9 @@ function NodeFields({
             onChange={(command) => change({ command })}
           />
           <Hint>Fills in from {"{{ }}"} are quoted for the shell. It reports exitCode, stdout and stderr.</Hint>
+          {IS_WIN ? (
+            <Hint>Command nodes are not supported on Windows yet, so this step will fail when it runs.</Hint>
+          ) : null}
         </>
       );
     case "askMono":

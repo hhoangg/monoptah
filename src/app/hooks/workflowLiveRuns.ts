@@ -36,7 +36,7 @@ export function createLiveRunRegistry(options: {
 }): LiveRunRegistry {
   const { storage } = options;
   const owner = options.owner ?? crypto.randomUUID();
-  const now = options.now ?? Date.now;
+  const now = options.now ?? (() => Date.now());
   const read = (): Record<string, Entry> => {
     try {
       const value = JSON.parse(storage.getItem(LIVE_RUNS_KEY) ?? "{}");

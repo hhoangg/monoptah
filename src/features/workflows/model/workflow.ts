@@ -128,6 +128,12 @@ export type Workflow = {
   resumeRunId?: string;
   lastRunId?: string;
   importedFrom?: string;
+  /**
+   * Set on a workflow the Mono created from a file through the CLI. Its commands and prompts
+   * came from elsewhere, so only the user, in the panel, may enable or run it; that clears
+   * the mark. Never exported.
+   */
+  needsReview?: boolean;
 };
 
 export const WORKFLOWS_MAX = 20;

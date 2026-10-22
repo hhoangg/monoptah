@@ -409,6 +409,39 @@ it("makes hidden characters in commands and prompts visible", async () => {
   expect(commands.textContent! + section("Prompts")!.textContent!).not.toMatch(/[\u202a-\u202e\u2066-\u2069\u200b-\u200d\u2060\ufeff]/);
 });
 
+it("makes tag characters, direction marks, lone carriage returns and other controls visible", async () => {
+  await renderPage();
+  const sneaky = source({
+    nodes: steps.map((node) =>
+      node.type === "command"
+        ? {
+            ...node,
+            command: "echo a\u{E0041}b\u200e\u200f\u061c\u00ad c\rd\r\ne\u0007\u2028",
+          }
+        : node,
+    ),
+  });
+  await paste(yamlOf(sneaky));
+  const block = section("Commands this workflow runs")!.querySelector("pre")!;
+  // The astral tag character shows its full code point; a CRLF pair is a plain line break.
+  expect(block.textContent).toBe(
+    "echo a<U+E0041>b<U+200E><U+200F><U+061C><U+00AD> c<U+000D>d\r\ne<U+0007><U+2028>",
+  );
+});
+
+it("makes hidden characters in input names and descriptions visible", async () => {
+  await renderPage();
+  const tricky = source({
+    inputs: {
+      project: { type: "project" },
+      area: { type: "string", description: "Where\u202e to look\u{E0041}" },
+    },
+  });
+  await paste(yamlOf(tricky));
+  const input = section("Inputs")!.querySelector<HTMLInputElement>("input[aria-label='area']")!;
+  expect(input.placeholder).toBe("Where<U+202E> to look<U+E0041>");
+});
+
 it("renders a file that repeats node ids without duplicate keys", async () => {
   const error = vi.spyOn(console, "error").mockImplementation(() => {});
   await renderPage();

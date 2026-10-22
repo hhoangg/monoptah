@@ -78,6 +78,7 @@ function example(): Workflow {
     runRequested: true,
     lastRunId: "run-1",
     importedFrom: "somewhere.yaml",
+    needsReview: true,
   };
 }
 
@@ -91,6 +92,29 @@ function error(text: string): string {
   if (result.ok) throw new Error("expected an error, got a preview");
   return result.error;
 }
+
+describe("a file nested far too deeply", () => {
+  it("gets the model's error instead of a RangeError", () => {
+    for (const depth of [100, 50_000]) {
+      const deep = `${"[".repeat(depth)}${"]".repeat(depth)}`;
+      const text = `{"monoptahWorkflow": 1, "name": "x", "nodes": [], "extra": ${deep}}`;
+      let result: ReturnType<typeof previewImport> | undefined;
+      expect(() => {
+        result = previewImport(text);
+      }).not.toThrow();
+      expect(result).toEqual({
+        ok: false,
+        error: expect.stringMatching(/nested too deeply|Could not read/),
+      });
+    }
+  });
+
+  it("names the depth problem for a file that parses", () => {
+    const deep = `${"[".repeat(100)}${"]".repeat(100)}`;
+    const result = previewImport(`{"monoptahWorkflow": 1, "name": "x", "nodes": [], "extra": ${deep}}`);
+    expect(result).toEqual({ ok: false, error: "The workflow file is nested too deeply" });
+  });
+});
 
 describe("exportWorkflow", () => {
   it("writes the version key first and the other keys in a fixed order", () => {
@@ -114,6 +138,7 @@ describe("exportWorkflow", () => {
       "runRequested",
       "lastRunId",
       "importedFrom",
+      "needsReview",
       "createdAt",
       "enabled",
       "wf-abcd1234",
@@ -463,6 +488,7 @@ describe("finishImport", () => {
     expect(w.edges).toEqual(example().edges);
     expect(w.nextRunAt).toBeUndefined();
     expect(w.runRequested).toBeUndefined();
+    expect(w.needsReview).toBeUndefined();
     expect(w.lastRunId).toBeUndefined();
   });
 

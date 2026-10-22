@@ -30,7 +30,7 @@ export function createDriverLease(options: {
   id?: string;
 }): DriverLease {
   const { storage } = options;
-  const now = options.now ?? Date.now;
+  const now = options.now ?? (() => Date.now());
   const id = options.id ?? crypto.randomUUID();
   const read = (): Lease | undefined => {
     try {

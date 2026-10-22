@@ -80,11 +80,16 @@ function lastSessionRun(run: WorkflowRun, runs: NodeRun[]): NodeRun | undefined 
   return best;
 }
 
-/** Fields the report shows: `inReport` when declared, else on for strings and off for the rest. */
+/** Whether the report shows a field: `inReport` when declared, else on for strings and off for the rest. */
+export function fieldInReport(field: OutputField): boolean {
+  return field.inReport ?? field.type === "string";
+}
+
+/** Fields the report shows. */
 function reportedFields(node: SessionNode, output: Record<string, unknown>): Array<[string, unknown]> {
   const shown: Array<[string, unknown]> = [];
   for (const [name, field] of Object.entries(node.output) as Array<[string, OutputField]>) {
-    if (!(field.inReport ?? field.type === "string")) continue;
+    if (!fieldInReport(field)) continue;
     if (!Object.prototype.hasOwnProperty.call(output, name)) continue;
     shown.push([name, output[name]]);
   }

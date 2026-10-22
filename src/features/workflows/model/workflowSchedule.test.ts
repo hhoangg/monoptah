@@ -57,3 +57,22 @@ describe("dueWorkflows", () => {
     expect(advance).toHaveLength(1);
   });
 });
+
+describe("a workflow that needs review", () => {
+  const never = () => false;
+
+  it("is not claimed when due", () => {
+    const due = workflow({ needsReview: true });
+    expect(dueWorkflows([due], NOW, never)).toEqual({ run: [], advance: [] });
+  });
+
+  it("is not claimed when a run was requested", () => {
+    const asked = workflow({ needsReview: true, enabled: false, runRequested: true });
+    expect(dueWorkflows([asked], NOW, never)).toEqual({ run: [], advance: [] });
+  });
+
+  it("runs once the review is done", () => {
+    const { needsReview: _gone, ...reviewed } = workflow({ needsReview: true });
+    expect(dueWorkflows([reviewed], NOW, never).run).toHaveLength(1);
+  });
+});

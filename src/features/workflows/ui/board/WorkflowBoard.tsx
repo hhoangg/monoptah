@@ -160,6 +160,8 @@ function merged(stored: Workflow | undefined, next: Workflow, now: number): Work
     edges,
     enabled,
   } as Workflow;
+  // Saving it enabled, with every step in view, is the review a CLI import was waiting for.
+  if (enabled) delete base.needsReview;
   const trigger = triggerOf(base);
   if (!enabled || trigger?.type !== "schedule") return base;
   // A schedule that is unchanged keeps its place; a new, edited or resumed one starts afresh.
