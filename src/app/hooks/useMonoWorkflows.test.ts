@@ -26,6 +26,8 @@ const MONO = {
   projects: ["/code/app"],
 };
 const fileFailures = { runs: false };
+/** Run-file writes in flight, to show saves never overlap. */
+const runWrites = { delayMs: 0, inflight: 0, max: 0, texts: [] as string[] };
 
 vi.mock("../../features/monos/model/mono", async (original) => ({
   ...(await original<object>()),
@@ -45,6 +47,15 @@ vi.mock("../../features/monos/model/monoFiles", async (original) => {
       async (_monoId: string, path: string, text: string, expected: string) => {
         if (fileFailures.runs && path.startsWith("workflow-runs/"))
           throw new Error("file too large");
+        const tracked = path.startsWith("workflow-runs/");
+        if (tracked) {
+          runWrites.inflight++;
+          runWrites.max = Math.max(runWrites.max, runWrites.inflight);
+          if (runWrites.delayMs)
+            await new Promise((r) => setTimeout(r, runWrites.delayMs));
+          runWrites.inflight--;
+          runWrites.texts.push(text);
+        }
         const current = files.get(path)?.hash ?? 0;
         if (expected !== String(current)) throw new actual.MonoFileConflict();
         files.set(path, { text, hash: current + 1 });
@@ -58,8 +69,12 @@ const { useMonoWorkflows, resumeWorkflowRun } =
   await import("./useMonoWorkflows");
 const { checkWorkflowsNow, requestWorkflowStop, workflowRunningId } =
   await import("../../features/workflows/model/workflowStore");
-const { setWorkflowRunning, clearWorkflowStop } =
-  await import("../../features/workflows/model/workflowStore");
+const {
+  setWorkflowRunning,
+  clearWorkflowStop,
+  stopWorkflowRun,
+  workflowStopRequested,
+} = await import("../../features/workflows/model/workflowStore");
 const { relayApproval, dropRelays } =
   await import("../../features/monos/model/monoHabits");
 
@@ -220,7 +235,7 @@ function makeHost(script: Script) {
         } as unknown as Session);
         return {
           sessionId: id,
-          folderId: "folder-1",
+          folderId: `folder:${req.project}`,
           settled: turn(id, req.prompt),
         };
       },
@@ -252,7 +267,7 @@ function makeHost(script: Script) {
     ),
     endApprovals: vi.fn(),
     projectPath: vi.fn((_monoId: string, input: string) =>
-      input === "/code/app" ? input : undefined,
+      input === "/code/app" || input === "/code/lib" ? input : undefined,
     ),
     worktreeOf: vi.fn((id: string) => `/code/app-wt-${id}`),
   };
@@ -266,6 +281,7 @@ let release: Array<() => void> = [];
 beforeEach(() => {
   files.clear();
   fileFailures.runs = false;
+  Object.assign(runWrites, { delayMs: 0, inflight: 0, max: 0, texts: [] });
   release = [];
   delete (window as unknown as Record<string, unknown>).__monoWorkflowsSwept;
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -283,9 +299,9 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function mount(host: ReturnType<typeof makeHost>) {
+function mount(host: ReturnType<typeof makeHost>, driver = true) {
   function Probe() {
-    useMonoWorkflows(host);
+    useMonoWorkflows(host, driver);
     return null;
   }
   act(() => root.render(createElement(Probe)));
@@ -338,7 +354,7 @@ describe("useMonoWorkflows", () => {
     expect(storedRuns()[0]).toMatchObject({
       id: runId,
       trigger: "schedule",
-      folderId: "folder-1",
+      folderId: "folder:/code/app",
     });
     expect(storedRuns()[0].nodes.find((n) => n.nodeId === "dev")).toMatchObject(
       { status: "done", sessionId: "s1", output: { summary: "all good" } },
@@ -365,6 +381,7 @@ describe("useMonoWorkflows", () => {
   });
 
   it("skips a tick while previous run is running", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
     save([simple()]);
     const script: Script = { replies: ["ok"] };
     const gate = hold(script);
@@ -379,6 +396,7 @@ describe("useMonoWorkflows", () => {
       expect(stored()[0].nextRunAt).toBeGreaterThan(Date.now()),
     );
     expect(host.startSession).toHaveBeenCalledTimes(1);
+    expect(info).toHaveBeenCalledWith(expect.stringContaining("still running"));
 
     gate.resolve();
     await vi.waitFor(() => expect(storedRuns()[0].status).toBe("done"));
@@ -395,6 +413,8 @@ describe("useMonoWorkflows", () => {
     mount(host);
     await vi.waitFor(() => expect(storedRuns()[0].status).toBe("interrupted"));
     expect(host.startSession).not.toHaveBeenCalled();
+    // An interrupted run says nothing until it is resumed.
+    expect(host.post).not.toHaveBeenCalled();
   });
 
   it("leaves a stored running run alone when this window is driving it", async () => {
@@ -577,8 +597,12 @@ describe("useMonoWorkflows", () => {
     expect(storedRuns()[0].nodes.find((n) => n.nodeId === "dev")!.status).toBe(
       "stopped",
     );
-    expect(host.post).not.toHaveBeenCalled();
+    // A stopped run reports once.
+    expect(host.post).toHaveBeenCalledTimes(1);
+    expect(host.post.mock.calls[0][3]).toBe("Ship it · stopped");
+    expect(host.post.mock.calls[0][4]).toContain("stopped");
     await vi.waitFor(() => expect(workflowRunningId(WF)).toBeUndefined());
+    expect(host.post).toHaveBeenCalledTimes(1);
   });
 
   it("command node failure fails only its branch", async () => {
@@ -690,22 +714,24 @@ describe("useMonoWorkflows", () => {
     await vi.waitFor(() => expect(workflowRunningId(WF)).toBeUndefined());
   });
 
-  it("coalesces saves to the latest state", async () => {
+  it("coalesces saves to the latest state and never writes concurrently", async () => {
     save([simple({})]);
+    runWrites.delayMs = 20;
     const host = makeHost({ replies: ["ok"] });
     mount(host);
     await vi.waitFor(() => expect(storedRuns()[0]?.status).toBe("done"));
-    const { writeAgentFile } =
-      await import("../../features/monos/model/monoFiles");
-    const runWrites = vi
-      .mocked(writeAgentFile)
-      .mock.calls.filter(([, path]) =>
-        String(path).startsWith("workflow-runs/"),
-      );
-    // Fewer writes than state changes, never concurrent, last one is the final state.
-    expect(runWrites.length).toBeGreaterThan(0);
-    const last = JSON.parse(runWrites[runWrites.length - 1][2] as string);
-    expect(last[0].status).toBe("done");
+    await vi.waitFor(() => expect(workflowRunningId(WF)).toBeUndefined());
+    // Start, node started, then everything that happened while that write was going.
+    expect(runWrites.max).toBe(1);
+    expect(runWrites.texts.length).toBeGreaterThan(1);
+    expect(runWrites.texts.length).toBeLessThanOrEqual(3);
+    const states = runWrites.texts.map(
+      (text) => (JSON.parse(text) as WorkflowRun[])[0],
+    );
+    expect(states[states.length - 1].status).toBe("done");
+    expect(
+      states[states.length - 1].nodes.find((n) => n.nodeId === "dev"),
+    ).toMatchObject({ status: "done", sessionId: "s1" });
   });
 
   it("relays approvals to the Mono chat and shows the node as waiting", async () => {
@@ -758,11 +784,30 @@ describe("useMonoWorkflows", () => {
     });
     expect(storedRuns()[0].status).toBe("interrupted");
 
-    resumeWorkflowRun("mono-1", WF, "run-old");
+    await resumeWorkflowRun("mono-1", WF, "run-old");
     await vi.waitFor(() => expect(storedRuns()[0].status).toBe("done"));
     expect(storedRuns()).toHaveLength(1);
     expect(host.startSession).toHaveBeenCalledTimes(1);
     expect(host.post).toHaveBeenCalledTimes(1);
+    // The request is answered, so it is not repeated.
+    expect(stored()[0].resumeRunId).toBeUndefined();
+  });
+
+  it("a resume asked for in another window is picked up by the driver on its next look", async () => {
+    const def = simple({}, { enabled: false });
+    save([def]);
+    saveRuns([markInterrupted(startRun(def, "manual", 1_000, "run-old"))]);
+    const host = makeHost({ replies: ["ok"] });
+    mount(host);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(storedRuns()[0].status).toBe("interrupted");
+    // Another window can only write the request; the driver's own look finds it.
+    save([{ ...stored()[0], resumeRunId: "run-old" }]);
+    checkWorkflowsNow();
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("done"));
+    expect(stored()[0].resumeRunId).toBeUndefined();
   });
 
   it("fails a run of an invalid workflow without starting sessions", async () => {
@@ -773,6 +818,10 @@ describe("useMonoWorkflows", () => {
     await vi.waitFor(() => expect(storedRuns()[0]?.status).toBe("failed"));
     expect(storedRuns()[0].error).toContain("Report");
     expect(host.startSession).not.toHaveBeenCalled();
+    // Scheduled breakage is visible in the chat, not only in the run history.
+    expect(host.post).toHaveBeenCalledTimes(1);
+    expect(host.post.mock.calls[0][3]).toBe("Ship it · failed");
+    expect(host.post.mock.calls[0][4]).toContain("could not start");
   });
 
   it("nests under another node's session and uses its worktree", async () => {
@@ -805,8 +854,206 @@ describe("useMonoWorkflows", () => {
       workspaceMode: "current",
       parentSessionId: "s1",
       worktreeCwd: "/code/app-wt-s1",
-      folderId: "folder-1",
+      folderId: "folder:/code/app",
     });
-    expect(second.folderName).toBe(host.startSession.mock.calls[0][1].folderName);
+    expect(second.folderName).toBe(
+      host.startSession.mock.calls[0][1].folderName,
+    );
+  });
+
+  it("a window that is not the driver never ticks, sweeps, resumes or claims", async () => {
+    const def = simple({}, { stopRequested: true, resumeRunId: "run-old" });
+    save([def]);
+    saveRuns([startRun(def, "manual", 1_000, "run-old")]);
+    const host = makeHost({ replies: ["ok"] });
+    mount(host, false);
+    checkWorkflowsNow();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 80));
+    });
+    expect(host.startSession).not.toHaveBeenCalled();
+    expect(host.post).not.toHaveBeenCalled();
+    // The running run is not swept to interrupted and the requests are left for the driver.
+    expect(storedRuns()[0].status).toBe("running");
+    expect(stored()[0]).toMatchObject({
+      stopRequested: true,
+      resumeRunId: "run-old",
+    });
+    expect(stored()[0].nextRunAt).toBeLessThan(Date.now());
+    expect(workflowRunningId(WF)).toBeUndefined();
+  });
+
+  it("a stop written by another window reaches the driver's run", async () => {
+    save([simple()]);
+    const script: Script = { replies: ["ok"] };
+    hold(script);
+    const host = makeHost(script);
+    mount(host);
+    await vi.waitFor(() => expect(host.startSession).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() =>
+      expect(
+        storedRuns()[0]?.nodes.find((n) => n.nodeId === "dev")?.sessionId,
+      ).toBe("s1"),
+    );
+    // Only the file is shared between windows.
+    save([{ ...stored()[0], stopRequested: true }]);
+    checkWorkflowsNow();
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("stopped"));
+    expect(host.stop).toHaveBeenCalledWith("s1");
+    expect(host.post).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(stored()[0].stopRequested).toBeUndefined());
+  });
+
+  it("looks for a stop request every few seconds while a run is going", async () => {
+    vi.useFakeTimers({
+      toFake: [
+        "setTimeout",
+        "setInterval",
+        "clearTimeout",
+        "clearInterval",
+        "Date",
+      ],
+    });
+    save([simple()]);
+    const script: Script = { replies: ["ok"] };
+    hold(script);
+    const host = makeHost(script);
+    mount(host);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(host.startSession).toHaveBeenCalledTimes(1);
+    save([{ ...stored()[0], stopRequested: true }]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000);
+    });
+    expect(storedRuns()[0].status).toBe("stopped");
+    expect(host.stop).toHaveBeenCalledWith("s1");
+  });
+
+  it("stopWorkflowRun stops here at once and leaves the request in the file for the driver", async () => {
+    save([simple({}, { enabled: false })]);
+    await stopWorkflowRun("mono-1", WF);
+    expect(stored()[0].stopRequested).toBe(true);
+    expect(workflowStopRequested(WF)).toBe(true);
+  });
+
+  it("does not launch starts queued behind another one once the run is stopped", async () => {
+    const def = workflow(
+      [
+        trigger,
+        session("fetch", { tickets: { type: "list" } }),
+        { id: "each", type: "forEach", in: "{{fetch.tickets}}", as: "item" },
+        { ...session("work", {}), parent: "each" },
+        report,
+      ],
+      [
+        { from: "trigger", to: "fetch" },
+        { from: "fetch", to: "each" },
+        { from: "each", to: "report" },
+      ],
+    );
+    save([def]);
+    const host = makeHost({ replies: [fenced({ tickets: ["a", "b"] })] });
+    const gate = deferred();
+    release.push(gate.resolve);
+    const original = host.startSession.getMockImplementation()!;
+    let calls = 0;
+    host.startSession.mockImplementation(async (monoId, req) => {
+      // The first branch's start is slow, so the second one waits in the queue behind it.
+      if (++calls === 2) await gate.promise;
+      return original(monoId, req);
+    });
+    mount(host);
+    await vi.waitFor(() => expect(calls).toBe(2));
+
+    requestWorkflowStop(WF);
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("stopped"));
+    gate.resolve();
+    await vi.waitFor(() => expect(workflowRunningId(WF)).toBeUndefined());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    // fetch and the first branch only; the first branch's session is stopped as it appears.
+    expect(host.startSession).toHaveBeenCalledTimes(2);
+    expect(calls).toBe(2);
+    expect(host.stop).toHaveBeenCalledWith("s2");
+  });
+
+  it("keeps one folder per project for a run", async () => {
+    const def = workflow(
+      [
+        trigger,
+        session("dev", {}),
+        session("docs", {}, { project: "{{inputs.lib}}" }),
+        session("more", {}, { project: "{{inputs.lib}}" }),
+        report,
+      ],
+      [
+        { from: "trigger", to: "dev" },
+        { from: "dev", to: "docs" },
+        { from: "docs", to: "more" },
+        { from: "more", to: "report" },
+      ],
+      {
+        inputs: { repo: { type: "project" }, lib: { type: "project" } },
+        inputValues: { repo: "/code/app", lib: "/code/lib" },
+      },
+    );
+    save([def]);
+    const host = makeHost({ replies: ["ok", "ok", "ok"] });
+    mount(host);
+    await vi.waitFor(() => expect(storedRuns()[0]?.status).toBe("done"));
+    const requests = host.startSession.mock.calls.map(
+      (call) =>
+        call[1] as {
+          project: string;
+          folderId?: string;
+          folderName?: string;
+        },
+    );
+    // First session: no folder yet, so it names one.
+    expect(requests[0]).toMatchObject({ project: "/code/app" });
+    expect(requests[0].folderId).toBeUndefined();
+    // First session in another project: the name makes a folder there.
+    expect(requests[1].project).toBe("/code/lib");
+    expect(requests[1].folderName).toBe(requests[0].folderName);
+    // Later sessions reuse the folder of their own project, not the first project's.
+    expect(requests[2]).toMatchObject({
+      project: "/code/lib",
+      folderId: "folder:/code/lib",
+    });
+    expect(storedRuns()[0].folderId).toBe("folder:/code/app");
+  });
+
+  it("caps the reason the Mono gives", async () => {
+    const def = workflow(
+      [
+        trigger,
+        {
+          id: "ask",
+          type: "askMono",
+          question: "Ship?",
+          answers: ["yes", "no"],
+        },
+        report,
+      ],
+      [
+        { from: "trigger", to: "ask" },
+        { from: "ask", to: "report" },
+      ],
+    );
+    save([def]);
+    const host = makeHost({ replies: [] });
+    host.askMono.mockResolvedValueOnce(
+      fenced({ answer: "yes", reason: "r".repeat(20_000) }),
+    );
+    mount(host);
+    await vi.waitFor(() => expect(storedRuns()[0]?.status).toBe("done"));
+    const output = storedRuns()[0].nodes.find((n) => n.nodeId === "ask")!
+      .output as { answer: string; reason: string };
+    expect(output.answer).toBe("yes");
+    expect(output.reason.length).toBeLessThan(16_200);
+    expect(output.reason).toContain("truncated");
   });
 });

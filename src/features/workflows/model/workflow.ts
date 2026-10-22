@@ -119,6 +119,13 @@ export type Workflow = {
   createdAt: number;
   nextRunAt?: number;
   runRequested?: boolean;
+  /**
+   * Requests made from another window, kept in the file because only the main window drives runs.
+   * `stopRequested` asks it to stop the workflow's running run; `resumeRunId` asks it to resume
+   * that interrupted run. The driver clears each once it has acted on it.
+   */
+  stopRequested?: boolean;
+  resumeRunId?: string;
   lastRunId?: string;
   importedFrom?: string;
 };

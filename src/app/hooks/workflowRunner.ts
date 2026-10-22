@@ -285,6 +285,8 @@ export async function executeRun(
       renderTemplate(node.project, runScope(run, branch, nodeId)),
     );
 
+  /** The run's folder in each project it has started a session in. */
+  const folderIds = new Map<string, string>();
   // Sessions are started one at a time so the first one makes the run's folder and the rest reuse it.
   let startChain: Promise<unknown> = Promise.resolve();
   const serial = <T>(task: () => Promise<T>): Promise<T> => {
@@ -398,8 +400,10 @@ export async function executeRun(
       const parent = node.nestUnder
         ? sessionOf(node.nestUnder, branch)
         : undefined;
-      const started = await serial(() =>
-        host.startSession(monoId, {
+      const started = await serial(async () => {
+        // Starts queued behind another one wait here; a stopped run must not launch them.
+        if (!live()) return undefined;
+        return host.startSession(monoId, {
           project,
           prompt: action.prompt,
           ...(node.harness ? { harness: node.harness } : {}),
@@ -409,15 +413,22 @@ export async function executeRun(
             node.checkout === "newWorktree" ? "worktree" : "current",
           ...(worktreeCwd ? { worktreeCwd } : {}),
           ...(parent ? { parentSessionId: parent } : {}),
-          // A folder belongs to one project; the name makes one in another project.
-          ...(run.folderId ? { folderId: run.folderId } : {}),
+          // A folder belongs to one project: a project the run has not filed in yet gets the
+          // first one's id with the name, which makes a folder there (and is remembered below).
+          ...((folderIds.get(project) ?? run.folderId)
+            ? { folderId: folderIds.get(project) ?? run.folderId }
+            : {}),
           folderName: runFolderName(run.definition.name, run.startedAt),
-        }),
-      );
+        });
+      });
+      if (!started) return;
       sessionId = started.sessionId;
-      if (started.folderId && !run.folderId) {
-        run = { ...run, folderId: started.folderId };
-        void save();
+      if (started.folderId) {
+        folderIds.set(project, started.folderId);
+        if (!run.folderId) {
+          run = { ...run, folderId: started.folderId };
+          void save();
+        }
       }
       turn = started.settled;
       if (!live()) {
@@ -548,7 +559,9 @@ export async function executeRun(
       nodeId,
       branch,
       value: decision.value,
-      ...(decision.reason !== undefined ? { reason: decision.reason } : {}),
+      ...(decision.reason !== undefined
+        ? { reason: capOutput(decision.reason) }
+        : {}),
       at: Date.now(),
     });
   };
@@ -593,25 +606,29 @@ export async function executeRun(
     return launches;
   };
 
+  const postText = (finished: WorkflowRun) => {
+    const { title, text } = composeReport(finished);
+    try {
+      getHost().post(
+        monoSessionId,
+        finished.definition,
+        finished.id,
+        title,
+        text,
+        launchesOf(finished),
+      );
+    } catch (error) {
+      console.error("Could not post the workflow report", error);
+    }
+  };
+
   /** Posts the report. The run's final status is known once the report counts as posted. */
   const postReport = (): boolean => {
     const posted = applyEvent(run, { kind: "reportPosted", at: Date.now() });
     if (posted === run) return false;
     run = posted;
     void save();
-    const { title, text } = composeReport(posted);
-    try {
-      getHost().post(
-        monoSessionId,
-        posted.definition,
-        posted.id,
-        title,
-        text,
-        launchesOf(posted),
-      );
-    } catch (error) {
-      console.error("Could not post the workflow report", error);
-    }
+    postText(posted);
     return true;
   };
 
@@ -665,6 +682,12 @@ export async function executeRun(
         host.endApprovals(id);
       }),
     );
+    // A stopped run reports once, with what had finished by then.
+    if (run.reportPostedAt === undefined) {
+      run = { ...run, reportPostedAt: Date.now() };
+      void save();
+      postText(run);
+    }
   };
 
   let stopTask: Promise<void> | undefined;

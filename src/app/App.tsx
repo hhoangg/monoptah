@@ -693,7 +693,11 @@ import {
   writeAgentFile,
 } from "../features/monos/model/monoFiles";
 import { finalReply, useMonoHabits } from "./hooks/useMonoHabits";
-import { useMonoWorkflows } from "./hooks/useMonoWorkflows";
+import {
+  useMonoWorkflows,
+  type MonoWorkflowHost,
+} from "./hooks/useMonoWorkflows";
+import { currentWindowDrivesWorkflows } from "./hooks/workflowDriver";
 import { ASK_TIMEOUT_MS } from "./hooks/workflowRunner";
 import { startWorkflowSession } from "./model/workflowSessionStart";
 import { useFloatingMono } from "./hooks/useFloatingMono";
@@ -9291,7 +9295,7 @@ function Workspace({
     },
   });
 
-  useMonoWorkflows({
+  const workflowHost: MonoWorkflowHost = {
     sessions: () => sessionsRef.current,
     startSession: (monoId, req) =>
       startWorkflowSession(
@@ -9465,7 +9469,10 @@ function Workspace({
       );
       return target ? sessionWorkCwd(target) : undefined;
     },
-  });
+  };
+  // One window drives workflows; the others ask it through the workflow files.
+  const [workflowDriver] = useState(currentWindowDrivesWorkflows);
+  useMonoWorkflows(workflowHost, workflowDriver);
 
   const automationSessionReservations = useRef(new Set<string>());
   // Automation runs that opened a terminal session, keyed by session id. The

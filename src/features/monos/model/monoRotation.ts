@@ -85,7 +85,11 @@ function exchanges(blocks: readonly Block[], afterId?: string): Exchange[] {
       });
       continue;
     }
-    const post = monoPost(block);
+    // A workflow's approval requests are not reports; a habit's were always counted.
+    const post =
+      block.monoHabit || block.role === "assistant"
+        ? monoPost(block)
+        : undefined;
     if (post && block.text.trim()) {
       out.push({
         id: block.id,

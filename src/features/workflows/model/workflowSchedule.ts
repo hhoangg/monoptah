@@ -49,7 +49,8 @@ export function afterClaim(
   now: number,
   runId?: string,
 ): Workflow {
-  const { runRequested, ...rest } = workflow;
+  // A stop asked for before this run started was meant for an earlier one.
+  const { runRequested, stopRequested: _stop, ...rest } = workflow;
   const schedule = scheduleOf(workflow);
   const keep =
     runRequested && workflow.nextRunAt !== undefined && workflow.nextRunAt > now;

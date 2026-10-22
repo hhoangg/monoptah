@@ -376,7 +376,43 @@ it("hands the Mono what its habits posted since the user last wrote", () => {
   const context = habitPostsContext(posts);
   expect(context).toContain("<while_you_were_away>");
   expect(context).toContain("Morning CI check: CI is red on main");
+  expect(context).toContain("Your habits and workflows posted these");
   expect(habitPostsContext([])).toBe("");
+});
+
+it("hands the Mono a workflow report too, clipped, but not a workflow approval request", () => {
+  const blocks: Block[] = [
+    { id: "u1", role: "user", text: "thanks" },
+    {
+      id: "report",
+      role: "assistant",
+      text: `## Ship it · completed\n\n${"x".repeat(900)}`,
+      monoWorkflow: {
+        id: "wf-abcd1234",
+        name: "Ship it",
+        runId: "r1",
+        at: at(5, 9),
+      },
+    },
+    {
+      id: "ask",
+      role: "approval",
+      text: "git push",
+      approval: { requestId: 1 },
+      monoWorkflow: {
+        id: "wf-abcd1234",
+        name: "Ship it",
+        runId: "r1",
+        at: at(5, 9),
+      },
+    },
+  ];
+  const posts = unseenHabitPosts(blocks);
+  expect(posts.map((block) => block.id)).toEqual(["report"]);
+  const context = habitPostsContext(posts);
+  expect(context).toContain("Ship it: ## Ship it · completed");
+  expect(context).toContain("…");
+  expect(context.length).toBeLessThan(900);
 });
 
 it("routes an answer in the Mono's chat back to the run that asked", () => {

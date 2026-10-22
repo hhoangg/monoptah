@@ -154,6 +154,23 @@ export function requestWorkflowStop(workflowId: WorkflowId): void {
   window.dispatchEvent(new CustomEvent(ACTIVE_CHANGED));
 }
 
+/**
+ * Stops a workflow's running run from any window. Only the main window drives runs, so the
+ * request is also written to the workflow's file, where the driver picks it up within seconds.
+ */
+export async function stopWorkflowRun(
+  monoId: string,
+  workflowId: WorkflowId,
+): Promise<void> {
+  requestWorkflowStop(workflowId);
+  await updateWorkflows(monoId, (list) => ({
+    workflows: list.map((w) =>
+      w.id === workflowId ? { ...w, stopRequested: true } : w,
+    ),
+    result: undefined,
+  }));
+}
+
 export function workflowStopRequested(workflowId: WorkflowId): boolean {
   return stops.has(workflowId);
 }

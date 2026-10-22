@@ -242,6 +242,8 @@ function parseWorkflow(raw: unknown): Workflow | undefined {
     createdAt: num(raw, "createdAt") ?? 0,
     ...opt("nextRunAt", num(raw, "nextRunAt")),
     ...(raw.runRequested === true ? { runRequested: true } : {}),
+    ...(raw.stopRequested === true ? { stopRequested: true } : {}),
+    ...opt("resumeRunId", str(raw, "resumeRunId")),
     ...opt("lastRunId", str(raw, "lastRunId")),
     ...opt("importedFrom", str(raw, "importedFrom")),
   };

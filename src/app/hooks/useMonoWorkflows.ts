@@ -1,6 +1,9 @@
 import { useEffect, useRef } from "react";
 import { listMonos } from "../../features/monos/model/mono";
-import type { WorkflowId } from "../../features/workflows/model/workflow";
+import type {
+  Workflow,
+  WorkflowId,
+} from "../../features/workflows/model/workflow";
 import {
   markInterrupted,
   resumeRun,
@@ -16,6 +19,7 @@ import {
   clearWorkflowStop,
   loadRuns,
   loadWorkflows,
+  requestWorkflowStop,
   setWorkflowRunning,
   subscribeCheckWorkflowsNow,
   updateRuns,
@@ -38,18 +42,26 @@ const SWEPT = "__monoWorkflowsSwept";
 type OwnedWindow = Window & { [OWNER]?: symbol; [SWEPT]?: boolean };
 
 type ResumeRequest = { monoId: string; workflowId: WorkflowId; runId: string };
-const resumeRequests: ResumeRequest[] = [];
+
+/** How soon a stop asked for in another window reaches a run that is going. */
+const STOP_CHECK_MS = 5_000;
 
 /**
- * Asks the scheduler to continue an interrupted run from where it stopped. The run is
- * picked up on the scheduler's next look, which this triggers right away.
+ * Asks for an interrupted run to continue from where it stopped. Only the main window drives
+ * runs, so the request is written to the workflow's file and the driver picks it up on its
+ * next look (at most a minute; at once when this is the driver's window).
  */
-export function resumeWorkflowRun(
+export async function resumeWorkflowRun(
   monoId: string,
   workflowId: WorkflowId,
   runId: string,
-): void {
-  resumeRequests.push({ monoId, workflowId, runId });
+): Promise<void> {
+  await updateWorkflows(monoId, (list) => ({
+    workflows: list.map((w) =>
+      w.id === workflowId ? { ...w, resumeRunId: runId } : w,
+    ),
+    result: undefined,
+  }));
   checkWorkflowsNow();
 }
 
@@ -59,7 +71,8 @@ const isRunning = (workflowId: string) =>
 /**
  * Runs each Mono's workflows while the app is open: on their schedule, when asked to run, and
  * when an interrupted run is resumed. Runs of different workflows go on side by side; one
- * workflow never has two runs at once.
+ * workflow never has two runs at once. Pass `enabled` only for the one window that drives
+ * workflows (see `workflowDriver`): a disabled hook never ticks, sweeps, resumes or claims.
  */
 export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
   const hostRef = useRef(host);
@@ -72,6 +85,8 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
     surface[OWNER] = owner;
     let stopped = false;
     let ticking = false;
+    let watching = false;
+    let liveRuns = 0;
     // A check asked for mid-tick happens as soon as that tick ends.
     let checkAgain = false;
     const getHost = () => hostRef.current;
@@ -84,9 +99,15 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
       setWorkflowRunning(run.workflowId, run.id);
       // A request made before this run started was meant for an earlier one.
       clearWorkflowStop(run.workflowId);
-      void executeRun(getHost, monoId, monoSessionId, run).catch((error) =>
-        console.error(`Workflow "${run.definition.name}" could not run`, error),
-      );
+      liveRuns++;
+      void executeRun(getHost, monoId, monoSessionId, run)
+        .catch((error) =>
+          console.error(
+            `Workflow "${run.definition.name}" could not run`,
+            error,
+          ),
+        )
+        .finally(() => liveRuns--);
     };
 
     const startWorkflow = async (
@@ -120,13 +141,22 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
         runId,
       );
       const issues = validateWorkflow(claimed);
-      if (issues.length)
-        run = {
-          ...run,
-          status: "failed",
-          endedAt: now,
-          error: `The workflow is not valid: ${issues.map((issue) => issue.message).join("; ")}`,
-        };
+      if (issues.length) {
+        const error = `The workflow is not valid: ${issues.map((issue) => issue.message).join("; ")}`;
+        run = { ...run, status: "failed", endedAt: now, error };
+        // A run that never starts would otherwise only show in the run history.
+        try {
+          getHost().post(
+            monoSessionId,
+            claimed,
+            runId,
+            `${claimed.name} · failed`,
+            `## ${claimed.name} · failed\n\nThe workflow could not start. ${error}`,
+          );
+        } catch (postError) {
+          console.error("Could not post the workflow failure", postError);
+        }
+      }
       launch(monoId, monoSessionId, run);
     };
 
@@ -144,6 +174,60 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
       );
       if (stored?.status !== "interrupted") return;
       launch(monoId, monoSessionId, resumeRun(stored));
+    };
+
+    /**
+     * Requests other windows left in the workflow files. A stop reaches a run that is going; a
+     * request for a run that is not (it ended first) is just cleared.
+     */
+    const applySignals = async (
+      monoId: string,
+      workflows: Workflow[],
+      resumes: boolean,
+    ) => {
+      const stops = workflows.filter((w) => w.stopRequested);
+      const resuming = resumes ? workflows.filter((w) => w.resumeRunId) : [];
+      if (!stops.length && !resuming.length) return;
+      for (const w of stops) if (isRunning(w.id)) requestWorkflowStop(w.id);
+      const asked = new Map(resuming.map((w) => [w.id, w.resumeRunId]));
+      await updateWorkflows(monoId, (list) => ({
+        workflows: list.map((w) => {
+          const { stopRequested: _stop, resumeRunId: _resume, ...rest } = w;
+          const clearStop = stops.some((entry) => entry.id === w.id);
+          const clearResume =
+            asked.get(w.id) !== undefined && asked.get(w.id) === w.resumeRunId;
+          return {
+            ...rest,
+            ...(w.stopRequested && !clearStop ? { stopRequested: true } : {}),
+            ...(w.resumeRunId && !clearResume
+              ? { resumeRunId: w.resumeRunId }
+              : {}),
+          };
+        }),
+        result: undefined,
+      }));
+      for (const w of resuming)
+        await resume({
+          monoId,
+          workflowId: w.id,
+          runId: w.resumeRunId as string,
+        }).catch((error) =>
+          console.warn("Could not resume the workflow run", error),
+        );
+    };
+
+    /** While runs are going, looks often for a stop asked for in another window. */
+    const watchStops = async () => {
+      if (stopped || watching || liveRuns === 0) return;
+      watching = true;
+      try {
+        for (const { id } of listMonos())
+          await applySignals(id, await loadWorkflows(id), false);
+      } catch (error) {
+        console.warn("Could not check for workflow stop requests", error);
+      } finally {
+        watching = false;
+      }
     };
 
     /** Runs a previous launch left running cannot be going on: mark them interrupted. */
@@ -183,20 +267,15 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
           surface[SWEPT] = true;
           await sweepInterrupted();
         }
-        while (resumeRequests.length) {
-          if (stopped) return;
-          await resume(resumeRequests.shift()!).catch((error) =>
-            console.warn("Could not resume the workflow run", error),
-          );
-        }
         for (const { id, sessionId } of listMonos()) {
           if (stopped) return;
+          let workflows = await loadWorkflows(id);
+          if (workflows.some((w) => w.stopRequested || w.resumeRunId)) {
+            await applySignals(id, workflows, true);
+            workflows = await loadWorkflows(id);
+          }
           const now = Date.now();
-          const { run, advance } = dueWorkflows(
-            await loadWorkflows(id),
-            now,
-            isRunning,
-          );
+          const { run, advance } = dueWorkflows(workflows, now, isRunning);
           if (advance.length) {
             for (const workflow of advance)
               if (isRunning(workflow.id) && workflow.nextRunAt !== undefined)
@@ -241,10 +320,15 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
 
     void tick();
     const timer = window.setInterval(() => void tick(), TICK_MS);
+    const stopTimer = window.setInterval(
+      () => void watchStops(),
+      STOP_CHECK_MS,
+    );
     const stopChecks = subscribeCheckWorkflowsNow(() => void tick());
     return () => {
       stopped = true;
       window.clearInterval(timer);
+      window.clearInterval(stopTimer);
       stopChecks();
       if (surface[OWNER] === owner) delete surface[OWNER];
     };
