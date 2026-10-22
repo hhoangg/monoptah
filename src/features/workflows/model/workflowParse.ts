@@ -251,25 +251,42 @@ function parseWorkflow(raw: unknown): Workflow | undefined {
   };
 }
 
-/** workflows.json as written by the app; anything malformed is left out. Never throws. */
-export function parseWorkflows(text: string): Workflow[] {
-  if (!text?.trim()) return [];
+/** What workflows.json holds: the entries that parse, and the ones that do not, as they were written. */
+export type WorkflowFile = { workflows: Workflow[]; unreadable: unknown[] };
+
+/**
+ * Splits workflows.json into readable and unreadable entries. An entry is unreadable when it does
+ * not parse as a workflow (a node of a type this app does not know, a damaged field) or repeats an
+ * earlier id. Undefined when the text is not a JSON list, so a caller can refuse to overwrite it.
+ * A blank text is an empty file. Never throws.
+ */
+export function readWorkflowFile(text: string): WorkflowFile | undefined {
+  if (!text?.trim()) return { workflows: [], unreadable: [] };
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return [];
+    return undefined;
   }
-  if (!Array.isArray(parsed)) return [];
+  if (!Array.isArray(parsed)) return undefined;
   const workflows: Workflow[] = [];
+  const unreadable: unknown[] = [];
   const seen = new Set<string>();
   for (const raw of parsed) {
     const workflow = parseWorkflow(raw);
-    if (!workflow || seen.has(workflow.id)) continue;
+    if (!workflow || seen.has(workflow.id)) {
+      unreadable.push(raw);
+      continue;
+    }
     seen.add(workflow.id);
     workflows.push(workflow);
   }
-  return workflows;
+  return { workflows, unreadable };
+}
+
+/** workflows.json as written by the app; anything malformed is left out. Never throws. */
+export function parseWorkflows(text: string): Workflow[] {
+  return readWorkflowFile(text)?.workflows ?? [];
 }
 
 // ---------------------------------------------------------------------------------------------

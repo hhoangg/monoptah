@@ -249,3 +249,97 @@ it("updateWorkflows refuses a list that would pass the file cap, with a clear me
   expect((error as Error).message).toMatch(/too large to save/);
   expect(saved).toEqual([]);
 });
+
+/** Serves `text` for every read and records what is saved. */
+function serve(text: string | null) {
+  const saved: string[] = [];
+  native.invoke.mockImplementation(async (command: string, args: any) => {
+    if (command === "mono_read") return { text, hash: "h" };
+    saved.push(args.text);
+    return "new-hash";
+  });
+  return saved;
+}
+
+it("updateWorkflows keeps an entry it cannot read, untouched", async () => {
+  const strange = {
+    id: "wf-strange01",
+    name: "From a newer app",
+    nodes: [{ id: "trigger", type: "manual" }, { id: "x", type: "teleport", beam: [1, 2] }],
+    edges: [],
+    futureField: { keep: true },
+  };
+  const saved = serve(JSON.stringify([workflow(), strange]));
+  await updateWorkflows("mono-1", (list) => ({
+    workflows: list.map((w) => ({ ...w, name: "Renamed" })),
+    result: null,
+  }));
+  const written = JSON.parse(saved[0]);
+  expect(written).toHaveLength(2);
+  expect(written[0]).toMatchObject({ id: "wf-abcd1234", name: "Renamed" });
+  expect(written[1]).toEqual(strange);
+  // The panel still lists only what it can read.
+  serve(JSON.stringify([workflow(), strange]));
+  expect((await loadWorkflows("mono-1")).map((w) => w.id)).toEqual(["wf-abcd1234"]);
+});
+
+it("updateWorkflows keeps unreadable entries that are not objects", async () => {
+  const saved = serve(JSON.stringify([3, null, workflow(), "text"]));
+  await updateWorkflows("mono-1", (list) => ({ workflows: list, result: null }));
+  expect(JSON.parse(saved[0])).toEqual([workflow(), 3, null, "text"]);
+});
+
+it("updateWorkflows refuses to add an id that an unreadable entry already has", async () => {
+  const saved = serve(JSON.stringify([{ id: "wf-zzzz9999", nodes: "broken" }]));
+  const error = await updateWorkflows("mono-1", (list) => ({
+    workflows: [...list, workflow({ id: "wf-zzzz9999" })],
+    result: null,
+  })).catch((e: unknown) => e);
+  expect((error as Error).message).toContain("wf-zzzz9999");
+  expect(saved).toEqual([]);
+});
+
+it("updateWorkflows refuses to write over a file that is not valid JSON", async () => {
+  const saved = serve("{ not json");
+  const edit = vi.fn((list: Workflow[]) => ({ workflows: list, result: 1 }));
+  await expect(updateWorkflows("mono-1", edit)).rejects.toThrow(
+    "workflows.json could not be read; fix or remove the file before changing workflows",
+  );
+  expect(saved).toEqual([]);
+  expect(edit).not.toHaveBeenCalled();
+});
+
+it("updateWorkflows refuses to write over a file that is not a list", async () => {
+  const saved = serve('{"workflows": []}');
+  await expect(
+    updateWorkflows("mono-1", (list) => ({ workflows: list, result: 1 })),
+  ).rejects.toThrow("could not be read");
+  expect(saved).toEqual([]);
+});
+
+it("updateWorkflows treats a missing or blank file as an empty list", async () => {
+  let saved = serve(null);
+  await updateWorkflows("mono-1", () => ({ workflows: [workflow()], result: 1 }));
+  expect(JSON.parse(saved[0])).toHaveLength(1);
+  saved = serve("  \n");
+  await updateWorkflows("mono-1", () => ({ workflows: [workflow()], result: 1 }));
+  expect(JSON.parse(saved[0])).toHaveLength(1);
+});
+
+it("updateRuns refuses to write over a runs file that is not valid JSON", async () => {
+  const saved = serve("[{ broken");
+  await expect(
+    updateRuns("mono-1", "wf-abcd1234", (runs) => ({ runs, result: 1 })),
+  ).rejects.toThrow("could not be read");
+  expect(saved).toEqual([]);
+});
+
+it("updateRuns keeps run entries it cannot read", async () => {
+  const odd = { id: "run-odd", note: "from a newer app" };
+  const saved = serve(JSON.stringify([run("a"), odd]));
+  await updateRuns("mono-1", "wf-abcd1234", (runs) => ({
+    runs: [run("b"), ...runs],
+    result: 1,
+  }));
+  expect((JSON.parse(saved[0]) as { id: string }[]).map((r) => r.id)).toEqual(["b", "a", "run-odd"]);
+});
