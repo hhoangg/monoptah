@@ -4,7 +4,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Workflow, WorkflowNode } from "../model/workflow";
 import { WORKFLOWS_MAX } from "../model/workflow";
-import { exportWorkflow } from "../model/workflowYaml";
+import { validateWorkflow } from "../model/workflowParse";
+import { MAX_FILE_BYTES, exportWorkflow } from "../model/workflowYaml";
 import { ImportWorkflowPage } from "./ImportWorkflowPage";
 import { SCHEDULE, workflow } from "./workflowUiFixtures";
 
@@ -251,7 +252,13 @@ it("shows validation issues plainly without blocking the import", async () => {
   await paste(yamlOf(broken));
   const issues = section("Problems")!;
   expect(issues).toBeDefined();
-  expect(issues.textContent!.length).toBeGreaterThan("Problems".length);
+  const expected = validateWorkflow({
+    ...broken,
+    inputValues: {},
+    enabled: false,
+  }).map((issue) => issue.message);
+  expect(expected.length).toBeGreaterThan(0);
+  for (const message of expected) expect(issues.textContent).toContain(message);
   await chooseProject("project", "api");
   expect(importButton().disabled).toBe(false);
 });
@@ -264,6 +271,7 @@ it("is disabled and explains itself at the workflow limit", async () => {
 });
 
 it("re-checks the limit when saving, over what is on disk", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   const full = Array.from({ length: WORKFLOWS_MAX }, (_, i) =>
     workflow({ id: `wf-full${i}` }),
   );
@@ -274,6 +282,8 @@ it("re-checks the limit when saving, over what is on disk", async () => {
   expect(stored()).toHaveLength(WORKFLOWS_MAX);
   expect(onImported).not.toHaveBeenCalled();
   expect(container.querySelector("[role=alert]")!.textContent).toContain(`at most ${WORKFLOWS_MAX}`);
+  expect(warn).toHaveBeenCalledWith("Could not import the workflow", expect.any(Error));
+  warn.mockRestore();
 });
 
 it("reads a picked file into the same preview", async () => {
@@ -300,6 +310,7 @@ it("keeps what is shown when the file dialog is cancelled", async () => {
 });
 
 it("says why a file could not be read", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   open.mockResolvedValue("/home/me/big.yaml");
   readTextFile.mockRejectedValue("File is too large to edit (maximum 8 MB).");
   await renderPage();
@@ -309,6 +320,11 @@ it("says why a file could not be read", async () => {
   expect(container.querySelector("[role=alert]")!.textContent).toContain(
     "File is too large to edit",
   );
+  expect(warn).toHaveBeenCalledWith(
+    "Could not read the workflow file",
+    "File is too large to edit (maximum 8 MB).",
+  );
+  warn.mockRestore();
 });
 
 it("shows the model's error for a file over 512 KiB", async () => {
@@ -320,6 +336,21 @@ it("shows the model's error for a file over 512 KiB", async () => {
   );
   expect(container.querySelector("[role=alert]")!.textContent).toContain("too large");
   expect(importButton().disabled).toBe(true);
+});
+
+it("does not put a picked file over the limit into the page", async () => {
+  const big = "a: 1\n".repeat(Math.ceil(MAX_FILE_BYTES / 5) + 10);
+  open.mockResolvedValue("/home/me/big.yaml");
+  readTextFile.mockResolvedValue(big);
+  await renderPage();
+  await paste(yamlOf());
+  await act(async () =>
+    container.querySelector<HTMLButtonElement>("button[data-choose-file]")!.click(),
+  );
+  expect(area().value.length).toBeLessThan(MAX_FILE_BYTES);
+  expect(container.textContent).not.toContain("a: 1\na: 1");
+  expect(container.querySelector("[role=alert]")!.textContent).toContain("too large (over 512 KiB)");
+  expect(section("Commands this workflow runs")).toBeUndefined();
 });
 
 it("anchors an interval schedule the way the CLI import does", async () => {
@@ -344,4 +375,78 @@ it("anchors an interval schedule the way the CLI import does", async () => {
     /^\d{4}-\d{2}-\d{2}$/,
   );
   expect(saved.enabled).toBe(false);
+});
+
+it("lists a report's template among the prompts", async () => {
+  await renderPage();
+  const reporting = source({
+    nodes: steps.map((node) =>
+      node.type === "report" ? { ...node, template: "Tell the user to run {{fix.summary}}" } : node,
+    ),
+  });
+  await paste(yamlOf(reporting));
+  const prompts = section("Prompts")!.textContent!;
+  expect(prompts).toContain("Tell the user to run {{fix.summary}}");
+  expect(prompts).toContain("Tell the Mono (report)");
+});
+
+it("makes hidden characters in commands and prompts visible", async () => {
+  await renderPage();
+  const sneaky = source({
+    nodes: steps.map((node) =>
+      node.type === "command"
+        ? { ...node, command: "echo safe \u202e# rm -rf ~\u200b\u2066" }
+        : node.type === "session"
+          ? { ...node, prompt: "Do it\ufeff now\u2060" }
+          : node,
+    ),
+  });
+  await paste(yamlOf(sneaky));
+  const commands = section("Commands this workflow runs")!;
+  const block = commands.querySelector("pre")!;
+  expect(block.textContent).toBe("echo safe <U+202E># rm -rf ~<U+200B><U+2066>");
+  expect(section("Prompts")!.textContent).toContain("Do it<U+FEFF> now<U+2060>");
+  expect(commands.textContent! + section("Prompts")!.textContent!).not.toMatch(/[\u202a-\u202e\u2066-\u2069\u200b-\u200d\u2060\ufeff]/);
+});
+
+it("renders a file that repeats node ids without duplicate keys", async () => {
+  const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  await renderPage();
+  const twice = source({
+    inputs: {},
+    nodes: [
+      steps[0],
+      { id: "build", type: "command", project: "{{inputs.project}}", command: "echo one" },
+      { id: "build", type: "command", project: "{{inputs.project}}", command: "echo two" },
+      steps[4],
+    ],
+    edges: [{ from: "trigger", to: "build" }],
+  });
+  await paste(yamlOf(twice));
+  const commands = section("Commands this workflow runs")!.textContent!;
+  expect(commands).toContain("echo one");
+  expect(commands).toContain("echo two");
+  const duplicateKey = error.mock.calls.some((call) => String(call[0]).includes("same key"));
+  expect(duplicateKey).toBe(false);
+  error.mockRestore();
+});
+
+it("does not carry an input's value over to a file that declares it differently", async () => {
+  await renderPage();
+  const declared = (type: "string" | "project") =>
+    yamlOf(
+      source({
+        inputs: { area: { type } },
+        nodes: [steps[0], steps[4]],
+        edges: [{ from: "trigger", to: "report" }],
+      }),
+    );
+  await paste(declared("string"));
+  await typeInto("area", "/work/api");
+  expect(importButton().disabled).toBe(false);
+  await paste(declared("project"));
+  expect(importButton().disabled).toBe(true);
+  expect(
+    container.querySelector("button[aria-label^='area:']")!.getAttribute("aria-label"),
+  ).toBe("area: Choose a project");
 });

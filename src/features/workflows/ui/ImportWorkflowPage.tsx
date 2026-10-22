@@ -7,10 +7,7 @@ import {
 } from "react";
 import { ChevronDown } from "../../../shared/ui/icons";
 import type { MonoProject } from "../../monos/model/mono";
-import {
-  anchorSchedule,
-  habitScheduleLabel,
-} from "../../monos/model/monoHabits";
+import { habitScheduleLabel } from "../../monos/model/monoHabits";
 import {
   AutoTextarea,
   Hint,
@@ -27,6 +24,8 @@ import {
 } from "../model/workflow";
 import { updateWorkflows } from "../model/workflowStore";
 import {
+  MAX_FILE_BYTES,
+  anchorNode,
   finishImport,
   inputValueProblems,
   previewImport,
@@ -36,21 +35,17 @@ import { NODE_LABEL, nodeTitle } from "./board/boardNodes";
 import { pickWorkflowFile } from "./workflowImportFile";
 import { FIELD, InputField } from "./WorkflowPage";
 
-/** What the user typed or chose for each input, before it is read as a value. */
-type Draft = Record<string, string | boolean>;
+/**
+ * What the user typed or chose for each input, before it is read as a value, with the type
+ * it was entered for: a file that declares the input differently does not inherit it.
+ */
+type Draft = Record<string, { type: WorkflowInput["type"]; value: string | boolean }>;
 
 const ERROR = "text-red-500/80";
 const BUTTON =
   "h-6 rounded-md bg-content/10 px-2 text-[12px] text-content enabled:hover:bg-content/[0.14] disabled:opacity-40";
 const TEXT_AREA =
   "block w-full resize-none rounded-md bg-transparent px-2 py-1 font-mono text-[11px] leading-4 text-content/75 outline-none placeholder:font-sans placeholder:text-[12px] placeholder:text-content/35 hover:bg-content/5 focus:bg-content/5 focus:text-content/90";
-
-/** An interval schedule counts from the day it was imported, as with the CLI's import. */
-function anchorNode(node: WorkflowNode, now: number): WorkflowNode {
-  return node.type === "schedule" && !node.schedule.intervalFrom
-    ? { ...node, schedule: anchorSchedule(node.schedule, now) }
-    : node;
-}
 
 /** What the user typed or chose, as the values the workflow takes. */
 function valuesOf(
@@ -60,22 +55,37 @@ function valuesOf(
   const values: Record<string, string | number | boolean> = {};
   for (const [name, input] of Object.entries(inputs)) {
     const entry = draft[name];
-    if (entry === undefined) continue;
-    if (input.type !== "number") values[name] = entry;
-    else if (typeof entry === "string" && entry.trim() !== "")
-      values[name] = Number(entry);
+    if (entry === undefined || entry.type !== input.type) continue;
+    const { value } = entry;
+    if (input.type !== "number") values[name] = value;
+    else if (typeof value === "string" && value.trim() !== "")
+      values[name] = Number(value);
   }
   return values;
 }
 
+/**
+ * The text with the characters that change how it reads or what it looks like, without
+ * showing, made visible as <U+XXXX>: bidirectional controls, which can reorder what the
+ * eye reads, and zero-width characters, which hide. What is reviewed is then what runs.
+ */
+const HIDDEN = /[\u202A-\u202E\u2066-\u2069\u200B-\u200D\u2060\uFEFF]/g;
+function visible(text: string): string {
+  return text.replace(
+    HIDDEN,
+    (char) =>
+      `<U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}>`,
+  );
+}
+
 /** How the file names a step: its title as written, else its id read as words. */
 function stepLabel(node: WorkflowNode): string {
-  return node.title?.trim() ? node.title : nodeTitle(node);
+  return visible(node.title?.trim() ? node.title : nodeTitle(node));
 }
 
 function stepName(preview: ImportPreview, nodeId: string): string {
   const node = preview.workflow.nodes.find((entry) => entry.id === nodeId);
-  return node ? `${stepLabel(node)} (${node.id})` : nodeId;
+  return node ? `${stepLabel(node)} (${visible(node.id)})` : visible(nodeId);
 }
 
 function triggerLabel(preview: ImportPreview): string {
@@ -90,7 +100,7 @@ function triggerLabel(preview: ImportPreview): string {
 function Verbatim({ children }: { children: string }) {
   return (
     <pre className="whitespace-pre-wrap break-words rounded-md bg-content/5 px-2.5 py-2 font-mono text-[11px] leading-4 text-content/75">
-      {children}
+      {visible(children)}
     </pre>
   );
 }
@@ -213,8 +223,14 @@ export function ImportWorkflowPage({
   const choose = async () => {
     const picked = await pickWorkflowFile();
     if (!picked) return;
-    if ("error" in picked) setFileError(picked.error);
-    else change(picked.text);
+    if ("error" in picked) return setFileError(picked.error);
+    if (new TextEncoder().encode(picked.text).length > MAX_FILE_BYTES) {
+      // The model's own refusal; the text itself stays out of the page.
+      const refused = previewImport(picked.text);
+      change("");
+      return setFileError(refused.ok ? "Workflow file is too large" : refused.error);
+    }
+    change(picked.text);
   };
 
   const inputs = preview?.workflow.inputs ?? {};
@@ -323,14 +339,14 @@ export function ImportWorkflowPage({
         {preview ? (
           <>
             <dl className="flex flex-col gap-0.5 px-4 py-3">
-              <Property label="Name">{preview.workflow.name}</Property>
+              <Property label="Name">{visible(preview.workflow.name)}</Property>
               <Property label="Runs">{triggerLabel(preview)}</Property>
             </dl>
 
             {preview.workflow.description ? (
               <Section title="What it does">
                 <p className="whitespace-pre-wrap px-2 text-[12px] leading-5 text-content/75">
-                  {preview.workflow.description}
+                  {visible(preview.workflow.description)}
                 </p>
               </Section>
             ) : null}
@@ -340,14 +356,14 @@ export function ImportWorkflowPage({
                 <ul className="flex flex-col gap-1 px-2">
                   {preview.issues.map((issue, index) => (
                     <li
-                      key={`${index}:${issue.message}`}
+                      key={index}
                       className={`flex items-start gap-1.5 text-[11px] leading-4 ${ERROR}`}
                     >
                       <span
                         aria-hidden
                         className="mt-1.5 size-1.5 shrink-0 rounded-full bg-red-500/70"
                       />
-                      {issue.message}
+                      {visible(issue.message)}
                     </li>
                   ))}
                 </ul>
@@ -360,8 +376,8 @@ export function ImportWorkflowPage({
 
             <Section title="Steps">
               <ol className="flex flex-col gap-1 px-2 pb-1 text-[12px] leading-5">
-                {preview.workflow.nodes.map((node) => (
-                  <li key={node.id} className="flex min-w-0 gap-2">
+                {preview.workflow.nodes.map((node, index) => (
+                  <li key={index} className="flex min-w-0 gap-2">
                     <span className="w-24 shrink-0 text-content/45">
                       {NODE_LABEL[node.type]}
                     </span>
@@ -371,10 +387,10 @@ export function ImportWorkflowPage({
                   </li>
                 ))}
               </ol>
-              {preview.workflow.edges.map((edge) =>
+              {preview.workflow.edges.map((edge, index) =>
                 edge.loop ? (
                   <LoopRow
-                    key={`${edge.from}->${edge.to}`}
+                    key={index}
                     preview={preview}
                     edge={edge}
                   />
@@ -384,8 +400,8 @@ export function ImportWorkflowPage({
 
             <Section title="Commands this workflow runs">
               {preview.commands.length ? (
-                preview.commands.map(({ nodeId, command }) => (
-                  <Labelled key={nodeId} label={stepName(preview, nodeId)}>
+                preview.commands.map(({ nodeId, command }, index) => (
+                  <Labelled key={index} label={stepName(preview, nodeId)}>
                     <Verbatim>{command}</Verbatim>
                   </Labelled>
                 ))
@@ -415,8 +431,8 @@ export function ImportWorkflowPage({
               }
             >
               {!promptsOpen ? null : preview.prompts.length ? (
-                preview.prompts.map(({ nodeId, text: prompt }) => (
-                  <Labelled key={nodeId} label={stepName(preview, nodeId)}>
+                preview.prompts.map(({ nodeId, text: prompt }, index) => (
+                  <Labelled key={index} label={stepName(preview, nodeId)}>
                     <Verbatim>{prompt}</Verbatim>
                   </Labelled>
                 ))
@@ -437,14 +453,21 @@ export function ImportWorkflowPage({
                           name={name}
                           input={inputs[name]}
                           value={values[name]}
-                          raw={draft[name]}
+                          raw={
+                            draft[name]?.type === inputs[name].type
+                              ? draft[name].value
+                              : undefined
+                          }
                           projects={projects}
                           onChange={(next) =>
                             setDraft((now) => {
                               const { [name]: _gone, ...rest } = now;
                               return next === undefined
                                 ? rest
-                                : { ...rest, [name]: next };
+                                : {
+                                    ...rest,
+                                    [name]: { type: inputs[name].type, value: next },
+                                  };
                             })
                           }
                         />

@@ -1,5 +1,5 @@
 import { Scalar, parse, stringify } from "yaml";
-import type { HabitSchedule } from "../../monos/model/monoHabits";
+import { anchorSchedule, type HabitSchedule } from "../../monos/model/monoHabits";
 import {
   NODE_TYPES,
   newWorkflowId,
@@ -24,7 +24,7 @@ import {
 /** The value of the top-level `monoptahWorkflow` key. */
 export const WORKFLOW_FILE_VERSION = 1;
 /** Larger files are refused before they are parsed. */
-const MAX_FILE_BYTES = 512 * 1024;
+export const MAX_FILE_BYTES = 512 * 1024;
 /** Caps alias expansion, so a file cannot blow up into a huge structure. */
 const MAX_ALIAS_COUNT = 20;
 
@@ -176,7 +176,8 @@ export type ImportPreview = {
   /**
    * Every text that reaches an agent, as the agent will read it before templates are filled in:
    * a session's prompt followed by the output instruction (which carries the output field
-   * descriptions), and the questions put to the Mono with their answers.
+   * descriptions), the questions put to the Mono with their answers, and a report's template
+   * (the report is posted into the Mono's own session, so the Mono reads it as its own reply).
    */
   prompts: { nodeId: NodeId; text: string }[];
   issues: WorkflowIssue[];
@@ -318,6 +319,8 @@ export function previewImport(
       });
     } else if (node.type === "if" && node.question !== undefined) {
       prompts.push({ nodeId: node.id, text: node.question });
+    } else if (node.type === "report" && node.template?.trim()) {
+      prompts.push({ nodeId: node.id, text: node.template });
     }
   }
   return { ok: true, preview: { workflow, commands, prompts, issues } };
@@ -359,6 +362,13 @@ export function inputValueProblems(
   for (const name of Object.keys(values))
     if (!has(inputs, name)) problems.push(`Unknown input "${name}"; the workflow declares no such input`);
   return problems;
+}
+
+/** An interval schedule counts from the day it was created or imported. */
+export function anchorNode(node: WorkflowNode, now: number): WorkflowNode {
+  return node.type === "schedule" && !node.schedule.intervalFrom
+    ? { ...node, schedule: anchorSchedule(node.schedule, now) }
+    : node;
 }
 
 /**

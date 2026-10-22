@@ -1,6 +1,5 @@
 import type { Session } from "../../sessions/model/session";
 import {
-  anchorSchedule,
   habitSchedule,
   habitScheduleLabel,
   nextHabitRunAt,
@@ -24,6 +23,7 @@ import {
   type WorkflowIssue,
 } from "../../workflows/model/workflowParse";
 import {
+  anchorNode,
   exportPathProblem,
   exportWorkflow,
   finishImport,
@@ -116,13 +116,6 @@ function inputValues(value: unknown, name: string): Values {
     });
   }
   return values;
-}
-
-/** An interval schedule counts from the day it was created. */
-function anchorNode(node: WorkflowNode, now: number): WorkflowNode {
-  return node.type === "schedule" && !node.schedule.intervalFrom
-    ? { ...node, schedule: anchorSchedule(node.schedule, now) }
-    : node;
 }
 
 function definitionFrom(
