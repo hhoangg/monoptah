@@ -10,6 +10,8 @@
 //!     ├── SOUL.md           who it is; edited by the user or at their request
 //!     ├── MEMORY.md         what it has learned; loads into every turn
 //!     ├── habits.json       what it does on its own, on a schedule
+//!     ├── workflows.json    the workflows it runs
+//!     ├── workflow-runs/    one `<workflow id>.json` of recent runs per workflow
 //!     └── memory/           topic notes read on demand, and archive.md
 //! ```
 //!
@@ -32,9 +34,14 @@ const SOUL_FILE: &str = "SOUL.md";
 const MEMORY_FILE: &str = "MEMORY.md";
 const MEMORY_DIR: &str = "memory";
 const HABITS_FILE: &str = "habits.json";
+const WORKFLOWS_FILE: &str = "workflows.json";
+const WORKFLOW_RUNS_DIR: &str = "workflow-runs";
 /// Larger than anything that would load: the soul and memory both have far
 /// smaller prompt budgets, this only stops a runaway write.
 const FILE_MAX: usize = 256 * 1024;
+/// A workflow's runs file holds up to 20 runs, each with a definition snapshot and node
+/// outputs, so it gets a larger cap than the other files.
+const RUNS_FILE_MAX: usize = 4 * 1024 * 1024;
 pub const CONFLICT: &str = "conflict";
 
 /// Serializes index updates, so two Monos opening at once cannot both read
@@ -82,12 +89,36 @@ pub struct AgentFiles {
     pub topics: Vec<String>,
 }
 
+/// A workflow id: `wf-` and eight lowercase base36 characters.
+fn is_workflow_id(id: &str) -> bool {
+    id.strip_prefix("wf-").is_some_and(|rest| {
+        rest.len() == 8
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    })
+}
+
 /// The files the app reads and writes for an agent, relative to its folder:
-/// SOUL.md, MEMORY.md, habits.json, or one `memory/<name>.md`. Nothing nested, nothing
-/// hidden, so a path from the agent's CLI can never leave the folder.
+/// SOUL.md, MEMORY.md, habits.json, workflows.json, one `workflow-runs/<workflow id>.json`,
+/// or one `memory/<name>.md`. Nothing nested, nothing hidden, so a path from the agent's CLI
+/// can never leave the folder.
 fn resolve_file(dir: &Path, relative: &str) -> Result<PathBuf, String> {
-    if relative == SOUL_FILE || relative == MEMORY_FILE || relative == HABITS_FILE {
+    if relative == SOUL_FILE
+        || relative == MEMORY_FILE
+        || relative == HABITS_FILE
+        || relative == WORKFLOWS_FILE
+    {
         return Ok(dir.join(relative));
+    }
+    if let Some(id) = relative
+        .strip_prefix("workflow-runs/")
+        .and_then(|rest| rest.strip_suffix(".json"))
+    {
+        if !is_workflow_id(id) {
+            return Err(format!("Not an agent file: {relative}"));
+        }
+        return Ok(dir.join(WORKFLOW_RUNS_DIR).join(format!("{id}.json")));
     }
     let name = relative
         .strip_prefix("memory/")
@@ -277,7 +308,12 @@ fn save(
     text: &str,
     expected_hash: Option<&str>,
 ) -> Result<String, String> {
-    if text.len() > FILE_MAX {
+    let max = if relative.starts_with("workflow-runs/") {
+        RUNS_FILE_MAX
+    } else {
+        FILE_MAX
+    };
+    if text.len() > max {
         return Err(format!("{relative} is too large"));
     }
     let _guard = FILES_LOCK.lock().map_err(|e| e.to_string())?;
@@ -288,6 +324,9 @@ fn save(
         if content_hash(&current) != expected {
             return Err(CONFLICT.into());
         }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     write_atomic(&path, text)?;
     Ok(content_hash(text))
@@ -352,6 +391,69 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mono-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn resolves_workflow_files() {
+        let dir = Path::new("/tmp/mono-x");
+        assert_eq!(
+            resolve_file(dir, "workflows.json").unwrap(),
+            dir.join("workflows.json")
+        );
+        assert_eq!(
+            resolve_file(dir, "workflow-runs/wf-abc12345.json").unwrap(),
+            dir.join("workflow-runs").join("wf-abc12345.json")
+        );
+        for bad in [
+            "workflow-runs/../x.json",
+            "workflow-runs/wf-ABC.json",
+            "workflow-runs/a/b.json",
+            "workflow-runs/wf-abc1234.json",
+            "workflow-runs/wf-abc123456.json",
+            "workflow-runs/wf-abc12345.md",
+            "workflow-runs/.json",
+        ] {
+            assert!(resolve_file(dir, bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn save_creates_the_workflow_runs_folder() {
+        let root = temp_root();
+        let path = "workflow-runs/wf-abc12345.json";
+        let hash = save(&root, "m", None, path, "[]", None).unwrap();
+        let file = read(&root, "m", None, path).unwrap();
+        assert_eq!(file.text.as_deref(), Some("[]"));
+        assert_eq!(file.hash, hash);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runs_files_have_a_larger_size_cap() {
+        let root = temp_root();
+        let big = format!("[\"{}\"]", "x".repeat(1024 * 1024));
+        assert!(save(
+            &root,
+            "m",
+            None,
+            "workflow-runs/wf-abc12345.json",
+            &big,
+            None
+        )
+        .is_ok());
+        let err = save(&root, "m", None, WORKFLOWS_FILE, &big, None).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        let huge = "x".repeat(RUNS_FILE_MAX + 1);
+        assert!(save(
+            &root,
+            "m",
+            None,
+            "workflow-runs/wf-abc12345.json",
+            &huge,
+            None
+        )
+        .is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

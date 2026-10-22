@@ -155,3 +155,49 @@ export function isTrigger(node: WorkflowNode): node is ScheduleNode | ManualNode
 export function triggerOf(w: Workflow): ScheduleNode | ManualNode | undefined {
   return w.nodes.find(isTrigger);
 }
+
+export type NodeStatus =
+  | "pending"
+  | "running"
+  | "waitingApproval"
+  | "done"
+  | "failed"
+  | "skipped"
+  | "stopped";
+/** "" for top level, "<forEachId>#<index>" inside a group. */
+export type BranchKey = string;
+export type NodeRun = {
+  nodeId: NodeId;
+  branch: BranchKey;
+  status: NodeStatus;
+  round: number;
+  sessionId?: string;
+  output?: Record<string, unknown>;
+  error?: string;
+  decision?: { value: string; reason?: string };
+  startedAt?: number;
+  endedAt?: number;
+  reasked?: boolean;
+};
+export type RunStatus =
+  | "running"
+  | "done"
+  | "doneWithFailures"
+  | "failed"
+  | "stopped"
+  | "interrupted";
+export type WorkflowRun = {
+  id: string;
+  workflowId: WorkflowId;
+  /** Snapshot of the definition the run started from. */
+  definition: Workflow;
+  status: RunStatus;
+  startedAt: number;
+  endedAt?: number;
+  trigger: "schedule" | "manual" | "cli";
+  folderId?: string;
+  items: Record<NodeId, unknown[]>;
+  nodes: NodeRun[];
+  reportPostedAt?: number;
+  error?: string;
+};

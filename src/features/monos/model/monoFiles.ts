@@ -30,7 +30,12 @@ export type MonoFile = "soul" | "memory";
 
 /** An agent file by its path in the agent's folder. */
 export type AgentFilePath =
-  "SOUL.md" | "MEMORY.md" | "habits.json" | `memory/${string}.md`;
+  | "SOUL.md"
+  | "MEMORY.md"
+  | "habits.json"
+  | "workflows.json"
+  | `workflow-runs/${string}.json`
+  | `memory/${string}.md`;
 
 const FILE_PATH: Record<MonoFile, AgentFilePath> = {
   soul: "SOUL.md",
