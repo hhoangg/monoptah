@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderTemplate, shellQuote, templateVars } from "./workflowTemplate";
+import { renderTemplate, shellQuote, shellTemplateProblems, templateVars } from "./workflowTemplate";
 
 describe("workflowTemplate", () => {
   it("renders nested paths", () => {
@@ -57,5 +57,47 @@ describe("workflowTemplate", () => {
   it("shellQuote wraps in single quotes", () => {
     expect(shellQuote("abc")).toBe("'abc'");
     expect(shellQuote("")).toBe("''");
+  });
+
+  it("does not follow the prototype chain", () => {
+    expect(renderTemplate("[{{inputs.toString}}][{{inputs.__proto__}}]", { inputs: {} })).toBe("[][]");
+    expect(renderTemplate("echo {{inputs.toString}}", { inputs: {} }, { shell: true })).toBe("echo ''");
+  });
+
+  it("renders non-JSON values as empty", () => {
+    expect(renderTemplate("[{{f}}]", { f: () => 1 })).toBe("[]");
+  });
+
+  describe("shellTemplateProblems", () => {
+    it("flags a var inside double quotes", () => {
+      const problems = shellTemplateProblems('echo "{{x}}"');
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("{{x}}");
+      expect(problems[0]).toContain("double quotes");
+    });
+
+    it("flags a var inside single quotes and backticks", () => {
+      expect(shellTemplateProblems("echo '{{x}}'")).toHaveLength(1);
+      expect(shellTemplateProblems("echo `{{x}}`")).toHaveLength(1);
+    });
+
+    it("does not flag a bare var", () => {
+      expect(shellTemplateProblems("echo {{x}}")).toEqual([]);
+    });
+
+    it("does not flag a quote pair that does not enclose a var", () => {
+      expect(shellTemplateProblems('echo "hi" {{x}}')).toEqual([]);
+      expect(shellTemplateProblems("echo 'a b' {{x}} 'c'")).toEqual([]);
+    });
+
+    it("respects backslash escapes outside single quotes", () => {
+      expect(shellTemplateProblems('echo \\"{{x}}')).toEqual([]);
+      expect(shellTemplateProblems('echo "a\\"{{x}}"')).toHaveLength(1);
+      expect(shellTemplateProblems("echo 'a\\' {{x}}")).toEqual([]);
+    });
+
+    it("reports each var and ignores if tags", () => {
+      expect(shellTemplateProblems('{{#if a}}echo "{{a}} {{b}}"{{/if}}')).toHaveLength(2);
+    });
   });
 });

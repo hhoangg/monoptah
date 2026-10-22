@@ -23,10 +23,62 @@ export function templateVars(text: string): string[] {
   return [...seen];
 }
 
+const VAR_AT = new RegExp(`\\{\\{\\s*(${PATH})\\s*\\}\\}`, "y");
+const IF_OPEN_AT = new RegExp(`\\{\\{#if\\s+${PATH}\\s*\\}\\}`, "y");
+
+const QUOTE_NAMES: Record<string, string> = {
+  "'": "single quotes",
+  '"': "double quotes",
+  "`": "backticks",
+};
+
+/**
+ * Problems with using `text` as a shell command template: one message per `{{var}}` that sits
+ * inside quotes in the literal text. The app quotes every value itself, so a variable written
+ * inside quotes would be wrapped twice and its value could break out of the author's quotes.
+ */
+export function shellTemplateProblems(text: string): string[] {
+  const problems: string[] = [];
+  let quote: string | null = null;
+  let i = 0;
+  while (i < text.length) {
+    if (text.startsWith("{{", i)) {
+      IF_OPEN_AT.lastIndex = i;
+      if (IF_OPEN_AT.test(text)) {
+        i = IF_OPEN_AT.lastIndex;
+        continue;
+      }
+      VAR_AT.lastIndex = i;
+      const m = VAR_AT.exec(text);
+      if (m && !m[1].startsWith("/")) {
+        if (quote) {
+          problems.push(
+            `{{${m[1]}}} is inside ${QUOTE_NAMES[quote]}; write it bare, the app quotes it for the shell`,
+          );
+        }
+        i = VAR_AT.lastIndex;
+        continue;
+      }
+    }
+    const ch = text[i];
+    if (ch === "\\" && quote !== "'") {
+      i += 2;
+      continue;
+    }
+    if (quote === null) {
+      if (ch === "'" || ch === '"' || ch === "`") quote = ch;
+    } else if (ch === quote) {
+      quote = null;
+    }
+    i++;
+  }
+  return problems;
+}
+
 function lookup(scope: TemplateScope, path: string): unknown {
   let cur: unknown = scope;
   for (const key of path.split(".")) {
-    if (cur === null || typeof cur !== "object") return undefined;
+    if (cur === null || typeof cur !== "object" || !Object.prototype.hasOwnProperty.call(cur, key)) return undefined;
     cur = (cur as Record<string, unknown>)[key];
   }
   return cur;
@@ -36,7 +88,8 @@ function stringify(value: unknown): string {
   if (value === undefined || value === null) return "";
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
-  return JSON.stringify(value, null, 2);
+  // JSON.stringify yields undefined for functions and symbols.
+  return JSON.stringify(value, null, 2) ?? "";
 }
 
 function isTruthy(value: unknown): boolean {
