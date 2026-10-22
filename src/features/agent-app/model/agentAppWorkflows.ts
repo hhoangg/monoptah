@@ -201,6 +201,13 @@ function problems(w: Workflow): WorkflowIssue[] {
   ];
 }
 
+/** The values of the inputs that are declared; the rest belong to inputs that are gone. */
+function declaredValues(inputs: Record<string, WorkflowInput>, values: Values): Values {
+  const kept: Values = {};
+  for (const name of Object.keys(inputs)) if (has(values, name)) kept[name] = values[name];
+  return kept;
+}
+
 function scheduleOf(w: Workflow): HabitSchedule | undefined {
   const trigger = triggerOf(w);
   return trigger?.type === "schedule" ? trigger.schedule : undefined;
@@ -341,7 +348,8 @@ export async function handleWorkflows(
           nodes: preview.preview.workflow.nodes.map((node) => anchorNode(node, now)),
         };
         review = preview.preview;
-        if (input.values !== undefined) values = inputValues(input.values, "values");
+        if (input.values !== undefined)
+          values = declaredValues(definition.inputs, inputValues(input.values, "values"));
       }
       return change((list) => {
         if (list.length >= WORKFLOWS_MAX)
@@ -389,7 +397,9 @@ export async function handleWorkflows(
         const draft: Workflow = {
           ...kept,
           ...parsed.definition,
-          inputValues: parsed.values ?? current.inputValues,
+          // Values of inputs the new definition dropped go with them; given ones are checked as given.
+          inputValues:
+            parsed.values ?? declaredValues(parsed.definition.inputs, current.inputValues),
           enabled: wanted ?? current.enabled,
         };
         const issues = problems(draft);
@@ -501,7 +511,8 @@ export async function handleWorkflows(
       if (!preview.ok) throw new Error(preview.error);
       const values =
         input.values === undefined ? {} : inputValues(input.values, "values");
-      const created = finishImport(preview.preview, values, now);
+      const finished = finishImport(preview.preview, values, now);
+      const created = { ...finished, nodes: finished.nodes.map((node) => anchorNode(node, now)) };
       await change((list) => {
         if (list.length >= WORKFLOWS_MAX)
           throw new Error(`A Mono can have at most ${WORKFLOWS_MAX} workflows`);
@@ -511,8 +522,9 @@ export async function handleWorkflows(
         id: created.id,
         name: created.name,
         enabled: false,
-        issues: preview.preview.issues,
+        issues: problems(created),
         commands: preview.preview.commands,
+        prompts: preview.preview.prompts,
         note: "Saved paused. Check the commands and prompts, then workflows.resume to enable it.",
       };
     }

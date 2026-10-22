@@ -189,6 +189,22 @@ describe("workflows.add", () => {
     expect(other.stored()[0].nextRunAt).toBeUndefined();
   });
 
+  it("drops undeclared values from a yaml add, like an import does", async () => {
+    const source = fixture();
+    const { id } = (await source.call("workflows.add", { workflow: definition() })) as Added;
+    const { yaml } = (await source.call("workflows.export", { id })) as { yaml: string };
+    const added = fixture();
+    const result = (await added.call("workflows.add", {
+      yaml,
+      values: { project: "/code/app", stray: "x" },
+    })) as Added;
+    expect(result.issues).toEqual([]);
+    expect(added.stored()[0].inputValues).toEqual({ project: "/code/app" });
+    const imported = fixture();
+    await imported.call("workflows.import", { yaml, values: { project: "/code/app", stray: "x" } });
+    expect(imported.stored()[0].inputValues).toEqual(added.stored()[0].inputValues);
+  });
+
   it("anchors an interval schedule the same way from YAML and from JSON", async () => {
     const interval = { kind: "interval", hours: 4, time: "09:00" };
     const withInterval = definition({
@@ -311,6 +327,46 @@ describe("workflows.update", () => {
     }
   });
 
+  it("carries over only the values of inputs the new definition still declares", async () => {
+    const { call, stored } = fixture();
+    // No inputValues in the update, so the stored ones are what is carried over.
+    const withoutValues = (extra: Record<string, unknown>) => {
+      const { inputValues: _values, ...rest } = definition(extra);
+      return rest;
+    };
+    const { id } = (await call("workflows.add", {
+      workflow: definition({
+        inputs: { project: { type: "project" }, label: { type: "string" } },
+        inputValues: { project: "/code/app", label: "x" },
+      }),
+    })) as Added;
+    // The label input is removed; its value goes too and the workflow stays enabled.
+    const result = (await call("workflows.update", {
+      id,
+      workflow: withoutValues({ enabled: true }),
+    })) as Added;
+    expect(result).toEqual({ id, enabled: true, issues: [] });
+    expect(stored()[0].inputValues).toEqual({ project: "/code/app" });
+    // A renamed input has no value yet, which is reported, not an unknown key.
+    const renamed = (await call("workflows.update", {
+      id,
+      workflow: withoutValues({ inputs: { repo: { type: "project" } }, enabled: true }),
+    })) as Added;
+    expect(renamed.enabled).toBe(false);
+    expect(renamed.issues.map((issue) => issue.message)).toContain(
+      'Missing a value for input "repo"',
+    );
+    expect(stored()[0].inputValues).toEqual({});
+    // Values given explicitly are taken as given: an undeclared key is still an issue.
+    const explicit = (await call("workflows.update", {
+      id,
+      workflow: definition({ inputValues: { project: "/p", stray: 1 } }),
+    })) as Added;
+    expect(explicit.issues.map((issue) => issue.message)).toContain(
+      'Unknown input "stray"; the workflow declares no such input',
+    );
+  });
+
   it("refuses an unknown id and runtime fields", async () => {
     const { call } = fixture();
     await expect(
@@ -342,6 +398,21 @@ describe("export and import", () => {
     expect(copy.inputs).toEqual(original.inputs);
     expect(copy.nodes).toEqual(original.nodes);
     expect(copy.edges).toEqual(original.edges);
+  });
+
+  it("import returns the same issues as add and the prompts to review", async () => {
+    const { call } = fixture();
+    const { id } = (await call("workflows.add", { workflow: definition() })) as Added;
+    const { yaml } = (await call("workflows.export", { id })) as { yaml: string };
+    const imported = (await call("workflows.import", {
+      yaml,
+      values: { project: "/code/app" },
+    })) as { id: string; issues: unknown[]; prompts: { nodeId: string; text: string }[] };
+    const got = (await call("workflows.get", { id: imported.id })) as { issues: unknown[] };
+    expect(imported.issues).toEqual(got.issues);
+    expect(imported.prompts).toEqual([
+      expect.objectContaining({ nodeId: "fetch", text: expect.stringContaining("open tickets") }),
+    ]);
   });
 
   it("names the input that has no value when importing", async () => {
