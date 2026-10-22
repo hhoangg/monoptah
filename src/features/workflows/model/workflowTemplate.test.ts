@@ -98,6 +98,13 @@ describe("workflowTemplate", () => {
       ["f3: comment after a closing paren", "(true)# don't\necho '{{x}}'"],
       ["f3: comment after an opening paren", "(# don't\necho '{{x}}'"],
       ["arithmetic expansion", "echo $[1+{{x}}]"],
+      ["A: line continuation joins $ and a var", "echo $\\\n{{x}}"],
+      ["A: line continuation joins a heredoc operator", "cat <\\\n<EOF\n{{x}}\nEOF"],
+      ["A: line continuation joins a nested substitution", 'echo "$\\\n(echo "{{x}}")"'],
+      ["A: line continuation hides $[", "echo $\\\n[1+{{x}}]"],
+      ["A: CRLF line continuation", "echo $\\\r\n{{x}}"],
+      ["A: line continuation joins $ and a quote", "echo $\\\n'\\' {{x}} '"],
+      ["B: nested double quotes inside a parameter expansion", 'echo "${y:-"}{{x}}"}"'],
     ])("flags every var when the text has syntax it cannot follow (%s)", (_name, tpl) => {
       const problems = shellTemplateProblems(tpl);
       expect(problems.some((p) => p.includes("{{x}}"))).toBe(true);

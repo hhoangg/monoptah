@@ -46,6 +46,10 @@ function usesUnquotableSyntax(text: string): boolean {
   // A backslash would escape the quote the app adds; a `$` would turn it into `$'...'`.
   if (/\\\{\{/.test(text)) return true;
   if (/\$\s*\{\{/.test(text)) return true;
+  // Bash deletes backslash-newline before tokenising, which can join `$` and `'`, `<` and `<`, etc.
+  if (/\\\r?\n/.test(text)) return true;
+  // Parameter expansion nests its own quoting (`"${y:-"}"}"`), which the tracker does not follow.
+  if (text.includes("${")) return true;
   const literal = text.replace(VAR, "X");
   if (literal.includes("`") || literal.includes("$(") || literal.includes("$'")) return true;
   if (literal.includes("$[") || literal.includes("<<")) return true;
@@ -63,7 +67,8 @@ function usesUnquotableSyntax(text: string): boolean {
  *
  * Deliberately conservative: this is a simple quote tracker, not a shell parser. A variable is
  * accepted only in a clearly bare context. If the text uses syntax the tracker cannot follow
- * (backticks, `$(`, `$'`, `$[`, heredocs, comments, `$` or a backslash before a variable),
+ * (backticks, `$(`, `$'`, `$[`, `${`, heredocs, comments, line continuations, `$` or a
+ * backslash before a variable),
  * every variable is reported instead. Conditionals are rejected outright: whether an #if body
  * renders changes the surrounding quote state, so no static check can cover both branches.
  */
