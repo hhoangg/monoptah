@@ -13,15 +13,16 @@ import {
   Section,
   SwitchRow,
 } from "../../../monos/ui/monoPanelParts";
-import type {
-  Checkout,
-  LoopSpec,
-  NodeId,
-  OutputField,
-  OutputFieldType,
-  Workflow,
-  WorkflowInput,
-  WorkflowNode,
+import {
+  MAX_TIMEOUT_MINUTES,
+  type Checkout,
+  type LoopSpec,
+  type NodeId,
+  type OutputField,
+  type OutputFieldType,
+  type Workflow,
+  type WorkflowInput,
+  type WorkflowNode,
 } from "../../model/workflow";
 import { fieldInReport } from "../../model/workflowReport";
 import { inputValueProblems } from "../../model/workflowYaml";
@@ -506,6 +507,7 @@ function NodeFields({
             <NumberProperty
               label="Time limit"
               min={1}
+              max={MAX_TIMEOUT_MINUTES}
               value={node.timeoutMinutes}
               placeholder="120 min"
               onChange={(timeoutMinutes) => {
@@ -554,6 +556,7 @@ function NodeFields({
             <NumberProperty
               label="Time limit"
               min={1}
+              max={MAX_TIMEOUT_MINUTES}
               value={node.timeoutMinutes}
               placeholder="10 min"
               onChange={(timeoutMinutes) => {

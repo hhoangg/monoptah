@@ -137,6 +137,8 @@ export type Workflow = {
 };
 
 export const WORKFLOWS_MAX = 20;
+/** The longest time limit a session or command node may have: 24 hours. */
+export const MAX_TIMEOUT_MINUTES = 1440;
 export const WORKFLOW_RUNS_KEPT = 20;
 
 export const NODE_ID = /^[a-z][a-z0-9_]{0,39}$/;

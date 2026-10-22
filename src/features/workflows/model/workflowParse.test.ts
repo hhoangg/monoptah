@@ -96,6 +96,28 @@ function withCommand(command: string): Workflow {
   };
 }
 
+describe("timeout limits", () => {
+  it("accepts timeouts up to 24 hours on session and command nodes", () => {
+    const w = patchNode(withCommand("npm test"), "fetch", { timeoutMinutes: 1440 });
+    expect(messages(patchNode(w, "lint", { timeoutMinutes: 1440 }))).toEqual([]);
+  });
+
+  it("rejects a session timeout above 24 hours", () => {
+    const issues = messages(patchNode(example(), "fetch", { timeoutMinutes: 1441 }));
+    expect(issues).toEqual([expect.stringContaining("1440")]);
+    expect(issues[0]).toContain("timeoutMinutes");
+  });
+
+  it("rejects a command timeout above 24 hours", () => {
+    expect(flags(patchNode(withCommand("npm test"), "lint", { timeoutMinutes: 1e6 }), "1440")).toBe(true);
+  });
+
+  it("names the node in the issue", () => {
+    const w = patchNode(example(), "fetch", { timeoutMinutes: 5000 });
+    expect(validateWorkflow(w).find((i) => i.message.includes("1440"))?.nodeId).toBe("fetch");
+  });
+});
+
 describe("parseWorkflows", () => {
   it("parses a valid ClickUp workflow", () => {
     const w = example();

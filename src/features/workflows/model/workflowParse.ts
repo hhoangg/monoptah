@@ -1,5 +1,6 @@
 import { habitSchedule, type HabitSchedule } from "../../monos/model/monoHabits";
 import {
+  MAX_TIMEOUT_MINUTES,
   NODE_ID,
   NODE_TYPES,
   isTrigger,
@@ -564,6 +565,8 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
   const checkTimeout = (node: WorkflowNode & { timeoutMinutes?: number }) => {
     if (node.timeoutMinutes !== undefined && !(node.timeoutMinutes > 0)) {
       add("timeoutMinutes must be greater than 0", node.id);
+    } else if (node.timeoutMinutes !== undefined && node.timeoutMinutes > MAX_TIMEOUT_MINUTES) {
+      add(`timeoutMinutes must be at most ${MAX_TIMEOUT_MINUTES} (24 hours)`, node.id);
     }
   };
 
