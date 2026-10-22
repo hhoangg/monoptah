@@ -11,6 +11,7 @@ import {
   type WorkflowInput,
   type WorkflowNode,
 } from "./workflow";
+import { outputInstruction } from "./workflowOutput";
 import {
   findAbsolutePath,
   parseEdge,
@@ -60,7 +61,7 @@ function exportSchedule(s: HabitSchedule): Rec {
 function importSchedule(raw: unknown): unknown {
   if (!isRec(raw) || raw.scheduleKind !== undefined || raw.kind === undefined) return raw;
   const { kind, hours, ...rest } = raw;
-  return defined({ ...rest, scheduleKind: kind, intervalHours: hours });
+  return defined({ ...rest, scheduleKind: kind, intervalHours: hours ?? rest.intervalHours });
 }
 
 function exportOutput(output: Record<string, OutputField>): Rec {
@@ -138,8 +139,8 @@ function exportInput(input: WorkflowInput): Rec {
  * The shareable definition as YAML: only name, description, inputs (declarations, no values),
  * nodes (with board positions) and edges. The output is deterministic.
  */
-export function exportWorkflow(w: Workflow): string {
-  const doc = defined({
+function exportDocument(w: Workflow): Rec {
+  return defined({
     monoptahWorkflow: WORKFLOW_FILE_VERSION,
     name: w.name,
     description: w.description,
@@ -147,8 +148,21 @@ export function exportWorkflow(w: Workflow): string {
     nodes: w.nodes.map(exportNode),
     edges: w.edges.map(exportEdge),
   });
+}
+
+export function exportWorkflow(w: Workflow): string {
   // lineWidth 0 keeps long prompts on one line instead of folding them.
-  return stringify(doc, { lineWidth: 0 });
+  return stringify(exportDocument(w), { lineWidth: 0 });
+}
+
+/**
+ * Why this workflow cannot be shared, when a string in it (name, description, input
+ * descriptions, prompts, commands...) reads as an absolute path: the same rule previewImport
+ * applies, so a file the app writes is a file it can read back. Undefined when it is fine.
+ */
+export function exportPathProblem(w: Workflow): string | undefined {
+  const problem = findPathField(exportDocument(w), "");
+  return problem ? `${problem}; use a project input or a relative path` : undefined;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -159,7 +173,11 @@ export type ImportPreview = {
   workflow: Omit<Workflow, "id" | "createdAt" | "inputValues" | "enabled">;
   /** Every command node's command, verbatim, for the user to review. */
   commands: { nodeId: NodeId; command: string }[];
-  /** Every text that reaches an agent: session prompts and the questions put to the Mono. */
+  /**
+   * Every text that reaches an agent, as the agent will read it before templates are filled in:
+   * a session's prompt followed by the output instruction (which carries the output field
+   * descriptions), and the questions put to the Mono with their answers.
+   */
   prompts: { nodeId: NodeId; text: string }[];
   issues: WorkflowIssue[];
 };
@@ -192,6 +210,7 @@ function parseFile(text: string): Parsed {
 
 /** The first string anywhere in `value` that reads as an absolute path, with where it sits. */
 function findPathField(value: unknown, label: string): string | undefined {
+  if (value instanceof Scalar) return findPathField(value.value, label);
   if (typeof value === "string") {
     const found = findAbsolutePath(value);
     return found ? `${label} contains an absolute path ("${found}")` : undefined;
@@ -285,9 +304,19 @@ export function previewImport(
   const prompts: ImportPreview["prompts"] = [];
   for (const node of nodes) {
     if (node.type === "command") commands.push({ nodeId: node.id, command: node.command });
-    else if (node.type === "session") prompts.push({ nodeId: node.id, text: node.prompt });
-    else if (node.type === "askMono") prompts.push({ nodeId: node.id, text: node.question });
-    else if (node.type === "if" && node.question !== undefined) {
+    else if (node.type === "session") {
+      const instruction = outputInstruction(node.output);
+      prompts.push({
+        nodeId: node.id,
+        text: instruction ? `${node.prompt}\n\n${instruction}` : node.prompt,
+      });
+    } else if (node.type === "askMono") {
+      const answers = node.answers.map((a) => `- ${a}`).join("\n");
+      prompts.push({
+        nodeId: node.id,
+        text: answers ? `${node.question}\n\nAnswers:\n${answers}` : node.question,
+      });
+    } else if (node.type === "if" && node.question !== undefined) {
       prompts.push({ nodeId: node.id, text: node.question });
     }
   }
