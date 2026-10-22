@@ -775,13 +775,23 @@ export async function executeRun(
   } finally {
     unsubscribe();
     for (const timer of timers) clearInterval(timer);
-    await stopTask;
-    await writing;
-    for (const n of run.nodes)
-      if (n.sessionId) getHost().endApprovals(n.sessionId);
+    try {
+      await stopTask;
+      await writing;
+    } catch (error) {
+      console.warn("A workflow run did not finish cleanly", error);
+    }
+    // These must happen whatever went wrong above or in the approvals clean-up below.
     registry?.remove(run.id);
-    setWorkflowRunning(workflowId, null);
-    clearWorkflowStop(workflowId);
+    try {
+      for (const n of run.nodes)
+        if (n.sessionId) getHost().endApprovals(n.sessionId);
+    } catch (error) {
+      console.warn("Could not withdraw a workflow run's approvals", error);
+    } finally {
+      setWorkflowRunning(workflowId, null);
+      clearWorkflowStop(workflowId);
+    }
   }
   return run;
 }

@@ -9,6 +9,11 @@ import {
   DRIVER_STALE_MS,
   useWorkflowDriver,
 } from "./workflowDriver";
+import {
+  createLiveRunRegistry,
+  LIVE_RUNS_KEY,
+  liveRunRegistry,
+} from "./workflowLiveRuns";
 
 function memoryStorage(onSet?: (key: string) => void) {
   const values = new Map<string, string>();
@@ -149,6 +154,38 @@ describe("useWorkflowDriver", () => {
     expect(drives).toBe(false);
     act(() => root.unmount());
     vi.restoreAllMocks();
+  });
+
+  it("takes its own runs off the registry when the page is going away, not when React unmounts", () => {
+    const mine = liveRunRegistry()!;
+    const other = createLiveRunRegistry({
+      storage: localStorage,
+      owner: "another-window",
+    });
+    mine.touch("run-1", "wf-1");
+    other.touch("run-2", "wf-2");
+    function Probe() {
+      useWorkflowDriver();
+      return null;
+    }
+    const first = createRoot(document.createElement("div"));
+    act(() => first.render(createElement(Probe)));
+    act(() => first.unmount());
+    // Unmounting is not the window closing: its runs may be going on.
+    expect(mine.isFresh("run-1")).toBe(true);
+
+    const second = createRoot(document.createElement("div"));
+    act(() => second.render(createElement(Probe)));
+    window.dispatchEvent(new Event("pagehide"));
+    expect(mine.isFresh("run-1")).toBe(false);
+    expect(other.isFresh("run-2")).toBe(true);
+    expect(
+      Object.keys(JSON.parse(localStorage.getItem(LIVE_RUNS_KEY)!)),
+    ).toEqual(["run-2"]);
+    mine.touch("run-3", "wf-3");
+    window.dispatchEvent(new Event("beforeunload"));
+    expect(mine.isFresh("run-3")).toBe(false);
+    act(() => second.unmount());
   });
 
   it("frees the lease when the page is going away", () => {

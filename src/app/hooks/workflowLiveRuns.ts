@@ -21,6 +21,8 @@ export type LiveRunRegistry = {
   touch(runId: string, workflowId: WorkflowId): void;
   /** Forgets a run this window was driving. */
   remove(runId: string): void;
+  /** Forgets every run this window was driving, for a window that is going away. */
+  removeOwned(): void;
   /** Whether some window, this one included, refreshed the run's entry recently. */
   isFresh(runId: string): boolean;
   /** The id of a run of the workflow that some window is driving, if any. */
@@ -68,6 +70,12 @@ export function createLiveRunRegistry(options: {
       const entries = read();
       if (entries[runId]?.owner !== owner) return;
       delete entries[runId];
+      write(entries);
+    },
+    removeOwned() {
+      const entries = read();
+      for (const [runId, entry] of Object.entries(entries))
+        if (entry.owner === owner) delete entries[runId];
       write(entries);
     },
     isFresh: (runId) => fresh(read()[runId]),

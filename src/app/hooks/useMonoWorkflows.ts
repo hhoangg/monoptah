@@ -1,9 +1,6 @@
 import { useEffect, useRef } from "react";
 import { listMonos } from "../../features/monos/model/mono";
-import type {
-  WorkflowId,
-  WorkflowRun,
-} from "../../features/workflows/model/workflow";
+import type { WorkflowId } from "../../features/workflows/model/workflow";
 import {
   markInterrupted,
   resumeRun,
@@ -180,29 +177,46 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
         );
     };
 
-    /** Runs a previous launch left running cannot be going on: mark them interrupted. */
-    const sweepInterrupted = async () => {
+    /**
+     * Runs a window that is gone left `running` in the files: mark them interrupted. Returns
+     * whether it skipped a run some other window still seems to be driving (or could not
+     * look), in which case it has to look again later: that window may be closing.
+     */
+    const sweepInterrupted = async (): Promise<boolean> => {
+      let again = false;
       for (const { id } of listMonos()) {
         try {
           for (const workflow of await loadWorkflows(id)) {
-            const runs = await loadRuns(id, workflow.id);
-            if (!runs.some((entry) => entry.status === "running")) continue;
-            // A run some window is still driving is not abandoned, whoever drives now.
-            const abandoned = (entry: WorkflowRun) =>
-              entry.status === "running" &&
-              workflowRunningId(workflow.id) !== entry.id &&
-              !liveRunRegistry()?.isFresh(entry.id);
+            const running = (await loadRuns(id, workflow.id)).filter(
+              (entry) => entry.status === "running",
+            );
+            if (!running.length) continue;
+            // A run this window drives is its own business; one another window seems to be
+            // driving is not abandoned yet, whoever drives now.
+            const mine = (runId: string) =>
+              workflowRunningId(workflow.id) === runId;
+            const elsewhere = (runId: string) =>
+              !mine(runId) && liveRunRegistry()?.isFresh(runId) === true;
+            if (running.some((entry) => elsewhere(entry.id))) again = true;
+            if (running.every((entry) => mine(entry.id) || elsewhere(entry.id)))
+              continue;
             await updateRuns(id, workflow.id, (list) => ({
               runs: list.map((entry) =>
-                abandoned(entry) ? markInterrupted(entry) : entry,
+                entry.status === "running" &&
+                !mine(entry.id) &&
+                !elsewhere(entry.id)
+                  ? markInterrupted(entry)
+                  : entry,
               ),
               result: undefined,
             }));
           }
         } catch (error) {
+          again = true;
           console.warn("Could not check for interrupted workflow runs", error);
         }
       }
+      return again;
     };
 
     const tick = async () => {
@@ -216,11 +230,9 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
       checkAgain = false;
       try {
         // On taking over from a window that is gone, its unfinished runs are left running in
-        // the files; mark them so they can be resumed.
-        if (!swept) {
-          swept = true;
-          await sweepInterrupted();
-        }
+        // the files; mark them so they can be resumed. A run whose window left only moments
+        // ago still has a fresh entry, so the look is repeated every tick until it skips none.
+        if (!swept) swept = !(await sweepInterrupted());
         for (const { id, sessionId } of listMonos()) {
           if (stopped) return;
           let workflows = await loadWorkflows(id);

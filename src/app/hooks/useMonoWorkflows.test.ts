@@ -71,6 +71,7 @@ vi.mock("../../features/monos/model/monoFiles", async (original) => {
 
 const { useWorkflowDriver } = await import("./workflowDriver");
 const { createLiveRunRegistry } = await import("./workflowLiveRuns");
+const { readAgentFile } = await import("../../features/monos/model/monoFiles");
 const { useMonoWorkflows, resumeWorkflowRun } =
   await import("./useMonoWorkflows");
 const { checkWorkflowsNow, requestWorkflowStop, workflowRunningId } =
@@ -988,6 +989,103 @@ describe("useMonoWorkflows", () => {
     await resumeWorkflowRun("mono-1", WF, "run-a");
     await vi.waitFor(() => expect(storedRuns()[0].status).toBe("done"));
     expect(host.startSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps looking for a closed window's run until its entry is gone, then stops looking", async () => {
+    const def = simple({}, { enabled: false });
+    save([def]);
+    saveRuns([startRun(def, "manual", 1_000, "run-a")]);
+    // The window closed a moment ago: its entry has not gone stale yet.
+    const closing = createLiveRunRegistry({
+      storage: localStorage,
+      owner: "window-a",
+    });
+    closing.touch("run-a", WF);
+    const host = makeHost({ replies: ["ok"] });
+    const runFileReads = () =>
+      vi
+        .mocked(readAgentFile)
+        .mock.calls.filter(([, path]) =>
+          String(path).startsWith("workflow-runs/"),
+        ).length;
+    const settle = (ms: number) =>
+      act(async () => {
+        await new Promise((r) => setTimeout(r, ms));
+      });
+    mount(host);
+    await settle(80);
+    // The first look skipped the run, and nothing was written for it.
+    expect(storedRuns()[0].status).toBe("running");
+    expect(runWrites.texts).toHaveLength(0);
+
+    // Later ticks look again while the entry is fresh, still without writing.
+    const reads = runFileReads();
+    checkWorkflowsNow();
+    await settle(80);
+    expect(runFileReads()).toBeGreaterThan(reads);
+    expect(storedRuns()[0].status).toBe("running");
+    expect(runWrites.texts).toHaveLength(0);
+
+    // The entry goes (the window finished closing): the next tick marks the run.
+    closing.remove("run-a");
+    checkWorkflowsNow();
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("interrupted"));
+
+    // Nothing was skipped this time, so later ticks do not look at the runs again.
+    await settle(30);
+    const settled = runFileReads();
+    const writes = runWrites.texts.length;
+    checkWorkflowsNow();
+    await settle(60);
+    checkWorkflowsNow();
+    await settle(60);
+    expect(runFileReads()).toBe(settled);
+    expect(runWrites.texts).toHaveLength(writes);
+
+    // And the run can be resumed.
+    await resumeWorkflowRun("mono-1", WF, "run-a");
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("done"));
+  });
+
+  it("an entry that goes stale also lets the next tick mark the run", async () => {
+    const def = simple({}, { enabled: false });
+    save([def]);
+    saveRuns([startRun(def, "manual", 1_000, "run-a")]);
+    // Refreshed 29 s ago: still fresh now, stale a couple of seconds from now.
+    createLiveRunRegistry({
+      storage: localStorage,
+      owner: "window-a",
+      now: () => Date.now() - 29_000,
+    }).touch("run-a", WF);
+    const host = makeHost({ replies: [] });
+    mount(host);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 60));
+    });
+    expect(storedRuns()[0].status).toBe("running");
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 1_100));
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 1_100));
+    });
+    checkWorkflowsNow();
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("interrupted"));
+  });
+
+  it("still ends a run's bookkeeping when withdrawing its approvals fails", async () => {
+    save([simple()]);
+    const host = makeHost({ replies: ["ok"] });
+    host.endApprovals.mockImplementation(() => {
+      throw new Error("boom");
+    });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    mount(host);
+    await vi.waitFor(() => expect(host.post).toHaveBeenCalled());
+    await vi.waitFor(() => expect(workflowRunningId(WF)).toBeUndefined());
+    expect(
+      JSON.parse(localStorage.getItem("monocode.workflowLiveRuns") ?? "{}"),
+    ).toEqual({});
   });
 
   it("gives each resume request to exactly one of several drivers", async () => {

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { liveRunRegistry } from "./workflowLiveRuns";
 
 /**
  * Exactly one window drives workflows at a time. Every window runs the whole app, but a run
@@ -81,6 +82,12 @@ export function useWorkflowDriver(): boolean {
     }
     const check = () => setDrives(lease.claim());
     const release = () => lease.release();
+    // A window that is going away takes its runs off the registry too: the runner's own
+    // clean-up never gets to run, and the next driver should not have to wait out the 30 s.
+    const leave = () => {
+      release();
+      liveRunRegistry()?.removeOwned();
+    };
     check();
     const timer = window.setInterval(check, DRIVER_CHECK_MS);
     // A window that closes frees the lease, and the others hear of it at once.
@@ -88,13 +95,13 @@ export function useWorkflowDriver(): boolean {
       if (event.key === DRIVER_LEASE_KEY && event.newValue === null) check();
     };
     window.addEventListener("storage", onStorage);
-    window.addEventListener("beforeunload", release);
-    window.addEventListener("pagehide", release);
+    window.addEventListener("beforeunload", leave);
+    window.addEventListener("pagehide", leave);
     return () => {
       window.clearInterval(timer);
       window.removeEventListener("storage", onStorage);
-      window.removeEventListener("beforeunload", release);
-      window.removeEventListener("pagehide", release);
+      window.removeEventListener("beforeunload", leave);
+      window.removeEventListener("pagehide", leave);
       release();
     };
   }, []);
