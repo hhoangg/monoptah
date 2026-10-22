@@ -34,11 +34,11 @@ import { RUN_STATUS } from "./WorkflowRunPage";
 
 type InputValue = Workflow["inputValues"][string];
 
-const FIELD =
+export const FIELD =
   "h-7 min-w-0 flex-1 rounded-md bg-content/10 px-2 text-[12px] text-content outline-none placeholder:text-content/35 hover:bg-content/[0.14] focus-visible:bg-content/[0.14]";
 
 /** One declared input, edited in place: a project picker, a switch, or a text box. */
-function InputField({
+export function InputField({
   name,
   input,
   value,

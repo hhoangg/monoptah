@@ -152,7 +152,8 @@ export function NewHabitPage({
   );
 }
 
-function ScheduleFields({
+/** The "Repeats ... at ..." picker of a schedule; habits and workflow triggers share it. */
+export function ScheduleFields({
   schedule,
   onChange,
 }: {

@@ -44,6 +44,7 @@ beforeEach(() => {
     "ResizeObserver",
     class {
       observe() {}
+      unobserve() {}
       disconnect() {}
     },
   );
@@ -286,11 +287,33 @@ it("offers New and Import workflow only on Workflows, and says how to fill it", 
   ).toContain("Ask Broski to chain sessions into a workflow, or create one with +.");
 });
 
-it("opens a placeholder page from New and Import until their editors arrive", async () => {
+it("opens the board from New, and a placeholder from Import until its page arrives", async () => {
+  vi.stubGlobal(
+    "DOMMatrixReadOnly",
+    class {
+      m22 = 1;
+    },
+  );
   await render("workflows");
   await act(async () =>
     container
       .querySelector<HTMLButtonElement>('[aria-label="New workflow"]')!
+      .click(),
+  );
+  const board = container.querySelector("[data-workflow-board]");
+  expect(board).not.toBeNull();
+  expect(
+    board!.querySelector<HTMLInputElement>('input[aria-label="Workflow name"]')!
+      .value,
+  ).toBe("New workflow");
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('[data-workflow-board] [aria-label="Back"]')!
+      .click(),
+  );
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="Import workflow"]')!
       .click(),
   );
   expect(container.querySelector("[data-workflow-placeholder]")).not.toBeNull();

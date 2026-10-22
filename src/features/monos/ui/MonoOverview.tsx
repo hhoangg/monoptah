@@ -25,6 +25,7 @@ import {
   WorkflowPlaceholderPage,
   WorkflowsList,
 } from "../../workflows/ui/MonoWorkflows";
+import { WorkflowBoard } from "../../workflows/ui/board/WorkflowBoard";
 import { WorkflowPage } from "../../workflows/ui/WorkflowPage";
 import { WorkflowRunPage } from "../../workflows/ui/WorkflowRunPage";
 import { HabitPage } from "./HabitPage";
@@ -188,7 +189,14 @@ export function MonoOverview({
       return [
         {
           key: "new-workflow",
-          node: <WorkflowPlaceholderPage title="New workflow" onBack={back} />,
+          node: (
+            <WorkflowBoard
+              monoId={monoId}
+              color={agent.color}
+              projects={agent.projects}
+              onBack={back}
+            />
+          ),
         },
       ];
     if (route.kind === "import-workflow")
@@ -213,8 +221,11 @@ export function MonoOverview({
           {
             key: `workflow-board:${route.id}:${depth}`,
             node: (
-              <WorkflowPlaceholderPage
-                title={`${workflow.name} board`}
+              <WorkflowBoard
+                monoId={monoId}
+                workflow={workflow}
+                color={agent.color}
+                projects={agent.projects}
                 onBack={back}
               />
             ),
