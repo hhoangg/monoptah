@@ -211,6 +211,8 @@ export async function executeRun(
   /** Ids of the commands this run has started and not yet heard back from. */
   const runningCommands = new Set<string>();
   let commandSeq = 0;
+  /** Tells this execution's command ids from those of an earlier one of the same run (a resume). */
+  const nonce = Math.random().toString(36).slice(2, 8);
 
   // --- persistence ----------------------------------------------------------------------------
   // Every write fires a files-changed event, so writes go through one queue that always saves
@@ -421,7 +423,7 @@ export async function executeRun(
       const parent = node.nestUnder
         ? sessionOf(node.nestUnder, branch)
         : undefined;
-      const started = await serial(async () => {
+      const starting = serial(async () => {
         // Starts queued behind another one wait here; a stopped run must not launch them.
         if (!live()) return undefined;
         return host.startSession(monoId, {
@@ -442,6 +444,20 @@ export async function executeRun(
           folderName: runFolderName(run.definition.name, run.startedAt),
         });
       });
+      // Stop does not wait for a start that hangs; one that comes through later is ended.
+      const started = await Promise.race([
+        starting,
+        stopSignal.then(() => "stopped" as const),
+      ]);
+      if (started === "stopped") {
+        void starting.then(
+          (late) => {
+            if (late) void getHost().stop(late.sessionId).catch(() => undefined);
+          },
+          () => undefined,
+        );
+        return;
+      }
       if (!started) return;
       sessionId = started.sessionId;
       if (started.folderId) {
@@ -536,7 +552,7 @@ export async function executeRun(
         );
     }
     const minutes = node.timeoutMinutes ?? COMMAND_TIMEOUT_MINUTES;
-    const id = `${run.id}:${nodeId}:${branch}:${++commandSeq}`;
+    const id = `${run.id}:${nonce}:${nodeId}:${branch}:${++commandSeq}`;
     runningCommands.add(id);
     let result: CommandResult;
     try {
@@ -581,12 +597,19 @@ export async function executeRun(
 
   const runAsk = async (action: Extract<EngineAction, { kind: "askMono" }>) => {
     const { nodeId, branch } = action;
-    const reply = await withTimeout(
+    const asking = withTimeout(
       getHost().askMono(monoId, askMonoPrompt(action, run.definition.name)),
       ASK_TIMEOUT_MS,
       "The Mono did not answer in time",
     );
-    if (!live()) return;
+    // Stop abandons the question (its hidden session ends on its own); the rejection of an
+    // abandoned one has to be handled here or it would go unhandled.
+    asking.catch(() => undefined);
+    const reply = await Promise.race([
+      asking,
+      stopSignal.then(() => undefined),
+    ]);
+    if (reply === undefined || !live()) return;
     const decision = parseMonoDecision(reply, action.answers);
     if (!decision.ok) return fail(nodeId, branch, decision.error);
     apply({
@@ -756,8 +779,10 @@ export async function executeRun(
   // A run is its window's to look after for as long as it lives, whatever that window's place
   // in the election: it tells the others it is going, and applies a stop written to the file.
   const registry = liveRunRegistry();
+  // Beats go on while a stopped run still waits for its work, so other windows do not
+  // take the run for gone (and start the workflow again) in the meantime.
   const beat = () => {
-    if (live()) registry?.touch(run.id, workflowId);
+    if (live() || active.size > 0) registry?.touch(run.id, workflowId);
   };
   let looking = false;
   const lookForStop = async () => {
@@ -825,20 +850,23 @@ export async function executeRun(
     }
   } finally {
     unsubscribe();
-    for (const timer of timers) clearInterval(timer);
     try {
       await stopTask;
-      // A command left over from a run that ended some other way is killed too. Then every
-      // node's work is awaited, so the workflow is not seen as idle (and a scheduled run does
-      // not start in the same directory) while something of this run is still alive. This is
-      // bounded: a stopped run ends commands and sessions at once, a session waits at most
-      // POLL_MS to notice, a command has its node timeout (at most 24 h) and an Ask Mono
-      // question has ASK_TIMEOUT_MS.
+      // A command left over from a run that ended some other way is killed too. Then the
+      // commands and sessions are awaited, so the workflow is not seen as idle (and a scheduled
+      // run does not start in the same directory) while something of this run is still alive.
+      // A question to the Mono and a start that has not returned are abandoned on Stop, so
+      // they do not hold the run. The wait is bounded: Stop ends commands and sessions at
+      // once, a session notices within POLL_MS, and a command has its node timeout (at most
+      // 24 h). A run that ended without Stop (an unexpected error) leaves a pending question
+      // to its own ASK_TIMEOUT_MS. The beats above go on until the wait is over.
       await cancelCommands();
       while (active.size > 0) await Promise.allSettled([...active]);
       await writing;
     } catch (error) {
       console.warn("A workflow run did not finish cleanly", error);
+    } finally {
+      for (const timer of timers) clearInterval(timer);
     }
     // These must happen whatever went wrong above or in the approvals clean-up below.
     registry?.remove(run.id);

@@ -717,6 +717,57 @@ describe("useMonoWorkflows", () => {
     expect(storedRuns()[0].status).toBe("stopped");
   });
 
+  it("stop does not wait for a pending Ask Mono question", async () => {
+    save([
+      workflow(
+        [
+          trigger,
+          {
+            id: "ask",
+            type: "askMono",
+            question: "Ship it?",
+            answers: ["yes", "no"],
+          },
+          report,
+        ],
+        [
+          { from: "trigger", to: "ask" },
+          { from: "ask", to: "report" },
+        ],
+      ),
+    ]);
+    const host = makeHost({ replies: [] });
+    host.askMono.mockImplementationOnce(() => new Promise<string>(() => {}));
+    mount(host);
+    await vi.waitFor(() => expect(host.askMono).toHaveBeenCalledTimes(1));
+
+    requestWorkflowStop(WF);
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("stopped"));
+    await vi.waitFor(() => expect(workflowRunningId(WF)).toBeUndefined());
+  });
+
+  it("stop does not wait for a session that never finishes starting", async () => {
+    save([simple()]);
+    const host = makeHost({ replies: ["ok"] });
+    let started!: (value: {
+      sessionId: string;
+      settled: Promise<ControlOutcome>;
+    }) => void;
+    host.startSession.mockImplementationOnce(
+      () => new Promise((resolve) => (started = resolve)),
+    );
+    mount(host);
+    await vi.waitFor(() => expect(host.startSession).toHaveBeenCalledTimes(1));
+
+    requestWorkflowStop(WF);
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("stopped"));
+    await vi.waitFor(() => expect(workflowRunningId(WF)).toBeUndefined());
+
+    // A start that finally comes through after the stop is still ended.
+    started({ sessionId: "late", settled: new Promise(() => {}) });
+    await vi.waitFor(() => expect(host.stop).toHaveBeenCalledWith("late"));
+  });
+
   it("a command cancelled from outside the run fails its node", async () => {
     save([commandWorkflow()]);
     const host = makeHost({ replies: [] });

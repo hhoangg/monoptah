@@ -807,7 +807,6 @@ pub fn run() {
         tauri::RunEvent::Exit => {
             handle.state::<remote::RemoteConnections>().shutdown();
             reap_harness_children(handle);
-            workflow_command::cancel_all_workflow_commands();
         }
         _ => {}
     });
@@ -820,6 +819,8 @@ fn reap_harness_children(handle: &tauri::AppHandle) {
     if let Some(host) = handle.try_state::<pty::PtyHost>() {
         host.kill_all();
     }
+    // Command nodes run in their own process group, so they outlive the window that ran them.
+    workflow_command::cancel_all_workflow_commands();
 }
 
 #[cfg(test)]

@@ -71,6 +71,9 @@ mod imp {
     /// Extra wait for the readers after the group was killed.
     const POST_KILL_WAIT: Duration = Duration::from_secs(1);
     const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    /// How long a cancel for an id that is not running yet is remembered. The caller can
+    /// cancel while its run request is still on the way here; the command then ends at once.
+    const EARLY_CANCEL_TTL: Duration = Duration::from_secs(60);
 
     /// Pick the shell. Command templates are quoted for POSIX shells, so the
     /// user's login shell is only used when it is one; anything else (fish, nu,
@@ -91,13 +94,38 @@ mod imp {
         cancelled: Arc<AtomicBool>,
     }
 
-    fn running() -> &'static Mutex<HashMap<String, Running>> {
-        static RUNNING: OnceLock<Mutex<HashMap<String, Running>>> = OnceLock::new();
-        RUNNING.get_or_init(|| Mutex::new(HashMap::new()))
+    #[derive(Default)]
+    struct Registry {
+        running: HashMap<String, Running>,
+        /// Ids cancelled before they were running, and when.
+        early_cancels: HashMap<String, Instant>,
     }
 
-    fn lock_running() -> std::sync::MutexGuard<'static, HashMap<String, Running>> {
-        running().lock().unwrap_or_else(|e| e.into_inner())
+    impl Registry {
+        fn forget_stale(&mut self, now: Instant) {
+            self.early_cancels
+                .retain(|_, at| now.saturating_duration_since(*at) < EARLY_CANCEL_TTL);
+        }
+
+        fn remember_early_cancel(&mut self, id: &str, now: Instant) {
+            self.forget_stale(now);
+            self.early_cancels.insert(id.to_string(), now);
+        }
+
+        /// True once, if `id` was cancelled before it ran and that is still remembered.
+        fn take_early_cancel(&mut self, id: &str, now: Instant) -> bool {
+            self.forget_stale(now);
+            self.early_cancels.remove(id).is_some()
+        }
+    }
+
+    fn registry() -> &'static Mutex<Registry> {
+        static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(Registry::default()))
+    }
+
+    fn lock_registry() -> std::sync::MutexGuard<'static, Registry> {
+        registry().lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keeps a command in the registry for as long as it lives; every exit path
@@ -109,12 +137,16 @@ mod imp {
 
     impl Registration {
         fn new(id: &str, pgid: i32) -> Result<Self, String> {
-            let mut map = lock_running();
-            if map.contains_key(id) {
+            let mut registry = lock_registry();
+            if registry.running.contains_key(id) {
                 return Err(format!("A command with id {id} is already running"));
             }
-            let cancelled = Arc::new(AtomicBool::new(false));
-            map.insert(
+            // Cancelled while its request was on the way: it is registered as cancelled,
+            // and the caller kills the group before anything else.
+            let cancelled = Arc::new(AtomicBool::new(
+                registry.take_early_cancel(id, Instant::now()),
+            ));
+            registry.running.insert(
                 id.to_string(),
                 Running {
                     pgid,
@@ -130,14 +162,16 @@ mod imp {
 
     impl Drop for Registration {
         fn drop(&mut self) {
-            lock_running().remove(&self.id);
+            lock_registry().running.remove(&self.id);
         }
     }
 
-    /// Kills the command's whole process group. False when `id` is not running.
+    /// Kills the command's whole process group. False when `id` is not running; the
+    /// cancel is then remembered for a minute, so the command ends at once if it starts.
     pub(super) fn cancel(id: &str) -> bool {
-        let map = lock_running();
-        let Some(entry) = map.get(id) else {
+        let mut registry = lock_registry();
+        let Some(entry) = registry.running.get(id) else {
+            registry.remember_early_cancel(id, Instant::now());
             return false;
         };
         // Flagged before the kill, so the run call sees it once the child is gone.
@@ -153,7 +187,7 @@ mod imp {
     /// Kills every running command whose id matches. Split out of `cancel_all` so a test
     /// can end only its own commands while other tests run beside it.
     fn cancel_where(matches: impl Fn(&str) -> bool) {
-        for (id, entry) in lock_running().iter() {
+        for (id, entry) in lock_registry().running.iter() {
             if matches(id) {
                 entry.cancelled.store(true, Ordering::SeqCst);
                 kill_group(entry.pgid);
@@ -186,6 +220,15 @@ mod imp {
         dir: &Path,
         timeout: Duration,
     ) -> Result<CommandResult, String> {
+        if lock_registry().take_early_cancel(id, Instant::now()) {
+            return Ok(CommandResult {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+                cancelled: true,
+            });
+        }
         let mut cmd = Command::new(program);
         use std::os::unix::process::CommandExt;
         cmd.arg(flag).arg(command);
@@ -207,6 +250,10 @@ mod imp {
                 return Err(e);
             }
         };
+        // Cancelled between the check above and the registration: nothing ran for long.
+        if registration.cancelled.load(Ordering::SeqCst) {
+            kill_tree(&mut child);
+        }
 
         let stdout = child.stdout.take().map(TailReader::spawn);
         let stderr = child.stderr.take().map(TailReader::spawn);
@@ -230,10 +277,14 @@ mod imp {
             thread::sleep(POLL_INTERVAL);
         };
 
+        // The shell is gone, so the command no longer counts as running: leave the registry
+        // now rather than after the readers are collected.
+        let cancelled = registration.cancelled.load(Ordering::SeqCst) && !timed_out;
+        drop(registration);
+
         // A descendant that outlives the shell can keep a pipe open forever; give
         // the readers a moment, then end the group so the join cannot hang.
         let (out, err) = collect([stdout, stderr], &mut child);
-        let cancelled = registration.cancelled.load(Ordering::SeqCst) && !timed_out;
         Ok(CommandResult {
             exit_code: if timed_out || cancelled {
                 None
@@ -534,7 +585,7 @@ mod imp {
                 .expect("command runs")
             });
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !lock_running().contains_key(id) {
+            while !lock_registry().running.contains_key(id) {
                 assert!(Instant::now() < deadline, "{id} never registered");
                 thread::sleep(Duration::from_millis(5));
             }
@@ -564,7 +615,7 @@ mod imp {
                 thread::sleep(Duration::from_millis(20));
             }
             assert!(gone, "grandchild {pid} survived the cancel");
-            assert!(!lock_running().contains_key(&id));
+            assert!(!lock_registry().running.contains_key(&id));
         }
 
         #[test]
@@ -592,10 +643,10 @@ mod imp {
             run(&done, "echo hi", 5000);
             assert!(run(&timed, "sleep 5", 100).timed_out);
             run(&exited, "exit 4", 5000);
-            let map = lock_running();
-            assert!(ids.iter().all(|id| !map.contains_key(id)));
+            let registry = lock_registry();
+            assert!(ids.iter().all(|id| !registry.running.contains_key(id)));
             // A finished command cannot be cancelled afterwards.
-            drop(map);
+            drop(registry);
             assert!(!cancel(&done));
         }
 
@@ -612,7 +663,7 @@ mod imp {
             )
             .unwrap_err();
             assert!(err.contains("Could not start"), "{err}");
-            assert!(!lock_running().contains_key(&id));
+            assert!(!lock_registry().running.contains_key(&id));
         }
 
         #[test]
@@ -634,6 +685,81 @@ mod imp {
         }
 
         #[test]
+        fn a_cancel_that_came_first_ends_the_command_before_it_runs() {
+            let id = unique_id();
+            assert!(!cancel(&id));
+            let started = Instant::now();
+            let result = execute(
+                &id,
+                "/bin/sh",
+                "-c",
+                "echo ran; sleep 30",
+                Path::new("/tmp"),
+                Duration::from_secs(60),
+            )
+            .expect("call returns");
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(result.cancelled);
+            assert!(!result.timed_out);
+            assert_eq!(result.exit_code, None);
+            assert_eq!(result.stdout, "");
+            // The memory of the cancel is used up: the same id can run normally later.
+            let again = execute(
+                &id,
+                "/bin/sh",
+                "-c",
+                "echo ran",
+                Path::new("/tmp"),
+                Duration::from_secs(5),
+            )
+            .expect("command runs");
+            assert!(!again.cancelled);
+            assert_eq!(again.stdout, "ran\n");
+        }
+
+        #[test]
+        fn a_cancel_that_lands_during_registration_marks_the_command_cancelled() {
+            let id = unique_id();
+            assert!(!cancel(&id));
+            let registration = Registration::new(&id, 0).expect("registers");
+            assert!(registration.cancelled.load(Ordering::SeqCst));
+            drop(registration);
+            let fresh = Registration::new(&id, 0).expect("registers");
+            assert!(!fresh.cancelled.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn an_early_cancel_is_forgotten_after_its_ttl() {
+            let mut registry = Registry::default();
+            let now = Instant::now();
+            registry.remember_early_cancel("a", now);
+            registry.remember_early_cancel("b", now);
+            assert!(registry.take_early_cancel("a", now + EARLY_CANCEL_TTL / 2));
+            // Taken once only.
+            assert!(!registry.take_early_cancel("a", now + EARLY_CANCEL_TTL / 2));
+            assert!(
+                !registry.take_early_cancel("b", now + EARLY_CANCEL_TTL + Duration::from_secs(1))
+            );
+            assert!(registry.early_cancels.is_empty());
+        }
+
+        #[test]
+        fn the_registry_is_left_before_the_readers_are_collected() {
+            // A descendant keeps the pipe open past the shell, so collect() waits; the
+            // command must already be gone from the registry by then.
+            let id = unique_id();
+            let handle = start(&id, "sleep 3 & echo started");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while lock_registry().running.contains_key(&id) {
+                assert!(Instant::now() < deadline, "still registered");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!handle.is_finished(), "collect() should still be waiting");
+            let result = handle.join().expect("run thread");
+            assert_eq!(result.exit_code, Some(0));
+        }
+
+        #[test]
         fn cancel_all_kills_every_running_command() {
             let ids = [
                 format!("all-{}", unique_id()),
@@ -648,8 +774,8 @@ mod imp {
                 assert!(!result.timed_out);
             }
             assert!(started.elapsed() < Duration::from_secs(3));
-            let map = lock_running();
-            assert!(ids.iter().all(|id| !map.contains_key(id)));
+            let registry = lock_registry();
+            assert!(ids.iter().all(|id| !registry.running.contains_key(id)));
         }
 
         #[test]
