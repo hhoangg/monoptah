@@ -1,9 +1,11 @@
 //! Run a workflow command node: one shell command in a working directory,
 //! with a timeout that kills the whole process tree and a bounded output tail.
-use std::io::Read;
+//! A leftover background process that inherited the output pipes is killed
+//! after a short grace period; one that redirected its output is left running.
+use std::io::{ErrorKind, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,6 +16,8 @@ const OUTPUT_TAIL_CHARS: usize = 8000;
 const OUTPUT_TAIL_BYTES: usize = OUTPUT_TAIL_CHARS * 4;
 /// How long the pipe readers may outlive the shell before the group is killed.
 const READER_GRACE: Duration = Duration::from_millis(500);
+/// Extra wait for the readers after the group was killed.
+const POST_KILL_WAIT: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, serde::Serialize)]
@@ -100,8 +104,8 @@ fn execute(
         .spawn()
         .map_err(|e| format!("Could not start {program}: {e}"))?;
 
-    let stdout = child.stdout.take().map(spawn_tail_reader);
-    let stderr = child.stderr.take().map(spawn_tail_reader);
+    let stdout = child.stdout.take().map(TailReader::spawn);
+    let stderr = child.stderr.take().map(TailReader::spawn);
 
     let started = Instant::now();
     let mut timed_out = false;
@@ -124,8 +128,7 @@ fn execute(
 
     // A descendant that outlives the shell can keep a pipe open forever; give
     // the readers a moment, then end the group so the join cannot hang.
-    let out = collect(stdout, &mut child);
-    let err = collect(stderr, &mut child);
+    let (out, err) = collect([stdout, stderr], &mut child);
     Ok(CommandResult {
         exit_code: if timed_out {
             None
@@ -138,39 +141,77 @@ fn execute(
     })
 }
 
-fn spawn_tail_reader<R: Read + Send + 'static>(mut stream: R) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut tail: Vec<u8> = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match stream.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    tail.extend_from_slice(&chunk[..n]);
-                    if tail.len() > OUTPUT_TAIL_BYTES * 2 {
-                        tail.drain(..tail.len() - OUTPUT_TAIL_BYTES);
+/// A pipe reader running on its own thread. `tail` holds what has been read so
+/// far, so the output survives even when the thread never finishes.
+struct TailReader {
+    tail: Arc<Mutex<Vec<u8>>>,
+    done: mpsc::Receiver<()>,
+}
+
+impl TailReader {
+    fn spawn<R: Read + Send + 'static>(mut stream: R) -> Self {
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        let (tx, done) = mpsc::channel();
+        let shared = Arc::clone(&tail);
+        thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                    Ok(n) => {
+                        let mut tail = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        tail.extend_from_slice(&chunk[..n]);
+                        if tail.len() > OUTPUT_TAIL_BYTES * 2 {
+                            let cut = tail.len() - OUTPUT_TAIL_BYTES;
+                            tail.drain(..cut);
+                        }
                     }
                 }
             }
-        }
-        let _ = tx.send(tail);
-    });
-    rx
+            let _ = tx.send(());
+        });
+        Self { tail, done }
+    }
+
+    /// True once the pipe hit EOF, false if it was still open at `deadline`.
+    fn finished_by(&self, deadline: Instant) -> bool {
+        !matches!(
+            self.done
+                .recv_timeout(deadline.saturating_duration_since(Instant::now())),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        )
+    }
+
+    fn text(&self) -> String {
+        let tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
+        tail_chars(&tail, OUTPUT_TAIL_CHARS)
+    }
 }
 
-fn collect(reader: Option<mpsc::Receiver<Vec<u8>>>, child: &mut Child) -> String {
-    let Some(rx) = reader else {
-        return String::new();
+/// Both waits are bounded, so a descendant that keeps a pipe open (even one
+/// that escaped the process group) cannot hold the call past the timeout. A
+/// reader that is still stuck is left detached and what it read so far is used.
+fn collect(readers: [Option<TailReader>; 2], child: &mut Child) -> (String, String) {
+    let all_finished = |deadline: Instant| {
+        // Check every reader (no short-circuit) so each gets its share of the wait.
+        let states: Vec<bool> = readers
+            .iter()
+            .flatten()
+            .map(|r| r.finished_by(deadline))
+            .collect();
+        states.iter().all(|&done| done)
     };
-    let bytes = match rx.recv_timeout(READER_GRACE) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            kill_tree(child);
-            rx.recv().unwrap_or_default()
-        }
-    };
-    tail_chars(&bytes, OUTPUT_TAIL_CHARS)
+    if !all_finished(Instant::now() + READER_GRACE) {
+        kill_tree(child);
+        all_finished(Instant::now() + POST_KILL_WAIT);
+    }
+    let [out, err] = &readers;
+    (
+        out.as_ref().map(TailReader::text).unwrap_or_default(),
+        err.as_ref().map(TailReader::text).unwrap_or_default(),
+    )
 }
 
 /// Last `max` chars of `bytes`, cut on a char boundary. The buffer start may
@@ -197,6 +238,17 @@ fn kill_tree(child: &mut Child) {
 
 #[cfg(windows)]
 fn kill_tree(child: &mut Child) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // `child.kill()` ends only cmd.exe; taskkill /T also ends what it started
+    // (npm, python...), which would otherwise keep the output pipes open.
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     let _ = child.kill();
 }
 
@@ -265,6 +317,32 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.stdout, "started\n");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn escaped_descendant_holding_the_pipe_does_not_block_the_timeout() {
+        // perl's setsid moves the sleeper out of the process group, so the
+        // group kill cannot reach it while it still holds the stdout pipe.
+        if Command::new("perl").arg("-e").arg("1").status().is_err() {
+            eprintln!("skipped: perl is not available to call setsid");
+            return;
+        }
+        let started = Instant::now();
+        let result = sh(
+            "perl -MPOSIX -e 'POSIX::setsid(); sleep 5' & echo started; sleep 5",
+            200,
+        );
+        assert!(result.timed_out);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.stdout, "started\n");
+        assert!(started.elapsed() < Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn signal_killed_child_has_no_exit_code() {
+        let result = sh("kill -9 $$", 5000);
+        assert_eq!(result.exit_code, None);
+        assert!(!result.timed_out);
     }
 
     #[test]
