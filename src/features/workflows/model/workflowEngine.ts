@@ -32,6 +32,7 @@ import { outputInstruction } from "./workflowOutput";
 import {
   lookup,
   renderTemplate,
+  shellDashProblems,
   shellTemplateProblems,
   type TemplateScope,
 } from "./workflowTemplate";
@@ -567,7 +568,11 @@ function pass(d: Draft): boolean {
         }
         break;
       case "command": {
+        // The dash check needs the values, so it runs once the node is ready to start.
         const problems = shellTemplateProblems(node.command);
+        if (problems.length === 0) {
+          problems.push(...shellDashProblems(node.command, runScope(d.run, r.branch, r.nodeId)));
+        }
         if (problems.length > 0) {
           failNode(d, r, problems.join("; "));
           changed = true;
@@ -702,7 +707,8 @@ export function nextActions(run: WorkflowRun): EngineAction[] {
         break;
       }
       case "command":
-        // Commands with unsafe quoting were failed while settling, so none reach this point.
+        // Commands with unsafe quoting or option-like values were failed while settling.
+        if (shellDashProblems(node.command, scope).length > 0) break;
         actions.push({
           kind: "runCommand",
           nodeId: r.nodeId,

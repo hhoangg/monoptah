@@ -251,6 +251,41 @@ describe("workflowEngine", () => {
     expect(nextActions(after)).toEqual([{ kind: "postReport" }]);
   });
 
+  it("fails a command whose rendered value would be read as an option", () => {
+    const cmd = (command: string) =>
+      startRun(
+        def(
+          [
+            trigger,
+            session("a", { output: { host: { type: "string" } } }),
+            { id: "cmd", type: "command", project: PROJECT, command },
+            report,
+          ],
+          [
+            { from: "trigger", to: "a" },
+            { from: "a", to: "cmd" },
+            { from: "cmd", to: "report" },
+          ],
+        ),
+        "manual",
+        at,
+        "r",
+      );
+    const bad = complete(cmd("ssh {{a.host}}"), "a", { host: "-oProxyCommand=x" });
+    expect(statusOf(bad, "cmd")).toBe("failed");
+    expect(nodeOf(bad, "cmd").error).toContain("{{a.host}}");
+    expect(nextActions(bad)).toEqual([{ kind: "postReport" }]);
+
+    const guarded = complete(cmd("git log -- {{a.host}}"), "a", { host: "-x" });
+    expect(nextActions(guarded)).toEqual([
+      { kind: "runCommand", nodeId: "cmd", branch: "", command: "git log -- '-x'" },
+    ]);
+    const plain = complete(cmd("ssh {{a.host}}"), "a", { host: "example.com" });
+    expect(nextActions(plain)).toEqual([
+      { kind: "runCommand", nodeId: "cmd", branch: "", command: "ssh 'example.com'" },
+    ]);
+  });
+
   it("forEach fans out 3 items with maxParallel 2 (2 then 1)", () => {
     let run = startRun(fanOut(), "manual", at, "r");
     run = complete(run, "fetch", { tickets: TICKETS });

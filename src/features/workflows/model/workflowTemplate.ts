@@ -12,10 +12,12 @@ const ANY_VAR = new RegExp(`\\{\\{#if\\s+(${PATH})\\s*\\}\\}|\\{\\{\\s*(${PATH})
  * POSIX single-quote quoting: the value always reaches the shell as one literal word.
  * Quoting only protects against word splitting, expansion and operators. A value that a
  * command later feeds to eval, bash -c, (( )), [[ ]], let, declare -i or an array subscript is
- * still interpreted by the shell, so command authors must not pass variables to those. The same
- * holds for declare -a / typeset -a (a quoted '(...)' value is re-parsed as a compound
- * assignment) and for zsh glob qualifiers such as `ls /tmp({{x}})` (an `e:cmd:` qualifier runs
- * even when the value was quoted).
+ * still interpreted by the shell, so command authors must not pass variables to those; templates
+ * that use the syntax forms of these are rejected (see shellTemplateProblems). The same holds
+ * for declare -a / typeset -a (a quoted '(...)' value is re-parsed as a compound assignment) and
+ * for zsh glob qualifiers such as `ls /tmp({{x}})` (an `e:cmd:` qualifier runs even when the
+ * value was quoted). Quoting also does not stop a value that starts with `-` from being read as
+ * an option; shellDashProblems covers that.
  */
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -44,6 +46,9 @@ const UNSAFE_MESSAGE =
 
 const IF_MESSAGE = "conditionals ({{#if}}) are not supported in command templates";
 
+// `let`, `declare`, `typeset` and `eval` as whole words, not inside `evaluate`, `outlet` or `eval-all`.
+const RE_PARSING_WORD = /(^|[^\w./-])(let|declare|typeset|eval)(?![\w./-])/;
+
 /** True when the literal text uses shell syntax this check cannot reason about. */
 function usesUnquotableSyntax(text: string): boolean {
   // A backslash would escape the quote the app adds; a `$` would turn it into `$'...'`.
@@ -58,6 +63,11 @@ function usesUnquotableSyntax(text: string): boolean {
   if (literal.includes("$[") || literal.includes("<<")) return true;
   // zsh and ksh do not treat quotes inside (( )) as quotes, which desyncs the tracker.
   if (literal.includes("((")) return true;
+  // These builtins and operators parse a value a second time, even one that was quoted:
+  // `[[ 'a[$(cmd)]' -eq 0 ]]` and `let`/`declare -i` evaluate it as arithmetic, `eval` runs it,
+  // and a zsh glob qualifier (`*(e:cmd:)`) runs it.
+  if (literal.includes("[[") || literal.includes("*(") || literal.includes("?(")) return true;
+  if (RE_PARSING_WORD.test(literal)) return true;
   // A `#` at the start of a word starts a comment that can swallow quotes.
   return /(^|[\s;&|()])#/.test(literal);
 }
@@ -66,16 +76,17 @@ function usesUnquotableSyntax(text: string): boolean {
  * Problems with using `text` as a shell command template, as readable messages.
  *
  * Covers quoting context only. The app single-quotes every value, so a variable written
- * inside the author's own quotes would be wrapped twice and could break out of them. Values
- * passed to eval, bash -c, (( )), [[ ]], let, declare -i or array subscripts are still
- * interpreted by the shell, so command authors must not feed variables to those. The same holds
- * for declare -a / typeset -a (a quoted '(...)' value is re-parsed as a compound assignment) and
- * for zsh glob qualifiers such as `ls /tmp({{x}})` (an `e:cmd:` qualifier runs even when the
- * value was quoted).
+ * inside the author's own quotes would be wrapped twice and could break out of them. Quoting
+ * does not help when the shell parses a value a second time, so a template that uses any of
+ * these is rejected for every variable: `eval`, `(( ))`, `[[ ]]`, `let`, `declare`, `typeset` and
+ * zsh glob qualifiers such as `ls /tmp/*(e:cmd:)` (`*(` and `?(`). `bash -c` and array
+ * subscripts cannot be told apart from ordinary arguments, so command authors must not feed
+ * variables to those. A value that starts with `-` is checked separately, against its rendered
+ * value (see shellDashProblems).
  *
  * Deliberately conservative: this is a simple quote tracker, not a shell parser. A variable is
  * accepted only in a clearly bare context. If the text uses syntax the tracker cannot follow
- * (backticks, `$(`, `$'`, `$[`, `${`, `((`, heredocs, comments, line continuations, `$` or a
+ * (backticks, `$(`, `$'`, `$[`, `${`, `((`, `[[`, heredocs, comments, line continuations, `$` or a
  * backslash before a variable), every variable is reported instead. Conditionals are rejected outright: whether an #if body
  * renders changes the surrounding quote state, so no static check can cover both branches.
  */
@@ -136,6 +147,27 @@ function stringify(value: unknown): string {
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   // JSON.stringify yields undefined for functions and symbols.
   return JSON.stringify(value, null, 2) ?? "";
+}
+
+/**
+ * Problems with rendered values that start with `-`: a command that gets such a value as a word
+ * of its own reads it as an option (`ssh {{host}}` with `-oProxyCommand=...`). A value is fine
+ * after a standalone `--` earlier in the same simple command. A variable that is only part of a
+ * word (`--flag={{x}}`) cannot become an option, so it is not reported.
+ */
+export function shellDashProblems(text: string, scope: TemplateScope): string[] {
+  const problems: string[] = [];
+  for (const m of text.matchAll(VAR)) {
+    if (m[1].startsWith("/") || !stringify(lookup(scope, m[1])).startsWith("-")) continue;
+    const before = text.slice(0, m.index);
+    if (before !== "" && !/[\s;&|(]$/.test(before)) continue;
+    const command = before.split(/[;&|\n]/).pop() ?? "";
+    if (/(^|\s)--(\s|$)/.test(command)) continue;
+    problems.push(
+      `{{${m[1]}}}: the value starts with "-" and would be read as an option; put "--" before it`,
+    );
+  }
+  return problems;
 }
 
 function isTruthy(value: unknown): boolean {

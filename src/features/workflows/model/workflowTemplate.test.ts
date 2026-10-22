@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { renderTemplate, shellQuote, shellTemplateProblems, templateVars } from "./workflowTemplate";
+import {
+  renderTemplate,
+  shellDashProblems,
+  shellQuote,
+  shellTemplateProblems,
+  templateVars,
+} from "./workflowTemplate";
 
 describe("workflowTemplate", () => {
   it("renders nested paths", () => {
@@ -113,6 +119,28 @@ describe("workflowTemplate", () => {
       expect(problems.some((p) => p.includes("{{x}}"))).toBe(true);
     });
 
+    it.each([
+      ["double brackets", "if [[ {{x}} -gt 0 ]]; then echo hi; fi"],
+      ["let", "let n={{x}}"],
+      ["let after a separator", "true; let n={{x}}"],
+      ["declare", "declare -i n={{x}}"],
+      ["typeset", "typeset -i n={{x}}"],
+      ["eval", "eval {{x}}"],
+      ["eval after a pipe", "echo hi | eval {{x}}"],
+      ["zsh glob qualifier after a star", "ls *(e:{{x}}:)"],
+      ["zsh glob qualifier after a question mark", "ls ?(e:{{x}}:)"],
+    ])("flags every var next to syntax that re-parses a value (%s)", (_name, tpl) => {
+      expect(shellTemplateProblems(tpl).some((p) => p.includes("{{x}}"))).toBe(true);
+    });
+
+    it("does not mistake other words for let, declare, typeset or eval", () => {
+      expect(shellTemplateProblems("npm run evaluate {{x}}")).toEqual([]);
+      expect(shellTemplateProblems("echo outlet {{x}}")).toEqual([]);
+      expect(shellTemplateProblems("npm run eval-all {{x}}")).toEqual([]);
+      expect(shellTemplateProblems("cat declared.txt {{x}}")).toEqual([]);
+      expect(shellTemplateProblems("git log --format=%h -n 1 {{x}} [a-z]*")).toEqual([]);
+    });
+
     it("does not flag a bare var", () => {
       expect(shellTemplateProblems("echo {{x}}")).toEqual([]);
     });
@@ -142,6 +170,38 @@ describe("workflowTemplate", () => {
 
     it("keeps conditionals working in renderTemplate for prompts", () => {
       expect(renderTemplate("a{{#if c}}b{{/if}}", { c: true })).toBe("ab");
+    });
+  });
+
+  describe("shellDashProblems", () => {
+    const scope = { inputs: { host: "-oProxyCommand=x", ok: "example.com" }, x: "-x", empty: "" };
+
+    it("flags a value that starts with a dash and would be read as an option", () => {
+      const problems = shellDashProblems("ssh {{inputs.host}}", scope);
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("{{inputs.host}}");
+      expect(problems[0]).toContain("--");
+    });
+
+    it("accepts the same value after a standalone --", () => {
+      expect(shellDashProblems("git log -- {{x}}", scope)).toEqual([]);
+      expect(shellDashProblems("git log --\t{{x}}", scope)).toEqual([]);
+    });
+
+    it("does not count -- inside another word or after a command separator", () => {
+      expect(shellDashProblems("git log --format=x {{x}}", scope)).toHaveLength(1);
+      expect(shellDashProblems("git log -- a && ssh {{x}}", scope)).toHaveLength(1);
+      expect(shellDashProblems("git log -- a\nssh {{x}}", scope)).toHaveLength(1);
+    });
+
+    it("passes values that do not start with a dash", () => {
+      expect(shellDashProblems("ssh {{inputs.ok}}", scope)).toEqual([]);
+      expect(shellDashProblems("ssh {{empty}} {{missing}}", scope)).toEqual([]);
+      expect(shellDashProblems("echo a-{{x}} --opt={{x}}", scope)).toEqual([]);
+    });
+
+    it("reports each offending occurrence once per occurrence", () => {
+      expect(shellDashProblems("a {{x}} b {{x}} -- {{x}}", scope)).toHaveLength(2);
     });
   });
 });
