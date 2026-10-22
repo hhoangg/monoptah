@@ -5,6 +5,8 @@ import { ticketWorkflow, workflow } from "../workflowUiFixtures";
 import {
   autoPlace,
   connectionKind,
+  definitionKey,
+  deletion,
   dropCrossingEdges,
   dropNodes,
   fitGroups,
@@ -396,5 +398,70 @@ describe("projectInputFor", () => {
     const w = workflow({ inputs: { project: { type: "string" } }, inputValues: { project: "x" } });
     const out = projectInputFor(w, "/work/api", "api");
     expect(out.ref).toBe("{{inputs.api}}");
+  });
+});
+
+describe("keyboard delete", () => {
+  it("removes a For each and its wires but keeps its children with theirs", () => {
+    const { nodes, edges } = toFlow(ticketWorkflow());
+    // What React Flow hands over for a selected group: the group, its children, and every
+    // edge touching any of them.
+    const group = { ...nodes.find((n) => n.id === "each")!, selected: true };
+    const children = nodes.filter((n) => n.parentId === "each");
+    const listed = [group, ...children];
+    const out = deletion(listed, edges);
+    expect(out.nodes.map((n) => n.id)).toEqual(["each"]);
+    expect(out.edges.map((e) => e.id)).toEqual(["fetch->each", "each->report"]);
+  });
+
+  it("removes children that were selected themselves, and edges that were selected", () => {
+    const { nodes, edges } = toFlow(ticketWorkflow());
+    const dev = { ...nodes.find((n) => n.id === "dev")!, selected: true };
+    const wire = { ...edges.find((e) => e.id === "trigger->fetch")!, selected: true };
+    const out = deletion([dev], [...edges.filter((e) => e.id !== wire.id), wire]);
+    expect(out.nodes.map((n) => n.id)).toEqual(["dev"]);
+    expect(out.edges.map((e) => e.id).sort()).toEqual(["dev->review", "review->dev~loop", "trigger->fetch"].sort());
+  });
+});
+
+describe("If handles", () => {
+  const w = workflow({
+    nodes: [
+      { id: "trigger", type: "manual" },
+      { id: "check", type: "if", decide: "mono" },
+      { id: "report", type: "report" },
+    ],
+    edges: [
+      { from: "trigger", to: "check" },
+      { from: "check", to: "report", handle: "true" },
+    ],
+  });
+
+  it("lets true and false lead to the same node, but not the same handle twice", () => {
+    expect(connectionKind(w, "check", "report", "false")).toBe("edge");
+    expect(connectionKind(w, "check", "report", "true")).toBe("invalid");
+  });
+});
+
+describe("definitionKey", () => {
+  it("treats a whitespace-only description as none", () => {
+    const w = ticketWorkflow();
+    const { description: _d, ...bare } = w;
+    expect(definitionKey({ ...w, description: "   " })).toBe(definitionKey(bare));
+  });
+});
+
+describe("projectInputFor and inputs with no value", () => {
+  it("fills a declared project input that has no value yet", () => {
+    const w = workflow({ inputs: { repo: { type: "project" } } });
+    const out = projectInputFor(w, "/work/api", "api");
+    expect(out.ref).toBe("{{inputs.repo}}");
+    expect(Object.keys(out.inputs)).toEqual(["repo"]);
+    expect(out.inputValues.repo).toBe("/work/api");
+  });
+
+  it("prefers the input the step already uses", () => {
+    const w = workflow({ inputs: { a: { type: "project" }, b: { type: "project" } } });
+    expect(projectInputFor(w, "/work/api", "api", "b").ref).toBe("{{inputs.b}}");
   });
 });

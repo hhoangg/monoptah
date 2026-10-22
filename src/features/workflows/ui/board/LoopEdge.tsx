@@ -10,13 +10,10 @@ import type { FlowEdge } from "./boardModel";
 const CONDITION_MAX = 28;
 
 /** "Mono decides · max 3", or "If <condition> · max 3". */
-export function loopLabel(loop: LoopSpec): string {
+export function loopLabel(loop: LoopSpec, full = false): string {
   const condition = loop.decide.trim();
-  const who =
-    loop.decide === "mono"
-      ? "Mono decides"
-      : `If ${condition.length > CONDITION_MAX ? `${condition.slice(0, CONDITION_MAX - 1)}…` : condition}`;
-  return `${who} · max ${loop.maxRounds}`;
+  const shown = condition.length > CONDITION_MAX && !full ? `${condition.slice(0, CONDITION_MAX - 1)}…` : condition;
+  return `${loop.decide === "mono" ? "Mono decides" : `If ${shown}`} · max ${loop.maxRounds}`;
 }
 
 /**
@@ -53,6 +50,7 @@ export function LoopEdge({
           <span
             data-loop-label
             data-selected={selected || undefined}
+            title={loopLabel(data.loop, true)}
             className="loop-edge-label nodrag nopan"
             style={{
               transform: `translate(-50%, -50%) translate(${labelX + 12}px, ${labelY}px) rotate(90deg)`,

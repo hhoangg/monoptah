@@ -197,13 +197,15 @@ function ProjectPicker({
     options.unshift({ value: current, label: basename(current) });
   const choose = (next: string) => {
     const label = options.find((o) => o.value === next)?.label ?? basename(next);
-    const made = projectInputFor(workflow, next, label);
+    const made = projectInputFor(workflow, next, label, name);
     let { inputs, inputValues } = made;
     // An input this node left, that nothing else mentions, goes with it.
     if (name && made.ref !== node.project && inputs[name]?.type === "project") {
-      const rest = JSON.stringify(
-        workflow.nodes.map((n) => (n.id === node.id ? { ...n, project: "" } : n)),
-      );
+      // Loop conditions mention inputs too, so the edges are searched along with the nodes.
+      const rest = JSON.stringify({
+        nodes: workflow.nodes.map((n) => (n.id === node.id ? { ...n, project: "" } : n)),
+        edges: workflow.edges,
+      });
       if (!rest.includes(`inputs.${name}`)) {
         const { [name]: _gone, ...keptInputs } = inputs;
         const { [name]: _value, ...keptValues } = inputValues;

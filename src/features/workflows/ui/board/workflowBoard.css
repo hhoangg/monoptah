@@ -111,8 +111,8 @@
   position: absolute;
   bottom: -19px;
   transform: translateX(9px);
-  font-size: 10px;
-  line-height: 12px;
+  font-size: 11px;
+  line-height: 14px;
   color: color-mix(in srgb, var(--color-content) 42%, transparent);
   pointer-events: none;
 }
@@ -135,8 +135,8 @@
   padding: 0 4px;
   background: color-mix(in srgb, var(--wf-accent) 12%, transparent);
   color: color-mix(in srgb, var(--wf-accent) 80%, var(--color-content));
-  font-size: 10px;
-  line-height: 14px;
+  font-size: 11px;
+  line-height: 16px;
   white-space: nowrap;
   pointer-events: all;
 }

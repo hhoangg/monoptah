@@ -306,13 +306,16 @@ export function connectionKind(
   w: Workflow,
   from: NodeId,
   to: NodeId,
+  /** The If handle the connection leaves from; an If node may send both to one node. */
+  handle?: "true" | "false",
 ): "edge" | "loop" | "invalid" {
   const a = w.nodes.find((n) => n.id === from);
   const b = w.nodes.find((n) => n.id === to);
   if (!a || !b || from === to) return "invalid";
   if (isTrigger(b) || a.type === "report") return "invalid";
   if (a.parent !== b.parent) return "invalid";
-  if (w.edges.some((e) => !e.loop && e.from === from && e.to === to)) return "invalid";
+  if (w.edges.some((e) => !e.loop && e.from === from && e.to === to && e.handle === handle))
+    return "invalid";
   if (reaches(w, to, from)) {
     if (!LOOP_SOURCES.includes(a.type)) return "invalid";
     if (w.edges.some((e) => e.loop && e.from === from)) return "invalid";
@@ -397,15 +400,25 @@ export function projectInputFor(
   w: Workflow,
   path: string,
   label: string,
+  /** The input the step uses now, which takes the project first when it has no value. */
+  current?: string,
 ): {
   ref: string;
   inputs: Record<string, WorkflowInput>;
   inputValues: Workflow["inputValues"];
 } {
-  const held = Object.keys(w.inputs).find(
-    (key) => w.inputs[key].type === "project" && w.inputValues[key] === path,
-  );
-  if (held) return { ref: `{{inputs.${held}}}`, inputs: w.inputs, inputValues: w.inputValues };
+  const reuse = (name: string, value: string) => ({
+    ref: `{{inputs.${name}}}`,
+    inputs: w.inputs,
+    inputValues: w.inputValues[name] === value ? w.inputValues : { ...w.inputValues, [name]: value },
+  });
+  const isProject = (key: string) => has(w.inputs, key) && w.inputs[key].type === "project";
+  const unset = (key: string) => isProject(key) && !w.inputValues[key];
+  const held = Object.keys(w.inputs).find((key) => isProject(key) && w.inputValues[key] === path);
+  if (held) return reuse(held, path);
+  // An input that is declared but still has no value is there to be filled.
+  const empty = current && unset(current) ? current : Object.keys(w.inputs).find(unset);
+  if (empty) return reuse(empty, path);
   const base = has(w.inputs, "project") ? inputName(label) || "project" : "project";
   let name = base;
   for (let n = 2; has(w.inputs, name); n++) name = `${base}_${n}`;
@@ -549,6 +562,25 @@ export function dropNodes(
   };
 }
 
+/**
+ * What a keyboard delete removes. React Flow also lists the children of a deleted For each,
+ * and every edge touching them; the children stay (the group's frame goes) and so do their
+ * wires. Edges go when they touch a removed node or were selected themselves.
+ */
+export function deletion(
+  nodes: FlowNode[],
+  edges: FlowEdge[],
+): { nodes: FlowNode[]; edges: FlowEdge[] } {
+  const removed = nodes.filter(
+    (n) => !n.parentId || n.selected || !nodes.some((p) => p.id === n.parentId),
+  );
+  const ids = new Set(removed.map((n) => n.id));
+  return {
+    nodes: removed,
+    edges: edges.filter((e) => ids.has(e.source) || ids.has(e.target) || e.selected),
+  };
+}
+
 /** The messages of the issues that belong to one node, by node id. */
 export function issuesByNode(issues: readonly WorkflowIssue[]): Map<NodeId, string[]> {
   const out = new Map<NodeId, string[]>();
@@ -602,7 +634,7 @@ export function definitionKey(w: Workflow): string {
   return JSON.stringify(
     canonical({
       name: w.name,
-      description: w.description ?? "",
+      description: w.description?.trim() ? w.description : "",
       enabled: w.enabled,
       inputs: w.inputs,
       inputValues: Object.fromEntries(

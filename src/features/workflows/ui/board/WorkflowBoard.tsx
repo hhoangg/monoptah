@@ -61,6 +61,7 @@ import {
   connectionKind,
   definitionKey,
   dropCrossingEdges,
+  deletion,
   dropNodes,
   EMPTY_GROUP_H,
   fitGroups,
@@ -173,6 +174,9 @@ function merged(stored: Workflow | undefined, next: Workflow, now: number): Work
     nextRunAt: same ? stored.nextRunAt : nextHabitRunAt(trigger.schedule, now),
   };
 }
+
+const ifHandle = (handle: string | null | undefined) =>
+  handle === "true" || handle === "false" ? handle : undefined;
 
 function ZoomControls() {
   const flow = useReactFlow();
@@ -384,7 +388,7 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
   const connect = useCallback(
     (c: Connection) => {
       const w = live.current.current;
-      const kind = connectionKind(w, c.source, c.target);
+      const kind = connectionKind(w, c.source, c.target, ifHandle(c.sourceHandle));
       if (kind === "invalid") return;
       if (kind === "loop") {
         setLoopAsk({
@@ -411,20 +415,16 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
     [],
   );
 
-  // Deleting a For each takes only its frame: its nodes stay, now outside it.
+  // Deleting a For each takes only its frame: its nodes stay, now outside it, with their wires.
   const beforeDelete = useCallback(
-    async ({ nodes, edges }: { nodes: FlowNode[]; edges: FlowEdge[] }) => ({
-      nodes: nodes.filter(
-        (n) => !n.parentId || n.selected || !nodes.some((p) => p.id === n.parentId),
-      ),
-      edges,
-    }),
+    async ({ nodes, edges }: { nodes: FlowNode[]; edges: FlowEdge[] }) => deletion(nodes, edges),
     [],
   );
 
   const isValidConnection = useCallback(
-    (c: { source: string; target: string }) =>
-      connectionKind(live.current.current, c.source, c.target) !== "invalid",
+    (c: { source: string; target: string; sourceHandle?: string | null }) =>
+      connectionKind(live.current.current, c.source, c.target, ifHandle(c.sourceHandle)) !==
+      "invalid",
     [],
   );
 
@@ -558,6 +558,16 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
         };
       });
       setBase(saved);
+      // The save may have anchored an interval schedule; the board takes that, so it is clean.
+      setBoard((b) => ({
+        ...b,
+        nodes: b.nodes.map((n) => {
+          const stored = saved.nodes.find((s) => s.id === n.id);
+          return n.data.node.type === "schedule" && stored?.type === "schedule"
+            ? { ...n, data: { ...n.data, node: { ...n.data.node, schedule: stored.schedule } } }
+            : n;
+        }),
+      }));
       setMeta((m) => ({ ...m, enabled: saved.enabled }));
       setIsNew(false);
       const key = definitionKey(saved);
@@ -732,7 +742,8 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
             panOnScroll
             zoomOnScroll={false}
             nodeDragThreshold={2}
-            deleteKeyCode={["Backspace", "Delete"]}
+            // Not while the inspector is open: Backspace on one of its buttons must not delete a node.
+            deleteKeyCode={view ? null : ["Backspace", "Delete"]}
             onBeforeDelete={beforeDelete}
             proOptions={{ hideAttribution: true }}
           >

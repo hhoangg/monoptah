@@ -303,3 +303,27 @@ it("Keep mine dismisses the notice and keeps the draft", async () => {
   await act(async () => button("Save").click());
   expect(stored()[0].name).toBe("Mine");
 });
+
+it("is clean after saving a schedule the save anchored", async () => {
+  // An interval schedule with no start date gets one when it is saved.
+  const w = ticketWorkflow();
+  const interval: Workflow = {
+    ...w,
+    nodes: w.nodes.map((n) =>
+      n.type === "schedule"
+        ? { ...n, schedule: { scheduleKind: "interval", time: "09:00", minute: 0, dayOfWeek: 1, intervalHours: 4 } }
+        : n,
+    ),
+  };
+  const onBack = vi.fn();
+  await renderBoard(interval, { onBack });
+  const name = container.querySelector<HTMLInputElement>("input[aria-label='Workflow name']")!;
+  await act(async () => type(name, "Renamed"));
+  await act(async () => button("Save").click());
+  const trigger = stored()[0].nodes.find((n) => n.type === "schedule");
+  expect(trigger && "schedule" in trigger && trigger.schedule.intervalFrom).toBeTruthy();
+  expect(button("Save").disabled).toBe(true);
+  await act(async () => button("Back").click());
+  expect(document.body.querySelector("[role='dialog']")).toBeNull();
+  expect(onBack).toHaveBeenCalledTimes(1);
+});
