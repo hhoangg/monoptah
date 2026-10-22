@@ -23,6 +23,13 @@ export type WorkflowIssue = { nodeId?: NodeId; message: string };
 
 type Rec = Record<string, unknown>;
 
+const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * Whether `name` may be a key of an input or output map. Names end up in `{{a.b}}` paths, and
+ * "__proto__" would replace the prototype of a plain object when a parsed map is built.
+ */
+const isMapKey = (name: string) => NAME.test(name) && name !== "__proto__";
+
 const isRec = (v: unknown): v is Rec => !!v && typeof v === "object" && !Array.isArray(v);
 const isString = (v: unknown): v is string => typeof v === "string";
 const isNumber = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
@@ -71,7 +78,7 @@ function parseOutput(raw: unknown): Record<string, OutputField> | undefined {
   if (!isRec(raw)) return undefined;
   const output: Record<string, OutputField> = {};
   for (const [name, field] of Object.entries(raw)) {
-    if (!isRec(field) || !OUTPUT_TYPES.includes(field.type as OutputFieldType)) continue;
+    if (!isMapKey(name) || !isRec(field) || !OUTPUT_TYPES.includes(field.type as OutputFieldType)) continue;
     output[name] = {
       type: field.type as OutputFieldType,
       ...opt("inReport", bool(field, "inReport")),
@@ -193,7 +200,7 @@ function parseInputs(raw: unknown): Record<string, WorkflowInput> {
   const inputs: Record<string, WorkflowInput> = {};
   if (!isRec(raw)) return inputs;
   for (const [name, input] of Object.entries(raw)) {
-    if (!isRec(input) || !INPUT_TYPES.includes(input.type as WorkflowInput["type"])) continue;
+    if (!isMapKey(name) || !isRec(input) || !INPUT_TYPES.includes(input.type as WorkflowInput["type"])) continue;
     inputs[name] = {
       type: input.type as WorkflowInput["type"],
       ...opt("description", str(input, "description")),
@@ -206,6 +213,7 @@ function parseInputValues(raw: unknown): Record<string, string | number | boolea
   const values: Record<string, string | number | boolean> = {};
   if (!isRec(raw)) return values;
   for (const [name, value] of Object.entries(raw)) {
+    if (!isMapKey(name)) continue;
     if (isString(value) || isNumber(value) || isBool(value)) values[name] = value;
   }
   return values;
@@ -264,7 +272,6 @@ export function parseWorkflows(text: string): Workflow[] {
 // Validation
 // ---------------------------------------------------------------------------------------------
 
-const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PROJECT_REF = /^\{\{inputs\.([^{}\s.]+)\}\}$/;
 const RUN_VARS = ["round", "id", "startedAt"];
 const RESERVED_HEADS = ["inputs", "run"];
@@ -273,7 +280,15 @@ const RESERVED_HEADS = ["inputs", "run"];
  * drive, or `~/`. A bare `/api/users` is not matched, so prompts may talk about URL paths.
  */
 const ABSOLUTE_PATH =
-  /(?:^|[\s"'`=(\[,])(?:~\/|\/(?:Users|home|Volumes|private|tmp|var|opt|etc|usr|mnt|root|Library|Applications|System)\/|[A-Za-z]:[\\/])\S*/;
+  /(?:^|[\s"'`=(\[,<>|;&:])(?:~\/|\/(?:Users|home|Volumes|private|tmp|var|opt|etc|usr|mnt|root|Library|Applications|System)\/|[A-Za-z]:[\\/])\S*/;
+/**
+ * For shell commands every word that starts with `/` or `~/` is a path on this machine, also
+ * right after a redirect or operator (`>/tmp/log`, `;/usr/bin/x`). `//` is left alone so a URL
+ * such as https://host/a/b is not read as a path, and so are the harmless /dev/null-style
+ * device files used to discard output.
+ */
+const COMMAND_ABSOLUTE_PATH =
+  /(?:^|[\s"'`=(\[,<>|;&:])(?:~\/|\/(?!\/|dev\/(?:null|stdin|stdout|stderr)(?![\w/.-]))\S|[A-Za-z]:[\\/])\S*/;
 
 const COMMAND_FIELDS = ["exitCode", "stdout", "stderr"];
 const ASK_FIELDS = ["answer", "reason"];
@@ -393,7 +408,7 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
   }
 
   for (const name of Object.keys(w.inputs)) {
-    if (!NAME.test(name)) {
+    if (!isMapKey(name)) {
       add(`Invalid input name "${name}": use letters, digits and underscores`);
     }
   }
@@ -494,9 +509,9 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
   };
 
   const checkPaths = (node: WorkflowNode) => {
-    const walk = (value: unknown, label: string) => {
+    const walk = (value: unknown, label: string, strict = false) => {
       if (isString(value)) {
-        const m = ABSOLUTE_PATH.exec(value);
+        const m = (strict ? COMMAND_ABSOLUTE_PATH : ABSOLUTE_PATH).exec(value);
         if (m) {
           add(
             `${label} contains an absolute path ("${m[0].trim()}"); use a project input or a relative path`,
@@ -511,7 +526,7 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
     };
     for (const [key, value] of Object.entries(node)) {
       if (["id", "type", "parent", "ui", "project"].includes(key)) continue;
-      walk(value, key);
+      walk(value, key, node.type === "command" && key === "command");
     }
   };
 
@@ -524,7 +539,10 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
           : "project must be exactly {{inputs.<name>}} naming a project input",
         node.id,
       );
-    } else if (w.inputs[m[1]]?.type !== "project") {
+    } else if (
+      !Object.prototype.hasOwnProperty.call(w.inputs, m[1]) ||
+      w.inputs[m[1]].type !== "project"
+    ) {
       add(`${node.project} is not a declared project input`, node.id);
     }
   };
@@ -572,7 +590,7 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
         checkProject(node);
         checkText(node.prompt, node);
         for (const name of Object.keys(node.output)) {
-          if (!NAME.test(name)) {
+          if (!isMapKey(name)) {
             add(`Invalid output field name "${name}": use letters, digits and underscores`, node.id);
           }
         }

@@ -409,6 +409,77 @@ describe("validateWorkflow", () => {
   });
 });
 
+describe("validateWorkflow absolute paths in commands", () => {
+  it.each([
+    "make >/tmp/log",
+    "make 2>/var/log/x",
+    "make;/usr/bin/x",
+    "make|/usr/bin/x",
+    "cd /srv/app && make",
+    "cd /tmp",
+    "make &>/srv/out",
+    "cat </etc/hosts",
+    "make --out=/srv/out",
+    "cd ~/work && make",
+  ])("flags %s", (command) => {
+    expect(flags(withCommand(command), "absolute path")).toBe(true);
+  });
+
+  it("does not flag URLs, relative paths or discarded output", () => {
+    for (const command of [
+      "curl https://example.com/a/b {{inputs.clickupList}}",
+      "curl -s http://localhost:3000/health",
+      "git commit -m {{inputs.clickupList}}",
+      "make 2>/dev/null",
+      "make >/dev/null 2>&1",
+      "ls ./src/features && cat docs/a.md",
+      "echo $((6 / 3))",
+    ]) {
+      expect(flags(withCommand(command), "absolute path")).toBe(false);
+    }
+  });
+
+  it("flags a path only after shell operators in prose prompts too", () => {
+    const w = patchNode(example(), "fetch", { prompt: "Write the log to >/tmp/log" });
+    expect(flags(w, "absolute path")).toBe(true);
+  });
+});
+
+describe("prototype-like map keys", () => {
+  it("parseWorkflows skips a __proto__ input or output key", () => {
+    const text =
+      '[{"id":"wf-aaaaaaaa","nodes":[{"id":"s","type":"session","project":"p","prompt":"x",' +
+      '"checkout":"root","output":{"__proto__":{"type":"string"},"ok":{"type":"string"}}}],' +
+      '"inputs":{"__proto__":{"type":"project"},"p":{"type":"project"}},' +
+      '"inputValues":{"__proto__":"x","p":"y"}}]';
+    const [w] = parseWorkflows(text);
+    expect(Object.keys(w.inputs)).toEqual(["p"]);
+    expect(Object.getPrototypeOf(w.inputs)).toBe(Object.prototype);
+    expect(Object.keys(w.inputValues)).toEqual(["p"]);
+    const session = w.nodes[0];
+    expect(session.type === "session" && Object.keys(session.output)).toEqual(["ok"]);
+    expect(session.type === "session" && Object.getPrototypeOf(session.output)).toBe(
+      Object.prototype,
+    );
+  });
+
+  it("a project that names an inherited key is not a project input", () => {
+    for (const name of ["__proto__", "constructor", "toString"]) {
+      const w = patchNode(example(), "fetch", { project: `{{inputs.${name}}}` });
+      expect(flags(w, "project input")).toBe(true);
+    }
+  });
+
+  it("flags a __proto__ input name", () => {
+    const w = example();
+    Object.defineProperty(w.inputs, "__proto__", {
+      value: { type: "string" },
+      enumerable: true,
+    });
+    expect(flags(w, "input name")).toBe(true);
+  });
+});
+
 describe("validateWorkflow command templates", () => {
   it("flags a variable inside double quotes", () => {
     const issues = validateWorkflow(withCommand('echo "{{inputs.clickupList}}"'));
