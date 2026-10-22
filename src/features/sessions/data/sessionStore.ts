@@ -991,6 +991,25 @@ function sanitizeBlock(
       at: block.monoHabit.at,
     };
   }
+  const workflow = block.monoWorkflow;
+  if (
+    (block.role === "assistant" || block.role === "approval") &&
+    typeof workflow?.id === "string" &&
+    workflow.id.trim() &&
+    typeof workflow.name === "string" &&
+    workflow.name.trim() &&
+    typeof workflow.runId === "string" &&
+    workflow.runId.trim() &&
+    typeof workflow.at === "number" &&
+    Number.isFinite(workflow.at)
+  ) {
+    next.monoWorkflow = {
+      id: workflow.id,
+      name: workflow.name,
+      runId: workflow.runId,
+      at: workflow.at,
+    };
+  }
   if (block.role === "user" && typeof block.sentAt === "number")
     next.sentAt = block.sentAt;
   const turnModel = sanitizeTurnModel(block.turnModel);
@@ -1031,7 +1050,8 @@ function sanitizeBlock(
   // never do, so the field stays off them.
   if (
     spawned.length &&
-    (block.role === "user" || (block.role === "assistant" && next.monoHabit))
+    (block.role === "user" ||
+      (block.role === "assistant" && (next.monoHabit || next.monoWorkflow)))
   )
     next.monoSpawnedSessions = spawned;
   const turnMetrics = sanitizeTurnMetrics(block.turnMetrics);

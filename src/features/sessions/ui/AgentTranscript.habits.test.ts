@@ -324,6 +324,26 @@ it("keeps a posted report actionable while the conversation is still running", a
   expect(onSaveNote).toHaveBeenCalledWith(report.text);
 });
 
+it("gives a standalone workflow report the Mono's identity, posting time and actions", () => {
+  const workflowReport: Block = {
+    id: "workflow-report",
+    role: "assistant",
+    text: "Both tickets shipped.",
+    monoWorkflow: { id: "wf-aaaaaaaa", name: "Ship tickets", runId: "run-1", at: postedAt },
+  };
+  render([workflowReport]);
+  const turn = container.querySelector('[data-transcript-turn="workflow-report"]')!;
+  expect(turn.querySelector(".pixel-mascot")).not.toBeNull();
+  expect(turn.textContent).toContain("Captain Awesome");
+  expect(turn.textContent).toContain(
+    new Intl.DateTimeFormat(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(postedAt),
+  );
+  expect(turn.querySelector('[aria-label="Copy response"]')).not.toBeNull();
+});
+
 it("renders the identity and actions for older standalone reports missing their habit tag", () => {
   const { monoHabit: _habit, ...legacy } = report;
   render([legacy]);

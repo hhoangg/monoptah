@@ -18,6 +18,8 @@ import {
   joinedTurnStart,
   initialThinkingIndex,
   lastActivityIndex,
+  monoPost,
+  monoTurnLatestStart,
   monoTurnRuns,
   nestedScrollAbsorbsWheel,
   proseSummary,
@@ -177,6 +179,31 @@ describe("groupMonoChatTurns", () => {
       "first",
       "second",
       "habit",
+      "review",
+    ]);
+  });
+
+  it("keeps a workflow report as its own turn in the Mono chat", () => {
+    const blocks: Block[] = [
+      { id: "first", role: "user", text: "First", startedAt: at },
+      note("first-answer", "Done."),
+      {
+        id: "workflow",
+        role: "assistant",
+        text: "Report",
+        monoWorkflow: {
+          id: "wf-aaaaaaaa",
+          name: "Ship",
+          runId: "run-1",
+          at: at + 2 * minute,
+        },
+      },
+      completion("review", at + 3 * minute),
+      note("cancelled", "The review was cancelled."),
+    ];
+    expect(groupMonoChatTurns(blocks).map((turn) => turn[0].id)).toEqual([
+      "first",
+      "workflow",
       "review",
     ]);
   });
@@ -673,6 +700,28 @@ describe("groupTurns", () => {
       ["next-report"],
       ["next-user"],
     ]);
+  });
+
+  it("keeps workflow reports outside conversation turns like habit reports", () => {
+    const monoWorkflow = {
+      id: "wf-aaaaaaaa",
+      name: "Ship tickets",
+      runId: "run-1",
+      at: 1_000,
+    };
+    const turns = groupTurns([
+      { id: "user", role: "user", text: "Review" },
+      { id: "answer", role: "assistant", text: "Reviewed." },
+      { id: "report", role: "assistant", text: "All shipped.", monoWorkflow },
+      { id: "next-user", role: "user", text: "Thanks" },
+    ]);
+    expect(turns.map((turn) => turn.map((block) => block.id))).toEqual([
+      ["user", "answer"],
+      ["report"],
+      ["next-user"],
+    ]);
+    expect(monoPost(turns[1][0])).toEqual(monoWorkflow);
+    expect(monoTurnLatestStart(turns[1])).toBe(1_000);
   });
 
   it("folds an orchestration turn the app wrote into the turn above", () => {

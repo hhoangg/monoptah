@@ -21,6 +21,7 @@ import {
   foldableWork,
   isNoticeBlock,
   isProseBlock,
+  monoPost,
   monoTurnLatestStart,
   monoTurnRuns,
   needsApproval,
@@ -124,7 +125,7 @@ export function mobileTranscript(
   const turns = cache.group(blocks, false, inlineWork);
   const activeTurnIndex = turns.reduce(
     (latest, turn, index) =>
-      turn[0].monoHabit || turn[0].role === "handoff" ? latest : index,
+      monoPost(turn[0]) || turn[0].role === "handoff" ? latest : index,
     -1,
   );
   const model = resolveModel(session.harness, session.model).name;
@@ -145,7 +146,7 @@ export function mobileTranscript(
       : turnUserBlock(turn);
     const lastRun =
       runs.length > 1 ? monoTurnUserBlock(runs[runs.length - 1]) : userBlock;
-    const habit = turn[0].monoHabit;
+    const habit = monoPost(turn[0]);
     const agentName = options.mono?.name;
     const standaloneReply =
       !userBlock && !!(agentName || habit) && turn.some(isProseBlock);
@@ -166,7 +167,7 @@ export function mobileTranscript(
       : inlineWork
         ? monoTurnLatestStart(previous)
         : (turnUserBlock(previous)?.startedAt ??
-          previous[0].monoHabit?.at ??
+          monoPost(previous[0])?.at ??
           previous[0].startedAt);
     const stampAt =
       inlineWork && startedAt != null && opensNewStretch(startedAt, previousAt)

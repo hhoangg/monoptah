@@ -78,8 +78,8 @@ export type EngineEvent =
   | { kind: "stopped"; at: number };
 
 const DEFAULT_MAX_PARALLEL = 3;
-const MAX_ROUNDS_REASON = "max rounds reached";
-const BRANCH_FAILED_REASON = "branch failed";
+export const MAX_ROUNDS_REASON = "max rounds reached";
+export const BRANCH_FAILED_REASON = "branch failed";
 
 // --- graph ----------------------------------------------------------------------------------
 

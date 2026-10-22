@@ -98,6 +98,30 @@ describe("mobile transcript", () => {
     expect(turn.items[1]).toMatchObject({ label: "Pip", entries: [] });
   });
 
+  it("treats a workflow report like a habit report: its own turn, with its posting time", () => {
+    const [chat, post] = mobileTranscript(
+      session([
+        prompt("u", "Hi"),
+        reply("a", "Hello."),
+        reply("r", "All shipped.", {
+          monoWorkflow: {
+            id: "wf-aaaaaaaa",
+            name: "Ship tickets",
+            runId: "run-1",
+            at: at + 3_600_000,
+          },
+        }),
+      ]),
+      { busy: false, mono: { name: "Pip" } },
+    );
+    expect(chat.items[0]).toMatchObject({ type: "user" });
+    expect(post).toMatchObject({ completedAt: at + 3_600_000 });
+    expect(post.items.some((item) => item.type === "text")).toBe(true);
+    expect(post.items.find((item) => item.type === "header")).toMatchObject({
+      label: "Pip",
+    });
+  });
+
   it("pins a Mono's reaction to the message it answers", () => {
     const [turn] = mobileTranscript(
       session([prompt("u", "thanks!"), reply("a", "<reaction>👍</reaction>")]),

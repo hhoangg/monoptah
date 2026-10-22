@@ -99,6 +99,38 @@ describe("composeReport", () => {
     expect(text).toContain("failed");
   });
 
+  it("shows top-level session outputs next to a For each", () => {
+    const d = def(
+      [
+        trigger,
+        { id: "each", type: "forEach", in: "{{items}}" },
+        session("dev", { parent: "each", output: { pr_url: { type: "string" } } }),
+        session("summary", { output: { digest: { type: "string" }, raw: { type: "list" } } }),
+        report,
+      ],
+      [
+        { from: "trigger", to: "each" },
+        { from: "each", to: "summary" },
+        { from: "summary", to: "report" },
+      ],
+    );
+    const run = runOf(
+      d,
+      [
+        nodeRun({ nodeId: "dev", branch: "each#0", output: { pr_url: "https://x/1" }, endedAt: 2 }),
+        nodeRun({ nodeId: "summary", output: { digest: "One PR opened", raw: ["x"] }, endedAt: 3 }),
+      ],
+      { items: { each: [{ title: "T" }] } },
+    );
+    const { text } = composeReport(run);
+    expect(text).toContain("summary.digest: One PR opened");
+    expect(text).not.toContain("raw");
+    expect(text).toContain("https://x/1");
+    // Without any reported top-level output there is no extra section.
+    const quiet = composeReport(runOf(d, [run.nodes[0]], { items: run.items })).text;
+    expect(quiet).not.toContain("### Run");
+  });
+
   it("report flags max rounds", () => {
     const d = def(
       [

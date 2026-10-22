@@ -1,7 +1,7 @@
 // What a finished run tells the Mono: the report the app composes itself, plus the prompt and reply
 // parsing for the questions the engine puts to the Mono (Ask Mono nodes, Mono-decided Ifs and loops).
 import type { NodeId, NodeRun, OutputField, RunStatus, SessionNode, WorkflowRun } from "./workflow";
-import type { EngineAction } from "./workflowEngine";
+import { BRANCH_FAILED_REASON, MAX_ROUNDS_REASON, type EngineAction } from "./workflowEngine";
 import { OUTPUT_FENCE, parseWorkflowOutput } from "./workflowOutput";
 import { renderTemplate } from "./workflowTemplate";
 
@@ -14,8 +14,6 @@ const RUN_STATUS_LABEL: Record<RunStatus, string> = {
   interrupted: "interrupted",
 };
 
-const MAX_ROUNDS_REASON = "max rounds reached";
-const BRANCH_FAILED_REASON = "branch failed";
 /** A string longer than this is shown as a quoted block instead of inline. */
 const INLINE_STRING_MAX = 200;
 const ACTION_TYPES = new Set(["session", "command", "askMono", "if"]);
@@ -93,7 +91,19 @@ function reportedFields(node: SessionNode, output: Record<string, unknown>): Arr
   return shown;
 }
 
-function resultOf(run: WorkflowRun, branch: string, name: string): BranchResult {
+/** Reported fields of every finished session node in the branch, as `<node>.<field>`, in finish order. */
+function allSessionFields(run: WorkflowRun, runs: NodeRun[]): Array<[string, unknown]> {
+  const finished = runs
+    .filter((r) => r.status === "done" && r.output !== undefined)
+    .sort((a, b) => (a.endedAt ?? a.startedAt ?? 0) - (b.endedAt ?? b.startedAt ?? 0));
+  return finished.flatMap((r) => {
+    const node = run.definition.nodes.find((n) => n.id === r.nodeId);
+    if (node?.type !== "session") return [];
+    return reportedFields(node, r.output ?? {}).map(([name, value]): [string, unknown] => [`${r.nodeId}.${name}`, value]);
+  });
+}
+
+function resultOf(run: WorkflowRun, branch: string, name: string, allSessions = false): BranchResult {
   const loopNodes = new Set(run.definition.edges.filter((e) => e.loop).map((e) => e.from));
   const runs = run.nodes.filter((r) => r.branch === branch && ACTION_TYPES.has(nodeType(run, r.nodeId)));
   const last = lastSessionRun(run, runs);
@@ -112,7 +122,11 @@ function resultOf(run: WorkflowRun, branch: string, name: string): BranchResult 
       .filter((r) => r.decision?.reason === BRANCH_FAILED_REASON)
       .map((r) => nodeLabel(run, r.nodeId)),
     output,
-    shown: lastNode?.type === "session" ? reportedFields(lastNode, output) : [],
+    shown: allSessions
+      ? allSessionFields(run, runs)
+      : lastNode?.type === "session"
+        ? reportedFields(lastNode, output)
+        : [],
   };
 }
 
@@ -134,8 +148,11 @@ function collect(run: WorkflowRun): { results: BranchResult[]; empty: string[]; 
     );
   }
   // Work outside any For each. With no For each at all this is the whole run.
-  const top = resultOf(run, "", "Run");
-  if (groups.length === 0 || top.status === "failed" || top.errors.length > 0) results.unshift(top);
+  // Next to a For each it also lists the outputs of steps before or after it (e.g. a summary).
+  const top = resultOf(run, "", "Run", groups.length > 0);
+  if (groups.length === 0 || top.status === "failed" || top.errors.length > 0 || top.shown.length > 0) {
+    results.unshift(top);
+  }
   return { results, empty, groups: groups.length };
 }
 

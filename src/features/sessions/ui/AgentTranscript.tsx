@@ -155,6 +155,7 @@ import {
   workKind,
   workSummaryLine,
   joinedTurnStart,
+  monoPost,
   monoTurnLatestStart,
   monoTurnRuns,
   opensNewStretch,
@@ -799,7 +800,7 @@ function AgentTranscriptComponent({
   // A scheduled update can land while the chat's own turn is still running.
   const activeTurnIndex = turns.reduce(
     (latest, turn, index) =>
-      turn[0].monoHabit || turn[0].role === "handoff" ? latest : index,
+      monoPost(turn[0]) || turn[0].role === "handoff" ? latest : index,
     -1,
   );
   const firstVisibleTurn = Math.max(0, turns.length - visibleTurnCount);
@@ -1188,7 +1189,7 @@ function AgentTranscriptComponent({
             runs.length > 1
               ? monoTurnUserBlock(runs[runs.length - 1], messageDeliveries)
               : userBlock;
-          const habit = turn[0].monoHabit;
+          const habit = monoPost(turn[0]);
           // Older saved reports may have lost their habit tag. A Mono's
           // standalone reply still needs its identity and response actions.
           const standaloneReply =
@@ -1231,7 +1232,7 @@ function AgentTranscriptComponent({
             : inlineWork
               ? monoTurnLatestStart(previousTurn)
               : (turnUserBlock(previousTurn, managed)?.startedAt ??
-                previousTurn[0].monoHabit?.at ??
+                monoPost(previousTurn[0])?.at ??
                 previousTurn[0].startedAt);
           const stampAt =
             daySeparators &&
@@ -5309,7 +5310,7 @@ function stacksAfterReaction(
     turn.some((block) => !!block.monoReaction) &&
     start.role === "user" &&
     !start.internal &&
-    !start.monoHabit &&
+    !monoPost(start) &&
     !(
       daySeparators &&
       start.startedAt != null &&
