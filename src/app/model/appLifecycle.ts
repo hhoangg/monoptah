@@ -51,6 +51,7 @@ import {
   hydrateWorkspaceSnapshot,
   parseWorkspaceSnapshot,
 } from "../../features/workspace/model/workspaceSnapshot";
+import { liveWorkflowRuns } from "../../features/workflows/model/workflowStore";
 import { loadWindowTransfer } from "./windowTransferBootstrap";
 import type { WindowTransferPayload } from "./windowTransfer";
 import {
@@ -62,6 +63,14 @@ import type { ProjectReturnMemory } from "../../features/projects/model/projectR
 
 export type { ResumedWorkspace };
 export { hasInFlightSessions };
+
+/**
+ * Whether closing the window would cut work short: a busy session, or a workflow run this
+ * window is driving (the run lives in its memory, so destroying the window ends it).
+ */
+export function hasInFlightWork(sessions: Session[]): boolean {
+  return hasInFlightSessions(sessions) || liveWorkflowRuns().size > 0;
+}
 
 export type BootWorkspace = {
   windowTransfer: WindowTransferPayload | null;

@@ -144,6 +144,11 @@ export function workflowRunningId(workflowId: WorkflowId): string | undefined {
   return running.get(workflowId);
 }
 
+/** A copy of the runs in flight in this window, by workflow. */
+export function liveWorkflowRuns(): ReadonlyMap<WorkflowId, string> {
+  return new Map(running);
+}
+
 export function subscribeWorkflowsRunning(listener: () => void): () => void {
   window.addEventListener(ACTIVE_CHANGED, listener);
   return () => window.removeEventListener(ACTIVE_CHANGED, listener);
@@ -155,14 +160,16 @@ export function requestWorkflowStop(workflowId: WorkflowId): void {
 }
 
 /**
- * Stops a workflow's running run from any window. Only the main window drives runs, so the
- * request is also written to the workflow's file, where the driver picks it up within seconds.
+ * Stops a workflow's running run from any window. Only one window drives runs (see
+ * `workflowDriver`), so the request is also written to the workflow's file, where the driver
+ * picks it up within seconds. Here it takes effect at once when this window is the driver.
  */
 export async function stopWorkflowRun(
   monoId: string,
   workflowId: WorkflowId,
 ): Promise<void> {
-  requestWorkflowStop(workflowId);
+  // Runs live in the driver's memory only: a flag set anywhere else would never be cleared.
+  if (workflowRunningId(workflowId)) requestWorkflowStop(workflowId);
   await updateWorkflows(monoId, (list) => ({
     workflows: list.map((w) =>
       w.id === workflowId ? { ...w, stopRequested: true } : w,

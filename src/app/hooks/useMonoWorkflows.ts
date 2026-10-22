@@ -1,9 +1,6 @@
 import { useEffect, useRef } from "react";
 import { listMonos } from "../../features/monos/model/mono";
-import type {
-  Workflow,
-  WorkflowId,
-} from "../../features/workflows/model/workflow";
+import type { WorkflowId } from "../../features/workflows/model/workflow";
 import {
   markInterrupted,
   resumeRun,
@@ -18,6 +15,7 @@ import {
   checkWorkflowsNow,
   clearWorkflowStop,
   loadRuns,
+  liveWorkflowRuns,
   loadWorkflows,
   requestWorkflowStop,
   setWorkflowRunning,
@@ -37,9 +35,7 @@ const TICK_MS = 60_000;
  * leave an older copy of this hook running beside the new one.
  */
 const OWNER = "__monoWorkflowsScheduler";
-/** Set once this window has marked the runs a previous launch left unfinished. */
-const SWEPT = "__monoWorkflowsSwept";
-type OwnedWindow = Window & { [OWNER]?: symbol; [SWEPT]?: boolean };
+type OwnedWindow = Window & { [OWNER]?: symbol };
 
 type ResumeRequest = { monoId: string; workflowId: WorkflowId; runId: string };
 
@@ -86,7 +82,7 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
     let stopped = false;
     let ticking = false;
     let watching = false;
-    let liveRuns = 0;
+    let swept = false;
     // A check asked for mid-tick happens as soon as that tick ends.
     let checkAgain = false;
     const getHost = () => hostRef.current;
@@ -99,15 +95,9 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
       setWorkflowRunning(run.workflowId, run.id);
       // A request made before this run started was meant for an earlier one.
       clearWorkflowStop(run.workflowId);
-      liveRuns++;
-      void executeRun(getHost, monoId, monoSessionId, run)
-        .catch((error) =>
-          console.error(
-            `Workflow "${run.definition.name}" could not run`,
-            error,
-          ),
-        )
-        .finally(() => liveRuns--);
+      void executeRun(getHost, monoId, monoSessionId, run).catch((error) =>
+        console.error(`Workflow "${run.definition.name}" could not run`, error),
+      );
     };
 
     const startWorkflow = async (
@@ -177,31 +167,39 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
     };
 
     /**
-     * Requests other windows left in the workflow files. A stop reaches a run that is going; a
-     * request for a run that is not (it ended first) is just cleared.
+     * Requests other windows left in the workflow files. A stop reaches the run that was live
+     * when the file was read, and only that one: a flag that may be meant for an earlier run is
+     * left for the next look when a different run has started meanwhile, and cleared when no
+     * run is live at all.
      */
-    const applySignals = async (
-      monoId: string,
-      workflows: Workflow[],
-      resumes: boolean,
-    ) => {
-      const stops = workflows.filter((w) => w.stopRequested);
+    const applySignals = async (monoId: string, resumes: boolean) => {
+      const liveBefore = liveWorkflowRuns();
+      const workflows = await loadWorkflows(monoId);
+      const toStop: WorkflowId[] = [];
+      const clearStop = new Set<WorkflowId>();
+      for (const w of workflows) {
+        if (!w.stopRequested) continue;
+        const live = workflowRunningId(w.id);
+        if (!live) clearStop.add(w.id);
+        else if (liveBefore.get(w.id) === live) {
+          toStop.push(w.id);
+          clearStop.add(w.id);
+        }
+      }
       const resuming = resumes ? workflows.filter((w) => w.resumeRunId) : [];
-      if (!stops.length && !resuming.length) return;
-      for (const w of stops) if (isRunning(w.id)) requestWorkflowStop(w.id);
+      if (!clearStop.size && !resuming.length) return;
+      for (const id of toStop) requestWorkflowStop(id);
       const asked = new Map(resuming.map((w) => [w.id, w.resumeRunId]));
       await updateWorkflows(monoId, (list) => ({
         workflows: list.map((w) => {
           const { stopRequested: _stop, resumeRunId: _resume, ...rest } = w;
-          const clearStop = stops.some((entry) => entry.id === w.id);
-          const clearResume =
-            asked.get(w.id) !== undefined && asked.get(w.id) === w.resumeRunId;
+          const keepResume = w.resumeRunId && asked.get(w.id) !== w.resumeRunId;
           return {
             ...rest,
-            ...(w.stopRequested && !clearStop ? { stopRequested: true } : {}),
-            ...(w.resumeRunId && !clearResume
-              ? { resumeRunId: w.resumeRunId }
+            ...(w.stopRequested && !clearStop.has(w.id)
+              ? { stopRequested: true }
               : {}),
+            ...(keepResume ? { resumeRunId: w.resumeRunId } : {}),
           };
         }),
         result: undefined,
@@ -218,11 +216,10 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
 
     /** While runs are going, looks often for a stop asked for in another window. */
     const watchStops = async () => {
-      if (stopped || watching || liveRuns === 0) return;
+      if (stopped || watching || liveWorkflowRuns().size === 0) return;
       watching = true;
       try {
-        for (const { id } of listMonos())
-          await applySignals(id, await loadWorkflows(id), false);
+        for (const { id } of listMonos()) await applySignals(id, false);
       } catch (error) {
         console.warn("Could not check for workflow stop requests", error);
       } finally {
@@ -263,15 +260,17 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
       ticking = true;
       checkAgain = false;
       try {
-        if (!surface[SWEPT]) {
-          surface[SWEPT] = true;
+        // On taking over from a window that is gone, its unfinished runs are left running in
+        // the files; mark them so they can be resumed.
+        if (!swept) {
+          swept = true;
           await sweepInterrupted();
         }
         for (const { id, sessionId } of listMonos()) {
           if (stopped) return;
           let workflows = await loadWorkflows(id);
           if (workflows.some((w) => w.stopRequested || w.resumeRunId)) {
-            await applySignals(id, workflows, true);
+            await applySignals(id, true);
             workflows = await loadWorkflows(id);
           }
           const now = Date.now();

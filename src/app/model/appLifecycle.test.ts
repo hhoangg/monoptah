@@ -5,9 +5,11 @@ import { forgetHarnessSession } from "../../integrations/harness/core/registry";
 import { killAllChildren } from "../../integrations/harness/core/child";
 import { newSession } from "../../features/sessions/model/session";
 import { newTab } from "../../features/workspace/model/layout";
+import { setWorkflowRunning } from "../../features/workflows/model/workflowStore";
 import {
   askQuitConfirmation,
   closeBusyWindow,
+  hasInFlightWork,
   commitQuit,
   confirmReload,
   reportQuitPoll,
@@ -562,5 +564,23 @@ describe("remembering the terminal dock side across restarts", () => {
     const { handleQuitRequested } = await import("./appLifecycle");
     await handleQuitRequested();
     expect(await lastSavedDockSide()).toBe("left");
+  });
+});
+
+describe("hasInFlightWork", () => {
+  it("counts a workflow run this window is driving, like a busy session", () => {
+    const idle = newSession("claude", "/code/app");
+    expect(hasInFlightWork([idle])).toBe(false);
+    expect(hasInFlightWork([{ ...idle, busy: true }])).toBe(true);
+    // The run registry announces changes on window; this file runs without one.
+    vi.stubGlobal("window", new EventTarget());
+    setWorkflowRunning("wf-abcd1234", "run-1");
+    try {
+      expect(hasInFlightWork([idle])).toBe(true);
+    } finally {
+      setWorkflowRunning("wf-abcd1234", null);
+      vi.unstubAllGlobals();
+    }
+    expect(hasInFlightWork([idle])).toBe(false);
   });
 });

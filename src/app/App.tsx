@@ -697,7 +697,7 @@ import {
   useMonoWorkflows,
   type MonoWorkflowHost,
 } from "./hooks/useMonoWorkflows";
-import { currentWindowDrivesWorkflows } from "./hooks/workflowDriver";
+import { useWorkflowDriver } from "./hooks/workflowDriver";
 import { ASK_TIMEOUT_MS } from "./hooks/workflowRunner";
 import { startWorkflowSession } from "./model/workflowSessionStart";
 import { useFloatingMono } from "./hooks/useFloatingMono";
@@ -908,7 +908,7 @@ import {
   closeBusyWindow,
   closeCurrentWindow,
   confirmReload,
-  hasInFlightSessions,
+  hasInFlightWork,
   hideCurrentWindow,
   isAppQuitting,
   persistLiveTranscripts,
@@ -2667,7 +2667,7 @@ function Workspace({
           return;
         }
         const toTray = loadCloseToTray();
-        if (hasInFlightSessions(sessionsRef.current)) {
+        if (hasInFlightWork(sessionsRef.current)) {
           flushHarnessEvents();
           if (!toTray && !IS_MAC) {
             void closeBusyWindow();
@@ -9470,8 +9470,8 @@ function Workspace({
       return target ? sessionWorkCwd(target) : undefined;
     },
   };
-  // One window drives workflows; the others ask it through the workflow files.
-  const [workflowDriver] = useState(currentWindowDrivesWorkflows);
+  // One window at a time drives workflows; the others ask it through the workflow files.
+  const workflowDriver = useWorkflowDriver();
   useMonoWorkflows(workflowHost, workflowDriver);
 
   const automationSessionReservations = useRef(new Set<string>());

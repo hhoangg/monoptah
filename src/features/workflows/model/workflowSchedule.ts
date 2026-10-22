@@ -49,13 +49,15 @@ export function afterClaim(
   now: number,
   runId?: string,
 ): Workflow {
-  // A stop asked for before this run started was meant for an earlier one.
-  const { runRequested, stopRequested: _stop, ...rest } = workflow;
+  const { runRequested, stopRequested, ...rest } = workflow;
   const schedule = scheduleOf(workflow);
   const keep =
     runRequested && workflow.nextRunAt !== undefined && workflow.nextRunAt > now;
   return {
     ...rest,
+    // A stop asked for before a run started was meant for an earlier one. Moving the schedule
+    // past a workflow whose run is still going must keep a stop written for that run.
+    ...(stopRequested && !runId ? { stopRequested } : {}),
     ...(schedule && !keep ? { nextRunAt: nextHabitRunAt(schedule, now) } : {}),
     ...(runId ? { lastRunId: runId } : {}),
   };

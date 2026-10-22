@@ -26,6 +26,8 @@ const MONO = {
   projects: ["/code/app"],
 };
 const fileFailures = { runs: false };
+/** Lets a test change the world while a workflows.json read is under way. */
+const fileHooks: { onWorkflowsRead?: () => void } = {};
 /** Run-file writes in flight, to show saves never overlap. */
 const runWrites = { delayMs: 0, inflight: 0, max: 0, texts: [] as string[] };
 
@@ -41,7 +43,12 @@ vi.mock("../../features/monos/model/monoFiles", async (original) => {
     ...actual,
     readAgentFile: vi.fn(async (_monoId: string, path: string) => {
       const file = files.get(path);
-      return { text: file?.text ?? null, hash: String(file?.hash ?? 0) };
+      const result = {
+        text: file?.text ?? null,
+        hash: String(file?.hash ?? 0),
+      };
+      if (path === "workflows.json") fileHooks.onWorkflowsRead?.();
+      return result;
     }),
     writeAgentFile: vi.fn(
       async (_monoId: string, path: string, text: string, expected: string) => {
@@ -65,6 +72,7 @@ vi.mock("../../features/monos/model/monoFiles", async (original) => {
   };
 });
 
+const { useWorkflowDriver } = await import("./workflowDriver");
 const { useMonoWorkflows, resumeWorkflowRun } =
   await import("./useMonoWorkflows");
 const { checkWorkflowsNow, requestWorkflowStop, workflowRunningId } =
@@ -283,7 +291,8 @@ beforeEach(() => {
   fileFailures.runs = false;
   Object.assign(runWrites, { delayMs: 0, inflight: 0, max: 0, texts: [] });
   release = [];
-  delete (window as unknown as Record<string, unknown>).__monoWorkflowsSwept;
+  localStorage.clear();
+  fileHooks.onWorkflowsRead = undefined;
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   root = createRoot(document.createElement("div"));
 });
@@ -931,11 +940,101 @@ describe("useMonoWorkflows", () => {
     expect(host.stop).toHaveBeenCalledWith("s1");
   });
 
-  it("stopWorkflowRun stops here at once and leaves the request in the file for the driver", async () => {
+  it("stopWorkflowRun writes the request for the driver and stops at once only where the run is", async () => {
     save([simple({}, { enabled: false })]);
+    // A window that drives no run leaves no stop flag behind in memory.
     await stopWorkflowRun("mono-1", WF);
     expect(stored()[0].stopRequested).toBe(true);
+    expect(workflowStopRequested(WF)).toBe(false);
+    // The window that is driving the run stops it right away.
+    setWorkflowRunning(WF, "run-x");
+    await stopWorkflowRun("mono-1", WF);
     expect(workflowStopRequested(WF)).toBe(true);
+  });
+
+  it("leaves a stop request alone when a different run started while it was read", async () => {
+    save([simple({}, { enabled: false, stopRequested: true })]);
+    setWorkflowRunning(WF, "run-a");
+    const host = makeHost({ replies: [] });
+    mount(host);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    // The first look (this tick's own read) saw the same run before and after: it is stopped.
+    expect(workflowStopRequested(WF)).toBe(true);
+    expect(stored()[0].stopRequested).toBeUndefined();
+    clearWorkflowStop(WF);
+
+    save([{ ...stored()[0], stopRequested: true }]);
+    let reads = 0;
+    fileHooks.onWorkflowsRead = () => {
+      // The tick reads once, then applySignals reads: the run changes during that second read.
+      if (++reads === 2) setWorkflowRunning(WF, "run-b");
+    };
+    checkWorkflowsNow();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(workflowRunningId(WF)).toBe("run-b");
+    expect(workflowStopRequested(WF)).toBe(false);
+    expect(stored()[0].stopRequested).toBe(true);
+  });
+
+  it("clears a stop request when no run is live", async () => {
+    save([simple({}, { enabled: false, stopRequested: true })]);
+    const host = makeHost({ replies: [] });
+    mount(host);
+    await vi.waitFor(() => expect(stored()[0].stopRequested).toBeUndefined());
+    expect(workflowStopRequested(WF)).toBe(false);
+  });
+
+  it("marks the runs of a window that is gone when it takes over as the driver", async () => {
+    const def = simple({}, { enabled: false });
+    save([def]);
+    saveRuns([startRun(def, "manual", 1_000, "run-dead")]);
+    const host = makeHost({ replies: [] });
+    mount(host, false);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 40));
+    });
+    expect(storedRuns()[0].status).toBe("running");
+    // Becoming the driver sweeps, though this window swept (or never swept) before.
+    mount(host, true);
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("interrupted"));
+  });
+
+  it("takes over from a stale lease and drives; a fresh lease of another window blocks it", async () => {
+    const def = simple({}, { enabled: false });
+    save([def]);
+    saveRuns([startRun(def, "manual", 1_000, "run-dead")]);
+    const host = makeHost({ replies: [] });
+    function Elected() {
+      useMonoWorkflows(host, useWorkflowDriver());
+      return null;
+    }
+    // Another window holds the lease and renewed it just now: this one must stay out.
+    localStorage.setItem(
+      "monocode.workflowDriver",
+      JSON.stringify({ id: "other", at: Date.now() }),
+    );
+    act(() => root.render(createElement(Elected)));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 60));
+    });
+    expect(storedRuns()[0].status).toBe("running");
+    act(() => root.unmount());
+
+    // That window is gone: its lease is stale, so a new window takes over and sweeps.
+    localStorage.setItem(
+      "monocode.workflowDriver",
+      JSON.stringify({ id: "other", at: Date.now() - 31_000 }),
+    );
+    root = createRoot(document.createElement("div"));
+    act(() => root.render(createElement(Elected)));
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("interrupted"));
+    expect(
+      JSON.parse(localStorage.getItem("monocode.workflowDriver")!).id,
+    ).not.toBe("other");
   });
 
   it("does not launch starts queued behind another one once the run is stopped", async () => {
