@@ -55,6 +55,7 @@ import {
   checkHabitsNow,
   habitRunningSince,
   habitSchedule,
+  anchorSchedule,
   habitScheduleLabel,
   newHabit,
   nextHabitRunAt,
@@ -910,6 +911,8 @@ async function handleHabits(
             : { enabled: input.enabled as boolean }),
         };
         // A new schedule, or turning it back on, counts from now.
+        if (patch.schedule)
+          next.schedule = anchorSchedule(next.schedule, now.getTime());
         if (patch.schedule || (next.enabled && !current.enabled))
           next.nextRunAt = nextHabitRunAt(next.schedule, now.getTime());
         return {

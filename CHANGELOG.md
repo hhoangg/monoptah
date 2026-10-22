@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-10-22
+
+### Added
+
+- Habits can run every N hours (1 to 24) from an anchor time, for example every 4 hours from 09:00, which runs at 09:00, 13:00, 17:00, 21:00, 01:00 and 05:00 and carries on across midnight. Pick **Every N hours** when creating a habit, or have a Mono add one with `{"kind":"interval","hours":4,"time":"09:00"}`. A missed run is made up at most once, like the other schedules.
+
 ## [0.30.0] - 2026-10-22
 
 ### Added
