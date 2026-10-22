@@ -5,7 +5,9 @@ import { Play, Square } from "../../../shared/ui/icons";
 import { duration, RunningFor, when } from "../../monos/ui/HabitPage";
 import { PageHeader, Property, Section } from "../../monos/ui/monoPanelParts";
 import {
+  archivedItemsKey,
   isTrigger,
+  parseBranch,
   type NodeRun,
   type NodeStatus,
   type RunStatus,
@@ -74,23 +76,29 @@ export function definitionChanged(run: WorkflowRun, current: Workflow): boolean 
 
 type Lane = { branch: string; title: string; nodes: NodeRun[] };
 
-function splitBranch(branch: string): { groupId: string; index: number } {
-  const at = branch.lastIndexOf("#");
-  return { groupId: branch.slice(0, at), index: Number(branch.slice(at + 1)) };
+/** A branch key as the lane list needs it: `round` is set on a branch archived by a loop round. */
+function splitBranch(branch: string): {
+  groupId: string;
+  index: number;
+  round?: number;
+} {
+  return parseBranch(branch) ?? { groupId: branch, index: 0 };
 }
 
 /** An item's name for its lane: its title or name when it has one, else its place. */
 function itemTitle(run: WorkflowRun, branch: string): string {
-  const { groupId, index } = splitBranch(branch);
-  const item = run.items[groupId]?.[index];
+  const { groupId, index, round } = splitBranch(branch);
+  const items = run.items[round === undefined ? groupId : archivedItemsKey(groupId, round)];
+  const item = items?.[index];
+  const suffix = round === undefined ? "" : ` · round ${round}`;
   if (item && typeof item === "object") {
     const fields = item as Record<string, unknown>;
     for (const key of ["title", "name"]) {
       const value = fields[key];
-      if (typeof value === "string" && value.trim()) return value.trim();
+      if (typeof value === "string" && value.trim()) return `${value.trim()}${suffix}`;
     }
   }
-  return `#${index + 1}`;
+  return `#${index + 1}${suffix}`;
 }
 
 /** One lane per branch: the top level first, then each For each item in order. */
@@ -109,9 +117,11 @@ export function lanesOf(run: WorkflowRun): Lane[] {
     if (a === "" || b === "") return a === "" ? -1 : 1;
     const left = splitBranch(a);
     const right = splitBranch(b);
+    // Earlier loop rounds of an item come right before its live lane.
     return (
       (order.get(left.groupId) ?? 0) - (order.get(right.groupId) ?? 0) ||
-      left.index - right.index
+      left.index - right.index ||
+      (left.round ?? Infinity) - (right.round ?? Infinity)
     );
   });
   return branches.map((branch) => ({

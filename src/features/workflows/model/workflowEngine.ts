@@ -11,7 +11,11 @@
 // - `nextActions` only reads. It lists what the runner must do for nodes that are ready. An action
 //   is repeated until the matching `nodeStarted` event is applied, and never after.
 import {
+  archivedBranch,
+  archivedItemsKey,
+  isArchivedBranch,
   isTrigger,
+  parseBranch,
   type BranchKey,
   type LoopSpec,
   type NodeId,
@@ -203,7 +207,7 @@ const newNodeRun = (nodeId: NodeId, branch: BranchKey): NodeRun => ({
 
 /** A finished node whose loop edge has not been decided yet (exit or loop). */
 function openLoop(g: Graph, r: NodeRun): boolean {
-  return r.status === "done" && r.decision === undefined && g.loops.has(r.nodeId);
+  return !isArchivedBranch(r.branch) && r.status === "done" && r.decision === undefined && g.loops.has(r.nodeId);
 }
 
 /** A finished node whose loop edge is being put to the Mono (the node itself is not running). */
@@ -212,6 +216,8 @@ export function isAsking(r: NodeRun): boolean {
 }
 
 function unsettled(g: Graph, r: NodeRun): boolean {
+  // An archived branch belongs to a finished loop round: it never runs again.
+  if (isArchivedBranch(r.branch)) return false;
   return (
     r.status === "pending" ||
     r.status === "running" ||
@@ -227,9 +233,8 @@ function branchKey(forEachId: NodeId, index: number): BranchKey {
 }
 
 function splitBranch(branch: BranchKey): { forEachId: NodeId; index: number } | undefined {
-  const at = branch.lastIndexOf("#");
-  if (at < 0) return undefined;
-  return { forEachId: branch.slice(0, at), index: Number(branch.slice(at + 1)) };
+  const parts = parseBranch(branch);
+  return parts && { forEachId: parts.groupId, index: parts.index };
 }
 
 // --- scope -----------------------------------------------------------------------------------
@@ -373,7 +378,8 @@ function finishNode(d: Draft, r: NodeRun, output?: Record<string, unknown>): voi
  * previous one. Session ids stay too, so a looped session can be continued.
  */
 function resetLoop(d: Draft, from: NodeRun, to: NodeId): void {
-  const round = from.round + 1;
+  const finishedRound = from.round;
+  const round = finishedRound + 1;
   const dropped = new Set<NodeId>();
   for (const id of loopBody(d.g, from.nodeId, to)) {
     const r = d.index.get(slot(id, from.branch));
@@ -397,18 +403,25 @@ function resetLoop(d: Draft, from: NodeRun, to: NodeId): void {
     delete r.endedAt;
   }
   if (dropped.size === 0) return;
-  // A For each inside the loop body expands again next round, with a fresh item list.
-  const group = new Set<NodeId>();
+  // A For each inside the loop body expands again next round, with a fresh item list. The round
+  // that just finished is archived, not deleted: its sessions and failures stay on the run.
   for (const id of dropped) {
+    const items = d.run.items[id];
+    const kids = new Set((d.g.children.get(id) ?? []).map((c) => c.id));
+    let archiveRound = finishedRound;
+    while (archivedItemsKey(id, archiveRound) in d.run.items) archiveRound++;
+    let archived = false;
+    for (const n of d.run.nodes) {
+      const parts = parseBranch(n.branch);
+      if (!parts || parts.round !== undefined || parts.groupId !== id || !kids.has(n.nodeId)) continue;
+      d.index.delete(slot(n.nodeId, n.branch));
+      n.branch = archivedBranch(n.branch, archiveRound);
+      d.index.set(slot(n.nodeId, n.branch), n);
+      archived = true;
+    }
+    if (archived && items !== undefined) d.run.items[archivedItemsKey(id, archiveRound)] = items;
     delete d.run.items[id];
-    for (const c of d.g.children.get(id) ?? []) group.add(c.id);
   }
-  d.run.nodes = d.run.nodes.filter((n) => {
-    const split = splitBranch(n.branch);
-    const gone = split !== undefined && dropped.has(split.forEachId) && group.has(n.nodeId);
-    if (gone) d.index.delete(slot(n.nodeId, n.branch));
-    return !gone;
-  });
 }
 
 /** Applies a loop decision to a finished node: another round, or exit. */
@@ -484,7 +497,7 @@ function pass(d: Draft): boolean {
   const admitted = admittedBranches(d);
   for (const r of [...d.run.nodes]) {
     const node = d.g.byId.get(r.nodeId);
-    if (!node || !d.index.has(slot(r.nodeId, r.branch))) continue;
+    if (!node || isArchivedBranch(r.branch) || !d.index.has(slot(r.nodeId, r.branch))) continue;
 
     if (openLoop(d.g, r)) {
       const spec = d.g.loops.get(r.nodeId) as LoopEdge;
@@ -647,7 +660,7 @@ export function nextActions(run: WorkflowRun): EngineAction[] {
 
   for (const r of d.run.nodes) {
     const node = d.g.byId.get(r.nodeId);
-    if (!node) continue;
+    if (!node || isArchivedBranch(r.branch)) continue;
 
     if (openLoop(d.g, r)) {
       const spec = d.g.loops.get(r.nodeId) as LoopEdge;

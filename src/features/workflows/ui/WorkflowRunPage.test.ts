@@ -132,6 +132,42 @@ it("run page shows one lane per item and round 2", async () => {
   expect(lanes()[3].textContent).toContain("Waiting for approval");
 });
 
+it("run page lists an archived loop round next to the live lane", async () => {
+  stored = [
+    laneRun({
+      items: {
+        each: [{ title: "Fix login" }, { name: "Billing" }],
+        "each@r1": [{ title: "Old login" }, { name: "Old billing" }],
+      },
+      nodes: [
+        node({ nodeId: "trigger" }),
+        node({ nodeId: "each", status: "running", round: 2 }),
+        node({ branch: "each#0", status: "running", sessionId: "live-0" }),
+        node({ branch: "each#1", status: "pending" }),
+        node({ branch: "each#0@r1", status: "failed", sessionId: "old-0", error: "boom" }),
+        node({ branch: "each#1@r1", sessionId: "old-1" }),
+        node({ nodeId: "report", status: "pending" }),
+      ],
+    }),
+  ];
+  const onOpenSession = await renderPage();
+  expect(lanes().map((lane) => lane.getAttribute("data-lane"))).toEqual([
+    "",
+    "each#0@r1",
+    "each#0",
+    "each#1@r1",
+    "each#1",
+  ]);
+  expect(
+    lanes().map((lane) => lane.querySelector("h4")?.textContent),
+  ).toEqual(["Workflow", "Old login · round 1", "Fix login", "Old billing · round 1", "Billing"]);
+  const chip = container.querySelector<HTMLButtonElement>(
+    "[data-lane='each#0@r1'] button[data-node]",
+  );
+  act(() => chip?.click());
+  expect(onOpenSession).toHaveBeenCalledWith("old-0");
+});
+
 it("opens a node's session from its chip", async () => {
   stored = [laneRun()];
   const onOpenSession = await renderPage();

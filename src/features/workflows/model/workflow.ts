@@ -177,8 +177,32 @@ export type NodeStatus =
   | "failed"
   | "skipped"
   | "stopped";
-/** "" for top level, "<forEachId>#<index>" inside a group. */
+/**
+ * "" for top level, "<forEachId>#<index>" inside a group. A loop that goes back through a For
+ * each archives the branches of the round that just finished as "<forEachId>#<index>@r<round>";
+ * their nodes are settled for good and their items stay under `items["<forEachId>@r<round>"]`.
+ */
 export type BranchKey = string;
+
+const BRANCH_PATTERN = /^(.+)#(\d+)(?:@r(\d+))?$/;
+
+/** The parts of a For each branch key, or undefined for the top level. `round` is set on archived branches. */
+export function parseBranch(
+  branch: BranchKey,
+): { groupId: NodeId; index: number; round?: number } | undefined {
+  const match = BRANCH_PATTERN.exec(branch);
+  if (!match) return undefined;
+  return {
+    groupId: match[1],
+    index: Number(match[2]),
+    ...(match[3] !== undefined ? { round: Number(match[3]) } : {}),
+  };
+}
+
+export const isArchivedBranch = (branch: BranchKey): boolean => parseBranch(branch)?.round !== undefined;
+export const archivedBranch = (branch: BranchKey, round: number): BranchKey => `${branch}@r${round}`;
+/** Where the item list of a For each is kept once a loop round archived it. */
+export const archivedItemsKey = (groupId: NodeId, round: number): NodeId => `${groupId}@r${round}`;
 export type NodeRun = {
   nodeId: NodeId;
   branch: BranchKey;

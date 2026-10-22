@@ -1,6 +1,15 @@
 // What a finished run tells the Mono: the report the app composes itself, plus the prompt and reply
 // parsing for the questions the engine puts to the Mono (Ask Mono nodes, Mono-decided Ifs and loops).
-import type { NodeId, NodeRun, OutputField, RunStatus, SessionNode, WorkflowRun } from "./workflow";
+import {
+  archivedBranch,
+  archivedItemsKey,
+  type NodeId,
+  type NodeRun,
+  type OutputField,
+  type RunStatus,
+  type SessionNode,
+  type WorkflowRun,
+} from "./workflow";
 import { BRANCH_FAILED_REASON, MAX_ROUNDS_REASON, type EngineAction } from "./workflowEngine";
 import { OUTPUT_FENCE, parseWorkflowOutput } from "./workflowOutput";
 import { renderTemplate } from "./workflowTemplate";
@@ -139,6 +148,15 @@ function nodeType(run: WorkflowRun, nodeId: NodeId): string {
   return run.definition.nodes.find((n) => n.id === nodeId)?.type ?? "";
 }
 
+/** The loop rounds of a For each whose branches were archived, oldest first. */
+function archivedRounds(run: WorkflowRun, groupId: NodeId): number[] {
+  const prefix = `${groupId}@r`;
+  return Object.keys(run.items)
+    .filter((key) => key.startsWith(prefix) && /^\d+$/.test(key.slice(prefix.length)))
+    .map((key) => Number(key.slice(prefix.length)))
+    .sort((a, b) => a - b);
+}
+
 /** Branch results in report order, plus the For each nodes that had nothing to run. */
 function collect(run: WorkflowRun): { results: BranchResult[]; empty: string[]; groups: number } {
   const groups = run.definition.nodes.filter((n) => n.type === "forEach");
@@ -148,9 +166,22 @@ function collect(run: WorkflowRun): { results: BranchResult[]; empty: string[]; 
     const items = run.items[group.id];
     if (items === undefined) continue;
     if (items.length === 0) empty.push(nodeLabel(run, group.id));
-    items.forEach((item, index) =>
-      results.push(resultOf(run, `${group.id}#${index}`, itemLabel(item, index))),
-    );
+    const rounds = archivedRounds(run, group.id);
+    items.forEach((item, index) => {
+      results.push(resultOf(run, `${group.id}#${index}`, itemLabel(item, index)));
+      // Earlier loop rounds are archived. They only matter when something went wrong in them.
+      for (const round of rounds) {
+        const old = run.items[archivedItemsKey(group.id, round)]?.[index];
+        const earlier = resultOf(
+          run,
+          archivedBranch(`${group.id}#${index}`, round),
+          `${itemLabel(old, index)} · round ${round}`,
+        );
+        if (earlier.status === "failed" || earlier.maxRoundsReached || earlier.errors.length > 0) {
+          results.push(earlier);
+        }
+      }
+    });
   }
   // Work outside any For each. With no For each at all this is the whole run.
   // Next to a For each it also lists the outputs of steps before or after it (e.g. a summary).

@@ -568,6 +568,115 @@ describe("workflowEngine", () => {
     });
   });
 
+  describe("a loop around a For each keeps the earlier rounds", () => {
+    /** trigger -> fetch -> each(dev) -> review, review loops back to each, review -> report. */
+    const eachLoop = (maxRounds = 3, maxParallel = 2) =>
+      def(
+        [
+          trigger,
+          session("fetch", { output: { tickets: { type: "list" } } }),
+          { id: "each", type: "forEach", in: "{{fetch.tickets}}", as: "item", maxParallel },
+          session("dev", { parent: "each", prompt: "Implement {{item.title}}", output: { pr_url: { type: "string" } } }),
+          session("review", { output: { verdict: { type: "string" } } }),
+          report,
+        ],
+        [
+          { from: "trigger", to: "fetch" },
+          { from: "fetch", to: "each" },
+          { from: "each", to: "review" },
+          { from: "review", to: "report" },
+          { from: "review", to: "each", loop: { maxRounds, decide: "mono" } },
+        ],
+      );
+
+    /** Round 1 where `each#0` fails and `each#1` passes, then Mono sends the loop back. */
+    const afterRoundOne = () => {
+      let run = complete(startRun(eachLoop(), "manual", at, "r"), "fetch", { tickets: [{ title: "A" }, { title: "B" }] });
+      run = started(run, "dev", "each#0", "s-0");
+      run = failed(run, "dev", "boom", "each#0");
+      run = started(run, "dev", "each#1", "s-1");
+      run = finished(run, "dev", { pr_url: "u1" }, "each#1");
+      run = complete(run, "review", { verdict: "changes" });
+      run = started(run, "review"); // the loop question went out
+      return decided(run, "review", "loop");
+    };
+
+    it("archives the branches of the finished round instead of deleting them", () => {
+      const run = afterRoundOne();
+      expect(statusOf(run, "dev", "each#0@r1")).toBe("failed");
+      expect(nodeOf(run, "dev", "each#0@r1").sessionId).toBe("s-0");
+      expect(nodeOf(run, "dev", "each#0@r1").error).toBe("boom");
+      expect(statusOf(run, "dev", "each#1@r1")).toBe("done");
+      expect(nodeOf(run, "dev", "each#1@r1").output).toEqual({ pr_url: "u1" });
+      // The live branches start over, and the item list of round 1 is still known.
+      expect(statusOf(run, "dev", "each#0")).toBe("pending");
+      expect(statusOf(run, "dev", "each#1")).toBe("pending");
+      expect(run.items["each@r1"]).toEqual([{ title: "A" }, { title: "B" }]);
+    });
+
+    it("never emits or admits an archived branch", () => {
+      const run = afterRoundOne();
+      const actions = nextActions(run);
+      expect(actions.length).toBeGreaterThan(0);
+      expect(actions.every((a) => a.kind === "postReport" || !a.branch.includes("@"))).toBe(true);
+      expect(actions.map((a) => a.kind === "startSession" && [a.nodeId, a.branch, a.round])).toEqual([
+        ["dev", "each#0", 1],
+        ["dev", "each#1", 1],
+      ]);
+      // Events aimed at an archived branch change nothing.
+      expect(applyEvent(run, { kind: "nodeStarted", nodeId: "dev", branch: "each#0@r1", at })).toBe(run);
+    });
+
+    it("ends doneWithFailures when round 1 failed and round 2 passed", () => {
+      let run = afterRoundOne();
+      run = started(run, "dev", "each#0", "s-0b");
+      run = finished(run, "dev", { pr_url: "u0" }, "each#0");
+      run = complete(run, "dev", { pr_url: "u1b" }, "each#1");
+      expect(statusOf(run, "each")).toBe("done");
+      run = complete(run, "review", { verdict: "approve" });
+      run = started(run, "review");
+      run = decided(run, "review", "exit");
+      expect(nextActions(run)).toEqual([{ kind: "postReport" }]);
+      run = applyEvent(run, { kind: "reportPosted", at });
+      expect(run.status).toBe("doneWithFailures");
+      expect(statusOf(run, "dev", "each#0@r1")).toBe("failed");
+    });
+
+    it("keeps every earlier round when the loop runs again", () => {
+      let run = afterRoundOne();
+      run = complete(run, "dev", { pr_url: "a" }, "each#0");
+      run = complete(run, "dev", { pr_url: "b" }, "each#1");
+      run = complete(run, "review", { verdict: "changes" });
+      run = started(run, "review");
+      run = decided(run, "review", "loop");
+      expect(nodeOf(run, "dev", "each#0").round).toBe(1);
+      expect(nodeOf(run, "review").round).toBe(3);
+      for (const key of ["each#0@r1", "each#1@r1", "each#0@r2", "each#1@r2"]) {
+        expect(statusOf(run, "dev", key)).toBeDefined();
+      }
+      expect(statusOf(run, "dev", "each#0@r1")).toBe("failed");
+      expect(statusOf(run, "dev", "each#0@r2")).toBe("done");
+      expect(run.items["each@r2"]).toHaveLength(2);
+      expect(nextActions(run).every((a) => a.kind === "postReport" || !a.branch.includes("@"))).toBe(true);
+    });
+
+    it("does not count archived branches against maxParallel", () => {
+      let run = complete(startRun(eachLoop(3, 1), "manual", at, "r"), "fetch", { tickets: [1, 2] });
+      run = complete(run, "dev", {}, "each#0");
+      run = complete(run, "dev", {}, "each#1");
+      run = complete(run, "review", {});
+      run = started(run, "review");
+      run = decided(run, "review", "loop");
+      expect(nextActions(run).map((a) => a.kind === "startSession" && [a.nodeId, a.branch])).toEqual([["dev", "each#0"]]);
+    });
+
+    it("an archived failure does not stop the outer loop from running another round", () => {
+      const run = afterRoundOne();
+      expect(nodeOf(run, "review").round).toBe(2);
+      expect(nodeOf(run, "review").decision).toBeUndefined();
+    });
+  });
+
   it("if true/false skips the other side", () => {
     const w = def(
       [

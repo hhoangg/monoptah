@@ -99,6 +99,44 @@ describe("composeReport", () => {
     expect(text).toContain("failed");
   });
 
+  it("lists a failed branch of an earlier loop round and keeps the latest round as the main line", () => {
+    const d = fanOut();
+    const run = runOf(
+      d,
+      [
+        nodeRun({ nodeId: "dev", branch: "each#0", output: { pr_url: "https://x/new" }, endedAt: 9 }),
+        nodeRun({ nodeId: "dev", branch: "each#0@r1", status: "failed", error: "tests did not pass" }),
+        nodeRun({ nodeId: "dev", branch: "each#1@r1", output: { pr_url: "https://x/old-ok" }, endedAt: 4 }),
+        nodeRun({ nodeId: "dev", branch: "each#1", output: { pr_url: "https://x/ok" }, endedAt: 9 }),
+      ],
+      {
+        status: "doneWithFailures",
+        items: { each: [{ title: "Fix login" }, { title: "Billing" }], "each@r1": [{ title: "Fix login" }, { title: "Billing" }] },
+      },
+    );
+    const { text } = composeReport(run);
+    expect(text).toContain("### Fix login\n- Status: done");
+    expect(text).toContain("https://x/new");
+    expect(text).toContain("### Fix login · round 1\n- Status: failed");
+    expect(text).toContain("Error in dev: tests did not pass");
+    // A round that passed is not repeated.
+    expect(text).not.toContain("Billing · round 1");
+    expect(text).not.toContain("https://x/old-ok");
+  });
+
+  it("lists an archived branch that hit max rounds", () => {
+    const d = fanOut();
+    const run = runOf(
+      d,
+      [
+        nodeRun({ nodeId: "dev", branch: "each#0", output: { pr_url: "https://x/1" }, endedAt: 9 }),
+        nodeRun({ nodeId: "dev", branch: "each#0@r1", decision: { value: "exit", reason: "max rounds reached" } }),
+      ],
+      { items: { each: [{ title: "A" }], "each@r1": [{ title: "A" }] } },
+    );
+    expect(composeReport(run).text).toContain("### A · round 1");
+  });
+
   it("shows top-level session outputs next to a For each", () => {
     const d = def(
       [
