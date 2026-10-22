@@ -3,6 +3,9 @@
 //! A leftover background process that inherited the output pipes is killed
 //! after a short grace period; one that redirected its output is left running.
 //!
+//! A running command is registered under a caller-chosen id so it can be cancelled
+//! (`workflow_cancel_command`) and so every one of them is ended when the app exits.
+//!
 //! Command nodes are not supported on Windows yet: the command templates are
 //! quoted for POSIX shells, and `cmd.exe` would expand `%VAR%` and run `a & b`.
 use std::time::Duration;
@@ -14,27 +17,45 @@ pub struct CommandResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// Ended by `workflow_cancel_command` or by the app exiting, not by itself or the timeout.
+    pub cancelled: bool,
 }
 
+/// Runs a command. `id` names it for `workflow_cancel_command` while it runs.
 #[tauri::command]
 pub async fn workflow_run_command(
+    id: String,
     command: String,
     cwd: String,
     timeout_ms: u64,
 ) -> Result<CommandResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        imp::run_command(&command, &cwd, Duration::from_millis(timeout_ms))
+        imp::run_command(&id, &command, &cwd, Duration::from_millis(timeout_ms))
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
+/// Kills the process group of the running command `id`. False when no such command runs.
+/// The pending `workflow_run_command` call returns promptly with `cancelled: true`.
+#[tauri::command]
+pub fn workflow_cancel_command(id: String) -> Result<bool, String> {
+    Ok(imp::cancel(&id))
+}
+
+/// Kills every running command; the app calls this as it exits so none outlives it.
+pub fn cancel_all_workflow_commands() {
+    imp::cancel_all();
+}
+
 #[cfg(unix)]
 mod imp {
+    use std::collections::HashMap;
     use std::io::{ErrorKind, Read};
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -64,7 +85,84 @@ mod imp {
         }
     }
 
+    /// A running command: its process group and whether it was cancelled.
+    struct Running {
+        pgid: i32,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    fn running() -> &'static Mutex<HashMap<String, Running>> {
+        static RUNNING: OnceLock<Mutex<HashMap<String, Running>>> = OnceLock::new();
+        RUNNING.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn lock_running() -> std::sync::MutexGuard<'static, HashMap<String, Running>> {
+        running().lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Keeps a command in the registry for as long as it lives; every exit path
+    /// (timeout, error, panic) removes it again through `Drop`.
+    struct Registration {
+        id: String,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl Registration {
+        fn new(id: &str, pgid: i32) -> Result<Self, String> {
+            let mut map = lock_running();
+            if map.contains_key(id) {
+                return Err(format!("A command with id {id} is already running"));
+            }
+            let cancelled = Arc::new(AtomicBool::new(false));
+            map.insert(
+                id.to_string(),
+                Running {
+                    pgid,
+                    cancelled: Arc::clone(&cancelled),
+                },
+            );
+            Ok(Self {
+                id: id.to_string(),
+                cancelled,
+            })
+        }
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            lock_running().remove(&self.id);
+        }
+    }
+
+    /// Kills the command's whole process group. False when `id` is not running.
+    pub(super) fn cancel(id: &str) -> bool {
+        let map = lock_running();
+        let Some(entry) = map.get(id) else {
+            return false;
+        };
+        // Flagged before the kill, so the run call sees it once the child is gone.
+        entry.cancelled.store(true, Ordering::SeqCst);
+        kill_group(entry.pgid);
+        true
+    }
+
+    pub(super) fn cancel_all() {
+        cancel_where(|_| true);
+    }
+
+    /// Kills every running command whose id matches. Split out of `cancel_all` so a test
+    /// can end only its own commands while other tests run beside it.
+    fn cancel_where(matches: impl Fn(&str) -> bool) {
+        for (id, entry) in lock_running().iter() {
+            if matches(id) {
+                entry.cancelled.store(true, Ordering::SeqCst);
+                kill_group(entry.pgid);
+            }
+        }
+    }
+
     pub(super) fn run_command(
+        id: &str,
         command: &str,
         cwd: &str,
         timeout: Duration,
@@ -77,10 +175,11 @@ mod imp {
             return Err(format!("Working directory does not exist: {cwd}"));
         }
         let (program, flag) = shell_for(std::env::var("SHELL").ok().as_deref());
-        execute(&program, flag, command, dir, timeout)
+        execute(id, &program, flag, command, dir, timeout)
     }
 
     fn execute(
+        id: &str,
         program: &str,
         flag: &str,
         command: &str,
@@ -100,6 +199,14 @@ mod imp {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Could not start {program}: {e}"))?;
+        let registration = match Registration::new(id, child.id() as i32) {
+            Ok(registration) => registration,
+            Err(e) => {
+                kill_tree(&mut child);
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
 
         let stdout = child.stdout.take().map(TailReader::spawn);
         let stderr = child.stderr.take().map(TailReader::spawn);
@@ -126,8 +233,9 @@ mod imp {
         // A descendant that outlives the shell can keep a pipe open forever; give
         // the readers a moment, then end the group so the join cannot hang.
         let (out, err) = collect([stdout, stderr], &mut child);
+        let cancelled = registration.cancelled.load(Ordering::SeqCst) && !timed_out;
         Ok(CommandResult {
-            exit_code: if timed_out {
+            exit_code: if timed_out || cancelled {
                 None
             } else {
                 status.and_then(|s| s.code())
@@ -135,6 +243,7 @@ mod imp {
             stdout: out,
             stderr: err,
             timed_out,
+            cancelled,
         })
     }
 
@@ -223,12 +332,16 @@ mod imp {
         text.chars().skip(count - max).collect()
     }
 
-    fn kill_tree(child: &mut Child) {
+    fn kill_group(pgid: i32) {
         // process_group(0) made the pid the group id; the negative pid reaches the
         // shell and every descendant, such as a `sleep` it started.
         unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
+            libc::kill(-pgid, libc::SIGKILL);
         }
+    }
+
+    fn kill_tree(child: &mut Child) {
+        kill_group(child.id() as i32);
         let _ = child.kill();
     }
 
@@ -236,8 +349,17 @@ mod imp {
     mod tests {
         use super::*;
 
+        use std::sync::atomic::AtomicUsize;
+
+        /// A fresh id per call, so tests running in parallel never share a registry slot.
+        fn unique_id() -> String {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            format!("test-{}", NEXT.fetch_add(1, Ordering::SeqCst))
+        }
+
         fn sh(command: &str, timeout_ms: u64) -> CommandResult {
             execute(
+                &unique_id(),
                 "/bin/sh",
                 "-c",
                 command,
@@ -254,6 +376,7 @@ mod imp {
             assert_eq!(result.stdout, "hi\n");
             assert_eq!(result.stderr, "");
             assert!(!result.timed_out);
+            assert!(!result.cancelled);
         }
 
         #[test]
@@ -360,24 +483,173 @@ mod imp {
 
         #[test]
         fn rejects_relative_cwd() {
-            let err = run_command("echo hi", "relative/dir", Duration::from_secs(5)).unwrap_err();
+            let err = run_command(
+                &unique_id(),
+                "echo hi",
+                "relative/dir",
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
             assert!(err.contains("absolute"), "{err}");
         }
 
         #[test]
         fn rejects_missing_cwd() {
-            let err = run_command("echo hi", "/no/such/dir/anywhere", Duration::from_secs(5))
-                .unwrap_err();
+            let err = run_command(
+                &unique_id(),
+                "echo hi",
+                "/no/such/dir/anywhere",
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
             assert!(err.contains("does not exist"), "{err}");
         }
 
         #[test]
         fn runs_in_the_given_cwd() {
             let dir = std::env::temp_dir().canonicalize().expect("temp dir");
-            let result = run_command("pwd -P", dir.to_str().unwrap(), Duration::from_secs(10))
-                .expect("command runs");
+            let result = run_command(
+                &unique_id(),
+                "pwd -P",
+                dir.to_str().unwrap(),
+                Duration::from_secs(10),
+            )
+            .expect("command runs");
             assert_eq!(result.exit_code, Some(0));
             assert!(result.stdout.trim_end().ends_with(dir.to_str().unwrap()));
+        }
+
+        /// Runs `command` on a thread and waits until it shows up in the registry.
+        fn start(id: &str, command: &str) -> thread::JoinHandle<CommandResult> {
+            let (id_owned, command) = (id.to_string(), command.to_string());
+            let handle = thread::spawn(move || {
+                execute(
+                    &id_owned,
+                    "/bin/sh",
+                    "-c",
+                    &command,
+                    Path::new("/tmp"),
+                    Duration::from_secs(60),
+                )
+                .expect("command runs")
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !lock_running().contains_key(id) {
+                assert!(Instant::now() < deadline, "{id} never registered");
+                thread::sleep(Duration::from_millis(5));
+            }
+            handle
+        }
+
+        #[test]
+        fn cancel_kills_the_running_group_and_flags_the_result() {
+            let id = unique_id();
+            let handle = start(&id, "sleep 30 & echo $!; wait");
+            // Registered means spawned; give the shell time to print the grandchild's pid.
+            thread::sleep(Duration::from_millis(300));
+            let started = Instant::now();
+            assert!(cancel(&id));
+            let result = handle.join().expect("run thread");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(result.cancelled);
+            assert!(!result.timed_out);
+            assert_eq!(result.exit_code, None);
+            let pid: i32 = result.stdout.trim().parse().expect("grandchild pid");
+            let mut gone = false;
+            for _ in 0..50 {
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    gone = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(gone, "grandchild {pid} survived the cancel");
+            assert!(!lock_running().contains_key(&id));
+        }
+
+        #[test]
+        fn cancel_of_an_unknown_id_is_false() {
+            assert!(!cancel("no-such-command"));
+        }
+
+        #[test]
+        fn registry_is_empty_after_every_exit_path() {
+            let done = unique_id();
+            let timed = unique_id();
+            let exited = unique_id();
+            let ids = [done.clone(), timed.clone(), exited.clone()];
+            let run = |id: &str, command: &str, timeout_ms: u64| {
+                execute(
+                    id,
+                    "/bin/sh",
+                    "-c",
+                    command,
+                    Path::new("/tmp"),
+                    Duration::from_millis(timeout_ms),
+                )
+                .expect("command runs")
+            };
+            run(&done, "echo hi", 5000);
+            assert!(run(&timed, "sleep 5", 100).timed_out);
+            run(&exited, "exit 4", 5000);
+            let map = lock_running();
+            assert!(ids.iter().all(|id| !map.contains_key(id)));
+            // A finished command cannot be cancelled afterwards.
+            drop(map);
+            assert!(!cancel(&done));
+        }
+
+        #[test]
+        fn a_spawn_failure_leaves_nothing_registered() {
+            let id = unique_id();
+            let err = execute(
+                &id,
+                "/no/such/shell",
+                "-c",
+                "true",
+                Path::new("/tmp"),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert!(err.contains("Could not start"), "{err}");
+            assert!(!lock_running().contains_key(&id));
+        }
+
+        #[test]
+        fn a_duplicate_id_is_refused_and_leaves_the_first_running() {
+            let id = unique_id();
+            let first = start(&id, "sleep 30");
+            let err = execute(
+                &id,
+                "/bin/sh",
+                "-c",
+                "echo second",
+                Path::new("/tmp"),
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
+            assert!(err.contains("already running"), "{err}");
+            assert!(cancel(&id));
+            assert!(first.join().expect("run thread").cancelled);
+        }
+
+        #[test]
+        fn cancel_all_kills_every_running_command() {
+            let ids = [
+                format!("all-{}", unique_id()),
+                format!("all-{}", unique_id()),
+            ];
+            let handles: Vec<_> = ids.iter().map(|id| start(id, "sleep 30")).collect();
+            let started = Instant::now();
+            cancel_where(|id| id.starts_with("all-"));
+            for handle in handles {
+                let result = handle.join().expect("run thread");
+                assert!(result.cancelled);
+                assert!(!result.timed_out);
+            }
+            assert!(started.elapsed() < Duration::from_secs(3));
+            let map = lock_running();
+            assert!(ids.iter().all(|id| !map.contains_key(id)));
         }
 
         #[test]
@@ -402,6 +674,7 @@ mod imp {
     use std::time::Duration;
 
     pub(super) fn run_command(
+        _id: &str,
         _command: &str,
         _cwd: &str,
         _timeout: Duration,
@@ -409,14 +682,27 @@ mod imp {
         Err("Command nodes are not supported on Windows yet".to_string())
     }
 
+    /// Nothing runs on Windows, so there is nothing to cancel.
+    pub(super) fn cancel(_id: &str) -> bool {
+        false
+    }
+
+    pub(super) fn cancel_all() {}
+
     #[cfg(test)]
     mod tests {
         use super::*;
 
         #[test]
         fn refuses_every_command() {
-            let err = run_command("echo hi", "C:\\", Duration::from_secs(1)).unwrap_err();
+            let err = run_command("id", "echo hi", "C:\\", Duration::from_secs(1)).unwrap_err();
             assert_eq!(err, "Command nodes are not supported on Windows yet");
+        }
+
+        #[test]
+        fn nothing_can_be_cancelled() {
+            assert!(!cancel("id"));
+            cancel_all();
         }
     }
 }

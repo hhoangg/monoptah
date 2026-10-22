@@ -660,6 +660,7 @@ pub fn run() {
             mono::mono_read,
             mono::mono_save,
             workflow_command::workflow_run_command,
+            workflow_command::workflow_cancel_command,
             checkpoint::session_checkpoint_ensure,
             checkpoint::session_checkpoint_begin_turn,
             checkpoint::session_checkpoint_finish_turn,
@@ -806,6 +807,7 @@ pub fn run() {
         tauri::RunEvent::Exit => {
             handle.state::<remote::RemoteConnections>().shutdown();
             reap_harness_children(handle);
+            workflow_command::cancel_all_workflow_commands();
         }
         _ => {}
     });

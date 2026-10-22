@@ -257,9 +257,22 @@ function makeHost(script: Script) {
     stop: vi.fn(async () => {}),
     runCommand: vi.fn(async (_cwd: string, command: string) =>
       command.includes("bad")
-        ? { exitCode: 1, stdout: "", stderr: "boom", timedOut: false }
-        : { exitCode: 0, stdout: "fine", stderr: "", timedOut: false },
+        ? {
+            exitCode: 1,
+            stdout: "",
+            stderr: "boom",
+            timedOut: false,
+            cancelled: false,
+          }
+        : {
+            exitCode: 0,
+            stdout: "fine",
+            stderr: "",
+            timedOut: false,
+            cancelled: false,
+          },
     ),
+    cancelCommand: vi.fn(async (_id: string) => true),
     askMono: vi.fn(async (): Promise<string> => fenced({ answer: "exit" })),
     post: vi.fn(),
     // Like the app: the request is relayed, so later polls skip it.
@@ -652,6 +665,75 @@ describe("useMonoWorkflows", () => {
     expect(host.post).toHaveBeenCalledTimes(1);
   });
 
+  const commandWorkflow = () =>
+    workflow(
+      [
+        trigger,
+        {
+          id: "cmd",
+          type: "command",
+          project: "{{inputs.repo}}",
+          command: "./deploy.sh",
+        },
+        report,
+      ],
+      [
+        { from: "trigger", to: "cmd" },
+        { from: "cmd", to: "report" },
+      ],
+    );
+
+  it("stop cancels the running command and the run is released only after it settled", async () => {
+    save([commandWorkflow()]);
+    const host = makeHost({ replies: [] });
+    const finish = deferred();
+    host.runCommand.mockImplementationOnce(async () => {
+      await finish.promise;
+      return {
+        exitCode: null,
+        stdout: "partial",
+        stderr: "",
+        timedOut: false,
+        cancelled: true,
+      };
+    });
+    mount(host);
+    await vi.waitFor(() => expect(host.runCommand).toHaveBeenCalledTimes(1));
+    const id = host.runCommand.mock.calls[0][3];
+
+    requestWorkflowStop(WF);
+    await vi.waitFor(() => expect(host.cancelCommand).toHaveBeenCalledWith(id));
+    await vi.waitFor(() => expect(storedRuns()[0].status).toBe("stopped"));
+    expect(storedRuns()[0].nodes.find((n) => n.nodeId === "cmd")!.status).toBe(
+      "stopped",
+    );
+    // The command is still alive: another run of the workflow must not start yet.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(workflowRunningId(WF)).toBeDefined();
+
+    finish.resolve();
+    await vi.waitFor(() => expect(workflowRunningId(WF)).toBeUndefined());
+    expect(host.post).toHaveBeenCalledTimes(1);
+    expect(storedRuns()[0].status).toBe("stopped");
+  });
+
+  it("a command cancelled from outside the run fails its node", async () => {
+    save([commandWorkflow()]);
+    const host = makeHost({ replies: [] });
+    host.runCommand.mockResolvedValueOnce({
+      exitCode: null,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      cancelled: true,
+    });
+    mount(host);
+    await vi.waitFor(() => expect(storedRuns()[0]?.status).toBe("failed"));
+    expect(
+      storedRuns()[0].nodes.find((n) => n.nodeId === "cmd")!.error,
+    ).toContain("cancelled");
+  });
+
   it("command node failure fails only its branch", async () => {
     const def = workflow(
       [
@@ -695,7 +777,11 @@ describe("useMonoWorkflows", () => {
       "/code/app",
       "echo 'ok'",
       10 * 60_000,
+      expect.any(String),
     );
+    // Every command gets its own id.
+    const ids = host.runCommand.mock.calls.map((call) => call[3]);
+    expect(new Set(ids).size).toBe(ids.length);
     expect(host.post.mock.calls[0][3]).toBe(
       "Ship it · completed with failures",
     );
@@ -726,6 +812,7 @@ describe("useMonoWorkflows", () => {
       stdout: "",
       stderr: "",
       timedOut: true,
+      cancelled: false,
     });
     mount(host);
     await vi.waitFor(() => expect(storedRuns()[0]?.status).toBe("failed"));

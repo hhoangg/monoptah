@@ -65,6 +65,8 @@ export type CommandResult = {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Ended by `cancelCommand` (or the app quitting), not by itself or the timeout. */
+  cancelled: boolean;
 };
 
 export type MonoWorkflowHost = {
@@ -81,11 +83,15 @@ export type MonoWorkflowHost = {
   /** Sends a follow-up turn to an existing session and resolves when it settles. */
   send(sessionId: string, prompt: string): Promise<ControlOutcome>;
   stop(sessionId: string): Promise<void>;
+  /** Runs a shell command; `id` names it for `cancelCommand` while it runs. */
   runCommand(
     cwd: string,
     command: string,
     timeoutMs: number,
+    id: string,
   ): Promise<CommandResult>;
+  /** Kills the running command `id` and its children. False when no such command runs (yet). */
+  cancelCommand(id: string): Promise<boolean>;
   /** Hidden Mono-context turn (habit-style ephemeral session with /operator), returns the final reply. */
   askMono(monoId: string, prompt: string): Promise<string>;
   post(
@@ -126,6 +132,9 @@ export const ASK_TIMEOUT_MS = 10 * 60_000;
 export const OUTPUT_STRING_MAX = 16_000;
 const ERROR_MAX = 1_000;
 const STOPPED_BY_USER = "Stopped by the user.";
+/** A cancel can beat the host registering the command, so it is retried briefly. */
+const CANCEL_ATTEMPTS = 10;
+const CANCEL_RETRY_MS = 50;
 
 /** Shortens every long string inside a node output, saying so where it cut. */
 export function capOutput<T>(value: T): T {
@@ -196,6 +205,12 @@ export async function executeRun(
     wake?.();
   };
   const live = () => run.status === "running";
+  /** Settles when the user stops the run, so waits on a session end at once. */
+  let signalStop!: () => void;
+  const stopSignal = new Promise<void>((resolve) => (signalStop = resolve));
+  /** Ids of the commands this run has started and not yet heard back from. */
+  const runningCommands = new Set<string>();
+  let commandSeq = 0;
 
   // --- persistence ----------------------------------------------------------------------------
   // Every write fires a files-changed event, so writes go through one queue that always saves
@@ -322,7 +337,7 @@ export async function executeRun(
     let asking = false;
     try {
       while (!settled) {
-        await Promise.race([watched, sleep(POLL_MS)]);
+        await Promise.race([watched, stopSignal, sleep(POLL_MS)]);
         if (settled) break;
         if (!live())
           return { status: "cancelled", text: "", error: STOPPED_BY_USER };
@@ -521,8 +536,22 @@ export async function executeRun(
         );
     }
     const minutes = node.timeoutMinutes ?? COMMAND_TIMEOUT_MINUTES;
-    const result = await host.runCommand(cwd, action.command, minutes * 60_000);
+    const id = `${run.id}:${nodeId}:${branch}:${++commandSeq}`;
+    runningCommands.add(id);
+    let result: CommandResult;
+    try {
+      result = await host.runCommand(
+        cwd,
+        action.command,
+        minutes * 60_000,
+        id,
+      );
+    } finally {
+      runningCommands.delete(id);
+    }
     if (!live()) return;
+    if (result.cancelled)
+      return fail(nodeId, branch, "The command was cancelled");
     if (result.timedOut)
       return fail(
         nodeId,
@@ -571,6 +600,26 @@ export async function executeRun(
       at: Date.now(),
     });
   };
+
+  /** Kills every command this run still has going. Never throws. */
+  const cancelCommands = () =>
+    Promise.all(
+      [...runningCommands].map(async (id) => {
+        for (
+          let attempt = 0;
+          attempt < CANCEL_ATTEMPTS && runningCommands.has(id);
+          attempt++
+        ) {
+          try {
+            if (await getHost().cancelCommand(id)) return;
+          } catch (error) {
+            console.warn(`Could not cancel command ${id}`, error);
+            return;
+          }
+          await sleep(CANCEL_RETRY_MS);
+        }
+      }),
+    );
 
   const execute = async (action: EngineAction) => {
     if (action.kind === "startSession") return runSession(action);
@@ -676,10 +725,12 @@ export async function executeRun(
       .map((n) => n.sessionId as string);
     // The run is stopped first, so whatever the sessions report as they stop changes nothing.
     apply({ kind: "stopped", at: Date.now() });
+    signalStop();
     nudge();
     const host = getHost();
-    await Promise.all(
-      [...new Set(sessions)].map(async (id) => {
+    await Promise.all([
+      cancelCommands(),
+      ...[...new Set(sessions)].map(async (id) => {
         try {
           await host.stop(id);
         } catch (error) {
@@ -687,7 +738,7 @@ export async function executeRun(
         }
         host.endApprovals(id);
       }),
-    );
+    ]);
     // A stopped run reports once, with what had finished by then.
     if (run.reportPostedAt === undefined) {
       run = { ...run, reportPostedAt: Date.now() };
@@ -777,6 +828,14 @@ export async function executeRun(
     for (const timer of timers) clearInterval(timer);
     try {
       await stopTask;
+      // A command left over from a run that ended some other way is killed too. Then every
+      // node's work is awaited, so the workflow is not seen as idle (and a scheduled run does
+      // not start in the same directory) while something of this run is still alive. This is
+      // bounded: a stopped run ends commands and sessions at once, a session waits at most
+      // POLL_MS to notice, a command has its node timeout (at most 24 h) and an Ask Mono
+      // question has ASK_TIMEOUT_MS.
+      await cancelCommands();
+      while (active.size > 0) await Promise.allSettled([...active]);
       await writing;
     } catch (error) {
       console.warn("A workflow run did not finish cleanly", error);

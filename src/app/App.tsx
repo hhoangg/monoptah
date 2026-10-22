@@ -9353,8 +9353,9 @@ function Workspace({
       await flushSync(() => stopSessionRef.current(id));
       flushHarnessEvents();
     },
-    runCommand: (cwd, command, timeoutMs) =>
-      invoke("workflow_run_command", { command, cwd, timeoutMs }),
+    runCommand: (cwd, command, timeoutMs, id) =>
+      invoke("workflow_run_command", { id, command, cwd, timeoutMs }),
+    cancelCommand: (id) => invoke("workflow_cancel_command", { id }),
     // A short-lived hidden session of the Mono, like a habit run, so the question never
     // shows in the user's chat.
     askMono: async (monoId, prompt) => {
