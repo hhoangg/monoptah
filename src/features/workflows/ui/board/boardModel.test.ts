@@ -460,6 +460,53 @@ describe("projectInputFor and inputs with no value", () => {
     expect(out.inputValues.repo).toBe("/work/api");
   });
 
+  it("does not bind a step to a valueless input another step uses", () => {
+    const w = workflow({
+      inputs: { api: { type: "project" } },
+      nodes: [
+        { id: "trigger", type: "manual" },
+        { id: "a", type: "command", project: "{{inputs.api}}", command: "ls" },
+        { id: "report", type: "report" },
+      ],
+    });
+    const out = projectInputFor(w, "/work/web", "web");
+    expect(out.ref).toBe("{{inputs.project}}");
+    expect(out.inputs.api).toEqual({ type: "project" });
+    expect(out.inputValues).toEqual({ project: "/work/web" });
+    // A loop condition that mentions the input counts as using it too.
+    const looped = workflow({
+      inputs: { api: { type: "project" } },
+      edges: [{ from: "trigger", to: "report", loop: { maxRounds: 2, decide: "{{inputs.api}} == 1" } }],
+    });
+    expect(projectInputFor(looped, "/work/web", "web").ref).toBe("{{inputs.project}}");
+  });
+
+  it("reuses the step's own valueless input", () => {
+    const w = workflow({
+      inputs: { api: { type: "project" }, other: { type: "project" } },
+      nodes: [
+        { id: "trigger", type: "manual" },
+        { id: "a", type: "command", project: "{{inputs.api}}", command: "ls" },
+        { id: "report", type: "report" },
+      ],
+    });
+    const out = projectInputFor(w, "/work/web", "web", "api");
+    expect(out.ref).toBe("{{inputs.api}}");
+    expect(out.inputValues).toEqual({ api: "/work/web" });
+  });
+
+  it("does not mistake api_2 for api when looking for use", () => {
+    const w = workflow({
+      inputs: { api: { type: "project" }, api_2: { type: "project" } },
+      nodes: [
+        { id: "trigger", type: "manual" },
+        { id: "a", type: "command", project: "{{inputs.api_2}}", command: "ls" },
+        { id: "report", type: "report" },
+      ],
+    });
+    expect(projectInputFor(w, "/work/web", "web").ref).toBe("{{inputs.api}}");
+  });
+
   it("prefers the input the step already uses", () => {
     const w = workflow({ inputs: { a: { type: "project" }, b: { type: "project" } } });
     expect(projectInputFor(w, "/work/api", "api", "b").ref).toBe("{{inputs.b}}");

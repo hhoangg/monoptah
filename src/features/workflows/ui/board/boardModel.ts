@@ -416,8 +416,11 @@ export function projectInputFor(
   const unset = (key: string) => isProject(key) && !w.inputValues[key];
   const held = Object.keys(w.inputs).find((key) => isProject(key) && w.inputValues[key] === path);
   if (held) return reuse(held, path);
-  // An input that is declared but still has no value is there to be filled.
-  const empty = current && unset(current) ? current : Object.keys(w.inputs).find(unset);
+  // An input that is declared but has no value is there to be filled, when it is the step's
+  // own or nothing else uses it: binding another step to it would move that step's project.
+  const text = JSON.stringify({ nodes: w.nodes, edges: w.edges });
+  const used = (key: string) => new RegExp(`inputs\\.${key}(?![A-Za-z0-9_])`).test(text);
+  const empty = current && unset(current) ? current : Object.keys(w.inputs).find((k) => unset(k) && !used(k));
   if (empty) return reuse(empty, path);
   const base = has(w.inputs, "project") ? inputName(label) || "project" : "project";
   let name = base;

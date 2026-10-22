@@ -563,7 +563,10 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
         ...b,
         nodes: b.nodes.map((n) => {
           const stored = saved.nodes.find((s) => s.id === n.id);
-          return n.data.node.type === "schedule" && stored?.type === "schedule"
+          // Only a schedule the save anchored; an edit made while saving is kept.
+          return n.data.node.type === "schedule" &&
+            !n.data.node.schedule.intervalFrom &&
+            stored?.type === "schedule"
             ? { ...n, data: { ...n.data, node: { ...n.data.node, schedule: stored.schedule } } }
             : n;
         }),
