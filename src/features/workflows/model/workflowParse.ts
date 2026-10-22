@@ -88,7 +88,7 @@ function parseOutput(raw: unknown): Record<string, OutputField> | undefined {
   return output;
 }
 
-function parseNode(raw: unknown): WorkflowNode | undefined {
+export function parseNode(raw: unknown): WorkflowNode | undefined {
   if (!isRec(raw)) return undefined;
   const id = str(raw, "id");
   const type = raw.type;
@@ -176,7 +176,7 @@ function parseNode(raw: unknown): WorkflowNode | undefined {
   }
 }
 
-function parseEdge(raw: unknown): WorkflowEdge | undefined {
+export function parseEdge(raw: unknown): WorkflowEdge | undefined {
   if (!isRec(raw)) return undefined;
   const from = str(raw, "from");
   const to = str(raw, "to");
@@ -196,7 +196,7 @@ function parseEdge(raw: unknown): WorkflowEdge | undefined {
   };
 }
 
-function parseInputs(raw: unknown): Record<string, WorkflowInput> {
+export function parseInputs(raw: unknown): Record<string, WorkflowInput> {
   const inputs: Record<string, WorkflowInput> = {};
   if (!isRec(raw)) return inputs;
   for (const [name, input] of Object.entries(raw)) {
@@ -289,6 +289,11 @@ const ABSOLUTE_PATH =
  */
 const COMMAND_ABSOLUTE_PATH =
   /(?:^|[\s"'`=(\[,<>|;&:])(?:~\/|\/(?!\/|dev\/(?:null|stdin|stdout|stderr)(?![\w/.-]))\S|[A-Za-z]:[\\/])\S*/;
+
+/** The first thing in `text` that reads as an absolute path on this machine, if any. */
+export function findAbsolutePath(text: string): string | undefined {
+  return ABSOLUTE_PATH.exec(text)?.[0].trim();
+}
 
 const COMMAND_FIELDS = ["exitCode", "stdout", "stderr"];
 const ASK_FIELDS = ["answer", "reason"];
