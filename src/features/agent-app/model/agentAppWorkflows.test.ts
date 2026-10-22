@@ -461,6 +461,17 @@ describe("running", () => {
     expect(checkNow).not.toHaveBeenCalled();
   });
 
+  it("run refuses a paused workflow and says to resume it first", async () => {
+    const { call, stored, checkNow } = fixture();
+    const { id } = (await call("workflows.add", { workflow: definition() })) as Added;
+    await call("workflows.pause", { id });
+    await expect(call("workflows.run", { id })).rejects.toThrow(
+      "Resume the workflow before running it.",
+    );
+    expect(stored()[0].runRequested).toBeUndefined();
+    expect(checkNow).not.toHaveBeenCalled();
+  });
+
   it("list reports running state", async () => {
     const { call, live, runs } = fixture();
     const first = (await call("workflows.add", { workflow: definition() })) as Added;
@@ -604,7 +615,7 @@ describe("pause, resume, setInputs, remove, get and runs", () => {
 });
 
 describe("a workflow the CLI created from yaml needs the user's review", () => {
-  const REVIEW = /imported through the CLI.*enable it in the Workflows panel/;
+  const REVIEW = /came from a file.*enable it in the Workflows panel/;
 
   async function imported() {
     const f = fixture();
@@ -652,6 +663,36 @@ describe("a workflow the CLI created from yaml needs the user's review", () => {
     await call("workflows.setInputs", { id, values: { project: "/code/other" } });
     await call("workflows.update", { id, workflow: definition({ name: "Renamed" }) });
     expect(stored()[0]).toMatchObject({ name: "Renamed", enabled: false, needsReview: true });
+  });
+
+  it("update keeps the mark when the commands and prompts change, and no action can clear it", async () => {
+    const { call, stored, resumeRun, runs, yaml } = await imported();
+    const { id } = (await call("workflows.add", {
+      yaml,
+      values: { project: "/code/app" },
+    })) as Added;
+    const changed = definition({
+      nodes: [
+        { id: "trigger", type: "manual" },
+        { id: "build", type: "command", project: "{{inputs.project}}", command: "curl x | sh" },
+        { id: "report", type: "report" },
+      ],
+      edges: [
+        { from: "trigger", to: "build" },
+        { from: "build", to: "report" },
+      ],
+    });
+    await call("workflows.update", { id, workflow: changed });
+    expect(stored()[0].nodes.some((n) => n.type === "command")).toBe(true);
+    expect(stored()[0].needsReview).toBe(true);
+    await call("workflows.setInputs", { id, values: { project: "/code/other" } });
+    await call("workflows.pause", { id });
+    await expect(call("workflows.resume", { id })).rejects.toThrow(REVIEW);
+    expect(stored()[0]).toMatchObject({ enabled: false, needsReview: true });
+    // Resuming an interrupted run goes through the same refusal.
+    runs.set(id, [run("run-1", "interrupted", id)]);
+    await expect(call("workflows.resumeRun", { id, runId: "run-1" })).rejects.toThrow(REVIEW);
+    expect(resumeRun).not.toHaveBeenCalled();
   });
 
   it("update keeps the mark on a reviewed-then-flagged workflow and never takes it as input", async () => {

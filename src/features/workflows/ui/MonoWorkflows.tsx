@@ -18,6 +18,7 @@ import { RunningFor } from "../../monos/ui/HabitPage";
 import { HabitButton } from "../../monos/ui/MonoHabits";
 import { Hint, Empty } from "../../monos/ui/monoPanelParts";
 import {
+  definitionFingerprint,
   triggerOf,
   type Workflow,
   type WorkflowId,
@@ -192,13 +193,17 @@ function refusal(verb: string, issues: WorkflowIssue[]): string {
   return `Can't ${verb} yet: ${reason}${rest.length ? ` (and ${rest.length} more)` : ""}.`;
 }
 
-/**
- * The user acting on a workflow from the panel is the review a CLI import was waiting for.
- */
-function withoutReview(workflow: Workflow): Workflow {
-  const { needsReview: _reviewed, ...rest } = workflow;
-  return rest;
-}
+/** What approving a reviewed workflow goes on to do: enable it, or run it once. */
+export type ReviewIntent = "enable" | "run";
+
+/** How approving a reviewed workflow ended. */
+export type ApproveResult =
+  | { kind: "done" }
+  /** The stored definition is not the one that was reviewed; here is the current one. */
+  | { kind: "changed"; workflow: Workflow }
+  | { kind: "refused"; notice: string };
+
+const REVIEW_FIRST = "Review this workflow before running or enabling it.";
 
 export type WorkflowActions = {
   /** Resolves to why the workflow cannot run yet, if it cannot. */
@@ -206,9 +211,27 @@ export type WorkflowActions = {
   stop(id: string): Promise<void>;
   /** Resolves to why a paused workflow cannot be resumed yet, if it cannot. */
   toggle(id: string): Promise<string | undefined>;
+  /**
+   * The user approving a workflow that needs review: clears the mark and does what they asked,
+   * but only if the stored definition still has the `fingerprint` of the one they read. The
+   * only way the mark is cleared.
+   */
+  approve(id: string, intent: ReviewIntent, fingerprint: string): Promise<ApproveResult>;
   /** Resolves to why the workflow cannot be removed, if it cannot. */
   remove(id: string): Promise<string | undefined>;
 };
+
+/** The workflow switched on, its next scheduled run counted from now. */
+function enabledNow(workflow: Workflow): Workflow {
+  const trigger = triggerOf(workflow);
+  return {
+    ...workflow,
+    enabled: true,
+    ...(trigger?.type === "schedule"
+      ? { nextRunAt: nextHabitRunAt(trigger.schedule, Date.now()) }
+      : {}),
+  };
+}
 
 /** Edits to the Mono's workflows from the panel, saved over what was read. */
 export function workflowActions(monoId: string): WorkflowActions {
@@ -235,10 +258,12 @@ export function workflowActions(monoId: string): WorkflowActions {
   return {
     runNow: async (id) => {
       const notice = await change(id, (workflow) => {
+        // Never around the review, whichever screen asked.
+        if (workflow.needsReview) return { next: workflow, notice: REVIEW_FIRST };
         const issues = validateWorkflow(workflow);
         return issues.length
           ? { next: workflow, notice: refusal("run", issues) }
-          : { next: withoutReview({ ...workflow, runRequested: true }) };
+          : { next: { ...workflow, runRequested: true } };
       });
       if (!notice) checkWorkflowsNow();
       return notice;
@@ -252,20 +277,49 @@ export function workflowActions(monoId: string): WorkflowActions {
       change(id, (workflow) => {
         if (workflow.enabled)
           return { next: { ...workflow, enabled: false } };
+        if (workflow.needsReview) return { next: workflow, notice: REVIEW_FIRST };
         const issues = validateWorkflow(workflow);
         if (issues.length)
           return { next: workflow, notice: refusal("resume", issues) };
-        const trigger = triggerOf(workflow);
-        return {
-          next: withoutReview({
-            ...workflow,
-            enabled: true,
-            ...(trigger?.type === "schedule"
-              ? { nextRunAt: nextHabitRunAt(trigger.schedule, Date.now()) }
-              : {}),
-          }),
-        };
+        return { next: enabledNow(workflow) };
       }),
+    approve: async (id, intent, fingerprint) => {
+      let result = {
+        kind: "refused",
+        notice: "That workflow is gone.",
+      } as ApproveResult;
+      try {
+        await updateWorkflows(monoId, (list) => ({
+          workflows: list.map((workflow) => {
+            if (workflow.id !== id) return workflow;
+            // The user read one definition; a different one (the Mono edited it meanwhile) is not approved.
+            if (definitionFingerprint(workflow) !== fingerprint) {
+              result = { kind: "changed", workflow };
+              return workflow;
+            }
+            const issues = validateWorkflow(workflow);
+            if (issues.length) {
+              result = {
+                kind: "refused",
+                notice: refusal(intent === "run" ? "run" : "resume", issues),
+              };
+              return workflow;
+            }
+            result = { kind: "done" };
+            const { needsReview: _reviewed, ...approved } = workflow;
+            return intent === "run"
+              ? { ...approved, runRequested: true }
+              : enabledNow(approved);
+          }),
+          result: undefined,
+        }));
+      } catch (error) {
+        console.warn("Could not approve the workflow", error);
+        return { kind: "refused", notice: "Could not change the workflow." };
+      }
+      if (result.kind === "done" && intent === "run") checkWorkflowsNow();
+      return result;
+    },
     remove: async (id) => {
       // A run left going would keep posting its report with nothing to stop it.
       if (liveRunOf(id)) return "Stop the workflow before removing it.";
@@ -286,12 +340,25 @@ export function WorkflowNotice({ children }: { children?: ReactNode }) {
   );
 }
 
+/** The small label on a workflow whose commands and prompts nobody has read yet. */
+export function NeedsReviewBadge() {
+  return (
+    <span
+      data-needs-review
+      className="shrink-0 rounded bg-content/10 px-1.5 text-[10px] font-medium leading-4 text-content/70"
+    >
+      Needs review
+    </span>
+  );
+}
+
 export function WorkflowRow({
   monoId,
   workflow,
   actions,
   notify,
   onOpen,
+  onReview,
 }: {
   monoId: string;
   workflow: Workflow;
@@ -299,6 +366,8 @@ export function WorkflowRow({
   /** Told why an action was refused, or undefined when the next one went through. */
   notify: (message: string | undefined) => void;
   onOpen: () => void;
+  /** Opens the review a flagged workflow needs before it can run or be enabled. */
+  onReview: (intent: ReviewIntent) => void;
 }) {
   const liveRunId = useLiveRunId(workflow.id);
   const running = liveRunId !== undefined;
@@ -330,12 +399,17 @@ export function WorkflowRow({
           )}
         </span>
         <span className="flex min-w-0 flex-1 flex-col">
-          <span
-            className={`truncate text-[12px] leading-5 ${
-              workflow.enabled || running ? "text-content/85" : "text-content/45"
-            }`}
-          >
-            {workflow.name}
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span
+              className={`truncate text-[12px] leading-5 ${
+                workflow.enabled || running
+                  ? "text-content/85"
+                  : "text-content/45"
+              }`}
+            >
+              {workflow.name}
+            </span>
+            {workflow.needsReview ? <NeedsReviewBadge /> : null}
           </span>
           <span className="truncate text-[11px] leading-4 text-content/40">
             {running ? (
@@ -364,7 +438,11 @@ export function WorkflowRow({
             running ? "Already running" : starting ? "Starting" : "Run now"
           }
           disabled={running || starting}
-          onClick={() => void actions.runNow(workflow.id).then(notify)}
+          onClick={() =>
+            workflow.needsReview
+              ? onReview("run")
+              : void actions.runNow(workflow.id).then(notify)
+          }
         >
           <Zap className="size-3.5" strokeWidth={1.75} />
         </HabitButton>
@@ -378,7 +456,11 @@ export function WorkflowRow({
         ) : null}
         <HabitButton
           label={workflow.enabled ? "Pause" : "Resume"}
-          onClick={() => void actions.toggle(workflow.id).then(notify)}
+          onClick={() =>
+            workflow.needsReview && !workflow.enabled
+              ? onReview("enable")
+              : void actions.toggle(workflow.id).then(notify)
+          }
         >
           {workflow.enabled ? (
             <Pause className="size-3.5" strokeWidth={1.75} />
@@ -402,12 +484,14 @@ export function WorkflowsList({
   workflows,
   actions,
   onOpen,
+  onReview,
   empty = <Empty>No workflows yet</Empty>,
 }: {
   monoId: string;
   workflows: Workflow[] | undefined;
   actions: WorkflowActions;
   onOpen: (id: string) => void;
+  onReview: (id: string, intent: ReviewIntent) => void;
   /** Shown once loaded with none. */
   empty?: ReactNode;
 }) {
@@ -427,6 +511,7 @@ export function WorkflowsList({
             actions={actions}
             notify={setNotice}
             onOpen={() => onOpen(workflow.id)}
+            onReview={(intent) => onReview(workflow.id, intent)}
           />
         ))}
       </ul>

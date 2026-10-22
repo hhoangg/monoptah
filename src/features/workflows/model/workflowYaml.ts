@@ -184,6 +184,41 @@ export type ImportPreview = {
   issues: WorkflowIssue[];
 };
 
+/**
+ * What a user reviews before a workflow runs: every command verbatim, and every text that
+ * reaches an agent as the agent will read it before templates are filled in.
+ */
+export function reviewTexts(nodes: readonly WorkflowNode[]): Pick<ImportPreview, "commands" | "prompts"> {
+  const commands: ImportPreview["commands"] = [];
+  const prompts: ImportPreview["prompts"] = [];
+  for (const node of nodes) {
+    if (node.type === "command") commands.push({ nodeId: node.id, command: node.command });
+    else if (node.type === "session") {
+      const instruction = outputInstruction(node.output);
+      prompts.push({
+        nodeId: node.id,
+        text: instruction ? `${node.prompt}\n\n${instruction}` : node.prompt,
+      });
+    } else if (node.type === "askMono") {
+      const answers = node.answers.map((a) => `- ${a}`).join("\n");
+      prompts.push({
+        nodeId: node.id,
+        text: answers ? `${node.question}\n\nAnswers:\n${answers}` : node.question,
+      });
+    } else if (node.type === "if" && node.question !== undefined) {
+      prompts.push({ nodeId: node.id, text: node.question });
+    } else if (node.type === "report" && node.template?.trim()) {
+      prompts.push({ nodeId: node.id, text: node.template });
+    }
+  }
+  return { commands, prompts };
+}
+
+/** The review of a workflow already stored, built from its current definition. */
+export function reviewOf(w: Workflow): ImportPreview {
+  return { workflow: w, ...reviewTexts(w.nodes), issues: validateWorkflow(w) };
+}
+
 type Parsed = { ok: true; value: unknown } | { ok: false; error: string };
 
 function parseFile(text: string): Parsed {
@@ -310,28 +345,7 @@ export function previewImport(
     enabled: false,
   });
 
-  const commands: ImportPreview["commands"] = [];
-  const prompts: ImportPreview["prompts"] = [];
-  for (const node of nodes) {
-    if (node.type === "command") commands.push({ nodeId: node.id, command: node.command });
-    else if (node.type === "session") {
-      const instruction = outputInstruction(node.output);
-      prompts.push({
-        nodeId: node.id,
-        text: instruction ? `${node.prompt}\n\n${instruction}` : node.prompt,
-      });
-    } else if (node.type === "askMono") {
-      const answers = node.answers.map((a) => `- ${a}`).join("\n");
-      prompts.push({
-        nodeId: node.id,
-        text: answers ? `${node.question}\n\nAnswers:\n${answers}` : node.question,
-      });
-    } else if (node.type === "if" && node.question !== undefined) {
-      prompts.push({ nodeId: node.id, text: node.question });
-    } else if (node.type === "report" && node.template?.trim()) {
-      prompts.push({ nodeId: node.id, text: node.template });
-    }
-  }
+  const { commands, prompts } = reviewTexts(nodes);
   return { ok: true, preview: { workflow, commands, prompts, issues } };
 }
 

@@ -162,6 +162,35 @@ export function newWorkflowId(): WorkflowId {
   return `wf-${Array.from(bytes, (b) => BASE36[b % 36]).join("")}`;
 }
 
+/** `value` as JSON with object keys sorted and undefined members dropped. */
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const members = Object.entries(value)
+      .filter(([, member]) => member !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, member]) => `${JSON.stringify(key)}:${stableJson(member)}`);
+    return `{${members.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * A stable serialization of everything in a workflow that decides what runs or what reaches an
+ * agent: its name, description, input declarations, nodes (every field but their board position)
+ * and edges, loops included. Two workflows with the same fingerprint show the same review. It
+ * leaves out input values and the fields the app manages (enabled, schedule state, run state).
+ */
+export function definitionFingerprint(w: Workflow): string {
+  return stableJson({
+    name: w.name,
+    description: w.description ?? "",
+    inputs: w.inputs,
+    nodes: w.nodes.map(({ ui: _position, ...node }) => node),
+    edges: w.edges,
+  });
+}
+
 export function isTrigger(node: WorkflowNode): node is ScheduleNode | ManualNode {
   return node.type === "schedule" || node.type === "manual";
 }

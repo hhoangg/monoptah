@@ -59,7 +59,7 @@ const stored = (): Workflow[] => JSON.parse(files.get("workflows.json") ?? "[]")
 
 async function renderBoard(
   w: Workflow | undefined,
-  props: { onBack?: () => void } = {},
+  props: { onBack?: () => void; onReview?: (intent: "enable" | "run") => void } = {},
 ) {
   if (w) files.set("workflows.json", JSON.stringify([w]));
   await act(async () =>
@@ -70,6 +70,7 @@ async function renderBoard(
         color: "#9c9",
         projects: PROJECTS,
         onBack: props.onBack ?? (() => {}),
+        onReview: props.onReview ?? (() => {}),
       }),
     ),
   );
@@ -170,21 +171,63 @@ it("saves a valid workflow, keeping the fields the app manages", async () => {
   expect(button("Save").disabled).toBe(true);
 });
 
-it("saving a flagged workflow enabled counts as the user's review, saving it paused does not", async () => {
-  const rename = async () => {
-    const name = container.querySelector<HTMLInputElement>("input[aria-label='Workflow name']")!;
-    await act(async () => type(name, "Renamed"));
-    await act(async () => button("Save").click());
-  };
-  await renderBoard(ticketWorkflow({ enabled: true, needsReview: true }));
-  await rename();
-  expect(stored()[0].needsReview).toBeUndefined();
+const rename = async () => {
+  const name = container.querySelector<HTMLInputElement>("input[aria-label='Workflow name']")!;
+  await act(async () => type(name, "Renamed"));
+};
 
-  act(() => root.unmount());
-  root = createRoot(container);
+it("will not save a flagged workflow enabled, points to the review, and keeps the mark when saved paused", async () => {
+  const onReview = vi.fn();
+  await renderBoard(ticketWorkflow({ enabled: true, needsReview: true }), { onReview });
+  await rename();
+  expect(button("Save").disabled).toBe(true);
+  expect(container.textContent).toContain("Review this workflow before enabling it");
+  await act(async () => buttonText("Review")!.click());
+  expect(onReview).toHaveBeenCalledWith("enable");
+  expect(stored()[0]).toMatchObject({ enabled: true, needsReview: true });
+  await act(async () => buttonText("Save paused")!.click());
+  expect(stored()[0]).toMatchObject({ name: "Renamed", enabled: false, needsReview: true });
+});
+
+it("saving a flagged workflow that is paused keeps the mark", async () => {
   await renderBoard(ticketWorkflow({ enabled: false, needsReview: true }));
   await rename();
+  expect(container.textContent).not.toContain("Review this workflow before enabling it");
+  await act(async () => button("Save").click());
+  expect(stored()[0]).toMatchObject({ name: "Renamed", enabled: false, needsReview: true });
+});
+
+it("refuses to enable a workflow that was flagged after the board loaded it", async () => {
+  await renderBoard(ticketWorkflow({ enabled: true }));
+  await rename();
+  files.set(
+    "workflows.json",
+    JSON.stringify([ticketWorkflow({ enabled: true, needsReview: true })]),
+  );
+  await act(async () => button("Save").click());
+  expect(stored()[0]).toMatchObject({ name: "ClickUp -> Dev -> Review", needsReview: true });
+  expect(container.querySelector("[data-workflow-notice]")?.textContent).toMatch(
+    /Review this workflow/,
+  );
+});
+
+it("Run now and Resume in the menu open the review of a flagged workflow", async () => {
+  const onReview = vi.fn();
+  await renderBoard(ticketWorkflow({ enabled: false, needsReview: true }), { onReview });
+  const menuItem = (label: string) =>
+    [...document.body.querySelectorAll<HTMLButtonElement>("[role='menu'] button[role='menuitem']")].find(
+      (b) => b.textContent?.includes(label),
+    )!;
+  await act(async () => button("More").click());
+  await act(async () => menuItem("Run now").click());
+  expect(onReview).toHaveBeenLastCalledWith("run");
+  await act(async () => button("More").click());
+  await act(async () => menuItem("Resume").click());
+  expect(onReview).toHaveBeenLastCalledWith("enable");
+  // Nothing was switched on, in the draft or in the file.
+  expect(button("Save").disabled).toBe(true);
   expect(stored()[0]).toMatchObject({ enabled: false, needsReview: true });
+  expect(stored()[0].runRequested).toBeUndefined();
 });
 
 it("leaving with unsaved changes asks to save or discard", async () => {

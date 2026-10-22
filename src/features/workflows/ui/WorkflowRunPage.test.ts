@@ -235,6 +235,16 @@ it("Resume is refused while another run of the workflow is going", async () => {
   );
 });
 
+it("Resume is refused while the workflow still needs its review", async () => {
+  stored = [laneRun({ status: "interrupted" })];
+  await renderPage({ ...definition, needsReview: true });
+  await act(async () => button("Resume")!.click());
+  expect(resumeWorkflowRun).not.toHaveBeenCalled();
+  expect(container.querySelector("[data-workflow-notice]")?.textContent).toMatch(
+    /Review this workflow before resuming its run/,
+  );
+});
+
 it("notes when the workflow changed since the run started, ignoring board positions", async () => {
   stored = [laneRun({ status: "done" })];
   const moved: Workflow = {

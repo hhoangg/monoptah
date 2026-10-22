@@ -23,10 +23,12 @@ import {
 import { updateWorkflows } from "../model/workflowStore";
 import { inputValueProblems } from "../model/workflowYaml";
 import {
+  NeedsReviewBadge,
   useLiveRunId,
   useWorkflowRuns,
   WorkflowNotice,
   workflowTriggerLabel,
+  type ReviewIntent,
   type WorkflowActions,
 } from "./MonoWorkflows";
 import { exportWorkflowToFile } from "./workflowExportFile";
@@ -124,6 +126,7 @@ export function WorkflowPage({
   onEditBoard,
   onOpenRun,
   onRemove,
+  onReview,
 }: {
   monoId: string;
   workflow: Workflow;
@@ -137,6 +140,8 @@ export function WorkflowPage({
   onOpenRun: (runId: string) => void;
   /** Called once the workflow is removed, to close its page. */
   onRemove: () => void;
+  /** Opens the review a workflow that needs one must pass before it can run or be enabled. */
+  onReview: (intent: ReviewIntent) => void;
 }) {
   const [notice, setNotice] = useState<string>();
   const liveRunId = useLiveRunId(workflow.id);
@@ -183,7 +188,11 @@ export function WorkflowPage({
         <IconButton
           label={running ? "Already running" : starting ? "Starting" : "Run now"}
           disabled={running || starting}
-          onClick={() => void actions.runNow(workflow.id).then(setNotice)}
+          onClick={() =>
+            workflow.needsReview
+              ? onReview("run")
+              : void actions.runNow(workflow.id).then(setNotice)
+          }
         >
           <Zap className="size-3.5" strokeWidth={1.75} />
         </IconButton>
@@ -194,7 +203,11 @@ export function WorkflowPage({
         ) : null}
         <IconButton
           label={workflow.enabled ? "Pause" : "Resume"}
-          onClick={() => void actions.toggle(workflow.id).then(setNotice)}
+          onClick={() =>
+            workflow.needsReview && !workflow.enabled
+              ? onReview("enable")
+              : void actions.toggle(workflow.id).then(setNotice)
+          }
         >
           {workflow.enabled ? (
             <Pause className="size-3.5" strokeWidth={1.75} />
@@ -224,6 +237,11 @@ export function WorkflowPage({
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-none">
         <WorkflowNotice>{notice}</WorkflowNotice>
         <dl className="flex flex-col gap-0.5 px-4 py-3">
+          {workflow.needsReview ? (
+            <Property label="Status">
+              <NeedsReviewBadge />
+            </Property>
+          ) : null}
           <Property label="Runs">
             {workflow.enabled ? workflowTriggerLabel(workflow) : "Paused"}
           </Property>

@@ -21,12 +21,14 @@ import { HABITS_MAX } from "../model/monoHabits";
 import { WORKFLOWS_MAX } from "../../workflows/model/workflow";
 import {
   useWorkflows,
+  type ReviewIntent,
   workflowActions,
   WorkflowsList,
 } from "../../workflows/ui/MonoWorkflows";
 import { WorkflowBoard } from "../../workflows/ui/board/WorkflowBoard";
 import { ImportWorkflowPage } from "../../workflows/ui/ImportWorkflowPage";
 import { WorkflowPage } from "../../workflows/ui/WorkflowPage";
+import { WorkflowReviewPage } from "../../workflows/ui/WorkflowReviewPage";
 import { WorkflowRunPage } from "../../workflows/ui/WorkflowRunPage";
 import { HabitPage } from "./HabitPage";
 import { NewHabitPage } from "./NewHabitPage";
@@ -85,6 +87,7 @@ type Route =
   | { kind: "workflow"; id: string }
   | { kind: "workflow-run"; id: string; runId: string }
   | { kind: "workflow-board"; id: string }
+  | { kind: "workflow-review"; id: string; intent: ReviewIntent }
   | { kind: "new-workflow" }
   | { kind: "import-workflow" };
 
@@ -229,7 +232,8 @@ export function MonoOverview({
     if (
       route.kind === "workflow" ||
       route.kind === "workflow-run" ||
-      route.kind === "workflow-board"
+      route.kind === "workflow-board" ||
+      route.kind === "workflow-review"
     ) {
       // A workflow removed while open closes its pages.
       const workflow = workflows?.find((entry) => entry.id === route.id);
@@ -244,6 +248,24 @@ export function MonoOverview({
                 workflow={workflow}
                 color={agent.color}
                 projects={agent.projects}
+                onBack={back}
+                onReview={(intent) =>
+                  push({ kind: "workflow-review", id: route.id, intent })
+                }
+              />
+            ),
+          },
+        ];
+      if (route.kind === "workflow-review")
+        return [
+          {
+            key: `workflow-review:${route.id}:${depth}`,
+            node: (
+              <WorkflowReviewPage
+                workflow={workflow}
+                intent={route.intent}
+                color={agent.color}
+                actions={workflowOps}
                 onBack={back}
               />
             ),
@@ -282,6 +304,9 @@ export function MonoOverview({
                 push({ kind: "workflow-run", id: route.id, runId })
               }
               onRemove={back}
+              onReview={(intent) =>
+                push({ kind: "workflow-review", id: route.id, intent })
+              }
             />
           ),
         },
@@ -514,6 +539,9 @@ export function MonoOverview({
               workflows={workflows}
               actions={workflowOps}
               onOpen={(id) => push({ kind: "workflow", id })}
+              onReview={(id, intent) =>
+                push({ kind: "workflow-review", id, intent })
+              }
               empty={
                 <EmptyState icon={Workflow}>
                   Ask {agent.name} to chain sessions into a workflow, or create

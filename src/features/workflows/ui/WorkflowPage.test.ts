@@ -36,6 +36,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   files.clear();
   runs = [];
+  onReview.mockReset();
   save.mockClear();
   writeTextFile.mockClear();
   container = document.createElement("div");
@@ -49,6 +50,8 @@ afterEach(() => {
 });
 
 const stored = (): Workflow[] => JSON.parse(files.get("workflows.json") ?? "[]");
+
+const onReview = vi.fn();
 
 async function renderPage(w: Workflow, onOpenRun = vi.fn(), onRemove = vi.fn()) {
   files.set("workflows.json", JSON.stringify([w]));
@@ -67,6 +70,7 @@ async function renderPage(w: Workflow, onOpenRun = vi.fn(), onRemove = vi.fn()) 
         onEditBoard: () => {},
         onOpenRun,
         onRemove,
+        onReview,
       }),
     ),
   );
@@ -158,4 +162,21 @@ it("Remove is refused with a notice while a run is going", async () => {
   expect(stored()).toHaveLength(1);
   expect(onRemove).not.toHaveBeenCalled();
   expect(notice()?.textContent).toMatch(/Stop the workflow before removing it/);
+});
+
+it("shows a Needs review badge only on a workflow that needs it", async () => {
+  await renderPage(workflow());
+  expect(container.querySelector("[data-needs-review]")).toBeNull();
+  await renderPage(workflow({ needsReview: true }));
+  expect(container.querySelector("[data-needs-review]")?.textContent).toBe("Needs review");
+});
+
+it("Run now and Resume on a workflow that needs review open the review instead", async () => {
+  await renderPage(workflow({ enabled: false, needsReview: true }));
+  await act(async () => button("Run now").click());
+  expect(onReview).toHaveBeenLastCalledWith("run");
+  await act(async () => button("Resume").click());
+  expect(onReview).toHaveBeenLastCalledWith("enable");
+  expect(stored()[0]).toMatchObject({ enabled: false, needsReview: true });
+  expect(stored()[0].runRequested).toBeUndefined();
 });

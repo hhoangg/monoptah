@@ -54,7 +54,12 @@ import {
 import { validateWorkflow, type WorkflowIssue } from "../../model/workflowParse";
 import { loadWorkflows, updateWorkflows } from "../../model/workflowStore";
 import { inputValueProblems } from "../../model/workflowYaml";
-import { useLiveRunId, workflowActions, WorkflowNotice } from "../MonoWorkflows";
+import {
+  useLiveRunId,
+  workflowActions,
+  WorkflowNotice,
+  type ReviewIntent,
+} from "../MonoWorkflows";
 import { exportWorkflowToFile } from "../workflowExportFile";
 import {
   blankWorkflow,
@@ -95,6 +100,7 @@ type Meta = Pick<Workflow, "name" | "description" | "enabled" | "inputs" | "inpu
 const ARROW = { type: MarkerType.ArrowClosed, width: 12, height: 12, color: "currentColor" } as const;
 const LOOP_ARROW = { ...ARROW, color: "var(--mono-color)" } as const;
 const DEFAULT_LOOP: LoopSpec = { maxRounds: 3, decide: "mono" };
+const REVIEW_FIRST = "Review this workflow before enabling it.";
 
 function metaOf(w: Workflow): Meta {
   return {
@@ -160,8 +166,6 @@ function merged(stored: Workflow | undefined, next: Workflow, now: number): Work
     edges,
     enabled,
   } as Workflow;
-  // Saving it enabled, with every step in view, is the review a CLI import was waiting for.
-  if (enabled) delete base.needsReview;
   const trigger = triggerOf(base);
   if (!enabled || trigger?.type !== "schedule") return base;
   // A schedule that is unchanged keeps its place; a new, edited or resumed one starts afresh.
@@ -238,6 +242,8 @@ type Props = {
   /** The Mono's projects, for the steps and inputs that name one. */
   projects: readonly MonoProject[];
   onBack: () => void;
+  /** Opens the review a stored workflow that needs one must pass before it can run or be enabled. */
+  onReview?: (intent: ReviewIntent) => void;
 };
 
 /**
@@ -252,7 +258,7 @@ export function WorkflowBoard(props: Props) {
   );
 }
 
-function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
+function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () => {} }: Props) {
   const flow = useReactFlow();
   const [base, setBase] = useState<Workflow>(() => workflow ?? blankWorkflow());
   const [board, setBoard] = useState<Board>(() => boardOf(base));
@@ -286,7 +292,9 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
   const issues = useMemo(() => problemsOf(current), [current]);
   const byNode = useMemo(() => issuesByNode(issues), [issues]);
   const changed = definitionKey(current) !== baseline;
-  const blocked = current.enabled && issues.length > 0;
+  // Enabling goes through the review, never through Save.
+  const unreviewed = !!base.needsReview && current.enabled;
+  const blocked = current.enabled && (issues.length > 0 || unreviewed);
 
   // The latest of these, for handlers that outlive a render.
   const live = useRef({ current, changed, baseline, seen: baseline });
@@ -553,6 +561,8 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
         const stored = list.find((w) => w.id === next.id);
         if (!stored && list.length >= WORKFLOWS_MAX)
           throw new Error(`At most ${WORKFLOWS_MAX} workflows.`);
+        // The stored copy decides, not what this board loaded: it may have been flagged since.
+        if (stored?.needsReview && next.enabled) throw new Error(REVIEW_FIRST);
         const result = merged(stored, next, Date.now());
         return {
           workflows: stored ? list.map((w) => (w.id === next.id ? result : w)) : [...list, result],
@@ -582,7 +592,11 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
       return true;
     } catch (error) {
       console.warn("Could not save the workflow", error);
-      setNotice(error instanceof Error && /^At most/.test(error.message) ? error.message : "Could not save the workflow.");
+      setNotice(
+        error instanceof Error && (/^At most/.test(error.message) || error.message === REVIEW_FIRST)
+          ? error.message
+          : "Could not save the workflow.",
+      );
       return false;
     } finally {
       setSaving(false);
@@ -598,6 +612,7 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
 
   const runNow = async () => {
     setMenu(false);
+    if (base.needsReview) return onReview("run");
     setNotice(await workflowActions(monoId).runNow(current.id));
   };
 
@@ -683,6 +698,32 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
         </div>
       ) : null}
 
+      {unreviewed ? (
+        <div
+          data-board-review
+          className="flex items-center gap-2 border-b border-stroke px-4 py-1.5 text-[11px] leading-4 text-content/60"
+        >
+          <span className="min-w-0 flex-1">{REVIEW_FIRST}</span>
+          <button
+            type="button"
+            onClick={() => onReview("enable")}
+            className="shrink-0 rounded px-1.5 py-0.5 text-content/70 hover:bg-content/8 hover:text-content"
+          >
+            Review
+          </button>
+          {problemCount ? null : (
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => void save(true)}
+              className="shrink-0 rounded px-1.5 py-0.5 text-content/70 hover:bg-content/8 hover:text-content disabled:opacity-40"
+            >
+              Save paused
+            </button>
+          )}
+        </div>
+      ) : null}
+
       {problemCount ? (
         <div
           data-board-issues
@@ -701,7 +742,7 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
               </span>
               <span className="min-w-0 truncate text-content/45">{issues[0].message}</span>
             </button>
-            {blocked ? (
+            {current.enabled ? (
               <button
                 type="button"
                 disabled={saving}
@@ -825,6 +866,7 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
             label={current.enabled ? "Pause" : "Resume"}
             onClick={() => {
               setMenu(false);
+              if (base.needsReview && !current.enabled) return onReview("enable");
               setMeta((m) => ({ ...m, enabled: !m.enabled }));
             }}
           />
@@ -872,7 +914,11 @@ function BoardEditor({ monoId, workflow, color, projects, onBack }: Props) {
           <div className="flex flex-col gap-3 px-4 pb-4 pt-3">
             <p className="text-[13px] leading-5 text-content/70">
               {blocked
-                ? "This workflow has changes you have not saved, and problems that keep it from being saved while enabled."
+                ? `This workflow has changes you have not saved, and ${
+                    issues.length
+                      ? "problems that keep it from being saved while enabled"
+                      : "it needs a review before it can be enabled"
+                  }.`
                 : "This workflow has changes you have not saved."}
             </p>
             <div className="flex justify-end gap-2 pt-1">

@@ -220,6 +220,9 @@ export function WorkflowRunPage({
     }
   };
   const resume = () => {
+    // The driver would pick it up from the file; the review comes first, in the panel.
+    if (current?.needsReview)
+      return setNotice("Review this workflow before resuming its run.");
     // Two runs of one workflow would race over its files; this one waits for the other.
     if (liveRunOf(workflowId))
       return setNotice(

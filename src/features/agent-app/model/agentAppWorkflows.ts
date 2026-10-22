@@ -44,8 +44,9 @@ const DEFINITION_FIELDS = [
 const NAME_MAX = 80;
 const DESCRIPTION_MAX = 1_000;
 const DEFINITION_MAX_BYTES = 512 * 1024;
+const NOT_ENABLED = "Resume the workflow before running it.";
 const NEEDS_REVIEW =
-  "This workflow was imported through the CLI. Ask the user to review it and enable it in the Workflows panel.";
+  "This workflow came from a file and the user has not reviewed it yet. Ask the user to review it and enable it in the Workflows panel.";
 const RUNS_DEFAULT = 5;
 const RUNS_MAX = 20;
 
@@ -446,9 +447,12 @@ export async function handleWorkflows(
       const issues = problems(current);
       if (issues.length)
         throw new Error(`The workflow cannot run yet: ${issuesText(issues)}`);
+      // A paused workflow is paused on purpose; running it would go around that.
+      if (!current.enabled) throw new Error(NOT_ENABLED);
       await change((list) => {
         const latest = find(list);
         if (latest.needsReview) throw new Error(NEEDS_REVIEW);
+        if (!latest.enabled) throw new Error(NOT_ENABLED);
         return { list: replace(list, { ...latest, runRequested: true }), result: undefined };
       });
       workflows.checkNow();
@@ -481,6 +485,7 @@ export async function handleWorkflows(
     case "workflows.resumeRun": {
       const runId = text(input.runId, "runId", 128);
       const current = find(await workflows.load(monoId));
+      if (current.needsReview) throw new Error(NEEDS_REVIEW);
       if (running(current.id))
         throw new Error("That workflow is already running");
       const run = (await workflows.runs(monoId, current.id)).find(

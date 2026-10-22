@@ -1,13 +1,14 @@
 // @vitest-environment happy-dom
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { habitScheduleLabel } from "../../monos/model/monoHabits";
-import type { Workflow, WorkflowRun } from "../model/workflow";
+import { definitionFingerprint, type Workflow, type WorkflowRun } from "../model/workflow";
 import { setWorkflowRunning } from "../model/workflowStore";
 import {
   WorkflowsList,
   useWorkflows,
+  type ReviewIntent,
   workflowActions,
   type WorkflowActions,
 } from "./MonoWorkflows";
@@ -40,6 +41,7 @@ beforeEach(() => {
   files.clear();
   runs = [];
   loadCount = 0;
+  onReview.mockReset();
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -55,13 +57,20 @@ const save = (list: Workflow[]) =>
 const saved = (): Workflow[] => JSON.parse(files.get("workflows.json") ?? "[]");
 
 /** The tab as the overview mounts it: the Mono's workflows, loaded, in the list. */
-function Panel({ actions }: { actions: WorkflowActions }) {
+function Panel({
+  actions,
+  onReview,
+}: {
+  actions: WorkflowActions;
+  onReview: (id: string, intent: ReviewIntent) => void;
+}) {
   const workflows = useWorkflows("mono-1", "idle");
   return createElement(WorkflowsList, {
     monoId: "mono-1",
     workflows,
     actions,
     onOpen: () => {},
+    onReview,
     empty: createElement(
       "p",
       null,
@@ -70,11 +79,13 @@ function Panel({ actions }: { actions: WorkflowActions }) {
   });
 }
 
+const onReview = vi.fn<(id: string, intent: ReviewIntent) => void>();
+
 async function renderPanel(
   actions: WorkflowActions = workflowActions("mono-1"),
 ) {
   await act(async () =>
-    root.render(createElement(Panel, { actions })),
+    root.render(createElement(Panel, { actions, onReview })),
   );
 }
 
@@ -201,27 +212,112 @@ it("Remove is refused while a run is going", async () => {
   );
 });
 
-it("Resume by the user ends the review a CLI import was waiting for", async () => {
+it("a row that needs review says so, and others do not", async () => {
+  save([
+    workflow({ id: "wf-flagged1", name: "Imported", needsReview: true }),
+    workflow({ id: "wf-plain001", name: "Mine" }),
+  ]);
+  await renderPanel();
+  const [flagged, plain] = rows();
+  expect(flagged.querySelector("[data-needs-review]")?.textContent).toBe("Needs review");
+  expect(plain.querySelector("[data-needs-review]")).toBeNull();
+});
+
+it("Resume on a workflow that needs review opens the review instead of enabling it", async () => {
   save([scheduled({ enabled: false, nextRunAt: undefined, needsReview: true })]);
   await renderPanel();
   await act(async () => button("Resume").click());
-  expect(saved()[0].enabled).toBe(true);
-  expect(saved()[0].needsReview).toBeUndefined();
+  expect(onReview).toHaveBeenCalledWith("wf-aaaaaaaa", "enable");
+  expect(saved()[0]).toMatchObject({ enabled: false, needsReview: true });
+  expect(saved()[0].nextRunAt).toBeUndefined();
 });
 
-it("Resume that is refused keeps the review pending", async () => {
-  save([workflow({ enabled: false, nodes: [], edges: [], needsReview: true })]);
-  await renderPanel();
-  await act(async () => button("Resume").click());
-  expect(saved()[0].needsReview).toBe(true);
-});
-
-it("Run now by the user ends the review a CLI import was waiting for", async () => {
+it("Run now on a workflow that needs review opens the review instead of running it", async () => {
   save([workflow({ enabled: false, needsReview: true })]);
   await renderPanel();
   await act(async () => button("Run now").click());
-  expect(saved()[0].runRequested).toBe(true);
-  expect(saved()[0].needsReview).toBeUndefined();
+  expect(onReview).toHaveBeenCalledWith("wf-aaaaaaaa", "run");
+  expect(saved()[0].runRequested).toBeUndefined();
+  expect(saved()[0].needsReview).toBe(true);
+});
+
+it("the actions themselves refuse a flagged workflow, whoever calls them", async () => {
+  save([workflow({ enabled: false, needsReview: true })]);
+  const actions = workflowActions("mono-1");
+  expect(await actions.runNow("wf-aaaaaaaa")).toMatch(/Review this workflow/);
+  expect(await actions.toggle("wf-aaaaaaaa")).toMatch(/Review this workflow/);
+  expect(saved()[0]).toMatchObject({ enabled: false, needsReview: true });
+  expect(saved()[0].runRequested).toBeUndefined();
+});
+
+describe("approve", () => {
+  const fingerprint = (w: Workflow) => definitionFingerprint(w);
+
+  it("clears the mark and enables the workflow, counting the next run from now", async () => {
+    const w = scheduled({ enabled: false, nextRunAt: undefined, needsReview: true });
+    save([w]);
+    expect(await workflowActions("mono-1").approve(w.id, "enable", fingerprint(w))).toEqual({
+      kind: "done",
+    });
+    expect(saved()[0].enabled).toBe(true);
+    expect(saved()[0].needsReview).toBeUndefined();
+    expect(saved()[0].nextRunAt).toBeGreaterThan(Date.now());
+  });
+
+  it("clears the mark and asks for a run", async () => {
+    const w = workflow({ enabled: false, needsReview: true });
+    save([w]);
+    expect(await workflowActions("mono-1").approve(w.id, "run", fingerprint(w))).toEqual({
+      kind: "done",
+    });
+    expect(saved()[0]).toMatchObject({ runRequested: true, enabled: false });
+    expect(saved()[0].needsReview).toBeUndefined();
+  });
+
+  it("changes nothing when the stored definition is not the one that was reviewed", async () => {
+    const reviewed = workflow({
+      enabled: false,
+      needsReview: true,
+      nodes: [
+        { id: "trigger", type: "manual" },
+        { id: "build", type: "command", project: "{{inputs.project}}", command: "npm test" },
+        { id: "report", type: "report" },
+      ],
+      edges: [
+        { from: "trigger", to: "build" },
+        { from: "build", to: "report" },
+      ],
+    });
+    const swapped: Workflow = {
+      ...reviewed,
+      nodes: reviewed.nodes.map((n) =>
+        n.type === "command" ? { ...n, command: "rm -rf ~" } : n,
+      ),
+    };
+    save([swapped]);
+    const result = await workflowActions("mono-1").approve(
+      reviewed.id,
+      "enable",
+      fingerprint(reviewed),
+    );
+    expect(result).toMatchObject({ kind: "changed", workflow: { needsReview: true } });
+    expect(saved()[0]).toEqual(swapped);
+  });
+
+  it("refuses a workflow with problems and keeps the mark", async () => {
+    const w = workflow({ enabled: false, nodes: [], edges: [], needsReview: true });
+    save([w]);
+    const result = await workflowActions("mono-1").approve(w.id, "enable", fingerprint(w));
+    expect(result).toMatchObject({ kind: "refused", notice: expect.stringMatching(/Can't resume/) });
+    expect(saved()[0]).toMatchObject({ enabled: false, needsReview: true });
+  });
+
+  it("does nothing for a workflow that is gone", async () => {
+    save([]);
+    const result = await workflowActions("mono-1").approve("wf-aaaaaaaa", "run", "x");
+    expect(result).toMatchObject({ kind: "refused" });
+    expect(saved()).toEqual([]);
+  });
 });
 
 it("Pause leaves a pending review alone", async () => {

@@ -202,6 +202,8 @@ it("imported workflow is saved paused", async () => {
   expect(saved.id).not.toBe("wf-sourceaaa");
   expect(saved.inputValues).toEqual({ project: "/work/web", area: "the parser" });
   expect(saved.nextRunAt).toBeUndefined();
+  // What came from a file is read again, and approved, before it can run.
+  expect(saved.needsReview).toBe(true);
   expect(onImported).toHaveBeenCalledWith(saved.id);
 });
 
