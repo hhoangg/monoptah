@@ -93,8 +93,11 @@ describe("workflowTemplate", () => {
       ["c: backslash before a bare var", "echo \\{{x}}"],
       ["d: unquoted heredoc", "cat <<EOF\n{{x}}\nEOF"],
       ["e: ANSI-C string with an escaped quote", "echo $'\\' {{x}} '"],
-      ["quote only inside an #if body", "echo {{#if a}}'{{/if}} {{x}}"],
-      ["backslash only inside an #if body", "echo {{#if a}}\\{{/if}} {{x}}"],
+      ["f1: dollar right before a var", "echo ${{x}}"],
+      ["f1: dollar and space before a var", "echo ${{ x }}"],
+      ["f3: comment after a closing paren", "(true)# don't\necho '{{x}}'"],
+      ["f3: comment after an opening paren", "(# don't\necho '{{x}}'"],
+      ["arithmetic expansion", "echo $[1+{{x}}]"],
     ])("flags every var when the text has syntax it cannot follow (%s)", (_name, tpl) => {
       const problems = shellTemplateProblems(tpl);
       expect(problems.some((p) => p.includes("{{x}}"))).toBe(true);
@@ -115,8 +118,20 @@ describe("workflowTemplate", () => {
       expect(shellTemplateProblems("echo 'a\\' {{x}}")).toEqual([]);
     });
 
-    it("reports each var and ignores if tags", () => {
-      expect(shellTemplateProblems('{{#if a}}echo "{{a}} {{b}}"{{/if}}')).toHaveLength(2);
+    it.each([
+      ["f2: comment formed when the #if body is dropped", "echo hi {{#if c}}z{{/if}}# don't\necho '{{x}}'"],
+      ["f2: ANSI-C quote formed when the #if body is dropped", "echo ${{#if c}}z{{/if}}'\\' {{x}} '"],
+      ["f2: heredoc formed when the #if body is dropped", "cat <{{#if c}}z{{/if}}<EOF\n{{x}}\nEOF"],
+      ["f2: #if joins pieces into a var token", 'echo "{{#if a}}{{{/if}}{x}}"'],
+      ["plain #if", "echo {{#if a}}yes{{/if}} {{x}}"],
+    ])("rejects conditionals in command templates (%s)", (_name, tpl) => {
+      const problems = shellTemplateProblems(tpl);
+      expect(problems.length).toBeGreaterThan(0);
+      expect(problems.some((p) => p.includes("conditionals"))).toBe(true);
+    });
+
+    it("keeps conditionals working in renderTemplate for prompts", () => {
+      expect(renderTemplate("a{{#if c}}b{{/if}}", { c: true })).toBe("ab");
     });
   });
 });

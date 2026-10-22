@@ -8,7 +8,12 @@ const VAR = new RegExp(`\\{\\{\\s*(${PATH})\\s*\\}\\}`, "g");
 // Matches either an `#if` opener (capture 1) or a plain variable (capture 2), in text order.
 const ANY_VAR = new RegExp(`\\{\\{#if\\s+(${PATH})\\s*\\}\\}|\\{\\{\\s*(${PATH})\\s*\\}\\}`, "g");
 
-/** POSIX single-quote quoting: the value always reaches the shell as one literal word. */
+/**
+ * POSIX single-quote quoting: the value always reaches the shell as one literal word.
+ * Quoting only protects against word splitting, expansion and operators. A value that a
+ * command later feeds to eval, bash -c, (( )), [[ ]], let, declare -i or an array subscript is
+ * still interpreted by the shell, so command authors must not pass variables to those.
+ */
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -24,7 +29,6 @@ export function templateVars(text: string): string[] {
 }
 
 const VAR_AT = new RegExp(`\\{\\{\\s*(${PATH})\\s*\\}\\}`, "y");
-const IF_OPEN_AT = new RegExp(`\\{\\{#if\\s+${PATH}\\s*\\}\\}`, "y");
 
 const QUOTE_NAMES: Record<string, string> = {
   "'": "single quotes",
@@ -35,51 +39,50 @@ const UNSAFE_MESSAGE =
   "the command uses shell syntax that cannot be quoted safely around variables; " +
   "move the variable to a simple argument or pass it differently";
 
+const IF_MESSAGE = "conditionals ({{#if}}) are not supported in command templates";
+
 /** True when the literal text uses shell syntax this check cannot reason about. */
 function usesUnquotableSyntax(text: string): boolean {
-  // Backslash right before a variable would escape the quote the app adds.
+  // A backslash would escape the quote the app adds; a `$` would turn it into `$'...'`.
   if (/\\\{\{/.test(text)) return true;
-  // A quote or backslash inside an #if body can change quote state only when it renders.
-  for (const m of text.matchAll(IF_BLOCK)) {
-    if (/["'`\\]/.test(m[2])) return true;
-  }
-  // Check the remaining literal text with variables and #if tags removed.
-  const literal = text.replace(IF_BLOCK, "$2").replace(VAR, "X").replace(/\{\{[#/]if[^}]*\}\}/g, "");
+  if (/\$\s*\{\{/.test(text)) return true;
+  const literal = text.replace(VAR, "X");
   if (literal.includes("`") || literal.includes("$(") || literal.includes("$'")) return true;
-  if (literal.includes("<<")) return true;
-  // An unquoted-looking `#` at the start of a word may start a comment that swallows quotes.
-  return /(^|[\s;&|(])#/.test(literal);
+  if (literal.includes("$[") || literal.includes("<<")) return true;
+  // A `#` at the start of a word starts a comment that can swallow quotes.
+  return /(^|[\s;&|()])#/.test(literal);
 }
 
 /**
- * Problems with using `text` as a shell command template: one message per `{{var}}` that sits
- * inside quotes in the literal text. The app quotes every value itself, so a variable written
- * inside quotes would be wrapped twice and its value could break out of the author's quotes.
+ * Problems with using `text` as a shell command template, as readable messages.
+ *
+ * Covers quoting context only. The app single-quotes every value, so a variable written
+ * inside the author's own quotes would be wrapped twice and could break out of them. Values
+ * passed to eval, bash -c, (( )), [[ ]], let, declare -i or array subscripts are still
+ * interpreted by the shell, so command authors must not feed variables to those.
  *
  * Deliberately conservative: this is a simple quote tracker, not a shell parser. A variable is
  * accepted only in a clearly bare context. If the text uses syntax the tracker cannot follow
- * (backticks, `$(`, `$'`, heredocs, comments, a backslash before a variable, quotes inside an
- * #if body), every variable is reported instead.
+ * (backticks, `$(`, `$'`, `$[`, heredocs, comments, `$` or a backslash before a variable),
+ * every variable is reported instead. Conditionals are rejected outright: whether an #if body
+ * renders changes the surrounding quote state, so no static check can cover both branches.
  */
 export function shellTemplateProblems(text: string): string[] {
-  if (usesUnquotableSyntax(text)) {
-    return [...text.matchAll(VAR)]
-      .filter((m) => !m[1].startsWith("/"))
-      .map((m) => `{{${m[1]}}}: ${UNSAFE_MESSAGE}`);
+  const everyVar = (message: string) =>
+    [...text.matchAll(VAR)].filter((m) => !m[1].startsWith("/")).map((m) => `{{${m[1]}}}: ${message}`);
+  if (text.includes("{{#if") || text.includes("{{/if}}")) {
+    return [IF_MESSAGE, ...everyVar(IF_MESSAGE)];
   }
+  if (usesUnquotableSyntax(text)) return everyVar(UNSAFE_MESSAGE);
+
   const problems: string[] = [];
   let quote: string | null = null;
   let i = 0;
   while (i < text.length) {
     if (text.startsWith("{{", i)) {
-      IF_OPEN_AT.lastIndex = i;
-      if (IF_OPEN_AT.test(text)) {
-        i = IF_OPEN_AT.lastIndex;
-        continue;
-      }
       VAR_AT.lastIndex = i;
       const m = VAR_AT.exec(text);
-      if (m && !m[1].startsWith("/")) {
+      if (m) {
         if (quote) {
           problems.push(
             `{{${m[1]}}} is inside ${QUOTE_NAMES[quote]}; write it bare, the app quotes it for the shell`,
