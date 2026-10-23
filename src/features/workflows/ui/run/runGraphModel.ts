@@ -93,6 +93,12 @@ function short(text: string): string {
   return flat.length > LABEL_MAX ? `${flat.slice(0, LABEL_MAX - 3)}...` : flat;
 }
 
+/** How long a node that has finished took, when it is long enough to say. */
+function took(r: NodeRun | undefined): string[] {
+  if (r?.startedAt === undefined || r.endedAt === undefined || r.endedAt - r.startedAt < 1000) return [];
+  return [span(r.endedAt - r.startedAt)];
+}
+
 function labelOf(r: NodeRun | undefined, status: RunNodeStatus, now: number): string {
   const parts: string[] = [];
   switch (status) {
@@ -101,9 +107,8 @@ function labelOf(r: NodeRun | undefined, status: RunNodeStatus, now: number): st
       if (r?.decision) {
         const reason = r.decision.reason ? `: ${short(r.decision.reason)}` : "";
         parts.push(`${r.decision.value}${reason}`);
-      } else if (r?.startedAt !== undefined && r.endedAt !== undefined && r.endedAt - r.startedAt >= 1000) {
-        parts.push(span(r.endedAt - r.startedAt));
       }
+      parts.push(...took(r));
       break;
     }
     case "running":
@@ -113,13 +118,13 @@ function labelOf(r: NodeRun | undefined, status: RunNodeStatus, now: number): st
       parts.push(r && isAsking(r) ? "Asking the Mono" : "Waiting for approval");
       break;
     case "failed":
-      parts.push(r?.error ? `Failed: ${short(r.error)}` : "Failed");
+      parts.push(r?.error ? `Failed: ${short(r.error)}` : "Failed", ...took(r));
       break;
     case "skipped":
       parts.push("Skipped");
       break;
     case "stopped":
-      parts.push("Stopped");
+      parts.push("Stopped", ...took(r));
       break;
     case "pending":
       parts.push("Not started");
@@ -181,12 +186,14 @@ function roundsOf(run: WorkflowRun, group: ForEach): Rounds {
     if (Number.isInteger(tail) && tail > 0 && key === archivedItemsKey(group.id, tail)) archived.add(tail);
   }
   const liveItems = items[group.id];
+  const own = (run.nodes ?? []).find((n) => n.nodeId === group.id && n.branch === "")?.round ?? 1;
+  const lastArchived = Math.max(0, ...archived);
   let live: number | undefined;
-  if (Array.isArray(liveItems)) {
-    const own = (run.nodes ?? []).find((n) => n.nodeId === group.id && n.branch === "")?.round ?? 1;
-    live = Math.max(own, Math.max(0, ...archived) + 1);
-  }
-  const rounds = [...archived, ...(live !== undefined ? [live] : [])].sort((a, b) => a - b);
+  if (Array.isArray(liveItems)) live = Math.max(own, lastArchived + 1);
+  // A loop sent the group round again but it has not expanded (yet, or it failed): that round is
+  // the current one even though it has no items, so it is what shows by default.
+  const current = live ?? (lastArchived > 0 && own > lastArchived ? own : undefined);
+  const rounds = [...archived, ...(current !== undefined ? [current] : [])].sort((a, b) => a - b);
   const list = (round: number): unknown[] | undefined => {
     const found = round === live ? liveItems : items[archivedItemsKey(group.id, round)];
     return Array.isArray(found) ? found : undefined;
@@ -259,10 +266,13 @@ export function groupViews(
         chosen !== undefined && chosen >= 0 && chosen < count
           ? chosen
           : Math.max(0, items.findIndex((i) => i.status === "running" || i.status === "waiting"));
-      const own = byKey.get(nodeRunKey(group.id, ""));
       let summary: string;
-      if (count === 0) summary = own?.status === "failed" && own.error ? own.error : "No items";
-      else {
+      if (list !== undefined && list.length === 0) summary = "No items";
+      else if (count === 0) {
+        // Not expanded in this round: say where the group stands, or why it failed.
+        const own = byKey.get(nodeRunKey(group.id, ""));
+        summary = own?.status === "failed" && own.error ? own.error : stateOf(byKey, group.id, "", 0).label;
+      } else {
         const counts = SUMMARY_ORDER.map((s) => [s, items.filter((i) => i.status === s).length] as const);
         summary = counts.filter(([, n]) => n > 0).map(([s, n]) => `${n} ${s}`).join(" · ");
       }
@@ -270,10 +280,18 @@ export function groupViews(
     });
 }
 
-/** Lanes when every For each is small (up to 4 items, up to 3 nodes in it), else one lane at a time. */
+/** The width of one lane of a group: its children's snapshot layout, left padding left out. */
+function laneWidthOf(kids: readonly FlowNode[]): number {
+  return Math.max(NODE_W, ...kids.map((k) => k.position.x + NODE_W - GROUP_PAD));
+}
+
+/** Lanes when every For each is small (up to 4 items, up to 3 narrow nodes in it), else one lane at a time. */
 export function defaultRunView(run: WorkflowRun): RunView {
+  const flow = toFlow(run.definition).nodes;
   for (const group of run.definition.nodes) {
     if (group.type !== "forEach") continue;
+    // Children laid out side by side make a lane too wide to repeat.
+    if (laneWidthOf(flow.filter((n) => n.parentId === group.id)) > NODE_W * 1.5) return "single";
     const info = roundsOf(run, group);
     const items = Math.max(0, ...info.rounds.map((r) => info.count(r)));
     if (items > LANES_MAX_ITEMS || childrenOf(run, group.id).length > LANES_MAX_CHILDREN) return "single";
@@ -296,28 +314,38 @@ function edgeState(def: WorkflowEdge, branch: BranchKey, byKey: Map<string, Node
   if (source.status !== "done") return "idle";
   if (def.handle && source.decision?.value !== def.handle) return "idle";
   if (target && (target.status === "running" || target.status === "waitingApproval")) return "active";
-  // The decision alone takes an If side; any other edge is taken once its target has started.
-  const started = target !== undefined && target.status !== "pending" && target.status !== "skipped";
-  return def.handle || started ? "taken" : "idle";
+  return "taken";
 }
 
 // --- the graph --------------------------------------------------------------------------------
 
 type Box = { x: number; y: number; w: number; h: number };
 
-/** Moves what a grown group would now cover: the nodes to its right, then the nodes below it. */
-function pushAway(boxes: Map<NodeId, Box>, id: NodeId, grow: { dx: number; dy: number }): void {
+/**
+ * Makes room for a box that grows by `dx` and `dy` (a group that got lanes) or moves by them:
+ * what sits to its right moves right, what sits below moves down, and those moves cascade, so
+ * nothing ends up covered. Boxes only ever move right or down, so it ends.
+ */
+function shove(boxes: Map<NodeId, Box>, id: NodeId, dx: number, dy: number, moves: boolean): void {
   const g = boxes.get(id) as Box;
-  for (const [other, b] of boxes) {
-    if (other === id || grow.dx <= 0) continue;
-    if (b.x >= g.x + g.w && b.y < g.y + g.h && b.y + b.h > g.y) b.x += grow.dx;
+  const old = { ...g };
+  if (dx > 0) {
+    for (const [other, b] of boxes) {
+      if (other !== id && b.x >= old.x + old.w && b.y < old.y + old.h && b.y + b.h > old.y) shove(boxes, other, dx, 0, true);
+    }
   }
-  for (const [other, b] of boxes) {
-    if (other === id || grow.dy <= 0) continue;
-    if (b.y >= g.y + g.h && b.x < g.x + g.w + grow.dx && b.x + b.w > g.x) b.y += grow.dy;
+  if (dy > 0) {
+    for (const [other, b] of boxes) {
+      if (other !== id && b.y >= old.y + old.h && b.x < old.x + old.w + dx && b.x + b.w > old.x) shove(boxes, other, 0, dy, true);
+    }
   }
-  g.w += grow.dx;
-  g.h += grow.dy;
+  if (moves) {
+    g.x += dx;
+    g.y += dy;
+  } else {
+    g.w += dx;
+    g.h += dy;
+  }
 }
 
 export function runGraph(
@@ -350,8 +378,7 @@ export function runGraph(
       const kids = base.nodes.filter((n) => n.parentId === flow.id);
       const picked = gv ? (view === "lanes" ? gv.items : gv.items.filter((i) => i.index === gv.item)) : [];
       const picks = kids.length === 0 ? [] : picked;
-      const right = Math.max(GROUP_PAD + NODE_W, ...kids.map((k) => k.position.x + NODE_W));
-      const laneW = right - GROUP_PAD;
+      const laneW = laneWidthOf(kids);
       lanes.set(
         flow.id,
         picks.map((item, k) => ({
@@ -364,7 +391,7 @@ export function runGraph(
         ...flow,
         data: {
           ...flow.data,
-          run: { ...stateOf(byKey, flow.id, "", now), label: gv?.summary ?? "No items" },
+          run: { ...stateOf(byKey, flow.id, "", now), label: gv?.summary ?? stateOf(byKey, flow.id, "", now).label },
           loopIn: loopTo.has(flow.id),
           loopOut: loopFrom.has(flow.id),
         },
@@ -386,7 +413,10 @@ export function runGraph(
   const order = [...growth.keys()].sort(
     (a, b) => (boxes.get(a)?.y ?? 0) - (boxes.get(b)?.y ?? 0) || (boxes.get(a)?.x ?? 0) - (boxes.get(b)?.x ?? 0),
   );
-  for (const id of order) pushAway(boxes, id, growth.get(id) as { dx: number; dy: number });
+  for (const id of order) {
+    const { dx, dy } = growth.get(id) as { dx: number; dy: number };
+    shove(boxes, id, dx, dy, false);
+  }
   for (const n of nodes) {
     const box = boxes.get(n.id);
     if (!box) continue;

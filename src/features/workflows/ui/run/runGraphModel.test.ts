@@ -102,7 +102,24 @@ it("linear run maps statuses and labels", () => {
   expect(stateOf(nodes, "dev")?.nodeRunKey).toBe("dev|");
   expect(stateOf(nodes, "report")?.status).toBe("pending");
   expect(edgeOf(edges, "trigger", "dev")?.data?.run).toBe("taken");
-  expect(edgeOf(edges, "dev", "report")?.data?.run).toBe("idle");
+  // Spec 5.1: a done source takes its edge even though the target has not started.
+  expect(edgeOf(edges, "dev", "report")?.data?.run).toBe("taken");
+});
+
+it("an edge out of a done node is taken whether its target is pending or skipped", () => {
+  for (const target of ["pending", "skipped"] as const) {
+    const r = run({
+      definition: linear,
+      nodes: [nr("trigger"), nr("dev"), nr("report", { status: target })],
+    });
+    const { edges } = runGraph(r, "lanes", groupViews(r));
+    expect(edgeOf(edges, "dev", "report")?.data?.run).toBe("taken");
+  }
+  const notDone = run({
+    definition: linear,
+    nodes: [nr("trigger"), nr("dev", { status: "failed" }), nr("report", { status: "pending" })],
+  });
+  expect(edgeOf(runGraph(notDone, "lanes", groupViews(notDone)).edges, "dev", "report")?.data?.run).toBe("idle");
 });
 
 it("if marks only the taken side", () => {
@@ -134,17 +151,33 @@ it("if marks only the taken side", () => {
   expect(stateOf(nodes, "check")?.label).toBe("Done · true");
 });
 
+it("keeps the duration next to a decision, a failure or a stop", () => {
+  const r = run({
+    definition: linear,
+    nodes: [
+      nr("trigger", { decision: { value: "loop", reason: "needs tests" }, startedAt: 0, endedAt: 12_000 }),
+      nr("dev", { status: "failed", error: "Exit code 2", startedAt: 0, endedAt: 65_000 }),
+      nr("report", { status: "stopped", startedAt: 0, endedAt: 3000 }),
+    ],
+  });
+  const { nodes } = runGraph(r, "lanes", groupViews(r));
+  expect(stateOf(nodes, "trigger")?.label).toBe("Done · loop: needs tests · 12s");
+  expect(stateOf(nodes, "dev")?.label).toBe("Failed: Exit code 2 · 1m 5s");
+  expect(stateOf(nodes, "report")?.label).toBe("Stopped · 3s");
+});
+
 it("running node and active edge", () => {
+  const now = 1_000_000_000;
   const r = run({
     definition: linear,
     status: "running",
     nodes: [
       nr("trigger"),
-      nr("dev", { status: "running", startedAt: Date.now() - 180_000 }),
+      nr("dev", { status: "running", startedAt: now - 180_000 }),
       nr("report", { status: "pending" }),
     ],
   });
-  const { nodes, edges } = runGraph(r, "lanes", groupViews(r));
+  const { nodes, edges } = runGraph(r, "lanes", groupViews(r), now);
   expect(stateOf(nodes, "dev")?.status).toBe("running");
   expect(stateOf(nodes, "dev")?.label).toBe("Running 3m");
   expect(edgeOf(edges, "trigger", "dev")?.data?.run).toBe("active");
@@ -366,4 +399,88 @@ it("shows the round on a node that looped and a loop edge as taken", () => {
   expect(loop?.data?.run).toBe("taken");
   expect(nodes.find((n) => n.id === "review")?.data.loopOut).toBe(true);
   expect(nodes.find((n) => n.id === "dev")?.data.loopIn).toBe(true);
+});
+
+it("a For each in a loop whose current round failed shows that round", () => {
+  const r = run({
+    definition: eachWorkflow(),
+    items: { "each@r1": [{ title: "Old A" }] },
+    nodes: [
+      nr("trigger"),
+      nr("each", { status: "failed", round: 2, error: "Expected a list for {{trigger.tickets}}" }),
+      nr("dev", { branch: "each#0@r1" }),
+      nr("review", { branch: "each#0@r1" }),
+    ],
+  });
+  const [group] = groupViews(r);
+  expect(group.rounds).toEqual([1, 2]);
+  expect(group.round).toBe(2);
+  expect(group.items).toEqual([]);
+  expect(group.summary).toBe("Expected a list for {{trigger.tickets}}");
+  expect(children(runGraph(r, "lanes", [group]).nodes)).toHaveLength(0);
+  const [old] = groupViews(r, { each: { round: 1 } });
+  expect(old.summary).toBe("1 done");
+});
+
+it("No items is only for a For each that expanded to an empty list", () => {
+  const states: [Partial<NodeRun>, string][] = [
+    [{ status: "pending" }, "Not started"],
+    [{ status: "skipped" }, "Skipped"],
+    [{ status: "failed", error: "boom" }, "boom"],
+  ];
+  for (const [own, summary] of states) {
+    const r = run({ definition: eachWorkflow(), items: {}, nodes: [nr("trigger"), nr("each", own)] });
+    expect(groupViews(r)[0].summary).toBe(summary);
+  }
+  const noRecord = run({ definition: eachWorkflow(), items: {}, nodes: [nr("trigger")] });
+  expect(groupViews(noRecord)[0].summary).toBe("Not started");
+  const group = runGraph(noRecord, "lanes", groupViews(noRecord)).nodes.find((n) => n.id === "each");
+  expect(group?.data.run?.label).toBe("Not started");
+  const empty = run({
+    definition: eachWorkflow(),
+    items: { each: [] },
+    nodes: [nr("trigger"), nr("each")],
+  });
+  expect(groupViews(empty)[0].summary).toBe("No items");
+});
+
+it("defaults to single view when the children sit side by side", () => {
+  const w = eachWorkflow();
+  w.nodes = w.nodes.map((n) =>
+    n.id === "dev" ? { ...n, ui: { x: 16, y: 32 } } : n.id === "review" ? { ...n, ui: { x: 300, y: 32 } } : n,
+  );
+  expect(defaultRunView(eachRun(2, { definition: w }))).toBe("single");
+});
+
+it("moves everything a grown group would cover, cascading", () => {
+  const w = eachWorkflow();
+  const place = (id: string, x: number, y: number) => {
+    const n = w.nodes.find((m) => m.id === id) as WorkflowNode;
+    n.ui = { x, y };
+  };
+  // A tall box to the right, and a node beyond it that only that box's move can reach.
+  w.nodes.push(
+    { id: "tall", type: "forEach", in: "{{trigger.more}}", ui: { x: 300, y: 150 } },
+    session("far", { ui: { x: 900, y: 260 } }),
+  );
+  w.nodes.push(session("below", { ui: { x: 0, y: 300 } }), session("lower", { ui: { x: 0, y: 300 + NODE_H + 4 } }));
+  place("each", 0, 0);
+  place("trigger", 600, 400);
+  place("report", 600, 500);
+  const r = eachRun(["done", "done", "done"], { definition: w });
+  const { nodes } = runGraph(r, "lanes", groupViews(r));
+  const top = nodes.filter((n) => !n.parentId);
+  for (let i = 0; i < top.length; i++) {
+    for (let j = i + 1; j < top.length; j++) {
+      const a = top[i];
+      const b = top[j];
+      const [aw, ah, bw, bh] = [a.width ?? NODE_W, a.height ?? NODE_H, b.width ?? NODE_W, b.height ?? NODE_H];
+      const apart =
+        a.position.x + aw <= b.position.x ||
+        b.position.x + bw <= a.position.x ||
+        a.position.y + ah <= b.position.y ||
+        b.position.y + bh <= a.position.y;
+      expect(apart, `${a.id} vs ${b.id}`).toBe(true);
+    }
+  }
 });
