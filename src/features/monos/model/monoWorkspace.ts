@@ -14,7 +14,11 @@ import {
   saveMonoSessionId,
 } from "./mono";
 import { forgetAgentContext } from "./monoFiles";
-import { forgetMonoRotation } from "./monoRotation";
+import {
+  monoProviderFiles,
+  type ProviderSessionRef,
+} from "./monoProviderFiles";
+import { forgetMonoRotation, retiredProviderSessions } from "./monoRotation";
 
 const openingMonos = new Map<string, Promise<Session | undefined>>();
 
@@ -60,14 +64,24 @@ async function loadMonoSession(
   return session;
 }
 
-/** Reset only the Mono's chat, keeping its identity, habits and memory. */
+/**
+ * Reset only the Mono's chat, keeping its identity, habits and memory. With
+ * `deleteProviderFiles`, the provider's own session files for this
+ * conversation go too, including the ones context rotation retired. Trouble
+ * deleting those is reported through `host.warn`, never thrown.
+ */
 export async function resetMonoSession(
   current: Session,
   host: {
     stop(id: string): Promise<Session | undefined>;
-    remove(session: Session): Promise<void>;
+    remove(
+      session: Session,
+      provider?: { sessions: ProviderSessionRef[] },
+    ): Promise<void | string[]>;
     replace(session: Session): void;
+    warn?(problems: string[]): void;
   },
+  options?: { deleteProviderFiles?: boolean },
 ): Promise<Session> {
   const monoId = monoForSession(current.id)?.id;
   const stopped = (await host.stop(current.id)) ?? current;
@@ -79,12 +93,19 @@ export async function resetMonoSession(
     stopped.modelSettings,
     { surface: "chat" },
   );
+  // The rotation record is forgotten below, so read what it retired first.
+  const provider = options?.deleteProviderFiles
+    ? monoProviderFiles(stopped, retiredProviderSessions(current.id))
+    : undefined;
   // A failed deletion must leave the original conversation selected.
-  await host.remove(stopped);
+  const problems = provider?.sessions.length
+    ? await host.remove(stopped, { sessions: provider.sessions })
+    : await host.remove(stopped);
   forgetAgentContext(current.id);
   forgetMonoRotation(current.id);
   if (monoId) saveMonoSessionId(monoId, fresh.id);
   host.replace(fresh);
+  if (Array.isArray(problems) && problems.length) host.warn?.(problems);
   return fresh;
 }
 

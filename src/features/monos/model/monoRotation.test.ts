@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Block } from "../../sessions/model/session";
 import {
   loadMonoRotation,
@@ -191,4 +191,111 @@ it("remembers a workflow report as a post of its own, not the answer to the user
   expect(text).toContain("How is CI?\n\nYou:\nGreen on main.");
   expect(text).toContain('from your workflow "Ship it"');
   expect(text).toContain("PR #12 opened.");
+});
+
+const UUID_A = "11111111-1111-4111-8111-111111111111";
+const UUID_B = "22222222-2222-4222-8222-222222222222";
+
+describe("retired provider sessions", () => {
+  const blocks = turn("hello", "hi", T0);
+  const plan = (
+    previous: Parameters<typeof planRotation>[1],
+    retiring?: Parameters<typeof planRotation>[4],
+  ) => planRotation(blocks, previous, "context", T0 + HOUR, retiring).rotation;
+
+  it("records the session being retired", () => {
+    expect(plan(undefined, { harness: "claude", id: UUID_A }).retired).toEqual([
+      { harness: "claude", id: UUID_A },
+    ]);
+  });
+
+  it("carries earlier retired sessions forward and dedupes", () => {
+    const first = plan(undefined, { harness: "codex", id: UUID_A });
+    const second = plan(first, { harness: "codex", id: UUID_B });
+    expect(second.retired).toEqual([
+      { harness: "codex", id: UUID_A },
+      { harness: "codex", id: UUID_B },
+    ]);
+    expect(plan(second, { harness: "codex", id: UUID_A }).retired).toEqual([
+      { harness: "codex", id: UUID_B },
+      { harness: "codex", id: UUID_A },
+    ]);
+  });
+
+  it("carries retired sessions forward when nothing new is retired", () => {
+    const first = plan(undefined, { harness: "claude", id: UUID_A });
+    expect(plan(first).retired).toEqual([{ harness: "claude", id: UUID_A }]);
+    expect(plan(first, { harness: "claude" }).retired).toEqual([
+      { harness: "claude", id: UUID_A },
+    ]);
+  });
+
+  it("keeps only the newest 200", () => {
+    const many = Array.from({ length: 200 }, (_, i) => ({
+      harness: "claude" as const,
+      id: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+    }));
+    const rotation = plan(
+      { at: 1, reason: "context", earlier: [], retired: many },
+      { harness: "claude", id: UUID_A },
+    );
+    expect(rotation.retired).toHaveLength(200);
+    expect(rotation.retired![199]).toEqual({ harness: "claude", id: UUID_A });
+    expect(rotation.retired![0]).toEqual(many[1]);
+  });
+
+  it("ignores an unsupported harness or a malformed id", () => {
+    expect(
+      plan(undefined, { harness: "cursor", id: UUID_A }).retired,
+    ).toBeUndefined();
+    expect(
+      plan(undefined, { harness: "claude", id: "../x" }).retired,
+    ).toBeUndefined();
+    expect(
+      plan(undefined, { harness: "claude", id: "" }).retired,
+    ).toBeUndefined();
+  });
+
+  it.each([
+    ["a null entry", null],
+    ["an entry without an id", { harness: "claude" }],
+    ["a non-string id", { harness: "claude", id: 42 }],
+    ["a bad harness", { harness: "cursor", id: UUID_B }],
+    ["a bad id", { harness: "codex", id: "../x" }],
+    ["a string", "nope"],
+  ])("drops %s from the stored list instead of throwing", (_, bad) => {
+    const stored = {
+      at: 1,
+      reason: "context",
+      earlier: [],
+      retired: [bad, { harness: "claude", id: UUID_B }],
+    } as unknown as Parameters<typeof planRotation>[1];
+    let rotation!: ReturnType<typeof plan>;
+    expect(() => {
+      rotation = plan(stored, { harness: "claude", id: UUID_A });
+    }).not.toThrow();
+    expect(rotation.retired).toEqual([
+      { harness: "claude", id: UUID_B },
+      { harness: "claude", id: UUID_A },
+    ]);
+  });
+
+  it("drops a stored list that is not an array", () => {
+    const stored = {
+      at: 1,
+      reason: "context",
+      earlier: [],
+      retired: "x",
+    } as unknown as Parameters<typeof planRotation>[1];
+    expect(() => plan(stored)).not.toThrow();
+    expect(plan(stored).retired).toBeUndefined();
+    expect(plan(stored, { harness: "claude", id: UUID_A }).retired).toEqual([
+      { harness: "claude", id: UUID_A },
+    ]);
+  });
+
+  it("leaves the rotation exactly as before without a fifth argument", () => {
+    const rotation = plan(undefined);
+    expect("retired" in rotation).toBe(false);
+  });
 });

@@ -58,7 +58,12 @@ type Props = {
   onModelChange: (harness: HarnessId, model: string) => void;
   onModelSettingsChange: (settings: Record<string, string>) => void;
   onRuntimeModeChange: (mode: RuntimeMode) => void;
-  onReset?: () => Promise<void>;
+  /** Resolves to a message to show once the reset is done, if any. */
+  onReset?: (options: {
+    deleteProviderFiles: boolean;
+  }) => Promise<string | void>;
+  /** The provider's own session files a reset can also delete. */
+  providerFiles?: { label: string; hasFiles: boolean; note?: string };
   onClose: () => void;
 };
 
@@ -143,6 +148,7 @@ function GeneralSection({
   onModelSettingsChange,
   onRuntimeModeChange,
   onReset,
+  providerFiles,
 }: Omit<Props, "status" | "initialSection" | "onClose">) {
   const lock = useLockOverscroll<HTMLDivElement>();
   const shown = useSyncExternalStore(
@@ -251,7 +257,22 @@ function GeneralSection({
             body="All messages in this Mono's conversation will be deleted and any active reply will be stopped. This can't be undone."
             kept="Its soul, memory and habits will be kept."
             failure="Could not reset the conversation."
-            onConfirm={onReset}
+            option={
+              providerFiles
+                ? {
+                    label: `Also delete the ${providerFiles.label} session files on this computer`,
+                    note: providerFiles.hasFiles
+                      ? ["They can't be recovered.", providerFiles.note]
+                          .filter(Boolean)
+                          .join(" ")
+                      : providerFiles.note,
+                    disabled: !providerFiles.hasFiles,
+                  }
+                : undefined
+            }
+            onConfirm={(deleteProviderFiles) =>
+              onReset({ deleteProviderFiles })
+            }
           >
             {(open, ref) => (
               <SettingGroup>

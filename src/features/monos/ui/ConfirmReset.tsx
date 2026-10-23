@@ -1,13 +1,32 @@
 import { useRef, useState, type ReactNode, type RefObject } from "react";
 import { Modal } from "../../../shared/ui/Modal";
 
-/** A destructive reset that asks first, then reports a failure in place. */
+/** An extra choice offered in the dialog, such as also deleting files. */
+export type ConfirmResetOption = {
+  label: string;
+  /** Said under the label, such as why the choice is unavailable. */
+  note?: string;
+  /** Unavailable: shown unchecked and cannot be changed. */
+  disabled?: boolean;
+  /** Checked when the dialog opens. Defaults to true. */
+  defaultChecked?: boolean;
+};
+
+const startsChecked = (option: ConfirmResetOption | undefined) =>
+  !!option && !option.disabled && option.defaultChecked !== false;
+
+/**
+ * A destructive reset that asks first, then reports a failure in place. A
+ * message returned from `onConfirm` closes the dialog and shows beside the
+ * trigger, for trouble that must not undo the reset.
+ */
 export function ConfirmReset({
   label,
   title,
   body,
   kept,
   failure,
+  option,
   onConfirm,
   children,
 }: {
@@ -18,7 +37,9 @@ export function ConfirmReset({
   /** What survives, said separately so it reads as reassurance. */
   kept: string;
   failure: string;
-  onConfirm: () => Promise<void>;
+  option?: ConfirmResetOption;
+  /** Receives whether the option is ticked; false when there is none. */
+  onConfirm: (checked: boolean) => Promise<string | void>;
   /** The trigger; focus returns to `ref` when the dialog closes. */
   children: (
     open: () => void,
@@ -28,6 +49,12 @@ export function ConfirmReset({
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [notice, setNotice] = useState<string>();
+  // Until the user touches the box, its value follows the option's props.
+  const [touched, setTouched] = useState<boolean>();
+  const checked = option?.disabled
+    ? false
+    : (touched ?? startsChecked(option));
   const running = useRef(false);
   const trigger = useRef<HTMLButtonElement>(null);
   const close = () => {
@@ -41,7 +68,8 @@ export function ConfirmReset({
     setBusy(true);
     setError(undefined);
     try {
-      await onConfirm();
+      const message = await onConfirm(checked);
+      setNotice(typeof message === "string" && message ? message : undefined);
       setConfirming(false);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
@@ -54,13 +82,44 @@ export function ConfirmReset({
     <>
       {children(() => {
         setError(undefined);
+        setNotice(undefined);
+        setTouched(undefined);
         setConfirming(true);
       }, trigger)}
+      {notice ? (
+        <p
+          role="status"
+          className="px-1 pt-2 text-[12px] leading-5 text-amber-300"
+        >
+          {notice}
+        </p>
+      ) : null}
       {confirming ? (
         <Modal title={title} size="sm" onClose={close}>
           <div className="flex flex-col gap-3 px-4 pb-4 pt-3">
             <p className="text-[13px] leading-5 text-content/70">{body}</p>
             <p className="text-[12px] leading-5 text-content/50">{kept}</p>
+            {option ? (
+              <label className="flex items-start gap-2 text-[12px]">
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={option.disabled || busy}
+                  onChange={(e) => setTouched(e.target.checked)}
+                  className="mt-0.5 accent-accent"
+                />
+                <span
+                  className={option.disabled ? "text-content/50" : undefined}
+                >
+                  {option.label}
+                  {option.note ? (
+                    <span className="mt-1 block text-[11px] text-content/45">
+                      {option.note}
+                    </span>
+                  ) : null}
+                </span>
+              </label>
+            ) : null}
             {error ? (
               <p role="alert" className="text-[12px] leading-5 text-red-400">
                 {failure} {error}

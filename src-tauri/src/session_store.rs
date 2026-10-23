@@ -560,7 +560,8 @@ pub fn session_delete(
     session_id: String,
     mut image_paths: Vec<String>,
     delete_provider_files: Option<bool>,
-) -> Result<(), String> {
+    mono_reset: Option<crate::provider_session_cleanup::MonoResetCleanup>,
+) -> Result<Vec<String>, String> {
     validate_id(&session_id, "session")?;
     let conn = store.conn.lock().map_err(|_| "Session store is locked")?;
     let record = get_session(&conn, &session_id).ok().flatten();
@@ -570,12 +571,28 @@ pub fn session_delete(
         .unwrap_or_default();
     let cleanup = record.as_ref().and_then(|record| {
         crate::provider_session_cleanup::cleanup_request(
-            delete_provider_files.unwrap_or(false),
+            // A Mono reset always wants its provider files gone.
+            delete_provider_files.unwrap_or(false) || mono_reset.is_some(),
             &record.harness,
             record.provider_session_id.as_deref(),
             &record.blocks,
         )
     });
+    // A reset also removes ids retired by context rotation; the plan is made
+    // now, while the record's own ids are still known.
+    let mut problems = Vec::new();
+    let (cleanup, reset_requests) = match mono_reset {
+        Some(reset) => {
+            let (requests, skipped) = crate::provider_session_cleanup::plan_reset_cleanup(
+                cleanup,
+                &reset.sessions,
+                record.is_some(),
+            );
+            problems = skipped;
+            (None, Some(requests))
+        }
+        None => (cleanup, None),
+    };
     image_paths.extend(persisted_paths);
     image_paths.extend(
         crate::mono_transcript::generated_image_paths(&conn, &session_id)
@@ -595,8 +612,15 @@ pub fn session_delete(
             crate::provider_session_cleanup::run_cleanup(&app, &request);
         });
     }
+    if let Some(requests) = reset_requests {
+        // The caller shows these, so wait for them. A failure here never undoes
+        // the deletion above.
+        problems.extend(crate::provider_session_cleanup::run_cleanup_report(
+            &app, &requests, true,
+        ));
+    }
     let _ = app.emit(crate::reminders::CHANGED, ());
-    Ok(())
+    Ok(problems)
 }
 
 #[tauri::command(async)]

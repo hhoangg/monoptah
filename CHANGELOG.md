@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-10-22
+
+### Added
+
+- Resetting a Mono's conversation can also delete the Claude Code or Codex session files for that conversation on this computer, including sessions left behind by earlier context rotations. The option is ticked by default and says the files cannot be recovered. It is disabled for other providers, and a failure to delete never blocks the reset: you get a short notice instead.
+
 ## [0.31.0] - 2026-10-22
 
 ### Added

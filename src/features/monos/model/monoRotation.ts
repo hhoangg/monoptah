@@ -1,6 +1,12 @@
 import type { Block, Session } from "../../sessions/model/session";
 import { contextRatio } from "../../sessions/model/contextUsage";
 import { monoPost } from "../../sessions/model/transcriptActivity";
+import {
+  dedupeProviderSessions,
+  providerSessionRef,
+  sanitizeProviderSessions,
+  type ProviderSessionRef,
+} from "./monoProviderFiles";
 
 /**
  * A Mono's chat never ends, but the provider session behind it does. Every
@@ -26,6 +32,9 @@ const EARLIER_CHARS = 3_000;
 
 export type RotationReason = "context";
 
+/** Retired provider sessions remembered per conversation, newest kept. */
+const MAX_RETIRED = 200;
+
 /** What the latest rotation started the provider session with. */
 export type MonoRotation = {
   at: number;
@@ -35,6 +44,11 @@ export type MonoRotation = {
   afterBlockId?: string;
   /** One line per exchange before the verbatim ones, oldest first. */
   earlier: string[];
+  /**
+   * Provider sessions earlier rotations replaced, oldest first. Their files
+   * stay on disk after rotation, so a reset can offer to delete them too.
+   */
+  retired?: ProviderSessionRef[];
 };
 
 type Exchange = {
@@ -172,6 +186,8 @@ export function planRotation(
   previous: MonoRotation | undefined,
   reason: RotationReason,
   now: number,
+  /** The provider session this rotation replaces. */
+  retiring?: { harness: string; id?: string },
 ): { rotation: MonoRotation; brief: (sessionId: string) => string } {
   const segment = exchanges(blocks, previous?.afterBlockId);
   const verbatim = segment.slice(-VERBATIM_EXCHANGES);
@@ -185,12 +201,24 @@ export function planRotation(
     EARLIER_CHARS,
   );
   const carried = [...earlier, ...verbatim.map(exchangeLine)];
+  const replaced = providerSessionRef(retiring?.harness, retiring?.id);
+  const retired = dedupeProviderSessions([
+    // Re-retiring an id moves it to the newest end.
+    ...sanitizeProviderSessions(previous?.retired).filter(
+      (entry) =>
+        !replaced ||
+        entry.harness !== replaced.harness ||
+        entry.id.toLowerCase() !== replaced.id.toLowerCase(),
+    ),
+    ...(replaced ? [replaced] : []),
+  ]).slice(-MAX_RETIRED);
   const rotation: MonoRotation = {
     at: now,
     reason,
     ...(blocks.length ? { afterBlockId: blocks[blocks.length - 1].id } : {}),
     // The next rotation sees these turns as earlier ones.
     earlier: newestWithin(carried, EARLIER_CHARS),
+    ...(retired.length ? { retired } : {}),
   };
   const brief = (sessionId: string) => {
     const parts = [
@@ -232,6 +260,16 @@ function readRotations(): Record<string, MonoRotation> {
 
 export function loadMonoRotation(sessionId: string): MonoRotation | undefined {
   return readRotations()[sessionId];
+}
+
+/**
+ * The provider sessions context rotation retired for this conversation.
+ * Anything malformed in storage is ignored, never passed on.
+ */
+export function retiredProviderSessions(
+  sessionId: string,
+): ProviderSessionRef[] {
+  return sanitizeProviderSessions(loadMonoRotation(sessionId)?.retired);
 }
 
 export function saveMonoRotation(
