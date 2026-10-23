@@ -939,10 +939,21 @@ impl Bridge {
         else {
             return;
         };
-        let Some(api) = self.api_for_project(project) else {
+        // The prompt may have been answered or closed while the job waited.
+        let wanted = self
+            .lock()
+            .registry
+            .has_prompt_for_session(project, session_id);
+        let api = if wanted {
+            self.api_for_project(project)
+        } else {
+            None
+        };
+        let Some(api) = api else {
             self.release_job(&job);
             return;
         };
+        self.begin_send(chat);
         match api.create_forum_topic(chat, &topic_name(name)) {
             Ok(thread) => {
                 let mut state = self.lock();
@@ -1003,6 +1014,7 @@ impl Bridge {
             return;
         };
         for (index, html, markup) in items {
+            self.begin_send(chat);
             match api.send_message(chat, thread, &html, Some(markup)) {
                 Ok(message_id) => {
                     let still_waiting = {
@@ -1087,6 +1099,7 @@ impl Bridge {
         let Some(api) = self.api_for_project(project) else {
             return;
         };
+        self.begin_send(chat);
         match api.edit_message(chat, *message_id, html, keyboard.clone()) {
             // A deleted message cannot be edited and needs no problem line.
             Ok(()) | Err(TgError::NotModified | TgError::MessageNotFound) => self.sent_ok(chat),
@@ -1106,12 +1119,20 @@ impl Bridge {
         let Some(api) = self.api_for_project(project) else {
             return;
         };
+        self.begin_send(chat);
         match api.send_message(chat, *thread, html, None) {
             Ok(_) => self.sent_ok(chat),
             // A reply into a deleted topic is not worth a problem line.
             Err(TgError::ThreadNotFound) => {}
             Err(error) => self.handle_send_error(chat, job, error),
         }
+    }
+
+    /// Counts an HTTP call against the rate budget. Called right before the request, so a
+    /// job that is dropped without one costs nothing.
+    fn begin_send(&self, chat: i64) {
+        let now = self.now_ms();
+        self.lock().queue.record_send(chat, now);
     }
 
     fn sent_ok(&self, chat: i64) {
@@ -2094,6 +2115,52 @@ mod tests {
         assert!(method_of(&seen[1]).ends_with("sendMessage"));
         assert_eq!(seen[1].body["message_thread_id"], 11);
         assert_eq!(bridge.session_topic("proj", "s1"), Some(11));
+    }
+
+    #[test]
+    fn closed_prompt_makes_no_topic_and_costs_no_budget() {
+        // No scripted response: any HTTP call would fail and leave a retry behind.
+        let (base, server) = serve_script(vec![]);
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        bridge.forward("main", payload("s1", 1)).unwrap();
+        // Answered on the desktop before the sender got to it.
+        bridge.question_closed("s1", 1, "Answered on the desktop");
+
+        assert!(bridge.pump(false), "the topic job is dropped");
+        assert!(
+            bridge.pump(false),
+            "the question job is dropped too, with no 1 s wait: no send was made"
+        );
+        assert!(!bridge.pump(false));
+        server.join().unwrap();
+        let state = bridge.lock();
+        assert!(state.topics_pending.is_empty(), "slot released");
+        assert!(state.failures.is_empty(), "no HTTP call was attempted");
+        assert!(state.queue.next_wake(0).is_none(), "nothing left to retry");
+        drop(state);
+        assert_eq!(bridge.session_topic("proj", "s1"), None);
+    }
+
+    #[test]
+    fn topic_is_still_made_while_another_prompt_of_the_session_waits() {
+        let (base, server) = serve_script(vec![
+            ok(json!({ "message_thread_id": 11 })),
+            ok(json!({ "message_id": 3 })),
+        ]);
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        bridge.forward("main", payload("s1", 1)).unwrap();
+        bridge.forward("main", payload("s1", 2)).unwrap();
+        bridge.question_closed("s1", 1, "Answered on the desktop");
+        drain(&bridge);
+        let seen = server.join().unwrap();
+        assert!(method_of(&seen[0]).ends_with("createForumTopic"));
+        assert_eq!(bridge.session_topic("proj", "s1"), Some(11));
+        assert_eq!(
+            bridge.lock().registry.prompt("s1#2").unwrap().messages[0],
+            Some(3)
+        );
     }
 
     #[test]

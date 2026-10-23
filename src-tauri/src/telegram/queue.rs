@@ -2,7 +2,9 @@
 //!
 //! The queue is pure: time is passed in as `now_ms`, nothing sleeps, and nothing does I/O.
 //! The caller asks `next_ready` for a job, sends it, and uses `next_wake` to know when to
-//! ask again. Releasing a job records it against the budgets, so callers never report sends.
+//! ask again. Releasing a job does not spend any budget: the caller reports each HTTP call
+//! with `record_send` right before it makes it, so a job that is dropped without a call
+//! (a prompt closed while it waited) costs nothing.
 
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -121,7 +123,8 @@ impl SendQueue {
         }
     }
 
-    /// Releases the next job the budgets and pauses allow at `now_ms`, and records the send.
+    /// Releases the next job the budgets and pauses allow at `now_ms`. The send is not
+    /// counted until the caller reports it with `record_send`.
     pub fn next_ready(&mut self, now_ms: u64) -> Option<(i64, Job)> {
         if self.global_ready_at() > now_ms {
             return None;
@@ -143,12 +146,17 @@ impl SendQueue {
             .urgent
             .pop_front()
             .or_else(|| queue.edits.pop_front())?;
-        queue.record(now_ms);
+        Some((chat, job))
+    }
+
+    /// Counts one HTTP call to `chat` against the chat and bot budgets. Call it right before
+    /// the request, once per request.
+    pub fn record_send(&mut self, chat: i64, now_ms: u64) {
+        self.chats.entry(chat).or_default().record(now_ms);
         self.global_sends.push_back(now_ms);
         while self.global_sends.len() > GLOBAL_WINDOW_SENDS {
             self.global_sends.pop_front();
         }
-        Some((chat, job))
     }
 
     /// Earliest time at which some queued job could be released, or `None` when empty.
@@ -221,6 +229,13 @@ impl SendQueue {
 mod tests {
     use super::*;
 
+    /// Releases the next job and counts it as sent, the way the sender does.
+    fn take(q: &mut SendQueue, now_ms: u64) -> Option<(i64, Job)> {
+        let (chat, job) = q.next_ready(now_ms)?;
+        q.record_send(chat, now_ms);
+        Some((chat, job))
+    }
+
     fn question(key: &str) -> Job {
         Job::SendQuestion { key: key.into() }
     }
@@ -243,15 +258,15 @@ mod tests {
         }
         let mut released = 0;
         for t in (0..=19_000).step_by(1_000) {
-            assert!(q.next_ready(t).is_some(), "expected a send at t={t}");
+            assert!(take(&mut q, t).is_some(), "expected a send at t={t}");
             released += 1;
         }
         assert_eq!(released, 20);
         for t in (20_000..60_000).step_by(1_000) {
-            assert!(q.next_ready(t).is_none(), "unexpected send at t={t}");
+            assert!(take(&mut q, t).is_none(), "unexpected send at t={t}");
         }
         assert_eq!(q.next_wake(20_000), Some(60_000));
-        assert_eq!(q.next_ready(60_000), Some((1, question("k20"))));
+        assert_eq!(take(&mut q, 60_000), Some((1, question("k20"))));
     }
 
     #[test]
@@ -259,10 +274,27 @@ mod tests {
         let mut q = SendQueue::default();
         q.push(1, question("a"));
         q.push(1, question("b"));
+        assert_eq!(take(&mut q, 5_000), Some((1, question("a"))));
+        assert_eq!(take(&mut q, 5_999), None);
+        assert_eq!(q.next_wake(5_100), Some(6_000));
+        assert_eq!(take(&mut q, 6_000), Some((1, question("b"))));
+    }
+
+    #[test]
+    fn releasing_a_job_spends_no_budget_until_it_is_recorded() {
+        let mut q = SendQueue::default();
+        q.push(1, question("a"));
+        q.push(1, question("b"));
+        q.push(1, question("c"));
+        // A job dropped without an HTTP call leaves the budget alone.
         assert_eq!(q.next_ready(5_000), Some((1, question("a"))));
+        assert_eq!(q.next_wake(5_000), Some(5_000));
+        assert_eq!(q.next_ready(5_000), Some((1, question("b"))));
+        // The send that is recorded does count, for the spacing and for next_wake.
+        q.record_send(1, 5_000);
         assert_eq!(q.next_ready(5_999), None);
         assert_eq!(q.next_wake(5_100), Some(6_000));
-        assert_eq!(q.next_ready(6_000), Some((1, question("b"))));
+        assert_eq!(q.next_ready(6_000), Some((1, question("c"))));
     }
 
     #[test]
@@ -278,13 +310,13 @@ mod tests {
                 name: "n".into(),
             },
         );
-        assert_eq!(q.next_ready(0), Some((1, question("q1"))));
+        assert_eq!(take(&mut q, 0), Some((1, question("q1"))));
         assert!(matches!(
-            q.next_ready(1_000),
+            take(&mut q, 1_000),
             Some((1, Job::CreateTopic { .. }))
         ));
-        assert_eq!(q.next_ready(2_000), Some((1, edit(1, 10, "edit"))));
-        assert_eq!(q.next_ready(3_000), None);
+        assert_eq!(take(&mut q, 2_000), Some((1, edit(1, 10, "edit"))));
+        assert_eq!(take(&mut q, 3_000), None);
     }
 
     #[test]
@@ -295,10 +327,10 @@ mod tests {
         q.push(1, edit(1, 10, "second"));
         // Same message id in another chat is a different message.
         q.push(2, edit(2, 10, "elsewhere"));
-        assert_eq!(q.next_ready(0), Some((1, edit(1, 10, "second"))));
-        assert_eq!(q.next_ready(1_000), Some((1, edit(1, 11, "other"))));
-        assert_eq!(q.next_ready(1_000), Some((2, edit(2, 10, "elsewhere"))));
-        assert_eq!(q.next_ready(5_000), None);
+        assert_eq!(take(&mut q, 0), Some((1, edit(1, 10, "second"))));
+        assert_eq!(take(&mut q, 1_000), Some((1, edit(1, 11, "other"))));
+        assert_eq!(take(&mut q, 1_000), Some((2, edit(2, 10, "elsewhere"))));
+        assert_eq!(take(&mut q, 5_000), None);
     }
 
     #[test]
@@ -306,16 +338,16 @@ mod tests {
         let mut q = SendQueue::default();
         q.push(1, edit(1, 10, "e1"));
         // E1 goes out, and while it is in flight E2 for the same message is queued.
-        let (_, e1) = q.next_ready(0).unwrap();
+        let (_, e1) = take(&mut q, 0).unwrap();
         q.push(1, edit(1, 10, "e2"));
         // E1 failed on the network and goes back to the front, ahead of E2.
         q.requeue_front(1, e1);
         // E3 supersedes both; neither old text may be sent after it.
         q.push(1, edit(1, 10, "e3"));
         q.push(1, edit(1, 11, "other"));
-        assert_eq!(q.next_ready(10_000), Some((1, edit(1, 10, "e3"))));
-        assert_eq!(q.next_ready(11_000), Some((1, edit(1, 11, "other"))));
-        assert_eq!(q.next_ready(12_000), None);
+        assert_eq!(take(&mut q, 10_000), Some((1, edit(1, 10, "e3"))));
+        assert_eq!(take(&mut q, 11_000), Some((1, edit(1, 11, "other"))));
+        assert_eq!(take(&mut q, 12_000), None);
     }
 
     #[test]
@@ -325,16 +357,16 @@ mod tests {
         q.push(2, question("b"));
         q.pause(1, 10_000);
         // The other chat is not affected.
-        assert_eq!(q.next_ready(0), Some((2, question("b"))));
-        assert_eq!(q.next_ready(9_999), None);
+        assert_eq!(take(&mut q, 0), Some((2, question("b"))));
+        assert_eq!(take(&mut q, 9_999), None);
         assert_eq!(q.next_wake(0), Some(10_000));
-        assert_eq!(q.next_ready(10_000), Some((1, question("a"))));
+        assert_eq!(take(&mut q, 10_000), Some((1, question("a"))));
         // A shorter pause never shortens a longer one.
         q.push(1, question("c"));
         q.pause(1, 20_000);
         q.pause(1, 15_000);
-        assert_eq!(q.next_ready(19_999), None);
-        assert_eq!(q.next_ready(20_000), Some((1, question("c"))));
+        assert_eq!(take(&mut q, 19_999), None);
+        assert_eq!(take(&mut q, 20_000), Some((1, question("c"))));
     }
 
     #[test]
@@ -344,16 +376,16 @@ mod tests {
         q.push(1, question("b"));
         q.push(1, edit(1, 10, "e1"));
         q.push(1, edit(1, 11, "e2"));
-        let (_, first) = q.next_ready(0).unwrap();
+        let (_, first) = take(&mut q, 0).unwrap();
         assert_eq!(first, question("a"));
         q.requeue_front(1, first);
-        assert_eq!(q.next_ready(1_000), Some((1, question("a"))));
-        assert_eq!(q.next_ready(2_000), Some((1, question("b"))));
-        let (_, e1) = q.next_ready(3_000).unwrap();
+        assert_eq!(take(&mut q, 1_000), Some((1, question("a"))));
+        assert_eq!(take(&mut q, 2_000), Some((1, question("b"))));
+        let (_, e1) = take(&mut q, 3_000).unwrap();
         assert_eq!(e1, edit(1, 10, "e1"));
         q.requeue_front(1, e1);
-        assert_eq!(q.next_ready(4_000), Some((1, edit(1, 10, "e1"))));
-        assert_eq!(q.next_ready(5_000), Some((1, edit(1, 11, "e2"))));
+        assert_eq!(take(&mut q, 4_000), Some((1, edit(1, 10, "e1"))));
+        assert_eq!(take(&mut q, 5_000), Some((1, edit(1, 11, "e2"))));
     }
 
     #[test]
@@ -363,10 +395,10 @@ mod tests {
         q.push(1, edit(1, 10, "e"));
         q.pause(1, 5_000);
         q.rename_chat(1, 2);
-        assert_eq!(q.next_ready(4_999), None);
-        assert_eq!(q.next_ready(5_000), Some((2, question("a"))));
+        assert_eq!(take(&mut q, 4_999), None);
+        assert_eq!(take(&mut q, 5_000), Some((2, question("a"))));
         // The edit now addresses the new chat.
-        assert_eq!(q.next_ready(6_000), Some((2, edit(2, 10, "e"))));
+        assert_eq!(take(&mut q, 6_000), Some((2, edit(2, 10, "e"))));
         assert_eq!(q.next_wake(7_000), None);
     }
 
@@ -377,12 +409,12 @@ mod tests {
             q.push(chat, question(&format!("k{chat}")));
         }
         for _ in 0..30 {
-            assert!(q.next_ready(0).is_some());
+            assert!(take(&mut q, 0).is_some());
         }
-        assert_eq!(q.next_ready(0), None);
-        assert_eq!(q.next_ready(999), None);
+        assert_eq!(take(&mut q, 0), None);
+        assert_eq!(take(&mut q, 999), None);
         assert_eq!(q.next_wake(0), Some(1_000));
-        assert!(q.next_ready(1_000).is_some());
+        assert!(take(&mut q, 1_000).is_some());
         assert_eq!(q.next_wake(1_000), None);
     }
 }

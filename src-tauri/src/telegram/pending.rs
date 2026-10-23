@@ -339,6 +339,13 @@ impl Registry {
         self.prompts.get(key)
     }
 
+    /// Whether any pending prompt belongs to this session, i.e. a topic for it is still wanted.
+    pub fn has_prompt_for_session(&self, project: &str, session_id: &str) -> bool {
+        self.prompts
+            .values()
+            .any(|p| p.payload.project == project && p.payload.session_id == session_id)
+    }
+
     /// Whether the prompt stored under `key` is the one `payload` describes, asked by
     /// `owner`. Request ids restart when a window reloads, so a key alone does not say
     /// that: the owner window, the question ids and their option ids must all match too.
