@@ -6,6 +6,7 @@ import { newSession, type Session } from "../../sessions/model/session";
 import type { UserQuestionReply } from "../../sessions/model/userQuestion";
 import { FORWARD_DELAY_MS } from "../model/telegramForward";
 import { recordQuestionOutcome } from "../model/questionOutcome";
+import { invalidateTelegramStatus } from "../model/telegramStatusCache";
 import type { TelegramAnswerEvent, TelegramStatus } from "../model/telegram";
 import { useTelegramQuestions } from "./useTelegramQuestions";
 
@@ -135,6 +136,7 @@ describe("useTelegramQuestions", () => {
     vi.useFakeTimers();
     clock = 1_000_000;
     status = enabled;
+    invalidateTelegramStatus();
     forwardError = undefined;
     answerHandler = null;
     unlisten = vi.fn();
@@ -202,13 +204,45 @@ describe("useTelegramQuestions", () => {
     expect(callsTo("telegram_forward_question")).toHaveLength(0);
   });
 
-  it("never forwards a question first seen while status is unavailable", async () => {
+  it("retries an unavailable status on the next tick and then forwards", async () => {
     status = new Error("offline");
     await render([asking()]);
-    await advance(FORWARD_DELAY_MS);
+    await advance(TICK_MS * 3);
+    expect(callsTo("telegram_status").length).toBeGreaterThan(1);
     status = enabled;
-    await advance(120_000);
+    await advance(TICK_MS);
+    await advance(FORWARD_DELAY_MS);
+    expect(callsTo("telegram_forward_question")).toHaveLength(1);
+  });
+
+  it("does not cache a failed status", async () => {
+    status = new Error("offline");
+    await render([asking(1, "s1")]);
+    const failed = callsTo("telegram_status").length;
+    status = enabled;
+    await render([asking(1, "s1"), asking(1, "s2")]);
+    expect(callsTo("telegram_status").length).toBeGreaterThan(failed);
+  });
+
+  it("keeps a successful disabled status final even if retries came first", async () => {
+    status = new Error("offline");
+    await render([asking()]);
+    await advance(TICK_MS);
+    status = { ...enabled, enabled: false };
+    await advance(TICK_MS);
+    status = enabled;
+    await advance(FORWARD_DELAY_MS + TICK_MS * 6);
     expect(callsTo("telegram_forward_question")).toHaveLength(0);
+  });
+
+  it("asks for a fresh status after the cache is invalidated", async () => {
+    await render([asking(1, "s1")]);
+    expect(callsTo("telegram_status")).toHaveLength(1);
+    await render([asking(1, "s1"), asking(1, "s2")]);
+    expect(callsTo("telegram_status")).toHaveLength(1);
+    invalidateTelegramStatus();
+    await render([asking(1, "s1"), asking(1, "s2"), asking(1, "s3")]);
+    expect(callsTo("telegram_status")).toHaveLength(2);
   });
 
   it("never forwards a non-blocking question even after its timer is cleared", async () => {

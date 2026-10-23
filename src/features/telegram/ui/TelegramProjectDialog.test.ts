@@ -7,12 +7,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { copyText } from "../../../platform/tauri/clipboard";
 import type { TelegramStatus } from "../model/telegram";
+import { invalidateTelegramStatus } from "../model/telegramStatusCache";
 import { TelegramProjectDialog } from "./TelegramProjectDialog";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("../../../platform/tauri/clipboard", () => ({
   copyText: vi.fn(async () => undefined),
+}));
+
+vi.mock("../model/telegramStatusCache", () => ({
+  invalidateTelegramStatus: vi.fn(),
+  cachedTelegramStatus: vi.fn(),
 }));
 
 const PROJECT = "/work/alpha";
@@ -122,6 +128,7 @@ beforeEach(() => {
   vi.mocked(openUrl).mockReset();
   vi.mocked(openUrl).mockResolvedValue(undefined);
   vi.mocked(copyText).mockClear();
+  vi.mocked(invalidateTelegramStatus).mockClear();
   mockInvoke();
   container = document.createElement("div");
   document.body.append(container);
@@ -302,5 +309,45 @@ describe("telegram project dialog", () => {
     for (const input of dialog().querySelectorAll("input")) {
       expect(input.value).not.toContain(SECRET);
     }
+  });
+
+  describe("status cache invalidation", () => {
+    it("invalidates after a token is saved", async () => {
+      await renderDialog();
+      vi.mocked(invalidateTelegramStatus).mockClear();
+      await type("Bot token", SECRET);
+      await submit();
+      expect(invalidateTelegramStatus).toHaveBeenCalledWith(PROJECT);
+    });
+
+    it("invalidates after the enable toggle", async () => {
+      status = CONNECTED;
+      await renderDialog();
+      vi.mocked(invalidateTelegramStatus).mockClear();
+      await act(async () =>
+        dialog().querySelector<HTMLElement>('[role="switch"]')!.click(),
+      );
+      expect(invalidateTelegramStatus).toHaveBeenCalledWith(PROJECT);
+    });
+
+    it("invalidates after disconnecting", async () => {
+      status = CONNECTED;
+      await renderDialog();
+      vi.mocked(invalidateTelegramStatus).mockClear();
+      await act(async () => button("Disconnect")!.click());
+      expect(invalidateTelegramStatus).toHaveBeenCalledWith(PROJECT);
+    });
+
+    it("invalidates when the poll sees the group connect", async () => {
+      vi.useFakeTimers();
+      status = CONFIGURED;
+      await renderDialog();
+      expect(invalidateTelegramStatus).not.toHaveBeenCalled();
+      status = CONNECTED;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(invalidateTelegramStatus).toHaveBeenCalledWith(PROJECT);
+    });
   });
 });

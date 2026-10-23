@@ -17,11 +17,11 @@ import {
   telegramAnswerResult,
   telegramForwardQuestion,
   telegramQuestionClosed,
-  telegramStatus,
   type TelegramAnswerEvent,
   type TelegramQuestionStatus,
   type TelegramStatus,
 } from "../model/telegram";
+import { cachedTelegramStatus } from "../model/telegramStatusCache";
 import {
   dueForwards,
   forwardPayload,
@@ -29,7 +29,6 @@ import {
 } from "../model/telegramForward";
 
 const TICK_MS = 15_000;
-const STATUS_TTL_MS = 60_000;
 const MAX_FORWARD_ATTEMPTS = 2;
 
 type UseTelegramQuestionsInput = {
@@ -104,12 +103,6 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
   replyRef.current = onQuestionReply;
   const nowRef = useRef(now);
   nowRef.current = now;
-  const statusesRef = useRef(
-    new Map<
-      string,
-      { at: number; status: Promise<TelegramStatus | undefined> }
-    >(),
-  );
   const runRef = useRef<{ sync: () => void; forward: () => void } | null>(null);
 
   useEffect(() => {
@@ -121,15 +114,26 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
     const inFlight = new Set<string>();
     const attempts = new Map<string, number>();
     const byTelegram = new Set<string>();
-    const statuses = statusesRef.current;
+    const checking = new Set<string>();
 
     function statusFor(project: string): Promise<TelegramStatus | undefined> {
-      const at = nowRef.current();
-      const cached = statuses.get(project);
-      if (cached && at - cached.at < STATUS_TTL_MS) return cached.status;
-      const status = telegramStatus(project).catch(() => undefined);
-      statuses.set(project, { at, status });
-      return status;
+      return cachedTelegramStatus(project, nowRef.current());
+    }
+
+    /**
+     * Decides eligibility from a successful status. A failed call decides
+     * nothing: the question stays "checking" and the next tick asks again, so
+     * only a status that actually says "off" rules a question out for good.
+     */
+    function checkEligibility(key: string, session: Session) {
+      if (checking.has(key)) return;
+      checking.add(key);
+      void statusFor(projectKey(session.cwd)).then((status) => {
+        checking.delete(key);
+        if (disposed || eligibility.get(key) !== "checking") return;
+        if (status === undefined) return;
+        eligibility.set(key, canForward(status) ? "yes" : "no");
+      });
     }
 
     function forget(key: string) {
@@ -137,9 +141,10 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
       eligibility.delete(key);
       attempts.delete(key);
       inFlight.delete(key);
+      checking.delete(key);
     }
 
-    function sync() {
+    function sync(retryChecks = false) {
       if (disposed) return;
       const pending = new Set<string>();
       for (const session of sessionsRef.current) {
@@ -147,7 +152,12 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
         if (!question) continue;
         const key = questionKey(session.id, question.requestId);
         pending.add(key);
-        if (eligibility.has(key)) continue;
+        if (eligibility.has(key)) {
+          if (retryChecks && eligibility.get(key) === "checking") {
+            checkEligibility(key, session);
+          }
+          continue;
+        }
         // Request ids restart per Live, so an outcome stored for this key
         // belongs to an earlier question and must not describe this one.
         discardQuestionOutcome(session.id, question.requestId);
@@ -159,10 +169,7 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
         }
         eligibility.set(key, "checking");
         firstSeen.set(key, nowRef.current());
-        void statusFor(projectKey(session.cwd)).then((status) => {
-          if (disposed || eligibility.get(key) !== "checking") return;
-          eligibility.set(key, canForward(status) ? "yes" : "no");
-        });
+        checkEligibility(key, session);
       }
 
       for (const key of [...sent]) {
@@ -239,7 +246,7 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
     runRef.current = { sync, forward };
     sync();
     const timer = window.setInterval(() => {
-      sync();
+      sync(true);
       forward();
     }, TICK_MS);
 

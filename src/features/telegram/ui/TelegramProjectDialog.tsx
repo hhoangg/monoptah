@@ -15,6 +15,7 @@ import {
   type ConnectLink,
   type TelegramStatus,
 } from "../model/telegram";
+import { invalidateTelegramStatus } from "../model/telegramStatusCache";
 
 type Props = {
   project: string;
@@ -26,6 +27,15 @@ const POLL_MS = 3000;
 const WEBHOOK_PROBLEM = "This bot has a webhook";
 const ADMIN_NOTE =
   "Make the bot an admin with Manage topics so it can create a topic per session.";
+
+/** Whether a status change affects if the question hook may forward. */
+function gateChanged(before: TelegramStatus, after: TelegramStatus): boolean {
+  return (
+    before.configured !== after.configured ||
+    before.enabled !== after.enabled ||
+    before.chatId !== after.chatId
+  );
+}
 
 function errorText(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -41,6 +51,15 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
   // A poll that started before a change must not overwrite the change.
   const revision = useRef(0);
   const alive = useRef(true);
+  const seen = useRef<TelegramStatus | null>(null);
+
+  // The question hook caches the status for a minute; tell it when this
+  // project's status changed so it does not forward on stale settings.
+  const observe = (next: TelegramStatus) => {
+    const before = seen.current;
+    seen.current = next;
+    if (before && gateChanged(before, next)) invalidateTelegramStatus(project);
+  };
 
   useEffect(() => {
     alive.current = true;
@@ -54,7 +73,10 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
       const started = revision.current;
       try {
         const next = await telegramStatus(project);
-        if (alive.current && revision.current === started) setStatus(next);
+        if (alive.current && revision.current === started) {
+          observe(next);
+          setStatus(next);
+        }
       } catch (cause) {
         if (alive.current && revision.current === started)
           setError(errorText(cause));
@@ -81,10 +103,15 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
 
   const saveToken = () =>
     run(async () => {
-      const next = await telegramSetToken(project, token.trim());
-      if (!alive.current) return;
-      setToken("");
-      setStatus(next);
+      try {
+        const next = await telegramSetToken(project, token.trim());
+        if (!alive.current) return;
+        setToken("");
+        observe(next);
+        setStatus(next);
+      } finally {
+        invalidateTelegramStatus(project);
+      }
     });
 
   const connect = () =>
@@ -95,24 +122,39 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
 
   const setEnabled = (enabled: boolean) =>
     run(async () => {
-      const next = await telegramSetEnabled(project, enabled);
-      if (alive.current) setStatus(next);
+      try {
+        const next = await telegramSetEnabled(project, enabled);
+        if (!alive.current) return;
+        observe(next);
+        setStatus(next);
+      } finally {
+        invalidateTelegramStatus(project);
+      }
     });
 
   const removeWebhook = () =>
     run(async () => {
       await telegramRemoveWebhook(project);
       const next = await telegramStatus(project);
-      if (alive.current) setStatus(next);
+      if (!alive.current) return;
+      observe(next);
+      setStatus(next);
     });
 
   const disconnect = () =>
     run(async () => {
-      await telegramDisconnect(project);
+      try {
+        await telegramDisconnect(project);
+      } finally {
+        invalidateTelegramStatus(project);
+      }
       if (!alive.current) return;
       setLink(null);
       setToken("");
-      setStatus(await telegramStatus(project));
+      const next = await telegramStatus(project);
+      if (!alive.current) return;
+      observe(next);
+      setStatus(next);
     });
 
   const copyFallback = async (text: string) => {
