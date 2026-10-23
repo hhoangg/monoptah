@@ -424,7 +424,7 @@ impl Bridge {
             Job::CreateTopic { project, .. }
             | Job::EditStatus { project, .. }
             | Job::Notice { project, .. } => Some(project.clone()),
-            Job::SendQuestion { key } => self
+            Job::SendQuestion { key, .. } => self
                 .lock()
                 .registry
                 .prompt(key)
@@ -982,80 +982,74 @@ impl Bridge {
     }
 
     fn run_send_question(&self, chat: i64, job: Job) {
-        let Job::SendQuestion { key } = &job else {
+        let Job::SendQuestion { key, q_index } = &job else {
             return;
         };
+        let q_index = *q_index;
         // Everything needed is copied out, so no lock is held while sending.
         let plan = {
             let state = self.lock();
             state.registry.prompt(key).and_then(|prompt| {
+                // Sent already, answered, or no such question: nothing to send.
+                if prompt.messages.get(q_index)?.is_some() || prompt.done[q_index] {
+                    return None;
+                }
                 let project = state.cfg.projects.get(&prompt.payload.project)?;
-                let items: Vec<(usize, String, String, Value)> =
-                    (0..prompt.payload.questions.len())
-                        .filter(|i| prompt.messages[*i].is_none() && !prompt.done[*i])
-                        .map(|i| {
-                            let selected = &prompt.selected[i];
-                            (
-                                i,
-                                prompt.tokens[i].clone(),
-                                question_html(&prompt.payload, i, selected),
-                                keyboard(&prompt.tokens[i], &prompt.payload.questions[i], selected),
-                            )
-                        })
-                        .collect();
+                let selected = &prompt.selected[q_index];
                 Some((
                     prompt.payload.clone(),
                     project.topics.get(&prompt.payload.session_id).copied(),
                     self.api(&project.token),
-                    items,
+                    prompt.tokens[q_index].clone(),
+                    question_html(&prompt.payload, q_index, selected),
+                    keyboard(
+                        &prompt.tokens[q_index],
+                        &prompt.payload.questions[q_index],
+                        selected,
+                    ),
                 ))
             })
         };
-        let Some((payload, thread, api, items)) = plan else {
+        let Some((payload, thread, api, token, html, markup)) = plan else {
             // The prompt was closed or its project removed while the job waited.
             return;
         };
-        for (index, token, html, markup) in items {
-            self.begin_send(chat);
-            match api.send_message(chat, thread, &html, Some(markup)) {
-                Ok(message_id) => {
-                    let (stored, still_waiting) = {
-                        let mut state = self.lock();
-                        let stored = state.registry.set_message(key, index, message_id, &token);
-                        (stored, state.registry.prompt(key).is_some())
-                    };
-                    if !stored {
-                        // The prompt was closed, or replaced by a new one with new tokens,
-                        // while the message was in flight: do not leave live buttons.
-                        let status = if still_waiting {
-                            EXPIRED
-                        } else {
-                            "This question is no longer waiting"
-                        };
-                        self.push_job(
-                            chat,
-                            Job::EditStatus {
-                                project: payload.project.clone(),
-                                chat,
-                                message_id,
-                                html: status_html(&payload, index, status),
-                                keyboard: None,
-                            },
-                        );
-                        return;
-                    }
-                }
-                Err(TgError::ThreadNotFound) if thread.is_some() => {
-                    self.recover_topic(chat, job.clone(), &payload, thread);
+        self.begin_send(chat);
+        match api.send_message(chat, thread, &html, Some(markup)) {
+            Ok(message_id) => {
+                let (stored, still_waiting) = {
+                    let mut state = self.lock();
+                    let stored = state.registry.set_message(key, q_index, message_id, &token);
+                    (stored, state.registry.prompt(key).is_some())
+                };
+                if stored {
+                    self.sent_ok(chat);
                     return;
                 }
-                Err(error) => {
-                    self.handle_send_error(chat, job, error);
-                    return;
-                }
+                // The prompt was closed, or replaced by a new one with new tokens, while the
+                // message was in flight: do not leave live buttons.
+                let status = if still_waiting {
+                    EXPIRED
+                } else {
+                    "This question is no longer waiting"
+                };
+                self.push_job(
+                    chat,
+                    Job::EditStatus {
+                        project: payload.project.clone(),
+                        chat,
+                        message_id,
+                        html: status_html(&payload, q_index, status),
+                        keyboard: None,
+                    },
+                );
+                self.sent_ok(chat);
             }
+            Err(TgError::ThreadNotFound) if thread.is_some() => {
+                self.recover_topic(chat, job.clone(), &payload, thread);
+            }
+            Err(error) => self.handle_send_error(chat, job, error),
         }
-        self.sent_ok(chat);
     }
 
     /// The bound topic was deleted: forget it, make a new one first, then retry the question.
@@ -1222,7 +1216,7 @@ impl Bridge {
     /// Gives up on a job. A question that cannot be sent is closed so it does not linger.
     fn drop_job(&self, job: Job) {
         self.release_job(&job);
-        if let Job::SendQuestion { key } = &job {
+        if let Job::SendQuestion { key, .. } = &job {
             let (effects, project) = {
                 let mut state = self.lock();
                 let ids = state.registry.prompt(key).map(|p| {
@@ -1425,6 +1419,7 @@ impl Bridge {
         }
         let key = key_of(&payload.session_id, payload.request_id);
         let project_name = payload.project.clone();
+        let question_count = payload.questions.len();
         let expired = {
             let mut state = self.lock();
             let project = state
@@ -1463,7 +1458,16 @@ impl Bridge {
             if !has_topic && state.topics_pending.insert(slot) {
                 state.queue.push(chat, create);
             }
-            state.queue.push(chat, Job::SendQuestion { key });
+            // Topic first, then the questions in order: the queue is first in, first out.
+            for q_index in 0..question_count {
+                state.queue.push(
+                    chat,
+                    Job::SendQuestion {
+                        key: key.clone(),
+                        q_index,
+                    },
+                );
+            }
             expired
         };
         self.apply_effects(expired, Owner::Project(&project_name));
@@ -2214,9 +2218,117 @@ mod tests {
         );
         assert!(
             jobs.iter()
-                .any(|job| matches!(job, Job::SendQuestion { key } if key == "s1#1")),
+                .any(|job| matches!(job, Job::SendQuestion { key, .. } if key == "s1#1")),
             "the new prompt is still sent: {jobs:?}"
         );
+    }
+
+    #[test]
+    fn each_question_message_is_its_own_spaced_and_counted_send() {
+        let (base, server) =
+            serve_script((1..=4).map(|i| ok(json!({ "message_id": i }))).collect());
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        bind_topic(&bridge, "proj", "s1", 42);
+        let mut prompt = payload("s1", 1);
+        let template = prompt.questions[0].clone();
+        prompt.questions = (1..=4)
+            .map(|i| QuestionIn {
+                id: format!("q{i}"),
+                prompt: format!("Question number {i}?"),
+                ..template.clone()
+            })
+            .collect();
+        bridge.forward("main", prompt).unwrap();
+
+        for sent in 1..=4_usize {
+            assert!(bridge.pump(false), "message {sent} goes out");
+            assert_eq!(
+                bridge.lock().queue.recorded(CHAT),
+                sent,
+                "every message counts against the budget"
+            );
+            if sent < 4 {
+                assert!(
+                    !bridge.pump(false),
+                    "the next message waits for the 1 s spacing"
+                );
+                bridge.skew_ms.fetch_add(1_000, Ordering::Relaxed);
+            }
+        }
+        assert!(!bridge.pump(false));
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 4);
+        for (i, call) in seen.iter().enumerate() {
+            let text = call.body["text"].as_str().unwrap();
+            assert!(
+                text.contains(&format!("Question number {}?", i + 1)),
+                "{text}"
+            );
+        }
+        let state = bridge.lock();
+        let messages = &state.registry.prompt("s1#1").unwrap().messages;
+        assert_eq!(messages, &[Some(1), Some(2), Some(3), Some(4)]);
+    }
+
+    #[test]
+    fn failed_message_is_retried_alone_and_sent_ones_stay() {
+        let (base, server) = serve_script(vec![
+            ok(json!({ "message_id": 1 })),
+            fail(429, "Too Many Requests", json!({ "retry_after": 3 })),
+            ok(json!({ "message_id": 2 })),
+            ok(json!({ "message_id": 3 })),
+        ]);
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        bind_topic(&bridge, "proj", "s1", 42);
+        let mut prompt = payload("s1", 1);
+        let template = prompt.questions[0].clone();
+        prompt.questions = (1..=3)
+            .map(|i| QuestionIn {
+                id: format!("q{i}"),
+                prompt: format!("Question number {i}?"),
+                ..template.clone()
+            })
+            .collect();
+        bridge.forward("main", prompt).unwrap();
+        drain(&bridge);
+        let seen = server.join().unwrap();
+        let texts: Vec<&str> = seen
+            .iter()
+            .map(|call| call.body["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts.len(), 4, "{texts:?}");
+        assert!(texts[0].contains("number 1?"));
+        assert!(texts[1].contains("number 2?"), "the 429 hit message 2");
+        assert!(texts[2].contains("number 2?"), "only message 2 is retried");
+        assert!(texts[3].contains("number 3?"));
+        let state = bridge.lock();
+        let messages = &state.registry.prompt("s1#1").unwrap().messages;
+        assert_eq!(messages, &[Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn topic_is_created_before_the_first_question_message() {
+        let (base, server) = serve_script(vec![
+            ok(json!({ "message_thread_id": 11 })),
+            ok(json!({ "message_id": 1 })),
+            ok(json!({ "message_id": 2 })),
+        ]);
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        let mut prompt = payload("s1", 1);
+        let mut second = prompt.questions[0].clone();
+        second.id = "q2".into();
+        prompt.questions.push(second);
+        bridge.forward("main", prompt).unwrap();
+        drain(&bridge);
+        let seen = server.join().unwrap();
+        let methods: Vec<String> = seen.iter().map(method_of).collect();
+        assert_eq!(methods.len(), 3, "{methods:?}");
+        assert!(methods[0].ends_with("createForumTopic"), "{methods:?}");
+        assert_eq!(seen[1].body["message_thread_id"], 11);
+        assert_eq!(seen[2].body["message_thread_id"], 11);
     }
 
     #[test]
@@ -2501,7 +2613,7 @@ mod tests {
         );
         assert!(
             jobs.iter()
-                .any(|job| matches!(job, Job::SendQuestion { key } if key == "s1#1")),
+                .any(|job| matches!(job, Job::SendQuestion { key, .. } if key == "s1#1")),
             "the new prompt is sent: {jobs:?}"
         );
     }

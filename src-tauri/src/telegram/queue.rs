@@ -25,9 +25,13 @@ pub enum Job {
         session_id: String,
         name: String,
     },
+    /// Sends one question message. A prompt with several questions queues one job per
+    /// question, so each message counts against the spacing and the minute budget.
     SendQuestion {
-        /// Key of the pending question in the bridge state.
+        /// Key of the pending prompt in the bridge state.
         key: String,
+        /// Which question of the prompt this message carries.
+        q_index: usize,
     },
     /// Rewrites a forwarded message. `keyboard` is `None` once the question is settled, so
     /// the buttons disappear; an open multi-select question keeps its (updated) keyboard.
@@ -215,6 +219,12 @@ impl SendQueue {
         queue.sends = sends.split_off(keep_from).into();
     }
 
+    /// Test aid: how many sends of `chat` are inside the minute budget's history.
+    #[cfg(test)]
+    pub fn recorded(&self, chat: i64) -> usize {
+        self.chats.get(&chat).map_or(0, |queue| queue.sends.len())
+    }
+
     /// Earliest time the bot-wide budget allows another send.
     fn global_ready_at(&self) -> u64 {
         if self.global_sends.len() >= GLOBAL_WINDOW_SENDS {
@@ -237,7 +247,10 @@ mod tests {
     }
 
     fn question(key: &str) -> Job {
-        Job::SendQuestion { key: key.into() }
+        Job::SendQuestion {
+            key: key.into(),
+            q_index: 0,
+        }
     }
 
     fn edit(chat: i64, message_id: i64, html: &str) -> Job {
