@@ -2,6 +2,12 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import {
+  emitHarnessAvailability,
+  markHarnessAvailabilityProbed,
+  setHarnessAvailability,
+  type HarnessAvailability,
+} from "../../../../integrations/harness/core/availabilityState";
 import type { Workflow } from "../../model/workflow";
 import { ticketWorkflow } from "../workflowUiFixtures";
 import { loopLabel } from "./LoopEdge";
@@ -165,6 +171,28 @@ it("flags a session whose model is not in the catalog and blocks saving it enabl
   expect(button("Save").disabled).toBe(true);
   await act(async () => buttonText("Save paused")!.click());
   expect(stored()[0].enabled).toBe(false);
+});
+
+it("re-checks the session models when a CLI is found or lost", async () => {
+  const all = (on: boolean): HarnessAvailability => ({
+    claude: on, codex: on, cursor: on, grok: on, opencode: on, pi: on,
+    omp: on, fx: on, hermes: on, antigravity: on, devin: on,
+  });
+  setHarnessAvailability(all(true));
+  markHarnessAvailabilityProbed();
+  try {
+    await renderBoard(ticketWorkflow());
+    expect(container.querySelector("[data-board-issues]")).toBeNull();
+    await act(async () => {
+      setHarnessAvailability({ ...all(true), claude: false });
+      emitHarnessAvailability();
+    });
+    expect(
+      container.querySelector("[data-board-node='fetch'] [data-node-issue]")?.textContent,
+    ).toContain('Model "claude:sonnet-5" is not available');
+  } finally {
+    setHarnessAvailability(all(true));
+  }
 });
 
 it("saves a valid workflow, keeping the fields the app manages", async () => {

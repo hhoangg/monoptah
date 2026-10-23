@@ -8,6 +8,7 @@ import {
   finishImport,
   inputValueProblems,
   previewImport,
+  reviewOf,
   type ImportPreview,
 } from "./workflowYaml";
 
@@ -33,7 +34,7 @@ function example(): Workflow {
         id: "fetch",
         type: "session",
         project: "{{inputs.project}}",
-        model: "sonnet",
+        model: "claude:sonnet-5",
         checkout: "root",
         prompt: "List open tickets assigned to me in {{inputs.clickupList}}.",
         output: { tickets: { type: "list" } },
@@ -45,7 +46,7 @@ function example(): Workflow {
         type: "session",
         parent: "each",
         project: "{{inputs.project}}",
-        model: "sonnet",
+        model: "claude:sonnet-5",
         checkout: "newWorktree",
         prompt:
           "Implement {{item.title}} ({{item.url}}) and open a PR.\n" +
@@ -57,7 +58,7 @@ function example(): Workflow {
         type: "session",
         parent: "each",
         project: "{{inputs.project}}",
-        model: "opus",
+        model: "claude:opus-5",
         checkout: { worktreeOf: "dev" },
         nestUnder: "dev",
         prompt: "Review {{dev.pr_url}}. List blocking issues only.",
@@ -92,6 +93,30 @@ function error(text: string): string {
   if (result.ok) throw new Error("expected an error, got a preview");
   return result.error;
 }
+
+describe("model problems in a review", () => {
+  const typed = (): Workflow => {
+    const w = example();
+    return {
+      ...w,
+      nodes: w.nodes.map((n) =>
+        n.type === "session" ? { ...n, model: "claude-sonnet-5-5" } : n,
+      ),
+    };
+  };
+  const messages = (issues: ImportPreview["issues"]) => issues.map((issue) => issue.message);
+
+  it("reviewOf lists a model the catalog does not have", () => {
+    expect(messages(reviewOf(typed()).issues)).toContain(
+      'Model "claude-sonnet-5-5" is not available. Pick one in the step\'s model list.',
+    );
+  });
+
+  it("previewImport lists it too", () => {
+    const preview = ok(exportWorkflow(typed()));
+    expect(messages(preview.issues).join(" ")).toContain('Model "claude-sonnet-5-5"');
+  });
+});
 
 describe("a file nested far too deeply", () => {
   it("gets the model's error instead of a RangeError", () => {
@@ -218,7 +243,7 @@ describe("previewImport", () => {
           type: "session",
           project: "{{inputs.project}}",
           harness: "claude",
-          model: "opus",
+          model: "claude:opus-5",
           effort: "high",
           checkout: "newWorktree",
           reuseSession: false,

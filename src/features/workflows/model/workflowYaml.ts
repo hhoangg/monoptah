@@ -17,9 +17,9 @@ import {
   parseEdge,
   parseInputs,
   parseNode,
-  validateWorkflow,
   type WorkflowIssue,
 } from "./workflowParse";
+import { workflowIssues } from "./workflowModels";
 
 /** The value of the top-level `monoptahWorkflow` key. */
 export const WORKFLOW_FILE_VERSION = 1;
@@ -216,7 +216,7 @@ export function reviewTexts(nodes: readonly WorkflowNode[]): Pick<ImportPreview,
 
 /** The review of a workflow already stored, built from its current definition. */
 export function reviewOf(w: Workflow): ImportPreview {
-  return { workflow: w, ...reviewTexts(w.nodes), issues: validateWorkflow(w) };
+  return { workflow: w, ...reviewTexts(w.nodes), issues: workflowIssues(w) };
 }
 
 type Parsed = { ok: true; value: unknown } | { ok: false; error: string };
@@ -337,7 +337,7 @@ export function previewImport(
     nodes,
     edges,
   };
-  const issues = validateWorkflow({
+  const issues = workflowIssues({
     ...workflow,
     id: "wf-preview",
     createdAt: 0,

@@ -113,6 +113,22 @@ it("makes hidden characters in a command visible", async () => {
   expect(section("Commands this workflow runs")!.textContent).toContain("echo a<U+202E>b");
 });
 
+it("lists a session model the catalog does not have as a problem", async () => {
+  const w = flagged();
+  await renderPage(
+    {
+      ...w,
+      nodes: w.nodes.map((n) =>
+        n.type === "session" ? { ...n, model: "claude-sonnet-5-5" } : n,
+      ),
+    },
+    "enable",
+  );
+  expect(section("Problems")!.textContent).toContain(
+    'Model "claude-sonnet-5-5" is not available',
+  );
+});
+
 it("names the action after the intent", async () => {
   await renderPage(flagged(), "enable");
   expect(button("Approve and enable")).toBeDefined();

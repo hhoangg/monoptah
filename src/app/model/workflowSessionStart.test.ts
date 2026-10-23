@@ -170,6 +170,34 @@ describe("startWorkflowSession", () => {
     expect(launched).toEqual([]);
   });
 
+  it("names the effort when the model does not offer it", async () => {
+    const { deps, launched } = fixture();
+    await expect(
+      startWorkflowSession(deps, "mono-1", {
+        project: "/code/app",
+        prompt: "Do it",
+        workspaceMode: "current",
+        harness: "grok",
+        model: "grok:grok-4.6",
+        effort: "turbo",
+      }),
+    ).rejects.toThrow(
+      'Effort "turbo" is not available for this model. Pick one in the step\'s model list.',
+    );
+    // A model with no effort setting at all reads the same.
+    await expect(
+      startWorkflowSession(deps, "mono-1", {
+        project: "/code/app",
+        prompt: "Do it",
+        workspaceMode: "current",
+        harness: "codex",
+        model: "codex:test",
+        effort: "high",
+      }),
+    ).rejects.toThrow('Effort "high" is not available');
+    expect(launched).toEqual([]);
+  });
+
   it("rejects a project that is not the Mono's", async () => {
     const { deps } = fixture();
     await expect(

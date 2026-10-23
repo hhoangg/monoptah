@@ -287,7 +287,7 @@ it("monoContext includes workflows_rules", () => {
   expect(full).toContain("`workflows.resumeRun`");
   expect(full).toContain("show them the steps first");
   expect(full).toContain(
-    "A session node's harness, model and effort take exact ids from `app models.list`",
+    "A session node's harness and model take exact ids from `app models.list`, and effort one of that model's listed values",
   );
   expect(full).toContain("workflows.run needs the workflow to be resumed (not paused)");
   expect(full).toContain("until the user reviews and enables it in the Workflows panel");

@@ -8,7 +8,10 @@ import type { MonoLaunchRegistry } from "../../features/monos/model/monoLaunches
 import type { ControlOutcome } from "../../features/orchestration/model/orchestration";
 import { sameProjectPath } from "../../features/projects/model/recents";
 import { findModel } from "../../features/sessions/model/models";
-import { modelUnavailable } from "../../features/workflows/model/workflowModels";
+import {
+  effortUnavailable,
+  modelUnavailable,
+} from "../../features/workflows/model/workflowModels";
 import type { QuickLaunch } from "../../features/quick-composer/model/quickComposer";
 import type { Session } from "../../features/sessions/model/session";
 import type { Worktrees } from "../../features/source-control/model/worktrees";
@@ -144,6 +147,13 @@ export async function startWorkflowSession(
     // The catalog can change after a workflow was saved; say which model is gone.
     if (req.model && error instanceof Error && error.message.startsWith("Unknown model"))
       throw new Error(modelUnavailable(req.model));
+    if (
+      req.effort &&
+      error instanceof Error &&
+      (error.message.includes("does not expose an effort setting") ||
+        error.message.startsWith("Invalid model setting"))
+    )
+      throw new Error(effortUnavailable(req.effort));
     throw error;
   }
   return { sessionId: started.id, folderId: started.folderId, settled };

@@ -512,9 +512,7 @@ function SessionModel({
       </Property>
       {problem ? (
         <div data-model-issue>
-          <Hint>
-            {problem.message} {problem.saved}.
-          </Hint>
+          <Hint>{problem}</Hint>
         </div>
       ) : null}
       <ModelSettingRows

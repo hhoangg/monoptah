@@ -43,6 +43,10 @@ import type { MonoProject } from "../../../monos/model/mono";
 import { subscribeMonoFiles } from "../../../monos/model/monoFiles";
 import { anchorSchedule, nextHabitRunAt } from "../../../monos/model/monoHabits";
 import { PageHeader } from "../../../monos/ui/monoPanelParts";
+import {
+  getHarnessAvailabilitySnapshot,
+  subscribeHarnessAvailability,
+} from "../../../../integrations/harness/core/availabilityState";
 import { getModelSnapshot, subscribeModels } from "../../../sessions/model/models";
 import {
   triggerOf,
@@ -302,9 +306,13 @@ function BoardEditor({ monoId, workflow, color, projects, monoModel, onBack, onR
     () => ({ ...fromFlow(base, board.nodes, board.edges), ...meta }),
     [base, board, meta],
   );
-  // A model list that arrives later changes which models are available.
+  // A model list that arrives later, or a CLI found or lost, changes which models are available.
   const catalog = useSyncExternalStore(subscribeModels, getModelSnapshot);
-  const issues = useMemo(() => problemsOf(current), [current, catalog]);
+  const installed = useSyncExternalStore(
+    subscribeHarnessAvailability,
+    getHarnessAvailabilitySnapshot,
+  );
+  const issues = useMemo(() => problemsOf(current), [current, catalog, installed]);
   const byNode = useMemo(() => issuesByNode(issues), [issues]);
   const changed = definitionKey(current) !== baseline;
   // Enabling goes through the review, never through Save.

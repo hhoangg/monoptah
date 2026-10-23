@@ -211,7 +211,8 @@ it("says why a stored model is not available and shows the stored value", async 
   expect(hint?.textContent).toContain(
     "Model \"claude-sonnet-5-5\" is not available. Pick one in the step's model list.",
   );
-  expect(hint?.textContent).toContain("Saved model: claude-sonnet-5-5");
+  // The message already quotes the value; it is not repeated.
+  expect(hint?.textContent?.split("claude-sonnet-5-5")).toHaveLength(2);
 });
 
 it("shows no model hint for an exact id or for a node that sets nothing", async () => {
