@@ -96,16 +96,21 @@ pub struct SendQueue {
 }
 
 impl SendQueue {
-    /// Queues a job. A queued `EditStatus` for the same message is replaced in place, so only
-    /// the latest text is sent.
+    /// Queues a job. Queued `EditStatus` jobs for the same message are replaced by it, so only
+    /// the latest text is sent. That includes one put back at the front after a failed send,
+    /// otherwise the older text could go out after the newer one.
     pub fn push(&mut self, chat: i64, job: Job) {
         let queue = self.chats.entry(chat).or_default();
         if let Job::EditStatus { message_id, .. } = &job {
-            let same = queue.edits.iter_mut().find(
-                |queued| matches!(queued, Job::EditStatus { message_id: id, .. } if id == message_id),
-            );
-            if let Some(slot) = same {
-                *slot = job;
+            let id = *message_id;
+            let same = |queued: &Job| matches!(queued, Job::EditStatus { message_id, .. } if *message_id == id);
+            if let Some(first) = queue.edits.iter().position(same) {
+                queue.edits[first] = job;
+                let mut index = 0;
+                queue.edits.retain(|queued| {
+                    index += 1;
+                    index - 1 == first || !same(queued)
+                });
                 return;
             }
         }
@@ -294,6 +299,23 @@ mod tests {
         assert_eq!(q.next_ready(1_000), Some((1, edit(1, 11, "other"))));
         assert_eq!(q.next_ready(1_000), Some((2, edit(2, 10, "elsewhere"))));
         assert_eq!(q.next_ready(5_000), None);
+    }
+
+    #[test]
+    fn push_removes_a_requeued_edit_for_the_same_message() {
+        let mut q = SendQueue::default();
+        q.push(1, edit(1, 10, "e1"));
+        // E1 goes out, and while it is in flight E2 for the same message is queued.
+        let (_, e1) = q.next_ready(0).unwrap();
+        q.push(1, edit(1, 10, "e2"));
+        // E1 failed on the network and goes back to the front, ahead of E2.
+        q.requeue_front(1, e1);
+        // E3 supersedes both; neither old text may be sent after it.
+        q.push(1, edit(1, 10, "e3"));
+        q.push(1, edit(1, 11, "other"));
+        assert_eq!(q.next_ready(10_000), Some((1, edit(1, 10, "e3"))));
+        assert_eq!(q.next_ready(11_000), Some((1, edit(1, 11, "other"))));
+        assert_eq!(q.next_ready(12_000), None);
     }
 
     #[test]
