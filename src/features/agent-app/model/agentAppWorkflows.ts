@@ -29,6 +29,7 @@ import {
   finishImport,
   inputValueProblems,
   previewImport,
+  reviewTexts,
 } from "../../workflows/model/workflowYaml";
 import type { AgentAppHost } from "./agentApp";
 
@@ -55,6 +56,7 @@ export const WORKFLOW_FIELDS: ReadonlyMap<string, readonly string[]> = new Map([
   ["workflows.list", ["project"]],
   ["workflows.get", ["id", "project"]],
   ["workflows.add", ["workflow", "yaml", "values", "project"]],
+  ["workflows.validate", ["workflow", "yaml", "values", "project"]],
   ["workflows.update", ["id", "workflow", "project"]],
   ["workflows.setInputs", ["id", "values", "project"]],
   ["workflows.run", ["id", "project"]],
@@ -187,6 +189,47 @@ function definitionFrom(
       ? {}
       : { values: inputValues(raw.inputValues, "workflow.inputValues") }),
   };
+}
+
+/**
+ * The definition a `workflows.add` or `workflows.validate` call describes, from a JSON `workflow`
+ * or a YAML file. Both actions parse through here so they cannot disagree.
+ */
+function newWorkflowFrom(input: Rec, now: number) {
+  if ((input.workflow === undefined) === (input.yaml === undefined))
+    throw new Error("Pass either workflow (an object) or yaml (text), not both");
+  const fromYaml = input.yaml !== undefined;
+  let definition: Definition;
+  let values: Values = {};
+  let review: { commands: unknown[]; prompts: unknown[] } | undefined;
+  if (!fromYaml) {
+    if (input.values !== undefined)
+      throw new Error("values goes with yaml; put inputValues in the workflow");
+    const parsed = definitionFrom(input.workflow, now, DEFINITION_FIELDS);
+    definition = parsed.definition;
+    values = parsed.values ?? {};
+  } else {
+    const preview = previewImport(text(input.yaml, "yaml", DEFINITION_MAX_BYTES));
+    if (!preview.ok) throw new Error(preview.error);
+    definition = {
+      ...preview.preview.workflow,
+      nodes: preview.preview.workflow.nodes.map((node) => anchorNode(node, now)),
+    };
+    review = preview.preview;
+    if (input.values !== undefined)
+      values = declaredValues(definition.inputs, inputValues(input.values, "values"));
+  }
+  // Always paused: only the user, in the Workflows panel, enables what the CLI creates.
+  const draft: Workflow = {
+    ...definition,
+    id: newWorkflowId(),
+    inputValues: values,
+    enabled: false,
+    createdAt: now,
+    // Only the user, in the panel, may enable what came from a file.
+    ...(fromYaml ? { needsReview: true } : {}),
+  };
+  return { draft, review };
 }
 
 /** Problems that keep a workflow from running: its graph, and its input values. */
@@ -324,61 +367,29 @@ export async function handleWorkflows(
       };
     }
     case "workflows.add": {
-      if ((input.workflow === undefined) === (input.yaml === undefined))
-        throw new Error("Pass either workflow (an object) or yaml (text), not both");
-      const fromYaml = input.yaml !== undefined;
-      let definition: Definition;
-      let values: Values = {};
-      let review: { commands: unknown[]; prompts: unknown[] } | undefined;
-      if (!fromYaml) {
-        if (input.values !== undefined)
-          throw new Error("values goes with yaml; put inputValues in the workflow");
-        const parsed = definitionFrom(input.workflow, now, DEFINITION_FIELDS);
-        definition = parsed.definition;
-        values = parsed.values ?? {};
-      } else {
-        const preview = previewImport(text(input.yaml, "yaml", DEFINITION_MAX_BYTES));
-        if (!preview.ok) throw new Error(preview.error);
-        definition = {
-          ...preview.preview.workflow,
-          nodes: preview.preview.workflow.nodes.map((node) => anchorNode(node, now)),
-        };
-        review = preview.preview;
-        if (input.values !== undefined)
-          values = declaredValues(definition.inputs, inputValues(input.values, "values"));
-      }
+      const { draft, review } = newWorkflowFrom(input, now);
       return change((list) => {
         if (list.length >= WORKFLOWS_MAX)
           throw new Error(`A Mono can have at most ${WORKFLOWS_MAX} workflows`);
-        const draft: Workflow = {
-          ...definition,
-          id: newWorkflowId(),
-          inputValues: values,
-          enabled: false,
-          createdAt: now,
-          // Only the user, in the panel, may enable what came from a file.
-          ...(fromYaml ? { needsReview: true } : {}),
-        };
         const issues = problems(draft);
-        // A file from elsewhere is saved paused, like an import, so its commands and prompts are
-        // reviewed first. A definition written here is enabled once it is clean.
-        const created = scheduled({ ...draft, enabled: !fromYaml && !issues.length }, now);
         return {
-          list: [...list, created],
+          list: [...list, draft],
           result: {
-            id: created.id,
-            enabled: created.enabled,
+            id: draft.id,
+            enabled: false,
             issues,
-            ...(review
-              ? {
-                  commands: review.commands,
-                  prompts: review.prompts,
-                  note: "Saved paused. Check the commands and prompts with the user; only the user can enable it, in the Workflows panel.",
-                }
-              : {}),
+            note: review
+              ? "Saved paused. Check the commands and prompts with the user; only the user can enable it, in the Workflows panel."
+              : "Saved paused. Tell the user to open it in the Workflows panel and enable it there.",
+            ...(review ? { commands: review.commands, prompts: review.prompts } : {}),
           },
         };
       });
+    }
+    case "workflows.validate": {
+      // The same parse and checks as workflows.add, without saving anything.
+      const { draft } = newWorkflowFrom(input, now);
+      return { issues: problems(draft), ...reviewTexts(draft.nodes) };
     }
     case "workflows.update": {
       const parsed = definitionFrom(input.workflow, now, [

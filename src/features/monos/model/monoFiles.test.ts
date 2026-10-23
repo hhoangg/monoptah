@@ -290,7 +290,9 @@ it("monoContext includes workflows_rules", () => {
     "A session node's harness and model take exact ids from `app models.list`, and effort one of that model's listed values",
   );
   expect(full).toContain("workflows.run needs the workflow to be resumed (not paused)");
-  expect(full).toContain("until the user reviews and enables it in the Workflows panel");
+  expect(full).toContain(
+    "A workflow you add is always saved paused, however clean it is: the user enables it in the Workflows panel",
+  );
   expect(full.indexOf("</habits_rules>")).toBeLessThan(
     full.indexOf("<workflows_rules>"),
   );

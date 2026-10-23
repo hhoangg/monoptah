@@ -82,7 +82,7 @@ const ACTIONS: [&str; 12] = [
     "list", "delegate", "get", "steer", "message", "retry", "cancel", "wait", "review", "finish",
     "respond", "answer",
 ];
-const APP_ACTIONS: [&str; 46] = [
+const APP_ACTIONS: [&str; 48] = [
     "models.list",
     "sessions.list",
     "sessions.read",
@@ -128,6 +128,8 @@ const APP_ACTIONS: [&str; 46] = [
     "workflows.export",
     "workflows.import",
     "workflows.runs",
+    "workflows.validate",
+    "workflows.guide",
     "chat.card",
 ];
 const APP_USAGE: &str = r#"Monoptah app access — use in a thread enabled by /operator.
@@ -305,17 +307,25 @@ Actions:
                   "project":{"type":"project"}},"inputValues":{"project":"<path
                   or name>"},"nodes":[...],"edges":[{"from":"a","to":"b"}]}}
                   or {"yaml":"<exported file>","values":{...}}. Add only after
-                  the user saw the steps and agreed. A yaml file is always
-                  saved paused, like workflows.import, and the result lists its
-                  commands and prompts to review before workflows.resume.
+                  the user saw the steps and agreed. A workflow added here is
+                  always saved paused, however clean it is; the user enables it
+                  in the Workflows panel. A yaml file is also marked as needing
+                  review, like workflows.import, and the result lists its
+                  commands and prompts.
                   Node types: schedule (schedule as in habits.add) or manual,
                   session (project is "{{inputs.<name>}}", prompt, checkout
                   root | newWorktree | {"worktreeOf":"<nodeId>"}, output
                   fields), command, askMono (question, answers), if (condition
                   or decide "mono"), forEach (in, as, maxParallel; its child
-                  nodes have "parent") and one report. A workflow object is
-                  saved enabled only when "issues" is empty (including every
-                  input having a valid value), else paused.
+                  nodes have "parent") and one report. "issues" lists what
+                  would stop it from running (including every input needing a
+                  valid value); fix them before the user enables it.
+  workflows.validate {"workflow":{...}} or {"yaml":"...","values":{...}}  Dry
+                  run of workflows.add: the same checks, nothing is saved.
+                  Returns "issues", plus every command and prompt the steps
+                  would run.
+  workflows.guide {}  How to design and write a workflow; read it before
+                  adding or changing one.
   workflows.update {"id":"...","workflow":{...}}  Replace the definition; the id,
                   enabled state and run state are kept unless given. Values of
                   inputs the new definition still declares are kept unless
@@ -726,6 +736,8 @@ mod tests {
             "export",
             "import",
             "runs",
+            "validate",
+            "guide",
         ] {
             let name = format!("workflows.{action}");
             assert!(
@@ -739,7 +751,7 @@ mod tests {
             ));
             assert!(parse_args_for(&args(&[&name]), false).is_err());
         }
-        assert_eq!(actions.len(), 14);
+        assert_eq!(actions.len(), 16);
     }
 
     #[test]

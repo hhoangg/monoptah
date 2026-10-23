@@ -59,6 +59,7 @@ function fixture(kind: "mono" | "session" = "mono") {
   const stop = vi.fn(async () => {});
   const resumeRun = vi.fn(async () => {});
   const clearRuns = vi.fn(async (_monoId: string, _workflowId: string) => {});
+  const updates = vi.fn();
   const host = {
     isMono: (id: string) => kind === "mono" && id === source.id,
     monoOf: () => ({ id: "mono-1", projects: [] }),
@@ -69,6 +70,7 @@ function fixture(kind: "mono" | "session" = "mono") {
         _monoId: string,
         edit: (list: Workflow[]) => { workflows: Workflow[]; result: unknown },
       ) => {
+        updates();
         const { workflows, result } = edit(structuredClone(stored));
         stored = workflows;
         return result;
@@ -94,6 +96,7 @@ function fixture(kind: "mono" | "session" = "mono") {
     stop,
     resumeRun,
     clearRuns,
+    updates,
   };
 }
 
@@ -115,25 +118,41 @@ describe("workflows.add", () => {
     expect(stored()).toEqual([]);
   });
 
-  it("saves a valid workflow enabled, with its next run time and a generated id", async () => {
+  it("add saves a clean JSON workflow paused", async () => {
     const { call, stored } = fixture();
-    const result = (await call("workflows.add", { workflow: definition() })) as Added;
-    expect(result).toMatchObject({ enabled: true, issues: [] });
+    const result = (await call("workflows.add", { workflow: definition() })) as Added & {
+      note: string;
+    };
+    expect(result).toMatchObject({ enabled: false, issues: [] });
+    expect(result.note).toMatch(/paused/i);
     expect(result.id).toMatch(/^wf-[a-z0-9]{8}$/);
     const [saved] = stored();
     expect(saved).toMatchObject({
       id: result.id,
       name: "Ticket review",
-      enabled: true,
+      enabled: false,
       createdAt: NOW.getTime(),
       inputValues: { project: "/code/app" },
     });
-    // Weekdays 09:00, and it is Thursday 10:00: next is Friday.
-    expect(new Date(saved.nextRunAt!).getDay()).toBe(5);
+    expect(saved.nextRunAt).toBeUndefined();
     expect(saved.nodes[0]).toMatchObject({
       schedule: { scheduleKind: "weekdays", time: "09:00" },
     });
     expect(validateWorkflow(saved)).toEqual([]);
+  });
+
+  it("add ignores enabled true in the input", async () => {
+    const { call, stored } = fixture();
+    const attempt = call("workflows.add", { workflow: definition({ enabled: true }) });
+    // Either the field is refused or it is ignored; the stored workflow is paused in both cases.
+    await attempt.then(
+      (result) => expect((result as Added).enabled).toBe(false),
+      (error) => expect(String(error)).toMatch(/Unknown workflow fields: enabled/),
+    );
+    for (const saved of stored()) {
+      expect(saved.enabled).toBe(false);
+      expect(saved.nextRunAt).toBeUndefined();
+    }
   });
 
   it("add with issues saves paused and returns issues", async () => {
@@ -286,6 +305,8 @@ describe("workflows.update", () => {
   it("replaces the definition but keeps id, createdAt, inputValues, enabled and run state", async () => {
     const { call, stored, seed } = fixture();
     const { id } = (await call("workflows.add", { workflow: definition() })) as Added;
+    // The CLI saves paused; resuming is what enables it.
+    await call("workflows.resume", { id });
     const added = stored()[0];
     seed([
       {
@@ -475,6 +496,7 @@ describe("running", () => {
   it("run sets runRequested and calls checkNow", async () => {
     const { call, stored, checkNow } = fixture();
     const { id } = (await call("workflows.add", { workflow: definition() })) as Added;
+    await call("workflows.resume", { id });
     await call("workflows.run", { id });
     expect(stored()[0].runRequested).toBe(true);
     expect(checkNow).toHaveBeenCalledTimes(1);
@@ -511,6 +533,7 @@ describe("running", () => {
     const second = (await call("workflows.add", {
       workflow: definition({ name: "Other" }),
     })) as Added;
+    await call("workflows.resume", { id: first.id });
     live.set(first.id, "run-1");
     runs.set(first.id, [run("run-1", "running", first.id)]);
     const { workflows } = (await call("workflows.list")) as {
@@ -756,5 +779,96 @@ describe("a workflow the CLI created from yaml needs the user's review", () => {
     live.set(id, "run-1");
     await expect(call("workflows.remove", { id })).rejects.toThrow(/Stop the workflow/);
     expect(clearRuns).not.toHaveBeenCalled();
+  });
+});
+
+describe("workflows.validate", () => {
+  const brokenModel = () =>
+    definition({
+      nodes: definition().nodes.map((node) =>
+        node.type === "session" ? { ...node, prompt: "Fix {{nope.field}}" } : node,
+      ),
+    });
+
+  it("reports the same issues as add", async () => {
+    const { call } = fixture();
+    const added = (await call("workflows.add", { workflow: brokenModel() })) as Added;
+    const validated = (await call("workflows.validate", { workflow: brokenModel() })) as {
+      issues: unknown[];
+    };
+    expect(added.issues.length).toBeGreaterThan(0);
+    expect(validated.issues).toEqual(added.issues);
+  });
+
+  it("reports a missing input value, and none when values complete it", async () => {
+    const { call } = fixture();
+    const { inputValues: _values, ...bare } = definition();
+    const missing = (await call("workflows.validate", { workflow: bare })) as {
+      issues: { message: string }[];
+    };
+    expect(missing.issues[0].message).toBe('Missing a value for input "project"');
+    const source = fixture();
+    const { id } = (await source.call("workflows.add", { workflow: bare })) as Added;
+    const { yaml } = (await source.call("workflows.export", { id })) as { yaml: string };
+    const withValues = (await call("workflows.validate", {
+      yaml,
+      values: { project: "/code/app" },
+    })) as { issues: unknown[] };
+    expect(withValues.issues).toEqual([]);
+  });
+
+  it("never writes, for valid and invalid input", async () => {
+    const f = fixture();
+    await f.call("workflows.validate", { workflow: definition() });
+    await f.call("workflows.validate", { workflow: brokenModel() });
+    await expect(
+      f.call("workflows.validate", { workflow: definition({ name: "" }) }),
+    ).rejects.toThrow();
+    expect(f.stored()).toEqual([]);
+    expect(f.updates).not.toHaveBeenCalled();
+  });
+
+  it("lists commands and prompts verbatim", async () => {
+    const { call } = fixture();
+    const nodes = [
+      ...definition().nodes.filter((node) => node.type !== "report"),
+      {
+        id: "build",
+        type: "command",
+        project: "{{inputs.project}}",
+        command: "npm test -- --run",
+      },
+      { id: "report", type: "report" },
+    ];
+    const result = (await call("workflows.validate", {
+      workflow: definition({
+        nodes,
+        edges: [
+          { from: "trigger", to: "fetch" },
+          { from: "fetch", to: "build" },
+          { from: "build", to: "report" },
+        ],
+      }),
+    })) as {
+      commands: { nodeId: string; command: string }[];
+      prompts: { nodeId: string; text: string }[];
+    };
+    expect(result.commands).toEqual([{ nodeId: "build", command: "npm test -- --run" }]);
+    // The prompt is shown as the step sends it: the written text, then the output instructions.
+    expect(result.prompts).toHaveLength(1);
+    expect(result.prompts[0].nodeId).toBe("fetch");
+    expect(result.prompts[0].text.startsWith("List my open tickets.")).toBe(true);
+    expect(result.prompts[0].text).toContain("workflow-output");
+  });
+
+  it("accepts the same input shapes as add", async () => {
+    const { call } = fixture();
+    await expect(call("workflows.validate", {})).rejects.toThrow(/either workflow/);
+    await expect(
+      call("workflows.validate", { workflow: definition(), yaml: "x" }),
+    ).rejects.toThrow(/either workflow/);
+    await expect(
+      call("workflows.validate", { workflow: definition(), values: { project: "x" } }),
+    ).rejects.toThrow(/values goes with yaml/);
   });
 });
