@@ -994,6 +994,13 @@ impl Bridge {
                 if prompt.messages.get(q_index)?.is_some() || prompt.done[q_index] {
                     return None;
                 }
+                // A job that outlived its prompt (it was in flight when the key was reused)
+                // must not jump the queue: the current prompt has its own job per question.
+                let earlier_unsent =
+                    (0..q_index).any(|i| prompt.messages[i].is_none() && !prompt.done[i]);
+                if earlier_unsent {
+                    return None;
+                }
                 let project = state.cfg.projects.get(&prompt.payload.project)?;
                 let selected = &prompt.selected[q_index];
                 Some((
@@ -1446,6 +1453,9 @@ impl Bridge {
                 }
                 expired = state.registry.expire(&key);
             }
+            // Jobs of an earlier prompt under this key (replaced or closed) must not run
+            // against the new one. A queued topic job stays: it serves the session.
+            state.queue.purge_questions(&key);
             let slot = (payload.project.clone(), payload.session_id.clone());
             let create = Job::CreateTopic {
                 project: payload.project.clone(),
@@ -2309,6 +2319,61 @@ mod tests {
     }
 
     #[test]
+    fn replaced_prompt_leaves_no_stale_question_jobs() {
+        let (base, server) = serve_script(vec![
+            ok(json!({ "message_id": 1 })),
+            ok(json!({ "message_id": 2 })),
+            ok(json!({ "message_id": 3 })),
+            ok(json!({ "message_id": 4 })),
+            // The old prompt's first message is expired.
+            ok(json!(true)),
+        ]);
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        bind_topic(&bridge, "proj", "s1", 42);
+        let three = |tag: &str| {
+            let mut prompt = payload("s1", 1);
+            let template = prompt.questions[0].clone();
+            prompt.questions = (1..=3)
+                .map(|i| QuestionIn {
+                    id: format!("{tag}{i}"),
+                    prompt: format!("{tag} number {i}?"),
+                    ..template.clone()
+                })
+                .collect();
+            prompt
+        };
+        bridge.forward("main", three("old")).unwrap();
+        assert!(bridge.pump(false), "old question 1 goes out");
+        // The window reloads: the same key comes back as a different prompt while old
+        // questions 2 and 3 are still queued.
+        bridge.forward("main", three("new")).unwrap();
+        drain(&bridge);
+
+        let seen = server.join().unwrap();
+        let texts: Vec<String> = seen
+            .iter()
+            .filter(|call| method_of(call).ends_with("sendMessage"))
+            .map(|call| call.body["text"].as_str().unwrap().to_string())
+            .collect();
+        let order: Vec<&str> = [
+            "old number 1?",
+            "new number 1?",
+            "new number 2?",
+            "new number 3?",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(texts.len(), 4, "{texts:?}");
+        for (text, expected) in texts.iter().zip(order) {
+            assert!(text.contains(expected), "{texts:?}");
+        }
+        let state = bridge.lock();
+        let messages = &state.registry.prompt("s1#1").unwrap().messages;
+        assert_eq!(messages, &[Some(2), Some(3), Some(4)]);
+    }
+
+    #[test]
     fn topic_is_created_before_the_first_question_message() {
         let (base, server) = serve_script(vec![
             ok(json!({ "message_thread_id": 11 })),
@@ -2469,7 +2534,7 @@ mod tests {
             ok(json!({ "message_id": 1 })),
             ok(json!(true)),
             fail(
-                400,
+                403,
                 "Forbidden: bot was kicked from the group chat",
                 json!({}),
             ),

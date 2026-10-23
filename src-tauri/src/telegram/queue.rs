@@ -180,6 +180,16 @@ impl SendQueue {
         queue.paused_until = queue.paused_until.max(until_ms);
     }
 
+    /// Drops every queued `SendQuestion` of the prompt stored under `key`. Used when the key
+    /// is about to belong to a new prompt, so old jobs cannot send the new questions out of
+    /// order.
+    pub fn purge_questions(&mut self, key: &str) {
+        let stale = |job: &Job| matches!(job, Job::SendQuestion { key: k, .. } if k == key);
+        for queue in self.chats.values_mut() {
+            queue.urgent.retain(|job| !stale(job));
+        }
+    }
+
     /// Puts a job back at the front of its priority class so a retry goes first.
     pub fn requeue_front(&mut self, chat: i64, job: Job) {
         let queue = self.chats.entry(chat).or_default();
