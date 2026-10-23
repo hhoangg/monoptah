@@ -299,6 +299,32 @@ describe("Mono database pagination and writes", () => {
     expect(page.blocks[0].monoHabit).toEqual(monoHabit);
   });
 
+  it("keeps workflow report identity through saves and reloads", async () => {
+    const monoWorkflow = { id: "wf-aaaaaaaa", name: "Ship tickets", runId: "run-1", at: 1_000 };
+    const report = {
+      id: "report",
+      role: "assistant" as const,
+      text: "All shipped.",
+      monoWorkflow,
+    };
+    const stored = { ...record(), blocks: [report] };
+    call.mockResolvedValueOnce(stored);
+    const session = (await getSession(stored.id))!;
+    expect(session.blocks[0].monoWorkflow).toEqual(monoWorkflow);
+
+    session.blocks = [...session.blocks, { ...report, id: "next-report" }];
+    call.mockResolvedValueOnce(saved(session));
+    await upsertSession(session);
+    expect(call).toHaveBeenLastCalledWith(
+      "mono_session_upsert",
+      expect.objectContaining({
+        session: expect.objectContaining({
+          blocks: [expect.objectContaining({ id: "next-report", monoWorkflow })],
+        }),
+      }),
+    );
+  });
+
   it("preserves a Mono after removing its only loaded draft and appends to the saved tail", async () => {
     const session = await load();
     session.blocks = [];

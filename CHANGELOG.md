@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-10-23
+
+### Added
+
+- Workflows: a new tab in a Mono's panel, next to Habits, for chains of steps the app runs for you. A workflow is a graph of a trigger (manual or on a schedule, using the same schedules as habits), session steps, shell command steps, Ask Mono questions, If conditions, For each groups that run their steps once per list item, and one Report step that posts the result into the Mono chat. Session steps declare output fields that later steps read as `{{step.field}}`, `{{item.field}}` inside a For each and `{{inputs.name}}` for workflow inputs.
+- Loops are edges back to an earlier step, with a maximum number of rounds and either the Mono or a condition deciding when to stop, for example a dev step and a review step that go back and forth until the review approves. A looped session continues in the same session and worktree.
+- A board editor (vertical, drag and drop) to build workflows by hand, with a model picker per session step that matches the composer, validation shown on each step, and a guard against overwriting changes made elsewhere.
+- Each run is drawn as a live graph of the workflow as it was when the run started: finished, running, waiting, failed and skipped steps are colored, the paths taken are highlighted, and a For each opens into side-by-side lanes or one lane with item tabs (switch with the icon in the header). Clicking a step shows its rounds, decisions, outputs, command output and a link to its session.
+- Runs survive a restart: an interrupted run can be resumed from where it stopped. Stop ends running sessions and shell commands.
+- Export a workflow to a `.monoptah-workflow.yaml` file and import one. An imported workflow is saved paused with a "Needs review" badge, and it only runs after you approve the exact version you reviewed, with every command and prompt listed.
+- Monos can build and change workflows from chat with `app workflows.*`, read a full authoring guide with `app workflows.guide`, and check a definition with `app workflows.validate` before saving. Workflows a Mono creates are always saved paused for you to enable. "Ask Mono to build a workflow" in the Workflows tab starts that conversation.
+
 ## [0.31.1] - 2026-10-22
 
 ### Added

@@ -51,6 +51,8 @@ import {
   hydrateWorkspaceSnapshot,
   parseWorkspaceSnapshot,
 } from "../../features/workspace/model/workspaceSnapshot";
+import { liveWorkflowRuns } from "../../features/workflows/model/workflowStore";
+import { liveRunRegistry } from "../hooks/workflowLiveRuns";
 import { loadWindowTransfer } from "./windowTransferBootstrap";
 import type { WindowTransferPayload } from "./windowTransfer";
 import {
@@ -62,6 +64,14 @@ import type { ProjectReturnMemory } from "../../features/projects/model/projectR
 
 export type { ResumedWorkspace };
 export { hasInFlightSessions };
+
+/**
+ * Whether closing the window would cut work short: a busy session, or a workflow run this
+ * window is driving (the run lives in its memory, so destroying the window ends it).
+ */
+export function hasInFlightWork(sessions: Session[]): boolean {
+  return hasInFlightSessions(sessions) || liveWorkflowRuns().size > 0;
+}
 
 export type BootWorkspace = {
   windowTransfer: WindowTransferPayload | null;
@@ -125,6 +135,14 @@ export function setQuitWorkspace(
  * Exiting is `confirm_quit`'s job, once every window has reported ready.
  */
 export async function handleQuitRequested(): Promise<boolean> {
+  const saved = await persistForQuit();
+  // The app exits without a pagehide, so this window's workflow runs would stay on the
+  // registry until they went stale; the next driver should not have to wait that out.
+  if (saved) liveRunRegistry()?.removeOwned();
+  return saved;
+}
+
+async function persistForQuit(): Promise<boolean> {
   if (liveWorkspace) {
     liveWorkspace.flush();
     quitting = true;
@@ -491,9 +509,12 @@ async function confirmAndCloseWindow(
   quitDialogOpen = true;
   try {
     const refs = inFlightRefs(sessions, tabs);
-    if (refs.length > 0) {
+    const workflowRuns = liveWorkflowRuns().size;
+    if (refs.length > 0 || workflowRuns > 0) {
       const ok = await ask(
-        "Close this window and stop its running chats? Other windows will stay open.",
+        workflowRuns > 0
+          ? "Close this window and stop its running work? Other windows will stay open."
+          : "Close this window and stop its running chats? Other windows will stay open.",
         { title: "Monoptah", kind: "warning", okLabel: "Close window" },
       );
       if (!ok) return;

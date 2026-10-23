@@ -1,6 +1,10 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment happy-dom
+import { describe, expect, it, vi } from "vitest";
 import {
   acknowledgeQuoteRequest,
+  ADD_TO_CHAT_EVENT,
+  addToChatTargets,
+  appendComposerPrefill,
   appendSelectionQuote,
   composerSeedForAddToChat,
   consumeQuoteRequest,
@@ -94,5 +98,63 @@ describe("acknowledgeQuoteRequest", () => {
     const current: QuoteRequest = { id: 2, text: "newer" };
     expect(acknowledgeQuoteRequest(current, 2)).toBeUndefined();
     expect(acknowledgeQuoteRequest(current, 1)).toBe(current);
+  });
+});
+
+describe("prefill mode", () => {
+  it("keeps the text exactly, with no blank line after it", () => {
+    expect(appendComposerPrefill("", "Help me build a workflow that ")).toBe(
+      "Help me build a workflow that ",
+    );
+    expect(composerSeedForAddToChat("Start ", "prefill")).toBe("Start ");
+  });
+
+  it("goes after an existing draft on its own paragraph", () => {
+    expect(appendComposerPrefill("draft", "Start ")).toBe("draft\n\nStart ");
+    expect(appendComposerPrefill("draft\n\n", "Start ")).toBe(
+      "draft\n\nStart ",
+    );
+    expect(appendComposerPrefill("draft", "  \n")).toBe("draft");
+  });
+
+  it("is not added again when the draft already ends with it", () => {
+    expect(appendComposerPrefill("Start ", "Start ")).toBe("Start ");
+    expect(appendComposerPrefill("draft\n\nStart ", "Start ")).toBe("draft\n\nStart ");
+    expect(appendComposerPrefill("Start more", "Start ")).toBe("Start more\n\nStart ");
+  });
+
+  it("is consumed once like any other request", () => {
+    const request: QuoteRequest = { id: 4, text: "Start ", mode: "prefill" };
+    expect(consumeQuoteRequest("", null, request)).toEqual({
+      draft: "Start ",
+      consumedId: 4,
+      changed: true,
+    });
+    expect(consumeQuoteRequest("Start ", 4, request).changed).toBe(false);
+  });
+});
+
+describe("requestAddToChat", () => {
+  it("sends a prefill untrimmed and aimed at one session", async () => {
+    const { requestAddToChat } = await import("./quoteDraft");
+    const seen = vi.fn();
+    const listener = (event: Event) => seen((event as CustomEvent).detail);
+    window.addEventListener(ADD_TO_CHAT_EVENT, listener);
+    requestAddToChat("Start ", "prefill", "mono-chat");
+    requestAddToChat("  quoted  ");
+    window.removeEventListener(ADD_TO_CHAT_EVENT, listener);
+    expect(seen).toHaveBeenNthCalledWith(1, {
+      text: "Start ",
+      mode: "prefill",
+      sessionId: "mono-chat",
+    });
+    expect(seen).toHaveBeenNthCalledWith(2, { text: "quoted", mode: "quote" });
+  });
+
+  it("is taken by the named session only", () => {
+    const aimed = { text: "x", mode: "prefill" as const, sessionId: "a" };
+    expect(addToChatTargets(aimed, "a")).toBe(true);
+    expect(addToChatTargets(aimed, "b")).toBe(false);
+    expect(addToChatTargets({ text: "x", mode: "quote" }, "b")).toBe(true);
   });
 });

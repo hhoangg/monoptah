@@ -78,6 +78,7 @@ mod window;
 mod window_transfer;
 #[cfg(windows)]
 mod windows;
+mod workflow_command;
 mod worktree_lifecycle;
 mod worktrees;
 
@@ -658,6 +659,8 @@ pub fn run() {
             mono::mono_load,
             mono::mono_read,
             mono::mono_save,
+            workflow_command::workflow_run_command,
+            workflow_command::workflow_cancel_command,
             checkpoint::session_checkpoint_ensure,
             checkpoint::session_checkpoint_begin_turn,
             checkpoint::session_checkpoint_finish_turn,
@@ -816,6 +819,8 @@ fn reap_harness_children(handle: &tauri::AppHandle) {
     if let Some(host) = handle.try_state::<pty::PtyHost>() {
         host.kill_all();
     }
+    // Command nodes run in their own process group, so they outlive the window that ran them.
+    workflow_command::cancel_all_workflow_commands();
 }
 
 #[cfg(test)]

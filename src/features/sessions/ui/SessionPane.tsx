@@ -90,6 +90,7 @@ import { MOD } from "../../../platform/tauri/platform";
 import {
   acknowledgeQuoteRequest,
   ADD_TO_CHAT_EVENT,
+  addToChatTargets,
   type AddToChatRequest,
   type QuoteRequest,
 } from "../model/quoteDraft";
@@ -630,12 +631,12 @@ const LocalSessionPane = memo(function LocalSessionPane({
     if (!addToChatTarget) return;
     const onAdd = (event: Event) => {
       const detail = (event as CustomEvent<AddToChatRequest>).detail;
-      if (!detail?.text) return;
+      if (!detail?.text || !addToChatTargets(detail, session.id)) return;
       addSelectionToChat(detail.text, detail.mode);
     };
     window.addEventListener(ADD_TO_CHAT_EVENT, onAdd);
     return () => window.removeEventListener(ADD_TO_CHAT_EVENT, onAdd);
-  }, [addSelectionToChat, addToChatTarget]);
+  }, [addSelectionToChat, addToChatTarget, session.id]);
   const workCwd = sessionWorkCwd(session);
   const reviewHidden =
     remote ||

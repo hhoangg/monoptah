@@ -26,6 +26,13 @@ export type TurnItem =
   /** Delegated runs spawned together, kept out of the folding work trail. */
   | { type: "subagents"; blocks: Block[] };
 
+/** What a habit or a workflow run posted into a Mono chat outside any turn, if the block is one. */
+export function monoPost(
+  block: Block,
+): { name: string; at: number } | undefined {
+  return block.monoHabit ?? block.monoWorkflow;
+}
+
 export function needsApproval(block: Block): boolean {
   return !!block.approval && !block.approval.decided;
 }
@@ -353,7 +360,7 @@ function groupTranscriptTurns(
       }
       continue;
     }
-    if (block.role === "handoff" || block.monoHabit) {
+    if (block.role === "handoff" || monoPost(block)) {
       if (current.length > 0) turns.push(current);
       turns.push([block]);
       current = [];
@@ -411,7 +418,7 @@ export function opensNewStretch(at: number, previousAt?: number): boolean {
 
 /** When the latest run in a Mono turn started, for measuring the gap after it. */
 export function monoTurnLatestStart(turn: Block[]): number | undefined {
-  let latest = turn[0].monoHabit?.at ?? turn[0].startedAt;
+  let latest = monoPost(turn[0])?.at ?? turn[0].startedAt;
   for (const block of turn) {
     if (
       block.role === "user" &&
@@ -439,7 +446,7 @@ export function groupMonoChatTurns(
     const at = turn[0].startedAt;
     if (
       previous &&
-      !previous[0].monoHabit &&
+      !monoPost(previous[0]) &&
       previous[0].role !== "handoff" &&
       isMonoCompletionPrompt(turn[0]) &&
       (at == null || !opensNewStretch(at, monoTurnLatestStart(previous)))

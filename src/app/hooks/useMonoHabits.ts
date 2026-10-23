@@ -83,7 +83,7 @@ const POLL_MS = 2_000;
 const STOPPED_BY_USER = "Stopped by the user.";
 
 /** The last thing the run said, which is its message to the user. */
-function finalReply(session: Session | undefined): string {
+export function finalReply(session: Session | undefined): string {
   if (!session) return "";
   for (let i = session.blocks.length - 1; i >= 0; i--) {
     const block = session.blocks[i];

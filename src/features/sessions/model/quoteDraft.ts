@@ -1,10 +1,17 @@
 export const ADD_TO_CHAT_EVENT = "monocode:add-to-chat";
 
-export type AddToChatMode = "quote" | "plain";
+/**
+ * "quote" blockquotes the text, "plain" adds it as written, and "prefill"
+ * starts a sentence for the user to finish: it keeps the text exactly,
+ * including a trailing space, and leaves no blank line after it.
+ */
+export type AddToChatMode = "quote" | "plain" | "prefill";
 
 export type AddToChatRequest = {
   text: string;
   mode: AddToChatMode;
+  /** Only this session's composer takes the request; any other ignores it. */
+  sessionId?: string;
 };
 
 export type QuoteRequest = {
@@ -13,15 +20,28 @@ export type QuoteRequest = {
   mode?: AddToChatMode;
 };
 
-export function requestAddToChat(text: string, mode: AddToChatMode = "quote") {
+export function requestAddToChat(
+  text: string,
+  mode: AddToChatMode = "quote",
+  sessionId?: string,
+) {
   if (typeof window === "undefined") return;
-  const value = text.replace(/\r\n?/g, "\n").trim();
-  if (!value) return;
+  const normalized = text.replace(/\r\n?/g, "\n");
+  const value = mode === "prefill" ? normalized : normalized.trim();
+  if (!value.trim()) return;
   window.dispatchEvent(
     new CustomEvent<AddToChatRequest>(ADD_TO_CHAT_EVENT, {
-      detail: { text: value, mode },
+      detail: { text: value, mode, ...(sessionId ? { sessionId } : {}) },
     }),
   );
+}
+
+/** Whether the composer of `sessionId` should take this request. */
+export function addToChatTargets(
+  request: AddToChatRequest,
+  sessionId: string,
+): boolean {
+  return !request.sessionId || request.sessionId === sessionId;
 }
 
 /** Initial composer text for an add-to-chat request that opens a new session. */
@@ -29,9 +49,7 @@ export function composerSeedForAddToChat(
   text: string,
   mode: AddToChatMode = "quote",
 ): string {
-  return mode === "plain"
-    ? appendComposerInsert("", text)
-    : appendSelectionQuote("", text);
+  return addToDraft("", text, mode);
 }
 
 export type QuoteConsumption = {
@@ -75,10 +93,7 @@ export function consumeQuoteRequest(
     return { draft, consumedId, changed: false };
   }
 
-  const next =
-    request.mode === "plain"
-      ? appendComposerInsert(draft, request.text)
-      : appendSelectionQuote(draft, request.text);
+  const next = addToDraft(draft, request.text, request.mode);
   return {
     draft: next,
     consumedId: request.id,
@@ -93,14 +108,34 @@ export function acknowledgeQuoteRequest(
   return current?.id === handledId ? undefined : current;
 }
 
-function joinComposerInsert(draft: string, block: string): string {
-  const separator =
-    draft.length === 0
+export function appendComposerPrefill(draft: string, text: string): string {
+  const value = text.replace(/\r\n?/g, "\n");
+  if (!value.trim()) return draft;
+  // Asking twice must not stack the same sentence start.
+  if (draft.endsWith(value)) return draft;
+  return `${draft}${composerInsertSeparator(draft)}${value}`;
+}
+
+function addToDraft(
+  draft: string,
+  text: string,
+  mode: AddToChatMode = "quote",
+): string {
+  if (mode === "plain") return appendComposerInsert(draft, text);
+  if (mode === "prefill") return appendComposerPrefill(draft, text);
+  return appendSelectionQuote(draft, text);
+}
+
+function composerInsertSeparator(draft: string): string {
+  return draft.length === 0
+    ? ""
+    : draft.endsWith("\n\n")
       ? ""
-      : draft.endsWith("\n\n")
-        ? ""
-        : draft.endsWith("\n")
-          ? "\n"
-          : "\n\n";
-  return `${draft}${separator}${block}\n\n`;
+      : draft.endsWith("\n")
+        ? "\n"
+        : "\n\n";
+}
+
+function joinComposerInsert(draft: string, block: string): string {
+  return `${draft}${composerInsertSeparator(draft)}${block}\n\n`;
 }

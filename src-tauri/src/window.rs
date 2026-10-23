@@ -653,6 +653,8 @@ pub fn confirm_quit(app: AppHandle) {
     if let Some(host) = app.try_state::<crate::pty::PtyHost>() {
         host.kill_all();
     }
+    // A command node is in its own process group and would outlive the app.
+    crate::workflow_command::cancel_all_workflow_commands();
     app.exit(0);
 }
 

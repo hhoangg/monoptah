@@ -1,5 +1,6 @@
 import type { Block, Session } from "../../sessions/model/session";
 import { contextRatio } from "../../sessions/model/contextUsage";
+import { monoPost } from "../../sessions/model/transcriptActivity";
 import {
   dedupeProviderSessions,
   providerSessionRef,
@@ -55,8 +56,8 @@ type Exchange = {
   at?: number;
   user: string;
   reply: string;
-  /** Posted by this habit on its own, with no user message before it. */
-  habit?: string;
+  /** Posted by this habit or workflow on its own, with no user message before it. */
+  post?: { kind: "habit" | "workflow"; name: string };
   completion?: string;
 };
 
@@ -98,20 +99,28 @@ function exchanges(blocks: readonly Block[], afterId?: string): Exchange[] {
       });
       continue;
     }
-    if (block.monoHabit && block.text.trim()) {
+    // A workflow's approval requests are not reports; a habit's were always counted.
+    const post =
+      block.monoHabit || block.role === "assistant"
+        ? monoPost(block)
+        : undefined;
+    if (post && block.text.trim()) {
       out.push({
         id: block.id,
-        at: block.monoHabit.at,
+        at: post.at,
         user: "",
         reply: block.text.trim(),
-        habit: block.monoHabit.name,
+        post: {
+          kind: block.monoHabit ? "habit" : "workflow",
+          name: post.name,
+        },
       });
       continue;
     }
     const current = out[out.length - 1];
     if (
       current &&
-      !current.habit &&
+      !current.post &&
       block.role === "assistant" &&
       !block.tool &&
       !block.streaming &&
@@ -149,8 +158,8 @@ function when(at: number | undefined): string {
 function exchangeLine(exchange: Exchange): string {
   if (exchange.completion)
     return `- ${when(exchange.at)}You, reviewing session "${exchange.completion}": ${oneLine(exchange.reply, LINE_CHARS)}`;
-  if (exchange.habit)
-    return `- ${when(exchange.at)}You, from your habit "${exchange.habit}": ${oneLine(exchange.reply, LINE_CHARS)}`;
+  if (exchange.post)
+    return `- ${when(exchange.at)}You, from your ${exchange.post.kind} "${exchange.post.name}": ${oneLine(exchange.reply, LINE_CHARS)}`;
   return `- ${when(exchange.at)}User: ${oneLine(exchange.user, LINE_CHARS)}${
     exchange.reply ? ` → You: ${oneLine(exchange.reply, LINE_CHARS)}` : ""
   }`;
@@ -221,8 +230,8 @@ export function planRotation(
       parts.push(
         `Most recent, word for word:\n\n${verbatim
           .map((exchange) =>
-            exchange.habit
-              ? `You, on your own from your habit "${exchange.habit}" (${when(exchange.at).replace(/ · $/, "") || "earlier"}):\n${clip(exchange.reply, VERBATIM_REPLY_CHARS)}`
+            exchange.post
+              ? `You, on your own from your ${exchange.post.kind} "${exchange.post.name}" (${when(exchange.at).replace(/ · $/, "") || "earlier"}):\n${clip(exchange.reply, VERBATIM_REPLY_CHARS)}`
               : exchange.completion
                 ? `You, reviewing session "${exchange.completion}" (${when(exchange.at).replace(/ · $/, "") || "earlier"}):\n${clip(exchange.reply, VERBATIM_REPLY_CHARS)}`
                 : `User (${when(exchange.at).replace(/ · $/, "") || "earlier"}):\n${clip(exchange.user, VERBATIM_USER_CHARS)}${

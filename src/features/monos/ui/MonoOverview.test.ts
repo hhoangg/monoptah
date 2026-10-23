@@ -1,12 +1,43 @@
 // @vitest-environment happy-dom
-import { act, createElement } from "react";
+import { act, createElement, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { WORKFLOWS_MAX, type Workflow } from "../../workflows/model/workflow";
+import { exportWorkflow } from "../../workflows/model/workflowYaml";
+import { workflow } from "../../workflows/ui/workflowUiFixtures";
+import {
+  acknowledgeQuoteRequest,
+  ADD_TO_CHAT_EVENT,
+  addToChatTargets,
+  type AddToChatRequest,
+  type QuoteRequest,
+} from "../../sessions/model/quoteDraft";
+import { MonoComposer } from "./MonoComposer";
 import { MonoOverview, type MonoOverviewTab } from "./MonoOverview";
 
 vi.mock("../model/monoHabits", async (original) => ({
   ...(await original<object>()),
   loadHabits: async () => [],
+}));
+
+const saved = vi.hoisted(() => ({ workflows: [] as Workflow[] }));
+
+vi.mock("../../workflows/model/workflowStore", async (original) => ({
+  ...(await original<object>()),
+  loadWorkflows: async () => [...saved.workflows],
+  updateWorkflows: async (
+    _monoId: string,
+    edit: (list: Workflow[]) => { workflows: Workflow[]; result: unknown },
+  ) => {
+    const { workflows, result } = edit([...saved.workflows]);
+    saved.workflows = workflows;
+    window.dispatchEvent(new CustomEvent("monocode:mono-files-changed"));
+    return result;
+  },
+}));
+
+vi.mock("../../sessions/hooks/useFileDrop", () => ({
+  useFileDrop: () => false,
 }));
 
 vi.mock("./MonoChangesView", () => ({
@@ -34,11 +65,13 @@ let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
+  saved.workflows = [];
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal(
     "ResizeObserver",
     class {
       observe() {}
+      unobserve() {}
       disconnect() {}
     },
   );
@@ -105,11 +138,12 @@ it("names only the open tab, with its count, and switches tabs", async () => {
   const labels = tabs().map((tab) =>
     tab.querySelector("[data-tab-label]")!.getAttribute("data-tab-label"),
   );
-  expect(labels).toEqual(["open", "closed", "closed", "closed"]);
+  expect(labels).toEqual(["open", "closed", "closed", "closed", "closed"]);
   expect(tabs().map((tab) => tab.getAttribute("aria-label"))).toEqual([
     "Sessions",
     "Documents",
     "Habits",
+    "Workflows",
     "Changes",
   ]);
   expect(tabs()[0].textContent).toBe("Sessions2");
@@ -166,7 +200,7 @@ const changes = (totals: unknown) => ({
 
 it("always offers a Changes tab and keeps its view mounted once opened", async () => {
   await render("sessions", vi.fn(), changes(null));
-  expect(tabs()[3].getAttribute("aria-label")).toBe("Changes");
+  expect(tabs()[4].getAttribute("aria-label")).toBe("Changes");
   expect(container.querySelector("[data-changes-view]")).toBeNull();
   const onTabChange = vi.fn();
   await render(
@@ -174,11 +208,11 @@ it("always offers a Changes tab and keeps its view mounted once opened", async (
     onTabChange,
     changes({ files: 3, additions: 12, deletions: 4 }),
   );
-  expect(tabs()[3].textContent).toBe("Changes3");
+  expect(tabs()[4].textContent).toBe("Changes3");
   expect(container.querySelector("[data-changes-view]")).not.toBeNull();
   // Another tab keeps the view mounted, hidden, so a commit draft survives.
   await render("sessions", onTabChange, changes(null));
-  expect(tabs()[3].getAttribute("aria-label")).toBe("Changes");
+  expect(tabs()[4].getAttribute("aria-label")).toBe("Changes");
   expect(
     container.querySelector("[data-changes-view]")!.closest("[hidden]"),
   ).not.toBeNull();
@@ -186,20 +220,20 @@ it("always offers a Changes tab and keeps its view mounted once opened", async (
 
 it("dots the folded Changes icon while there are changes", async () => {
   await render("sessions", vi.fn(), changes(null));
-  expect(tabs()[3].querySelector("[data-changes-dot]")).toBeNull();
+  expect(tabs()[4].querySelector("[data-changes-dot]")).toBeNull();
   await render(
     "sessions",
     vi.fn(),
     changes({ files: 2, additions: 3, deletions: 1 }),
   );
-  expect(tabs()[3].querySelector("[data-changes-dot]")).not.toBeNull();
+  expect(tabs()[4].querySelector("[data-changes-dot]")).not.toBeNull();
   // Open, the tab names its count instead.
   await render(
     "changes",
     vi.fn(),
     changes({ files: 2, additions: 3, deletions: 1 }),
   );
-  expect(tabs()[3].querySelector("[data-changes-dot]")).toBeNull();
+  expect(tabs()[4].querySelector("[data-changes-dot]")).toBeNull();
 });
 
 it("lists every session it started, newest first", async () => {
@@ -265,4 +299,175 @@ it("opens a document over its tab with a way back", async () => {
     page.querySelector<HTMLButtonElement>('button[aria-label="Back"]')!.click(),
   );
   expect(onBackFromDocument).toHaveBeenCalledOnce();
+});
+
+it("offers New and Import workflow only on Workflows, and says how to fill it", async () => {
+  await render("habits");
+  expect(container.querySelector('[aria-label="New workflow"]')).toBeNull();
+  await render("workflows");
+  expect(container.querySelector('[aria-label="New workflow"]')).not.toBeNull();
+  expect(
+    container.querySelector('[aria-label="Import workflow"]'),
+  ).not.toBeNull();
+  expect(
+    container.querySelector('[data-mono-overview="workflows"]')!.textContent,
+  ).toContain(
+    "Ask Broski to chain sessions into a workflow, or create one with +.",
+  );
+});
+
+it("opens the board from New, and the import page from Import", async () => {
+  vi.stubGlobal(
+    "DOMMatrixReadOnly",
+    class {
+      m22 = 1;
+    },
+  );
+  await render("workflows");
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="New workflow"]')!
+      .click(),
+  );
+  const board = container.querySelector("[data-workflow-board]");
+  expect(board).not.toBeNull();
+  expect(
+    board!.querySelector<HTMLInputElement>('input[aria-label="Workflow name"]')!
+      .value,
+  ).toBe("New workflow");
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>(
+        '[data-workflow-board] [aria-label="Back"]',
+      )!
+      .click(),
+  );
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="Import workflow"]')!
+      .click(),
+  );
+  expect(container.querySelector("[data-import-workflow]")).not.toBeNull();
+  expect(container.textContent).toContain("Import workflow");
+});
+
+it("opens the imported workflow after the import page", async () => {
+  await render("workflows");
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="Import workflow"]')!
+      .click(),
+  );
+  const area = container.querySelector<HTMLTextAreaElement>(
+    "textarea[aria-label='Workflow file text']",
+  )!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )!.set!.call(
+      area,
+      exportWorkflow(workflow({ name: "Brought in", enabled: true })),
+    );
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>("button[data-import-paused]")!
+      .click(),
+  );
+  expect(saved.workflows).toHaveLength(1);
+  expect(saved.workflows[0].enabled).toBe(false);
+  const page = container.querySelector(
+    `[data-workflow-page="${saved.workflows[0].id}"]`,
+  );
+  expect(page).not.toBeNull();
+  expect(page!.textContent).toContain("Brought in");
+  expect(page!.textContent).toContain("Paused");
+});
+
+it("turns Import off at the workflow limit, as it does New", async () => {
+  saved.workflows = Array.from({ length: WORKFLOWS_MAX }, (_, i) =>
+    workflow({ id: `wf-full${i}`, name: `Flow ${i}` }),
+  );
+  await render("workflows");
+  const label = `At most ${WORKFLOWS_MAX} workflows`;
+  const buttons = [
+    ...container.querySelectorAll<HTMLButtonElement>(`[aria-label="${label}"]`),
+  ];
+  expect(buttons).toHaveLength(2);
+  expect(
+    buttons.every((button) => button.getAttribute("aria-disabled") === "true"),
+  ).toBe(true);
+});
+
+/** The Mono's chat as the app wires it: a composer fed by add-to-chat requests. */
+function MonoChat({ onSubmit }: { onSubmit: () => void }) {
+  const [request, setRequest] = useState<QuoteRequest>();
+  useEffect(() => {
+    let id = 0;
+    const onAdd = (event: Event) => {
+      const detail = (event as CustomEvent<AddToChatRequest>).detail;
+      if (!addToChatTargets(detail, "mono-chat")) return;
+      setRequest({ id: ++id, text: detail.text, mode: detail.mode });
+    };
+    window.addEventListener(ADD_TO_CHAT_EVENT, onAdd);
+    return () => window.removeEventListener(ADD_TO_CHAT_EVENT, onAdd);
+  }, []);
+  return createElement(MonoComposer, {
+    sessionId: "mono-chat",
+    name: "Broski",
+    quoteRequest: request,
+    onQuoteRequestConsumed: (handled: number) =>
+      setRequest((current) => acknowledgeQuoteRequest(current, handled)),
+    onSubmit: () => {
+      onSubmit();
+      return true;
+    },
+  });
+}
+
+it("ask mono button prefills the composer", async () => {
+  const onSubmit = vi.fn();
+  const chat = document.createElement("div");
+  document.body.append(chat);
+  const chatRoot = createRoot(chat);
+  await act(async () => chatRoot.render(createElement(MonoChat, { onSubmit })));
+  const field = () =>
+    chat.querySelector<HTMLTextAreaElement>('[aria-label="Message Broski"]')!;
+  const ask = () =>
+    container.querySelector<HTMLButtonElement>(
+      '[aria-label="Ask Mono to build a workflow"]',
+    );
+
+  await render("habits", vi.fn(), { chatSessionId: "mono-chat" });
+  expect(ask()).toBeNull();
+  await render("workflows", vi.fn(), { chatSessionId: "mono-chat" });
+  await act(async () => ask()!.click());
+
+  expect(field().value).toBe("Help me build a workflow that ");
+  expect(onSubmit).not.toHaveBeenCalled();
+  act(() => chatRoot.unmount());
+  chat.remove();
+});
+
+it("ask mono button does not reach another session's composer", async () => {
+  const seen = vi.fn();
+  const listener = (event: Event) => seen((event as CustomEvent).detail);
+  window.addEventListener(ADD_TO_CHAT_EVENT, listener);
+  await render("workflows", vi.fn(), { chatSessionId: "mono-chat" });
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>(
+        '[aria-label="Ask Mono to build a workflow"]',
+      )!
+      .click(),
+  );
+  window.removeEventListener(ADD_TO_CHAT_EVENT, listener);
+  expect(seen).toHaveBeenCalledWith({
+    text: "Help me build a workflow that ",
+    mode: "prefill",
+    sessionId: "mono-chat",
+  });
+  expect(addToChatTargets(seen.mock.calls[0][0], "workspace-chat")).toBe(false);
 });

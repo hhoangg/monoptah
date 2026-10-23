@@ -61,6 +61,13 @@ import {
   nextHabitRunAt,
   type Habit,
 } from "../../monos/model/monoHabits";
+import type { WorkflowRun } from "../../workflows/model/workflow";
+import type {
+  checkWorkflowsNow,
+  loadWorkflows,
+  updateWorkflows,
+} from "../../workflows/model/workflowStore";
+import { WORKFLOW_FIELDS, handleWorkflows } from "./agentAppWorkflows";
 import {
   memoryWithinBudget,
   MonoFileConflict,
@@ -164,6 +171,19 @@ export type AgentAppHost = {
       change: (habits: Habit[]) => { habits: Habit[]; result: T },
     ): Promise<T>;
   };
+  /** A Mono's workflows. Runs are driven by one window; the rest asks it through the files. */
+  workflows?: {
+    load: typeof loadWorkflows;
+    update: typeof updateWorkflows;
+    runs(monoId: string, workflowId: string): Promise<WorkflowRun[]>;
+    /** The id of the workflow's run going in any window, if one is. */
+    running(workflowId: string): string | undefined;
+    stop(monoId: string, workflowId: string): Promise<void>;
+    resumeRun(monoId: string, workflowId: string, runId: string): Promise<void>;
+    /** Empties the run history of a workflow that was removed. Never rejects. */
+    clearRuns(monoId: string, workflowId: string): Promise<void>;
+    checkNow: typeof checkWorkflowsNow;
+  };
   agentFiles(monoId: string): Promise<MonoFiles>;
   readAgentFile(
     monoId: string,
@@ -179,6 +199,19 @@ export type AgentAppHost = {
   /** The clock entries are dated by; tests pin it. */
   now?(): Date;
 };
+
+/** What starting a session needs from the host; workflows supply just these. */
+export type StartHost = Pick<
+  AgentAppHost,
+  | "start"
+  | "sessions"
+  | "session"
+  | "worktrees"
+  | "monoOf"
+  | "isMono"
+  | "isHabitRun"
+  | "launches"
+>;
 
 const FIELDS = new Map<string, readonly string[]>([
   ["models.list", []],
@@ -238,6 +271,7 @@ const FIELDS = new Map<string, readonly string[]>([
   ["habits.update", ["id", "name", "instructions", "schedule", "enabled"]],
   ["habits.run", ["id"]],
   ["habits.remove", ["id"]],
+  ...WORKFLOW_FIELDS,
   ["chat.card", [...CARD_FIELDS]],
 ]);
 
@@ -278,7 +312,7 @@ export function completionChatId(
 function completionRecipient(
   source: Session,
   input: Record<string, unknown>,
-  host: AgentAppHost,
+  host: StartHost,
   defaultForMono = false,
 ): string | undefined {
   const requested = input.notifyOnComplete;
@@ -300,7 +334,7 @@ function completionRecipient(
 function completionDelivery(
   source: Session,
   input: Record<string, unknown>,
-  host: AgentAppHost,
+  host: StartHost,
 ): CompletionDelivery {
   const requested = input.completionDelivery;
   if (requested !== undefined && requested !== "group" && requested !== "each")
@@ -344,6 +378,16 @@ function noteTags(value: unknown): string[] {
   return normalizeNoteTags(value as string[]);
 }
 
+/** One of a Mono's projects, by its path or by its name when that is unambiguous. */
+export function resolveMonoProject(
+  projects: readonly string[],
+  named: string,
+): string | undefined {
+  const byPath = projects.find((path) => pathKey(path) === pathKey(named));
+  const byName = projects.filter((path) => projectName(path) === named);
+  return byPath ?? (byName.length === 1 ? byName[0] : undefined);
+}
+
 /**
  * The project an action works in. A session works in its own; a Mono works on
  * several, so it names one with "project" (its path or name), and may leave it
@@ -352,7 +396,7 @@ function noteTags(value: unknown): string[] {
 function requireProject(
   source: Session,
   input: Record<string, unknown>,
-  host: AgentAppHost,
+  host: StartHost,
 ): string {
   const mono = host.monoOf?.(source.id);
   const named = optionalString(input.project, "project", 4096);
@@ -367,13 +411,7 @@ function requireProject(
       ? mono.projects.map((path) => `${projectName(path)} (${path})`).join(", ")
       : "none yet; the user adds them from your details panel";
   if (named) {
-    const byPath = mono.projects.find(
-      (path) => pathKey(path) === pathKey(named),
-    );
-    const byName = mono.projects.filter(
-      (path) => projectName(path) === named,
-    );
-    const match = byPath ?? (byName.length === 1 ? byName[0] : undefined);
+    const match = resolveMonoProject(mono.projects, named);
     if (!match) throw new Error(`Not one of your projects. Yours: ${choices()}`);
     return match;
   }
@@ -400,7 +438,7 @@ async function projectSession(
   source: Session,
   id: string,
   input: Record<string, unknown>,
-  host: AgentAppHost,
+  host: StartHost,
 ): Promise<Session> {
   const cwd = requireProject(source, input, host);
   if (!(await host.sessions(cwd)).some((session) => session.id === id))
@@ -497,7 +535,7 @@ function fileLaunchInFolder(
 async function startParent(
   source: Session,
   input: Record<string, unknown>,
-  host: AgentAppHost,
+  host: StartHost,
 ): Promise<string | undefined> {
   if (input.parentSessionId === undefined) return undefined;
   const parent = requiredString(input.parentSessionId, "parentSessionId", 256);
@@ -516,7 +554,7 @@ async function startParent(
 }
 
 /** The Mono a caller works for, if the caller is its chat or one of its habit runs. */
-function owningMono(source: Session, host: AgentAppHost) {
+function owningMono(source: Session, host: StartHost) {
   return host.isMono(source.id) || host.isHabitRun?.(source.id)
     ? host.monoOf?.(source.id)
     : undefined;
@@ -525,7 +563,7 @@ function owningMono(source: Session, host: AgentAppHost) {
 function startLaunch(
   source: Session,
   input: Record<string, unknown>,
-  host: AgentAppHost,
+  host: StartHost,
 ): QuickLaunch {
   const cwd = requireProject(source, input, host);
   const prompt = agentPrompt(input.prompt);
@@ -1071,6 +1109,103 @@ async function handleArtifacts(
   return { ...card, saved: true, attached: true };
 }
 
+/**
+ * Starts a session the way `sessions.start` does. Workflows call it with the Mono's own chat as
+ * the source, so their sessions get the same project check, worktree handling, nesting and
+ * folder filing as one the Mono starts itself.
+ */
+export async function startAppSession(
+  source: Session,
+  requestId: string,
+  input: Record<string, unknown>,
+  host: StartHost,
+) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(requestId))
+    throw new Error(
+      "request ID must use letters, digits, underscores or hyphens",
+    );
+  const launch = startLaunch(source, input, host);
+  const notifyMonoId = completionRecipient(source, input, host, true);
+  const delivery = completionDelivery(source, input, host);
+  if (launch.workspaceMode === "worktree") {
+    // A worktree is cut from HEAD, which a repository without commits lacks.
+    const main = (await host.worktrees(launch.cwd)).worktrees.find(
+      (tree) => tree.isMain,
+    );
+    if (main && /^0+$/.test(main.head))
+      throw new Error(
+        "This project has no commits yet; make an initial commit before using workspaceMode worktree",
+      );
+  }
+  if (input.worktreeCwd !== undefined) {
+    const chosen = (await host.worktrees(launch.cwd)).worktrees.find(
+      (tree) =>
+        !tree.missing &&
+        pathKey(tree.path) === pathKey(launch.worktreeCwd!),
+    );
+    if (!chosen)
+      throw new Error(
+        "Worktree is unavailable in this project; run worktrees.list",
+      );
+    launch.worktreeCwd =
+      pathKey(chosen.path) === pathKey(launch.cwd)
+        ? undefined
+        : chosen.path;
+  }
+  const placement = input.placement ?? "tab";
+  if (placement !== "tab" && placement !== "right" && placement !== "down")
+    throw new Error("placement must be tab, right or down");
+  if (input.besideSessionId !== undefined && placement === "tab")
+    throw new Error("besideSessionId requires placement right or down");
+  const besideSessionId =
+    placement === "tab"
+      ? undefined
+      : (optionalString(input.besideSessionId, "besideSessionId", 256) ??
+        source.id);
+  const parent = await startParent(source, input, host);
+  const id = `app-${parent ?? source.id}-${requestId}`;
+  // A session ID is also a directory name, which macOS limits to 255 bytes.
+  if (parent && id.length > 255)
+    throw new Error(
+      "The new session ID would exceed 255 characters; use a shorter request ID",
+    );
+  const choice = folderChoice(launch.cwd, input);
+  const mono = owningMono(source, host);
+  const defaultFolder = host.monoOf?.(source.id)?.folder;
+  const notify = notifyArgs(notifyMonoId, delivery);
+  if (besideSessionId)
+    await host.start(
+      launch,
+      id,
+      { direction: placement as SplitDir, besideSessionId },
+      ...notify,
+    );
+  else if (notifyMonoId) await host.start(launch, id, undefined, ...notify);
+  else await host.start(launch, id);
+  if (mono) host.launches?.record(id, mono.id, !!parent);
+  let filed: { id: string; name: string } | undefined;
+  if (!launch.sidebarHidden) {
+    if (choice)
+      filed = fileLaunchInFolder(
+        launch.cwd,
+        id,
+        choice,
+        mono?.color ?? mono?.folder?.color,
+      );
+    else if (defaultFolder) fileInMonoFolder(launch.cwd, id, defaultFolder);
+  }
+  return {
+    id,
+    cwd: launch.cwd,
+    harness: launch.harness,
+    model: launch.model,
+    submitted: !launch.draft,
+    draft: !!launch.draft,
+    ...(notifyMonoId ? { notifyOnComplete: true } : {}),
+    ...(filed ? { folderId: filed.id, folderName: filed.name } : {}),
+  };
+}
+
 export async function handleAgentApp(
   source: Session,
   requestId: string,
@@ -1087,6 +1222,8 @@ export async function handleAgentApp(
     return handleMemory(source, action, input, host);
   if (action.startsWith("habits."))
     return handleHabits(source, action, input, host);
+  if (action.startsWith("workflows."))
+    return handleWorkflows(source, action, input, host);
   if (action === "chat.card") {
     if (
       !host.postCard ||
@@ -1201,92 +1338,8 @@ export async function handleAgentApp(
         [mode === "archive" ? "archived" : "deleted"]: true,
       };
     }
-    case "sessions.start": {
-      if (!/^[A-Za-z0-9_-]{1,128}$/.test(requestId))
-        throw new Error(
-          "request ID must use letters, digits, underscores or hyphens",
-        );
-      const launch = startLaunch(source, input, host);
-      const notifyMonoId = completionRecipient(source, input, host, true);
-      const delivery = completionDelivery(source, input, host);
-      if (launch.workspaceMode === "worktree") {
-        // A worktree is cut from HEAD, which a repository without commits lacks.
-        const main = (await host.worktrees(launch.cwd)).worktrees.find(
-          (tree) => tree.isMain,
-        );
-        if (main && /^0+$/.test(main.head))
-          throw new Error(
-            "This project has no commits yet; make an initial commit before using workspaceMode worktree",
-          );
-      }
-      if (input.worktreeCwd !== undefined) {
-        const chosen = (await host.worktrees(launch.cwd)).worktrees.find(
-          (tree) =>
-            !tree.missing &&
-            pathKey(tree.path) === pathKey(launch.worktreeCwd!),
-        );
-        if (!chosen)
-          throw new Error(
-            "Worktree is unavailable in this project; run worktrees.list",
-          );
-        launch.worktreeCwd =
-          pathKey(chosen.path) === pathKey(launch.cwd)
-            ? undefined
-            : chosen.path;
-      }
-      const placement = input.placement ?? "tab";
-      if (placement !== "tab" && placement !== "right" && placement !== "down")
-        throw new Error("placement must be tab, right or down");
-      if (input.besideSessionId !== undefined && placement === "tab")
-        throw new Error("besideSessionId requires placement right or down");
-      const besideSessionId =
-        placement === "tab"
-          ? undefined
-          : (optionalString(input.besideSessionId, "besideSessionId", 256) ??
-            source.id);
-      const parent = await startParent(source, input, host);
-      const id = `app-${parent ?? source.id}-${requestId}`;
-      // A session ID is also a directory name, which macOS limits to 255 bytes.
-      if (parent && id.length > 255)
-        throw new Error(
-          "The new session ID would exceed 255 characters; use a shorter request ID",
-        );
-      const choice = folderChoice(launch.cwd, input);
-      const mono = owningMono(source, host);
-      const defaultFolder = host.monoOf?.(source.id)?.folder;
-      const notify = notifyArgs(notifyMonoId, delivery);
-      if (besideSessionId)
-        await host.start(
-          launch,
-          id,
-          { direction: placement as SplitDir, besideSessionId },
-          ...notify,
-        );
-      else if (notifyMonoId) await host.start(launch, id, undefined, ...notify);
-      else await host.start(launch, id);
-      if (mono) host.launches?.record(id, mono.id, !!parent);
-      let filed: { id: string; name: string } | undefined;
-      if (!launch.sidebarHidden) {
-        if (choice)
-          filed = fileLaunchInFolder(
-            launch.cwd,
-            id,
-            choice,
-            mono?.color ?? mono?.folder?.color,
-          );
-        else if (defaultFolder) fileInMonoFolder(launch.cwd, id, defaultFolder);
-      }
-      return {
-        id,
-        cwd: launch.cwd,
-        harness: launch.harness,
-        model: launch.model,
-        submitted: !launch.draft,
-        draft: !!launch.draft,
-        ...(notifyMonoId ? { notifyOnComplete: true } : {}),
-        ...(filed ? { folderId: filed.id, folderName: filed.name } : {}),
-      };
-    }
+    case "sessions.start":
+      return startAppSession(source, requestId, input, host);
     case "worktrees.list":
       return host.worktrees(requireProject(source, input, host));
     case "worktrees.create": {

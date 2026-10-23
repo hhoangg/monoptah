@@ -407,6 +407,35 @@ describe("sanitizeSessionForPersist", () => {
       }).blocks,
     ).toEqual(saved.blocks);
   });
+  it("keeps a workflow report's identity through a save and reload", () => {
+    const monoWorkflow = {
+      id: "wf-aaaaaaaa",
+      name: "Ship tickets",
+      runId: "run-1",
+      at: 1_000,
+    };
+    const session = newSession("codex", "/repo");
+    session.blocks = [
+      { id: "report", role: "assistant", text: "All shipped.", monoWorkflow },
+      {
+        id: "bad",
+        role: "assistant",
+        text: "No run",
+        monoWorkflow: { ...monoWorkflow, runId: " " },
+      },
+      { id: "user", role: "user", text: "Hi", monoWorkflow },
+    ];
+    const saved = sanitizeSessionForPersist(session);
+    expect(saved.blocks[0].monoWorkflow).toEqual(monoWorkflow);
+    expect(saved.blocks[1].monoWorkflow).toBeUndefined();
+    expect(saved.blocks[2].monoWorkflow).toBeUndefined();
+    expect(
+      sanitizeSessionForPersist({
+        ...session,
+        blocks: JSON.parse(JSON.stringify(saved.blocks)),
+      }).blocks,
+    ).toEqual(saved.blocks);
+  });
   it("keeps the stripped /operator turn marker for later turns", () => {
     const submitted = appendUser(
       newSession("codex", "/repo"),

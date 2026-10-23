@@ -5,9 +5,11 @@ import { forgetHarnessSession } from "../../integrations/harness/core/registry";
 import { killAllChildren } from "../../integrations/harness/core/child";
 import { newSession } from "../../features/sessions/model/session";
 import { newTab } from "../../features/workspace/model/layout";
+import { setWorkflowRunning } from "../../features/workflows/model/workflowStore";
 import {
   askQuitConfirmation,
   closeBusyWindow,
+  hasInFlightWork,
   commitQuit,
   confirmReload,
   reportQuitPoll,
@@ -51,6 +53,10 @@ vi.mock("../../integrations/harness/core/registry", () => ({
   bindHarnessSession: vi.fn(),
   isLiveHarness: vi.fn(),
   forgetHarnessSession: vi.fn().mockResolvedValue(undefined),
+}));
+const registry = vi.hoisted(() => ({ removeOwned: vi.fn() }));
+vi.mock("../hooks/workflowLiveRuns", () => ({
+  liveRunRegistry: () => registry,
 }));
 vi.mock("../../integrations/harness/core/child", () => ({
   killAllChildren: vi.fn().mockResolvedValue(undefined),
@@ -133,6 +139,28 @@ describe("project choices through lifecycle saves", () => {
             ([command]) => command === "workspace_set_snapshot",
           ),
       ).toHaveLength(2);
+    } finally {
+      release();
+    }
+  });
+
+  it("takes this window's workflow runs off the registry once the quit is saved", async () => {
+    const state = workspace();
+    const { handleQuitRequested, setQuitWorkspace } =
+      await import("./appLifecycle");
+    registry.removeOwned.mockClear();
+    const release = setQuitWorkspace(
+      () => state.sessions,
+      () => state.tabs,
+      () => state.activeTabId,
+      () => state.projectCwd,
+      () => [],
+      () => state.memory,
+      vi.fn(),
+    );
+    try {
+      await expect(handleQuitRequested()).resolves.toBe(true);
+      expect(registry.removeOwned).toHaveBeenCalledTimes(1);
     } finally {
       release();
     }
@@ -264,6 +292,31 @@ describe("closing a busy window", () => {
           .mock.calls.some(([command]) => command === "confirm_quit"),
       ).toBe(false);
     } finally {
+      release();
+    }
+  });
+
+  it("asks about running work, not chats, when only a workflow run would be cut short", async () => {
+    const session = newSession("cursor", "C:/test");
+    const tab = newTab(session.id);
+    const release = setQuitWorkspace(
+      () => [session],
+      () => [tab],
+      () => tab.id,
+      () => session.cwd,
+      () => [],
+      () => new Map(),
+      vi.fn(),
+    );
+    vi.stubGlobal("window", new EventTarget());
+    setWorkflowRunning("wf-abcd1234", "run-1");
+    try {
+      await closeBusyWindow();
+      expect(vi.mocked(ask).mock.calls[0][0]).toContain("running work");
+      expect(vi.mocked(ask).mock.calls[0][0]).not.toContain("chats");
+    } finally {
+      setWorkflowRunning("wf-abcd1234", null);
+      vi.unstubAllGlobals();
       release();
     }
   });
@@ -562,5 +615,23 @@ describe("remembering the terminal dock side across restarts", () => {
     const { handleQuitRequested } = await import("./appLifecycle");
     await handleQuitRequested();
     expect(await lastSavedDockSide()).toBe("left");
+  });
+});
+
+describe("hasInFlightWork", () => {
+  it("counts a workflow run this window is driving, like a busy session", () => {
+    const idle = newSession("claude", "/code/app");
+    expect(hasInFlightWork([idle])).toBe(false);
+    expect(hasInFlightWork([{ ...idle, busy: true }])).toBe(true);
+    // The run registry announces changes on window; this file runs without one.
+    vi.stubGlobal("window", new EventTarget());
+    setWorkflowRunning("wf-abcd1234", "run-1");
+    try {
+      expect(hasInFlightWork([idle])).toBe(true);
+    } finally {
+      setWorkflowRunning("wf-abcd1234", null);
+      vi.unstubAllGlobals();
+    }
+    expect(hasInFlightWork([idle])).toBe(false);
   });
 });

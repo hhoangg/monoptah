@@ -40,6 +40,7 @@ import {
   handleAgentApp,
   canAccessAgentAppProject,
   completionChatId,
+  resolveMonoProject,
   type AppSessionListing,
   type AppSessionPlacement,
 } from "../features/agent-app/model/agentApp";
@@ -148,7 +149,10 @@ import {
   type LaunchedSessionState,
   type LaunchedSessionView,
 } from "../features/monos/model/monoSpawnedSessions";
-import { groupMonoTurns } from "../features/sessions/model/transcriptActivity";
+import {
+  groupMonoTurns,
+  monoPost,
+} from "../features/sessions/model/transcriptActivity";
 import {
   resolveMonoActivity,
   type MonoActivitySelection,
@@ -688,9 +692,28 @@ import {
   recordAgentContext,
   writeAgentFile,
 } from "../features/monos/model/monoFiles";
-import { useMonoHabits } from "./hooks/useMonoHabits";
+import { finalReply, useMonoHabits } from "./hooks/useMonoHabits";
+import {
+  resumeWorkflowRun,
+  useMonoWorkflows,
+  type MonoWorkflowHost,
+} from "./hooks/useMonoWorkflows";
+import { useWorkflowDriver } from "./hooks/workflowDriver";
+import { liveRunRegistry } from "./hooks/workflowLiveRuns";
+import {
+  checkWorkflowsNow,
+  clearWorkflowRuns,
+  loadRuns,
+  loadWorkflows,
+  stopWorkflowRun,
+  updateWorkflows,
+  workflowRunningId,
+} from "../features/workflows/model/workflowStore";
+import { ASK_TIMEOUT_MS } from "./hooks/workflowRunner";
+import { startWorkflowSession } from "./model/workflowSessionStart";
 import { useFloatingMono } from "./hooks/useFloatingMono";
 import {
+  clearHabitRun,
   dropRelays,
   habitPostsContext,
   habitRunMono,
@@ -699,6 +722,7 @@ import {
   relayApproval,
   takeRelayedApproval,
   loadHabits,
+  markHabitRun,
   unseenHabitPosts,
   updateHabits,
 } from "../features/monos/model/monoHabits";
@@ -900,7 +924,7 @@ import {
   closeBusyWindow,
   closeCurrentWindow,
   confirmReload,
-  hasInFlightSessions,
+  hasInFlightWork,
   hideCurrentWindow,
   isAppQuitting,
   persistLiveTranscripts,
@@ -2216,7 +2240,8 @@ function Workspace({
   useEffect(() => {
     const openSessionForAddToChat = (event: Event) => {
       const detail = (event as CustomEvent<AddToChatRequest>).detail;
-      if (!detail?.text) return;
+      // A request aimed at one session's composer never opens a new chat.
+      if (!detail?.text || detail.sessionId) return;
 
       const result = applyAddToChatRequest({
         sessions: sessionsRef.current,
@@ -2659,7 +2684,7 @@ function Workspace({
           return;
         }
         const toTray = loadCloseToTray();
-        if (hasInFlightSessions(sessionsRef.current)) {
+        if (hasInFlightWork(sessionsRef.current)) {
           flushHarnessEvents();
           if (!toTray && !IS_MAC) {
             void closeBusyWindow();
@@ -9213,6 +9238,22 @@ function Workspace({
   };
   decideMonoBlockRef.current = decideMonoBlock;
 
+  /** Stops and deletes a session that only ever lived in memory, such as a habit's run. */
+  const removeHiddenSession = async (id: string) => {
+    const open = await stopSessionForRemoval(id);
+    if (open)
+      await Promise.all(
+        sessionChildHarnesses(open).map((harness) =>
+          forgetHarnessSession(harness, id),
+        ),
+      );
+    await deleteSession(id, []);
+    sessionsRef.current = sessionsRef.current.filter(
+      (session) => session.id !== id,
+    );
+    setSessions(sessionsRef.current);
+  };
+
   useMonoHabits({
     sessions: () => sessionsRef.current,
     open: async (id) => (await ensureOpenSession(id)) ?? undefined,
@@ -9228,20 +9269,7 @@ function Workspace({
           rejectionMessage: "The habit's run could not start.",
         });
       }),
-    remove: async (id) => {
-      const open = await stopSessionForRemoval(id);
-      if (open)
-        await Promise.all(
-          sessionChildHarnesses(open).map((harness) =>
-            forgetHarnessSession(harness, id),
-          ),
-        );
-      await deleteSession(id, []);
-      sessionsRef.current = sessionsRef.current.filter(
-        (session) => session.id !== id,
-      );
-      setSessions(sessionsRef.current);
-    },
+    remove: removeHiddenSession,
     stop: async (id, monoSessionId) => {
       const target = sessionsRef.current.find((session) => session.id === id);
       if (!target) throw new Error("The session is not open");
@@ -9309,6 +9337,186 @@ function Workspace({
         decideMonoBlock(relay.monoId, relay.blockId, "cancelled");
     },
   });
+
+  const workflowHost: MonoWorkflowHost = {
+    sessions: () => sessionsRef.current,
+    startSession: (monoId, req) =>
+      startWorkflowSession(
+        {
+          findMono,
+          openSession: ensureOpenSession,
+          launch: (launch, id, onSettled) =>
+            launchQuickSessionRef.current(launch, id, undefined, onSettled),
+          registry: appLaunchRegistry,
+          isMonoSession,
+          openSessions: () => sessionsRef.current,
+          storedSessions: (cwd) => listSessionsByProject(cwd),
+          storedSession: (id) => getSession(id),
+          worktrees: (cwd) => listWorktrees(cwd),
+        },
+        monoId,
+        req,
+      ),
+    send: async (id, prompt) => {
+      if (!(await ensureOpenSession(id)))
+        return {
+          status: "failed",
+          text: "",
+          error: "The session is no longer available.",
+        };
+      return new Promise((resolve) => {
+        void submitWithSettlement({
+          submit: (onSettled) => submitSession(id, prompt, [], { onSettled }),
+          onSettled: resolve,
+          rejectionMessage: "The workflow's follow-up could not start.",
+        });
+      });
+    },
+    stop: async (id) => {
+      const target = sessionsRef.current.find((session) => session.id === id);
+      if (!target) return;
+      if (
+        removingSessionIds.current.has(id) ||
+        switchingWorktrees.current.has(id)
+      )
+        throw new Error("The session is being removed or changing worktrees");
+      if (target.orchestrationLeadId || isMonoSession(id) || isHabitRun(id))
+        throw new Error("The session cannot be stopped from a workflow");
+      await flushSync(() => stopSessionRef.current(id));
+      flushHarnessEvents();
+    },
+    runCommand: (cwd, command, timeoutMs, id) =>
+      invoke("workflow_run_command", { id, command, cwd, timeoutMs }),
+    cancelCommand: (id) => invoke("workflow_cancel_command", { id }),
+    // A short-lived hidden session of the Mono, like a habit run, so the question never
+    // shows in the user's chat.
+    askMono: async (monoId, prompt) => {
+      const record = findMono(monoId);
+      const mono = record?.sessionId
+        ? await ensureOpenSession(record.sessionId)
+        : null;
+      if (!record || !mono) throw new Error("The Mono's chat is not available");
+      const files = await loadMonoFiles(monoId);
+      const look = monoLook(record);
+      const ask: Session = {
+        ...newSession(
+          mono.harness,
+          mono.cwd,
+          mono.model,
+          "full-access",
+          mono.modelSettings,
+          { surface: "chat" },
+        ),
+        title: `${look.name} · workflow question`,
+        ephemeral: true,
+      };
+      markHabitRun(ask.id, monoId);
+      sessionsRef.current = [...sessionsRef.current, ask];
+      setSessions(sessionsRef.current);
+      try {
+        const answered = new Promise<ControlOutcome>((resolve) => {
+          void submitWithSettlement({
+            submit: (onSettled) =>
+              submitSession(
+                ask.id,
+                `/operator ${monoContext(look, files, { soul: true, memory: true })}\n\n${prompt}`,
+                [],
+                { onSettled },
+              ),
+            onSettled: resolve,
+            rejectionMessage: "The workflow's question could not start.",
+          });
+        });
+        // Ends a little before the run gives up, so this clean-up still happens.
+        let timer: number | undefined;
+        const outcome = await Promise.race([
+          answered,
+          new Promise<never>((_, reject) => {
+            timer = window.setTimeout(
+              () => reject(new Error("The Mono did not answer in time")),
+              ASK_TIMEOUT_MS - 5_000,
+            );
+          }),
+        ]).finally(() => window.clearTimeout(timer));
+        if (outcome.status !== "completed")
+          throw new Error(outcome.error ?? "The Mono did not answer");
+        return (
+          finalReply(sessionsRef.current.find((s) => s.id === ask.id)) ||
+          outcome.text
+        );
+      } finally {
+        await removeHiddenSession(ask.id).catch(() => undefined);
+        clearHabitRun(ask.id);
+      }
+    },
+    post: (monoId, workflow, runId, title, text, launches) =>
+      appendToMono(
+        monoId,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text,
+          monoWorkflow: {
+            id: workflow.id,
+            name: workflow.name,
+            runId,
+            at: Date.now(),
+          },
+          ...(launches?.length ? { monoSpawnedSessions: launches } : {}),
+        },
+        (posted) => {
+          monoReplies.noteReply(monoId);
+          void announceSessionFinished(
+            { ...posted, title },
+            monoId === activeSessionIdRef.current,
+          );
+        },
+      ),
+    // Relayed like a habit run's approval: the chat shows it, the answer is routed back to
+    // the session in onApproval. Relays are keyed by the asking session.
+    askApproval: (monoId, workflow, runId, sessionId, block) => {
+      const blockId = crypto.randomUUID();
+      const requestId = relayApproval({
+        monoId,
+        runId: sessionId,
+        requestId: block.approval!.requestId,
+        blockId,
+      });
+      appendToMono(monoId, {
+        id: blockId,
+        role: "approval",
+        text: block.text,
+        ...(block.tool ? { tool: block.tool } : {}),
+        approval: { requestId },
+        monoWorkflow: {
+          id: workflow.id,
+          name: workflow.name,
+          runId,
+          at: Date.now(),
+        },
+      });
+    },
+    endApprovals: (sessionId) => {
+      for (const relay of dropRelays(sessionId))
+        decideMonoBlock(relay.monoId, relay.blockId, "cancelled");
+    },
+    projectPath: (monoId, projectInput) => {
+      const mono = findMono(monoId);
+      const named = projectInput.trim();
+      return mono && named
+        ? resolveMonoProject(mono.projects, named)
+        : undefined;
+    },
+    worktreeOf: (sessionId) => {
+      const target = sessionsRef.current.find(
+        (session) => session.id === sessionId,
+      );
+      return target ? sessionWorkCwd(target) : undefined;
+    },
+  };
+  // One window at a time drives workflows; the others ask it through the workflow files.
+  const workflowDriver = useWorkflowDriver();
+  useMonoWorkflows(workflowHost, workflowDriver);
 
   const automationSessionReservations = useRef(new Set<string>());
   // Automation runs that opened a terminal session, keyed by session id. The
@@ -11471,7 +11679,7 @@ function Workspace({
       // Mono's chat: answer the run, and settle the question in the chat.
       if (isMonoSession(sessionId)) {
         const asked = session.blocks.find(
-          (block) => block.monoHabit && block.approval?.requestId === requestId,
+          (block) => monoPost(block) && block.approval?.requestId === requestId,
         );
         if (asked) {
           const relay = takeRelayedApproval(sessionId, requestId);
@@ -12409,6 +12617,19 @@ function Workspace({
               );
             },
             habits: { load: loadHabits, update: updateHabits },
+            workflows: {
+              load: loadWorkflows,
+              update: updateWorkflows,
+              runs: loadRuns,
+              // A run may be going in another window, which the registry knows.
+              running: (workflowId) =>
+                workflowRunningId(workflowId) ??
+                liveRunRegistry()?.freshRunOf(workflowId),
+              stop: stopWorkflowRun,
+              resumeRun: resumeWorkflowRun,
+              clearRuns: clearWorkflowRuns,
+              checkNow: checkWorkflowsNow,
+            },
             agentFiles: (monoId) => loadMonoFiles(monoId),
             readAgentFile: (monoId, path) => readAgentFile(monoId, path),
             writeAgentFile: (monoId, path, text, hash) =>
@@ -14667,8 +14888,14 @@ function Workspace({
         key={monoViewMono.id}
         open={monoOverviewOpen}
         monoId={monoViewMono.id}
+        chatSessionId={monoViewSession.id}
         cwd={monoViewSession.cwd}
         agent={monoLook(monoViewMono)}
+        monoModel={{
+          harness: monoViewSession.harness,
+          model: monoViewSession.model,
+          modelSettings: monoViewSession.modelSettings,
+        }}
         state={monoState(monoViewSession)}
         launches={monoLaunches}
         sessions={sessions}

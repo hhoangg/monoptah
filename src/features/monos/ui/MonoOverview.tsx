@@ -7,15 +7,32 @@ import {
   ListBullet,
   ListFilter,
   MessageMultiple,
+  MessageSquarePlus,
   Plus,
   Search,
+  Workflow,
+  Download,
 } from "../../../shared/ui/icons";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import { artifactLabel, type ArtifactCard } from "../../artifacts/artifacts";
 import type { SessionSummary } from "../../sessions/data/sessionStore";
 import type { MonoSpawnedSession, Session } from "../../sessions/model/session";
 import type { MonoLook, MonoState } from "../model/mono";
+import { requestAddToChat } from "../../sessions/model/quoteDraft";
 import { HABITS_MAX } from "../model/monoHabits";
+import { WORKFLOWS_MAX } from "../../workflows/model/workflow";
+import {
+  useWorkflows,
+  type ReviewIntent,
+  workflowActions,
+  WorkflowsList,
+} from "../../workflows/ui/MonoWorkflows";
+import type { MonoModelDefault } from "../../workflows/ui/board/NodeInspector";
+import { WorkflowBoard } from "../../workflows/ui/board/WorkflowBoard";
+import { ImportWorkflowPage } from "../../workflows/ui/ImportWorkflowPage";
+import { WorkflowPage } from "../../workflows/ui/WorkflowPage";
+import { WorkflowReviewPage } from "../../workflows/ui/WorkflowReviewPage";
+import { WorkflowRunPage } from "../../workflows/ui/WorkflowRunPage";
 import { HabitPage } from "./HabitPage";
 import { NewHabitPage } from "./NewHabitPage";
 import { habitActions, HabitsList, useHabits } from "./MonoHabits";
@@ -40,7 +57,7 @@ import type { SessionChangeTotals } from "../../sessions/ui/SessionReview";
 import { MonoChangesView, type MonoChangesRequest } from "./MonoChangesView";
 
 export type MonoOverviewTab =
-  "activity" | "sessions" | "habits" | "documents" | "changes";
+  "activity" | "sessions" | "habits" | "workflows" | "documents" | "changes";
 
 // Activity sits apart, beside the panel toggle, since it follows the chat.
 const TABS: {
@@ -51,6 +68,7 @@ const TABS: {
   { id: "sessions", label: "Sessions", icon: MessageMultiple },
   { id: "documents", label: "Documents", icon: File },
   { id: "habits", label: "Habits", icon: Clock },
+  { id: "workflows", label: "Workflows", icon: Workflow },
   { id: "changes", label: "Changes", icon: FileDiff },
 ];
 
@@ -66,14 +84,29 @@ export type MonoOverviewChanges = {
   projects: readonly string[];
 };
 
-type Route = { kind: "new-habit" } | { kind: "habit"; id: string };
+type Route =
+  | { kind: "new-habit" }
+  | { kind: "habit"; id: string }
+  | { kind: "workflow"; id: string }
+  | { kind: "workflow-run"; id: string; runId: string }
+  | { kind: "workflow-board"; id: string }
+  | { kind: "workflow-review"; id: string; intent: ReviewIntent }
+  | { kind: "new-workflow" }
+  | { kind: "import-workflow" };
+
+/** What "Ask Mono to build a workflow" starts in the chat, for the user to finish. */
+export const ASK_MONO_WORKFLOW_DRAFT = "Help me build a workflow that ";
 
 type Props = {
   open: boolean;
   monoId: string;
+  /** Its conversation, whose composer "Ask Mono to build a workflow" fills in. */
+  chatSessionId?: string;
   /** Its conversation's folder, which habits run in. */
   cwd: string;
   agent: MonoLook;
+  /** The model its conversation uses, which workflow steps start with unless they pick another. */
+  monoModel?: MonoModelDefault;
   state: MonoState;
   /** Every session it has started, oldest first. */
   launches: readonly MonoSpawnedSession[];
@@ -107,8 +140,10 @@ type Props = {
 export function MonoOverview({
   open,
   monoId,
+  chatSessionId,
   cwd,
   agent,
+  monoModel,
   state,
   launches,
   sessions,
@@ -132,7 +167,11 @@ export function MonoOverview({
   const lock = useLockOverscroll<HTMLDivElement>();
   const habits = useHabits(monoId, state.status);
   const actions = habitActions(monoId);
+  const workflows = useWorkflows(monoId, state.status);
+  const workflowOps = workflowActions(monoId);
   const [routes, setRoutes] = useState<Route[]>([]);
+  // An imported workflow opens once the list has it, in place of the import page.
+  const [opening, setOpening] = useState<string>();
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<SessionSidebarFilters>(
     DEFAULT_SESSION_SIDEBAR_FILTERS,
@@ -152,6 +191,15 @@ export function MonoOverview({
     setQuery("");
     setFilters(DEFAULT_SESSION_SIDEBAR_FILTERS);
   }, [monoId]);
+  useEffect(() => {
+    if (!opening || !workflows?.some((entry) => entry.id === opening)) return;
+    setOpening(undefined);
+    setRoutes((current) =>
+      current[current.length - 1]?.kind === "import-workflow"
+        ? [...current.slice(0, -1), { kind: "workflow", id: opening }]
+        : current,
+    );
+  }, [opening, workflows]);
   const push = (route: Route) => setRoutes((current) => [...current, route]);
   const back = () => setRoutes((current) => current.slice(0, -1));
 
@@ -163,6 +211,121 @@ export function MonoOverview({
           node: <NewHabitPage monoId={monoId} onBack={back} onCreated={back} />,
         },
       ];
+    if (route.kind === "new-workflow")
+      return [
+        {
+          key: "new-workflow",
+          node: (
+            <WorkflowBoard
+              monoId={monoId}
+              color={agent.color}
+              projects={agent.projects}
+              monoModel={monoModel}
+              onBack={back}
+            />
+          ),
+        },
+      ];
+    if (route.kind === "import-workflow")
+      return [
+        {
+          key: "import-workflow",
+          node: (
+            <ImportWorkflowPage
+              monoId={monoId}
+              color={agent.color}
+              projects={agent.projects}
+              workflowCount={workflows?.length}
+              onBack={back}
+              onImported={setOpening}
+            />
+          ),
+        },
+      ];
+    if (
+      route.kind === "workflow" ||
+      route.kind === "workflow-run" ||
+      route.kind === "workflow-board" ||
+      route.kind === "workflow-review"
+    ) {
+      // A workflow removed while open closes its pages.
+      const workflow = workflows?.find((entry) => entry.id === route.id);
+      if (!workflow) return [];
+      if (route.kind === "workflow-board")
+        return [
+          {
+            key: `workflow-board:${route.id}:${depth}`,
+            node: (
+              <WorkflowBoard
+                monoId={monoId}
+                workflow={workflow}
+                color={agent.color}
+                projects={agent.projects}
+                monoModel={monoModel}
+                onBack={back}
+                onReview={(intent) =>
+                  push({ kind: "workflow-review", id: route.id, intent })
+                }
+              />
+            ),
+          },
+        ];
+      if (route.kind === "workflow-review")
+        return [
+          {
+            key: `workflow-review:${route.id}:${depth}`,
+            node: (
+              <WorkflowReviewPage
+                workflow={workflow}
+                intent={route.intent}
+                color={agent.color}
+                actions={workflowOps}
+                onBack={back}
+              />
+            ),
+          },
+        ];
+      if (route.kind === "workflow-run")
+        return [
+          {
+            key: `workflow-run:${route.id}:${route.runId}:${depth}`,
+            node: (
+              <WorkflowRunPage
+                monoId={monoId}
+                workflowId={workflow.id}
+                runId={route.runId}
+                current={workflow}
+                color={agent.color}
+                onBack={back}
+                onOpenSession={onOpenSession}
+              />
+            ),
+          },
+        ];
+      return [
+        {
+          key: `workflow:${route.id}:${depth}`,
+          node: (
+            <WorkflowPage
+              monoId={monoId}
+              workflow={workflow}
+              color={agent.color}
+              projects={agent.projects}
+              actions={workflowOps}
+              onBack={back}
+              onEditBoard={() => push({ kind: "workflow-board", id: route.id })}
+              onOpenRun={(runId) =>
+                push({ kind: "workflow-run", id: route.id, runId })
+              }
+              onRemove={back}
+              onReview={(intent) =>
+                push({ kind: "workflow-review", id: route.id, intent })
+              }
+            />
+          ),
+        },
+      ];
+    }
     // A habit removed while open closes its page.
     const habit = habits?.find((entry) => entry.id === route.id);
     if (!habit) return [];
@@ -222,9 +385,11 @@ export function MonoOverview({
     });
 
   const habitsFull = !habits || habits.length >= HABITS_MAX;
+  const workflowsFull = !workflows || workflows.length >= WORKFLOWS_MAX;
   const counts: Record<(typeof TABS)[number]["id"], number | undefined> = {
     sessions: launches.length,
     habits: habits?.length,
+    workflows: workflows?.length,
     documents: documents.length,
     changes: changes?.totals?.files,
   };
@@ -259,6 +424,48 @@ export function MonoOverview({
                 >
                   <Plus className="size-3.5" strokeWidth={1.75} />
                 </IconButton>
+              ) : null}
+              {tab === "workflows" ? (
+                <>
+                  <IconButton
+                    label="Ask Mono to build a workflow"
+                    disabled={!chatSessionId}
+                    onClick={() =>
+                      requestAddToChat(
+                        ASK_MONO_WORKFLOW_DRAFT,
+                        "prefill",
+                        chatSessionId,
+                      )
+                    }
+                  >
+                    <MessageSquarePlus
+                      className="size-3.5"
+                      strokeWidth={1.75}
+                    />
+                  </IconButton>
+                  <IconButton
+                    label={
+                      workflows && workflows.length >= WORKFLOWS_MAX
+                        ? `At most ${WORKFLOWS_MAX} workflows`
+                        : "Import workflow"
+                    }
+                    disabled={workflowsFull}
+                    onClick={() => push({ kind: "import-workflow" })}
+                  >
+                    <Download className="size-3.5" strokeWidth={1.75} />
+                  </IconButton>
+                  <IconButton
+                    label={
+                      workflows && workflows.length >= WORKFLOWS_MAX
+                        ? `At most ${WORKFLOWS_MAX} workflows`
+                        : "New workflow"
+                    }
+                    disabled={workflowsFull}
+                    onClick={() => push({ kind: "new-workflow" })}
+                  >
+                    <Plus className="size-3.5" strokeWidth={1.75} />
+                  </IconButton>
+                </>
               ) : null}
               <TabButton
                 label="Activity"
@@ -353,6 +560,22 @@ export function MonoOverview({
                 <EmptyState icon={Clock}>
                   Ask {agent.name} to put recurring work on a schedule, like a
                   morning digest or a weekly report.
+                </EmptyState>
+              }
+            />
+          ) : tab === "workflows" ? (
+            <WorkflowsList
+              monoId={monoId}
+              workflows={workflows}
+              actions={workflowOps}
+              onOpen={(id) => push({ kind: "workflow", id })}
+              onReview={(id, intent) =>
+                push({ kind: "workflow-review", id, intent })
+              }
+              empty={
+                <EmptyState icon={Workflow}>
+                  Ask {agent.name} to chain sessions into a workflow, or create
+                  one with +.
                 </EmptyState>
               }
             />

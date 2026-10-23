@@ -5,6 +5,7 @@ import {
   type AutomationScheduleKind,
 } from "../../automations/model/automations";
 import type { Block, MonoSpawnedSession } from "../../sessions/model/session";
+import { monoPost } from "../../sessions/model/transcriptActivity";
 import type { MonoLook } from "./mono";
 import {
   MonoFileConflict,
@@ -530,13 +531,21 @@ export function habitReport(text: string): string | undefined {
   return trimmed.replace(new RegExp(`\\s*${QUIET_MARKER}\\s*$`), "").trim();
 }
 
-/** The habit posts that the Mono's own session has not seen yet. */
+/**
+ * The habit and workflow posts that the Mono's own session has not seen yet. The Mono's
+ * provider session never saw a block the app posted, so it is told about them here.
+ */
 export function unseenHabitPosts(blocks: readonly Block[]): Block[] {
   const posts: Block[] = [];
   for (let i = blocks.length - 1; i >= 0; i--) {
     const block = blocks[i];
     if (block.role === "user" && !block.draft && !block.internal) break;
-    if (block.monoHabit && block.text.trim()) posts.unshift(block);
+    // A workflow's approval requests are not reports; a habit's were always listed.
+    const post =
+      block.monoHabit || block.role === "assistant"
+        ? monoPost(block)
+        : undefined;
+    if (post && block.text.trim()) posts.unshift(block);
   }
   return posts;
 }
@@ -546,11 +555,12 @@ export function habitPostsContext(posts: readonly Block[]): string {
   if (!posts.length) return "";
   const lines = posts.map((post) => {
     const text = post.text.replace(/\s+/g, " ").trim();
-    return `- ${new Date(post.monoHabit!.at).toLocaleString()} · ${post.monoHabit!.name}: ${
+    const source = monoPost(post)!;
+    return `- ${new Date(source.at).toLocaleString()} · ${source.name}: ${
       text.length > 600 ? `${text.slice(0, 599)}…` : text
     }`;
   });
-  return `<while_you_were_away>\nYour habits posted these to this chat on their own since the user's last message. The user has seen them; build on them rather than repeating them.\n${lines.join("\n")}\n</while_you_were_away>`;
+  return `<while_you_were_away>\nYour habits and workflows posted these to this chat on their own since the user's last message. The user has seen them; build on them rather than repeating them.\n${lines.join("\n")}\n</while_you_were_away>`;
 }
 
 /** The Mono's habits from its folder. */
