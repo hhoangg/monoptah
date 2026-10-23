@@ -12,7 +12,11 @@ import { useTelegramQuestions } from "./useTelegramQuestions";
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 const listen = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/event", () => ({ listen }));
+const globalListen = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/event", () => ({ listen: globalListen }));
+vi.mock("@tauri-apps/api/webviewWindow", () => ({
+  getCurrentWebviewWindow: () => ({ listen }),
+}));
 
 const TICK_MS = 15_000;
 
@@ -42,11 +46,7 @@ function prompt(
   };
 }
 
-function asking(
-  requestId = 1,
-  id = "s1",
-  autoResolveAt?: number,
-): Session {
+function asking(requestId = 1, id = "s1", autoResolveAt?: number): Session {
   return {
     ...newSession("codex", "/repo"),
     id,
@@ -150,6 +150,7 @@ describe("useTelegramQuestions", () => {
       }
     });
     listen.mockReset();
+    globalListen.mockReset();
     listen.mockImplementation(
       async (_event: string, handler: typeof answerHandler) => {
         answerHandler = handler;
@@ -219,6 +220,15 @@ describe("useTelegramQuestions", () => {
     ]);
     await advance(FORWARD_DELAY_MS + TICK_MS);
     expect(callsTo("telegram_forward_question")).toHaveLength(0);
+  });
+
+  it("subscribes through the current webview window, not the global listen", async () => {
+    await render([asking()]);
+    expect(listen).toHaveBeenCalledWith(
+      "monocode-telegram-answer",
+      expect.any(Function),
+    );
+    expect(globalListen).not.toHaveBeenCalled();
   });
 
   it("routes answer to onQuestionReply", async () => {

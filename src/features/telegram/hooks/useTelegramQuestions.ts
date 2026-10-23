@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { projectKey } from "../../../shared/lib/paths";
 import type { Session } from "../../sessions/model/session";
 import type { UserQuestionReply } from "../../sessions/model/userQuestion";
@@ -224,7 +225,10 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
       void telegramAnswerResult(resultKey, ok).catch(() => undefined);
     }
     try {
-      void listen<TelegramAnswerEvent>(TELEGRAM_ANSWER_EVENT, onAnswer)
+      // Scoped to this window: a global `listen` is registered as `Any` and
+      // would also receive answers emitted to the window that owns the question.
+      void getCurrentWebviewWindow()
+        .listen<TelegramAnswerEvent>(TELEGRAM_ANSWER_EVENT, onAnswer)
         .then((stop) => {
           if (disposed) stop();
           else stopListening = stop;
