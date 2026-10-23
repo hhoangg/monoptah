@@ -5,6 +5,9 @@ import {
 } from "../../monos/model/monoFiles";
 import {
   WORKFLOW_RUNS_KEPT,
+  type NodeRun,
+  type NodeStatus,
+  type RoundRecord,
   type Workflow,
   type WorkflowId,
   type WorkflowRun,
@@ -111,10 +114,58 @@ function readRunsFile(
   const runs: WorkflowRun[] = [];
   const unreadable: unknown[] = [];
   for (const raw of parsed) {
-    if (isRun(raw)) runs.push(raw);
+    if (isRun(raw)) runs.push(withCleanHistory(raw));
     else unreadable.push(raw);
   }
   return { runs, unreadable };
+}
+
+const NODE_STATUSES: ReadonlySet<string> = new Set<NodeStatus>([
+  "pending",
+  "running",
+  "waitingApproval",
+  "done",
+  "failed",
+  "skipped",
+  "stopped",
+]);
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  !!v && typeof v === "object" && !Array.isArray(v);
+const isOptionalNumber = (v: unknown) => v === undefined || typeof v === "number";
+const isOptionalString = (v: unknown) => v === undefined || typeof v === "string";
+
+function isRoundRecord(raw: unknown): raw is RoundRecord {
+  if (!isPlainObject(raw)) return false;
+  const { decision } = raw;
+  return (
+    typeof raw.round === "number" &&
+    typeof raw.status === "string" &&
+    NODE_STATUSES.has(raw.status) &&
+    isOptionalString(raw.sessionId) &&
+    isOptionalString(raw.error) &&
+    isOptionalNumber(raw.startedAt) &&
+    isOptionalNumber(raw.endedAt) &&
+    (raw.output === undefined || isPlainObject(raw.output)) &&
+    (decision === undefined ||
+      (isPlainObject(decision) &&
+        typeof decision.value === "string" &&
+        isOptionalString(decision.reason)))
+  );
+}
+
+/** Drops the per-round records of a run that cannot be read; the rest of the run stays as saved. */
+function withCleanHistory(run: WorkflowRun): WorkflowRun {
+  if (!run.nodes.some((n) => isPlainObject(n) && "history" in n)) return run;
+  return {
+    ...run,
+    nodes: run.nodes.map((n) => {
+      if (!isPlainObject(n) || !("history" in n)) return n;
+      const { history, ...rest } = n as NodeRun;
+      const kept = Array.isArray(history) ? history.filter(isRoundRecord) : [];
+      return kept.length > 0 ? { ...rest, history: kept } : rest;
+    }),
+  };
 }
 
 function isRun(raw: unknown): raw is WorkflowRun {

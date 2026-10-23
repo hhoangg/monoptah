@@ -21,6 +21,7 @@ import {
   type NodeId,
   type NodeRun,
   type NodeStatus,
+  type RoundRecord,
   type RunStatus,
   type Workflow,
   type WorkflowEdge,
@@ -381,6 +382,20 @@ function finishNode(d: Draft, r: NodeRun, output?: Record<string, unknown>): voi
   if (output !== undefined) r.output = output;
 }
 
+/** A snapshot of the round a node just finished, for `NodeRun.history`. */
+function roundRecord(r: NodeRun): RoundRecord {
+  return {
+    round: r.round,
+    status: r.status,
+    ...(r.sessionId !== undefined ? { sessionId: r.sessionId } : {}),
+    ...(r.output !== undefined ? { output: r.output } : {}),
+    ...(r.error !== undefined ? { error: r.error } : {}),
+    ...(r.decision !== undefined ? { decision: r.decision } : {}),
+    ...(r.startedAt !== undefined ? { startedAt: r.startedAt } : {}),
+    ...(r.endedAt !== undefined ? { endedAt: r.endedAt } : {}),
+  };
+}
+
 /**
  * Sends the branch back to `to`: that node, `from` and everything between them become pending
  * for the next round. Their outputs stay until they run again, so the next round can read the
@@ -393,6 +408,7 @@ function resetLoop(d: Draft, from: NodeRun, to: NodeId): void {
   for (const id of loopBody(d.g, from.nodeId, to)) {
     const r = d.index.get(slot(id, from.branch));
     if (!r) continue;
+    r.history = [...(r.history ?? []), roundRecord(r)];
     r.status = "pending";
     r.round = round;
     delete r.error;
@@ -443,6 +459,7 @@ function decideLoop(d: Draft, r: NodeRun, value: string, reason?: string): void 
     r.decision = { value: "exit", reason: BRANCH_FAILED_REASON };
   } else if (value === "loop" && r.round < spec.loop.maxRounds) {
     r.status = "done";
+    r.decision = { value: "loop", ...(reason !== undefined ? { reason } : {}) };
     resetLoop(d, r, spec.to);
   } else if (value === "exit" || value === "loop") {
     // A "loop" answer at the last round is treated as exit: the app always exits there.
@@ -519,7 +536,10 @@ function pass(d: Draft): boolean {
       } else if (spec.loop.decide !== "mono") {
         const result = evalCondition(spec.loop.decide, runScope(d.run, r.branch, r.nodeId));
         if (!result.ok) failNode(d, r, result.error);
-        else if (result.value) resetLoop(d, r, spec.to);
+        else if (result.value) {
+          r.decision = { value: "loop" };
+          resetLoop(d, r, spec.to);
+        }
         else r.decision = { value: "exit" };
         changed = true;
       }

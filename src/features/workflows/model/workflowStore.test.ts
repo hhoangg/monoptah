@@ -196,6 +196,42 @@ it("loadRuns drops malformed entries and unreadable files", async () => {
   expect(await loadRuns("mono-1", "wf-abcd1234")).toEqual([]);
 });
 
+it("loadRuns keeps per-round history and drops malformed records", async () => {
+  const history = [
+    {
+      round: 1,
+      status: "done",
+      sessionId: "s1",
+      output: { pr_url: "u1" },
+      decision: { value: "loop", reason: "needs tests" },
+      startedAt: 1,
+      endedAt: 2,
+    },
+  ];
+  const withHistory = run("with");
+  withHistory.nodes = [
+    { nodeId: "dev", branch: "", status: "pending", round: 2, history } as WorkflowRun["nodes"][number],
+    {
+      nodeId: "review",
+      branch: "",
+      status: "pending",
+      round: 3,
+      history: [history[0], { round: "x", status: "done" }, { round: 2, status: "nope" }, 7, null],
+    } as unknown as WorkflowRun["nodes"][number],
+  ];
+  const without = run("without");
+  without.nodes = [{ nodeId: "dev", branch: "", status: "done", round: 1 }];
+  native.invoke.mockResolvedValueOnce({
+    text: JSON.stringify([withHistory, without]),
+    hash: "h",
+  });
+  const [a, b] = await loadRuns("mono-1", "wf-abcd1234");
+  expect(a.nodes[0].history).toEqual(history);
+  expect(a.nodes[1].history).toEqual(history);
+  expect(b.nodes[0].history).toBeUndefined();
+  expect("history" in b.nodes[0]).toBe(false);
+});
+
 it("tracks running workflows and notifies subscribers", () => {
   const listener = vi.fn();
   const off = subscribeWorkflowsRunning(listener);

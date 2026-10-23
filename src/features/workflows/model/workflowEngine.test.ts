@@ -396,6 +396,41 @@ describe("workflowEngine", () => {
     expect(again.kind === "startSession" && again.prompt).toContain('Implement round 2. Fix: [\n  "x"\n]');
   });
 
+  it("records the finished round before a loop resets a node", () => {
+    let run = startRun(devReview("mono"), "manual", at, "r");
+    run = started(run, "dev", "", "s-dev-1");
+    run = finished(run, "dev", { pr_url: "u1" });
+    run = started(run, "review", "", "s-rev-1");
+    run = finished(run, "review", { verdict: "changes" });
+    run = decided(run, "review", "loop", "", "needs tests");
+    expect(nodeOf(run, "dev").history).toEqual([
+      expect.objectContaining({
+        round: 1,
+        status: "done",
+        sessionId: "s-dev-1",
+        output: { pr_url: "u1" },
+      }),
+    ]);
+    expect(nodeOf(run, "review").history).toHaveLength(1);
+    expect(nodeOf(run, "review").history?.[0].decision).toEqual({ value: "loop", reason: "needs tests" });
+    expect(nodeOf(run, "review").round).toBe(2);
+    // The current round is never part of the history.
+    expect(nodeOf(run, "review").decision).toBeUndefined();
+  });
+
+  it("exit decision stays on the node, not in history", () => {
+    let run = startRun(devReview("mono"), "manual", at, "r");
+    run = complete(run, "dev", { pr_url: "p1" });
+    run = complete(run, "review", { verdict: "no" });
+    run = decided(run, "review", "loop");
+    run = complete(run, "dev", { pr_url: "p2" });
+    run = complete(run, "review", { verdict: "ok" });
+    run = decided(run, "review", "exit");
+    expect(nodeOf(run, "review").decision?.value).toBe("exit");
+    expect(nodeOf(run, "review").history).toHaveLength(1);
+    expect(nodeOf(run, "review").history?.[0].round).toBe(1);
+  });
+
   it("loop does not reuse the session when reuseSession is false", () => {
     let run = startRun(devReview("mono", 3, false), "manual", at, "r");
     run = complete(run, "dev", { pr_url: "p" });

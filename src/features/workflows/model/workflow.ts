@@ -234,6 +234,17 @@ export const isArchivedBranch = (branch: BranchKey): boolean => parseBranch(bran
 export const archivedBranch = (branch: BranchKey, round: number): BranchKey => `${branch}@r${round}`;
 /** Where the item list of a For each is kept once a loop round archived it. */
 export const archivedItemsKey = (groupId: NodeId, round: number): NodeId => `${groupId}@r${round}`;
+/** What a node did in one round of a loop, kept when the loop sends the branch back for the next. */
+export type RoundRecord = {
+  round: number;
+  status: NodeStatus;
+  sessionId?: string;
+  output?: Record<string, unknown>;
+  error?: string;
+  decision?: { value: string; reason?: string };
+  startedAt?: number;
+  endedAt?: number;
+};
 export type NodeRun = {
   nodeId: NodeId;
   branch: BranchKey;
@@ -251,6 +262,8 @@ export type NodeRun = {
   startedAt?: number;
   endedAt?: number;
   reasked?: boolean;
+  /** The rounds a loop already finished, oldest first. Never includes the current round. */
+  history?: RoundRecord[];
 };
 export type RunStatus =
   | "running"
