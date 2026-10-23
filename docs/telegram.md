@@ -21,9 +21,11 @@ Telegram is set up per project. Right-click a project and choose **Telegram...**
    the group. If the link does not work, send the shown command (for example
    `/connect@your_bot CODE`) in the group instead. The dialog switches to
    "Connected to <group>" once the bot is in.
-6. **Check the status.** The dialog shows whether Topics are on and whether the bot
-   can manage topics, and explains what to fix if not. Use the **Enabled** switch to
-   pause forwarding without disconnecting.
+6. **Turn on Enabled.** Connecting a group does not start forwarding. Switch on
+   **Forward questions** (the **Enabled** switch); it starts off. Switch it off again
+   at any time to pause forwarding without disconnecting.
+7. **Check the status.** The dialog shows whether Topics are on and whether the bot
+   can manage topics, and explains what to fix if not.
 
 To use a topic you already have, open a session's menu, choose **Link Telegram
 topic...**, and send the `/link <code>` command it shows inside that topic. This
@@ -50,8 +52,11 @@ option arrives with the session menu update.
   delayed and sent later.
 - **The app must stay open.** Monoptah reads your answers while it is running. Nothing
   is forwarded or received while it is closed.
-- **Questions only.** Permission or tool approvals are not forwarded and cannot be
-  answered from Telegram.
+- **Questions only.** Permission or tool approvals and plans are not forwarded and
+  cannot be answered from Telegram.
+- **Not forwarded:** remote (SSH) projects, TUI sessions, Mono chats, and
+  orchestration workers (their lead answers them). The project menu hides
+  **Telegram...** for remote projects.
 - Topic names are cut to Telegram's 128 character limit.
 
 ## Do not run two apps on one bot

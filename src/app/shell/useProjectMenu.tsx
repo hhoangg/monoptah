@@ -22,6 +22,7 @@ import {
 import { IS_MAC, IS_WIN } from "../../platform/tauri/platform";
 import { projectKey, projectName } from "../../shared/lib/paths";
 import {
+  isRemoteProjectPath,
   loadPinnedProjects,
   sameProjectPath,
   subscribeProjectPathsChanged,
@@ -85,7 +86,7 @@ const REVEAL_LABEL = IS_MAC
     ? "Reveal in File Explorer"
     : "Open Containing Folder";
 
-function projectMenuExtraItems(
+export function projectMenuExtraItems(
   pinned: boolean,
   canRemove: boolean,
   canConfigureNotifications: boolean,
@@ -94,6 +95,8 @@ function projectMenuExtraItems(
   projectGroups: ProjectGroup[],
   currentProjectGroupId: string | undefined,
   railOptions: boolean,
+  /** Remote (SSH) projects never forward questions, so they get no setup. */
+  canForwardQuestions: boolean,
 ): TabGroupMenuExtraItem[] {
   const groupSubmenu: ExplorerMenuItem[] = [
     { kind: "item", id: "project-group:new", label: "New group…" },
@@ -118,7 +121,9 @@ function projectMenuExtraItems(
       label: "Background image",
       icon: ImagePlus,
     },
-    { id: "telegram-settings", label: "Telegram...", icon: Send },
+    ...(canForwardQuestions
+      ? [{ id: "telegram-settings", label: "Telegram...", icon: Send }]
+      : []),
     ...(railOptions
       ? [
           {
@@ -472,6 +477,7 @@ export function useProjectMenu({
             loadProjectGroupAssignments(),
           ),
           railOptions,
+          !isRemoteProjectPath(projectMenu.path),
         )}
         footer={
           menuError ? (

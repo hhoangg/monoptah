@@ -226,6 +226,34 @@ describe("telegram project dialog", () => {
     expect(dialog().querySelector('input[type="password"]')).not.toBeNull();
   });
 
+  it("labels the switch and says forwarding is off after connecting", async () => {
+    status = { ...CONNECTED, enabled: false };
+    await renderDialog();
+
+    expect(dialog().textContent).toContain("Forward questions");
+    expect(dialog().textContent).toContain(
+      "Forwarding is off. Turn it on to send questions that wait more than 5 minutes.",
+    );
+    const toggle = dialog().querySelector<HTMLElement>('[role="switch"]')!;
+    expect(toggle.getAttribute("aria-label")).toBe("Enabled");
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+
+    await act(async () => toggle.click());
+    expect(invoke).toHaveBeenCalledWith("telegram_set_enabled", {
+      project: PROJECT,
+      enabled: true,
+    });
+    expect(dialog().textContent).not.toContain("Forwarding is off");
+  });
+
+  it("does not show the off hint while forwarding is on", async () => {
+    status = CONNECTED;
+    await renderDialog();
+
+    expect(dialog().textContent).toContain("Forward questions");
+    expect(dialog().textContent).not.toContain("Forwarding is off");
+  });
+
   it("shows admin note when bot cannot manage topics", async () => {
     status = { ...CONNECTED, canManageTopics: false };
     await renderDialog();

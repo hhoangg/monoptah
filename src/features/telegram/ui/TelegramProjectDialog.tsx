@@ -234,7 +234,10 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
               </div>
             ) : (
               <>
-                <Row label={`Connected to ${status.chatTitle ?? "a group"}`}>
+                <p className="text-[13px] font-medium text-content">
+                  {`Connected to ${status.chatTitle ?? "a group"}`}
+                </p>
+                <Row label="Forward questions">
                   <Toggle
                     label="Enabled"
                     on={status.enabled}
@@ -242,6 +245,12 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
                     onChange={(next) => void setEnabled(next)}
                   />
                 </Row>
+                {status.enabled ? null : (
+                  <p className="text-[11px] leading-relaxed text-content/45">
+                    Forwarding is off. Turn it on to send questions that wait
+                    more than 5 minutes.
+                  </p>
+                )}
                 <dl className="flex flex-col gap-1 text-[12px]">
                   <StatusLine
                     label="Topics"
