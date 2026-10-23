@@ -297,7 +297,8 @@ const PROJECT_REF = /^\{\{inputs\.([^{}\s.]+)\}\}$/;
 const RUN_VARS = ["round", "id", "startedAt"];
 /** Template variables a node output must not shadow. */
 const RESERVED_NODE_IDS = ["run", "inputs", "results"];
-const RESERVED_HEADS = ["inputs", "run"];
+/** Extra `run` fields only a report template gets (see composeReport). */
+const REPORT_RUN_VARS = ["name", "status", "statusLabel", "endedAt"];
 /**
  * Something that reads as a path on this machine: a home or well-known root directory, a Windows
  * drive, or `~/`. A bare `/api/users` is not matched, so prompts may talk about URL paths.
@@ -509,6 +510,7 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
     nodeId: NodeId | undefined,
     scope: Set<NodeId>,
     itemNames: Set<string>,
+    runVars: string[] = RUN_VARS,
   ) => {
     for (const v of vars) {
       const [head, field] = v.split(".");
@@ -519,8 +521,11 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
           add(`${label} does not name a declared input`, nodeId);
         }
       } else if (head === "run") {
-        if (path.length !== 2 || !RUN_VARS.includes(field)) {
-          add(`${label} is not a run variable (use run.round, run.id or run.startedAt)`, nodeId);
+        if (path.length !== 2 || !runVars.includes(field)) {
+          add(
+            `${label} is not a run variable (use ${runVars.map((f) => `run.${f}`).join(", ")})`,
+            nodeId,
+          );
         }
       } else if (itemNames.has(head)) {
         // Any path under the loop variable is allowed; the items' shape is not declared.
@@ -672,7 +677,7 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
         if (!node.in.trim()) add("A For each node needs an input list", node.id);
         else checkText(node.in, node);
         const as = node.as ?? "item";
-        if (!NAME.test(as) || RESERVED_HEADS.includes(as) || g.byId.has(as)) {
+        if (!NAME.test(as) || RESERVED_NODE_IDS.includes(as) || g.byId.has(as)) {
           add(`Invalid loop variable name "${as}"`, node.id);
         }
         if (
@@ -699,7 +704,7 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
             const target = g.byId.get(head);
             if (target?.parent !== undefined) {
               add(
-                `The report cannot read "${v}": steps inside a For each are listed in {{results}}.`,
+                `The report cannot read "${v}": steps inside a For each are listed in {{results}} (or use {{${target.parent}.results}}).`,
                 node.id,
               );
             } else if (!target && head !== "inputs" && head !== "run" && loopNames.has(head)) {
@@ -711,7 +716,10 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
               readable.push(v);
             }
           }
-          checkVarList(readable, node.id, scopeOf(node.id), new Set());
+          checkVarList(readable, node.id, scopeOf(node.id), new Set(), [
+            ...RUN_VARS,
+            ...REPORT_RUN_VARS,
+          ]);
         }
         break;
       }

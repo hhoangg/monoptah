@@ -344,6 +344,57 @@ describe("validateWorkflow", () => {
     expect(flags(patchNode(w, "ask", { question: "{{lint.nope}}" }), "{{lint.nope}}")).toBe(true);
   });
 
+  it("accepts a report reading a top-level session upstream through an If", () => {
+    const session = (id: string, output: Record<string, { type: "string" }>): WorkflowNode => ({
+      id,
+      type: "session",
+      project: "{{inputs.project}}",
+      checkout: "root",
+      prompt: `Do ${id}`,
+      output,
+    });
+    const w: Workflow = {
+      id: "wf-weather1",
+      name: "Weather",
+      inputs: { project: { type: "project" } },
+      inputValues: { project: "/Users/x/repo" },
+      nodes: [
+        { id: "trigger", type: "manual" },
+        session("session", { weather: { type: "string" }, summary: { type: "string" } }),
+        { id: "gate", type: "if", condition: "{{session.weather}} == 'rain'" },
+        session("session_2", {}),
+        session("session_3", {}),
+        {
+          id: "report",
+          type: "report",
+          template: "Da Nang: {{session.weather}}. {{session.summary}} ({{run.status}})",
+        },
+      ],
+      edges: [
+        { from: "trigger", to: "session" },
+        { from: "session", to: "gate" },
+        { from: "gate", to: "session_2", handle: "true" },
+        { from: "gate", to: "session_3", handle: "false" },
+        { from: "session_2", to: "report" },
+        { from: "session_3", to: "report" },
+      ],
+      enabled: true,
+      createdAt: 1,
+    };
+    expect(validateWorkflow(w)).toEqual([]);
+  });
+
+  it("rejects reserved names as a For each loop variable", () => {
+    for (const as of ["results", "run", "inputs"]) {
+      expect(flags(patchNode(example(), "each", { as }), "Invalid loop variable name")).toBe(true);
+    }
+  });
+
+  it("keeps the extra run fields out of non-report templates", () => {
+    const w = patchNode(example(), "fetch", { prompt: "{{run.status}}" });
+    expect(flags(w, "{{run.status}}")).toBe(true);
+  });
+
   it("limits report templates to variables the report can read", () => {
     const withTemplate = (template: string) => {
       const w = example();
@@ -353,12 +404,12 @@ describe("validateWorkflow", () => {
     };
     // Readable: inputs, run, results (and its fields), top-level nodes with a declared field.
     const ok = withTemplate(
-      "{{inputs.project}} {{run.id}} {{run.round}} {{results}} {{results.0.status}} {{fetch.tickets}} {{each.results}}",
+      "{{inputs.project}} {{run.id}} {{run.round}} {{run.status}} {{run.statusLabel}} {{run.name}} {{run.endedAt}} {{results}} {{results.0.status}} {{fetch.tickets}} {{each.results}}",
     );
     expect(validateWorkflow(ok)).toEqual([]);
     // A step inside a For each is only reachable through results.
     expect(messages(withTemplate("{{dev.pr_url}}"))).toContain(
-      'The report cannot read "dev.pr_url": steps inside a For each are listed in {{results}}.',
+      'The report cannot read "dev.pr_url": steps inside a For each are listed in {{results}} (or use {{each.results}}).',
     );
     expect(flags(withTemplate("{{dev}}"), 'The report cannot read "dev"')).toBe(true);
     // The loop variable only exists inside the For each.
