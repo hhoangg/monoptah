@@ -8,6 +8,7 @@ import {
   ImagePlus,
   Pin,
   PinOff,
+  Send,
   Settings,
   Trash2,
 } from "../../shared/ui/icons";
@@ -56,6 +57,7 @@ import {
 } from "../../features/projects/model/projectGroups";
 import { useTabGroupLogos } from "../../features/projects/hooks/useTabGroupLogos";
 import { ProjectBackgroundDialog } from "../../features/projects/ui/ProjectBackgroundDialog";
+import { TelegramProjectDialog } from "../../features/telegram/ui/TelegramProjectDialog";
 import { RemoveProjectDialog } from "../../features/projects/ui/RemoveProjectDialog";
 import {
   TabGroupMenu,
@@ -116,6 +118,7 @@ function projectMenuExtraItems(
       label: "Background image",
       icon: ImagePlus,
     },
+    { id: "telegram-settings", label: "Telegram...", icon: Send },
     ...(railOptions
       ? [
           {
@@ -226,6 +229,10 @@ export function useProjectMenu({
     project: string;
     name: string;
   } | null>(null);
+  const [telegramProject, setTelegramProject] = useState<{
+    project: string;
+    name: string;
+  } | null>(null);
   const [menuError, setMenuError] = useState<string | null>(null);
   const [externalEditors, setExternalEditors] = useState<
     ExternalEditor[] | null
@@ -327,6 +334,7 @@ export function useProjectMenu({
     close();
     setRemoving(null);
     setBackgroundProject(null);
+    setTelegramProject(null);
   };
 
   const groupLabels = projectMenu ? loadTabGroupLabels() : {};
@@ -383,6 +391,11 @@ export function useProjectMenu({
       toggleProjectPin(path);
     } else if (action === "background") {
       setBackgroundProject({
+        project: key,
+        name: resolveTabGroupLabel(key, groupLabels, basename(path)),
+      });
+    } else if (action === "telegram-settings") {
+      setTelegramProject({
         project: key,
         name: resolveTabGroupLabel(key, groupLabels, basename(path)),
       });
@@ -594,6 +607,16 @@ export function useProjectMenu({
           }}
         />
       ) : null}
+      {telegramProject ? (
+        <TelegramProjectDialog
+          project={telegramProject.project}
+          name={telegramProject.name}
+          onClose={() => {
+            setTelegramProject(null);
+            restoreFocus();
+          }}
+        />
+      ) : null}
     </>
   );
 
@@ -610,7 +633,8 @@ export function useProjectMenu({
       groupMenu != null ||
       notificationMenu != null ||
       removing != null ||
-      backgroundProject != null,
+      backgroundProject != null ||
+      telegramProject != null,
     element,
   };
 }

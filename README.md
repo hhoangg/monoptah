@@ -46,6 +46,7 @@ MonoCode is still early. If something breaks, [report a bug](https://github.com/
 - [Linux installation](docs/install.md)
 - [Agent access with /operator](docs/agent-access.md)
 - [Remote sessions, experimental](docs/remote-access.md)
+- [Answer questions from Telegram](docs/telegram.md)
 
 ## Build from source
 
