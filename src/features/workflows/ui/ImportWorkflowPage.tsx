@@ -189,7 +189,9 @@ export function ImportWorkflowPage({
         setError(
           reason instanceof Error && reason.message === limit
             ? `${limit}.`
-            : "Could not save the workflow.",
+            : reason instanceof Error && reason.message
+              ? reason.message
+              : "Could not save the workflow.",
         );
       }
     })();

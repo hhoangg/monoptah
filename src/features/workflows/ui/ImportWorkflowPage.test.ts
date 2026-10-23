@@ -10,6 +10,10 @@ import { ImportWorkflowPage } from "./ImportWorkflowPage";
 import { SCHEDULE, workflow } from "./workflowUiFixtures";
 
 const files = new Map<string, string>();
+let writeFailure: Error | undefined;
+const TOO_LARGE = new Error(
+  "The workflows are too large to save (over 2 MiB in total). Remove a workflow or shorten its steps.",
+);
 const open = vi.hoisted(() => vi.fn(async (): Promise<string | null> => null));
 const readTextFile = vi.hoisted(() => vi.fn(async (_path: string) => ""));
 
@@ -25,6 +29,7 @@ vi.mock("../../monos/model/monoFiles", async (original) => ({
     hash: String(files.get(path)),
   }),
   writeAgentFile: async (_monoId: string, path: string, text: string) => {
+    if (writeFailure) throw writeFailure;
     files.set(path, text);
     return "h";
   },
@@ -35,6 +40,7 @@ let container: HTMLElement;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   files.clear();
+  writeFailure = undefined;
   open.mockReset();
   readTextFile.mockReset();
   container = document.createElement("div");
@@ -484,4 +490,17 @@ it("does not carry an input's value over to a file that declares it differently"
   expect(
     container.querySelector("button[aria-label^='area:']")!.getAttribute("aria-label"),
   ).toBe("area: Choose a project");
+});
+
+it("shows the real reason an import could not be saved", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const onImported = await renderPage();
+  await paste(yamlOf());
+  await chooseProject("project", "web");
+  await typeInto("area", "the parser");
+  writeFailure = TOO_LARGE;
+  await act(async () => importButton().click());
+  expect(onImported).not.toHaveBeenCalled();
+  expect(container.querySelector("[role=alert]")!.textContent).toBe(TOO_LARGE.message);
+  warn.mockRestore();
 });

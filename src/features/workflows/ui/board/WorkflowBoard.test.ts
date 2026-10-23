@@ -8,6 +8,10 @@ import { loopLabel } from "./LoopEdge";
 import { WorkflowBoard } from "./WorkflowBoard";
 
 const files = new Map<string, string>();
+let writeFailure: Error | undefined;
+const TOO_LARGE = new Error(
+  "The workflows are too large to save (over 2 MiB in total). Remove a workflow or shorten its steps.",
+);
 vi.mock("../../../monos/model/monoFiles", async (original) => ({
   ...(await original<object>()),
   readAgentFile: async (_monoId: string, path: string) => ({
@@ -15,6 +19,7 @@ vi.mock("../../../monos/model/monoFiles", async (original) => ({
     hash: String(files.get(path)?.length ?? 0),
   }),
   writeAgentFile: async (_monoId: string, path: string, text: string) => {
+    if (writeFailure) throw writeFailure;
     files.set(path, text);
     return "h";
   },
@@ -38,6 +43,7 @@ beforeEach(() => {
   vi.stubGlobal("ResizeObserver", FakeObserver);
   vi.stubGlobal("DOMMatrixReadOnly", FakeMatrix);
   files.clear();
+  writeFailure = undefined;
   container = document.createElement("div");
   container.style.width = "420px";
   container.style.height = "800px";
@@ -469,4 +475,20 @@ it("shows the review banner when the workflow is flagged elsewhere", async () =>
   files.set("workflows.json", JSON.stringify([ticketWorkflow({ enabled: true, needsReview: true })]));
   await filesChanged();
   expect(container.textContent).toContain("Review this workflow before enabling it");
+});
+
+it("shows the real reason a save failed", async () => {
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  await renderBoard(ticketWorkflow());
+  await act(async () => type(nameInput(), "Mine"));
+  writeFailure = TOO_LARGE;
+  await act(async () => button("Save").click());
+  expect(container.querySelector("[data-workflow-notice]")?.textContent).toBe(TOO_LARGE.message);
+  expect(stored()[0].name).toBe("ClickUp -> Dev -> Review");
+  // An error with no message falls back to the generic text.
+  writeFailure = new Error("");
+  await act(async () => button("Save").click());
+  expect(container.querySelector("[data-workflow-notice]")?.textContent).toBe(
+    "Could not save the workflow.",
+  );
 });

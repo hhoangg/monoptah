@@ -171,7 +171,7 @@ export function WorkflowPage({
       result: undefined,
     })).catch((error) => {
       console.warn("Could not save the input", error);
-      setNotice("Could not save the input.");
+      setNotice(error instanceof Error && error.message ? error.message : "Could not save the input.");
     });
   };
 

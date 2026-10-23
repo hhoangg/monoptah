@@ -613,11 +613,7 @@ function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () 
         return false;
       }
       console.warn("Could not save the workflow", error);
-      setNotice(
-        error instanceof Error && (/^At most/.test(error.message) || error.message === REVIEW_FIRST)
-          ? error.message
-          : "Could not save the workflow.",
-      );
+      setNotice(error instanceof Error && error.message ? error.message : "Could not save the workflow.");
       return false;
     } finally {
       setSaving(false);

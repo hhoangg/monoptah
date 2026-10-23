@@ -9,6 +9,10 @@ import { workflowActions } from "./MonoWorkflows";
 import { run, workflow } from "./workflowUiFixtures";
 
 const files = new Map<string, string>();
+let writeFailure: Error | undefined;
+const TOO_LARGE = new Error(
+  "The workflows are too large to save (over 2 MiB in total). Remove a workflow or shorten its steps.",
+);
 let runs: WorkflowRun[] = [];
 const save = vi.hoisted(() => vi.fn(async () => "/tmp/out.yaml"));
 const writeTextFile = vi.hoisted(() => vi.fn(async () => {}));
@@ -25,6 +29,7 @@ vi.mock("../../monos/model/monoFiles", async (original) => ({
       ? { text: JSON.stringify(runs), hash: "r" }
       : { text: files.get(path) ?? null, hash: String(files.get(path)) },
   writeAgentFile: async (_monoId: string, path: string, text: string) => {
+    if (writeFailure) throw writeFailure;
     files.set(path, text);
     return "h";
   },
@@ -35,6 +40,7 @@ let container: HTMLElement;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   files.clear();
+  writeFailure = undefined;
   runs = [];
   onReview.mockReset();
   save.mockClear();
@@ -143,6 +149,21 @@ it("edits an input value after checking its type", async () => {
   await act(async () => set("7"));
   expect(stored()[0].inputValues.limit).toBe(7);
   expect(notice()).toBeNull();
+});
+
+it("shows the real reason an input value could not be saved", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  await renderPage(workflow({ inputs: { limit: { type: "number" } }, inputValues: { limit: 3 } }));
+  const limit = container.querySelector<HTMLInputElement>("input[aria-label='limit']")!;
+  writeFailure = TOO_LARGE;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(limit, "7");
+    limit.dispatchEvent(new Event("input", { bubbles: true }));
+    limit.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+  });
+  expect(notice()?.textContent).toBe(TOO_LARGE.message);
+  expect(stored()[0].inputValues.limit).toBe(3);
+  warn.mockRestore();
 });
 
 it("Remove closes the page once the workflow is gone", async () => {
