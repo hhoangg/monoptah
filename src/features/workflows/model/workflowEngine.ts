@@ -11,6 +11,7 @@
 // - `nextActions` only reads. It lists what the runner must do for nodes that are ready. An action
 //   is repeated until the matching `nodeStarted` event is applied, and never after.
 import {
+  DEFAULT_MAX_PARALLEL,
   archivedBranch,
   archivedItemsKey,
   isArchivedBranch,
@@ -83,7 +84,6 @@ export type EngineEvent =
   | { kind: "reportPosted"; at: number }
   | { kind: "stopped"; at: number };
 
-const DEFAULT_MAX_PARALLEL = 3;
 export const MAX_ROUNDS_REASON = "max rounds reached";
 export const BRANCH_FAILED_REASON = "branch failed";
 

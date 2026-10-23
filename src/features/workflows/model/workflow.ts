@@ -140,6 +140,18 @@ export const WORKFLOWS_MAX = 20;
 /** The longest time limit a session or command node may have: 24 hours. */
 export const MAX_TIMEOUT_MINUTES = 1440;
 export const WORKFLOW_RUNS_KEPT = 20;
+/** The most iterations of a For each that run at once, and how many do when `maxParallel` is unset. */
+export const MAX_PARALLEL_LIMIT = 10;
+export const DEFAULT_MAX_PARALLEL = 3;
+/** The most passes a loop edge may allow (`maxRounds`). */
+export const MAX_ROUNDS_LIMIT = 10;
+/** How long a session or command node may run when `timeoutMinutes` is unset. */
+export const DEFAULT_SESSION_TIMEOUT_MINUTES = 120;
+export const DEFAULT_COMMAND_TIMEOUT_MINUTES = 10;
+/** Limits on a definition sent through the app CLI. */
+export const WORKFLOW_NAME_MAX = 80;
+export const WORKFLOW_DESCRIPTION_MAX = 1_000;
+export const WORKFLOW_DEFINITION_MAX_BYTES = 512 * 1024;
 
 export const NODE_ID = /^[a-z][a-z0-9_]{0,39}$/;
 export const NODE_TYPES: readonly NodeType[] = [

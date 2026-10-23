@@ -1,5 +1,7 @@
 import { habitSchedule, type HabitSchedule } from "../../monos/model/monoHabits";
 import {
+  MAX_PARALLEL_LIMIT,
+  MAX_ROUNDS_LIMIT,
   MAX_TIMEOUT_MINUTES,
   NODE_ID,
   NODE_TYPES,
@@ -682,9 +684,9 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
         }
         if (
           node.maxParallel !== undefined &&
-          !(Number.isInteger(node.maxParallel) && node.maxParallel >= 1 && node.maxParallel <= 10)
+          !(Number.isInteger(node.maxParallel) && node.maxParallel >= 1 && node.maxParallel <= MAX_PARALLEL_LIMIT)
         ) {
-          add("maxParallel must be a whole number from 1 to 10", node.id);
+          add(`maxParallel must be a whole number from 1 to ${MAX_PARALLEL_LIMIT}`, node.id);
         }
         break;
       }
@@ -759,8 +761,11 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
       add(`Loop edge ${e.from} -> ${e.to} must stay inside the same For each`, e.from);
     }
     const { maxRounds, decide } = e.loop;
-    if (!(Number.isInteger(maxRounds) && maxRounds >= 1 && maxRounds <= 10)) {
-      add(`Loop edge ${e.from} -> ${e.to}: maxRounds must be a whole number from 1 to 10`, e.from);
+    if (!(Number.isInteger(maxRounds) && maxRounds >= 1 && maxRounds <= MAX_ROUNDS_LIMIT)) {
+      add(
+        `Loop edge ${e.from} -> ${e.to}: maxRounds must be a whole number from 1 to ${MAX_ROUNDS_LIMIT}`,
+        e.from,
+      );
     }
     if (decide !== "mono") {
       if (!decide.trim()) {

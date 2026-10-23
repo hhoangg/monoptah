@@ -271,6 +271,24 @@ it("puts what the app adds ahead of the user's message, marked as its own", () =
   expect(turn.endsWith("</monocode_context>\n\nwhat is this")).toBe(true);
 });
 
+it("monoContext tells the Mono to read the guide", () => {
+  const look = {
+    name: "Skull",
+    mascot: "skull",
+    color: "#fff",
+    projects: [{ path: "/code/monocode", name: "monocode" }],
+  };
+  const full = monoContext(look, files(), { soul: true, memory: true });
+  const rules = full.slice(
+    full.indexOf("<workflows_rules>"),
+    full.indexOf("</workflows_rules>"),
+  );
+  expect(rules).toContain("app workflows.guide");
+  expect(rules).toContain("workflows.validate");
+  expect(rules).toContain("A workflow you add is always saved paused");
+  expect(rules).toContain("only then save it with `workflows.add`");
+});
+
 it("monoContext includes workflows_rules", () => {
   const look = {
     name: "Skull",

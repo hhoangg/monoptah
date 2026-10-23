@@ -8,11 +8,13 @@ import {
   HABIT_APPROVAL_WAIT_MS,
   isRelayed,
 } from "../../features/monos/model/monoHabits";
-import type {
-  NodeId,
-  SessionNode,
-  Workflow,
-  WorkflowRun,
+import {
+  DEFAULT_COMMAND_TIMEOUT_MINUTES,
+  DEFAULT_SESSION_TIMEOUT_MINUTES,
+  type NodeId,
+  type SessionNode,
+  type Workflow,
+  type WorkflowRun,
 } from "../../features/workflows/model/workflow";
 import {
   applyEvent,
@@ -124,8 +126,6 @@ export type MonoWorkflowHost = {
 const POLL_MS = 2_000;
 /** How often a run looks in the workflow file for a stop asked for in another window. */
 const STOP_CHECK_MS = 5_000;
-const SESSION_TIMEOUT_MINUTES = 120;
-const COMMAND_TIMEOUT_MINUTES = 10;
 /** How long the Mono has to answer a decision request. */
 export const ASK_TIMEOUT_MS = 10 * 60_000;
 /** Longest string kept in a node output, so a run record stays small. */
@@ -401,7 +401,7 @@ export async function executeRun(
         branch,
         `"${node.project}" is not one of the Mono's projects`,
       );
-    const timeoutMs = (node.timeoutMinutes ?? SESSION_TIMEOUT_MINUTES) * 60_000;
+    const timeoutMs = (node.timeoutMinutes ?? DEFAULT_SESSION_TIMEOUT_MINUTES) * 60_000;
 
     let sessionId: string;
     let turn: Promise<ControlOutcome>;
@@ -551,7 +551,7 @@ export async function executeRun(
           `No worktree is available from "${node.cwd.worktreeOf}"`,
         );
     }
-    const minutes = node.timeoutMinutes ?? COMMAND_TIMEOUT_MINUTES;
+    const minutes = node.timeoutMinutes ?? DEFAULT_COMMAND_TIMEOUT_MINUTES;
     const id = `${run.id}:${nonce}:${nodeId}:${branch}:${++commandSeq}`;
     runningCommands.add(id);
     let result: CommandResult;

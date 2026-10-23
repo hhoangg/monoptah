@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 import { describe, expect, it, vi } from "vitest";
 import { newSession } from "../../sessions/model/session";
-import type { Workflow, WorkflowRun } from "../../workflows/model/workflow";
+import { WORKFLOWS_MAX, type Workflow, type WorkflowRun } from "../../workflows/model/workflow";
+import { workflowGuide } from "../../workflows/model/workflowGuide";
 import { validateWorkflow } from "../../workflows/model/workflowParse";
 import { handleAgentApp, type AgentAppHost } from "./agentApp";
 
@@ -141,18 +142,27 @@ describe("workflows.add", () => {
     expect(validateWorkflow(saved)).toEqual([]);
   });
 
-  it("add ignores enabled true in the input", async () => {
+  it("add rejects enabled in a workflow object", async () => {
     const { call, stored } = fixture();
-    const attempt = call("workflows.add", { workflow: definition({ enabled: true }) });
-    // Either the field is refused or it is ignored; the stored workflow is paused in both cases.
-    await attempt.then(
-      (result) => expect((result as Added).enabled).toBe(false),
-      (error) => expect(String(error)).toMatch(/Unknown workflow fields: enabled/),
-    );
-    for (const saved of stored()) {
-      expect(saved.enabled).toBe(false);
-      expect(saved.nextRunAt).toBeUndefined();
-    }
+    await expect(
+      call("workflows.add", { workflow: definition({ enabled: true }) }),
+    ).rejects.toThrow(/Unknown workflow fields: enabled/);
+    expect(stored()).toEqual([]);
+  });
+
+  it("add with a yaml file that says enabled true still saves it paused", async () => {
+    const source = fixture();
+    const { id } = (await source.call("workflows.add", { workflow: definition() })) as Added;
+    const { yaml } = (await source.call("workflows.export", { id })) as { yaml: string };
+    const { call, stored } = fixture();
+    const result = (await call("workflows.add", {
+      yaml: `${yaml.trimEnd()}\nenabled: true\n`,
+      values: { project: "/code/app" },
+    })) as Added;
+    expect(result.enabled).toBe(false);
+    expect(stored()).toHaveLength(1);
+    expect(stored()[0].enabled).toBe(false);
+    expect(stored()[0].nextRunAt).toBeUndefined();
   });
 
   it("add with issues saves paused and returns issues", async () => {
@@ -164,6 +174,10 @@ describe("workflows.add", () => {
     const result = (await call("workflows.add", { workflow: broken })) as Added;
     expect(result.enabled).toBe(false);
     expect(result.issues.map((issue) => issue.message).join(" ")).toMatch(/Report/);
+    // With problems the next step is to fix them, not to enable the workflow.
+    const { note } = result as Added & { note: string };
+    expect(note).toMatch(/fix/i);
+    expect(note).not.toMatch(/enable/i);
     expect(stored()[0]).toMatchObject({ id: result.id, enabled: false });
     expect(stored()[0].nextRunAt).toBeUndefined();
   });
@@ -783,7 +797,7 @@ describe("a workflow the CLI created from yaml needs the user's review", () => {
 });
 
 describe("workflows.validate", () => {
-  const brokenModel = () =>
+  const brokenTemplate = () =>
     definition({
       nodes: definition().nodes.map((node) =>
         node.type === "session" ? { ...node, prompt: "Fix {{nope.field}}" } : node,
@@ -792,8 +806,8 @@ describe("workflows.validate", () => {
 
   it("reports the same issues as add", async () => {
     const { call } = fixture();
-    const added = (await call("workflows.add", { workflow: brokenModel() })) as Added;
-    const validated = (await call("workflows.validate", { workflow: brokenModel() })) as {
+    const added = (await call("workflows.add", { workflow: brokenTemplate() })) as Added;
+    const validated = (await call("workflows.validate", { workflow: brokenTemplate() })) as {
       issues: unknown[];
     };
     expect(added.issues.length).toBeGreaterThan(0);
@@ -820,7 +834,7 @@ describe("workflows.validate", () => {
   it("never writes, for valid and invalid input", async () => {
     const f = fixture();
     await f.call("workflows.validate", { workflow: definition() });
-    await f.call("workflows.validate", { workflow: brokenModel() });
+    await f.call("workflows.validate", { workflow: brokenTemplate() });
     await expect(
       f.call("workflows.validate", { workflow: definition({ name: "" }) }),
     ).rejects.toThrow();
@@ -870,5 +884,65 @@ describe("workflows.validate", () => {
     await expect(
       call("workflows.validate", { workflow: definition(), values: { project: "x" } }),
     ).rejects.toThrow(/values goes with yaml/);
+  });
+});
+
+describe("workflows.validate against the per-Mono limit", () => {
+  const seedFull = (f: ReturnType<typeof fixture>, count: number) =>
+    f.seed(
+      Array.from({ length: count }, (_, index) => ({
+        id: `wf-${String(index).padStart(8, "0")}`,
+        name: `Workflow ${index}`,
+        inputs: {},
+        inputValues: {},
+        nodes: [
+          { id: "trigger", type: "manual" },
+          { id: "report", type: "report" },
+        ],
+        edges: [{ from: "trigger", to: "report" }],
+        enabled: false,
+        createdAt: 1,
+      })) as Workflow[],
+    );
+
+  it("reports an issue when the Mono is at the limit, and still writes nothing", async () => {
+    const f = fixture();
+    seedFull(f, WORKFLOWS_MAX);
+    const result = (await f.call("workflows.validate", { workflow: definition() })) as {
+      issues: { message: string }[];
+    };
+    expect(result.issues.map((issue) => issue.message).join(" ")).toContain(
+      `at most ${WORKFLOWS_MAX} workflows`,
+    );
+    expect(f.stored()).toHaveLength(WORKFLOWS_MAX);
+    expect(f.updates).not.toHaveBeenCalled();
+    await expect(f.call("workflows.add", { workflow: definition() })).rejects.toThrow(
+      `at most ${WORKFLOWS_MAX} workflows`,
+    );
+  });
+
+  it("reports nothing extra below the limit", async () => {
+    const f = fixture();
+    seedFull(f, WORKFLOWS_MAX - 1);
+    const result = (await f.call("workflows.validate", { workflow: definition() })) as {
+      issues: unknown[];
+    };
+    expect(result.issues).toEqual([]);
+  });
+});
+
+describe("workflows.guide", () => {
+  it("workflows.guide returns the guide", async () => {
+    const { call } = fixture();
+    expect(await call("workflows.guide")).toEqual({ guide: workflowGuide() });
+  });
+
+  it("takes no input and only a Mono may read it", async () => {
+    await expect(fixture().call("workflows.guide", { id: "x" })).rejects.toThrow(
+      /Unknown workflows.guide fields: id/,
+    );
+    await expect(fixture("session").call("workflows.guide")).rejects.toThrow(
+      /Only a Mono's own conversation/,
+    );
   });
 });

@@ -7,6 +7,9 @@ import {
 } from "../../monos/model/monoHabits";
 import {
   WORKFLOWS_MAX,
+  WORKFLOW_DEFINITION_MAX_BYTES,
+  WORKFLOW_DESCRIPTION_MAX,
+  WORKFLOW_NAME_MAX,
   newWorkflowId,
   triggerOf,
   type Workflow,
@@ -21,6 +24,7 @@ import {
   parseNode,
   type WorkflowIssue,
 } from "../../workflows/model/workflowParse";
+import { workflowGuide } from "../../workflows/model/workflowGuide";
 import { workflowIssues } from "../../workflows/model/workflowModels";
 import {
   anchorNode,
@@ -42,9 +46,9 @@ const DEFINITION_FIELDS = [
   "nodes",
   "edges",
 ] as const;
-const NAME_MAX = 80;
-const DESCRIPTION_MAX = 1_000;
-const DEFINITION_MAX_BYTES = 512 * 1024;
+const NAME_MAX = WORKFLOW_NAME_MAX;
+const DESCRIPTION_MAX = WORKFLOW_DESCRIPTION_MAX;
+const DEFINITION_MAX_BYTES = WORKFLOW_DEFINITION_MAX_BYTES;
 const NOT_ENABLED = "Resume the workflow before running it.";
 const NEEDS_REVIEW =
   "This workflow came from a file and the user has not reviewed it yet. Ask the user to review it and enable it in the Workflows panel.";
@@ -57,6 +61,7 @@ export const WORKFLOW_FIELDS: ReadonlyMap<string, readonly string[]> = new Map([
   ["workflows.get", ["id", "project"]],
   ["workflows.add", ["workflow", "yaml", "values", "project"]],
   ["workflows.validate", ["workflow", "yaml", "values", "project"]],
+  ["workflows.guide", ["project"]],
   ["workflows.update", ["id", "workflow", "project"]],
   ["workflows.setInputs", ["id", "values", "project"]],
   ["workflows.run", ["id", "project"]],
@@ -240,6 +245,15 @@ function problems(w: Workflow): WorkflowIssue[] {
   ];
 }
 
+/** What `workflows.add` tells the Mono to do next. With problems the workflow cannot run, so fixing comes first. */
+function addNote(issues: readonly WorkflowIssue[], fromFile: boolean): string {
+  if (issues.length)
+    return `Saved paused, but it has problems and cannot run yet. Fix the issues first: change the definition, check it with workflows.validate, and save it with workflows.update.${fromFile ? " Check the commands and prompts with the user too." : ""}`;
+  return fromFile
+    ? "Saved paused. Check the commands and prompts with the user; only the user can enable it, in the Workflows panel."
+    : "Saved paused. Tell the user to open it in the Workflows panel and enable it there.";
+}
+
 /** The values of the inputs that are declared; the rest belong to inputs that are gone. */
 function declaredValues(inputs: Record<string, WorkflowInput>, values: Values): Values {
   const kept: Values = {};
@@ -378,9 +392,7 @@ export async function handleWorkflows(
             id: draft.id,
             enabled: false,
             issues,
-            note: review
-              ? "Saved paused. Check the commands and prompts with the user; only the user can enable it, in the Workflows panel."
-              : "Saved paused. Tell the user to open it in the Workflows panel and enable it there.",
+            note: addNote(issues, review !== undefined),
             ...(review ? { commands: review.commands, prompts: review.prompts } : {}),
           },
         };
@@ -389,7 +401,16 @@ export async function handleWorkflows(
     case "workflows.validate": {
       // The same parse and checks as workflows.add, without saving anything.
       const { draft } = newWorkflowFrom(input, now);
-      return { issues: problems(draft), ...reviewTexts(draft.nodes) };
+      // Read only: add would be refused at the limit, so say so here instead of at save time.
+      const issues = problems(draft);
+      if ((await workflows.load(monoId)).length >= WORKFLOWS_MAX)
+        issues.push({
+          message: `A Mono can have at most ${WORKFLOWS_MAX} workflows; remove one before adding another`,
+        });
+      return { issues, ...reviewTexts(draft.nodes) };
+    }
+    case "workflows.guide": {
+      return { guide: workflowGuide() };
     }
     case "workflows.update": {
       const parsed = definitionFrom(input.workflow, now, [
