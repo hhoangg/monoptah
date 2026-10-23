@@ -36,6 +36,12 @@ only for sessions of a project that has a bot and a connected group, and not for
 or Mono sessions or open terminal (TUI) sessions. A terminal session that is closed and
 only saved may still show it, but its questions are never forwarded.
 
+## Keep the group private
+
+Anyone in the connected group can answer the agent. A tap on an option, or a text
+reply to a question, becomes the agent's answer, and the bot does not check who sent
+it. Only add people you trust to the group.
+
 ## How it behaves
 
 - A question is forwarded only after it has waited **5 minutes** without an answer.

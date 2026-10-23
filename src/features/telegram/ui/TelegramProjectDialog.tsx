@@ -25,6 +25,8 @@ type Props = {
 
 const POLL_MS = 3000;
 const WEBHOOK_PROBLEM = "This bot has a webhook";
+const OPEN_GROUP_NOTE =
+  "Any member of the group can answer the agent, and a text reply becomes its answer. Keep the group private.";
 const ADMIN_NOTE =
   "Make the bot an admin with Manage topics so it can create a topic per session.";
 
@@ -278,6 +280,9 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
               <>
                 <p className="text-[13px] font-medium text-content">
                   {`Connected to ${status.chatTitle?.trim() || "this group"}`}
+                </p>
+                <p className="rounded-lg bg-amber-400/10 px-2.5 py-2 text-[11px] leading-4 text-amber-700 dark:text-amber-300">
+                  {OPEN_GROUP_NOTE}
                 </p>
                 <Row label="Forward questions">
                   <Toggle

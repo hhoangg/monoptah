@@ -276,6 +276,22 @@ describe("telegram project dialog", () => {
     expect(dialog().textContent).toContain("Connected to this group");
   });
 
+  it("warns that any group member can answer once a group is connected", async () => {
+    status = CONNECTED;
+    await renderDialog();
+
+    expect(dialog().textContent).toContain(
+      "Any member of the group can answer the agent, and a text reply becomes its answer. Keep the group private.",
+    );
+  });
+
+  it("shows no group warning before a group is connected", async () => {
+    status = CONFIGURED;
+    await renderDialog();
+
+    expect(dialog().textContent).not.toContain("Keep the group private");
+  });
+
   it("shows admin note when bot cannot manage topics", async () => {
     status = { ...CONNECTED, canManageTopics: false };
     await renderDialog();
