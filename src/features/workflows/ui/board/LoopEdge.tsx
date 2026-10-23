@@ -39,13 +39,14 @@ export function LoopEdge({
     targetY,
     sourcePosition,
     targetPosition,
-    offset: 26,
+    // A compact lane has little room beside it: a tighter arc and no label.
+    offset: data?.compact ? 14 : 26,
     borderRadius: 12,
   });
   return (
     <>
       <BaseEdge id={id} path={path} markerEnd={markerEnd} className="loop-edge-path" interactionWidth={16} />
-      {data?.loop ? (
+      {data?.loop && !data.compact ? (
         <EdgeLabelRenderer>
           <span
             data-loop-label

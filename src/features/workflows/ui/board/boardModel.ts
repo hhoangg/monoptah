@@ -47,9 +47,13 @@ export type BoardNodeData = {
   empty?: boolean;
   /** Set only when the node is drawn in a run graph: what the run did with it. */
   run?: RunNodeState;
+  /** Run graph: a narrow card (no icon tile) for lanes side by side. */
+  compact?: boolean;
+  /** Run graph, For each: how many items its selected round has. */
+  runItems?: number;
 };
 export type FlowNode = Node<BoardNodeData, "board" | "group">;
-export type FlowEdge = Edge<{ loop?: LoopSpec }>;
+export type FlowEdge = Edge<{ loop?: LoopSpec; compact?: boolean }>;
 
 type Point = { x: number; y: number };
 

@@ -101,13 +101,21 @@ export function BoardNode({ id, data, selected }: NodeProps<FlowNode>) {
   // In a run graph the handles only anchor the lines; nothing can be drawn from them.
   const connectable = !run;
   const handle = run ? "board-handle board-handle-run" : "board-handle";
+  // Lanes side by side: no icon tile and no dot (the border and the lane title carry the state), and a short round badge.
+  const compact = !!run && !!data.compact;
+  const dot = run ? (
+    <span aria-hidden data-run-dot className={`size-2 shrink-0 rounded-full ${RUN_DOT[run.status]}`} />
+  ) : null;
   return (
     <div
       data-board-node={id}
       data-type={node.type}
       data-run-status={run?.status}
+      data-compact={compact || undefined}
       data-selected={selected || undefined}
-      className="board-node flex flex-col rounded-lg border border-content/10 bg-content/5 px-2 py-2"
+      className={`board-node flex flex-col rounded-lg border border-content/10 bg-content/5 ${
+        compact ? "px-2 py-1.5" : "px-2 py-2"
+      }`}
     >
       {node.type === "schedule" || node.type === "manual" ? null : (
         <Handle type="target" position={Position.Top} className={handle} isConnectable={connectable} />
@@ -124,12 +132,14 @@ export function BoardNode({ id, data, selected }: NodeProps<FlowNode>) {
         />
       )}
       <span className="flex items-center gap-2.5">
-        <span
-          aria-hidden
-          className="grid size-7 shrink-0 place-items-center rounded-md bg-content/6 text-content/60"
-        >
-          <Icon className="size-3.5" strokeWidth={1.75} />
-        </span>
+        {compact ? null : (
+          <span
+            aria-hidden
+            className="grid size-7 shrink-0 place-items-center rounded-md bg-content/6 text-content/60"
+          >
+            <Icon className="size-3.5" strokeWidth={1.75} />
+          </span>
+        )}
         <span className="flex min-w-0 flex-1 flex-col">
           <span className="flex min-w-0 items-center gap-1.5">
             <span className="truncate text-[12px] leading-5 text-content/85">{nodeTitle(node)}</span>
@@ -138,7 +148,7 @@ export function BoardNode({ id, data, selected }: NodeProps<FlowNode>) {
                 data-run-round
                 className="shrink-0 rounded-full bg-[color-mix(in_srgb,var(--mono-color)_14%,transparent)] px-1.5 text-[10px] leading-4 text-[color-mix(in_srgb,var(--mono-color)_80%,var(--color-content))]"
               >
-                round {run.round}
+                {compact ? `r${run.round}` : `round ${run.round}`}
               </span>
             ) : null}
           </span>
@@ -160,7 +170,7 @@ export function BoardNode({ id, data, selected }: NodeProps<FlowNode>) {
           )}
         </span>
         {run ? (
-          <span aria-hidden data-run-dot className={`size-2 shrink-0 rounded-full ${RUN_DOT[run.status]}`} />
+          compact ? null : dot
         ) : issues.length ? (
           <span
             aria-hidden
@@ -222,6 +232,7 @@ export function GroupNode({ id, data, selected }: NodeProps<FlowNode>) {
         <span className="shrink-0">For each</span>
         <span className="min-w-0 truncate normal-case tracking-normal text-content/55">
           {node.title?.trim() || (node.type === "forEach" ? node.in : "")}
+          {run && data.runItems !== undefined ? ` · ${data.runItems}` : ""}
         </span>
         {run ? (
           <>

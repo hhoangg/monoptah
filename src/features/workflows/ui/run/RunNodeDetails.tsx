@@ -241,7 +241,7 @@ export function RunNodeDetails({
                   <h4 className="px-2 pb-1 text-[11px] font-medium uppercase tracking-wide text-content/40">Output</h4>
                   <dl className="px-2">
                     {fields.map(([name, value]) => (
-                      <OutputValue key={name} name={name} value={value} />
+                      <OutputValue key={`${nodeRunKey}:${name}`} name={name} value={value} />
                     ))}
                   </dl>
                 </div>

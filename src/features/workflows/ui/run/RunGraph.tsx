@@ -7,6 +7,7 @@ import {
   ReactFlow,
   ReactFlowProvider,
   type Node,
+  type NodeChange,
   type NodeProps,
 } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -111,18 +112,26 @@ function Tabs({
   onPick: (key: number) => void;
   attribute: string;
 }) {
+  const strip = useRef<HTMLDivElement>(null);
   const current = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    current.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    // Scroll the strip itself: scrollIntoView would also move the canvas around it.
+    const box = strip.current;
+    const tab = current.current;
+    if (!box || !tab) return;
+    if (tab.offsetLeft < box.scrollLeft) box.scrollLeft = Math.max(0, tab.offsetLeft - TAB_MARGIN);
+    else if (tab.offsetLeft + tab.offsetWidth > box.scrollLeft + box.clientWidth)
+      box.scrollLeft = tab.offsetLeft + tab.offsetWidth - box.clientWidth + TAB_MARGIN;
   }, [selected]);
   return (
     <div
+      ref={strip}
       role="tablist"
       aria-label={label}
       {...{ [attribute]: "" }}
       // The strip scrolls sideways under the finger or wheel instead of panning the canvas.
       className="run-bar run-tabs nodrag nopan nowheel"
-      style={{ overflowX: "auto" }}
+      style={{ overflowX: "auto", position: "relative" }}
     >
       {items.map((item) => (
         <button
@@ -183,10 +192,12 @@ const nodeTypes = { ...boardNodeTypes, runBar: RunBar };
 
 const ARROW = { type: MarkerType.ArrowClosed, width: 12, height: 12 } as const;
 const EDGE_COLOR: Record<RunEdgeState, string> = {
-  taken: "var(--wf-done, #34d399)",
+  // The same colours as the lines, so an arrowhead is as strong as the line into it.
+  taken: "color-mix(in srgb, var(--wf-done) 75%, transparent)",
   active: "var(--mono-color)",
-  idle: "color-mix(in srgb, var(--color-content) 30%, transparent)",
+  idle: "color-mix(in srgb, var(--color-content) 20%, transparent)",
 };
+const TAB_MARGIN = 4;
 const BAR_H = LANE_HEADER - 4;
 const ROUNDS_H = 22;
 
@@ -207,7 +218,8 @@ function barsOf(
     const width = group.width ?? NODE_W;
     const kids = nodes.filter((n) => n.parentId === group.id);
     if (gv.rounds.length > 1) {
-      const w = Math.min(width, gv.rounds.length * 64 + 8);
+      // Right of the column the edge into the group runs down, so that edge stays visible.
+      const w = Math.min(width - (GROUP_PAD + NODE_W / 2 + 12), gv.rounds.length * 64 + 8);
       bars.push({
         id: `bar-rounds:${group.id}`,
         type: "runBar",
@@ -296,6 +308,9 @@ export function RunGraph({
   onSelect: (key: string) => void;
 }) {
   const [pick, setPick] = useState<Pick>({});
+  // React Flow measures every card itself. The nodes are rebuilt from the run on every refresh, so
+  // what it measured is kept here and handed back, or each card would blink while it is measured again.
+  const measured = useRef(new Map<string, { width: number; height: number }>());
   // One clock for the whole drawing, so "Running 3m" and the groups agree.
   const now = useMemo(() => Date.now(), [run]);
   const groups = useMemo(() => groupViews(run, pick, now), [run, pick, now]);
@@ -317,10 +332,25 @@ export function RunGraph({
             : undefined,
         draggable: false,
         connectable: false,
+        measured: measured.current.get(n.id),
       })),
-      ...barsOf(graph.nodes, groups, view, choose),
+      ...barsOf(graph.nodes, groups, view, choose).map((n) => ({ ...n, measured: measured.current.get(n.id) })),
     ],
     [graph.nodes, groups, view, choose, selectedKey],
+  );
+  const byId = useMemo(() => new Map(graph.nodes.map((n) => [n.id, n.data.run?.nodeRunKey])), [graph.nodes]);
+  const onNodesChange = useCallback(
+    (changes: NodeChange<RunFlowNode>[]) => {
+      for (const change of changes) {
+        if (change.type === "dimensions" && change.dimensions) measured.current.set(change.id, change.dimensions);
+        // Picking with the keyboard (Enter or Space on a focused card) arrives as a selection.
+        else if (change.type === "select" && change.selected) {
+          const key = byId.get(change.id);
+          if (key) onSelect(key);
+        }
+      }
+    },
+    [byId, onSelect],
   );
   const edges = useMemo<FlowEdge[]>(
     () =>
@@ -342,6 +372,7 @@ export function RunGraph({
           edges={edges}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
+          onNodesChange={onNodesChange}
           onNodeClick={(_, node) => {
             if (node.type !== "runBar" && node.data && "run" in node.data && node.data.run) {
               onSelect(node.data.run.nodeRunKey);
@@ -352,8 +383,7 @@ export function RunGraph({
           elementsSelectable
           deleteKeyCode={null}
           fitView
-          // Side-by-side lanes can be far wider than the panel: stay readable and let the user pan.
-          fitViewOptions={{ padding: 0.12, maxZoom: 1, minZoom: view === "lanes" ? 0.5 : 0.3 }}
+          fitViewOptions={{ padding: 0.12, maxZoom: 1 }}
           minZoom={0.3}
           maxZoom={1.5}
           panOnScroll

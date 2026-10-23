@@ -1,10 +1,12 @@
 import { expect, it } from "vitest";
 import type { NodeRun, Workflow, WorkflowNode, WorkflowRun } from "../../model/workflow";
-import { NODE_H, NODE_W } from "../board/boardModel";
+import { NODE_H, NODE_W, toFlow } from "../board/boardModel";
 import { MANUAL, REPORT, run, workflow } from "../workflowUiFixtures";
 import {
   defaultRunView,
   groupViews,
+  LANE_CARD_W,
+  LANE_GAP,
   LANE_HEADER,
   nodeRunsByKey,
   runGraph,
@@ -232,7 +234,28 @@ it("lanes view fans a For each into one lane per item", () => {
   expect((group?.width ?? 0) > (lone?.width ?? 0)).toBe(true);
   // Lanes sit side by side without overlapping.
   const xs = [0, 1, 2, 3].map((i) => nodes.find((n) => n.id === `dev@each#${i}`)?.position.x ?? 0);
-  for (let i = 1; i < xs.length; i++) expect(xs[i] - xs[i - 1]).toBeGreaterThanOrEqual(NODE_W);
+  for (let i = 1; i < xs.length; i++) expect(xs[i] - xs[i - 1]).toBeGreaterThanOrEqual(LANE_CARD_W + LANE_GAP);
+});
+
+it("lanes view is compact: four lanes of two nodes fit a narrow panel", () => {
+  const r = eachRun(["done", "running", "failed", "pending"]);
+  const { nodes, edges } = runGraph(r, "lanes", groupViews(r));
+  const group = nodes.find((n) => n.id === "each");
+  expect(group?.width ?? Infinity).toBeLessThanOrEqual(500);
+  const kids = children(nodes);
+  expect(kids.every((n) => n.width === LANE_CARD_W && n.data.compact === true)).toBe(true);
+  // Every card stays inside the group box.
+  for (const k of kids) expect(k.position.x + (k.width ?? 0)).toBeLessThanOrEqual(group?.width ?? 0);
+  expect(edges.filter((e) => e.source.startsWith("dev@")).every((e) => e.data?.compact === true)).toBe(true);
+  // One lane or the single view keeps the board's cards.
+  const single = runGraph(r, "single", groupViews(r));
+  expect(children(single.nodes).every((n) => n.width === NODE_W && !n.data.compact)).toBe(true);
+  expect(single.edges.every((e) => !e.data?.compact)).toBe(true);
+});
+
+it("a For each says how many items it has", () => {
+  const r = eachRun(["done", "pending", "pending"]);
+  expect(runGraph(r, "single", groupViews(r)).nodes.find((n) => n.id === "each")?.data.runItems).toBe(3);
 });
 
 it("single view shows only the selected item", () => {
@@ -500,7 +523,9 @@ it("moves each node below or beside a widened group exactly once", () => {
   );
   const r = eachRun(["done", "done", "done"], { definition: w });
   const { nodes } = runGraph(r, "lanes", groupViews(r));
-  const dx = 2 * (NODE_W + 52);
+  const base = toFlow(w).nodes.find((n) => n.id === "each")?.width ?? 0;
+  const dx = Math.max(0, 2 * 16 + 3 * LANE_CARD_W + 2 * LANE_GAP + 12 - base);
+  expect(dx).toBeGreaterThan(0);
   const dy = LANE_HEADER;
   for (const i of [0, 1, 2, 5]) {
     const down = nodes.find((n) => n.id === `down${i}`);

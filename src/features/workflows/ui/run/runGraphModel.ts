@@ -60,9 +60,14 @@ export type GroupView = {
 
 /** Space above the lanes of a group, for lane titles or item tabs. */
 export const LANE_HEADER = 28;
-/** Space between two lanes; wide enough for the loop edge that runs down a lane's right. */
-export const LANE_GAP = 52;
+/** Width of a card in the lanes view: four lanes of two nodes fit the panel on the first frame. */
+export const LANE_CARD_W = 92;
+/** Space between two lanes; wide enough for the loop arc that runs down a lane's right. */
+export const LANE_GAP = 26;
+/** Room right of the last lane for that arc. */
+const LANE_EDGE = 12;
 
+const LANE_SCALE = LANE_CARD_W / NODE_W;
 const LANES_MAX_ITEMS = 4;
 const LANES_MAX_CHILDREN = 3;
 const LABEL_MAX = 60;
@@ -366,7 +371,7 @@ export function runGraph(
   groups: GroupView[],
   /** The clock for "Running 3m"; a parameter so tests need no fake timers. */
   now: number = Date.now(),
-): { nodes: FlowNode[]; edges: (FlowEdge & { data: { loop?: LoopSpec; run: RunEdgeState } })[] } {
+): { nodes: FlowNode[]; edges: (FlowEdge & { data: { loop?: LoopSpec; compact?: boolean; run: RunEdgeState } })[] } {
   const base = toFlow(run.definition);
   const byKey = nodeRunsByKey(run);
   const groupView = new Map(groups.map((g) => [g.groupId, g]));
@@ -390,7 +395,11 @@ export function runGraph(
       const kids = base.nodes.filter((n) => n.parentId === flow.id);
       const picked = gv ? (view === "lanes" ? gv.items : gv.items.filter((i) => i.index === gv.item)) : [];
       const picks = kids.length === 0 ? [] : picked;
-      const laneW = laneWidthOf(kids);
+      // Side by side, a lane is a narrow column of compact cards; alone it keeps the board's width.
+      const compact = view === "lanes";
+      const laneW = compact
+        ? Math.max(LANE_CARD_W, ...kids.map((k) => (k.position.x - GROUP_PAD) * LANE_SCALE + LANE_CARD_W))
+        : laneWidthOf(kids);
       lanes.set(
         flow.id,
         picks.map((item, k) => ({
@@ -398,12 +407,19 @@ export function runGraph(
           x: GROUP_PAD + k * (laneW + LANE_GAP),
         })),
       );
-      if (picks.length > 0) growth.set(flow.id, { dx: (picks.length - 1) * (laneW + LANE_GAP), dy: LANE_HEADER });
+      if (picks.length > 0) {
+        const wide = GROUP_PAD * 2 + picks.length * laneW + (picks.length - 1) * LANE_GAP + LANE_EDGE;
+        growth.set(flow.id, {
+          dx: compact ? Math.max(0, wide - box.w) : (picks.length - 1) * (laneW + LANE_GAP),
+          dy: LANE_HEADER,
+        });
+      }
       nodes.push({
         ...flow,
         data: {
           ...flow.data,
           run: { ...stateOf(byKey, flow.id, "", now), label: gv?.summary ?? stateOf(byKey, flow.id, "", now).label },
+          runItems: gv?.items.length,
           loopIn: loopTo.has(flow.id),
           loopOut: loopFrom.has(flow.id),
         },
@@ -442,13 +458,19 @@ export function runGraph(
   // The nodes inside the lanes.
   for (const flow of base.nodes) {
     if (!flow.parentId) continue;
+    const compact = view === "lanes";
     for (const lane of lanes.get(flow.parentId) ?? []) {
       nodes.push({
         ...flow,
         id: `${flow.id}@${lane.branch}`,
-        position: { x: lane.x + (flow.position.x - GROUP_PAD), y: flow.position.y + LANE_HEADER },
+        position: {
+          x: lane.x + (flow.position.x - GROUP_PAD) * (compact ? LANE_SCALE : 1),
+          y: flow.position.y + LANE_HEADER,
+        },
+        ...(compact ? { width: LANE_CARD_W } : {}),
         data: {
           ...flow.data,
+          compact,
           run: stateOf(byKey, flow.id, lane.branch, now),
           loopIn: loopTo.has(flow.id),
           loopOut: loopFrom.has(flow.id),
@@ -472,7 +494,7 @@ export function runGraph(
           id: `${flow.id}@${lane.branch}`,
           source: `${def.from}@${lane.branch}`,
           target: `${def.to}@${lane.branch}`,
-          data: { loop: def.loop, run: edgeState(def, lane.branch, byKey) },
+          data: { loop: def.loop, run: edgeState(def, lane.branch, byKey), compact: view === "lanes" },
         });
       }
     }

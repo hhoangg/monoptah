@@ -27,15 +27,22 @@ class FakeMatrix {
   constructor(_transform?: string) {}
 }
 
-const scrollIntoView = vi.fn();
+/** Reports a size for every card it is asked to watch, a moment later as a browser does (after layout). */
+class MeasuringObserver {
+  constructor(private callback: (entries: { target: Element }[]) => void) {}
+  observe(target: Element) {
+    if (target.getAttribute("data-id")) setTimeout(() => this.callback([{ target }]), 20);
+  }
+  unobserve() {}
+  disconnect() {}
+}
+
 let root: Root;
 let container: HTMLElement;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("ResizeObserver", FakeObserver);
   vi.stubGlobal("DOMMatrixReadOnly", FakeMatrix);
-  Element.prototype.scrollIntoView = scrollIntoView;
-  scrollIntoView.mockClear();
   localStorage.clear();
   stored = [];
   container = document.createElement("div");
@@ -45,6 +52,7 @@ beforeEach(() => {
   root = createRoot(container);
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   act(() => root.unmount());
   container.remove();
   vi.unstubAllGlobals();
@@ -171,6 +179,12 @@ it("no switch without a For each", async () => {
 });
 
 it("tabs scroll horizontally", async () => {
+  // happy-dom has no layout: tabs are 80 wide side by side in a 200 wide strip.
+  vi.spyOn(HTMLElement.prototype, "offsetLeft", "get").mockImplementation(function (this: HTMLElement) {
+    return this.hasAttribute("data-run-tab") ? [...this.parentElement!.children].indexOf(this) * 80 : 0;
+  });
+  vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(80);
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(200);
   stored = [eachRun(30)];
   await renderPage(eachDefinition);
   // Many items default to the single lane view.
@@ -179,17 +193,54 @@ it("tabs scroll horizontally", async () => {
   expect(tabs).not.toBeNull();
   expect(getComputedStyle(tabs).overflowX).toBe("auto");
   expect(tabs.querySelectorAll("[data-run-tab]")).toHaveLength(30);
-  expect(scrollIntoView).toHaveBeenCalled();
   expect(tabs.querySelector("[data-run-tab][aria-selected='true']")?.textContent).toContain("Ticket 1");
-  // Picking another item moves the selected tab and shows its lane.
-  scrollIntoView.mockClear();
+  expect(tabs.scrollLeft).toBe(0);
+  // Picking a tab far to the right scrolls the strip itself until it shows.
   await act(async () => tabs.querySelectorAll<HTMLElement>("[data-run-tab]")[7].click());
   expect(tabs.querySelector("[data-run-tab][aria-selected='true']")?.textContent).toContain("Ticket 8");
   expect(laneCards().map((c) => c.getAttribute("data-board-node"))).toEqual([
     "dev@each#7",
     "review@each#7",
   ]);
-  expect(scrollIntoView).toHaveBeenCalled();
+  // Its right edge (8 * 80) sits at the strip's right edge, plus a small margin.
+  expect(tabs.scrollLeft).toBe(8 * 80 - 200 + 4);
+});
+
+it("lanes draw compact cards and the group counts its items", async () => {
+  stored = [eachRun(4)];
+  await renderPage(eachDefinition);
+  expect(laneCards().every((c) => c.getAttribute("data-compact") === "true")).toBe(true);
+  expect(container.querySelector("[data-board-node='each']")?.textContent).toContain("Tickets · 4");
+  await act(async () => viewSwitch()!.click());
+  expect(laneCards().every((c) => c.getAttribute("data-compact") === null)).toBe(true);
+});
+
+it("cards stay visible when the run refreshes", async () => {
+  vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(100);
+  vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(40);
+  vi.stubGlobal("ResizeObserver", MeasuringObserver);
+  const first = run({
+    definition: linear,
+    status: "running",
+    nodes: [nr("trigger"), nr("dev", { status: "running" }), nr("report", { status: "pending" })],
+  });
+  stored = [first];
+  await renderPage(linear);
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 60));
+  });
+  const hidden = () =>
+    [...container.querySelectorAll<HTMLElement>(".react-flow__node")].filter(
+      (n) => n.style.visibility === "hidden",
+    );
+  expect(container.querySelectorAll(".react-flow__node")).toHaveLength(3);
+  expect(hidden()).toHaveLength(0);
+  // The page polls: a new run object with the same shape must not send the cards back to be measured.
+  stored = [structuredClone(first)];
+  await act(async () => {
+    window.dispatchEvent(new Event("focus"));
+  });
+  expect(hidden()).toHaveLength(0);
 });
 
 it("clicking a node shows its details and round history", async () => {
@@ -228,6 +279,25 @@ it("clicking a node shows its details and round history", async () => {
   const open = [...record.querySelectorAll("button")].find((b) => b.textContent === "Open session")!;
   await act(async () => open.click());
   expect(onOpenSession).toHaveBeenCalledWith("s-dev-1");
+});
+
+it("picking a card with the keyboard shows its details", async () => {
+  stored = [
+    run({
+      definition: linear,
+      status: "running",
+      nodes: [nr("trigger"), nr("dev", { status: "running" }), nr("report", { status: "pending" })],
+    }),
+  ];
+  await renderPage(linear);
+  const details = () => container.querySelector("[data-run-details]")?.textContent ?? "";
+  expect(details()).toContain("Dev");
+  const wrapper = container.querySelector<HTMLElement>('.react-flow__node[data-id="report"]')!;
+  await act(async () => {
+    wrapper.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  });
+  expect(details()).toContain("Report to Mono");
+  expect(details()).toContain("Not started");
 });
 
 it("details start on the running node and truncate long output with Show more", async () => {

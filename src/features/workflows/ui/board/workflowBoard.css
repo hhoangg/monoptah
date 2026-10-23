@@ -9,9 +9,9 @@
   --wf-line-strong: color-mix(in srgb, var(--color-content) 55%, transparent);
   --wf-accent: var(--mono-color, var(--color-accent));
   /* The status colours of a run graph are the app's own: emerald, amber and red. */
-  --wf-done: var(--color-emerald-400, #34d399);
-  --wf-wait: var(--color-amber-400, #fbbf24);
-  --wf-fail: var(--color-red-500, #ef4444);
+  --wf-done: var(--color-emerald-400);
+  --wf-wait: var(--color-amber-400);
+  --wf-fail: var(--color-red-500);
 }
 
 .workflow-board .react-flow {

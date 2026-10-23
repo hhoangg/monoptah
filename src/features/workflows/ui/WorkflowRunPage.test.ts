@@ -140,9 +140,9 @@ it("run page shows one card per item node, titled by item, with round 2", async 
   expect(card("each")?.textContent).toContain("Tickets");
   expect(card("each")?.textContent).toContain("1 done");
   // The loop round shows only past the first one, with the decision's reason.
-  expect(card("dev@each#0")?.textContent).toContain("round 2");
+  expect(card("dev@each#0")?.textContent).toContain("r2");
   expect(card("dev@each#0")?.textContent).toContain("tests still failing");
-  expect(card("dev@each#1")?.textContent).not.toContain("round");
+  expect(card("dev@each#1")?.querySelector("[data-run-round]")).toBeNull();
   expect(card("dev@each#1")?.getAttribute("data-run-status")).toBe("running");
   expect(card("dev@each#2")?.getAttribute("data-run-status")).toBe("waiting");
   expect(card("dev@each#2")?.textContent).toContain("Waiting for approval");
