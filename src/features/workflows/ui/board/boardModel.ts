@@ -11,6 +11,7 @@ import {
   type WorkflowNode,
 } from "../../model/workflow";
 import type { WorkflowIssue } from "../../model/workflowParse";
+import type { RunNodeState } from "../run/runGraphModel";
 
 /**
  * The board's pure side: a workflow as React Flow nodes and edges and back, the rules for what
@@ -44,6 +45,8 @@ export type BoardNodeData = {
   loopOut?: boolean;
   /** For a For each: nothing is in it yet. */
   empty?: boolean;
+  /** Set only when the node is drawn in a run graph: what the run did with it. */
+  run?: RunNodeState;
 };
 export type FlowNode = Node<BoardNodeData, "board" | "group">;
 export type FlowEdge = Edge<{ loop?: LoopSpec }>;
