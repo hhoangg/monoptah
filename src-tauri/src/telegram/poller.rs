@@ -406,10 +406,29 @@ impl Bridge {
         BotApi::new(&self.base, token)
     }
 
-    fn api_for_project(&self, project: &str) -> Option<BotApi> {
+    /// The project's bot API and the id of that bot, so a job can tell later whether the
+    /// project still belongs to the bot that planned it.
+    fn api_for_project(&self, project: &str) -> Option<(BotApi, i64)> {
         let state = self.lock();
-        let token = &state.cfg.projects.get(project)?.token;
-        (!token.is_empty()).then(|| self.api(token))
+        let p = state.cfg.projects.get(project)?;
+        (!p.token.is_empty()).then(|| (self.api(&p.token), p.bot_id))
+    }
+
+    /// Whether the project switched to another bot (or was removed) since a call was
+    /// planned with `bot_id`. The result of such a call belongs to a setup that is gone:
+    /// it must not be retried through the new bot or written onto the new config. A
+    /// renewed token of the same bot does not count. The job's bookkeeping is released.
+    fn bot_changed(&self, project: &str, bot_id: i64, job: &Job) -> bool {
+        let same = self
+            .lock()
+            .cfg
+            .projects
+            .get(project)
+            .is_some_and(|p| p.bot_id == bot_id);
+        if !same {
+            self.release_job(job);
+        }
+        !same
     }
 
     // ----- problems -----
@@ -958,12 +977,16 @@ impl Bridge {
         } else {
             None
         };
-        let Some(api) = api else {
+        let Some((api, bot_id)) = api else {
             self.release_job(&job);
             return;
         };
         self.begin_send(chat);
-        match api.create_forum_topic(chat, &topic_name(name)) {
+        let result = api.create_forum_topic(chat, &topic_name(name));
+        if self.bot_changed(project, bot_id, &job) {
+            return;
+        }
+        match result {
             Ok(thread) => {
                 let mut state = self.lock();
                 state
@@ -1126,11 +1149,15 @@ impl Bridge {
             return;
         };
         // The bot that sent the message is the only one that can edit it.
-        let Some(api) = self.api_for_project(project) else {
+        let Some((api, bot_id)) = self.api_for_project(project) else {
             return;
         };
         self.begin_send(chat);
-        match api.edit_message(chat, *message_id, html, keyboard.clone()) {
+        let result = api.edit_message(chat, *message_id, html, keyboard.clone());
+        if result.is_err() && self.bot_changed(project, bot_id, &job) {
+            return;
+        }
+        match result {
             // A deleted message cannot be edited and needs no problem line.
             Ok(()) | Err(TgError::NotModified | TgError::MessageNotFound) => self.sent_ok(chat),
             Err(error) => self.handle_send_error(chat, job, error),
@@ -1146,11 +1173,15 @@ impl Bridge {
         else {
             return;
         };
-        let Some(api) = self.api_for_project(project) else {
+        let Some((api, bot_id)) = self.api_for_project(project) else {
             return;
         };
         self.begin_send(chat);
-        match api.send_message(chat, *thread, html, None) {
+        let result = api.send_message(chat, *thread, html, None);
+        if result.is_err() && self.bot_changed(project, bot_id, &job) {
+            return;
+        }
+        match result {
             Ok(_) => self.sent_ok(chat),
             // A reply into a deleted topic is not worth a problem line.
             Err(TgError::ThreadNotFound) => {}
@@ -1874,6 +1905,152 @@ mod tests {
         assert!(
             !jobs.iter().any(|job| matches!(job, Job::EditStatus { .. })),
             "an edit would go out through the new bot: {jobs:?}"
+        );
+    }
+
+    /// Runs the first queued job with `response` as Telegram's answer, switching the project
+    /// to another bot while the call is in flight. Returns the bridge and how many requests
+    /// went out.
+    fn bot_changes_during_call(
+        response: (u16, Value),
+        queue_job: impl FnOnce(&Arc<Bridge>),
+    ) -> (Arc<Bridge>, usize) {
+        let slot: Arc<std::sync::OnceLock<Arc<Bridge>>> = Arc::default();
+        let hook_slot = Arc::clone(&slot);
+        let (base, server) = serve_script_with(vec![response], move |_| {
+            hook_slot
+                .get()
+                .unwrap()
+                .store_token("proj", "999:new", 999, "new_bot");
+        });
+        let (bridge, _sink) = bridge_with(&base);
+        slot.set(Arc::clone(&bridge)).ok();
+        add_project(&bridge, "proj", true);
+        queue_job(&bridge);
+        assert!(bridge.pump(false));
+        // Whatever is left must not reach Telegram: the script has no second answer.
+        for _ in 0..3 {
+            while bridge.pump(false) {}
+        }
+        let sent = server.join().unwrap().len();
+        (bridge, sent)
+    }
+
+    fn assert_clean_after_bot_change(bridge: &Arc<Bridge>, sent: usize) {
+        assert_eq!(sent, 1, "only the call that was already in flight");
+        let state = bridge.lock();
+        assert!(
+            state.cfg.projects["proj"].problem.is_none(),
+            "{:?}",
+            state.cfg.projects["proj"].problem
+        );
+        assert!(state.cfg.projects["proj"].topics.is_empty());
+        assert!(state.topics_pending.is_empty());
+        assert!(state.failures.is_empty());
+        drop(state);
+        assert!(queue_is_empty(bridge));
+    }
+
+    fn edit_job() -> Job {
+        Job::EditStatus {
+            project: "proj".into(),
+            chat: CHAT,
+            message_id: 9,
+            html: "Answered".into(),
+            keyboard: None,
+        }
+    }
+
+    #[test]
+    fn an_edit_in_flight_during_a_bot_change_is_not_retried() {
+        let retry = fail(
+            429,
+            "Too Many Requests: retry after 3",
+            json!({ "retry_after": 3 }),
+        );
+        let (bridge, sent) =
+            bot_changes_during_call(retry, |bridge| bridge.push_job(CHAT, edit_job()));
+        assert_clean_after_bot_change(&bridge, sent);
+    }
+
+    #[test]
+    fn an_edit_that_fails_for_good_after_a_bot_change_sets_no_problem() {
+        for refusal in [
+            fail(400, "Bad Request: message can't be edited", json!({})),
+            fail(401, "Unauthorized", json!({})),
+        ] {
+            let (bridge, sent) =
+                bot_changes_during_call(refusal, |bridge| bridge.push_job(CHAT, edit_job()));
+            assert_clean_after_bot_change(&bridge, sent);
+        }
+    }
+
+    #[test]
+    fn a_notice_in_flight_during_a_bot_change_is_dropped() {
+        let notice = |bridge: &Arc<Bridge>| {
+            bridge.push_job(
+                CHAT,
+                Job::Notice {
+                    project: "proj".into(),
+                    thread: None,
+                    html: "Linked".into(),
+                },
+            )
+        };
+        let retry = fail(
+            429,
+            "Too Many Requests: retry after 3",
+            json!({ "retry_after": 3 }),
+        );
+        let (bridge, sent) = bot_changes_during_call(retry, notice);
+        assert_clean_after_bot_change(&bridge, sent);
+        let forbidden = fail(403, "Forbidden: bot is not a member", json!({}));
+        let (bridge, sent) = bot_changes_during_call(forbidden, notice);
+        assert_clean_after_bot_change(&bridge, sent);
+    }
+
+    #[test]
+    fn a_topic_in_flight_during_a_bot_change_is_dropped() {
+        // No bound topic: forwarding queues the topic job first.
+        let forward = |bridge: &Arc<Bridge>| bridge.forward("main", payload("s1", 1)).unwrap();
+        for response in [
+            fail(
+                429,
+                "Too Many Requests: retry after 3",
+                json!({ "retry_after": 3 }),
+            ),
+            fail(400, "Bad Request: not enough rights", json!({})),
+            ok(json!({ "message_thread_id": 11 })),
+        ] {
+            let (bridge, sent) = bot_changes_during_call(response, forward);
+            assert_clean_after_bot_change(&bridge, sent);
+        }
+    }
+
+    #[test]
+    fn a_rotated_token_of_the_same_bot_does_not_skip_the_result() {
+        let slot: Arc<std::sync::OnceLock<Arc<Bridge>>> = Arc::default();
+        let hook_slot = Arc::clone(&slot);
+        let retry = fail(
+            429,
+            "Too Many Requests: retry after 3",
+            json!({ "retry_after": 3 }),
+        );
+        let (base, server) = serve_script_with(vec![retry], move |_| {
+            hook_slot
+                .get()
+                .unwrap()
+                .store_token("proj", "123456:renewed", 123456, "my_bot");
+        });
+        let (bridge, _sink) = bridge_with(&base);
+        slot.set(Arc::clone(&bridge)).ok();
+        add_project(&bridge, "proj", true);
+        bridge.push_job(CHAT, edit_job());
+        assert!(bridge.pump(false));
+        server.join().unwrap();
+        assert!(
+            !queued_edits(&bridge).is_empty(),
+            "the same bot still owns the message, so the edit is retried"
         );
     }
 

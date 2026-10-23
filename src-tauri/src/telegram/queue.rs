@@ -191,24 +191,18 @@ impl SendQueue {
     }
 
     /// Drops every queued job that belongs to `project`: its topic creations, status edits
-    /// and notices, plus the question jobs of the prompts in `keys`. Returns what was dropped.
-    pub fn purge_project(&mut self, project: &str, keys: &[String]) -> Vec<Job> {
+    /// and notices, plus the question jobs of the prompts in `keys`.
+    pub fn purge_project(&mut self, project: &str, keys: &[String]) {
         let ours = |job: &Job| match job {
             Job::CreateTopic { project: p, .. }
             | Job::EditStatus { project: p, .. }
             | Job::Notice { project: p, .. } => p == project,
             Job::SendQuestion { key, .. } => keys.contains(key),
         };
-        let mut dropped = Vec::new();
         for queue in self.chats.values_mut() {
-            for list in [&mut queue.urgent, &mut queue.edits] {
-                let (mine, rest): (VecDeque<Job>, VecDeque<Job>) =
-                    std::mem::take(list).into_iter().partition(|job| ours(job));
-                *list = rest;
-                dropped.extend(mine);
-            }
+            queue.urgent.retain(|job| !ours(job));
+            queue.edits.retain(|job| !ours(job));
         }
-        dropped
     }
 
     /// Puts a job back at the front of its priority class so a retry goes first.
