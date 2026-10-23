@@ -66,7 +66,7 @@ export function ticketWorkflow(extra: Partial<Workflow> = {}): Workflow {
         type: "session",
         title: "Fetch tickets",
         project: "{{inputs.project}}",
-        model: "sonnet",
+        model: "claude:sonnet-5",
         checkout: "root",
         prompt: "List open tickets assigned to me in {{inputs.clickupList}}.",
         output: { tickets: { type: "list" } },
@@ -87,7 +87,7 @@ export function ticketWorkflow(extra: Partial<Workflow> = {}): Workflow {
         title: "Dev",
         parent: "each",
         project: "{{inputs.project}}",
-        model: "sonnet",
+        model: "claude:sonnet-5",
         checkout: "newWorktree",
         prompt:
           "Implement {{item.title}} ({{item.url}}) and open a PR.\n" +
@@ -101,7 +101,7 @@ export function ticketWorkflow(extra: Partial<Workflow> = {}): Workflow {
         title: "Review",
         parent: "each",
         project: "{{inputs.project}}",
-        model: "opus",
+        model: "claude:opus-5",
         checkout: { worktreeOf: "dev" },
         nestUnder: "dev",
         prompt: "Review {{dev.pr_url}}. List blocking issues only.",

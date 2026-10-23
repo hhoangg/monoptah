@@ -19,9 +19,9 @@ import {
   parseEdge,
   parseInputs,
   parseNode,
-  validateWorkflow,
   type WorkflowIssue,
 } from "../../workflows/model/workflowParse";
+import { workflowIssues } from "../../workflows/model/workflowModels";
 import {
   anchorNode,
   exportPathProblem,
@@ -192,7 +192,7 @@ function definitionFrom(
 /** Problems that keep a workflow from running: its graph, and its input values. */
 function problems(w: Workflow): WorkflowIssue[] {
   return [
-    ...validateWorkflow(w),
+    ...workflowIssues(w),
     ...inputValueProblems(w.inputs, w.inputValues).map((message) => ({ message })),
   ];
 }

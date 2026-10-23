@@ -147,6 +147,26 @@ it("Save disabled for enabled workflow with issues", async () => {
   expect(stored()[0].enabled).toBe(false);
 });
 
+it("flags a session whose model is not in the catalog and blocks saving it enabled", async () => {
+  const w = ticketWorkflow();
+  // The free text an older build accepted: not an app model id.
+  const typed: Workflow = {
+    ...w,
+    nodes: w.nodes.map((n) =>
+      n.id === "fetch" && n.type === "session" ? { ...n, model: "claude-sonnet-5-5" } : n,
+    ),
+  };
+  await renderBoard(typed);
+  const issue = container.querySelector("[data-board-node='fetch'] [data-node-issue]");
+  expect(issue?.textContent).toContain('Model "claude-sonnet-5-5" is not available');
+  expect(container.querySelector("[data-board-issues]")?.textContent).toContain("1 problem");
+  const name = container.querySelector<HTMLInputElement>("input[aria-label='Workflow name']")!;
+  await act(async () => type(name, "Edited"));
+  expect(button("Save").disabled).toBe(true);
+  await act(async () => buttonText("Save paused")!.click());
+  expect(stored()[0].enabled).toBe(false);
+});
+
 it("saves a valid workflow, keeping the fields the app manages", async () => {
   const w = ticketWorkflow({
     runRequested: true,

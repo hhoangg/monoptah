@@ -14,7 +14,7 @@ import {
 } from "./workflowSessionStart";
 
 vi.mock("../../integrations/harness/core/availability", () => ({
-  isHarnessAvailable: (id: string) => id === "codex",
+  isHarnessAvailable: (id: string) => id === "codex" || id === "grok",
 }));
 
 const values = new Map<string, string>();
@@ -137,6 +137,37 @@ describe("startWorkflowSession", () => {
       });
       expect(flat.sessionId.startsWith("app-chat-")).toBe(true);
     }
+  });
+
+  it("starts a model in its own harness when the node sets only a model", async () => {
+    const { deps, launched } = fixture();
+    // The Mono runs on codex; grok:grok-4.6 belongs to grok.
+    await startWorkflowSession(deps, "mono-1", {
+      project: "/code/app",
+      prompt: "Do it",
+      workspaceMode: "current",
+      model: "grok:grok-4.6",
+    });
+    expect(launched[0].launch).toMatchObject({
+      harness: "grok",
+      model: "grok:grok-4.6",
+    });
+  });
+
+  it("names the model when the catalog no longer has it", async () => {
+    const { deps, launched } = fixture();
+    await expect(
+      startWorkflowSession(deps, "mono-1", {
+        project: "/code/app",
+        prompt: "Do it",
+        workspaceMode: "current",
+        harness: "codex",
+        model: "codex:gone",
+      }),
+    ).rejects.toThrow(
+      'Model "codex:gone" is not available. Pick one in the step\'s model list.',
+    );
+    expect(launched).toEqual([]);
   });
 
   it("rejects a project that is not the Mono's", async () => {

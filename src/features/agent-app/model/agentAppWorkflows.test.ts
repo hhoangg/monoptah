@@ -149,6 +149,39 @@ describe("workflows.add", () => {
     expect(stored()[0].nextRunAt).toBeUndefined();
   });
 
+  it("add with a model that is not in the catalog saves paused with the issue", async () => {
+    const { call, stored } = fixture();
+    const nodes = definition().nodes.map((node) =>
+      node.type === "session" ? { ...node, model: "sonnet" } : node,
+    );
+    const result = (await call("workflows.add", {
+      workflow: definition({ nodes }),
+    })) as Added & { issues: { nodeId?: string; message: string }[] };
+    expect(result.enabled).toBe(false);
+    expect(result.issues).toEqual([
+      {
+        nodeId: "fetch",
+        message: 'Model "sonnet" is not available. Pick one in the step\'s model list.',
+      },
+    ]);
+    expect(stored()[0]).toMatchObject({ id: result.id, enabled: false });
+    expect(stored()[0].nextRunAt).toBeUndefined();
+  });
+
+  it("run and resume refuse a workflow whose session model is not available", async () => {
+    const { call, stored, checkNow } = fixture();
+    const nodes = definition().nodes.map((node) =>
+      node.type === "session" ? { ...node, model: "claude-sonnet-5-5" } : node,
+    );
+    const { id } = (await call("workflows.add", {
+      workflow: definition({ nodes }),
+    })) as Added;
+    await expect(call("workflows.run", { id })).rejects.toThrow(/cannot run yet/);
+    await expect(call("workflows.resume", { id })).rejects.toThrow(/cannot be resumed/);
+    expect(stored()[0].runRequested).toBeUndefined();
+    expect(checkNow).not.toHaveBeenCalled();
+  });
+
   it("pauses a workflow whose input has no value and says which", async () => {
     const { call } = fixture();
     const { inputValues: _values, ...bare } = definition();

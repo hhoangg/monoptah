@@ -6,7 +6,7 @@ import {
   resumeRun,
   startRun,
 } from "../../features/workflows/model/workflowEngine";
-import { validateWorkflow } from "../../features/workflows/model/workflowParse";
+import { workflowIssues } from "../../features/workflows/model/workflowModels";
 import {
   afterClaim,
   dueWorkflows,
@@ -129,7 +129,7 @@ export function useMonoWorkflows(host: MonoWorkflowHost, enabled = true) {
         now,
         runId,
       );
-      const issues = validateWorkflow(claimed);
+      const issues = workflowIssues(claimed);
       if (issues.length) {
         const error = `The workflow is not valid: ${issues.map((issue) => issue.message).join("; ")}`;
         run = { ...run, status: "failed", endedAt: now, error };

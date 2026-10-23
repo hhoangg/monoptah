@@ -204,6 +204,30 @@ it("shows what the node picked, and Use Mono default clears it", async () => {
   expect(next).not.toHaveProperty("effort");
 });
 
+it("says why a stored model is not available and shows the stored value", async () => {
+  const typed: WorkflowNode = { ...SESSION, model: "claude-sonnet-5-5" } as WorkflowNode;
+  await renderInspector(typed, vi.fn(), MONO_MODEL);
+  const hint = container.querySelector("[data-model-issue]");
+  expect(hint?.textContent).toContain(
+    "Model \"claude-sonnet-5-5\" is not available. Pick one in the step's model list.",
+  );
+  expect(hint?.textContent).toContain("Saved model: claude-sonnet-5-5");
+});
+
+it("shows no model hint for an exact id or for a node that sets nothing", async () => {
+  await renderInspector(SESSION, vi.fn(), MONO_MODEL);
+  expect(container.querySelector("[data-model-issue]")).toBeNull();
+  act(() => root.unmount());
+  root = createRoot(container);
+  const picked: WorkflowNode = {
+    ...SESSION,
+    harness: "grok",
+    model: "grok:grok-4.5",
+  } as WorkflowNode;
+  await renderInspector(picked, vi.fn(), MONO_MODEL);
+  expect(container.querySelector("[data-model-issue]")).toBeNull();
+});
+
 async function renderIn(w: Workflow, id: string) {
   await act(async () =>
     root.render(

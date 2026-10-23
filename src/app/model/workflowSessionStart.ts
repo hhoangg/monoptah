@@ -7,6 +7,8 @@ import type { Mono } from "../../features/monos/model/mono";
 import type { MonoLaunchRegistry } from "../../features/monos/model/monoLaunches";
 import type { ControlOutcome } from "../../features/orchestration/model/orchestration";
 import { sameProjectPath } from "../../features/projects/model/recents";
+import { findModel } from "../../features/sessions/model/models";
+import { modelUnavailable } from "../../features/workflows/model/workflowModels";
 import type { QuickLaunch } from "../../features/quick-composer/model/quickComposer";
 import type { Session } from "../../features/sessions/model/session";
 import type { Worktrees } from "../../features/source-control/model/worktrees";
@@ -113,24 +115,36 @@ export async function startWorkflowSession(
         : undefined,
   };
   const requestId = `wf${crypto.randomUUID().replace(/-/g, "")}`;
-  const started = (await startAppSession(
-    chat,
-    requestId,
-    {
-      project: req.project,
-      prompt: req.prompt,
-      ...(req.harness ? { harness: req.harness } : {}),
-      ...(req.model ? { model: req.model } : {}),
-      ...(req.effort ? { effort: req.effort } : {}),
-      runtimeMode: "full-access",
-      workspaceMode: req.workspaceMode,
-      ...(req.worktreeCwd ? { worktreeCwd: req.worktreeCwd } : {}),
-      ...(parentSessionId ? { parentSessionId } : {}),
-      ...(req.folderId ? { folderId: req.folderId } : {}),
-      ...(req.folderName ? { folderName: req.folderName } : {}),
-      notifyOnComplete: false,
-    },
-    host,
-  )) as { id: string; folderId?: string };
+  // A model alone is started in its own harness, as the picker pins both. Left to the
+  // Mono's harness it would be refused whenever the two differ.
+  const harness =
+    req.harness ?? (req.model ? findModel(req.model)?.harness : undefined);
+  let started: { id: string; folderId?: string };
+  try {
+    started = (await startAppSession(
+      chat,
+      requestId,
+      {
+        project: req.project,
+        prompt: req.prompt,
+        ...(harness ? { harness } : {}),
+        ...(req.model ? { model: req.model } : {}),
+        ...(req.effort ? { effort: req.effort } : {}),
+        runtimeMode: "full-access",
+        workspaceMode: req.workspaceMode,
+        ...(req.worktreeCwd ? { worktreeCwd: req.worktreeCwd } : {}),
+        ...(parentSessionId ? { parentSessionId } : {}),
+        ...(req.folderId ? { folderId: req.folderId } : {}),
+        ...(req.folderName ? { folderName: req.folderName } : {}),
+        notifyOnComplete: false,
+      },
+      host,
+    )) as { id: string; folderId?: string };
+  } catch (error) {
+    // The catalog can change after a workflow was saved; say which model is gone.
+    if (req.model && error instanceof Error && error.message.startsWith("Unknown model"))
+      throw new Error(modelUnavailable(req.model));
+    throw error;
+  }
   return { sessionId: started.id, folderId: started.folderId, settled };
 }

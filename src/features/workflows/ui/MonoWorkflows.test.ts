@@ -168,6 +168,53 @@ it("Run now refuses a workflow with issues and says why", async () => {
   );
 });
 
+/** A manual workflow whose one session names a model the catalog does not have. */
+const typedModel = (extra: Partial<Workflow> = {}) =>
+  workflow({
+    inputs: { project: { type: "project" } },
+    inputValues: { project: "/work/api" },
+    nodes: [
+      { id: "trigger", type: "manual" },
+      {
+        id: "hi",
+        type: "session",
+        project: "{{inputs.project}}",
+        prompt: "hi",
+        checkout: "root",
+        output: {},
+        model: "claude-sonnet-5-5",
+      },
+      { id: "report", type: "report" },
+    ],
+    edges: [
+      { from: "trigger", to: "hi" },
+      { from: "hi", to: "report" },
+    ],
+    ...extra,
+  });
+
+it("Run now refuses a session model that is not in the catalog and names it", async () => {
+  save([typedModel()]);
+  await renderPanel();
+  await act(async () => button("Run now").click());
+  expect(saved()[0].runRequested).toBeUndefined();
+  expect(container.querySelector("[data-workflow-notice]")?.textContent).toContain(
+    'Model "claude-sonnet-5-5" is not available',
+  );
+});
+
+it("Resume and approve refuse a session model that is not in the catalog", async () => {
+  save([typedModel({ enabled: false })]);
+  const actions = workflowActions("mono-1");
+  expect(await actions.toggle("wf-aaaaaaaa")).toContain('Model "claude-sonnet-5-5"');
+  expect(saved()[0].enabled).toBe(false);
+  const reviewed = typedModel({ enabled: false, needsReview: true });
+  save([reviewed]);
+  const result = await actions.approve(reviewed.id, "enable", definitionFingerprint(reviewed));
+  expect(result).toMatchObject({ kind: "refused" });
+  expect(saved()[0]).toMatchObject({ enabled: false, needsReview: true });
+});
+
 it("Resume schedules the next run, and refuses when the workflow has issues", async () => {
   save([scheduled({ enabled: false, nextRunAt: undefined })]);
   await renderPanel();

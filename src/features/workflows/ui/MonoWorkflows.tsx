@@ -24,7 +24,8 @@ import {
   type WorkflowId,
   type WorkflowRun,
 } from "../model/workflow";
-import { validateWorkflow, type WorkflowIssue } from "../model/workflowParse";
+import type { WorkflowIssue } from "../model/workflowParse";
+import { workflowIssues } from "../model/workflowModels";
 import {
   checkWorkflowsNow,
   clearWorkflowRuns,
@@ -260,7 +261,7 @@ export function workflowActions(monoId: string): WorkflowActions {
       const notice = await change(id, (workflow) => {
         // Never around the review, whichever screen asked.
         if (workflow.needsReview) return { next: workflow, notice: REVIEW_FIRST };
-        const issues = validateWorkflow(workflow);
+        const issues = workflowIssues(workflow);
         return issues.length
           ? { next: workflow, notice: refusal("run", issues) }
           : { next: { ...workflow, runRequested: true } };
@@ -278,7 +279,7 @@ export function workflowActions(monoId: string): WorkflowActions {
         if (workflow.enabled)
           return { next: { ...workflow, enabled: false } };
         if (workflow.needsReview) return { next: workflow, notice: REVIEW_FIRST };
-        const issues = validateWorkflow(workflow);
+        const issues = workflowIssues(workflow);
         if (issues.length)
           return { next: workflow, notice: refusal("resume", issues) };
         return { next: enabledNow(workflow) };
@@ -297,7 +298,7 @@ export function workflowActions(monoId: string): WorkflowActions {
               result = { kind: "changed", workflow };
               return workflow;
             }
-            const issues = validateWorkflow(workflow);
+            const issues = workflowIssues(workflow);
             if (issues.length) {
               result = {
                 kind: "refused",

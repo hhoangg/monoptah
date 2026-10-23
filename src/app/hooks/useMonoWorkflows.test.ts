@@ -1039,6 +1039,27 @@ describe("useMonoWorkflows", () => {
     expect(host.post.mock.calls[0][4]).toContain("could not start");
   });
 
+  it("fails a run whose session names a model that is not in the catalog, naming it", async () => {
+    const def = workflow(
+      [trigger, session("dev", {}, { model: "claude-sonnet-5-5" }), report],
+      [
+        { from: "trigger", to: "dev" },
+        { from: "dev", to: "report" },
+      ],
+    );
+    save([def]);
+    const host = makeHost({ replies: [] });
+    mount(host);
+    await vi.waitFor(() => expect(storedRuns()[0]?.status).toBe("failed"));
+    expect(storedRuns()[0].error).toContain(
+      'Model "claude-sonnet-5-5" is not available. Pick one in the step\'s model list.',
+    );
+    expect(host.startSession).not.toHaveBeenCalled();
+    expect(host.post).toHaveBeenCalledTimes(1);
+    expect(host.post.mock.calls[0][3]).toBe("Ship it · failed");
+    expect(host.post.mock.calls[0][4]).toContain('Model "claude-sonnet-5-5"');
+  });
+
   it("nests under another node's session and uses its worktree", async () => {
     const def = workflow(
       [

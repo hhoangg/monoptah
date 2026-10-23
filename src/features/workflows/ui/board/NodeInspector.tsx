@@ -33,6 +33,7 @@ import {
   type WorkflowNode,
 } from "../../model/workflow";
 import { loopedNodeIds } from "../../model/workflowEngine";
+import { sessionNodeProblem } from "../../model/workflowModels";
 import { fieldInReport } from "../../model/workflowReport";
 import { inputValueProblems } from "../../model/workflowYaml";
 import { FIELD, InputField } from "../WorkflowPage";
@@ -478,6 +479,7 @@ function SessionModel({
   };
   const { harness: _h, model: _m, effort: _e, ...rest } = node;
   const unset = !node.harness && !node.model && !node.effort;
+  const problem = sessionNodeProblem(node);
   return (
     <>
       <Property label="Model">
@@ -508,6 +510,13 @@ function SessionModel({
           )}
         </span>
       </Property>
+      {problem ? (
+        <div data-model-issue>
+          <Hint>
+            {problem.message} {problem.saved}.
+          </Hint>
+        </div>
+      ) : null}
       <ModelSettingRows
         harness={harness}
         model={model}

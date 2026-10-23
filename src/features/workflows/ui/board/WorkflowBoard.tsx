@@ -20,6 +20,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type CSSProperties,
   type ReactNode,
 } from "react";
@@ -42,6 +43,7 @@ import type { MonoProject } from "../../../monos/model/mono";
 import { subscribeMonoFiles } from "../../../monos/model/monoFiles";
 import { anchorSchedule, nextHabitRunAt } from "../../../monos/model/monoHabits";
 import { PageHeader } from "../../../monos/ui/monoPanelParts";
+import { getModelSnapshot, subscribeModels } from "../../../sessions/model/models";
 import {
   triggerOf,
   WORKFLOWS_MAX,
@@ -51,7 +53,8 @@ import {
   type Workflow,
   type WorkflowNode,
 } from "../../model/workflow";
-import { validateWorkflow, type WorkflowIssue } from "../../model/workflowParse";
+import type { WorkflowIssue } from "../../model/workflowParse";
+import { workflowIssues } from "../../model/workflowModels";
 import { loadWorkflows, updateWorkflows } from "../../model/workflowStore";
 import { inputValueProblems } from "../../model/workflowYaml";
 import {
@@ -129,7 +132,7 @@ function problemsOf(w: Workflow): WorkflowIssue[] {
     w.nodes.flatMap((n) => ((n.type === "session" || n.type === "command") && !n.project ? [n.id] : [])),
   );
   return [
-    ...validateWorkflow(w).map((issue) =>
+    ...workflowIssues(w).map((issue) =>
       issue.nodeId !== undefined &&
       unset.has(issue.nodeId) &&
       issue.message.startsWith("project must be exactly")
@@ -299,7 +302,9 @@ function BoardEditor({ monoId, workflow, color, projects, monoModel, onBack, onR
     () => ({ ...fromFlow(base, board.nodes, board.edges), ...meta }),
     [base, board, meta],
   );
-  const issues = useMemo(() => problemsOf(current), [current]);
+  // A model list that arrives later changes which models are available.
+  const catalog = useSyncExternalStore(subscribeModels, getModelSnapshot);
+  const issues = useMemo(() => problemsOf(current), [current, catalog]);
   const byNode = useMemo(() => issuesByNode(issues), [issues]);
   const changed = definitionKey(current) !== baseline;
   // Enabling goes through the review, never through Save.
