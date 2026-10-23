@@ -7,6 +7,7 @@ import {
 } from "../../sessions/model/session";
 import { isTuiSession } from "../../sessions/model/tuiSession";
 import type { ForwardPayload } from "./telegram";
+import { sessionTicket } from "./sessionTicket";
 import { workflowSessionContext } from "./workflowSessionContext";
 
 export const FORWARD_DELAY_MS = 5 * 60_000;
@@ -18,7 +19,7 @@ const CONTEXT_MAX = 600;
 export function isForwardable(session: Session): boolean {
   if (session.orchestrationLeadId) return false;
   if (session.inboxAsk) return false;
-  if (session.ephemeral || session.sidebarHidden) return false;
+  if (session.ephemeral) return false;
   if (isTuiSession(session)) return false;
   if (isMonoSession(session.id)) return false;
   if (isRemoteProjectPath(session.cwd)) return false;
@@ -28,6 +29,8 @@ export function isForwardable(session: Session): boolean {
 }
 
 export function sessionTicketId(session: Session): string | undefined {
+  const remembered = sessionTicket(session.id);
+  if (remembered) return remembered;
   const fromCard = session.inboxCard?.identifier.trim();
   if (fromCard) return fromCard;
   const fromWorkflow = workflowSessionContext(session.id)?.itemId?.trim();
@@ -40,13 +43,20 @@ function chars(text: string): string[] {
   return Array.from(text);
 }
 
-function title(session: Session): string {
-  return sessionDisplayTitle(session.title, session.harness);
+/** Inbox sessions are titled "<ticket> <title>"; the ticket is shown on its own, so drop it here. */
+function title(session: Session, ticket?: string): string {
+  const shown = sessionDisplayTitle(session.title, session.harness);
+  const prefix = ticket ? `${ticket} ` : "";
+  return prefix && shown.startsWith(prefix)
+    ? shown.slice(prefix.length)
+    : shown;
 }
 
 export function topicTitle(session: Session): string {
   const ticket = sessionTicketId(session);
-  const full = ticket ? `[${ticket}] ${title(session)}` : title(session);
+  const full = ticket
+    ? `[${ticket}] ${title(session, ticket)}`
+    : title(session);
   return chars(full).slice(0, TOPIC_TITLE_MAX).join("");
 }
 
@@ -63,7 +73,7 @@ export function questionContext(session: Session): string {
 
 function headerOf(session: Session): string {
   const ticket = sessionTicketId(session);
-  const first = [projectName(session.cwd), title(session), ticket]
+  const first = [projectName(session.cwd), title(session, ticket), ticket]
     .filter(Boolean)
     .join(" · ");
   const workflow = workflowSessionContext(session.id);

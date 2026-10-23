@@ -14,6 +14,7 @@ import {
   sessionTicketId,
   topicTitle,
 } from "./telegramForward";
+import { clearSessionTicket, setSessionTicket } from "./sessionTicket";
 import {
   clearWorkflowSessionContext,
   setWorkflowSessionContext,
@@ -62,19 +63,20 @@ function block(
 }
 
 const cleanup: string[] = [];
+const ticketCleanup: string[] = [];
 afterEach(() => {
+  for (const id of ticketCleanup.splice(0)) clearSessionTicket(id);
   for (const id of cleanup.splice(0)) clearWorkflowSessionContext(id);
 });
 
 describe("isForwardable", () => {
-  it("excludes orchestration workers, inbox ask, ephemeral, hidden, tui, mono chats, remote, codex auto-resolving", () => {
+  it("excludes orchestration workers, inbox ask, ephemeral, tui, mono chats, remote, codex auto-resolving", () => {
     expect(isForwardable(asking())).toBe(true);
     expect(isForwardable(asking({ orchestrationLeadId: "lead" }))).toBe(false);
     expect(isForwardable(asking({ inboxAsk: {} as Session["inboxAsk"] }))).toBe(
       false,
     );
     expect(isForwardable(asking({ ephemeral: true }))).toBe(false);
-    expect(isForwardable(asking({ sidebarHidden: true }))).toBe(false);
     expect(isForwardable(asking({ surface: "tui" }))).toBe(false);
     const mono = asking();
     monoChats.add(mono.id);
@@ -93,7 +95,19 @@ describe("isForwardable", () => {
   });
 });
 
+it("forwards sidebar-hidden sessions started by Monos", () => {
+  expect(isForwardable(asking({ sidebarHidden: true }))).toBe(true);
+});
+
 describe("sessionTicketId", () => {
+  it("ticket from the registry when the inbox card is gone", () => {
+    const session = asking();
+    expect(session.inboxCard).toBeUndefined();
+    setSessionTicket(session.id, "ENG-42");
+    ticketCleanup.push(session.id);
+    expect(sessionTicketId(session)).toBe("ENG-42");
+  });
+
   it("ticket from inbox card identifier", () => {
     const session = asking({
       inboxCard: { identifier: "ENG-42" } as Session["inboxCard"],
@@ -122,6 +136,27 @@ describe("sessionTicketId", () => {
 });
 
 describe("topicTitle", () => {
+  it("does not repeat a GitHub ticket already in the title", () => {
+    const session = asking({
+      title: "#12 Fix crash",
+      linkedWorkItem: { kind: "issue", repo: "a/b", number: 12, url: "u" },
+    });
+    expect(topicTitle(session)).toBe("[#12] Fix crash");
+    expect(forwardPayload(session, "/work/acme")?.header).toBe(
+      "acme · Fix crash · #12",
+    );
+  });
+
+  it("does not repeat a tracker key already in the title", () => {
+    const session = asking({ title: "ENG-42 Fix crash" });
+    setSessionTicket(session.id, "ENG-42");
+    ticketCleanup.push(session.id);
+    expect(topicTitle(session)).toBe("[ENG-42] Fix crash");
+    expect(forwardPayload(session, "/work/acme")?.header).toBe(
+      "acme · Fix crash · ENG-42",
+    );
+  });
+
   it("title without ticket is plain", () => {
     expect(topicTitle(asking())).toBe("Fix the login");
   });
@@ -226,7 +261,7 @@ describe("dueForwards", () => {
   });
 
   it("skips unseen, unforwardable and question-less sessions", () => {
-    const hidden = asking({ sidebarHidden: true });
+    const hidden = asking({ ephemeral: true });
     const none = asking({ pendingQuestion: undefined });
     const unseen = asking();
     const first = new Map([

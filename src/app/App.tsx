@@ -830,6 +830,7 @@ import {
   inboxComposerCard,
   type InboxItem,
 } from "../features/inbox/model/githubTasks";
+import { setSessionTicket } from "../features/telegram/model/sessionTicket";
 import {
   linkedWorkItemFromAutomationEvent,
   linkedWorkItemFromInboxItem,
@@ -3291,6 +3292,7 @@ function Workspace({
           title: `${ref} ${item.title}`,
           ...(linkedWorkItem ? { linkedWorkItem } : {}),
         };
+        setSessionTicket(session.id, ref);
         const tab = newTab(session.id);
         setSessions((prev) => [...prev, session]);
         appendTab(tab, cwd);
