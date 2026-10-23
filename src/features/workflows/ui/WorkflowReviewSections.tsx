@@ -35,6 +35,26 @@ function stepName(preview: ImportPreview, nodeId: string): string {
   return node ? `${stepLabel(node)} (${visible(node.id)})` : visible(nodeId);
 }
 
+/** Where a session step runs and with what, as its file says: nothing set means the Mono's own. */
+function sessionDetail(
+  preview: ImportPreview,
+  node: Extract<WorkflowNode, { type: "session" }>,
+): string {
+  const { checkout } = node;
+  let where = "Project folder";
+  if (checkout === "newWorktree") where = "New worktree";
+  else if (typeof checkout === "object") {
+    const source = preview.workflow.nodes.find((entry) => entry.id === checkout.worktreeOf);
+    where = `Worktree of ${source ? stepLabel(source) : visible(checkout.worktreeOf)}`;
+  }
+  return [
+    ...(node.harness ? [`Harness: ${visible(node.harness)}`] : []),
+    `Model: ${node.model ? visible(node.model) : node.harness ? "its default" : "Mono default"}`,
+    ...(node.effort ? [`Effort: ${visible(node.effort)}`] : []),
+    `Checkout: ${where}`,
+  ].join(" · ");
+}
+
 function triggerLabel(preview: ImportPreview): string {
   const trigger = preview.workflow.nodes.find(isTrigger);
   if (!trigger) return "No trigger";
@@ -145,6 +165,11 @@ export function WorkflowReviewSections({
               </span>
               <span className="min-w-0 flex-1 whitespace-pre-wrap break-words text-content/85">
                 {stepLabel(node)}
+                {node.type === "session" ? (
+                  <span className="block text-[11px] leading-4 text-content/45">
+                    {sessionDetail(preview, node)}
+                  </span>
+                ) : null}
               </span>
             </li>
           ))}

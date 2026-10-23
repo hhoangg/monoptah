@@ -7,6 +7,14 @@ import { SearchableSelect } from "../../../../shared/ui/SearchableSelect";
 import type { MonoProject } from "../../../monos/model/mono";
 import { ScheduleFields } from "../../../monos/ui/NewHabitPage";
 import {
+  isEffortSettingId,
+  modelEffortSetting,
+  preferredModelId,
+  resolveModel,
+} from "../../../sessions/model/models";
+import { HARNESSES, type HarnessId } from "../../../sessions/model/session";
+import { ModelPicker, ModelSettingRows } from "../../../sessions/ui/ModelPicker";
+import {
   AutoTextarea,
   Hint,
   Property,
@@ -32,6 +40,13 @@ import { NODE_LABEL, nodeTitle } from "./boardNodes";
 
 type InputMeta = Pick<Workflow, "inputs" | "inputValues">;
 type InputValue = Workflow["inputValues"][string];
+
+/** What a session starts with when its node leaves the model unset: the Mono's own choice. */
+export type MonoModelDefault = {
+  harness: HarnessId;
+  model: string;
+  modelSettings: Record<string, string>;
+};
 
 export type InspectorView = { kind: "node"; id: NodeId } | { kind: "settings" };
 
@@ -429,15 +444,102 @@ function checkoutValue(checkout: Checkout | undefined): string {
   return typeof checkout === "object" ? `worktree:${checkout.worktreeOf}` : (checkout ?? "root");
 }
 
+const isHarness = (value: string | undefined): value is HarnessId =>
+  HARNESSES.includes(value as HarnessId);
+
+/**
+ * A session's model, picked the way the composer and the Mono's settings do. A node that sets
+ * nothing runs with the Mono's own model, which is what the picker shows until something is picked.
+ */
+function SessionModel({
+  node,
+  monoModel,
+  onNode,
+}: {
+  node: Extract<WorkflowNode, { type: "session" }>;
+  monoModel: MonoModelDefault | undefined;
+  onNode: (next: WorkflowNode) => void;
+}) {
+  const fallback = monoModel ?? {
+    harness: HARNESSES[0],
+    model: preferredModelId(HARNESSES[0]),
+    modelSettings: {},
+  };
+  // The same fallbacks the host applies when it starts the session.
+  const harness = isHarness(node.harness) ? node.harness : fallback.harness;
+  const model =
+    node.model ?? (harness === fallback.harness ? fallback.model : preferredModelId(harness));
+  const sameAsMono = harness === fallback.harness && model === fallback.model;
+  const effortId = modelEffortSetting(resolveModel(harness, model))?.id;
+  const values = {
+    ...(sameAsMono ? fallback.modelSettings : {}),
+    ...(node.effort && effortId ? { [effortId]: node.effort } : {}),
+  };
+  const { harness: _h, model: _m, effort: _e, ...rest } = node;
+  const unset = !node.harness && !node.model && !node.effort;
+  return (
+    <>
+      <Property label="Model">
+        <span className="flex min-w-0 flex-1 flex-col items-start">
+          <ModelPicker
+            harness={harness}
+            model={model}
+            values={values}
+            hideSettings
+            side="bottom"
+            variant="plain"
+            // A new model has its own effort levels, so the old choice does not carry over.
+            onChange={(nextHarness, nextModel) =>
+              onNode({ ...rest, harness: nextHarness, model: nextModel })
+            }
+            onSettingsChange={() => {}}
+          />
+          {unset ? (
+            <span className="pb-0.5 text-[11px] text-content/35">Mono default</span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onNode(rest)}
+              className="-ml-1.5 rounded px-1.5 py-0.5 text-[11px] text-content/55 hover:bg-content/8 hover:text-content"
+            >
+              Use Mono default
+            </button>
+          )}
+        </span>
+      </Property>
+      <ModelSettingRows
+        harness={harness}
+        model={model}
+        values={values}
+        side="bottom"
+        onSettingsChange={(settings) => {
+          const effort = effortId ? settings[effortId] : undefined;
+          // An effort belongs to one model, so choosing it fixes the model it was chosen for.
+          if (effort) onNode({ ...rest, harness, model, effort });
+        }}
+        row={({ id, label, control }) =>
+          isEffortSettingId(id) ? (
+            <Property key={id} label={label}>
+              {control}
+            </Property>
+          ) : null
+        }
+      />
+    </>
+  );
+}
+
 function NodeFields({
   workflow,
   node,
   projects,
+  monoModel,
   onNode,
 }: {
   workflow: Workflow;
   node: WorkflowNode;
   projects: readonly MonoProject[];
+  monoModel: MonoModelDefault | undefined;
   onNode: (next: WorkflowNode, meta?: InputMeta) => void;
 }) {
   const change = (patch: Partial<WorkflowNode>) => onNode({ ...node, ...patch } as WorkflowNode);
@@ -467,15 +569,7 @@ function NodeFields({
         <>
           <dl className="flex flex-col gap-0.5 px-4 py-3">
             <ProjectPicker workflow={workflow} node={node} projects={projects} onNode={onNode} />
-            <TextProperty
-              label="Model"
-              value={node.model ?? ""}
-              placeholder="Default"
-              onChange={(model) => {
-                const { model: _old, ...rest } = node;
-                onNode(model ? { ...rest, model } : rest);
-              }}
-            />
+            <SessionModel node={node} monoModel={monoModel} onNode={onNode} />
             <SelectProperty
               label="Checkout"
               value={checkoutValue(node.checkout)}
@@ -848,6 +942,7 @@ export function NodeInspector({
   view,
   workflow,
   projects,
+  monoModel,
   issues,
   onNode,
   onSettings,
@@ -858,6 +953,8 @@ export function NodeInspector({
   view: InspectorView | null;
   workflow: Workflow;
   projects: readonly MonoProject[];
+  /** The Mono's own model, which a session without one of its own starts with. */
+  monoModel?: MonoModelDefault;
   /** The messages for the open node. */
   issues: string[];
   onNode: (next: WorkflowNode, meta?: InputMeta) => void;
@@ -929,7 +1026,13 @@ export function NodeInspector({
                 ))}
               </ul>
             ) : null}
-            <NodeFields workflow={workflow} node={node} projects={projects} onNode={onNode} />
+            <NodeFields
+              workflow={workflow}
+              node={node}
+              projects={projects}
+              monoModel={monoModel}
+              onNode={onNode}
+            />
             {loopOut ? (
               <Section
                 title={`Loops back to ${nodeTitle(workflow.nodes.find((n) => n.id === loopOut.to) ?? node)}`}

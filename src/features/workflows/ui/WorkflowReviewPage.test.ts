@@ -208,3 +208,57 @@ it("follows the workflow when it changes under the screen", async () => {
   expect(section("Commands this workflow runs")!.textContent).toContain("make");
   expect(notice()).toMatch(/changed while you were reviewing it/);
 });
+
+it("lists each session step's harness, model, effort and checkout", async () => {
+  const w = flagged();
+  const second = {
+    id: "polish",
+    type: "session" as const,
+    title: "Polish it",
+    project: "{{inputs.project}}",
+    checkout: { worktreeOf: "fix" },
+    prompt: "Polish.",
+    output: {},
+  };
+  await renderPage(
+    {
+      ...w,
+      nodes: [
+        ...w.nodes.map((n) =>
+          n.type === "session"
+            ? {
+                ...n,
+                title: "Fix it",
+                harness: "grok",
+                model: "grok:grok-4.5",
+                effort: "medium",
+                checkout: "newWorktree" as const,
+              }
+            : n,
+        ),
+        second,
+      ],
+    },
+    "enable",
+  );
+  const steps = [...section("Steps")!.querySelectorAll("li")].map((li) => li.textContent ?? "");
+  const fix = steps.find((text) => text.includes("Fix it"))!;
+  expect(fix).toContain("grok");
+  expect(fix).toContain("grok:grok-4.5");
+  expect(fix).toContain("medium");
+  expect(fix).toContain("New worktree");
+  const polish = steps.find((text) => text.includes("Polish it"))!;
+  expect(polish).toContain("Mono default");
+  expect(polish).toContain("Worktree of Fix it");
+  // Only session steps carry a model.
+  expect(steps.find((text) => text.includes("Build it"))).not.toContain("Mono default");
+});
+
+it("shows the project folder checkout for a session that sets nothing", async () => {
+  await renderPage(flagged(), "enable");
+  const fix = [...section("Steps")!.querySelectorAll("li")].find((li) =>
+    li.textContent?.includes("Session"),
+  )!;
+  expect(fix.textContent).toContain("Mono default");
+  expect(fix.textContent).toContain("Project folder");
+});

@@ -504,3 +504,29 @@ it("shows the real reason an import could not be saved", async () => {
   expect(container.querySelector("[role=alert]")!.textContent).toBe(TOO_LARGE.message);
   warn.mockRestore();
 });
+
+it("shows a session step's model and checkout before importing", async () => {
+  await renderPage();
+  const picked = source({
+    nodes: steps.map((n) =>
+      n.type === "session"
+        ? { ...n, harness: "grok", model: "grok:grok-4.5", effort: "medium", checkout: "newWorktree" as const }
+        : n,
+    ),
+  });
+  await paste(yamlOf(picked));
+  const fix = [...section("Steps")!.querySelectorAll("li")].find((li) =>
+    li.textContent?.includes("Fix failures"),
+  )!;
+  expect(fix.textContent).toContain("Harness: grok");
+  expect(fix.textContent).toContain("Model: grok:grok-4.5");
+  expect(fix.textContent).toContain("Effort: medium");
+  expect(fix.textContent).toContain("Checkout: New worktree");
+  // A file that sets nothing runs with the Mono's own model.
+  await paste(yamlOf());
+  const plain = [...section("Steps")!.querySelectorAll("li")].find((li) =>
+    li.textContent?.includes("Fix failures"),
+  )!;
+  expect(plain.textContent).toContain("Model: Mono default");
+  expect(plain.textContent).toContain("Checkout: Project folder");
+});

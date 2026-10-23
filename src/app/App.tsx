@@ -14838,6 +14838,11 @@ function Workspace({
         monoId={monoViewMono.id}
         cwd={monoViewSession.cwd}
         agent={monoLook(monoViewMono)}
+        monoModel={{
+          harness: monoViewSession.harness,
+          model: monoViewSession.model,
+          modelSettings: monoViewSession.modelSettings,
+        }}
         state={monoState(monoViewSession)}
         launches={monoLaunches}
         sessions={sessions}

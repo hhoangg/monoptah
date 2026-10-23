@@ -25,6 +25,7 @@ import {
   workflowActions,
   WorkflowsList,
 } from "../../workflows/ui/MonoWorkflows";
+import type { MonoModelDefault } from "../../workflows/ui/board/NodeInspector";
 import { WorkflowBoard } from "../../workflows/ui/board/WorkflowBoard";
 import { ImportWorkflowPage } from "../../workflows/ui/ImportWorkflowPage";
 import { WorkflowPage } from "../../workflows/ui/WorkflowPage";
@@ -97,6 +98,8 @@ type Props = {
   /** Its conversation's folder, which habits run in. */
   cwd: string;
   agent: MonoLook;
+  /** The model its conversation uses, which workflow steps start with unless they pick another. */
+  monoModel?: MonoModelDefault;
   state: MonoState;
   /** Every session it has started, oldest first. */
   launches: readonly MonoSpawnedSession[];
@@ -132,6 +135,7 @@ export function MonoOverview({
   monoId,
   cwd,
   agent,
+  monoModel,
   state,
   launches,
   sessions,
@@ -208,6 +212,7 @@ export function MonoOverview({
               monoId={monoId}
               color={agent.color}
               projects={agent.projects}
+              monoModel={monoModel}
               onBack={back}
             />
           ),
@@ -248,6 +253,7 @@ export function MonoOverview({
                 workflow={workflow}
                 color={agent.color}
                 projects={agent.projects}
+                monoModel={monoModel}
                 onBack={back}
                 onReview={(intent) =>
                   push({ kind: "workflow-review", id: route.id, intent })

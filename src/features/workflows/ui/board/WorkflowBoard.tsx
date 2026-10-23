@@ -90,7 +90,7 @@ import {
 } from "./boardModel";
 import { nodeTypes, nodeTitle } from "./boardNodes";
 import { edgeTypes } from "./LoopEdge";
-import { LoopForm, NodeInspector, type InspectorView } from "./NodeInspector";
+import { LoopForm, NodeInspector, type InspectorView, type MonoModelDefault } from "./NodeInspector";
 import { NodePicker } from "./NodePicker";
 
 type Board = { nodes: FlowNode[]; edges: FlowEdge[] };
@@ -248,6 +248,8 @@ type Props = {
   color: string;
   /** The Mono's projects, for the steps and inputs that name one. */
   projects: readonly MonoProject[];
+  /** The Mono's own model, which a session step without one of its own starts with. */
+  monoModel?: MonoModelDefault;
   onBack: () => void;
   /** Opens the review a stored workflow that needs one must pass before it can run or be enabled. */
   onReview?: (intent: ReviewIntent) => void;
@@ -265,7 +267,7 @@ export function WorkflowBoard(props: Props) {
   );
 }
 
-function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () => {} }: Props) {
+function BoardEditor({ monoId, workflow, color, projects, monoModel, onBack, onReview = () => {} }: Props) {
   const flow = useReactFlow();
   const [base, setBase] = useState<Workflow>(() => workflow ?? blankWorkflow());
   const [board, setBoard] = useState<Board>(() => boardOf(base));
@@ -833,6 +835,7 @@ function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () 
           view={view}
           workflow={current}
           projects={projects}
+          monoModel={monoModel}
           issues={view?.kind === "node" ? (byNode.get(view.id) ?? []) : []}
           onNode={updateNode}
           onSettings={(patch) => setMeta((m) => ({ ...m, ...patch }))}
