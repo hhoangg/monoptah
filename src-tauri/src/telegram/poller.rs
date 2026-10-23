@@ -246,6 +246,11 @@ fn connected_text(problem: Option<&str>) -> String {
                     posted here, one topic per session."
         .to_string();
     if let Some(problem) = problem {
+        // The problem can carry Telegram's own text, and the message is sent as HTML.
+        let problem = problem
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
         text.push_str(&format!("\n\nNote: {problem}."));
     }
     text
@@ -1605,6 +1610,20 @@ mod tests {
         assert_eq!(other.chat_id, None);
         assert!(other.topics.is_empty());
         assert!(!other.enabled);
+    }
+
+    #[test]
+    fn connected_text_escapes_the_problem() {
+        let text = connected_text(Some("<b>bad</b> & worse"));
+        assert!(
+            text.contains("Note: &lt;b&gt;bad&lt;/b&gt; &amp; worse."),
+            "{text}"
+        );
+        assert!(!text.contains("<b>"), "{text}");
+        assert_eq!(
+            connected_text(None),
+            "Connected to Monoptah. Questions from this project's sessions will be posted here, one topic per session."
+        );
     }
 
     #[test]
