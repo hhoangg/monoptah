@@ -1088,7 +1088,8 @@ impl Bridge {
             return;
         };
         match api.edit_message(chat, *message_id, html, keyboard.clone()) {
-            Ok(()) | Err(TgError::NotModified) => self.sent_ok(chat),
+            // A deleted message cannot be edited and needs no problem line.
+            Ok(()) | Err(TgError::NotModified | TgError::MessageNotFound) => self.sent_ok(chat),
             Err(error) => self.handle_send_error(chat, job, error),
         }
     }
@@ -2185,6 +2186,31 @@ mod tests {
     }
 
     #[test]
+    fn edit_of_a_deleted_message_is_done() {
+        let (base, server) = serve_script(vec![fail(
+            400,
+            "Bad Request: message to edit not found",
+            json!({}),
+        )]);
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        bridge.push_job(
+            CHAT,
+            Job::EditStatus {
+                project: "proj".into(),
+                chat: CHAT,
+                message_id: 5,
+                html: "x".into(),
+                keyboard: None,
+            },
+        );
+        drain(&bridge);
+        assert_eq!(server.join().unwrap().len(), 1, "no retry");
+        assert!(bridge.status("proj").problem.is_none());
+        assert!(bridge.lock().queue.next_wake(0).is_none());
+    }
+
+    #[test]
     fn network_error_backs_off_and_retries() {
         let (base, server) = serve_script(vec![
             (502, json!({ "ok": false })),
@@ -2207,7 +2233,11 @@ mod tests {
         let (base, server) = serve_script(vec![
             ok(json!({ "message_id": 1 })),
             ok(json!(true)),
-            fail(400, "Bad Request: message to edit not found", json!({})),
+            fail(
+                400,
+                "Forbidden: bot was kicked from the group chat",
+                json!({}),
+            ),
         ]);
         let (bridge, _sink) = bridge_with(&base);
         // Two bots in one group; "a" sorts first, so a by-chat lookup would pick its token.

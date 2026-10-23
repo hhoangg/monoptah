@@ -24,6 +24,9 @@ pub enum TgError {
     NotModified,
     /// 400 "message thread not found": the topic was deleted.
     ThreadNotFound,
+    /// 400 "message to edit not found": the message was deleted (or never existed), so
+    /// there is nothing left to edit.
+    MessageNotFound,
     /// 400 "query is too old" / "query ID is invalid".
     QueryTooOld,
     /// 409 from getUpdates. `webhook` is true when a webhook is set on the token.
@@ -220,6 +223,7 @@ pub fn classify(status: u16, body: &str) -> TgError {
         500..=599 => TgError::Network(format!("HTTP {status}")),
         _ if lowered.contains("message is not modified") => TgError::NotModified,
         _ if lowered.contains("message thread not found") => TgError::ThreadNotFound,
+        _ if lowered.contains("message to edit not found") => TgError::MessageNotFound,
         _ if lowered.contains("query is too old") || lowered.contains("query id is invalid") => {
             TgError::QueryTooOld
         }
@@ -362,6 +366,27 @@ mod tests {
     fn classifies_thread_not_found() {
         let body = error_body(400, "Bad Request: message thread not found", json!(null));
         assert_eq!(classify(400, &body), TgError::ThreadNotFound);
+    }
+
+    #[test]
+    fn classifies_message_to_edit_not_found() {
+        let body = error_body(400, "Bad Request: message to edit not found", json!(null));
+        assert_eq!(classify(400, &body), TgError::MessageNotFound);
+        // Other refusals of an edit stay permanent: only the missing message is "done".
+        let other = error_body(400, "Bad Request: message can't be edited", json!(null));
+        assert_eq!(
+            classify(400, &other),
+            TgError::Permanent("Bad Request: message can't be edited".into())
+        );
+        let reply = error_body(
+            400,
+            "Bad Request: message to be replied not found",
+            json!(null),
+        );
+        assert_eq!(
+            classify(400, &reply),
+            TgError::Permanent("Bad Request: message to be replied not found".into())
+        );
     }
 
     #[test]
