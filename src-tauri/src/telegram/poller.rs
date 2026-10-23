@@ -6,7 +6,7 @@
 
 use super::api::{BotApi, TgError, MAX_RETRY_AFTER_S};
 use super::config::{self, CodePurpose, Codes, ProjectConfig, TelegramConfig};
-use super::pending::{key_of, Effect, PendingPrompt, Receiver, Registry};
+use super::pending::{key_of, Effect, PendingPrompt, Receiver, Registry, EXPIRED};
 use super::queue::{Job, SendQueue};
 use super::render::{keyboard, question_html, status_html, ForwardPayload};
 use serde::Serialize;
@@ -990,17 +990,19 @@ impl Bridge {
             let state = self.lock();
             state.registry.prompt(key).and_then(|prompt| {
                 let project = state.cfg.projects.get(&prompt.payload.project)?;
-                let items: Vec<(usize, String, Value)> = (0..prompt.payload.questions.len())
-                    .filter(|i| prompt.messages[*i].is_none() && !prompt.done[*i])
-                    .map(|i| {
-                        let selected = &prompt.selected[i];
-                        (
-                            i,
-                            question_html(&prompt.payload, i, selected),
-                            keyboard(&prompt.tokens[i], &prompt.payload.questions[i], selected),
-                        )
-                    })
-                    .collect();
+                let items: Vec<(usize, String, String, Value)> =
+                    (0..prompt.payload.questions.len())
+                        .filter(|i| prompt.messages[*i].is_none() && !prompt.done[*i])
+                        .map(|i| {
+                            let selected = &prompt.selected[i];
+                            (
+                                i,
+                                prompt.tokens[i].clone(),
+                                question_html(&prompt.payload, i, selected),
+                                keyboard(&prompt.tokens[i], &prompt.payload.questions[i], selected),
+                            )
+                        })
+                        .collect();
                 Some((
                     prompt.payload.clone(),
                     project.topics.get(&prompt.payload.session_id).copied(),
@@ -1013,26 +1015,30 @@ impl Bridge {
             // The prompt was closed or its project removed while the job waited.
             return;
         };
-        for (index, html, markup) in items {
+        for (index, token, html, markup) in items {
             self.begin_send(chat);
             match api.send_message(chat, thread, &html, Some(markup)) {
                 Ok(message_id) => {
-                    let still_waiting = {
+                    let (stored, still_waiting) = {
                         let mut state = self.lock();
-                        state.registry.set_message(key, index, message_id);
-                        state.registry.prompt(key).is_some()
+                        let stored = state.registry.set_message(key, index, message_id, &token);
+                        (stored, state.registry.prompt(key).is_some())
                     };
-                    if !still_waiting {
-                        // Closed while the message was in flight: do not leave live buttons.
-                        let html =
-                            status_html(&payload, index, "This question is no longer waiting");
+                    if !stored {
+                        // The prompt was closed, or replaced by a new one with new tokens,
+                        // while the message was in flight: do not leave live buttons.
+                        let status = if still_waiting {
+                            EXPIRED
+                        } else {
+                            "This question is no longer waiting"
+                        };
                         self.push_job(
                             chat,
                             Job::EditStatus {
                                 project: payload.project.clone(),
                                 chat,
                                 message_id,
-                                html,
+                                html: status_html(&payload, index, status),
                                 keyboard: None,
                             },
                         );
@@ -1785,12 +1791,21 @@ mod tests {
 
     /// Serves the scripted responses in order, one connection each, and returns what it saw.
     fn serve_script(script: Vec<(u16, Value)>) -> (String, thread::JoinHandle<Vec<Recorded>>) {
+        serve_script_with(script, |_| {})
+    }
+
+    /// Like `serve_script`; `before_reply(n)` runs once request `n` was read and before it is
+    /// answered, so a test can change the bridge while a call is in flight.
+    fn serve_script_with(
+        script: Vec<(u16, Value)>,
+        before_reply: impl Fn(usize) + Send + 'static,
+    ) -> (String, thread::JoinHandle<Vec<Recorded>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let mut seen = Vec::new();
-            for (status, body) in script {
+            for (number, (status, body)) in script.into_iter().enumerate() {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
@@ -1825,6 +1840,7 @@ mod tests {
                 }
                 let mut raw = vec![0u8; length];
                 reader.read_exact(&mut raw).unwrap();
+                before_reply(number);
                 let body_text = body.to_string();
                 write!(
                     stream,
@@ -2164,6 +2180,46 @@ mod tests {
     }
 
     #[test]
+    fn message_sent_for_a_replaced_prompt_is_expired_not_adopted() {
+        let slot: Arc<std::sync::OnceLock<Arc<Bridge>>> = Arc::default();
+        let hook_slot = Arc::clone(&slot);
+        // While the first question is on the wire, the window reloads and the same key comes
+        // back as a different prompt with new tokens.
+        let (base, server) = serve_script_with(vec![ok(json!({ "message_id": 77 }))], move |_| {
+            let mut fresh = payload("s1", 1);
+            fresh.questions[0].id = "q9".into();
+            hook_slot.get().unwrap().forward("other", fresh).unwrap();
+        });
+        let (bridge, _sink) = bridge_with(&base);
+        slot.set(Arc::clone(&bridge)).ok();
+        add_project(&bridge, "proj", true);
+        bind_topic(&bridge, "proj", "s1", 42);
+        bridge.forward("main", payload("s1", 1)).unwrap();
+        assert!(bridge.pump(false));
+        server.join().unwrap();
+
+        assert_eq!(
+            bridge.lock().registry.prompt("s1#1").unwrap().messages[0],
+            None,
+            "the old message must not become the new prompt's"
+        );
+        let jobs = queued_edits(&bridge);
+        assert!(
+            jobs.iter().any(|job| matches!(
+                job,
+                Job::EditStatus { project, message_id: 77, html, keyboard: None, .. }
+                    if project == "proj" && html.contains("This question has expired")
+            )),
+            "{jobs:?}"
+        );
+        assert!(
+            jobs.iter()
+                .any(|job| matches!(job, Job::SendQuestion { key } if key == "s1#1")),
+            "the new prompt is still sent: {jobs:?}"
+        );
+    }
+
+    #[test]
     fn two_prompts_of_one_session_queue_one_topic() {
         let (bridge, _sink) = bridge_with("http://127.0.0.1:9");
         add_project(&bridge, "proj", true);
@@ -2316,7 +2372,7 @@ mod tests {
         prompt.project = "b".into();
         bridge.forward("main", prompt).unwrap();
         bridge.lock().queue = SendQueue::default();
-        bridge.lock().registry.set_message("s1#1", 0, 500);
+        bridge.lock().registry.set_message_for_test("s1#1", 0, 500);
 
         bridge.push_job(
             CHAT,
@@ -2400,7 +2456,7 @@ mod tests {
         bridge.forward("main", payload("s1", 1)).unwrap();
         let old_token = {
             let mut state = bridge.lock();
-            state.registry.set_message("s1#1", 0, 500);
+            state.registry.set_message_for_test("s1#1", 0, 500);
             state.registry.prompt("s1#1").unwrap().tokens[0].clone()
         };
         bridge.lock().queue = SendQueue::default();
@@ -2457,7 +2513,7 @@ mod tests {
         bridge.forward("main", payload("s1", 1)).unwrap();
         let token = {
             let mut state = bridge.lock();
-            state.registry.set_message("s1#1", 0, 500);
+            state.registry.set_message_for_test("s1#1", 0, 500);
             state.registry.prompt("s1#1").unwrap().tokens[0].clone()
         };
         bridge.lock().queue = SendQueue::default();
@@ -2506,7 +2562,7 @@ mod tests {
         bridge.forward("main", payload("s1", 1)).unwrap();
         let token = {
             let mut state = bridge.lock();
-            state.registry.set_message("s1#1", 0, 500);
+            state.registry.set_message_for_test("s1#1", 0, 500);
             state.registry.prompt("s1#1").unwrap().tokens[0].clone()
         };
         // Drop the queued SendQuestion so only effects of the tap remain.
@@ -2737,7 +2793,7 @@ mod tests {
         bridge.forward("main", prompt).unwrap();
         let token = {
             let mut state = bridge.lock();
-            state.registry.set_message("s1#1", 0, 500);
+            state.registry.set_message_for_test("s1#1", 0, 500);
             state.registry.prompt("s1#1").unwrap().tokens[0].clone()
         };
         bridge.lock().queue = SendQueue::default();

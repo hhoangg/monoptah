@@ -125,7 +125,7 @@ pub struct Registry {
     delivering: BTreeMap<String, Delivering>,
 }
 
-const EXPIRED: &str = "This question has expired";
+pub const EXPIRED: &str = "This question has expired";
 const MAX_CUSTOM_CHARS: usize = 2000;
 
 pub fn key_of(session_id: &str, request_id: u64) -> String {
@@ -384,14 +384,37 @@ impl Registry {
         }
     }
 
-    pub fn set_message(&mut self, key: &str, q_index: usize, message_id: i64) {
-        if let Some(slot) = self
-            .prompts
-            .get_mut(key)
-            .and_then(|prompt| prompt.messages.get_mut(q_index))
-        {
-            *slot = Some(message_id);
+    /// Records the message sent for a question, but only while the slot still has the
+    /// callback token the message was built with. A prompt that was replaced meanwhile has
+    /// new tokens, so the old message must not become the new prompt's. Returns whether the
+    /// id was stored.
+    pub fn set_message(
+        &mut self,
+        key: &str,
+        q_index: usize,
+        message_id: i64,
+        expected_token: &str,
+    ) -> bool {
+        let Some(prompt) = self.prompts.get_mut(key) else {
+            return false;
+        };
+        if prompt.tokens.get(q_index).map(String::as_str) != Some(expected_token) {
+            return false;
         }
+        match prompt.messages.get_mut(q_index) {
+            Some(slot) => {
+                *slot = Some(message_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Test shortcut: stores a message id under the slot's own current token.
+    #[cfg(test)]
+    pub fn set_message_for_test(&mut self, key: &str, q_index: usize, message_id: i64) {
+        let token = self.prompts[key].tokens[q_index].clone();
+        assert!(self.set_message(key, q_index, message_id, &token));
     }
 
     /// The desktop answered, skipped or cancelled the prompt (or it expired).
@@ -856,9 +879,33 @@ mod tests {
         let key = reg.insert(prompt);
         let base = 100 * (reg.prompts.len() as i64);
         for i in 0..count {
-            reg.set_message(&key, i, base + i as i64);
+            let token = reg.prompts[&key].tokens[i].clone();
+            assert!(reg.set_message(&key, i, base + i as i64, &token));
         }
         key
+    }
+
+    #[test]
+    fn set_message_needs_the_slots_current_token() {
+        let mut reg = Registry::default();
+        let key = add(&mut reg, "s", 1, vec![question("q1", false, false)]);
+        let old = token(&reg, &key, 0);
+        // The same key comes back as a new prompt with new tokens.
+        reg.expire(&key);
+        let fresh = PendingPrompt::new(
+            WINDOW.into(),
+            payload("s", 1, vec![question("q1", false, false)]),
+            CHAT,
+            BOT.into(),
+        );
+        reg.insert(fresh);
+        assert!(!reg.set_message(&key, 0, 900, &old), "stale token");
+        assert_eq!(reg.prompts[&key].messages[0], None);
+        assert!(!reg.set_message("missing#1", 0, 900, &old));
+        assert!(!reg.set_message(&key, 5, 900, &old), "no such question");
+        let current = token(&reg, &key, 0);
+        assert!(reg.set_message(&key, 0, 901, &current));
+        assert_eq!(msg_id(&reg, &key, 0), 901);
     }
 
     fn token(reg: &Registry, key: &str, q: usize) -> String {
