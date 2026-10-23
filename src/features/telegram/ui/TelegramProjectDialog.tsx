@@ -26,7 +26,7 @@ type Props = {
 const POLL_MS = 3000;
 const WEBHOOK_PROBLEM = "This bot has a webhook";
 const CHANGE_TOKEN_NOTE =
-  "A token for the same bot keeps the group and topic links. A different bot clears the group and topic links, and questions already sent stop working.";
+  "A token for the same bot keeps the group and topic links. A different bot clears the group and topic links, turns Forward questions off, and questions already sent stop working.";
 const DISCONNECT_NOTE =
   "Topic links will be lost and questions already sent stop working.";
 const OPEN_GROUP_NOTE =

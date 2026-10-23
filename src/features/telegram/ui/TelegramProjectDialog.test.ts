@@ -407,7 +407,7 @@ describe("telegram project dialog", () => {
         "A token for the same bot keeps the group and topic links.",
       );
       expect(dialog().textContent).toContain(
-        "A different bot clears the group and topic links, and questions already sent stop working.",
+        "A different bot clears the group and topic links, turns Forward questions off, and questions already sent stop working.",
       );
     });
 

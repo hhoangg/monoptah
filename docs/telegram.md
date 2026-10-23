@@ -42,7 +42,8 @@ Select **Change token** next to the bot name to paste a new token. The token is
 checked first; a rejected token leaves everything as it was. A new token for the
 **same bot** (for example after revoking it in BotFather) keeps the group and the topic
 links. A token for a **different bot** starts clean: the group connection and the topic
-links are cleared, and questions already sent stop working, so connect a group again.
+links are cleared, **Forward questions** is switched off, and questions already sent
+stop working, so connect a group again and switch **Forward questions** back on.
 
 **Disconnect** asks for confirmation first. It removes the bot token, the group and
 the topic links, and questions already sent stop working. Messages already in Telegram

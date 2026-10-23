@@ -1013,6 +1013,7 @@ impl Bridge {
                 let project = state.cfg.projects.get(&prompt.payload.project)?;
                 let selected = &prompt.selected[q_index];
                 Some((
+                    project.bot_id,
                     prompt.payload.clone(),
                     project.topics.get(&prompt.payload.session_id).copied(),
                     self.api(&project.token),
@@ -1026,7 +1027,7 @@ impl Bridge {
                 ))
             })
         };
-        let Some((payload, thread, api, token, html, markup)) = plan else {
+        let Some((bot_id, payload, thread, api, token, html, markup)) = plan else {
             // The prompt was closed or its project removed while the job waited.
             return;
         };
@@ -1039,6 +1040,19 @@ impl Bridge {
                     (stored, state.registry.prompt(key).is_some())
                 };
                 if stored {
+                    self.sent_ok(chat);
+                    return;
+                }
+                // The project switched to another bot (or was removed) while the message
+                // was in flight. The old bot is gone, so an edit would go out through the
+                // new one and fail.
+                let same_bot = self
+                    .lock()
+                    .cfg
+                    .projects
+                    .get(&payload.project)
+                    .is_some_and(|p| p.bot_id == bot_id);
+                if !same_bot {
                     self.sent_ok(chat);
                     return;
                 }
@@ -1384,11 +1398,13 @@ impl Bridge {
         Ok(status)
     }
 
-    /// Forgets the pending prompts of a project and the jobs queued for them.
+    /// Forgets the pending prompts of a project and every job queued for it.
     fn drop_project_prompts(&self, state: &mut State, project: &str) {
-        for key in state.registry.discard_project(project) {
-            state.queue.purge_questions(&key);
-        }
+        let keys = state.registry.discard_project(project);
+        // Edits and notices of the project resolve their token through the project, which
+        // may now be another bot, so none of them may stay queued.
+        state.queue.purge_project(project, &keys);
+        state.topics_pending.retain(|(owner, _)| owner != project);
     }
 
     pub fn disconnect(self: &Arc<Self>, project: &str) {
@@ -1759,6 +1775,105 @@ mod tests {
         assert!(
             !jobs.iter().any(|job| matches!(job, Job::EditStatus { .. })),
             "the old token is gone, so no edit may go out through the new bot: {jobs:?}"
+        );
+    }
+
+    fn queue_is_empty(bridge: &Arc<Bridge>) -> bool {
+        let mut state = bridge.lock();
+        state.queue.next_ready(u64::MAX / 2).is_none()
+    }
+
+    #[test]
+    fn a_bot_change_drops_every_queued_job_of_the_project() {
+        // No scripted response: any HTTP call would fail and leave a failure behind.
+        let (base, server) = serve_script(vec![]);
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        // No bound topic: forwarding queues a topic job and a question job.
+        bridge.forward("main", payload("s1", 1)).unwrap();
+        bridge.push_job(
+            CHAT,
+            Job::EditStatus {
+                project: "proj".into(),
+                chat: CHAT,
+                message_id: 9,
+                html: "Answered".into(),
+                keyboard: None,
+            },
+        );
+        bridge.push_job(
+            CHAT,
+            Job::Notice {
+                project: "proj".into(),
+                thread: None,
+                html: "Linked".into(),
+            },
+        );
+
+        bridge.store_token("proj", "999:new", 999, "new_bot");
+        for _ in 0..3 {
+            while bridge.pump(false) {}
+        }
+        server.join().unwrap();
+
+        let state = bridge.lock();
+        assert!(state.failures.is_empty(), "no request went out");
+        assert!(
+            state.cfg.projects["proj"].problem.is_none(),
+            "{:?}",
+            state.cfg.projects["proj"].problem
+        );
+        assert!(state.topics_pending.is_empty(), "slot released");
+        drop(state);
+        assert!(queue_is_empty(&bridge));
+    }
+
+    #[test]
+    fn a_bot_change_leaves_other_projects_jobs_queued() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:1");
+        forwarded_for(&bridge, "proj", "s1");
+        forwarded_for(&bridge, "other", "s2");
+        bridge.push_job(
+            CHAT,
+            Job::Notice {
+                project: "other".into(),
+                thread: None,
+                html: "Linked".into(),
+            },
+        );
+
+        bridge.store_token("proj", "999:new", 999, "new_bot");
+
+        let jobs = queued_edits(&bridge);
+        assert_eq!(jobs.len(), 2, "{jobs:?}");
+        assert!(jobs
+            .iter()
+            .any(|job| matches!(job, Job::Notice { project, .. } if project == "other")));
+    }
+
+    #[test]
+    fn a_send_in_flight_when_the_bot_changes_makes_no_edit() {
+        let slot: Arc<std::sync::OnceLock<Arc<Bridge>>> = Arc::default();
+        let hook_slot = Arc::clone(&slot);
+        // The message goes out with the old bot; the project switches bots before the reply.
+        let (base, server) = serve_script_with(vec![ok(json!({ "message_id": 77 }))], move |_| {
+            hook_slot
+                .get()
+                .unwrap()
+                .store_token("proj", "999:new", 999, "new_bot");
+        });
+        let (bridge, _sink) = bridge_with(&base);
+        slot.set(Arc::clone(&bridge)).ok();
+        add_project(&bridge, "proj", true);
+        bind_topic(&bridge, "proj", "s1", 42);
+        bridge.forward("main", payload("s1", 1)).unwrap();
+        assert!(bridge.pump(false));
+        server.join().unwrap();
+
+        let jobs = queued_edits(&bridge);
+        assert!(
+            !jobs.iter().any(|job| matches!(job, Job::EditStatus { .. })),
+            "an edit would go out through the new bot: {jobs:?}"
         );
     }
 
