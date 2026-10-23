@@ -279,6 +279,14 @@ pub trait EventSink: Send + Sync {
     fn emit_to(&self, window: &str, event: &str, payload: Value) -> bool;
 }
 
+/// Whose bot a batch of registry effects belongs to.
+enum Owner<'a> {
+    /// The project that owns the prompt.
+    Project(&'a str),
+    /// The bot token that received the update.
+    Token(&'a str),
+}
+
 struct Poller {
     stop: Arc<AtomicBool>,
 }
@@ -380,17 +388,6 @@ impl Bridge {
         (!token.is_empty()).then(|| self.api(token))
     }
 
-    /// Any project connected to `chat` knows the token to use for it.
-    fn api_for_chat(&self, chat: i64) -> Option<BotApi> {
-        let state = self.lock();
-        state
-            .cfg
-            .projects
-            .values()
-            .find(|p| p.chat_id == Some(chat) && !p.token.is_empty())
-            .map(|p| self.api(&p.token))
-    }
-
     // ----- problems -----
 
     fn set_problem(&self, state: &mut State, project: &str, text: &str) {
@@ -401,17 +398,25 @@ impl Bridge {
         self.persist(state);
     }
 
-    fn set_problem_for_chat(&self, chat: i64, text: &str) {
-        let mut state = self.lock();
-        let names: Vec<String> = state
-            .cfg
-            .projects
-            .iter()
-            .filter(|(_, p)| p.chat_id == Some(chat))
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in names {
-            self.set_problem(&mut state, &name, text);
+    /// The project a queued job belongs to, i.e. the bot that sends it.
+    fn job_project(&self, job: &Job) -> Option<String> {
+        match job {
+            Job::CreateTopic { project, .. }
+            | Job::EditStatus { project, .. }
+            | Job::Notice { project, .. } => Some(project.clone()),
+            Job::SendQuestion { key } => self
+                .lock()
+                .registry
+                .prompt(key)
+                .map(|p| p.payload.project.clone()),
+        }
+    }
+
+    /// Puts the problem on the project that owns the job, not on every project in the chat.
+    fn set_problem_for_job(&self, job: &Job, text: &str) {
+        if let Some(project) = self.job_project(job) {
+            let mut state = self.lock();
+            self.set_problem(&mut state, &project, text);
         }
     }
 
@@ -573,7 +578,7 @@ impl Bridge {
                 other => rest.push(other),
             }
         }
-        self.apply_effects(rest);
+        self.apply_effects(rest, Owner::Token(token));
     }
 
     /// A Connect code was used in `chat`. It must have been issued by a project of the bot
@@ -604,6 +609,7 @@ impl Bridge {
         self.push_job(
             chat,
             Job::Notice {
+                project: project.to_string(),
                 thread: None,
                 html: connected_text(problem.as_deref()),
             },
@@ -642,6 +648,7 @@ impl Bridge {
         self.push_job(
             chat,
             Job::Notice {
+                project: project.to_string(),
                 thread: Some(thread),
                 html: html.to_string(),
             },
@@ -694,6 +701,18 @@ impl Bridge {
 
     // ----- effects and deliveries -----
 
+    /// The project whose bot sent `chat`'s message: the poller's token names the bot that
+    /// received the tap or reply, which is the bot that owns the message.
+    fn project_for_token_chat(&self, token: &str, chat: i64) -> String {
+        let state = self.lock();
+        let own = || state.cfg.projects.iter().filter(|(_, p)| p.token == token);
+        own()
+            .find(|(_, p)| p.chat_id == Some(chat))
+            .or_else(|| own().next())
+            .map(|(name, _)| name.clone())
+            .unwrap_or_default()
+    }
+
     fn push_job(&self, chat: i64, job: Job) {
         self.lock().queue.push(chat, job);
         self.wake.notify_all();
@@ -701,7 +720,11 @@ impl Bridge {
 
     /// Queues the edits and replies a registry call asked for and hands finished prompts to
     /// their window. Callback answers, Connect and Link are handled by `process_update`.
-    fn apply_effects(&self, effects: Vec<Effect>) {
+    fn apply_effects(&self, effects: Vec<Effect>, owner: Owner<'_>) {
+        let project_of = |chat: i64| match &owner {
+            Owner::Project(name) => name.to_string(),
+            Owner::Token(token) => self.project_for_token_chat(token, chat),
+        };
         for effect in effects {
             match effect {
                 Effect::Edit {
@@ -712,15 +735,21 @@ impl Bridge {
                 } => self.push_job(
                     chat,
                     Job::EditStatus {
+                        project: project_of(chat),
                         chat,
                         message_id,
                         html,
                         keyboard,
                     },
                 ),
-                Effect::Reply { chat, thread, html } => {
-                    self.push_job(chat, Job::Notice { thread, html })
-                }
+                Effect::Reply { chat, thread, html } => self.push_job(
+                    chat,
+                    Job::Notice {
+                        project: project_of(chat),
+                        thread,
+                        html,
+                    },
+                ),
                 Effect::Deliver {
                     window,
                     session_id,
@@ -757,12 +786,19 @@ impl Bridge {
 
     /// The window's verdict on a delivered reply.
     pub fn answer_result(&self, key: &str, ok: bool) {
-        let effects = {
+        // The prompt is forgotten by `delivered`, so its project is read first.
+        let (effects, project) = {
             let mut state = self.lock();
             state.deliveries.remove(key);
-            state.registry.delivered(key, ok)
+            let project = state
+                .registry
+                .prompt(key)
+                .map(|p| p.payload.project.clone());
+            (state.registry.delivered(key, ok), project)
         };
-        self.apply_effects(effects);
+        if let Some(project) = project {
+            self.apply_effects(effects, Owner::Project(&project));
+        }
     }
 
     /// Treats every reply not confirmed in time as failed, so no prompt stays behind.
@@ -912,6 +948,7 @@ impl Bridge {
                         self.push_job(
                             chat,
                             Job::EditStatus {
+                                project: payload.project.clone(),
                                 chat,
                                 message_id,
                                 html,
@@ -968,6 +1005,7 @@ impl Bridge {
 
     fn run_edit(&self, chat: i64, job: Job) {
         let Job::EditStatus {
+            project,
             message_id,
             html,
             keyboard,
@@ -976,7 +1014,8 @@ impl Bridge {
         else {
             return;
         };
-        let Some(api) = self.api_for_chat(chat) else {
+        // The bot that sent the message is the only one that can edit it.
+        let Some(api) = self.api_for_project(project) else {
             return;
         };
         match api.edit_message(chat, *message_id, html, keyboard.clone()) {
@@ -986,10 +1025,15 @@ impl Bridge {
     }
 
     fn run_notice(&self, chat: i64, job: Job) {
-        let Job::Notice { thread, html } = &job else {
+        let Job::Notice {
+            project,
+            thread,
+            html,
+        } = &job
+        else {
             return;
         };
-        let Some(api) = self.api_for_chat(chat) else {
+        let Some(api) = self.api_for_project(project) else {
             return;
         };
         match api.send_message(chat, *thread, html, None) {
@@ -1040,11 +1084,13 @@ impl Bridge {
                 self.migrate_chat(chat, new_chat);
                 let job = match job {
                     Job::EditStatus {
+                        project,
                         message_id,
                         html,
                         keyboard,
                         ..
                     } => Job::EditStatus {
+                        project,
                         chat: new_chat,
                         message_id,
                         html,
@@ -1056,7 +1102,7 @@ impl Bridge {
             }
             TgError::NotModified => self.sent_ok(chat),
             TgError::Unauthorized => {
-                self.set_problem_for_chat(chat, PROBLEM_TOKEN_REJECTED);
+                self.set_problem_for_job(&job, PROBLEM_TOKEN_REJECTED);
                 self.drop_job(job);
             }
             other => {
@@ -1064,7 +1110,7 @@ impl Bridge {
                     TgError::Permanent(text) => text.clone(),
                     _ => describe_error(&other),
                 };
-                self.set_problem_for_chat(chat, &refused_problem(&description));
+                self.set_problem_for_job(&job, &refused_problem(&description));
                 self.drop_job(job);
             }
         }
@@ -1075,22 +1121,28 @@ impl Bridge {
     fn drop_job(&self, job: Job) {
         self.release_job(&job);
         if let Job::SendQuestion { key } = &job {
-            let effects = {
+            let (effects, project) = {
                 let mut state = self.lock();
-                let ids = state
-                    .registry
-                    .prompt(key)
-                    .map(|p| (p.payload.session_id.clone(), p.payload.request_id));
+                let ids = state.registry.prompt(key).map(|p| {
+                    (
+                        p.payload.session_id.clone(),
+                        p.payload.request_id,
+                        p.payload.project.clone(),
+                    )
+                });
                 match ids {
-                    Some((session_id, request_id)) => state.registry.close(
-                        &session_id,
-                        request_id,
-                        "Could not be sent to Telegram",
+                    Some((session_id, request_id, project)) => (
+                        state.registry.close(
+                            &session_id,
+                            request_id,
+                            "Could not be sent to Telegram",
+                        ),
+                        project,
                     ),
-                    None => Vec::new(),
+                    None => return,
                 }
             };
-            self.apply_effects(effects);
+            self.apply_effects(effects, Owner::Project(&project));
         }
     }
 
@@ -1309,8 +1361,21 @@ impl Bridge {
 
     /// The desktop answered, skipped or cancelled a forwarded question.
     pub fn question_closed(&self, session_id: &str, request_id: u64, status: &str) {
-        let effects = self.lock().registry.close(session_id, request_id, status);
-        self.apply_effects(effects);
+        let key = key_of(session_id, request_id);
+        let (effects, project) = {
+            let mut state = self.lock();
+            let project = state
+                .registry
+                .prompt(&key)
+                .map(|p| p.payload.project.clone());
+            (
+                state.registry.close(session_id, request_id, status),
+                project,
+            )
+        };
+        if let Some(project) = project {
+            self.apply_effects(effects, Owner::Project(&project));
+        }
     }
 }
 
@@ -1596,7 +1661,6 @@ mod tests {
     struct Recorded {
         line: String,
         body: Value,
-        at: Instant,
     }
 
     /// Serves the scripted responses in order, one connection each, and returns what it saw.
@@ -1620,7 +1684,6 @@ mod tests {
                         Err(error) => panic!("{error}"),
                     }
                 };
-                let at = Instant::now();
                 stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
@@ -1652,7 +1715,6 @@ mod tests {
                 seen.push(Recorded {
                     line,
                     body: serde_json::from_slice(&raw).unwrap_or(Value::Null),
-                    at,
                 });
             }
             seen
@@ -1700,11 +1762,13 @@ mod tests {
 
     #[test]
     fn sender_retries_after_429() {
+        // retry_after is 3 s, well above the queue's normal 1 s spacing, so only the pause
+        // from the 429 can hold the retry back.
         let (base, server) = serve_script(vec![
             fail(
                 429,
-                "Too Many Requests: retry after 1",
-                json!({ "retry_after": 1 }),
+                "Too Many Requests: retry after 3",
+                json!({ "retry_after": 3 }),
             ),
             ok(json!({ "message_id": 77 })),
         ]);
@@ -1712,22 +1776,23 @@ mod tests {
         add_project(&bridge, "proj", true);
         bind_topic(&bridge, "proj", "s1", 42);
         bridge.forward("main", payload("s1", 1)).unwrap();
+        let has_message =
+            |bridge: &Arc<Bridge>| bridge.lock().registry.prompt("s1#1").unwrap().messages[0];
 
-        // Real clock on purpose: the retry has to wait out the 1 s from Telegram.
-        let started = Instant::now();
-        while bridge.lock().registry.prompt("s1#1").unwrap().messages[0].is_none() {
-            bridge.pump(false);
-            assert!(started.elapsed() < Duration::from_secs(5), "never retried");
-            thread::sleep(Duration::from_millis(20));
-        }
+        // Injected clock: no real waiting.
+        assert!(bridge.pump(false), "first send goes out");
+        assert_eq!(has_message(&bridge), None);
+        bridge.skew_ms.fetch_add(1_500, Ordering::Relaxed);
+        assert!(!bridge.pump(false), "still paused 1.5 s after a 3 s 429");
+        bridge.skew_ms.fetch_add(1_000, Ordering::Relaxed);
+        assert!(!bridge.pump(false), "still paused 2.5 s after a 3 s 429");
+        bridge.skew_ms.fetch_add(700, Ordering::Relaxed);
+        assert!(bridge.pump(false), "retried once the 3 s have passed");
+
         let seen = server.join().unwrap();
         assert_eq!(seen.len(), 2);
-        assert!(seen[1].at.duration_since(seen[0].at) >= Duration::from_millis(1000));
         assert_eq!(seen[1].body["message_thread_id"], 42);
-        assert_eq!(
-            bridge.lock().registry.prompt("s1#1").unwrap().messages[0],
-            Some(77)
-        );
+        assert_eq!(has_message(&bridge), Some(77));
     }
 
     #[test]
@@ -1888,6 +1953,7 @@ mod tests {
         bridge.push_job(
             CHAT,
             Job::EditStatus {
+                project: "proj".into(),
                 chat: CHAT,
                 message_id: 5,
                 html: "x".into(),
@@ -1915,6 +1981,63 @@ mod tests {
             bridge.lock().registry.prompt("s1#1").unwrap().messages[0],
             Some(4)
         );
+    }
+
+    #[test]
+    fn edits_and_notices_use_the_owning_projects_bot() {
+        let (base, server) = serve_script(vec![
+            ok(json!({ "message_id": 1 })),
+            ok(json!(true)),
+            fail(400, "Bad Request: message to edit not found", json!({})),
+        ]);
+        let (bridge, _sink) = bridge_with(&base);
+        // Two bots in one group; "a" sorts first, so a by-chat lookup would pick its token.
+        for (name, token) in [("a", "111111:AAA"), ("b", "222222:BBB")] {
+            add_project(&bridge, name, true);
+            bridge.lock().cfg.projects.get_mut(name).unwrap().token = token.into();
+        }
+        let mut prompt = payload("s1", 1);
+        prompt.project = "b".into();
+        bridge.forward("main", prompt).unwrap();
+        bridge.lock().queue = SendQueue::default();
+        bridge.lock().registry.set_message("s1#1", 0, 500);
+
+        bridge.push_job(
+            CHAT,
+            Job::Notice {
+                project: "b".into(),
+                thread: None,
+                html: "hello".into(),
+            },
+        );
+        bridge.question_closed("s1", 1, "Skipped");
+        bridge.push_job(
+            CHAT,
+            Job::EditStatus {
+                project: "a".into(),
+                chat: CHAT,
+                message_id: 600,
+                html: "x".into(),
+                keyboard: None,
+            },
+        );
+        drain(&bridge);
+
+        let seen = server.join().unwrap();
+        let lines: Vec<&str> = seen.iter().map(|r| r.line.as_str()).collect();
+        assert!(lines[0].contains("/bot222222:BBB/sendMessage"), "{lines:?}");
+        assert!(
+            lines[1].contains("/bot222222:BBB/editMessageText"),
+            "{lines:?}"
+        );
+        assert_eq!(seen[1].body["message_id"], 500);
+        assert!(
+            lines[2].contains("/bot111111:AAA/editMessageText"),
+            "{lines:?}"
+        );
+        // The refused edit belongs to "a" only.
+        assert!(bridge.status("a").problem.is_some());
+        assert!(bridge.status("b").problem.is_none());
     }
 
     // ----- forwarding guards -----
@@ -2085,7 +2208,7 @@ mod tests {
         assert!(status.problem.is_none());
         let jobs = queued_edits(&bridge);
         assert!(
-            matches!(&jobs[..], [Job::Notice { thread: None, html }] if html.contains("Connected")),
+            matches!(&jobs[..], [Job::Notice { thread: None, html, .. }] if html.contains("Connected")),
             "{jobs:?}"
         );
     }

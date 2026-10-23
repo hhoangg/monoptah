@@ -30,6 +30,8 @@ pub enum Job {
     /// Rewrites a forwarded message. `keyboard` is `None` once the question is settled, so
     /// the buttons disappear; an open multi-select question keeps its (updated) keyboard.
     EditStatus {
+        /// Project whose bot sent the message; it must also edit it.
+        project: String,
         chat: i64,
         message_id: i64,
         html: String,
@@ -37,7 +39,12 @@ pub enum Job {
     },
     /// A plain message into the chat (command replies, confirmations). The chat is the
     /// queue's own chat, so it cannot go stale when a group migrates.
-    Notice { thread: Option<i64>, html: String },
+    Notice {
+        /// Project whose bot sends the message.
+        project: String,
+        thread: Option<i64>,
+        html: String,
+    },
 }
 
 impl Job {
@@ -215,6 +222,7 @@ mod tests {
 
     fn edit(chat: i64, message_id: i64, html: &str) -> Job {
         Job::EditStatus {
+            project: String::new(),
             chat,
             message_id,
             html: html.into(),
