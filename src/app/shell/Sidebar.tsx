@@ -1605,7 +1605,7 @@ function SidebarComponent({
           {
             kind: "item" as const,
             id: "link-telegram-topic",
-            label: "Link Telegram topic...",
+            label: "Link Telegram topic…",
           },
         ]
       : []),

@@ -122,7 +122,7 @@ export function projectMenuExtraItems(
       icon: ImagePlus,
     },
     ...(canForwardQuestions
-      ? [{ id: "telegram-settings", label: "Telegram...", icon: Send }]
+      ? [{ id: "telegram-settings", label: "Telegram…", icon: Send }]
       : []),
     ...(railOptions
       ? [

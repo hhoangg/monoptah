@@ -18,7 +18,7 @@ function items(canForwardQuestions: boolean) {
 describe("project menu Telegram item", () => {
   it("is offered for projects that can forward questions", () => {
     const item = items(true).find((entry) => entry.id === "telegram-settings");
-    expect(item?.label).toBe("Telegram...");
+    expect(item?.label).toBe("Telegram…");
   });
 
   it("is hidden for remote projects", () => {

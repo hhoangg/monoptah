@@ -21,10 +21,14 @@ let container: HTMLDivElement;
 let topic: number | null;
 let codes: string[];
 let linkError: string | null;
+let topicError: string | null;
 
 function mockInvoke() {
   vi.mocked(invoke).mockImplementation(async (command) => {
-    if (command === "telegram_session_topic") return topic;
+    if (command === "telegram_session_topic") {
+      if (topicError) throw topicError;
+      return topic;
+    }
     if (command === "telegram_link_code") {
       if (linkError) throw linkError;
       const code = codes.shift() ?? "LATE";
@@ -68,6 +72,7 @@ beforeEach(() => {
   topic = null;
   codes = ["CODE1", "CODE2"];
   linkError = null;
+  topicError = null;
   vi.mocked(invoke).mockReset();
   vi.mocked(copyText).mockClear();
   mockInvoke();
@@ -121,6 +126,29 @@ describe("link telegram topic dialog", () => {
     });
     expect(dialog().textContent).toContain("Linked");
     expect(dialog().querySelector("code")).toBeNull();
+  });
+
+  it("keeps polling after the first read failed and then detects the link", async () => {
+    vi.useFakeTimers();
+    topicError = "Telegram is busy";
+    await renderDialog();
+    expect(topicCalls()).toHaveLength(1);
+
+    // The retry reads the baseline; it cannot tell a link from it.
+    topicError = null;
+    topic = 5;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(topicCalls()).toHaveLength(2);
+    expect(dialog().textContent).not.toContain("Linked");
+    expect(dialog().querySelector('[role="alert"]')).toBeNull();
+
+    topic = 9;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(dialog().textContent).toContain("Linked");
   });
 
   it("shows linked when a session without a topic gets one", async () => {

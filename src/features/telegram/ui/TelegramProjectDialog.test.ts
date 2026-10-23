@@ -242,7 +242,7 @@ describe("telegram project dialog", () => {
       "Forwarding is off. Turn it on to send questions that wait more than 5 minutes.",
     );
     const toggle = dialog().querySelector<HTMLElement>('[role="switch"]')!;
-    expect(toggle.getAttribute("aria-label")).toBe("Enabled");
+    expect(toggle.getAttribute("aria-label")).toBe("Forward questions");
     expect(toggle.getAttribute("aria-checked")).toBe("false");
 
     await act(async () => toggle.click());
@@ -259,6 +259,21 @@ describe("telegram project dialog", () => {
 
     expect(dialog().textContent).toContain("Forward questions");
     expect(dialog().textContent).not.toContain("Forwarding is off");
+  });
+
+  it("never renders Connected to with an empty chat title", async () => {
+    status = { ...CONNECTED, chatTitle: "" };
+    await renderDialog();
+
+    expect(dialog().textContent).toContain("Connected to this group");
+    expect(dialog().textContent).not.toMatch(/Connected to\s*$/m);
+  });
+
+  it("falls back for a blank chat title", async () => {
+    status = { ...CONNECTED, chatTitle: "   " };
+    await renderDialog();
+
+    expect(dialog().textContent).toContain("Connected to this group");
   });
 
   it("shows admin note when bot cannot manage topics", async () => {

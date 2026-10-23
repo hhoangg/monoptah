@@ -125,7 +125,7 @@ describe("sidebar Telegram topic link", () => {
     expect(invoke).toHaveBeenCalledWith("telegram_status", {
       project: "/workspace/project",
     });
-    const item = menuItem("Link Telegram topic...");
+    const item = menuItem("Link Telegram topic…");
     expect(item).toBeDefined();
 
     await act(async () => item!.click());
@@ -144,7 +144,7 @@ describe("sidebar Telegram topic link", () => {
     await openMenu();
 
     expect(menuItem("Rename")).toBeDefined();
-    expect(menuItem("Link Telegram topic...")).toBeUndefined();
+    expect(menuItem("Link Telegram topic…")).toBeUndefined();
   });
 
   it("hides the link when no group is connected yet", async () => {
@@ -152,7 +152,7 @@ describe("sidebar Telegram topic link", () => {
     await renderSidebar();
     await openMenu();
 
-    expect(menuItem("Link Telegram topic...")).toBeUndefined();
+    expect(menuItem("Link Telegram topic…")).toBeUndefined();
   });
 
   it("hides the link for a saved terminal session, built the way the app builds its rows", async () => {
@@ -168,7 +168,7 @@ describe("sidebar Telegram topic link", () => {
     await openMenu();
 
     expect(menuItem("Rename")).toBeDefined();
-    expect(menuItem("Link Telegram topic...")).toBeUndefined();
+    expect(menuItem("Link Telegram topic…")).toBeUndefined();
     expect(invoke).not.toHaveBeenCalledWith(
       "telegram_status",
       expect.anything(),
@@ -185,6 +185,6 @@ describe("sidebar Telegram topic link", () => {
     await openMenu();
 
     expect(menuItem("Rename")).toBeDefined();
-    expect(menuItem("Link Telegram topic...")).toBeUndefined();
+    expect(menuItem("Link Telegram topic…")).toBeUndefined();
   });
 });

@@ -71,33 +71,38 @@ export function LinkTelegramTopicDialog({
   }, [link]);
 
   // A successful /link changes the stored binding, so compare with the topic
-  // the session had when the dialog opened.
+  // the session had when the dialog opened. A failed read leaves the baseline
+  // unknown; the next tick reads it again instead of giving up on polling.
   useEffect(() => {
     let disposed = false;
-    let timer: number | undefined;
-    const start = async () => {
-      let baseline: number | null;
-      try {
-        baseline = await telegramSessionTopic(project, sessionId);
-      } catch (cause) {
-        if (!disposed) setError(errorText(cause));
-        return;
-      }
+    let baseline: number | null | undefined;
+    let readError: string | null = null;
+    const fail = (cause: unknown) => {
       if (disposed) return;
-      timer = window.setInterval(() => {
-        void telegramSessionTopic(project, sessionId).then(
-          (topic) => {
-            if (disposed || topic == null || topic === baseline) return;
-            window.clearInterval(timer);
-            setLinked(true);
-          },
-          (cause) => {
-            if (!disposed) setError(errorText(cause));
-          },
-        );
-      }, POLL_MS);
+      readError = errorText(cause);
+      setError(readError);
     };
-    void start();
+    const recovered = () => {
+      if (readError === null) return;
+      const stale = readError;
+      readError = null;
+      setError((current) => (current === stale ? null : current));
+    };
+    const poll = () => {
+      void telegramSessionTopic(project, sessionId).then((topic) => {
+        if (disposed) return;
+        recovered();
+        if (baseline === undefined) {
+          baseline = topic;
+          return;
+        }
+        if (topic == null || topic === baseline) return;
+        window.clearInterval(timer);
+        setLinked(true);
+      }, fail);
+    };
+    const timer = window.setInterval(poll, POLL_MS);
+    poll();
     return () => {
       disposed = true;
       window.clearInterval(timer);

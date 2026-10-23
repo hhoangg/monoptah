@@ -277,11 +277,11 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
             ) : (
               <>
                 <p className="text-[13px] font-medium text-content">
-                  {`Connected to ${status.chatTitle ?? "a group"}`}
+                  {`Connected to ${status.chatTitle?.trim() || "this group"}`}
                 </p>
                 <Row label="Forward questions">
                   <Toggle
-                    label="Enabled"
+                    label="Forward questions"
                     on={status.enabled}
                     disabled={busy}
                     onChange={(next) => void setEnabled(next)}

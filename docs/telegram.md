@@ -6,7 +6,7 @@ Everything else stays in the app.
 
 ## Setup
 
-Telegram is set up per project. Right-click a project and choose **Telegram...**.
+Telegram is set up per project. Right-click a project and choose **Telegram…**.
 
 1. **Create a bot.** Open [@BotFather](https://t.me/BotFather) in Telegram, send
    `/newbot`, and follow the prompts. Copy the bot token it gives you.
@@ -21,14 +21,14 @@ Telegram is set up per project. Right-click a project and choose **Telegram...**
    the group. If the link does not work, send the shown command (for example
    `/connect@your_bot CODE`) in the group instead. The dialog switches to
    "Connected to <group>" once the bot is in.
-6. **Turn on Enabled.** Connecting a group does not start forwarding. Switch on
-   **Forward questions** (the **Enabled** switch); it starts off. Switch it off again
-   at any time to pause forwarding without disconnecting.
+6. **Turn on Forward questions.** Connecting a group does not start forwarding. Switch
+   on **Forward questions**; it starts off. Switch it off again at any time to pause
+   forwarding without disconnecting.
 7. **Check the status.** The dialog shows whether Topics are on and whether the bot
    can manage topics, and explains what to fix if not.
 
 To use a topic you already have, open the session's menu and choose **Link Telegram
-topic...**. The dialog shows a command like `/link@your_bot CODE`. Send it inside the
+topic…**. The dialog shows a command like `/link@your_bot CODE`. Send it inside the
 topic you want to use (not in General); the bot confirms in that topic and the dialog
 shows **Linked**. The code is valid for 15 minutes; select **New code** if it expires.
 You can link a session before or after it first asks a question. The menu item appears
@@ -62,7 +62,7 @@ only saved may still show it, but its questions are never forwarded.
   cannot be answered from Telegram.
 - **Not forwarded:** remote (SSH) projects, TUI sessions, Mono chats, and
   orchestration workers (their lead answers them). The project menu hides
-  **Telegram...** for remote projects.
+  **Telegram…** for remote projects.
 - Topic names are cut to Telegram's 128 character limit.
 
 ## Do not run two apps on one bot
