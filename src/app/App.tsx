@@ -831,6 +831,7 @@ import {
   type InboxItem,
 } from "../features/inbox/model/githubTasks";
 import { setSessionTicket } from "../features/telegram/model/sessionTicket";
+import { useTelegramQuestions } from "../features/telegram/hooks/useTelegramQuestions";
 import {
   linkedWorkItemFromAutomationEvent,
   linkedWorkItemFromInboxItem,
@@ -11728,6 +11729,10 @@ function Workspace({
     },
     [],
   );
+
+  // Declared here rather than beside useInputNotifications because it needs
+  // onQuestionReply, which is defined above.
+  useTelegramQuestions({ sessions: promptableSessions, onQuestionReply });
 
   const onQuestionInteraction = useCallback(
     (sessionId: string, requestId: number) => {
