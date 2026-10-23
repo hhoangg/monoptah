@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
 pub struct ProjectConfig {
     pub token: String,
     pub bot_username: String,
@@ -22,6 +23,7 @@ pub struct ProjectConfig {
 }
 
 #[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TelegramConfig {
     /// projectKey -> config
     pub projects: BTreeMap<String, ProjectConfig>,
@@ -64,8 +66,8 @@ pub fn save(path: &Path, cfg: &TelegramConfig) -> Result<(), String> {
 /// How long a connect/link code stays valid.
 const CODE_TTL_MS: u64 = 15 * 60 * 1000;
 const CODE_LEN: usize = 8;
-/// A-Z and 2-9 without I and O: 32 symbols, so one random byte masked to 5 bits maps
-/// onto it without modulo bias, and no symbol looks like 0, 1 or another letter.
+/// A-Z and 2-9 without I and O: 32 symbols, so the low 5 bits of a uniformly random byte
+/// map onto it without modulo bias, and no symbol looks like 0, 1 or another letter.
 const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,10 +109,16 @@ impl Codes {
 }
 
 fn random_code() -> String {
-    let bytes = uuid::Uuid::new_v4().into_bytes();
-    bytes[..CODE_LEN]
+    // Bytes 6 and 8 of a v4 UUID carry the fixed version and variant bits, so their low
+    // 5 bits are not uniform (byte 6 is always 0x4X). Skip them; the other 14 bytes are
+    // fully random.
+    uuid::Uuid::new_v4()
+        .into_bytes()
         .iter()
-        .map(|byte| CODE_ALPHABET[(byte & 0x1f) as usize] as char)
+        .enumerate()
+        .filter(|(index, _)| *index != 6 && *index != 8)
+        .map(|(_, byte)| CODE_ALPHABET[(byte & 0x1f) as usize] as char)
+        .take(CODE_LEN)
         .collect()
 }
 
@@ -179,6 +187,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn file_missing_newer_fields_keeps_token() {
+        let dir = temp_dir();
+        let path = config_path(&dir);
+        std::fs::write(
+            &path,
+            r#"{"projects":{"proj":{"token":"123:secret","bot_username":"my_bot"}}}"#,
+        )
+        .unwrap();
+        let loaded = load(&path);
+        let project = &loaded.projects["proj"];
+        assert_eq!(project.token, "123:secret");
+        assert!(!project.enabled);
+        assert!(project.topics.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn connect() -> CodePurpose {
         CodePurpose::Connect {
             project: "proj".into(),
@@ -222,5 +247,21 @@ mod tests {
                 "ambiguous char in {code}"
             );
         }
+    }
+
+    #[test]
+    fn every_code_position_uses_the_whole_alphabet() {
+        let mut codes = Codes::default();
+        let mut late_half_seen = [false; CODE_LEN];
+        for _ in 0..2000 {
+            let code = codes.issue(connect(), 0);
+            for (position, c) in code.bytes().enumerate() {
+                let index = CODE_ALPHABET.iter().position(|a| *a == c).unwrap();
+                if index >= CODE_ALPHABET.len() / 2 {
+                    late_half_seen[position] = true;
+                }
+            }
+        }
+        assert_eq!(late_half_seen, [true; CODE_LEN]);
     }
 }
