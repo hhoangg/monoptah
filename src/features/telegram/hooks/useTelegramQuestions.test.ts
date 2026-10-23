@@ -299,6 +299,16 @@ describe("useTelegramQuestions", () => {
     ]);
   });
 
+  it("reports stale when the desktop already resolved a question that still looks pending", async () => {
+    await render([asking()]);
+    recordQuestionOutcome("s1", 1, "answered");
+    await deliver();
+    expect(onQuestionReply).not.toHaveBeenCalled();
+    expect(callsTo("telegram_answer_result")).toEqual([
+      { key: "pending-1", ok: false },
+    ]);
+  });
+
   it("reports stale for an unknown session", async () => {
     await render([]);
     await deliver();

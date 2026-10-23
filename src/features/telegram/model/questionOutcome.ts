@@ -26,6 +26,14 @@ export function recordQuestionOutcome(
   }
 }
 
+/** Reads an outcome without forgetting it. */
+export function peekQuestionOutcome(
+  sessionId: string,
+  requestId: number,
+): QuestionDecision | undefined {
+  return outcomes.get(outcomeKey(sessionId, requestId));
+}
+
 /** Reads and forgets the outcome of a question. */
 export function takeQuestionOutcome(
   sessionId: string,

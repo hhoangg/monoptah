@@ -9,6 +9,7 @@ import {
 } from "../../sessions/model/userQuestion";
 import {
   discardQuestionOutcome,
+  peekQuestionOutcome,
   takeQuestionOutcome,
 } from "../model/questionOutcome";
 import {
@@ -248,8 +249,12 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
       const session = sessionsRef.current.find((item) => item.id === sessionId);
       let ok = false;
       const pending = session?.pendingQuestion;
+      // A desktop answer records its outcome when it is queued, before the
+      // session state drops the question, so a recorded outcome means the
+      // question is already resolved even though it still looks pending.
       if (
         pending?.requestId === requestId &&
+        peekQuestionOutcome(sessionId, requestId) === undefined &&
         replyFitsQuestion(reply, pending)
       ) {
         const key = questionKey(sessionId, requestId);
