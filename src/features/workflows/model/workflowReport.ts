@@ -11,7 +11,7 @@ import {
   type SessionNode,
   type WorkflowRun,
 } from "./workflow";
-import { BRANCH_FAILED_REASON, MAX_ROUNDS_REASON, type EngineAction } from "./workflowEngine";
+import { BRANCH_FAILED_REASON, MAX_ROUNDS_REASON, runScope, type EngineAction } from "./workflowEngine";
 import { OUTPUT_FENCE, parseWorkflowOutput } from "./workflowOutput";
 import { renderTemplate } from "./workflowTemplate";
 
@@ -247,13 +247,16 @@ export function composeReport(run: WorkflowRun): { title: string; text: string }
   const template = reportNode?.type === "report" ? reportNode.template : undefined;
   let body: string;
   if (template !== undefined && template.trim() !== "") {
+    // The top-level scope (node outputs, inputs) first, so `{{<nodeId>.<field>}}` works as the
+    // validator promises; the report's own `run` and `results` then take precedence.
+    const scope = runScope(run, "");
     body = renderTemplate(template, {
+      ...scope,
       run: {
-        id: run.id,
+        ...(scope.run as Record<string, unknown>),
         name: workflowName,
         status: run.status,
         statusLabel,
-        startedAt: run.startedAt,
         endedAt: run.endedAt,
       },
       results: results.map((r) => ({

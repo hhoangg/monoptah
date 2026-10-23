@@ -438,6 +438,13 @@ describe("validateWorkflow", () => {
     expect(flags(patchNode(example(), "review", { nestUnder: "ghost" }), "ghost")).toBe(true);
   });
 
+  it("rejects node ids that would shadow template variables", () => {
+    for (const id of ["run", "inputs", "results"]) {
+      const w = patchNode(example(), "review", { id });
+      expect(flags(w, "reserved")).toBe(true);
+    }
+  });
+
   it("flags an invalid schedule", () => {
     const w = patchNode(example(), "trigger", {
       schedule: { scheduleKind: "monthly", time: "9am", minute: 0, dayOfWeek: 1 },

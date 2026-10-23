@@ -295,6 +295,8 @@ export function parseWorkflows(text: string): Workflow[] {
 
 const PROJECT_REF = /^\{\{inputs\.([^{}\s.]+)\}\}$/;
 const RUN_VARS = ["round", "id", "startedAt"];
+/** Template variables a node output must not shadow. */
+const RESERVED_NODE_IDS = ["run", "inputs", "results"];
 const RESERVED_HEADS = ["inputs", "run"];
 /**
  * Something that reads as a path on this machine: a home or well-known root directory, a Windows
@@ -428,6 +430,9 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
         `Invalid node id "${node.id}": use lowercase letters, digits and underscores, starting with a letter (max 40)`,
         node.id,
       );
+    }
+    if (RESERVED_NODE_IDS.includes(node.id)) {
+      add(`Node id "${node.id}" is reserved (it is a template variable)`, node.id);
     }
     if (ids.has(node.id)) add(`Duplicate node id "${node.id}"`, node.id);
     ids.add(node.id);

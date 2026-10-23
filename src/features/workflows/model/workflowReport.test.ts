@@ -272,6 +272,38 @@ describe("composeReport", () => {
     expect(text).toContain("No items");
   });
 
+  it("template can read top-level node outputs and inputs", () => {
+    const d = def(
+      [
+        trigger,
+        session("session", { output: { weather: { type: "string" }, summary: { type: "string" } } }),
+        { id: "gate", type: "if", condition: "{{session.weather}} == 'rain'" },
+        session("session_2"),
+        session("session_3"),
+        {
+          id: "report",
+          type: "report",
+          template: "Đà Nẵng hôm nay: {{session.weather}}. {{session.summary}} ({{inputs.project}}, {{run.id}}, {{run.status}})",
+        },
+      ],
+      [
+        { from: "trigger", to: "session" },
+        { from: "session", to: "gate" },
+        { from: "gate", to: "session_2", handle: "true" },
+        { from: "gate", to: "session_3", handle: "false" },
+        { from: "session_2", to: "report" },
+        { from: "session_3", to: "report" },
+      ],
+    );
+    const run = runOf(d, [
+      nodeRun({ nodeId: "session", output: { weather: "nắng", summary: "Trời đẹp." }, endedAt: 2 }),
+      nodeRun({ nodeId: "session_2", status: "skipped" }),
+      nodeRun({ nodeId: "session_3", status: "skipped" }),
+    ]);
+    const { text } = composeReport(run);
+    expect(text).toContain("Đà Nẵng hôm nay: nắng. Trời đẹp. (/work/repo, run-1, done)");
+  });
+
   it("template override renders", () => {
     const d = def(
       [
