@@ -242,6 +242,7 @@ function childrenOf(run: WorkflowRun, groupId: NodeId): WorkflowNode[] {
 export function groupViews(
   run: WorkflowRun,
   pick: Record<NodeId, { round?: number; item?: number }> = {},
+  now: number = Date.now(),
 ): GroupView[] {
   const byKey = nodeRunsByKey(run);
   return run.definition.nodes
@@ -271,7 +272,7 @@ export function groupViews(
       else if (count === 0) {
         // Not expanded in this round: say where the group stands, or why it failed.
         const own = byKey.get(nodeRunKey(group.id, ""));
-        summary = own?.status === "failed" && own.error ? own.error : stateOf(byKey, group.id, "", 0).label;
+        summary = own?.status === "failed" && own.error ? own.error : stateOf(byKey, group.id, "", now).label;
       } else {
         const counts = SUMMARY_ORDER.map((s) => [s, items.filter((i) => i.status === s).length] as const);
         summary = counts.filter(([, n]) => n > 0).map(([s, n]) => `${n} ${s}`).join(" · ");
@@ -321,31 +322,42 @@ function edgeState(def: WorkflowEdge, branch: BranchKey, byKey: Map<string, Node
 
 type Box = { x: number; y: number; w: number; h: number };
 
-/**
- * Makes room for a box that grows by `dx` and `dy` (a group that got lanes) or moves by them:
- * what sits to its right moves right, what sits below moves down, and those moves cascade, so
- * nothing ends up covered. Boxes only ever move right or down, so it ends.
- */
-function shove(boxes: Map<NodeId, Box>, id: NodeId, dx: number, dy: number, moves: boolean): void {
-  const g = boxes.get(id) as Box;
-  const old = { ...g };
-  if (dx > 0) {
-    for (const [other, b] of boxes) {
-      if (other !== id && b.x >= old.x + old.w && b.y < old.y + old.h && b.y + b.h > old.y) shove(boxes, other, dx, 0, true);
+/** Every box reached from `start` by following `follows`, each once. */
+function reached(others: Box[], start: Box[], follows: (from: Box, to: Box) => boolean): Box[] {
+  const seen = new Set(start);
+  const queue = [...start];
+  for (let m = queue.pop(); m; m = queue.pop()) {
+    for (const o of others) {
+      if (seen.has(o) || !follows(m, o)) continue;
+      seen.add(o);
+      queue.push(o);
     }
+  }
+  return [...seen];
+}
+
+const overlapsY = (a: Box, b: Box) => b.y < a.y + a.h && b.y + b.h > a.y;
+const overlapsX = (a: Box, b: Box) => b.x < a.x + a.w && b.x + b.w > a.x;
+
+/**
+ * Makes room for a group that grows by `dx` and `dy`: what sits to its right moves right and what
+ * sits below moves down, and so does whatever those moves would then cover. The boxes to move are
+ * collected first, so each moves once, by exactly `dx` or `dy`.
+ */
+function grow(boxes: Map<NodeId, Box>, id: NodeId, dx: number, dy: number): void {
+  const g = boxes.get(id) as Box;
+  const others = [...boxes].filter(([key]) => key !== id).map(([, box]) => box);
+  if (dx > 0) {
+    const seeds = others.filter((b) => b.x >= g.x + g.w && overlapsY(g, b));
+    for (const b of reached(others, seeds, (m, o) => o.x >= m.x + m.w && overlapsY(m, o))) b.x += dx;
   }
   if (dy > 0) {
-    for (const [other, b] of boxes) {
-      if (other !== id && b.y >= old.y + old.h && b.x < old.x + old.w + dx && b.x + b.w > old.x) shove(boxes, other, 0, dy, true);
-    }
+    const wider = { ...g, w: g.w + dx };
+    const seeds = others.filter((b) => b.y >= g.y + g.h && overlapsX(wider, b));
+    for (const b of reached(others, seeds, (m, o) => o.y >= m.y + m.h && overlapsX(m, o))) b.y += dy;
   }
-  if (moves) {
-    g.x += dx;
-    g.y += dy;
-  } else {
-    g.w += dx;
-    g.h += dy;
-  }
+  g.w += dx;
+  g.h += dy;
 }
 
 export function runGraph(
@@ -415,7 +427,7 @@ export function runGraph(
   );
   for (const id of order) {
     const { dx, dy } = growth.get(id) as { dx: number; dy: number };
-    shove(boxes, id, dx, dy, false);
+    grow(boxes, id, dx, dy);
   }
   for (const n of nodes) {
     const box = boxes.get(n.id);

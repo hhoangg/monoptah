@@ -5,6 +5,7 @@ import { MANUAL, REPORT, run, workflow } from "../workflowUiFixtures";
 import {
   defaultRunView,
   groupViews,
+  LANE_HEADER,
   nodeRunsByKey,
   runGraph,
   type RunNodeStatus,
@@ -482,5 +483,29 @@ it("moves everything a grown group would cover, cascading", () => {
         b.position.y + bh <= a.position.y;
       expect(apart, `${a.id} vs ${b.id}`).toBe(true);
     }
+  }
+});
+
+it("moves each node below or beside a widened group exactly once", () => {
+  const w = eachWorkflow();
+  const at = new Map<string, { x: number; y: number }>();
+  const put = (id: string, x: number, y: number, extra: Partial<WorkflowNode> = {}) => {
+    at.set(id, { x, y });
+    w.nodes.push(session(id, { ui: { x, y }, ...extra }));
+  };
+  for (let i = 0; i < 6; i++) put(`down${i}`, 0, 300 + i * (NODE_H + 10));
+  for (let i = 0; i < 6; i++) put(`side${i}`, 300 + i * (NODE_W + 10), 50);
+  w.nodes = w.nodes.map((n) =>
+    n.id === "each" ? { ...n, ui: { x: 0, y: 0 } } : n.id === "trigger" ? { ...n, ui: { x: 700, y: 3000 } } : n.id === "report" ? { ...n, ui: { x: 700, y: 3100 } } : n,
+  );
+  const r = eachRun(["done", "done", "done"], { definition: w });
+  const { nodes } = runGraph(r, "lanes", groupViews(r));
+  const dx = 2 * (NODE_W + 52);
+  const dy = LANE_HEADER;
+  for (const i of [0, 1, 2, 5]) {
+    const down = nodes.find((n) => n.id === `down${i}`);
+    expect(down?.position).toEqual({ x: at.get(`down${i}`)?.x, y: (at.get(`down${i}`)?.y ?? 0) + dy });
+    const side = nodes.find((n) => n.id === `side${i}`);
+    expect(side?.position).toEqual({ x: (at.get(`side${i}`)?.x ?? 0) + dx, y: at.get(`side${i}`)?.y });
   }
 });
