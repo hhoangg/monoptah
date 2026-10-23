@@ -73,7 +73,7 @@ export function nodeRunsByKey(run: WorkflowRun): Map<string, NodeRun> {
   return new Map((run.nodes ?? []).map((n) => [nodeRunKey(n.nodeId, n.branch), n]));
 }
 
-function statusOf(r: NodeRun | undefined): RunNodeStatus {
+export function statusOf(r: NodeRun | undefined): RunNodeStatus {
   if (!r) return "pending";
   if (r.status === "waitingApproval") return "waiting";
   if (r.status === "running" && isAsking(r)) return "waiting";
@@ -208,7 +208,7 @@ function roundsOf(run: WorkflowRun, group: ForEach): Rounds {
   };
 }
 
-function itemTitle(list: unknown[] | undefined, index: number): string {
+export function itemTitle(list: unknown[] | undefined, index: number): string {
   const item = list?.[index];
   if (item && typeof item === "object") {
     const fields = item as Record<string, unknown>;

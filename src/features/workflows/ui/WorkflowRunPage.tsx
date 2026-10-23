@@ -1,23 +1,15 @@
-import { useState, type CSSProperties } from "react";
+import { useState, type CSSProperties, type ReactNode } from "react";
 import { resumeWorkflowRun } from "../../../app/hooks/useMonoWorkflows";
 import { IconButton } from "../../../app/shell/TitleBar";
-import { Play, Square } from "../../../shared/ui/icons";
+import { Columns3, Layers, Play, Square } from "../../../shared/ui/icons";
 import { duration, RunningFor, when } from "../../monos/ui/HabitPage";
-import { PageHeader, Property, Section } from "../../monos/ui/monoPanelParts";
-import {
-  archivedItemsKey,
-  isTrigger,
-  parseBranch,
-  type NodeRun,
-  type NodeStatus,
-  type RunStatus,
-  type Workflow,
-  type WorkflowNode,
-  type WorkflowRun,
-} from "../model/workflow";
-import { isAsking } from "../model/workflowEngine";
+import { PageHeader } from "../../monos/ui/monoPanelParts";
+import type { RunStatus, Workflow, WorkflowRun } from "../model/workflow";
 import { stopWorkflowRun } from "../model/workflowStore";
 import { liveRunOf, useWorkflowRuns, WorkflowNotice } from "./MonoWorkflows";
+import { defaultSelection, hasForEach, RunGraph, useRunView } from "./run/RunGraph";
+import { RunNodeDetails } from "./run/RunNodeDetails";
+import { nodeRunsByKey } from "./run/runGraphModel";
 
 /** Dot colours reuse the habit page's: the Mono's colour, red for trouble, grey for rest. */
 export const RUN_STATUS: Record<RunStatus, { label: string; dot: string }> = {
@@ -33,22 +25,6 @@ export const RUN_STATUS: Record<RunStatus, { label: string; dot: string }> = {
   failed: { label: "Failed", dot: "bg-red-500/70" },
   stopped: { label: "Stopped", dot: "bg-content/40" },
   interrupted: { label: "Interrupted", dot: "bg-amber-400/80" },
-};
-
-const NODE_STATUS: Record<NodeStatus, { label: string; dot: string }> = {
-  pending: { label: "Waiting", dot: "bg-content/25" },
-  running: {
-    label: "Running",
-    dot: "animate-pulse bg-[var(--mono-color)]",
-  },
-  waitingApproval: {
-    label: "Waiting for approval",
-    dot: "bg-amber-400/80",
-  },
-  done: { label: "Done", dot: "bg-emerald-400/80" },
-  failed: { label: "Failed", dot: "bg-red-500/70" },
-  skipped: { label: "Skipped", dot: "bg-content/25" },
-  stopped: { label: "Stopped", dot: "bg-content/40" },
 };
 
 /** The parts of a definition that change what a run does; board positions do not. */
@@ -74,120 +50,16 @@ export function definitionChanged(run: WorkflowRun, current: Workflow): boolean 
   return definitionKey(run.definition) !== definitionKey(current);
 }
 
-type Lane = { branch: string; title: string; nodes: NodeRun[] };
-
-/** A branch key as the lane list needs it: `round` is set on a branch archived by a loop round. */
-function splitBranch(branch: string): {
-  groupId: string;
-  index: number;
-  round?: number;
-} {
-  return parseBranch(branch) ?? { groupId: branch, index: 0 };
-}
-
-/** An item's name for its lane: its title or name when it has one, else its place. */
-function itemTitle(run: WorkflowRun, branch: string): string {
-  const { groupId, index, round } = splitBranch(branch);
-  const items = run.items[round === undefined ? groupId : archivedItemsKey(groupId, round)];
-  const item = items?.[index];
-  const suffix = round === undefined ? "" : ` · round ${round}`;
-  if (item && typeof item === "object") {
-    const fields = item as Record<string, unknown>;
-    for (const key of ["title", "name"]) {
-      const value = fields[key];
-      if (typeof value === "string" && value.trim()) return `${value.trim()}${suffix}`;
-    }
-  }
-  return `#${index + 1}${suffix}`;
-}
-
-/** One lane per branch: the top level first, then each For each item in order. */
-export function lanesOf(run: WorkflowRun): Lane[] {
-  const order = new Map(run.definition.nodes.map((n, i) => [n.id, i]));
-  const byId = new Map<string, WorkflowNode>(
-    run.definition.nodes.map((n) => [n.id, n]),
-  );
-  const shown = run.nodes
-    .filter((n) => {
-      const node = byId.get(n.nodeId);
-      return !node || !isTrigger(node);
-    })
-    .sort((a, b) => (order.get(a.nodeId) ?? 0) - (order.get(b.nodeId) ?? 0));
-  const branches = [...new Set(shown.map((n) => n.branch))].sort((a, b) => {
-    if (a === "" || b === "") return a === "" ? -1 : 1;
-    const left = splitBranch(a);
-    const right = splitBranch(b);
-    // Earlier loop rounds of an item come right before its live lane.
-    return (
-      (order.get(left.groupId) ?? 0) - (order.get(right.groupId) ?? 0) ||
-      left.index - right.index ||
-      (left.round ?? Infinity) - (right.round ?? Infinity)
-    );
-  });
-  return branches.map((branch) => ({
-    branch,
-    title: branch === "" ? "Workflow" : itemTitle(run, branch),
-    nodes: shown.filter((n) => n.branch === branch),
-  }));
-}
-
-function NodeChip({
-  run,
-  node,
-  onOpenSession,
-}: {
-  run: WorkflowRun;
-  node: NodeRun;
-  onOpenSession: (sessionId: string) => void | Promise<void>;
-}) {
-  const def = run.definition.nodes.find((n) => n.id === node.nodeId);
-  const status = NODE_STATUS[node.status];
-  const detail = [
-    isAsking(node) ? "Deciding what's next" : status.label,
-    node.status === "failed" ? node.error : undefined,
-    node.decision ? (node.decision.reason ?? node.decision.value) : undefined,
-  ].filter(Boolean);
-  const body = (
-    <>
-      <span
-        aria-hidden
-        className={`size-2 shrink-0 rounded-full ${status.dot}`}
-        data-node-status={node.status}
-      />
-      <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate text-[12px] leading-5 text-content/85">
-          {def?.title ?? node.nodeId}
-          {node.round > 1 ? ` · round ${node.round}` : ""}
-        </span>
-        <span className="truncate text-[11px] leading-4 text-content/40">
-          {detail.join(" · ")}
-        </span>
-      </span>
-    </>
-  );
-  const chip =
-    "flex w-full min-w-0 items-center gap-2.5 rounded-md px-2 py-1.5 text-left";
+function Meta({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <li>
-      {node.sessionId ? (
-        <button
-          type="button"
-          data-node={node.nodeId}
-          className={`${chip} hover:bg-content/5`}
-          onClick={() => onOpenSession(node.sessionId as string)}
-        >
-          {body}
-        </button>
-      ) : (
-        <div data-node={node.nodeId} className={chip}>
-          {body}
-        </div>
-      )}
-    </li>
+    <div className="flex h-6 items-center gap-1.5">
+      <dt className="text-content/45">{label}</dt>
+      <dd className="flex items-center text-content/85">{children}</dd>
+    </div>
   );
 }
 
-/** One run up close: a lane for each branch, with the nodes it passed and their sessions. */
+/** One run up close: the workflow as it ran, node by node, and what the picked node did. */
 export function WorkflowRunPage({
   monoId,
   workflowId,
@@ -208,7 +80,15 @@ export function WorkflowRunPage({
 }) {
   const runs = useWorkflowRuns(monoId, workflowId);
   const [notice, setNotice] = useState<string>();
+  const [picked, setPicked] = useState<string>();
   const run = runs?.find((entry) => entry.id === runId);
+  const { view, toggle } = useRunView(workflowId, run);
+  // A pick the run no longer has (a loop reset it, the run was replaced) falls back to the default.
+  const selected = run
+    ? picked && nodeRunsByKey(run).has(picked)
+      ? picked
+      : defaultSelection(run)
+    : undefined;
   const status = run ? RUN_STATUS[run.status] : undefined;
   const openSession = (sessionId: string) => {
     setNotice(undefined);
@@ -240,6 +120,18 @@ export function WorkflowRunPage({
       data-workflow-run-page={runId}
     >
       <PageHeader title={run?.definition.name ?? "Run"} onBack={onBack}>
+        {run && hasForEach(run) ? (
+          <IconButton
+            label={view === "lanes" ? "Show one item at a time" : "Show items side by side"}
+            onClick={toggle}
+          >
+            {view === "lanes" ? (
+              <Layers className="size-3.5" strokeWidth={1.75} />
+            ) : (
+              <Columns3 className="size-3.5" strokeWidth={1.75} />
+            )}
+          </IconButton>
+        ) : null}
         {run?.status === "running" ? (
           <IconButton
             label="Stop run"
@@ -262,19 +154,19 @@ export function WorkflowRunPage({
         ) : null}
       </PageHeader>
 
-      <div className="min-h-0 flex-1 overflow-y-auto overscroll-none">
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-none">
         <WorkflowNotice>{notice}</WorkflowNotice>
         {run && status ? (
           <>
-            <dl className="flex flex-col gap-0.5 px-4 py-3">
-              <Property label="Status">
+            <dl className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-0.5 px-4 py-2 text-[12px]">
+              <Meta label="Status">
                 <span
-                  className={`mr-2 size-2 shrink-0 rounded-full ${status.dot}`}
+                  className={`mr-1.5 size-2 shrink-0 rounded-full ${status.dot}`}
                 />
                 {status.label}
-              </Property>
-              <Property label="Started">{when(run.startedAt)}</Property>
-              <Property label="Took">
+              </Meta>
+              <Meta label="Started">{when(run.startedAt)}</Meta>
+              <Meta label="Took">
                 {run.endedAt ? (
                   duration(run.endedAt - run.startedAt)
                 ) : run.status === "running" ? (
@@ -282,37 +174,32 @@ export function WorkflowRunPage({
                 ) : (
                   "-"
                 )}
-              </Property>
+              </Meta>
             </dl>
             {current && definitionChanged(run, current) ? (
               <p
                 data-run-changed
-                className="px-4 pb-3 text-[11px] leading-4 text-content/45"
+                className="shrink-0 px-4 pb-3 text-[11px] leading-4 text-content/45"
               >
                 The workflow changed since this run started.
               </p>
             ) : null}
             {run.error ? (
-              <p className="whitespace-pre-wrap px-4 pb-3 text-[12px] leading-5 text-red-500/80">
+              <p className="shrink-0 whitespace-pre-wrap px-4 pb-3 text-[12px] leading-5 text-red-500/80">
                 {run.error}
               </p>
             ) : null}
-            {lanesOf(run).map((lane) => (
-              <div key={lane.branch} data-lane={lane.branch}>
-                <Section title={lane.title}>
-                  <ul className="flex flex-col gap-px">
-                    {lane.nodes.map((node) => (
-                      <NodeChip
-                        key={node.nodeId}
-                        run={run}
-                        node={node}
-                        onOpenSession={openSession}
-                      />
-                    ))}
-                  </ul>
-                </Section>
-              </div>
-            ))}
+            <RunGraph
+              run={run}
+              view={view}
+              selectedKey={selected}
+              onSelect={setPicked}
+            />
+            <RunNodeDetails
+              run={run}
+              nodeRunKey={selected}
+              onOpenSession={openSession}
+            />
           </>
         ) : runs ? (
           <p className="px-4 py-6 text-center text-[12px] text-content/45">

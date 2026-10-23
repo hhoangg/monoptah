@@ -20,6 +20,7 @@ import {
   NODE_W,
   type FlowNode,
 } from "./boardModel";
+import type { RunNodeStatus } from "../run/runGraphModel";
 
 export const NODE_ICON: Record<NodeType, IconComponent> = {
   schedule: Clock,
@@ -75,6 +76,20 @@ export function nodeSummary(node: WorkflowNode): string {
   }
 }
 
+/** The dot that says how a node stands in a run: the app's usual status colours. */
+export const RUN_DOT: Record<RunNodeStatus, string> = {
+  done: "bg-emerald-400/80",
+  running: "animate-pulse bg-[var(--mono-color)]",
+  waiting: "bg-amber-400/80",
+  failed: "bg-red-500/70",
+  stopped: "bg-content/40",
+  skipped: "border border-content/30",
+  pending: "border border-content/30",
+};
+
+/** "Done · 12s · round 2" without its round: the badge beside the title says that. */
+const withoutRound = (label: string) => label.replace(/ · round \d+$/, "");
+
 const LOOPS_OUT: readonly NodeType[] = ["session", "command", "askMono"];
 
 /** A trigger, action, If or Report node: an icon tile and two lines, like a habit row. */
@@ -82,23 +97,29 @@ export function BoardNode({ id, data, selected }: NodeProps<FlowNode>) {
   const node = data.node;
   const Icon = NODE_ICON[node.type];
   const issues = data.issues ?? [];
+  const run = data.run;
+  // In a run graph the handles only anchor the lines; nothing can be drawn from them.
+  const connectable = !run;
+  const handle = run ? "board-handle board-handle-run" : "board-handle";
   return (
     <div
       data-board-node={id}
       data-type={node.type}
+      data-run-status={run?.status}
       data-selected={selected || undefined}
       className="board-node flex flex-col rounded-lg border border-content/10 bg-content/5 px-2 py-2"
     >
       {node.type === "schedule" || node.type === "manual" ? null : (
-        <Handle type="target" position={Position.Top} className="board-handle" />
+        <Handle type="target" position={Position.Top} className={handle} isConnectable={connectable} />
       )}
       {node.type === "schedule" || node.type === "manual" || node.type === "report" ? null : (
         <Handle
           id={LOOP_IN}
           type="target"
           position={Position.Right}
-          className="board-handle board-handle-loop"
+          className={`board-handle board-handle-loop${run ? " board-handle-run" : ""}`}
           style={{ top: "30%" }}
+          isConnectable={connectable}
           data-used={data.loopIn || undefined}
         />
       )}
@@ -110,8 +131,22 @@ export function BoardNode({ id, data, selected }: NodeProps<FlowNode>) {
           <Icon className="size-3.5" strokeWidth={1.75} />
         </span>
         <span className="flex min-w-0 flex-1 flex-col">
-          <span className="truncate text-[12px] leading-5 text-content/85">{nodeTitle(node)}</span>
-          {issues.length ? (
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate text-[12px] leading-5 text-content/85">{nodeTitle(node)}</span>
+            {run && run.round > 1 ? (
+              <span
+                data-run-round
+                className="shrink-0 rounded-full bg-[color-mix(in_srgb,var(--mono-color)_14%,transparent)] px-1.5 text-[10px] leading-4 text-[color-mix(in_srgb,var(--mono-color)_80%,var(--color-content))]"
+              >
+                round {run.round}
+              </span>
+            ) : null}
+          </span>
+          {run ? (
+            <span data-run-label title={run.label} className="truncate text-[11px] leading-4 text-content/40">
+              {withoutRound(run.label)}
+            </span>
+          ) : issues.length ? (
             <span
               data-node-issue
               title={issues.join("\n")}
@@ -124,7 +159,9 @@ export function BoardNode({ id, data, selected }: NodeProps<FlowNode>) {
             <span className="truncate text-[11px] leading-4 text-content/40">{nodeSummary(node)}</span>
           )}
         </span>
-        {issues.length ? (
+        {run ? (
+          <span aria-hidden data-run-dot className={`size-2 shrink-0 rounded-full ${RUN_DOT[run.status]}`} />
+        ) : issues.length ? (
           <span
             aria-hidden
             className="size-2 shrink-0 rounded-full bg-red-500/70"
@@ -133,8 +170,8 @@ export function BoardNode({ id, data, selected }: NodeProps<FlowNode>) {
       </span>
       {node.type === "if" ? (
         <>
-          <Handle id="true" type="source" position={Position.Bottom} className="board-handle" style={{ left: "28%" }} />
-          <Handle id="false" type="source" position={Position.Bottom} className="board-handle" style={{ left: "72%" }} />
+          <Handle id="true" type="source" position={Position.Bottom} className={handle} style={{ left: "28%" }} isConnectable={connectable} />
+          <Handle id="false" type="source" position={Position.Bottom} className={handle} style={{ left: "72%" }} isConnectable={connectable} />
           <span aria-hidden className="board-handle-label" style={{ left: "28%" }}>
             true
           </span>
@@ -143,15 +180,16 @@ export function BoardNode({ id, data, selected }: NodeProps<FlowNode>) {
           </span>
         </>
       ) : node.type === "report" ? null : (
-        <Handle type="source" position={Position.Bottom} className="board-handle" />
+        <Handle type="source" position={Position.Bottom} className={handle} isConnectable={connectable} />
       )}
       {LOOPS_OUT.includes(node.type) ? (
         <Handle
           id={LOOP_OUT}
           type="source"
           position={Position.Right}
-          className="board-handle board-handle-loop"
+          className={`board-handle board-handle-loop${run ? " board-handle-run" : ""}`}
           style={{ top: "70%" }}
+          isConnectable={connectable}
           data-used={data.loopOut || undefined}
         />
       ) : null}
@@ -163,16 +201,19 @@ export function BoardNode({ id, data, selected }: NodeProps<FlowNode>) {
 export function GroupNode({ id, data, selected }: NodeProps<FlowNode>) {
   const node = data.node;
   const issues = data.issues ?? [];
+  const run = data.run;
   // The handle sits inside the 1px border, so one less puts it over the column of the nodes.
   const middle = GROUP_PAD + NODE_W / 2 - 1;
+  const handle = run ? "board-handle board-handle-run" : "board-handle";
   return (
     <div
       data-board-node={id}
       data-type="forEach"
+      data-run-status={run?.status}
       data-selected={selected || undefined}
       className="board-group h-full w-full rounded-xl border border-content/10 bg-content/[0.03]"
     >
-      <Handle type="target" position={Position.Top} className="board-handle" style={{ left: middle }} />
+      <Handle type="target" position={Position.Top} className={handle} style={{ left: middle }} isConnectable={!run} />
       <div
         className="flex items-center gap-1.5 px-3 text-[11px] font-medium uppercase tracking-wide text-content/40"
         style={{ height: GROUP_HEADER }}
@@ -182,7 +223,18 @@ export function GroupNode({ id, data, selected }: NodeProps<FlowNode>) {
         <span className="min-w-0 truncate normal-case tracking-normal text-content/55">
           {node.title?.trim() || (node.type === "forEach" ? node.in : "")}
         </span>
-        {issues.length ? (
+        {run ? (
+          <>
+            <span
+              data-run-label
+              title={run.label}
+              className="ml-auto min-w-0 shrink-[2] truncate normal-case tracking-normal text-content/40"
+            >
+              {run.label}
+            </span>
+            <span aria-hidden data-run-dot className={`size-2 shrink-0 rounded-full ${RUN_DOT[run.status]}`} />
+          </>
+        ) : issues.length ? (
           <span
             data-node-issue
             title={issues.join("\n")}
@@ -193,7 +245,7 @@ export function GroupNode({ id, data, selected }: NodeProps<FlowNode>) {
       {data.empty ? (
         <p className="px-3 pt-1 text-[11px] leading-4 text-content/35">Drag nodes in to run them once per item.</p>
       ) : null}
-      <Handle type="source" position={Position.Bottom} className="board-handle" style={{ left: middle }} />
+      <Handle type="source" position={Position.Bottom} className={handle} style={{ left: middle }} isConnectable={!run} />
     </div>
   );
 }

@@ -8,6 +8,10 @@
   --wf-line: color-mix(in srgb, var(--color-content) 26%, transparent);
   --wf-line-strong: color-mix(in srgb, var(--color-content) 55%, transparent);
   --wf-accent: var(--mono-color, var(--color-accent));
+  /* The status colours of a run graph are the app's own: emerald, amber and red. */
+  --wf-done: var(--color-emerald-400, #34d399);
+  --wf-wait: var(--color-amber-400, #fbbf24);
+  --wf-fail: var(--color-red-500, #ef4444);
 }
 
 .workflow-board .react-flow {
@@ -65,6 +69,133 @@
   border-color: color-mix(in srgb, var(--wf-accent) 65%, transparent);
 }
 
+/* A run graph: the same cards, read-only, each carrying how the run left it. */
+.workflow-board .board-node[data-run-status="done"] {
+  border-color: color-mix(in srgb, var(--wf-done) 45%, transparent);
+}
+.workflow-board .board-node[data-run-status="running"] {
+  border-color: color-mix(in srgb, var(--wf-accent) 70%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--wf-accent) 14%, transparent);
+}
+.workflow-board .board-node[data-run-status="waiting"] {
+  border-color: color-mix(in srgb, var(--wf-wait) 55%, transparent);
+}
+.workflow-board .board-node[data-run-status="failed"] {
+  border-color: color-mix(in srgb, var(--wf-fail) 55%, transparent);
+}
+.workflow-board .board-node[data-run-status="skipped"],
+.workflow-board .board-node[data-run-status="pending"] {
+  border-style: dashed;
+  background-color: transparent;
+}
+.workflow-board .board-node[data-run-status="skipped"] > *,
+.workflow-board .board-node[data-run-status="pending"] > * {
+  opacity: 0.55;
+}
+.workflow-board .board-group[data-run-status="running"] {
+  border-color: color-mix(in srgb, var(--wf-accent) 35%, transparent);
+}
+.workflow-board .board-group[data-run-status="failed"] {
+  border-color: color-mix(in srgb, var(--wf-fail) 35%, transparent);
+}
+.workflow-board .board-group[data-run-status="done"] {
+  border-color: color-mix(in srgb, var(--wf-done) 28%, transparent);
+}
+/* The selected card keeps the board's accent ring over its status border. */
+.workflow-board .board-node[data-run-status][data-selected],
+.workflow-board .board-group[data-run-status][data-selected] {
+  border-color: color-mix(in srgb, var(--wf-accent) 65%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--wf-accent) 30%, transparent);
+}
+
+/* Edges of a run: taken lines are green, the one into a running node is the Mono's, the rest wait dashed. */
+.workflow-board .react-flow__edge.run-taken .react-flow__edge-path {
+  stroke: color-mix(in srgb, var(--wf-done) 75%, transparent);
+  stroke-width: 1.5;
+}
+.workflow-board .react-flow__edge.run-active .react-flow__edge-path {
+  stroke: var(--wf-accent);
+  stroke-width: 1.5;
+}
+.workflow-board .react-flow__edge.run-idle .react-flow__edge-path {
+  stroke: color-mix(in srgb, var(--color-content) 20%, transparent);
+  stroke-dasharray: 3 4;
+}
+.workflow-board .react-flow__edge.run-idle .loop-edge-path {
+  stroke: color-mix(in srgb, var(--wf-accent) 35%, transparent);
+}
+.workflow-board .react-flow__edge.run-taken .loop-edge-path,
+.workflow-board .react-flow__edge.run-active .loop-edge-path {
+  stroke: var(--wf-accent);
+  stroke-dasharray: 5 4;
+}
+
+/* A single-lane group hints at the other items with cards stacked behind the lane. */
+.workflow-board .run-stacked .board-node {
+  box-shadow:
+    5px 5px 0 -1px var(--color-background-base),
+    5px 5px 0 0 color-mix(in srgb, var(--color-content) 10%, transparent),
+    10px 10px 0 -1px var(--color-background-base),
+    10px 10px 0 0 color-mix(in srgb, var(--color-content) 6%, transparent);
+}
+
+/* The strips above the lanes: item tabs, lane titles and the round selector. */
+.workflow-board .run-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  height: 100%;
+}
+.workflow-board .run-tabs {
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.workflow-board .run-tabs::-webkit-scrollbar {
+  display: none;
+}
+.workflow-board .run-tab {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+  max-width: 160px;
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+  color: color-mix(in srgb, var(--color-content) 60%, transparent);
+  background: color-mix(in srgb, var(--color-content) 5%, transparent);
+  cursor: pointer;
+}
+.workflow-board .run-tab:hover {
+  background: color-mix(in srgb, var(--color-content) 9%, transparent);
+}
+.workflow-board .run-tab[aria-selected="true"] {
+  color: var(--color-content);
+  background: color-mix(in srgb, var(--wf-accent) 16%, transparent);
+}
+.workflow-board .run-tab > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.workflow-board .run-lane-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 4px;
+  font-size: 11px;
+  line-height: 18px;
+  color: color-mix(in srgb, var(--color-content) 55%, transparent);
+}
+.workflow-board .run-lane-title > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Handles are small rings, dim until the node is hovered or a connection is being drawn. */
 .workflow-board .board-handle {
   width: 8px;
@@ -105,6 +236,11 @@
 .workflow-board .board-handle-loop[data-used],
 .workflow-board:has(.react-flow__handle.connectingfrom) .board-handle-loop {
   opacity: 1;
+}
+/* In a run graph the handles only anchor the lines: nothing to see, nothing to grab. */
+.workflow-board .react-flow__node .board-handle.board-handle-run {
+  opacity: 0;
+  pointer-events: none;
 }
 /* Only the side a connection could land on lights up while drawing one. */
 .workflow-board .board-handle-label {

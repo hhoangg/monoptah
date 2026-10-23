@@ -18,10 +18,25 @@ vi.mock("../model/workflowStore", async (original) => ({
   stopWorkflowRun,
 }));
 
+/** React Flow measures with these; happy-dom has neither. */
+class FakeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+class FakeMatrix {
+  m22 = 1;
+  constructor(_transform?: string) {}
+}
+
 let root: Root;
 let container: HTMLElement;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("ResizeObserver", FakeObserver);
+  vi.stubGlobal("DOMMatrixReadOnly", FakeMatrix);
+  Element.prototype.scrollIntoView = () => {};
+  localStorage.clear();
   stored = [];
   resumeWorkflowRun.mockClear();
   stopWorkflowRun.mockClear();
@@ -105,34 +120,35 @@ async function renderPage(
   return onOpenSession;
 }
 
-const lanes = () => [...container.querySelectorAll("[data-lane]")];
+const card = (id: string) =>
+  container.querySelector<HTMLElement>(`[data-board-node="${id}"]`);
+const laneTitles = () =>
+  [...container.querySelectorAll("[data-run-lane-title]")].map((t) => t.textContent);
 const button = (label: string) =>
   container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
 
-it("run page shows one lane per item and round 2", async () => {
+it("run page shows one card per item node, titled by item, with round 2", async () => {
   stored = [laneRun()];
   await renderPage();
-  expect(lanes().map((lane) => lane.getAttribute("data-lane"))).toEqual([
-    "",
-    "each#0",
-    "each#1",
-    "each#2",
-  ]);
   expect(
-    lanes().map((lane) => lane.querySelector("h4")?.textContent),
-  ).toEqual(["Workflow", "Fix login", "Billing", "#3"]);
-  // Top level first: the group node, not the trigger.
-  expect(lanes()[0].textContent).toContain("Tickets");
-  expect(lanes()[0].textContent).not.toContain("trigger");
+    [...container.querySelectorAll("[data-board-node]")]
+      .map((c) => c.getAttribute("data-board-node"))
+      .sort(),
+  ).toEqual(["dev@each#0", "dev@each#1", "dev@each#2", "each", "report", "trigger"]);
+  expect(laneTitles()).toEqual(["Fix login", "Billing", "#3"]);
+  // The group box carries the summary, the cards their state.
+  expect(card("each")?.textContent).toContain("Tickets");
+  expect(card("each")?.textContent).toContain("1 done");
   // The loop round shows only past the first one, with the decision's reason.
-  expect(lanes()[1].textContent).toContain("Dev · round 2");
-  expect(lanes()[1].textContent).toContain("tests still failing");
-  expect(lanes()[2].textContent).not.toContain("round");
-  expect(lanes()[2].textContent).toContain("Running");
-  expect(lanes()[3].textContent).toContain("Waiting for approval");
+  expect(card("dev@each#0")?.textContent).toContain("round 2");
+  expect(card("dev@each#0")?.textContent).toContain("tests still failing");
+  expect(card("dev@each#1")?.textContent).not.toContain("round");
+  expect(card("dev@each#1")?.getAttribute("data-run-status")).toBe("running");
+  expect(card("dev@each#2")?.getAttribute("data-run-status")).toBe("waiting");
+  expect(card("dev@each#2")?.textContent).toContain("Waiting for approval");
 });
 
-it("run page lists an archived loop round next to the live lane", async () => {
+it("run page picks between the rounds of a For each a loop ran again", async () => {
   stored = [
     laneRun({
       items: {
@@ -150,37 +166,33 @@ it("run page lists an archived loop round next to the live lane", async () => {
       ],
     }),
   ];
-  const onOpenSession = await renderPage();
-  expect(lanes().map((lane) => lane.getAttribute("data-lane"))).toEqual([
-    "",
-    "each#0@r1",
-    "each#0",
-    "each#1@r1",
-    "each#1",
-  ]);
-  expect(
-    lanes().map((lane) => lane.querySelector("h4")?.textContent),
-  ).toEqual(["Workflow", "Old login · round 1", "Fix login", "Old billing · round 1", "Billing"]);
-  const chip = container.querySelector<HTMLButtonElement>(
-    "[data-lane='each#0@r1'] button[data-node]",
-  );
-  act(() => chip?.click());
-  expect(onOpenSession).toHaveBeenCalledWith("old-0");
+  await renderPage();
+  const rounds = () =>
+    [...container.querySelectorAll<HTMLElement>("[data-run-rounds] [data-run-tab]")];
+  expect(rounds().map((r) => r.textContent)).toEqual(["Round 1", "Round 2"]);
+  // The latest round shows by default.
+  expect(laneTitles()).toEqual(["Fix login", "Billing"]);
+  await act(async () => rounds()[0].click());
+  expect(laneTitles()).toEqual(["Old login", "Old billing"]);
+  expect(card("dev@each#0@r1")?.getAttribute("data-run-status")).toBe("failed");
 });
 
-it("opens a node's session from its chip", async () => {
+it("opens a node's session from its details", async () => {
   stored = [laneRun()];
   const onOpenSession = await renderPage();
-  const chips = container.querySelectorAll<HTMLButtonElement>(
-    "[data-lane='each#0'] button[data-node]",
-  );
-  expect(chips).toHaveLength(1);
-  act(() => chips[0].click());
+  await act(async () => card("dev@each#0")!.click());
+  const open = [...container.querySelectorAll<HTMLButtonElement>("[data-run-details] button")].find(
+    (b) => b.textContent === "Open session",
+  )!;
+  act(() => open.click());
   expect(onOpenSession).toHaveBeenCalledWith("session-1");
-  // A node without a session is not a button.
+  // A node without a session has nothing to open.
+  await act(async () => card("dev@each#1")!.click());
   expect(
-    container.querySelectorAll("[data-lane='each#1'] button[data-node]"),
-  ).toHaveLength(0);
+    [...container.querySelectorAll("[data-run-details] button")].some(
+      (b) => b.textContent === "Open session",
+    ),
+  ).toBe(false);
 });
 
 it("says so when a node's session cannot be opened", async () => {
@@ -191,9 +203,10 @@ it("says so when a node's session cannot be opened", async () => {
   const unhandled = vi.fn();
   process.on("unhandledRejection", unhandled);
   await renderPage(definition, onOpenSession);
+  await act(async () => card("dev@each#0")!.click());
   await act(async () =>
-    container
-      .querySelector<HTMLButtonElement>("[data-lane='each#0'] button[data-node]")!
+    [...container.querySelectorAll<HTMLButtonElement>("[data-run-details] button")]
+      .find((b) => b.textContent === "Open session")!
       .click(),
   );
   process.off("unhandledRejection", unhandled);

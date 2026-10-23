@@ -198,7 +198,7 @@ function merged(stored: Workflow | undefined, next: Workflow, now: number): Work
 const ifHandle = (handle: string | null | undefined) =>
   handle === "true" || handle === "false" ? handle : undefined;
 
-function ZoomControls() {
+export function ZoomControls() {
   const flow = useReactFlow();
   return (
     <div className="board-zoom absolute bottom-2 left-2 z-[5] flex flex-col rounded-lg border border-content/10 p-0.5">
