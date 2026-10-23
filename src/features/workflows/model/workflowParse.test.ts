@@ -361,7 +361,7 @@ describe("validateWorkflow", () => {
       nodes: [
         { id: "trigger", type: "manual" },
         session("session", { weather: { type: "string" }, summary: { type: "string" } }),
-        { id: "gate", type: "if", condition: "{{session.weather}} == 'rain'" },
+        { id: "gate", type: "if", condition: '{{session.weather}} == "rain"' },
         session("session_2", {}),
         session("session_3", {}),
         {
@@ -437,6 +437,48 @@ describe("validateWorkflow", () => {
       e.loop ? { ...e, loop: { maxRounds: 3, decide: '{{review.verdict}} != "approve"' } } : e,
     );
     expect(validateWorkflow(looped)).toEqual([]);
+  });
+
+  it("flags an if condition or loop decider that does not follow the condition grammar", () => {
+    const bad = [
+      "{{review.verdict}} == approve",
+      '{{review.verdict}} == "a" and {{review.issues}} not empty',
+      "{{review.verdict}} >> 3",
+      '{{review.verdict}} == "unterminated',
+      "{{review.verdict}} == 'single'",
+    ];
+    for (const condition of bad) {
+      const gate = example();
+      gate.nodes.push({ id: "gate", type: "if", condition });
+      gate.edges.push({ from: "fetch", to: "gate" });
+      const issues = validateWorkflow(gate).filter((i) => i.message.includes("Cannot parse condition"));
+      expect(issues, condition).toHaveLength(1);
+      expect(issues[0].nodeId).toBe("gate");
+
+      const looped = example();
+      looped.edges = looped.edges.map((e) => (e.loop ? { ...e, loop: { maxRounds: 3, decide: condition } } : e));
+      const loopIssues = validateWorkflow(looped).filter((i) => i.message.includes("Cannot parse condition"));
+      expect(loopIssues, condition).toHaveLength(1);
+      expect(loopIssues[0].message).toContain("Loop edge");
+    }
+  });
+
+  it("accepts every operator of the condition grammar", () => {
+    for (const condition of [
+      '{{fetch.tickets}} not empty',
+      '{{fetch.tickets}} empty',
+      '{{fetch.tickets}} contains "x"',
+      "{{fetch.tickets}} == 3",
+      "{{fetch.tickets}} != true",
+    ]) {
+      const w = example();
+      w.nodes.push({ id: "gate", type: "if", condition });
+      w.edges.push({ from: "fetch", to: "gate" });
+      expect(
+        validateWorkflow(w).filter((i) => i.message.includes("Cannot parse condition")),
+        condition,
+      ).toEqual([]);
+    }
   });
 
   it('flags absolute project path "/Users/x/repo"', () => {

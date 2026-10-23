@@ -2,7 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { newSession } from "../../sessions/model/session";
 import { WORKFLOWS_MAX, type Workflow, type WorkflowRun } from "../../workflows/model/workflow";
-import { workflowGuide } from "../../workflows/model/workflowGuide";
+import { GUIDE_EXAMPLES, workflowGuide } from "../../workflows/model/workflowGuide";
 import { validateWorkflow } from "../../workflows/model/workflowParse";
 import { handleAgentApp, type AgentAppHost } from "./agentApp";
 
@@ -921,6 +921,30 @@ describe("workflows.validate against the per-Mono limit", () => {
     );
   });
 
+  it("does not apply the limit when id names an existing workflow (an update)", async () => {
+    const f = fixture();
+    seedFull(f, WORKFLOWS_MAX);
+    const [first] = f.stored();
+    const result = (await f.call("workflows.validate", {
+      id: first.id,
+      workflow: definition(),
+    })) as { issues: unknown[] };
+    expect(result.issues).toEqual([]);
+    // An id that names nothing is a new workflow, so the limit still applies.
+    const unknown = (await f.call("workflows.validate", {
+      id: "wf-zzzzzzzz",
+      workflow: definition(),
+    })) as { issues: { message: string }[] };
+    expect(unknown.issues.map((issue) => issue.message).join(" ")).toContain(
+      `at most ${WORKFLOWS_MAX} workflows`,
+    );
+    expect(f.updates).not.toHaveBeenCalled();
+    // The update the validation described is accepted at the limit.
+    await expect(
+      f.call("workflows.update", { id: first.id, workflow: definition() }),
+    ).resolves.toMatchObject({ id: first.id, issues: [] });
+  });
+
   it("reports nothing extra below the limit", async () => {
     const f = fixture();
     seedFull(f, WORKFLOWS_MAX - 1);
@@ -928,6 +952,24 @@ describe("workflows.validate against the per-Mono limit", () => {
       issues: unknown[];
     };
     expect(result.issues).toEqual([]);
+  });
+});
+
+describe("the guide examples through the CLI", () => {
+  it("every example is stored by workflows.add exactly as written", async () => {
+    for (const example of GUIDE_EXAMPLES) {
+      const { call, stored } = fixture();
+      const sent = JSON.parse(JSON.stringify(example.workflow)) as Record<string, unknown>;
+      const result = (await call("workflows.add", { workflow: sent })) as Added;
+      expect(result.issues.map((issue) => issue.message), example.name).toEqual([]);
+      const [saved] = stored();
+      expect(saved.name).toBe(example.workflow.name);
+      expect(saved.description).toBe(example.workflow.description);
+      expect(saved.inputs).toEqual(example.workflow.inputs);
+      expect(saved.inputValues).toEqual(example.workflow.inputValues);
+      expect(saved.edges).toEqual(example.workflow.edges);
+      expect(saved.nodes).toEqual(example.workflow.nodes);
+    }
   });
 });
 

@@ -60,7 +60,7 @@ export const WORKFLOW_FIELDS: ReadonlyMap<string, readonly string[]> = new Map([
   ["workflows.list", ["project"]],
   ["workflows.get", ["id", "project"]],
   ["workflows.add", ["workflow", "yaml", "values", "project"]],
-  ["workflows.validate", ["workflow", "yaml", "values", "project"]],
+  ["workflows.validate", ["id", "workflow", "yaml", "values", "project"]],
   ["workflows.guide", ["project"]],
   ["workflows.update", ["id", "workflow", "project"]],
   ["workflows.setInputs", ["id", "values", "project"]],
@@ -403,7 +403,10 @@ export async function handleWorkflows(
       const { draft } = newWorkflowFrom(input, now);
       // Read only: add would be refused at the limit, so say so here instead of at save time.
       const issues = problems(draft);
-      if ((await workflows.load(monoId)).length >= WORKFLOWS_MAX)
+      // Checking a change to an existing workflow (`id`) adds nothing, so the limit does not apply.
+      const list = await workflows.load(monoId);
+      const updating = input.id !== undefined && list.some((entry) => entry.id === id());
+      if (!updating && list.length >= WORKFLOWS_MAX)
         issues.push({
           message: `A Mono can have at most ${WORKFLOWS_MAX} workflows; remove one before adding another`,
         });

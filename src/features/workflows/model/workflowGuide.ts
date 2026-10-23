@@ -6,6 +6,7 @@ import {
   MAX_ROUNDS_LIMIT,
   MAX_TIMEOUT_MINUTES,
   WORKFLOWS_MAX,
+  WORKFLOW_DEFINITION_MAX_BYTES,
   WORKFLOW_DESCRIPTION_MAX,
   WORKFLOW_NAME_MAX,
   WORKFLOW_RUNS_KEPT,
@@ -240,6 +241,8 @@ export function workflowGuide(): string {
     "- `inputValues`: the value of each declared input. A `project` input takes the path or name of one of the Mono's projects. A missing or mistyped value is reported as an issue. Change values later with `workflows.setInputs`.",
     "- `nodes`: a list of nodes (below). `edges`: a list of `{\"from\", \"to\", \"handle\"?, \"loop\"?}`.",
     "",
+    "The app is lenient about extras inside the definition: a misspelled or unknown optional field on a node or edge is ignored without a warning (so a typo such as `timeoutMinute` silently does nothing), and a session output field with an unknown `type` is dropped. An input with a bad name or type is refused with an error. Check the result of `workflows.get` after saving if you are unsure a field was read.",
+    "",
     "Every node has `id` and `type`, and may have `title` (a readable label for the board), `parent` (the For each it runs inside) and `ui` (a board position; leave it out, the board places the nodes itself).",
     "",
     "A node id matches `^[a-z][a-z0-9_]{0,39}$` (lowercase letters, digits and underscores, starting with a letter), is unique, and must not be `run`, `inputs` or `results`, because ids appear in templates as `{{id.field}}`.",
@@ -276,7 +279,7 @@ export function workflowGuide(): string {
     "- Inside the group, draw edges only between its own nodes; a child without an incoming edge starts at once. The group's own edges go to and from the nodes outside it. A For each cannot contain another For each or the report, and the trigger stays outside. When every item has finished, the group's output is `results`: the last output of each item.",
     "",
     "`report`",
-    "- Exactly one, at the top level, with no outgoing edges. `template` (optional) is the report text; without it the app writes the report itself (see Reports).",
+    "- Exactly one, at the top level, with no outgoing edges. `template` (optional) is the report text; without it the app writes the report itself (see Session output and reports).",
     "",
     "### Edges",
     "",
@@ -300,7 +303,7 @@ export function workflowGuide(): string {
     "- `<nodeId>.<field>` for a node upstream of this one (over non-loop edges), and inside a loop for any node of the loop body. Outputs: a session's declared fields; a command's `exitCode`, `stdout`, `stderr`; an askMono's `answer`, `reason`; a For each's `results`. An unknown field is an issue.",
     "- `<as>.<path>` (default `item`) inside a For each; steps inside it also read everything upstream of the group.",
     "",
-    "The report template is narrower. It reads `inputs.*`, `run.round|id|startedAt` plus `run.name`, `run.status`, `run.statusLabel` and `run.endedAt`, `results`, and the outputs of nodes at the top level. It cannot read steps inside a For each or the loop variable; their data reaches the report through `{{results}}` (one entry per item with `name`, `status`, `rounds`, `maxRoundsReached`, `errors`, `output`) or `{{<forEachId>.results}}`. Templates have no loops, so `{{results}}` prints as JSON; when you want a readable list, leave the template out and mark the fields to show with `inReport`.",
+    "The report template is narrower. It reads `inputs.*`, `run.round|id|startedAt` plus `run.name`, `run.status`, `run.statusLabel` and `run.endedAt`, `results`, and the outputs of top-level nodes that are upstream of the report. It cannot read steps inside a For each or the loop variable; their data reaches the report through `{{results}}` or `{{<forEachId>.results}}`. `{{results}}` is a list with one entry per piece of work: `branch`, `name`, `status`, `rounds`, `maxRoundsReached`, `errors` and `output` (the item's last session output). It starts with a `Run` entry for the work outside any For each, and has extra entries for earlier loop rounds that failed or ran out of rounds. Templates have no loops, so `{{results}}` prints as JSON; when you want a readable list, leave the template out and mark the fields to show with `inReport`.",
     "",
     "`{{#if path}}text{{/if}}` includes `text` only when the value is set: not empty, not false, not zero, not an empty list. It takes one path and nothing else (no comparison, no else, no nesting; use an `if` node for branching). It works in prompts, questions and report templates, and is refused in commands.",
   );
@@ -320,7 +323,7 @@ export function workflowGuide(): string {
     "- `{{fetch.titles}} contains \"urgent\"`",
     "- `{{tests.stdout}} contains \"FAIL\"`",
     "",
-    "A condition that cannot be read fails the node at run time, so run `workflows.validate` and keep to this grammar.",
+    "`workflows.validate` checks every condition against this grammar and reports one it cannot read (for example an unquoted word, single quotes, `and`, or an unknown operator) as an issue on the node or loop edge. An unreadable condition would otherwise fail the node when the run reaches it.",
   );
 
   add(
@@ -330,7 +333,9 @@ export function workflowGuide(): string {
     "",
     "The app appends the contract to the prompt for you: the session must end its last reply with one fenced code block whose info string is `workflow-output` and whose body is a JSON object with every declared field, each of the declared type. Do not write that instruction in the prompt yourself; describe what each field means in its `description` instead. If the block is missing or wrong the session is asked once to fix it, and the node fails if it still does not comply. A session with no output fields needs no block.",
     "",
-    "Without a report `template`, the app writes the report: for every For each item (or for the run itself when there is no For each) the status, errors, loop rounds used and the fields of the item's last session node that are shown. `inReport: true` shows a field, `inReport: false` hides it; unset, string fields are shown and the rest are hidden. If the report must contain something from an earlier step of an item, repeat it in a field of the last session, as `pr_url` does in the ticket example below.",
+    "Without a report `template`, the app writes the report: for every For each item the status, errors, loop rounds used and the reported fields of the item's last session node, plus a `Run` entry for the work outside any For each (shown when it failed or has something to show; next to a For each it lists the reported fields of every top-level session). `inReport: true` shows a field, `inReport: false` hides it; unset, string fields are shown and the rest are hidden. If the report must contain something from an earlier step of an item, repeat it in a field of the last session, as `pr_url` does in the ticket example below.",
+    "",
+    "With a report `template`, the report body is only your template. Failures, errors and loop notes are not added: they appear only if the template prints `{{results}}`. The report title (the workflow name and the run status, such as completed with failures) is always added, so the status stays visible.",
   );
 
   add(
@@ -360,7 +365,8 @@ export function workflowGuide(): string {
     `- A Mono can have at most ${WORKFLOWS_MAX} workflows. The last ${WORKFLOW_RUNS_KEPT} runs of each are kept.`,
     `- \`maxParallel\` 1 to ${MAX_PARALLEL_LIMIT} (default ${DEFAULT_MAX_PARALLEL}); \`maxRounds\` 1 to ${MAX_ROUNDS_LIMIT}.`,
     `- \`timeoutMinutes\` above 0 and at most ${MAX_TIMEOUT_MINUTES} (24 hours); defaults ${DEFAULT_SESSION_TIMEOUT_MINUTES} for a session and ${DEFAULT_COMMAND_TIMEOUT_MINUTES} for a command.`,
-    `- Name up to ${WORKFLOW_NAME_MAX} characters, description up to ${WORKFLOW_DESCRIPTION_MAX}, and a definition under 512 KiB.`,
+    `- Name up to ${WORKFLOW_NAME_MAX} characters, description up to ${WORKFLOW_DESCRIPTION_MAX}, and a definition under ${WORKFLOW_DEFINITION_MAX_BYTES / 1024} KiB.`,
+    "- The workflow limit applies to new workflows. Checking a change to an existing one (`workflows.validate` with its `id`) does not count against it.",
     "- Long text in a node output is cut to keep a run record small.",
   );
 
@@ -369,9 +375,9 @@ export function workflowGuide(): string {
     "",
     "1. The user describes what they want. Ask only what you cannot infer (which project, which models, how many review rounds, what should happen on failure), one or two questions at a time. Do not ask about things this guide already decides.",
     "2. Propose the steps in plain words in the chat before you build anything: the trigger, each step with its model, what each step reads and produces, the loops and conditions, and what the report says. Wait for the user's go.",
-    "3. Write the definition and run `workflows.validate` with it. It saves nothing and returns `issues` (each with a `nodeId` and a message), plus the `commands` and `prompts` the steps would run. Fix the definition and validate again until `issues` is empty.",
+    "3. Write the definition and run `workflows.validate` with it. It saves nothing and returns `issues`, plus the `commands` and `prompts` the steps would run. An issue has a `message` and, when it belongs to one node, a `nodeId`; problems with the graph as a whole, the inputs or the workflow limit have no `nodeId`. Fix the definition and validate again until `issues` is empty. When you are checking a change to an existing workflow, also pass its `id`.",
     "4. Save it with `workflows.add`. A workflow added this way is always **saved paused**, however clean it is and whatever it says about being enabled. Then tell the user to open it on the Workflows board, review it and enable it there; do not enable it for them. A definition from a yaml file also needs the user's review before it can be enabled or run.",
-    "5. For a change (\"make the reviewer Opus\", \"loop at most 2 rounds\"), read the definition with `workflows.get`, change it, validate the full new definition and save it with `workflows.update {\"id\": ..., \"workflow\": {...}}`. It replaces the whole definition and keeps the id, enabled state and run history; a workflow that ends up with issues is paused. The board shows the change live.",
+    "5. For a change (\"make the reviewer Opus\", \"loop at most 2 rounds\"), read the definition with `workflows.get`, change it, validate the full new definition with `workflows.validate {\"id\": ..., \"workflow\": {...}}` and save it with `workflows.update {\"id\": ..., \"workflow\": {...}}`. `workflows.get` also returns `id`, `enabled`, `trigger`, `running`, `issues` and `runs`; send back only the definition fields `name`, `description`, `inputs`, `inputValues`, `nodes` and `edges`, because any other field is refused (leave `enabled` out too; the user enables a workflow). `workflows.update` replaces the whole definition and keeps the id, enabled state and run history; a workflow that ends up with issues is paused. The board shows the change live.",
     "6. A finished run posts its report to this chat. If a run fails, read it with `workflows.runs`, explain the cause to the user and fix the definition the same way.",
   );
 

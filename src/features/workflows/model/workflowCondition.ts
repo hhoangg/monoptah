@@ -58,9 +58,13 @@ function isEmpty(value: unknown): boolean {
   return false;
 }
 
-/** Evaluates a single-comparison condition against `scope`. */
-export function evalCondition(condition: string, scope: TemplateScope): ConditionResult {
-  const fail = (reason: string): ConditionResult => ({
+type Parsed =
+  | { ok: true; operator: string; left: unknown; right?: unknown }
+  | { ok: false; error: string };
+
+/** Reads `condition` against `scope`: the grammar and the operands, but not the comparison itself. */
+function parseCondition(condition: string, scope: TemplateScope): Parsed {
+  const fail = (reason: string): Parsed => ({
     ok: false,
     error: `Cannot parse condition "${condition}": ${reason}`,
   });
@@ -78,8 +82,7 @@ export function evalCondition(condition: string, scope: TemplateScope): Conditio
 
   if (operator === "empty" || operator === "not empty") {
     if (pos < text.length) return fail("unexpected text after the operator (and/or are not supported)");
-    const empty = isEmpty(left.operand.value);
-    return { ok: true, value: operator === "empty" ? empty : !empty };
+    return { ok: true, operator, left: left.operand.value };
   }
 
   const right = readOperand(text, pos, scope);
@@ -87,9 +90,31 @@ export function evalCondition(condition: string, scope: TemplateScope): Conditio
   if (skipSpace(text, right.end) < text.length) {
     return fail("unexpected text after the second operand (and/or are not supported)");
   }
+  return { ok: true, operator, left: left.operand.value, right: right.operand.value };
+}
 
-  const a = left.operand.value;
-  const b = right.operand.value;
+/**
+ * What is wrong with the way `condition` is written, if anything: the grammar only, not whether
+ * it can be true. Used to refuse a workflow whose condition would fail when the run reaches it.
+ */
+export function conditionSyntaxProblem(condition: string): string | undefined {
+  const parsed = parseCondition(condition, {});
+  return parsed.ok ? undefined : parsed.error;
+}
+
+/** Evaluates a single-comparison condition against `scope`. */
+export function evalCondition(condition: string, scope: TemplateScope): ConditionResult {
+  const parsed = parseCondition(condition, scope);
+  if (!parsed.ok) return parsed;
+  const { operator, left: a, right: b } = parsed;
+  if (operator === "empty" || operator === "not empty") {
+    const empty = isEmpty(a);
+    return { ok: true, value: operator === "empty" ? empty : !empty };
+  }
+  const fail = (reason: string): ConditionResult => ({
+    ok: false,
+    error: `Cannot parse condition "${condition}": ${reason}`,
+  });
   switch (operator) {
     case "==":
       return { ok: true, value: sameValue(a, b) };

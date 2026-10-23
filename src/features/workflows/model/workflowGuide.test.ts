@@ -8,6 +8,9 @@ import {
   MAX_TIMEOUT_MINUTES,
   NODE_TYPES,
   WORKFLOWS_MAX,
+  WORKFLOW_DEFINITION_MAX_BYTES,
+  WORKFLOW_DESCRIPTION_MAX,
+  WORKFLOW_NAME_MAX,
   WORKFLOW_RUNS_KEPT,
   type Workflow,
 } from "./workflow";
@@ -52,19 +55,15 @@ describe("workflowGuide", () => {
       expect(guide, example.name).toContain(JSON.stringify(example.workflow, null, 2));
       expect(guide).toContain(example.why);
     }
-    for (const limit of [
-      WORKFLOWS_MAX,
-      WORKFLOW_RUNS_KEPT,
-      MAX_PARALLEL_LIMIT,
-      MAX_ROUNDS_LIMIT,
-      MAX_TIMEOUT_MINUTES,
-      DEFAULT_MAX_PARALLEL,
-      DEFAULT_SESSION_TIMEOUT_MINUTES,
-      DEFAULT_COMMAND_TIMEOUT_MINUTES,
-    ])
-      expect(guide).toContain(String(limit));
     expect(guide).toContain(`at most ${WORKFLOWS_MAX} workflows`);
-    expect(guide).toContain("1440");
+    expect(guide).toContain(`last ${WORKFLOW_RUNS_KEPT} runs`);
+    expect(guide).toContain(`1 to ${MAX_PARALLEL_LIMIT} (default ${DEFAULT_MAX_PARALLEL})`);
+    expect(guide).toContain(`\`maxRounds\` 1 to ${MAX_ROUNDS_LIMIT}`);
+    expect(guide).toContain(`at most ${MAX_TIMEOUT_MINUTES} (24 hours)`);
+    expect(guide).toContain(`defaults ${DEFAULT_SESSION_TIMEOUT_MINUTES} for a session and ${DEFAULT_COMMAND_TIMEOUT_MINUTES} for a command`);
+    expect(guide).toContain(`under ${WORKFLOW_DEFINITION_MAX_BYTES / 1024} KiB`);
+    expect(guide).toContain(`at most ${WORKFLOW_NAME_MAX} characters`);
+    expect(guide).toContain(`at most ${WORKFLOW_DESCRIPTION_MAX} characters`);
   });
 
   it("examples use catalog model ids", () => {
@@ -78,6 +77,19 @@ describe("workflowGuide", () => {
   it("guide mentions every node type", () => {
     const guide = workflowGuide();
     for (const type of NODE_TYPES) expect(guide).toContain(`\`${type}\``);
+  });
+
+  it("guide states the points reviewers asked for", () => {
+    const guide = workflowGuide();
+    expect(guide).toContain("only your template");
+    expect(guide).toContain("only if the template prints `{{results}}`");
+    expect(guide).toContain("upstream of the report");
+    expect(guide).toContain("`Run` entry");
+    expect(guide).toContain("problems with the graph as a whole");
+    expect(guide).toContain("pass its `id`");
+    expect(guide).toContain("does not count against it");
+    expect(guide).toContain("`name`, `description`, `inputs`, `inputValues`, `nodes` and `edges`");
+    expect(guide).toContain("checks every condition against this grammar");
   });
 
   it("guide covers the rules the validator enforces", () => {
@@ -110,8 +122,8 @@ describe("workflowGuide", () => {
 
   it("guide has no dashes", () => {
     const guide = workflowGuide();
-    expect(guide).not.toContain("—");
-    expect(guide).not.toContain("–");
+    expect(guide).not.toContain("\u2014");
+    expect(guide).not.toContain("\u2013");
   });
 
   it("guide is deterministic", () => {

@@ -16,6 +16,7 @@ import {
   type WorkflowInput,
   type WorkflowNode,
 } from "./workflow";
+import { conditionSyntaxProblem } from "./workflowCondition";
 import { shellTemplateProblems, templateVars } from "./workflowTemplate";
 
 export type WorkflowIssue = { nodeId?: NodeId; message: string };
@@ -671,6 +672,10 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
         if (hasCondition === decidesByMono) {
           add('An If node needs either a condition or decide "mono", not both or neither', node.id);
         }
+        if (hasCondition) {
+          const problem = conditionSyntaxProblem(node.condition as string);
+          if (problem) add(problem, node.id);
+        }
         if (node.condition) checkText(node.condition, node);
         if (node.question) checkText(node.question, node);
         break;
@@ -771,6 +776,8 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
       if (!decide.trim()) {
         add(`Loop edge ${e.from} -> ${e.to}: decide must be "mono" or a condition`, e.from);
       } else {
+        const problem = conditionSyntaxProblem(decide);
+        if (problem) add(`Loop edge ${e.from} -> ${e.to}: ${problem}`, e.from);
         const scope = scopeOf(e.from);
         scope.add(e.from);
         const itemNames = new Set(parentChain(from).map((p) => p.as ?? "item"));
