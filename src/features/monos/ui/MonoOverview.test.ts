@@ -1,10 +1,18 @@
 // @vitest-environment happy-dom
-import { act, createElement } from "react";
+import { act, createElement, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { WORKFLOWS_MAX, type Workflow } from "../../workflows/model/workflow";
 import { exportWorkflow } from "../../workflows/model/workflowYaml";
 import { workflow } from "../../workflows/ui/workflowUiFixtures";
+import {
+  acknowledgeQuoteRequest,
+  ADD_TO_CHAT_EVENT,
+  addToChatTargets,
+  type AddToChatRequest,
+  type QuoteRequest,
+} from "../../sessions/model/quoteDraft";
+import { MonoComposer } from "./MonoComposer";
 import { MonoOverview, type MonoOverviewTab } from "./MonoOverview";
 
 vi.mock("../model/monoHabits", async (original) => ({
@@ -26,6 +34,10 @@ vi.mock("../../workflows/model/workflowStore", async (original) => ({
     window.dispatchEvent(new CustomEvent("monocode:mono-files-changed"));
     return result;
   },
+}));
+
+vi.mock("../../sessions/hooks/useFileDrop", () => ({
+  useFileDrop: () => false,
 }));
 
 vi.mock("./MonoChangesView", () => ({
@@ -299,7 +311,9 @@ it("offers New and Import workflow only on Workflows, and says how to fill it", 
   ).not.toBeNull();
   expect(
     container.querySelector('[data-mono-overview="workflows"]')!.textContent,
-  ).toContain("Ask Broski to chain sessions into a workflow, or create one with +.");
+  ).toContain(
+    "Ask Broski to chain sessions into a workflow, or create one with +.",
+  );
 });
 
 it("opens the board from New, and the import page from Import", async () => {
@@ -323,7 +337,9 @@ it("opens the board from New, and the import page from Import", async () => {
   ).toBe("New workflow");
   await act(async () =>
     container
-      .querySelector<HTMLButtonElement>('[data-workflow-board] [aria-label="Back"]')!
+      .querySelector<HTMLButtonElement>(
+        '[data-workflow-board] [aria-label="Back"]',
+      )!
       .click(),
   );
   await act(async () =>
@@ -383,4 +399,75 @@ it("turns Import off at the workflow limit, as it does New", async () => {
   expect(
     buttons.every((button) => button.getAttribute("aria-disabled") === "true"),
   ).toBe(true);
+});
+
+/** The Mono's chat as the app wires it: a composer fed by add-to-chat requests. */
+function MonoChat({ onSubmit }: { onSubmit: () => void }) {
+  const [request, setRequest] = useState<QuoteRequest>();
+  useEffect(() => {
+    let id = 0;
+    const onAdd = (event: Event) => {
+      const detail = (event as CustomEvent<AddToChatRequest>).detail;
+      if (!addToChatTargets(detail, "mono-chat")) return;
+      setRequest({ id: ++id, text: detail.text, mode: detail.mode });
+    };
+    window.addEventListener(ADD_TO_CHAT_EVENT, onAdd);
+    return () => window.removeEventListener(ADD_TO_CHAT_EVENT, onAdd);
+  }, []);
+  return createElement(MonoComposer, {
+    sessionId: "mono-chat",
+    name: "Broski",
+    quoteRequest: request,
+    onQuoteRequestConsumed: (handled: number) =>
+      setRequest((current) => acknowledgeQuoteRequest(current, handled)),
+    onSubmit: () => {
+      onSubmit();
+      return true;
+    },
+  });
+}
+
+it("ask mono button prefills the composer", async () => {
+  const onSubmit = vi.fn();
+  const chat = document.createElement("div");
+  document.body.append(chat);
+  const chatRoot = createRoot(chat);
+  await act(async () => chatRoot.render(createElement(MonoChat, { onSubmit })));
+  const field = () =>
+    chat.querySelector<HTMLTextAreaElement>('[aria-label="Message Broski"]')!;
+  const ask = () =>
+    container.querySelector<HTMLButtonElement>(
+      '[aria-label="Ask Mono to build a workflow"]',
+    );
+
+  await render("habits", vi.fn(), { chatSessionId: "mono-chat" });
+  expect(ask()).toBeNull();
+  await render("workflows", vi.fn(), { chatSessionId: "mono-chat" });
+  await act(async () => ask()!.click());
+
+  expect(field().value).toBe("Help me build a workflow that ");
+  expect(onSubmit).not.toHaveBeenCalled();
+  act(() => chatRoot.unmount());
+  chat.remove();
+});
+
+it("ask mono button does not reach another session's composer", async () => {
+  const seen = vi.fn();
+  const listener = (event: Event) => seen((event as CustomEvent).detail);
+  window.addEventListener(ADD_TO_CHAT_EVENT, listener);
+  await render("workflows", vi.fn(), { chatSessionId: "mono-chat" });
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>(
+        '[aria-label="Ask Mono to build a workflow"]',
+      )!
+      .click(),
+  );
+  window.removeEventListener(ADD_TO_CHAT_EVENT, listener);
+  expect(seen).toHaveBeenCalledWith({
+    text: "Help me build a workflow that ",
+    mode: "prefill",
+    sessionId: "mono-chat",
+  });
+  expect(addToChatTargets(seen.mock.calls[0][0], "workspace-chat")).toBe(false);
 });

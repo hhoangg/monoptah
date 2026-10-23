@@ -7,6 +7,7 @@ import {
   ListBullet,
   ListFilter,
   MessageMultiple,
+  MessageSquarePlus,
   Plus,
   Search,
   Workflow,
@@ -17,6 +18,7 @@ import { artifactLabel, type ArtifactCard } from "../../artifacts/artifacts";
 import type { SessionSummary } from "../../sessions/data/sessionStore";
 import type { MonoSpawnedSession, Session } from "../../sessions/model/session";
 import type { MonoLook, MonoState } from "../model/mono";
+import { requestAddToChat } from "../../sessions/model/quoteDraft";
 import { HABITS_MAX } from "../model/monoHabits";
 import { WORKFLOWS_MAX } from "../../workflows/model/workflow";
 import {
@@ -92,9 +94,14 @@ type Route =
   | { kind: "new-workflow" }
   | { kind: "import-workflow" };
 
+/** What "Ask Mono to build a workflow" starts in the chat, for the user to finish. */
+export const ASK_MONO_WORKFLOW_DRAFT = "Help me build a workflow that ";
+
 type Props = {
   open: boolean;
   monoId: string;
+  /** Its conversation, whose composer "Ask Mono to build a workflow" fills in. */
+  chatSessionId?: string;
   /** Its conversation's folder, which habits run in. */
   cwd: string;
   agent: MonoLook;
@@ -133,6 +140,7 @@ type Props = {
 export function MonoOverview({
   open,
   monoId,
+  chatSessionId,
   cwd,
   agent,
   monoModel,
@@ -419,6 +427,22 @@ export function MonoOverview({
               ) : null}
               {tab === "workflows" ? (
                 <>
+                  <IconButton
+                    label="Ask Mono to build a workflow"
+                    disabled={!chatSessionId}
+                    onClick={() =>
+                      requestAddToChat(
+                        ASK_MONO_WORKFLOW_DRAFT,
+                        "prefill",
+                        chatSessionId,
+                      )
+                    }
+                  >
+                    <MessageSquarePlus
+                      className="size-3.5"
+                      strokeWidth={1.75}
+                    />
+                  </IconButton>
                   <IconButton
                     label={
                       workflows && workflows.length >= WORKFLOWS_MAX

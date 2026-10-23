@@ -100,6 +100,23 @@ it("consumes quotes once and adds them to the current draft", () => {
   expect(consumed).toHaveBeenCalledWith(1);
 });
 
+it("prefills the draft exactly, focuses it and sends nothing", () => {
+  const onSubmit = vi.fn(() => true);
+  render({ onSubmit });
+  render({
+    onSubmit,
+    quoteRequest: {
+      id: 1,
+      text: "Help me build a workflow that ",
+      mode: "prefill",
+    },
+    focusToken: undefined,
+  });
+  expect(field().value).toBe("Help me build a workflow that ");
+  expect(document.activeElement).toBe(field());
+  expect(onSubmit).not.toHaveBeenCalled();
+});
+
 it("sends consecutive messages without duplicating rapid Enter presses", () => {
   const onSubmit = vi.fn(() => true);
   render({ onSubmit });

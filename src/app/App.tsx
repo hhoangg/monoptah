@@ -2235,7 +2235,8 @@ function Workspace({
   useEffect(() => {
     const openSessionForAddToChat = (event: Event) => {
       const detail = (event as CustomEvent<AddToChatRequest>).detail;
-      if (!detail?.text) return;
+      // A request aimed at one session's composer never opens a new chat.
+      if (!detail?.text || detail.sessionId) return;
 
       const result = applyAddToChatRequest({
         sessions: sessionsRef.current,
@@ -14836,6 +14837,7 @@ function Workspace({
         key={monoViewMono.id}
         open={monoOverviewOpen}
         monoId={monoViewMono.id}
+        chatSessionId={monoViewSession.id}
         cwd={monoViewSession.cwd}
         agent={monoLook(monoViewMono)}
         monoModel={{
