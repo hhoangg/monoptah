@@ -81,6 +81,11 @@ pub enum Effect {
         thread: Option<i64>,
         html: String,
     },
+    /// A configured group became a supergroup (Telegram's service message).
+    Migrated {
+        from: i64,
+        to: i64,
+    },
 }
 
 /// A completed prompt whose reply was handed to the frontend and awaits its result.
@@ -279,6 +284,36 @@ impl Registry {
 
     pub fn prompt(&self, key: &str) -> Option<&PendingPrompt> {
         self.prompts.get(key)
+    }
+
+    /// Whether the prompt stored under `key` is the one `payload` describes, asked by
+    /// `owner`. Request ids restart when a window reloads, so a key alone does not say
+    /// that: the owner window, the question ids and their option ids must all match too.
+    pub fn is_same_prompt(&self, key: &str, owner: &str, payload: &ForwardPayload) -> bool {
+        let Some(old) = self.prompts.get(key) else {
+            return false;
+        };
+        let shape = |payload: &ForwardPayload| -> Vec<(String, Vec<String>)> {
+            payload
+                .questions
+                .iter()
+                .map(|q| {
+                    let options = q.options.iter().map(|option| option.id.clone());
+                    (q.id.clone(), options.collect())
+                })
+                .collect()
+        };
+        old.owner_window == owner && shape(&old.payload) == shape(payload)
+    }
+
+    /// Drops a prompt that a new one is about to replace under the same key. Its messages
+    /// are edited to the expired status and its tokens stop working, even when its reply
+    /// was already with a window.
+    pub fn expire(&mut self, key: &str) -> Vec<Effect> {
+        match self.forget(key) {
+            Some(prompt) => edit_all(&prompt, EXPIRED),
+            None => Vec::new(),
+        }
     }
 
     /// A group became a supergroup: its prompts now live under the new chat id, so taps and
@@ -515,6 +550,9 @@ impl Registry {
         let Some(chat) = msg.pointer("/chat/id").and_then(Value::as_i64) else {
             return Vec::new();
         };
+        if let Some(effect) = migration(msg, chat, chats) {
+            return vec![effect];
+        }
         if msg.pointer("/from/is_bot").and_then(Value::as_bool) == Some(true) {
             return Vec::new();
         }
@@ -574,6 +612,21 @@ impl Registry {
         prompt.selected[q_index] = BTreeSet::from([CUSTOM_OPTION_ID.to_string()]);
         self.finish_question(&key, q_index, &by)
     }
+}
+
+/// The service message Telegram posts when a group is upgraded: `migrate_to_chat_id` in
+/// the old chat, `migrate_from_chat_id` in the new one. Only a chat that is configured
+/// (the old one, in either form) can move, so an unrelated group cannot rewrite the config.
+fn migration(msg: &Value, chat: i64, chats: &BTreeSet<i64>) -> Option<Effect> {
+    let (from, to) = match (
+        msg["migrate_to_chat_id"].as_i64(),
+        msg["migrate_from_chat_id"].as_i64(),
+    ) {
+        (Some(to), _) => (chat, to),
+        (None, Some(from)) => (from, chat),
+        (None, None) => return None,
+    };
+    (from != to && chats.contains(&from)).then_some(Effect::Migrated { from, to })
 }
 
 fn reply(chat: i64, thread: Option<i64>, html: &str) -> Effect {
@@ -1233,6 +1286,66 @@ mod tests {
         }
         // The hint does not burn the code.
         assert!(codes.take(&code, 0).is_some());
+    }
+
+    #[test]
+    fn service_message_migration_effect() {
+        let mut reg = Registry::default();
+        let new_chat = -1002_i64;
+        let service = |chat: i64, key: &str, other: i64| json!({"message_id": 3, "chat": {"id": chat, "type": "group"}, key: other});
+        let effects = say(&mut reg, service(CHAT, "migrate_to_chat_id", new_chat));
+        assert_eq!(
+            effects,
+            [Effect::Migrated {
+                from: CHAT,
+                to: new_chat
+            }]
+        );
+        // The matching message in the new supergroup names the configured old chat.
+        let effects = say(&mut reg, service(new_chat, "migrate_from_chat_id", CHAT));
+        assert_eq!(
+            effects,
+            [Effect::Migrated {
+                from: CHAT,
+                to: new_chat
+            }]
+        );
+        // A group that is not configured cannot move anything.
+        assert!(say(&mut reg, service(-999, "migrate_to_chat_id", new_chat)).is_empty());
+        assert!(say(&mut reg, service(new_chat, "migrate_from_chat_id", -999)).is_empty());
+        assert!(say(&mut reg, service(CHAT, "migrate_to_chat_id", CHAT)).is_empty());
+    }
+
+    #[test]
+    fn expire_edits_every_message_and_drops_tokens() {
+        let mut reg = Registry::default();
+        let key = add(&mut reg, "s1", 7, vec![question("q1", false, false)]);
+        let t = token(&reg, &key, 0);
+        let effects = reg.expire(&key);
+        assert_eq!(effects.len(), 1, "{effects:?}");
+        assert!(
+            matches!(&effects[0], Effect::Edit { html, keyboard: None, .. } if html.contains("This question has expired"))
+        );
+        assert_eq!(
+            toast(&tap(&mut reg, &format!("o:{t}:0"))),
+            "This question has expired"
+        );
+        assert!(reg.expire(&key).is_empty());
+    }
+
+    #[test]
+    fn is_same_prompt_compares_owner_and_shape() {
+        let mut reg = Registry::default();
+        let key = add(&mut reg, "s1", 7, vec![question("q1", false, false)]);
+        let same = payload("s1", 7, vec![question("q1", false, false)]);
+        assert!(reg.is_same_prompt(&key, WINDOW, &same));
+        assert!(!reg.is_same_prompt(&key, "other", &same));
+        let other_question = payload("s1", 7, vec![question("q2", false, false)]);
+        assert!(!reg.is_same_prompt(&key, WINDOW, &other_question));
+        let mut other_option = same.clone();
+        other_option.questions[0].options[0].id = "zzz".into();
+        assert!(!reg.is_same_prompt(&key, WINDOW, &other_option));
+        assert!(!reg.is_same_prompt("missing#1", WINDOW, &same));
     }
 
     #[test]

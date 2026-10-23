@@ -4,7 +4,7 @@
 //! All shared state sits behind one mutex (`State`). No lock is held across an HTTP call,
 //! an event emit or a sleep. The bot token never appears in a log line or a problem string.
 
-use super::api::{BotApi, TgError};
+use super::api::{BotApi, TgError, MAX_RETRY_AFTER_S};
 use super::config::{self, CodePurpose, Codes, ProjectConfig, TelegramConfig};
 use super::pending::{key_of, Effect, PendingPrompt, Registry};
 use super::queue::{Job, SendQueue};
@@ -25,6 +25,8 @@ const POLL_TIMEOUT_S: u64 = 50;
 /// How long a paused poller (409) waits before it tries again.
 const PAUSE_S: u64 = 60;
 const MAX_BACKOFF_S: u64 = 60;
+/// Group-to-supergroup hops one chat lookup follows before it gives up.
+const MAX_MIGRATION_HOPS: usize = 2;
 /// A reply handed to a window must be confirmed within this time, or it counts as failed.
 const DELIVERY_TIMEOUT_MS: u64 = 30_000;
 const TOPIC_NAME_MAX_CHARS: usize = 128;
@@ -323,7 +325,10 @@ pub struct Bridge {
 }
 
 fn sleep_unless_stopped(stop: &AtomicBool, seconds: u64) {
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(Duration::from_secs(seconds.min(MAX_RETRY_AFTER_S)))
+        .unwrap_or(now);
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -575,6 +580,11 @@ impl Bridge {
                     session_id,
                     thread,
                 } => self.on_linked(token, &project, &session_id, thread, update_chat),
+                Effect::Migrated { from, to } => {
+                    self.migrate_chat(from, to);
+                    self.refresh_chat(to);
+                    self.wake.notify_all();
+                }
                 other => rest.push(other),
             }
         }
@@ -656,7 +666,9 @@ impl Bridge {
     }
 
     /// Records whether Topics are on and whether the bot may manage them. Returns the
-    /// problem to show, if any. A failed lookup changes nothing.
+    /// problem to show, if any. A failed lookup changes nothing. When Telegram says the
+    /// group became a supergroup (turning Topics on does that), the stored chat follows
+    /// it and the lookup is repeated on the new id, at most `MAX_MIGRATION_HOPS` times.
     fn refresh_chat_info(
         &self,
         api: &BotApi,
@@ -667,21 +679,51 @@ impl Bridge {
         if bot_id == 0 {
             return None;
         }
-        let chat_info = api.get_chat(chat).ok()?;
-        let member = api.get_chat_member(chat, bot_id).ok()?;
-        let (is_forum, can_manage, problem) = topic_rights(&chat_info, &member);
-        let mut state = self.lock();
-        let p = state.cfg.projects.get_mut(project)?;
-        p.is_forum = Some(is_forum);
-        p.can_manage_topics = Some(can_manage);
-        match problem {
-            Some(text) => p.problem = Some(text.to_string()),
-            None if p.problem.as_deref().is_some_and(is_rights_problem) => p.problem = None,
-            None => {}
+        let mut chat = chat;
+        for _ in 0..=MAX_MIGRATION_HOPS {
+            let lookup = api
+                .get_chat(chat)
+                .and_then(|info| Ok((info, api.get_chat_member(chat, bot_id)?)));
+            let (chat_info, member) = match lookup {
+                Ok(found) => found,
+                Err(TgError::Migrated(new_chat)) if new_chat != chat => {
+                    self.migrate_chat(chat, new_chat);
+                    chat = new_chat;
+                    continue;
+                }
+                Err(_) => return None,
+            };
+            let (is_forum, can_manage, problem) = topic_rights(&chat_info, &member);
+            let mut state = self.lock();
+            let p = state.cfg.projects.get_mut(project)?;
+            p.is_forum = Some(is_forum);
+            p.can_manage_topics = Some(can_manage);
+            match problem {
+                Some(text) => p.problem = Some(text.to_string()),
+                None if p.problem.as_deref().is_some_and(is_rights_problem) => p.problem = None,
+                None => {}
+            }
+            let shown = p.problem.clone();
+            self.persist(&state);
+            return shown;
         }
-        let shown = p.problem.clone();
-        self.persist(&state);
-        shown
+        None
+    }
+
+    /// Re-checks Topics and rights for every project whose group is `chat`. Used after a
+    /// migration, when the stored `isForum`, rights and problem describe the old group.
+    fn refresh_chat(&self, chat: i64) {
+        let targets: Vec<(String, String, i64)> = self
+            .lock()
+            .cfg
+            .projects
+            .iter()
+            .filter(|(_, p)| p.chat_id == Some(chat) && !p.token.is_empty())
+            .map(|(name, p)| (name.clone(), p.token.clone(), p.bot_id))
+            .collect();
+        for (project, token, bot_id) in targets {
+            self.refresh_chat_info(&self.api(&token), &project, chat, bot_id);
+        }
     }
 
     /// After a start, re-checks the group of every project of this bot.
@@ -759,7 +801,8 @@ impl Bridge {
                 } => self.deliver(&window, &session_id, request_id, reply, &by),
                 Effect::AnswerCallback { .. }
                 | Effect::Connected { .. }
-                | Effect::Linked { .. } => {}
+                | Effect::Linked { .. }
+                | Effect::Migrated { .. } => {}
             }
         }
     }
@@ -1069,7 +1112,9 @@ impl Bridge {
         match error {
             TgError::RetryAfter(seconds) => {
                 let mut state = self.lock();
-                state.queue.pause(chat, now + seconds.saturating_mul(1000));
+                state
+                    .queue
+                    .pause(chat, now.saturating_add(seconds.saturating_mul(1000)));
                 state.queue.requeue_front(chat, job);
             }
             TgError::Network(_) => {
@@ -1077,11 +1122,14 @@ impl Bridge {
                 let failures = state.failures.entry(chat).or_insert(0);
                 *failures += 1;
                 let wait = backoff_secs(*failures);
-                state.queue.pause(chat, now + wait * 1000);
+                state
+                    .queue
+                    .pause(chat, now.saturating_add(wait.saturating_mul(1000)));
                 state.queue.requeue_front(chat, job);
             }
             TgError::Migrated(new_chat) if new_chat != chat => {
                 self.migrate_chat(chat, new_chat);
+                self.refresh_chat(new_chat);
                 let job = match job {
                     Job::EditStatus {
                         project,
@@ -1322,7 +1370,8 @@ impl Bridge {
             return Err("The prompt has no questions".to_string());
         }
         let key = key_of(&payload.session_id, payload.request_id);
-        {
+        let project_name = payload.project.clone();
+        let expired = {
             let mut state = self.lock();
             let project = state
                 .cfg
@@ -1336,11 +1385,17 @@ impl Bridge {
             let chat = project
                 .chat_id
                 .ok_or("No Telegram group is connected for this project")?;
-            // Forwarding the same prompt twice must not send it twice.
-            if state.registry.prompt(&key).is_some() {
-                return Ok(());
-            }
             let has_topic = project.topics.contains_key(&payload.session_id);
+            // Forwarding the same prompt twice must not send it twice. The same key with a
+            // different owner or different questions is a new prompt after a window reload
+            // (request ids restart), so the old one is closed first.
+            let mut expired = Vec::new();
+            if state.registry.prompt(&key).is_some() {
+                if state.registry.is_same_prompt(&key, window, &payload) {
+                    return Ok(());
+                }
+                expired = state.registry.expire(&key);
+            }
             let slot = (payload.project.clone(), payload.session_id.clone());
             let create = Job::CreateTopic {
                 project: payload.project.clone(),
@@ -1354,7 +1409,9 @@ impl Bridge {
                 state.queue.push(chat, create);
             }
             state.queue.push(chat, Job::SendQuestion { key });
-        }
+            expired
+        };
+        self.apply_effects(expired, Owner::Project(&project_name));
         self.wake.notify_all();
         Ok(())
     }
@@ -1804,18 +1861,34 @@ mod tests {
                 "Bad Request: group chat was upgraded to a supergroup chat",
                 json!({ "migrate_to_chat_id": new_chat }),
             ),
+            // The group is looked at again after the move.
+            ok(json!({ "id": new_chat, "is_forum": true })),
+            ok(json!({ "status": "administrator", "can_manage_topics": true })),
             ok(json!({ "message_id": 5 })),
         ]);
         let (bridge, _sink) = bridge_with(&base);
         add_project(&bridge, "proj", true);
         bind_topic(&bridge, "proj", "s1", 42);
+        {
+            let mut state = bridge.lock();
+            let p = state.cfg.projects.get_mut("proj").unwrap();
+            p.is_forum = Some(false);
+            p.problem = Some(PROBLEM_NOT_FORUM.to_string());
+        }
         bridge.forward("main", payload("s1", 1)).unwrap();
         drain(&bridge);
 
         let seen = server.join().unwrap();
-        assert_eq!(seen.len(), 2);
+        let methods: Vec<String> = seen.iter().map(method_of).collect();
+        assert_eq!(methods.len(), 4, "{methods:?}");
         assert_eq!(seen[0].body["chat_id"], CHAT);
         assert_eq!(seen[1].body["chat_id"], new_chat);
+        assert_eq!(seen[2].body["chat_id"], new_chat);
+        assert_eq!(seen[3].body["chat_id"], new_chat);
+        let status = bridge.status("proj");
+        assert_eq!(status.is_forum, Some(true), "refreshed after the move");
+        assert_eq!(status.can_manage_topics, Some(true));
+        assert!(status.problem.is_none(), "{:?}", status.problem);
         let state = bridge.lock();
         assert_eq!(state.cfg.projects["proj"].chat_id, Some(new_chat));
         assert_eq!(state.registry.prompt("s1#1").unwrap().chat, new_chat);
@@ -1825,6 +1898,111 @@ mod tests {
             config::load(&bridge.path).projects["proj"].chat_id,
             Some(new_chat)
         );
+    }
+
+    #[test]
+    fn service_message_migration_updates_chat() {
+        let new_chat = -1002_i64;
+        let (base, server) = serve_script(vec![
+            ok(json!({ "id": new_chat, "is_forum": true })),
+            ok(json!({ "status": "administrator", "can_manage_topics": true })),
+        ]);
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        bind_topic(&bridge, "proj", "s1", 42);
+        {
+            let mut state = bridge.lock();
+            let p = state.cfg.projects.get_mut("proj").unwrap();
+            p.is_forum = Some(false);
+            p.problem = Some(PROBLEM_NOT_FORUM.to_string());
+        }
+        bridge.forward("main", payload("s1", 1)).unwrap();
+        let update = json!({
+            "update_id": 4,
+            "message": {
+                "message_id": 3,
+                "from": { "id": 9 },
+                "chat": { "id": CHAT, "type": "group", "title": "Team" },
+                "migrate_to_chat_id": new_chat
+            }
+        });
+        bridge.process_update(&bridge.api(TOKEN), TOKEN, &update);
+
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].body["chat_id"], new_chat);
+        let status = bridge.status("proj");
+        assert_eq!(status.chat_id, Some(new_chat));
+        assert_eq!(status.is_forum, Some(true));
+        assert!(status.problem.is_none(), "{:?}", status.problem);
+        assert_eq!(
+            bridge.lock().registry.prompt("s1#1").unwrap().chat,
+            new_chat
+        );
+        // Queued work moved with it and the config on disk follows.
+        assert!(bridge
+            .lock()
+            .queue
+            .next_ready(10_000_000)
+            .is_some_and(|(chat, _)| chat == new_chat));
+        assert_eq!(
+            config::load(&bridge.path).projects["proj"].chat_id,
+            Some(new_chat)
+        );
+
+        // The same service message again (the old chat is no longer configured) is ignored.
+        bridge.process_update(&bridge.api(TOKEN), TOKEN, &update);
+        assert_eq!(bridge.status("proj").chat_id, Some(new_chat));
+    }
+
+    #[test]
+    fn refresh_follows_migrated_chat() {
+        let new_chat = -1002_i64;
+        let (base, server) = serve_script(vec![
+            fail(
+                400,
+                "Bad Request: group chat was upgraded to a supergroup chat",
+                json!({ "migrate_to_chat_id": new_chat }),
+            ),
+            ok(json!({ "id": new_chat, "is_forum": true })),
+            ok(json!({ "status": "administrator", "can_manage_topics": true })),
+        ]);
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        bridge.lock().cfg.projects.get_mut("proj").unwrap().problem =
+            Some(PROBLEM_NOT_FORUM.to_string());
+        let problem = bridge.refresh_chat_info(&bridge.api(TOKEN), "proj", CHAT, 123456);
+        assert_eq!(problem, None);
+
+        let seen = server.join().unwrap();
+        let methods: Vec<String> = seen.iter().map(method_of).collect();
+        assert_eq!(methods.len(), 3, "{methods:?}");
+        assert_eq!(seen[0].body["chat_id"], CHAT);
+        assert_eq!(seen[1].body["chat_id"], new_chat);
+        assert_eq!(seen[2].body["chat_id"], new_chat);
+        let status = bridge.status("proj");
+        assert_eq!(status.chat_id, Some(new_chat));
+        assert_eq!(status.is_forum, Some(true));
+        assert_eq!(status.can_manage_topics, Some(true));
+        assert!(status.problem.is_none());
+    }
+
+    #[test]
+    fn refresh_migration_hops_are_bounded() {
+        let moved = |to: i64| {
+            fail(
+                400,
+                "Bad Request: group chat was upgraded to a supergroup chat",
+                json!({ "migrate_to_chat_id": to }),
+            )
+        };
+        // Each lookup points at yet another chat; the refresh must give up by itself.
+        let (base, server) = serve_script(vec![moved(-2001), moved(-2002), moved(-2003)]);
+        let (bridge, _sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        let problem = bridge.refresh_chat_info(&bridge.api(TOKEN), "proj", CHAT, 123456);
+        assert_eq!(problem, None);
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     #[test]
@@ -2074,6 +2252,113 @@ mod tests {
             .filter(|job| matches!(job, Job::SendQuestion { .. }))
             .count();
         assert_eq!(sends, 1);
+    }
+
+    #[test]
+    fn reloaded_window_replaces_prompt_with_same_key() {
+        let (base, server) = serve_script(vec![ok(json!(true))]);
+        let (bridge, sink) = bridge_with(&base);
+        add_project(&bridge, "proj", true);
+        bridge.forward("main", payload("s1", 1)).unwrap();
+        let old_token = {
+            let mut state = bridge.lock();
+            state.registry.set_message("s1#1", 0, 500);
+            state.registry.prompt("s1#1").unwrap().tokens[0].clone()
+        };
+        bridge.lock().queue = SendQueue::default();
+
+        // After a window reload the request id restarts, so the key comes back with
+        // different questions (and here a different owner window).
+        let mut fresh = payload("s1", 1);
+        fresh.questions[0].id = "q9".into();
+        bridge.forward("other", fresh).unwrap();
+        let new_token = {
+            let state = bridge.lock();
+            let prompt = state.registry.prompt("s1#1").unwrap();
+            assert_eq!(prompt.owner_window, "other");
+            assert_eq!(prompt.payload.questions[0].id, "q9");
+            prompt.tokens[0].clone()
+        };
+        assert_ne!(new_token, old_token);
+
+        // A tap on the old message no longer reaches anything.
+        let update = json!({
+            "update_id": 1,
+            "callback_query": {
+                "id": "cb1",
+                "from": { "id": 9, "username": "alice" },
+                "data": format!("o:{old_token}:0"),
+                "message": { "message_id": 500, "chat": { "id": CHAT } }
+            }
+        });
+        bridge.process_update(&bridge.api(TOKEN), TOKEN, &update);
+        let seen = server.join().unwrap();
+        assert_eq!(seen[0].body["text"], "This question has expired");
+        assert!(sink.events.lock().unwrap().is_empty());
+
+        let jobs = queued_edits(&bridge);
+        assert!(
+            jobs.iter().any(|job| matches!(
+                job,
+                Job::EditStatus { message_id: 500, html, keyboard: None, .. }
+                    if html.contains("This question has expired")
+            )),
+            "{jobs:?}"
+        );
+        assert!(
+            jobs.iter()
+                .any(|job| matches!(job, Job::SendQuestion { key } if key == "s1#1")),
+            "the new prompt is sent: {jobs:?}"
+        );
+    }
+
+    #[test]
+    fn same_prompt_from_same_window_stays_open() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:9");
+        add_project(&bridge, "proj", true);
+        bridge.forward("main", payload("s1", 1)).unwrap();
+        let token = {
+            let mut state = bridge.lock();
+            state.registry.set_message("s1#1", 0, 500);
+            state.registry.prompt("s1#1").unwrap().tokens[0].clone()
+        };
+        bridge.lock().queue = SendQueue::default();
+        bridge.forward("main", payload("s1", 1)).unwrap();
+        let state = bridge.lock();
+        assert_eq!(state.registry.prompt("s1#1").unwrap().tokens[0], token);
+        assert_eq!(
+            state.registry.prompt("s1#1").unwrap().messages[0],
+            Some(500)
+        );
+        drop(state);
+        assert!(queued_edits(&bridge).is_empty(), "nothing edited or resent");
+    }
+
+    #[test]
+    fn huge_retry_after_is_clamped() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:9");
+        add_project(&bridge, "proj", true);
+        // A bogus value must neither overflow the pause nor the poller's sleep deadline.
+        let job = Job::Notice {
+            project: "proj".into(),
+            thread: None,
+            html: "hi".into(),
+        };
+        bridge.handle_send_error(CHAT, job, TgError::RetryAfter(u64::MAX));
+        assert!(bridge.lock().queue.next_wake(0).is_some());
+        let stop = AtomicBool::new(true);
+        sleep_unless_stopped(&stop, u64::MAX);
+
+        let body = json!({
+            "ok": false,
+            "error_code": 429,
+            "parameters": { "retry_after": u64::MAX }
+        })
+        .to_string();
+        assert_eq!(
+            crate::telegram::api::classify(429, &body),
+            TgError::RetryAfter(MAX_RETRY_AFTER_S)
+        );
     }
 
     // ----- deliveries -----

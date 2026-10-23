@@ -240,6 +240,47 @@ describe("useTelegramQuestions", () => {
     ]);
   });
 
+  it("rejects answer whose question ids do not match the current question", async () => {
+    await render([asking()]);
+    await deliver({ reply: { kind: "answered", answers: { old: ["a"] } } });
+    await deliver({
+      reply: {
+        kind: "answered",
+        answers: { q1: ["a"] },
+        custom: { old: "text" },
+      },
+    });
+    expect(onQuestionReply).not.toHaveBeenCalled();
+    expect(callsTo("telegram_answer_result")).toEqual([
+      { key: "pending-1", ok: false },
+      { key: "pending-1", ok: false },
+    ]);
+  });
+
+  it("rejects answer whose option ids do not match the current question", async () => {
+    await render([asking()]);
+    await deliver({ reply: { kind: "answered", answers: { q1: ["gone"] } } });
+    expect(onQuestionReply).not.toHaveBeenCalled();
+    expect(callsTo("telegram_answer_result")).toEqual([
+      { key: "pending-1", ok: false },
+    ]);
+  });
+
+  it("accepts a skipped reply and a custom answer", async () => {
+    await render([asking()]);
+    await deliver({ reply: { kind: "skipped" } });
+    const custom: UserQuestionReply = {
+      kind: "answered",
+      answers: { q1: ["__custom__"] },
+      custom: { q1: "my text" },
+    };
+    await deliver({ reply: custom });
+    expect(onQuestionReply).toHaveBeenNthCalledWith(1, "s1", 1, {
+      kind: "skipped",
+    });
+    expect(onQuestionReply).toHaveBeenNthCalledWith(2, "s1", 1, custom);
+  });
+
   it("ignores answer for a different requestId", async () => {
     await render([asking(2)]);
     await deliver({ requestId: 1 });

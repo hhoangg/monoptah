@@ -46,8 +46,9 @@ only saved may still show it, but its questions are never forwarded.
 - The **first answer wins**. If you answer on the desktop first, the Telegram message
   is marked "Answered on desktop". If someone answers on Telegram first, the desktop
   question is answered with that reply.
-- Choose options with the buttons. For a free-text answer, **reply to the question
-  message** with your text.
+- Choose options with the buttons. For a free-text answer, tap **Other (reply with
+  text)** on the question message, then **reply to that message** with your text. Only
+  questions that allow a custom answer have that button.
 - A prompt with several questions is sent as one message per question, each with its
   own **Skip**.
 

@@ -3,7 +3,10 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { projectKey } from "../../../shared/lib/paths";
 import type { Session } from "../../sessions/model/session";
-import type { UserQuestionReply } from "../../sessions/model/userQuestion";
+import {
+  CUSTOM_OPTION_ID,
+  type UserQuestionReply,
+} from "../../sessions/model/userQuestion";
 import { takeQuestionOutcome } from "../model/questionOutcome";
 import {
   TELEGRAM_ANSWER_EVENT,
@@ -42,6 +45,32 @@ type SentQuestion = { sessionId: string; requestId: number };
 
 function questionKey(sessionId: string, requestId: number): string {
   return `${sessionId}#${requestId}`;
+}
+
+/**
+ * Whether a reply from Telegram fits the question that is pending now. A request
+ * id alone is not enough: ids restart after a window reload, so an old message
+ * could otherwise answer a different question with the old option ids.
+ */
+function replyFitsQuestion(
+  reply: UserQuestionReply,
+  prompt: NonNullable<Session["pendingQuestion"]>,
+): boolean {
+  if (reply.kind !== "answered") return true;
+  const known = new Map(
+    prompt.questions.map((question) => [
+      question.id,
+      new Set(question.options.map((option) => option.id)),
+    ]),
+  );
+  for (const [questionId, optionIds] of Object.entries(reply.answers)) {
+    const options = known.get(questionId);
+    if (!options) return false;
+    if (optionIds.some((id) => id !== CUSTOM_OPTION_ID && !options.has(id))) {
+      return false;
+    }
+  }
+  return Object.keys(reply.custom ?? {}).every((id) => known.has(id));
 }
 
 function canForward(status: TelegramStatus | undefined): boolean {
@@ -212,7 +241,11 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
       const { key: resultKey, sessionId, requestId, reply } = event.payload;
       const session = sessionsRef.current.find((item) => item.id === sessionId);
       let ok = false;
-      if (session?.pendingQuestion?.requestId === requestId) {
+      const pending = session?.pendingQuestion;
+      if (
+        pending?.requestId === requestId &&
+        replyFitsQuestion(reply, pending)
+      ) {
         const key = questionKey(sessionId, requestId);
         byTelegram.add(key);
         try {

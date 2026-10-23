@@ -11,6 +11,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_TIMEOUT_MARGIN_S: u64 = 10;
 /// Wait used when Telegram sends a 429 without `parameters.retry_after`.
 const DEFAULT_RETRY_AFTER_S: u64 = 5;
+/// Longest wait honoured from a 429, so a bogus `retry_after` cannot overflow a deadline.
+pub const MAX_RETRY_AFTER_S: u64 = 3600;
 
 #[derive(Debug, PartialEq)]
 pub enum TgError {
@@ -200,7 +202,8 @@ pub fn classify(status: u16, body: &str) -> TgError {
         let seconds = parameters
             .and_then(|p| p.get("retry_after"))
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_RETRY_AFTER_S);
+            .unwrap_or(DEFAULT_RETRY_AFTER_S)
+            .min(MAX_RETRY_AFTER_S);
         return TgError::RetryAfter(seconds);
     }
     if let Some(chat) = parameters
@@ -323,6 +326,16 @@ mod tests {
             json!({ "retry_after": 7 }),
         );
         assert_eq!(classify(429, &body), TgError::RetryAfter(7));
+    }
+
+    #[test]
+    fn huge_retry_after_is_clamped() {
+        let body = error_body(
+            429,
+            "Too Many Requests: retry after 18446744073709551615",
+            json!({ "retry_after": u64::MAX }),
+        );
+        assert_eq!(classify(429, &body), TgError::RetryAfter(MAX_RETRY_AFTER_S));
     }
 
     #[test]
