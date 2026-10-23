@@ -387,3 +387,59 @@ it("is clean after saving a schedule the save anchored", async () => {
   expect(document.body.querySelector("[role='dialog']")).toBeNull();
   expect(onBack).toHaveBeenCalledTimes(1);
 });
+
+const nameInput = () =>
+  container.querySelector<HTMLInputElement>("input[aria-label='Workflow name']")!;
+
+/** An edit that no files-changed event told this board about (another window, the CLI). */
+const editBehindTheBoard = (patch: Partial<Workflow>) =>
+  files.set("workflows.json", JSON.stringify([{ ...ticketWorkflow(), ...patch }]));
+
+it("does not save over a definition that changed since the board loaded it, and says so", async () => {
+  await renderBoard(ticketWorkflow());
+  await act(async () => type(nameInput(), "Mine"));
+  editBehindTheBoard({ name: "By the Mono" });
+  await act(async () => button("Save").click());
+  // Nothing was written.
+  expect(stored()[0].name).toBe("By the Mono");
+  const banner = container.querySelector("[data-board-changed]")!;
+  expect(banner.textContent).toContain("This workflow changed elsewhere");
+  expect(buttonText("Reload", banner)).toBeDefined();
+  expect(buttonText("Overwrite", banner)).toBeDefined();
+  // The draft is still there, and saving again still refuses.
+  expect(nameInput().value).toBe("Mine");
+  await act(async () => button("Save").click());
+  expect(stored()[0].name).toBe("By the Mono");
+});
+
+it("Overwrite saves the draft over the version made elsewhere", async () => {
+  await renderBoard(ticketWorkflow());
+  await act(async () => type(nameInput(), "Mine"));
+  editBehindTheBoard({ name: "By the Mono" });
+  await act(async () => button("Save").click());
+  await act(async () => buttonText("Overwrite")!.click());
+  expect(stored()[0].name).toBe("Mine");
+  expect(container.querySelector("[data-board-changed]")).toBeNull();
+  expect(button("Save").disabled).toBe(true);
+});
+
+it("Reload after a refused save drops the draft and takes the stored version", async () => {
+  await renderBoard(ticketWorkflow());
+  await act(async () => type(nameInput(), "Mine"));
+  editBehindTheBoard({ name: "By the Mono" });
+  await act(async () => button("Save").click());
+  await act(async () => buttonText("Reload")!.click());
+  expect(nameInput().value).toBe("By the Mono");
+  expect(stored()[0].name).toBe("By the Mono");
+  expect(container.querySelector("[data-board-changed]")).toBeNull();
+  expect(button("Save").disabled).toBe(true);
+});
+
+it("saves normally when only fields the app manages changed since the board loaded", async () => {
+  await renderBoard(ticketWorkflow());
+  await act(async () => type(nameInput(), "Mine"));
+  editBehindTheBoard({ lastRunId: "run-3", runRequested: true });
+  await act(async () => button("Save").click());
+  expect(stored()[0]).toMatchObject({ name: "Mine", lastRunId: "run-3", runRequested: true });
+  expect(container.querySelector("[data-board-changed]")).toBeNull();
+});

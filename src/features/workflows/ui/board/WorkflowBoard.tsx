@@ -102,6 +102,13 @@ const LOOP_ARROW = { ...ARROW, color: "var(--mono-color)" } as const;
 const DEFAULT_LOOP: LoopSpec = { maxRounds: 3, decide: "mono" };
 const REVIEW_FIRST = "Review this workflow before enabling it.";
 
+/** The stored definition is not the one this board last synced: someone else changed it. */
+class ChangedElsewhere extends Error {
+  constructor(readonly stored: Workflow) {
+    super("This workflow changed elsewhere");
+  }
+}
+
 function metaOf(w: Workflow): Meta {
   return {
     name: w.name,
@@ -279,7 +286,8 @@ function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () 
   const [notice, setNotice] = useState<string>();
   const [saving, setSaving] = useState(false);
   const [showIssues, setShowIssues] = useState(false);
-  const [elsewhere, setElsewhere] = useState<Workflow | null>(null);
+  // An edit made elsewhere; `refused` when it stopped a Save, which then waits for a choice.
+  const [elsewhere, setElsewhere] = useState<{ workflow: Workflow; refused: boolean } | null>(null);
   const addAnchor = useRef<HTMLSpanElement>(null);
   const moreAnchor = useRef<HTMLSpanElement>(null);
   const pointer = useRef({ x: 0, y: 0 });
@@ -322,7 +330,7 @@ function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () 
             if (key === live.current.seen) return;
             live.current.seen = key;
             if (key === live.current.baseline) return;
-            if (live.current.changed) setElsewhere(stored);
+            if (live.current.changed) setElsewhere({ workflow: stored, refused: false });
             else load(stored);
           })
           .catch(() => {});
@@ -551,7 +559,7 @@ function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () 
 
   // --- saving and leaving ------------------------------------------------------------------------
 
-  const save = async (paused = false): Promise<boolean> => {
+  const save = async (paused = false, overwrite = false): Promise<boolean> => {
     if (saving) return false;
     const next: Workflow = { ...current, enabled: paused ? false : current.enabled };
     setSaving(true);
@@ -559,6 +567,9 @@ function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () 
     try {
       const saved = await updateWorkflows(monoId, (list) => {
         const stored = list.find((w) => w.id === next.id);
+        // Not over a definition this board has not seen; Overwrite is the explicit way past.
+        if (stored && !overwrite && definitionKey(stored) !== live.current.seen)
+          throw new ChangedElsewhere(stored);
         if (!stored && list.length >= WORKFLOWS_MAX)
           throw new Error(`At most ${WORKFLOWS_MAX} workflows.`);
         // The stored copy decides, not what this board loaded: it may have been flagged since.
@@ -591,6 +602,10 @@ function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () 
       setElsewhere(null);
       return true;
     } catch (error) {
+      if (error instanceof ChangedElsewhere) {
+        setElsewhere({ workflow: error.stored, refused: true });
+        return false;
+      }
       console.warn("Could not save the workflow", error);
       setNotice(
         error instanceof Error && (/^At most/.test(error.message) || error.message === REVIEW_FIRST)
@@ -680,21 +695,36 @@ function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () 
           role="status"
           className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-stroke px-4 py-1.5 text-[11px] leading-4 text-content/60"
         >
-          <span className="min-w-0 flex-1">This workflow changed elsewhere</span>
+          <span className="min-w-0 flex-1">
+            {elsewhere.refused
+              ? "This workflow changed elsewhere, so your changes were not saved"
+              : "This workflow changed elsewhere"}
+          </span>
           <button
             type="button"
-            onClick={() => load(elsewhere)}
+            onClick={() => load(elsewhere.workflow)}
             className="rounded px-1.5 py-0.5 text-content/70 hover:bg-content/8 hover:text-content"
           >
             Reload
           </button>
-          <button
-            type="button"
-            onClick={() => setElsewhere(null)}
-            className="rounded px-1.5 py-0.5 text-content/70 hover:bg-content/8 hover:text-content"
-          >
-            Keep mine
-          </button>
+          {elsewhere.refused ? (
+            <button
+              type="button"
+              disabled={saving || blocked}
+              onClick={() => void save(false, true)}
+              className="rounded px-1.5 py-0.5 text-content/70 hover:bg-content/8 hover:text-content disabled:opacity-40"
+            >
+              Overwrite
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setElsewhere(null)}
+              className="rounded px-1.5 py-0.5 text-content/70 hover:bg-content/8 hover:text-content"
+            >
+              Keep mine
+            </button>
+          )}
         </div>
       ) : null}
 
