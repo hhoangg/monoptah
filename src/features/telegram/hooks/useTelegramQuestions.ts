@@ -7,7 +7,10 @@ import {
   CUSTOM_OPTION_ID,
   type UserQuestionReply,
 } from "../../sessions/model/userQuestion";
-import { takeQuestionOutcome } from "../model/questionOutcome";
+import {
+  discardQuestionOutcome,
+  takeQuestionOutcome,
+} from "../model/questionOutcome";
 import {
   TELEGRAM_ANSWER_EVENT,
   telegramAnswerResult,
@@ -144,6 +147,9 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
         const key = questionKey(session.id, question.requestId);
         pending.add(key);
         if (eligibility.has(key)) continue;
+        // Request ids restart per Live, so an outcome stored for this key
+        // belongs to an earlier question and must not describe this one.
+        discardQuestionOutcome(session.id, question.requestId);
         // Decided once, when first seen: a later change must not flip it.
         // Questions with an auto-skip deadline never block the agent.
         if (question.autoResolveAt != null || !isForwardable(session)) {

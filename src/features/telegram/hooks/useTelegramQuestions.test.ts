@@ -364,6 +364,15 @@ describe("useTelegramQuestions", () => {
     ]);
   });
 
+  it("ignores a stale outcome left by an earlier question with the same key", async () => {
+    recordQuestionOutcome("s1", 1, "answered");
+    await forwarded(asking(1));
+    await render([]);
+    expect(callsTo("telegram_question_closed")).toEqual([
+      { sessionId: "s1", requestId: 1, status: "Cancelled" },
+    ]);
+  });
+
   it("reports a vanished session as cancelled", async () => {
     await forwarded(asking());
     await render([]);

@@ -36,3 +36,11 @@ export function takeQuestionOutcome(
   outcomes.delete(key);
   return decision;
 }
+
+/** Forgets an outcome without reading it, e.g. one left by an earlier question with the same key. */
+export function discardQuestionOutcome(
+  sessionId: string,
+  requestId: number,
+): void {
+  outcomes.delete(outcomeKey(sessionId, requestId));
+}
