@@ -414,7 +414,12 @@ impl Bridge {
         let Some(p) = state.cfg.projects.get_mut(project) else {
             return;
         };
-        p.problem = Some(truncate(&text.replace(&p.token, "<token>")));
+        let problem = Some(truncate(&text.replace(&p.token, "<token>")));
+        // The 409 loop reports the same problem every minute: save only a change.
+        if p.problem == problem {
+            return;
+        }
+        p.problem = problem;
         self.persist(state);
     }
 
@@ -1579,6 +1584,32 @@ mod tests {
         }
         let problem = bridge.status("proj").problem.unwrap();
         assert!(!problem.contains("SECRET"), "{problem}");
+    }
+
+    #[test]
+    fn an_unchanged_problem_does_not_rewrite_the_config() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:9");
+        add_project(&bridge, "proj", true);
+        bridge.set_problem_for_token(TOKEN, PROBLEM_OTHER_APP);
+        assert!(bridge.path.exists(), "the first problem is saved");
+
+        // The 409 loop reports the same problem every minute. Removing the file shows
+        // whether another save happens.
+        std::fs::remove_file(&bridge.path).unwrap();
+        bridge.set_problem_for_token(TOKEN, PROBLEM_OTHER_APP);
+        assert!(
+            !bridge.path.exists(),
+            "an identical problem was saved again"
+        );
+
+        bridge.set_problem_for_token(TOKEN, PROBLEM_WEBHOOK);
+        assert!(bridge.path.exists(), "a changed problem must be saved");
+        assert_eq!(
+            config::load(&bridge.path).projects["proj"]
+                .problem
+                .as_deref(),
+            Some(PROBLEM_WEBHOOK)
+        );
     }
 
     #[test]

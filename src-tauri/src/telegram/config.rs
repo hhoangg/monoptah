@@ -57,13 +57,44 @@ pub fn load(path: &Path) -> TelegramConfig {
     }
 }
 
-/// Writes the config through the shared 0600 secret-file writer.
+/// Writes the config atomically: the JSON goes to a temp file in the same directory,
+/// created 0600 before any content is written, and is renamed over the target. The
+/// target therefore is either the old or the new content, never half of one, and it
+/// ends up 0600 even if the previous file was more open.
 pub fn save(path: &Path, cfg: &TelegramConfig) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
     let value = serde_json::to_string(cfg).map_err(|error| error.to_string())?;
-    crate::clickup::write_secret_file(path, &value)
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = write_new_secret_file(&temp, &value)
+        .and_then(|()| std::fs::rename(&temp, path).map_err(|error| error.to_string()));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Creates a file that must not exist yet, with 0600 from the first byte on unix.
+fn write_new_secret_file(path: &Path, value: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    file.write_all(value.as_bytes())
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
 }
 
 /// How long a connect/link code stays valid.
@@ -191,6 +222,68 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_tightens_an_existing_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let path = config_path(&dir);
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&path), 0o644);
+
+        save(&path, &sample()).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(load(&path).projects["proj"].token, "123:secret");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_leaves_no_temp_files_behind() {
+        let dir = temp_dir();
+        let path = config_path(&dir);
+        save(&path, &sample()).unwrap();
+        save(&path, &sample()).unwrap();
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["telegram-config.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_save_keeps_the_previous_file_intact() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let path = config_path(&dir);
+        save(&path, &sample()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // No new file can be created in a read-only directory, so the temp write fails.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut changed = sample();
+        changed.projects.get_mut("proj").unwrap().token = "999:other".into();
+        let result = save(&path, &changed);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "save must report the failure");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temp file left"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
