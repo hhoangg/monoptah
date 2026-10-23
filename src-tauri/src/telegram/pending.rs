@@ -4,9 +4,10 @@
 //! through `handle_update` and come out as `Effect`s the caller performs. Text from
 //! Telegram is data only: it can become a custom answer string and nothing else.
 //!
-//! Commands (`/start`, `/connect`, `/link`) are matched leniently: the `@bot` suffix is
-//! ignored. The codes are random, single-use and expire, so a command that reaches the
-//! wrong bot cannot do harm, and the registry needs no bot username.
+//! Several bots can sit in one group and each sees every message, so each update comes
+//! with the `Receiver` that got it. A command addressed to another bot (`/link@other`) is
+//! ignored, a code is only spent by a bot that serves the code's project, and a text reply
+//! only answers a question that the receiving bot sent.
 
 use super::config::{CodePurpose, Codes};
 use super::render::{
@@ -20,6 +21,9 @@ pub struct PendingPrompt {
     pub owner_window: String,
     pub payload: ForwardPayload,
     pub chat: i64,
+    /// Username of the bot that sent the question messages. Only that bot's poller may
+    /// treat a reply to them as an answer.
+    pub bot: String,
     /// Telegram message id per question, set once the message was sent.
     pub messages: Vec<Option<i64>>,
     /// Callback token per question.
@@ -31,12 +35,13 @@ pub struct PendingPrompt {
 }
 
 impl PendingPrompt {
-    pub fn new(owner_window: String, payload: ForwardPayload, chat: i64) -> Self {
+    pub fn new(owner_window: String, payload: ForwardPayload, chat: i64, bot: String) -> Self {
         let count = payload.questions.len();
         Self {
             owner_window,
             payload,
             chat,
+            bot,
             messages: vec![None; count],
             tokens: (0..count).map(|_| new_token()).collect(),
             selected: vec![BTreeSet::new(); count],
@@ -54,6 +59,8 @@ pub enum Effect {
         text: String,
     },
     Edit {
+        /// The project whose bot sent the message, so the edit goes out with its token.
+        project: String,
         chat: i64,
         message_id: i64,
         html: String,
@@ -78,6 +85,9 @@ pub enum Effect {
         thread: i64,
     },
     Reply {
+        /// The project whose bot answers; `None` for replies to commands, which the bot
+        /// that received the command sends.
+        project: Option<String>,
         chat: i64,
         thread: Option<i64>,
         html: String,
@@ -97,6 +107,13 @@ struct Delivering {
     last: usize,
     /// Set when the desktop closed the prompt while the reply was in flight.
     closed_as: Option<String>,
+}
+
+/// The bot whose poller received an update, and the projects that use that bot.
+pub struct Receiver<'a> {
+    /// Bot username without the `@`; empty when unknown.
+    pub username: &'a str,
+    pub projects: &'a BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -144,14 +161,31 @@ fn actor(from: &Value) -> String {
     }
 }
 
-/// `/name@bot arg` -> ("name", "arg"). The bot suffix is ignored, see the module docs.
-fn parse_command(text: &str) -> Option<(String, &str)> {
+/// `/name@bot arg` -> ("name", Some("bot"), "arg"); a bare command has no bot.
+fn parse_command(text: &str) -> Option<(String, Option<&str>, &str)> {
     let rest = text.trim_start().strip_prefix('/')?;
     let (head, arg) = rest
         .split_once(char::is_whitespace)
         .map_or((rest, ""), |(head, arg)| (head, arg.trim()));
-    let name = head.split('@').next().unwrap_or("").to_ascii_lowercase();
-    Some((name, arg))
+    let (name, bot) = match head.split_once('@') {
+        Some((name, bot)) => (name, Some(bot)),
+        None => (head, None),
+    };
+    Some((name.to_ascii_lowercase(), bot, arg))
+}
+
+fn project_of(purpose: &CodePurpose) -> &str {
+    match purpose {
+        CodePurpose::Connect { project } | CodePurpose::Link { project, .. } => project,
+    }
+}
+
+/// A live code issued for a project of another bot. Such a code is neither spent nor
+/// answered, so the bot it is for can still use it.
+fn is_foreign_code(codes: &Codes, code: &str, now_ms: u64, receiver: &Receiver<'_>) -> bool {
+    codes
+        .peek(code, now_ms)
+        .is_some_and(|purpose| !receiver.projects.contains(project_of(purpose)))
 }
 
 fn is_group(chat: &Value) -> bool {
@@ -253,6 +287,7 @@ fn outcome_text(prompt: &PendingPrompt, q_index: usize, by: &str) -> String {
 fn edit_status(prompt: &PendingPrompt, q_index: usize, status: &str) -> Option<Effect> {
     let message_id = prompt.messages.get(q_index).copied().flatten()?;
     Some(Effect::Edit {
+        project: prompt.payload.project.clone(),
         chat: prompt.chat,
         message_id,
         html: status_html(&prompt.payload, q_index, status),
@@ -272,6 +307,7 @@ fn edit_open(prompt: &PendingPrompt, q_index: usize) -> Option<Effect> {
     let q = &prompt.payload.questions[q_index];
     let selected = &prompt.selected[q_index];
     Some(Effect::Edit {
+        project: prompt.payload.project.clone(),
         chat: prompt.chat,
         message_id,
         html: question_html(&prompt.payload, q_index, selected),
@@ -374,6 +410,7 @@ impl Registry {
         &mut self,
         update: &Value,
         configured_chats: &BTreeSet<i64>,
+        receiver: &Receiver<'_>,
         codes: &mut Codes,
         now_ms: u64,
     ) -> Vec<Effect> {
@@ -381,7 +418,7 @@ impl Registry {
             return self.handle_callback(callback, configured_chats);
         }
         if let Some(message) = update.get("message") {
-            return self.handle_message(message, configured_chats, codes, now_ms);
+            return self.handle_message(message, configured_chats, receiver, codes, now_ms);
         }
         Vec::new()
     }
@@ -519,6 +556,7 @@ impl Registry {
         }
         prompt.awaiting_text[q_index] = true;
         let hint = Effect::Reply {
+            project: Some(prompt.payload.project.clone()),
             chat: prompt.chat,
             thread,
             html: "Reply to the question message above with your answer.".to_string(),
@@ -561,6 +599,7 @@ impl Registry {
         &mut self,
         msg: &Value,
         chats: &BTreeSet<i64>,
+        receiver: &Receiver<'_>,
         codes: &mut Codes,
         now_ms: u64,
     ) -> Vec<Effect> {
@@ -576,24 +615,40 @@ impl Registry {
         let text = msg["text"].as_str().unwrap_or("");
         let configured = chats.contains(&chat);
         match parse_command(text) {
-            Some((name, arg)) if name == "start" || name == "connect" => {
-                return connect(msg, chat, configured, arg, codes, now_ms);
-            }
-            Some((name, arg)) if name == "link" => {
-                return link(msg, chat, configured, arg, codes, now_ms);
+            Some((name, bot, arg)) if matches!(name.as_str(), "start" | "connect" | "link") => {
+                if bot.is_some_and(|bot| !bot.eq_ignore_ascii_case(receiver.username)) {
+                    return Vec::new();
+                }
+                let ctx = Command {
+                    chat,
+                    configured,
+                    receiver,
+                    now_ms,
+                };
+                return if name == "link" {
+                    link(msg, &ctx, arg, codes)
+                } else {
+                    connect(msg, &ctx, arg, codes)
+                };
             }
             _ => {}
         }
         if !configured {
             return Vec::new();
         }
-        self.handle_text(msg, chat, text)
+        self.handle_text(msg, chat, text, receiver)
     }
 
     /// A reply to a question message the user asked to answer with text. Only a reply to
     /// exactly that message counts: topic messages all carry a `reply_to_message` that
     /// points at the topic creation message, and those must not become answers.
-    fn handle_text(&mut self, msg: &Value, chat: i64, text: &str) -> Vec<Effect> {
+    fn handle_text(
+        &mut self,
+        msg: &Value,
+        chat: i64,
+        text: &str,
+        receiver: &Receiver<'_>,
+    ) -> Vec<Effect> {
         let Some(reply_to) = msg
             .pointer("/reply_to_message/message_id")
             .and_then(Value::as_i64)
@@ -605,7 +660,8 @@ impl Registry {
             return Vec::new();
         }
         let Some((key, q_index)) = self.prompts.iter().find_map(|(key, prompt)| {
-            if prompt.chat != chat {
+            // Another bot's question can be replied to in the same group; not ours to answer.
+            if prompt.chat != chat || !prompt.bot.eq_ignore_ascii_case(receiver.username) {
                 return None;
             }
             let index = prompt.messages.iter().position(|m| *m == Some(reply_to))?;
@@ -649,78 +705,87 @@ fn migration(msg: &Value, chat: i64, chats: &BTreeSet<i64>) -> Option<Effect> {
 
 fn reply(chat: i64, thread: Option<i64>, html: &str) -> Effect {
     Effect::Reply {
+        project: None,
         chat,
         thread,
         html: html.to_string(),
     }
 }
 
-/// `/start <code>` or `/connect <code>` in a group: the one place an unconfigured chat is
-/// listened to. A bad code is answered only in an already configured chat.
-fn connect(
-    msg: &Value,
+/// What `connect` and `link` need to know about the command they handle.
+struct Command<'a> {
     chat: i64,
     configured: bool,
-    code: &str,
-    codes: &mut Codes,
+    receiver: &'a Receiver<'a>,
     now_ms: u64,
-) -> Vec<Effect> {
+}
+
+/// `/start <code>` or `/connect <code>` in a group: the one place an unconfigured chat is
+/// listened to. A bad code is answered only in an already configured chat.
+fn connect(msg: &Value, ctx: &Command<'_>, code: &str, codes: &mut Codes) -> Vec<Effect> {
     if code.is_empty() || !is_group(&msg["chat"]) {
         return Vec::new();
     }
-    match codes.take(code, now_ms) {
-        Some(CodePurpose::Connect { project }) => vec![Effect::Connected {
-            project,
-            chat,
-            title: msg
-                .pointer("/chat/title")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        }],
-        _ if configured => vec![reply(
-            chat,
+    if is_foreign_code(codes, code, ctx.now_ms, ctx.receiver) {
+        return Vec::new();
+    }
+    // Only a Connect code is spent here; a Link code typed into /connect stays valid.
+    if matches!(
+        codes.peek(code, ctx.now_ms),
+        Some(CodePurpose::Connect { .. })
+    ) {
+        if let Some(CodePurpose::Connect { project }) = codes.take(code, ctx.now_ms) {
+            return vec![Effect::Connected {
+                project,
+                chat: ctx.chat,
+                title: msg
+                    .pointer("/chat/title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            }];
+        }
+    }
+    if ctx.configured {
+        return vec![reply(
+            ctx.chat,
             thread_of(msg),
             "That code is not valid or has expired.",
-        )],
-        _ => Vec::new(),
+        )];
     }
+    Vec::new()
 }
 
 /// `/link <code>` inside a topic of a configured group.
-fn link(
-    msg: &Value,
-    chat: i64,
-    configured: bool,
-    code: &str,
-    codes: &mut Codes,
-    now_ms: u64,
-) -> Vec<Effect> {
-    if !configured {
+fn link(msg: &Value, ctx: &Command<'_>, code: &str, codes: &mut Codes) -> Vec<Effect> {
+    if !ctx.configured || is_foreign_code(codes, code, ctx.now_ms, ctx.receiver) {
         return Vec::new();
     }
     let Some(thread) = thread_of(msg) else {
         return vec![reply(
-            chat,
+            ctx.chat,
             None,
             "Send /link inside the topic you want to link, not in General.",
         )];
     };
-    match codes.take(code, now_ms) {
-        Some(CodePurpose::Link {
+    if matches!(codes.peek(code, ctx.now_ms), Some(CodePurpose::Link { .. })) {
+        if let Some(CodePurpose::Link {
             project,
             session_id,
-        }) => vec![Effect::Linked {
-            project,
-            session_id,
-            thread,
-        }],
-        _ => vec![reply(
-            chat,
-            Some(thread),
-            "That code is not valid or has expired.",
-        )],
+        }) = codes.take(code, ctx.now_ms)
+        {
+            return vec![Effect::Linked {
+                project,
+                session_id,
+                thread,
+            }];
+        }
     }
+    vec![reply(
+        ctx.chat,
+        Some(thread),
+        "That code is not valid or has expired.",
+    )]
 }
 
 #[cfg(test)]
@@ -730,6 +795,7 @@ mod tests {
 
     const CHAT: i64 = -1001;
     const WINDOW: &str = "main";
+    const BOT: &str = "my_bot";
 
     fn option(id: &str, label: &str) -> OptionIn {
         OptionIn {
@@ -774,7 +840,12 @@ mod tests {
     /// is the number of prompts inserted before. Returns the key.
     fn add(reg: &mut Registry, session: &str, request_id: u64, qs: Vec<QuestionIn>) -> String {
         let count = qs.len();
-        let prompt = PendingPrompt::new(WINDOW.into(), payload(session, request_id, qs), CHAT);
+        let prompt = PendingPrompt::new(
+            WINDOW.into(),
+            payload(session, request_id, qs),
+            CHAT,
+            BOT.into(),
+        );
         let key = reg.insert(prompt);
         let base = 100 * (reg.prompts.len() as i64);
         for i in 0..count {
@@ -817,7 +888,16 @@ mod tests {
             "message": {"message_id": 100, "chat": {"id": chat, "type": "supergroup"},
                 "message_thread_id": 9, "is_topic_message": true}
         }});
-        reg.handle_update(&update, &chats(), &mut Codes::default(), 0)
+        let receiver = Receiver {
+            username: BOT,
+            projects: &projects(),
+        };
+        reg.handle_update(&update, &chats(), &receiver, &mut Codes::default(), 0)
+    }
+
+    /// The projects the receiving bot serves in these tests.
+    fn projects() -> BTreeSet<String> {
+        ["proj", "p"].into_iter().map(String::from).collect()
     }
 
     fn say(reg: &mut Registry, msg: Value) -> Vec<Effect> {
@@ -825,7 +905,16 @@ mod tests {
     }
 
     fn say_with(reg: &mut Registry, msg: Value, codes: &mut Codes) -> Vec<Effect> {
-        reg.handle_update(&json!({"update_id": 2, "message": msg}), &chats(), codes, 0)
+        say_as(reg, msg, codes, BOT)
+    }
+
+    fn say_as(reg: &mut Registry, msg: Value, codes: &mut Codes, bot: &str) -> Vec<Effect> {
+        let update = json!({"update_id": 2, "message": msg});
+        let receiver = Receiver {
+            username: bot,
+            projects: &projects(),
+        };
+        reg.handle_update(&update, &chats(), &receiver, codes, 0)
     }
 
     fn text_msg(chat: i64, text: &str, reply_to: Option<i64>) -> Value {
@@ -900,6 +989,7 @@ mod tests {
                 message_id,
                 html,
                 keyboard,
+                ..
             } => {
                 assert_eq!(*chat, CHAT);
                 assert_eq!(*message_id, 100);
@@ -1295,7 +1385,9 @@ mod tests {
         let effects = say_with(&mut reg, msg, &mut codes);
         assert_eq!(effects.len(), 1, "{effects:?}");
         match &effects[0] {
-            Effect::Reply { chat, thread, html } => {
+            Effect::Reply {
+                chat, thread, html, ..
+            } => {
                 assert_eq!(*chat, CHAT);
                 assert_eq!(*thread, None);
                 assert!(html.contains("topic"), "{html}");
@@ -1387,6 +1479,7 @@ mod tests {
                     message_id,
                     html,
                     keyboard,
+                    ..
                 } => {
                     assert_eq!(*chat, CHAT);
                     assert_eq!(*message_id, ids[i]);
@@ -1532,5 +1625,151 @@ mod tests {
             ),
             _ => unreachable!(),
         }
+    }
+
+    fn code_for(codes: &mut Codes, purpose: CodePurpose) -> String {
+        codes.issue(purpose, 0)
+    }
+
+    fn connect_for(project: &str) -> CodePurpose {
+        CodePurpose::Connect {
+            project: project.into(),
+        }
+    }
+
+    fn link_for(project: &str) -> CodePurpose {
+        CodePurpose::Link {
+            project: project.into(),
+            session_id: "s1".into(),
+        }
+    }
+
+    #[test]
+    fn command_addressed_to_another_bot_is_ignored_and_keeps_the_code() {
+        let mut reg = Registry::default();
+        let mut codes = Codes::default();
+        let connect_code = code_for(&mut codes, connect_for("proj"));
+        let link_code = code_for(&mut codes, link_for("proj"));
+        for text in [
+            format!("/start@other_bot {connect_code}"),
+            format!("/connect@Other_Bot {connect_code}"),
+        ] {
+            // Configured chat, so a wrong code would be answered if the command counted.
+            let effects = say_with(&mut reg, connect_msg(CHAT, &text), &mut codes);
+            assert!(effects.is_empty(), "{text}: {effects:?}");
+        }
+        let effects = say_with(
+            &mut reg,
+            text_msg(CHAT, &format!("/link@other_bot {link_code}"), Some(9)),
+            &mut codes,
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        // Neither code was burned.
+        assert!(codes.take(&connect_code, 0).is_some());
+        assert!(codes.take(&link_code, 0).is_some());
+    }
+
+    #[test]
+    fn bare_and_own_commands_still_work() {
+        let mut reg = Registry::default();
+        let mut codes = Codes::default();
+        let code = code_for(&mut codes, connect_for("proj"));
+        let own = say_with(
+            &mut reg,
+            connect_msg(-777, &format!("/start@MY_BOT {code}")),
+            &mut codes,
+        );
+        assert!(matches!(&own[..], [Effect::Connected { .. }]), "{own:?}");
+        let code = code_for(&mut codes, link_for("proj"));
+        let bare = say_with(
+            &mut reg,
+            text_msg(CHAT, &format!("/link {code}"), Some(9)),
+            &mut codes,
+        );
+        assert!(matches!(&bare[..], [Effect::Linked { .. }]), "{bare:?}");
+    }
+
+    #[test]
+    fn code_of_a_project_of_another_bot_is_left_alone() {
+        let mut reg = Registry::default();
+        let mut codes = Codes::default();
+        let connect_code = code_for(&mut codes, connect_for("elsewhere"));
+        let link_code = code_for(&mut codes, link_for("elsewhere"));
+        // Bare commands reach every bot in the group; this bot serves "proj" only.
+        let connect = say_with(
+            &mut reg,
+            connect_msg(CHAT, &format!("/connect {connect_code}")),
+            &mut codes,
+        );
+        assert!(connect.is_empty(), "{connect:?}");
+        let link = say_with(
+            &mut reg,
+            text_msg(CHAT, &format!("/link {link_code}"), Some(9)),
+            &mut codes,
+        );
+        assert!(link.is_empty(), "{link:?}");
+        assert_eq!(
+            codes.take(&connect_code, 0),
+            Some(connect_for("elsewhere")),
+            "connect code must survive"
+        );
+        assert_eq!(
+            codes.take(&link_code, 0),
+            Some(link_for("elsewhere")),
+            "link code must survive"
+        );
+    }
+
+    #[test]
+    fn reply_to_another_bots_question_is_ignored() {
+        let mut reg = Registry::default();
+        let key = add(&mut reg, "s1", 7, vec![question("q1", false, true)]);
+        reg.prompts.get_mut(&key).unwrap().bot = "other_bot".into();
+        press(&mut reg, &key, 0, "c", None);
+        let id = msg_id(&reg, &key, 0);
+
+        let wrong = say_with(
+            &mut reg,
+            text_msg(CHAT, "answer", Some(id)),
+            &mut Codes::default(),
+        );
+        assert!(wrong.is_empty(), "{wrong:?}");
+        assert!(reg.prompts[&key].awaiting_text[0], "still waiting");
+        assert!(!reg.prompts[&key].done[0]);
+
+        let right = say_as(
+            &mut reg,
+            text_msg(CHAT, "answer", Some(id)),
+            &mut Codes::default(),
+            "other_bot",
+        );
+        assert_eq!(delivers(&right).len(), 1, "{right:?}");
+    }
+
+    #[test]
+    fn effects_of_a_prompt_carry_its_project() {
+        let mut reg = Registry::default();
+        let key = add(&mut reg, "s1", 7, vec![question("q1", false, true)]);
+        let ask = press(&mut reg, &key, 0, "c", None);
+        assert!(
+            ask.iter().any(
+                |e| matches!(e, Effect::Reply { project: Some(project), .. } if project == "proj")
+            ),
+            "{ask:?}"
+        );
+        let answered = reply_to_question(&mut reg, CHAT, "text", &key, 0);
+        let after = reg.delivered(&key, true);
+        for effect in answered.iter().chain(after.iter()) {
+            if let Effect::Edit { project, .. } = effect {
+                assert_eq!(project, "proj");
+            }
+        }
+        assert!(matches!(&after[0], Effect::Edit { project, .. } if project == "proj"));
+        // A reply to a command has no prompt, so no project.
+        let invalid = say(&mut reg, connect_msg(CHAT, "/start nope"));
+        assert!(
+            matches!(&invalid[..], [Effect::Reply { project: None, .. }]),
+            "{invalid:?}"
+        );
     }
 }

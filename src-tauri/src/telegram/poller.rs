@@ -6,7 +6,7 @@
 
 use super::api::{BotApi, TgError, MAX_RETRY_AFTER_S};
 use super::config::{self, CodePurpose, Codes, ProjectConfig, TelegramConfig};
-use super::pending::{key_of, Effect, PendingPrompt, Registry};
+use super::pending::{key_of, Effect, PendingPrompt, Receiver, Registry};
 use super::queue::{Job, SendQueue};
 use super::render::{keyboard, question_html, status_html, ForwardPayload};
 use serde::Serialize;
@@ -270,6 +270,16 @@ fn configured_chats(cfg: &TelegramConfig, token: &str) -> BTreeSet<i64> {
         .filter(|p| p.token == token)
         .filter_map(|p| p.chat_id)
         .collect()
+}
+
+/// The username and the projects of the bot behind `token`.
+fn bot_of(cfg: &TelegramConfig, token: &str) -> (String, BTreeSet<String>) {
+    let own = || cfg.projects.iter().filter(|(_, p)| p.token == token);
+    let username = own()
+        .map(|(_, p)| p.bot_username.clone())
+        .find(|name| !name.is_empty())
+        .unwrap_or_default();
+    (username, own().map(|(name, _)| name.clone()).collect())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -557,10 +567,15 @@ impl Bridge {
         let effects = {
             let mut state = self.lock();
             let chats = configured_chats(&state.cfg, token);
+            let (username, projects) = bot_of(&state.cfg, token);
+            let receiver = Receiver {
+                username: &username,
+                projects: &projects,
+            };
             let State {
                 registry, codes, ..
             } = &mut *state;
-            registry.handle_update(update, &chats, codes, now)
+            registry.handle_update(update, &chats, &receiver, codes, now)
         };
         let update_chat = update.pointer("/message/chat/id").and_then(Value::as_i64);
         let mut rest = Vec::new();
@@ -770,6 +785,7 @@ impl Bridge {
         for effect in effects {
             match effect {
                 Effect::Edit {
+                    project,
                     chat,
                     message_id,
                     html,
@@ -777,17 +793,22 @@ impl Bridge {
                 } => self.push_job(
                     chat,
                     Job::EditStatus {
-                        project: project_of(chat),
+                        project,
                         chat,
                         message_id,
                         html,
                         keyboard,
                     },
                 ),
-                Effect::Reply { chat, thread, html } => self.push_job(
+                Effect::Reply {
+                    project,
+                    chat,
+                    thread,
+                    html,
+                } => self.push_job(
                     chat,
                     Job::Notice {
-                        project: project_of(chat),
+                        project: project.unwrap_or_else(|| project_of(chat)),
                         thread,
                         html,
                     },
@@ -1379,6 +1400,7 @@ impl Bridge {
                 .get(&payload.project)
                 .filter(|p| !p.token.is_empty())
                 .ok_or("Telegram is not set up for this project")?;
+            let bot = project.bot_username.clone();
             if !project.enabled {
                 return Err("Telegram is turned off for this project".to_string());
             }
@@ -1404,7 +1426,7 @@ impl Bridge {
             };
             state
                 .registry
-                .insert(PendingPrompt::new(window.to_string(), payload, chat));
+                .insert(PendingPrompt::new(window.to_string(), payload, chat, bot));
             if !has_topic && state.topics_pending.insert(slot) {
                 state.queue.push(chat, create);
             }
@@ -2511,6 +2533,9 @@ mod tests {
             &connect_update(&link, CHAT - 1),
         );
         assert_eq!(bridge.status("proj").chat_id, None);
+        // The wrong bot did not spend the code.
+        let now = bridge.now_ms();
+        assert!(bridge.lock().codes.take(&link, now).is_some());
     }
 
     #[test]
@@ -2541,6 +2566,101 @@ mod tests {
         // Used in its own group: bound.
         bridge.process_update(&api, TOKEN, &link(&bridge, CHAT, 78));
         assert_eq!(bridge.session_topic("a", "s1"), Some(78));
+    }
+
+    /// Projects "a" and "b" use two different bots that sit in the same group.
+    fn two_bots(bridge: &Arc<Bridge>) {
+        for (name, token, bot) in [("a", "111111:AAA", "bot_a"), ("b", "222222:BBB", "bot_b")] {
+            add_project(bridge, name, true);
+            let mut state = bridge.lock();
+            let project = state.cfg.projects.get_mut(name).unwrap();
+            project.token = token.into();
+            project.bot_username = bot.into();
+        }
+    }
+
+    #[test]
+    fn command_for_the_other_bot_keeps_the_code_valid() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:9");
+        two_bots(&bridge);
+        let code = bridge.link_code("a", "s1").map(|c| c.code).unwrap();
+        let link = |text: String| {
+            json!({
+                "update_id": 3,
+                "message": {
+                    "message_id": 2,
+                    "from": { "id": 9 },
+                    "chat": { "id": CHAT, "type": "supergroup" },
+                    "is_topic_message": true,
+                    "message_thread_id": 78,
+                    "text": text
+                }
+            })
+        };
+        let (api_a, api_b) = (bridge.api("111111:AAA"), bridge.api("222222:BBB"));
+        // Addressed to bot_a, but bot_b's poller sees it first (bots in a group see all).
+        bridge.process_update(&api_b, "222222:BBB", &link(format!("/link@bot_a {code}")));
+        // A bare command reaches both bots; the code is project a's, so b leaves it alone.
+        bridge.process_update(&api_b, "222222:BBB", &link(format!("/link {code}")));
+        assert_eq!(bridge.session_topic("a", "s1"), None);
+        assert!(
+            queued_edits(&bridge).is_empty(),
+            "the wrong bot must not answer"
+        );
+        bridge.process_update(&api_a, "111111:AAA", &link(format!("/link@bot_a {code}")));
+        assert_eq!(bridge.session_topic("a", "s1"), Some(78));
+    }
+
+    #[test]
+    fn reply_to_a_question_is_handled_by_the_bot_that_asked_it() {
+        let (bridge, sink) = bridge_with("http://127.0.0.1:9");
+        two_bots(&bridge);
+        let mut prompt = payload("s1", 1);
+        prompt.project = "a".into();
+        prompt.questions[0].allow_custom = true;
+        bridge.forward("main", prompt).unwrap();
+        let token = {
+            let mut state = bridge.lock();
+            state.registry.set_message("s1#1", 0, 500);
+            state.registry.prompt("s1#1").unwrap().tokens[0].clone()
+        };
+        bridge.lock().queue = SendQueue::default();
+        let (api_a, api_b) = (bridge.api("111111:AAA"), bridge.api("222222:BBB"));
+        let tap = json!({
+            "update_id": 1,
+            "callback_query": {
+                "id": "cb1",
+                "from": { "id": 9, "username": "alice" },
+                "data": format!("c:{token}"),
+                "message": { "message_id": 500, "chat": { "id": CHAT } }
+            }
+        });
+        bridge.process_update(&api_a, "111111:AAA", &tap);
+        bridge.lock().queue = SendQueue::default();
+
+        let reply = json!({
+            "update_id": 2,
+            "message": {
+                "message_id": 501,
+                "from": { "id": 9, "username": "alice" },
+                "chat": { "id": CHAT, "type": "supergroup" },
+                "text": "my answer",
+                "reply_to_message": { "message_id": 500 }
+            }
+        });
+        // Bot b also sees the reply; it is not b's question.
+        bridge.process_update(&api_b, "222222:BBB", &reply);
+        assert!(sink.events.lock().unwrap().is_empty());
+        assert!(queued_edits(&bridge).is_empty());
+
+        bridge.process_update(&api_a, "111111:AAA", &reply);
+        assert_eq!(sink.events.lock().unwrap().len(), 1);
+        bridge.answer_result("s1#1", true);
+        let jobs = queued_edits(&bridge);
+        assert!(
+            matches!(&jobs[..], [Job::EditStatus { project, message_id: 500, .. }] if project == "a"),
+            "{jobs:?}"
+        );
     }
 
     // ----- poller thread -----

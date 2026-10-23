@@ -105,6 +105,13 @@ impl Codes {
         }
     }
 
+    /// The purpose of a live code without consuming it, so the receiver can check that
+    /// the code is its own before spending it.
+    pub fn peek(&self, code: &str, now_ms: u64) -> Option<&CodePurpose> {
+        let (purpose, expires_at) = self.pending.get(&code.trim().to_ascii_uppercase())?;
+        (now_ms <= *expires_at).then_some(purpose)
+    }
+
     /// Consumes the code: a second call with the same code, or a call after expiry,
     /// returns `None`. Input is trimmed and upper-cased so a typed code still matches.
     pub fn take(&mut self, code: &str, now_ms: u64) -> Option<CodePurpose> {
