@@ -86,8 +86,15 @@ pub struct Codes {
 }
 
 impl Codes {
+    /// A new Connect code replaces the live one of the same project, so only the code
+    /// shown last in the dialog can connect it.
     pub fn issue(&mut self, purpose: CodePurpose, now_ms: u64) -> String {
         self.prune(now_ms);
+        if let CodePurpose::Connect { project } = &purpose {
+            self.pending.retain(|_, (existing, _)| {
+                !matches!(existing, CodePurpose::Connect { project: other } if other == project)
+            });
+        }
         loop {
             let code = random_code();
             if !self.pending.contains_key(&code) {
@@ -224,6 +231,31 @@ mod tests {
         assert_eq!(codes.take("WRONG234", 2_000), None);
         assert_eq!(codes.take(&code, 2_000), Some(link));
         assert_eq!(codes.take(&code, 2_000), None);
+    }
+
+    #[test]
+    fn new_connect_code_revokes_the_old_one_for_that_project() {
+        let mut codes = Codes::default();
+        let old = codes.issue(connect(), 1_000);
+        let other_project = codes.issue(
+            CodePurpose::Connect {
+                project: "other".into(),
+            },
+            1_000,
+        );
+        let link = codes.issue(
+            CodePurpose::Link {
+                project: "proj".into(),
+                session_id: "s1".into(),
+            },
+            1_000,
+        );
+        let fresh = codes.issue(connect(), 2_000);
+        assert_eq!(codes.take(&old, 3_000), None, "old code must be revoked");
+        assert_eq!(codes.take(&fresh, 3_000), Some(connect()));
+        // Other projects and link codes are not affected.
+        assert!(codes.take(&other_project, 3_000).is_some());
+        assert!(codes.take(&link, 3_000).is_some());
     }
 
     #[test]
