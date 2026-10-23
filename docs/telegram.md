@@ -36,6 +36,18 @@ only for sessions of a project that has a bot and a connected group, and not for
 or Mono sessions or open terminal (TUI) sessions. A terminal session that is closed and
 only saved may still show it, but its questions are never forwarded.
 
+## Change the token or disconnect
+
+Select **Change token** next to the bot name to paste a new token. The token is
+checked first; a rejected token leaves everything as it was. A new token for the
+**same bot** (for example after revoking it in BotFather) keeps the group and the topic
+links. A token for a **different bot** starts clean: the group connection and the topic
+links are cleared, and questions already sent stop working, so connect a group again.
+
+**Disconnect** asks for confirmation first. It removes the bot token, the group and
+the topic links, and questions already sent stop working. Messages already in Telegram
+stay there.
+
 ## Keep the group private
 
 Anyone in the connected group can answer the agent. A tap on an option, or a text

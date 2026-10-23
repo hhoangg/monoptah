@@ -46,6 +46,8 @@ const CONNECTED: TelegramStatus = {
 let root: Root;
 let container: HTMLDivElement;
 let status: TelegramStatus;
+/** What the bot token command leaves behind; defaults to a bot without a group. */
+let afterToken: TelegramStatus | null;
 
 function mockInvoke() {
   vi.mocked(invoke).mockImplementation(async (command, args) => {
@@ -53,7 +55,7 @@ function mockInvoke() {
     if (command === "telegram_set_token") {
       if ((args as { token: string }).token === "bad")
         throw "Bot token was rejected";
-      status = CONFIGURED;
+      status = afterToken ?? CONFIGURED;
       return status;
     }
     if (command === "telegram_connect_link")
@@ -124,6 +126,7 @@ async function submit() {
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   status = NOT_CONFIGURED;
+  afterToken = null;
   vi.mocked(invoke).mockReset();
   vi.mocked(openUrl).mockReset();
   vi.mocked(openUrl).mockResolvedValue(undefined);
@@ -226,6 +229,7 @@ describe("telegram project dialog", () => {
       enabled: false,
     });
 
+    await act(async () => button("Disconnect")!.click());
     await act(async () => button("Disconnect")!.click());
     expect(invoke).toHaveBeenCalledWith("telegram_disconnect", {
       project: PROJECT,
@@ -366,6 +370,7 @@ describe("telegram project dialog", () => {
       await renderDialog();
       vi.mocked(invalidateTelegramStatus).mockClear();
       await act(async () => button("Disconnect")!.click());
+      await act(async () => button("Disconnect")!.click());
       expect(invalidateTelegramStatus).toHaveBeenCalledWith(PROJECT);
     });
 
@@ -379,6 +384,137 @@ describe("telegram project dialog", () => {
         await vi.advanceTimersByTimeAsync(3000);
       });
       expect(invalidateTelegramStatus).toHaveBeenCalledWith(PROJECT);
+    });
+  });
+
+  describe("changing the token", () => {
+    const calls = (command: string) =>
+      vi.mocked(invoke).mock.calls.filter(([name]) => name === command);
+
+    it("offers Change token without showing a field or the old token", async () => {
+      status = CONNECTED;
+      await renderDialog();
+
+      expect(button("Change token")).toBeDefined();
+      expect(dialog().querySelector('input[type="password"]')).toBeNull();
+
+      await act(async () => button("Change token")!.click());
+      const field = dialog().querySelector<HTMLInputElement>(
+        'input[type="password"]',
+      )!;
+      expect(field.value).toBe("");
+      expect(dialog().textContent).toContain(
+        "A token for the same bot keeps the group and topic links.",
+      );
+      expect(dialog().textContent).toContain(
+        "A different bot clears the group and topic links, and questions already sent stop working.",
+      );
+    });
+
+    it("keeps the group when the same bot is saved", async () => {
+      status = CONNECTED;
+      afterToken = CONNECTED;
+      await renderDialog();
+      await act(async () => button("Change token")!.click());
+      await type("Bot token", ` ${SECRET} `);
+      await submit();
+
+      expect(calls("telegram_set_token")).toEqual([
+        ["telegram_set_token", { project: PROJECT, token: SECRET }],
+      ]);
+      expect(dialog().querySelector('input[type="password"]')).toBeNull();
+      expect(dialog().textContent).toContain("Connected to Alpha team");
+      expect(dialog().innerHTML).not.toContain(SECRET);
+      expect(button("Change token")).toBeDefined();
+    });
+
+    it("shows the new bot without a group when another bot is saved", async () => {
+      status = CONNECTED;
+      afterToken = { ...CONFIGURED, botUsername: "beta_bot" };
+      await renderDialog();
+      await act(async () => button("Change token")!.click());
+      await type("Bot token", SECRET);
+      await submit();
+
+      expect(dialog().textContent).toContain("@beta_bot");
+      expect(dialog().textContent).not.toContain("Connected to");
+      expect(button("Connect a group")).toBeDefined();
+    });
+
+    it("recovers from a rejected token and keeps the connection", async () => {
+      status = CONNECTED;
+      await renderDialog();
+      await act(async () => button("Change token")!.click());
+      await type("Bot token", "bad");
+      await submit();
+
+      expect(dialog().querySelector('[role="alert"]')?.textContent).toBe(
+        "Bot token was rejected",
+      );
+      expect(dialog().textContent).toContain("Connected to Alpha team");
+      expect(dialog().querySelector('input[type="password"]')).not.toBeNull();
+
+      afterToken = CONNECTED;
+      await type("Bot token", SECRET);
+      await submit();
+      expect(dialog().querySelector('[role="alert"]')).toBeNull();
+      expect(dialog().querySelector('input[type="password"]')).toBeNull();
+    });
+
+    it("cancel closes the field and forgets what was typed", async () => {
+      status = CONNECTED;
+      await renderDialog();
+      await act(async () => button("Change token")!.click());
+      await type("Bot token", SECRET);
+      await act(async () => button("Cancel")!.click());
+
+      expect(dialog().querySelector('input[type="password"]')).toBeNull();
+      expect(calls("telegram_set_token")).toHaveLength(0);
+      await act(async () => button("Change token")!.click());
+      expect(
+        dialog().querySelector<HTMLInputElement>('input[type="password"]')!
+          .value,
+      ).toBe("");
+    });
+  });
+
+  describe("disconnect confirmation", () => {
+    const disconnects = () =>
+      vi
+        .mocked(invoke)
+        .mock.calls.filter(([name]) => name === "telegram_disconnect");
+
+    it("asks first and says topic links will be lost", async () => {
+      status = CONNECTED;
+      await renderDialog();
+      await act(async () => button("Disconnect")!.click());
+
+      expect(disconnects()).toHaveLength(0);
+      expect(dialog().textContent).toContain(
+        "Topic links will be lost and questions already sent stop working.",
+      );
+      expect(button("Cancel")).toBeDefined();
+    });
+
+    it("cancel keeps the connection", async () => {
+      status = CONNECTED;
+      await renderDialog();
+      await act(async () => button("Disconnect")!.click());
+      await act(async () => button("Cancel")!.click());
+
+      expect(disconnects()).toHaveLength(0);
+      expect(dialog().textContent).not.toContain("Topic links will be lost");
+      expect(dialog().textContent).toContain("Connected to Alpha team");
+    });
+
+    it("disconnects after confirming", async () => {
+      status = CONNECTED;
+      await renderDialog();
+      await act(async () => button("Disconnect")!.click());
+      await act(async () => button("Disconnect")!.click());
+
+      expect(disconnects()).toHaveLength(1);
+      expect(dialog().querySelector('input[type="password"]')).not.toBeNull();
     });
   });
 });

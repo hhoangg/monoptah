@@ -201,6 +201,10 @@ fn refused_problem(description: &str) -> String {
     truncate(&format!("Telegram refused a message: {description}"))
 }
 
+fn same_bot(project: &ProjectConfig, bot_id: i64) -> bool {
+    project.bot_id == bot_id && bot_id != 0
+}
+
 /// A project keeps its group and topics only when the same bot comes back.
 fn apply_token(
     existing: Option<ProjectConfig>,
@@ -209,7 +213,7 @@ fn apply_token(
     username: &str,
 ) -> ProjectConfig {
     let mut project = match existing {
-        Some(project) if project.bot_id == bot_id && bot_id != 0 => project,
+        Some(project) if same_bot(&project, bot_id) => project,
         _ => ProjectConfig::default(),
     };
     project.token = token.to_string();
@@ -1295,17 +1299,33 @@ impl Bridge {
         if bot_id == 0 || username.is_empty() {
             return Err("Telegram did not describe this bot".to_string());
         }
-        let status = {
-            let mut state = self.lock();
-            let existing = state.cfg.projects.remove(project);
-            let updated = apply_token(existing, token, bot_id, &username);
-            let status = status_of(Some(&updated));
-            state.cfg.projects.insert(project.to_string(), updated);
-            self.persist(&state);
-            status
-        };
+        let status = self.store_token(project, token, bot_id, &username);
         self.restart_poller(token);
         Ok(status)
+    }
+
+    /// Stores a token that Telegram accepted, keeping the group and topics only when it
+    /// belongs to the same bot as before.
+    fn store_token(
+        &self,
+        project: &str,
+        token: &str,
+        bot_id: i64,
+        username: &str,
+    ) -> TelegramStatus {
+        let mut state = self.lock();
+        let existing = state.cfg.projects.remove(project);
+        // Another bot cannot edit or answer the old bot's messages, and the old token is
+        // gone, so those prompts are dropped instead of edited. The messages stay in the
+        // group; their buttons answer "expired" while the old bot is still polled.
+        if existing.as_ref().is_some_and(|old| !same_bot(old, bot_id)) {
+            self.drop_project_prompts(&mut state, project);
+        }
+        let updated = apply_token(existing, token, bot_id, username);
+        let status = status_of(Some(&updated));
+        state.cfg.projects.insert(project.to_string(), updated);
+        self.persist(&state);
+        status
     }
 
     pub fn connect_link(self: &Arc<Self>, project: &str) -> Result<ConnectLink, String> {
@@ -1364,9 +1384,17 @@ impl Bridge {
         Ok(status)
     }
 
+    /// Forgets the pending prompts of a project and the jobs queued for them.
+    fn drop_project_prompts(&self, state: &mut State, project: &str) {
+        for key in state.registry.discard_project(project) {
+            state.queue.purge_questions(&key);
+        }
+    }
+
     pub fn disconnect(self: &Arc<Self>, project: &str) {
         {
             let mut state = self.lock();
+            self.drop_project_prompts(&mut state, project);
             state.cfg.projects.remove(project);
             state.awaiting_connect.remove(project);
             self.persist(&state);
@@ -1683,6 +1711,81 @@ mod tests {
         assert_eq!(other.chat_id, None);
         assert!(other.topics.is_empty());
         assert!(!other.enabled);
+    }
+
+    fn forwarded_for(bridge: &Arc<Bridge>, project: &str, session: &str) {
+        add_project(bridge, project, true);
+        bind_topic(bridge, project, session, 42);
+        let mut p = payload(session, 1);
+        p.project = project.into();
+        bridge.forward("main", p).unwrap();
+        let key = key_of(session, 1);
+        bridge.lock().registry.set_message_for_test(&key, 0, 500);
+    }
+
+    fn send_question_keys(jobs: &[Job]) -> Vec<String> {
+        jobs.iter()
+            .filter_map(|job| match job {
+                Job::SendQuestion { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_different_bot_drops_the_projects_pending_prompts() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:1");
+        forwarded_for(&bridge, "proj", "s1");
+        forwarded_for(&bridge, "other", "s2");
+
+        let status = bridge.store_token("proj", "999:new", 999, "new_bot");
+
+        assert!(status.chat_id.is_none(), "the old group is not kept");
+        {
+            let state = bridge.lock();
+            assert!(state.registry.prompt("s1#1").is_none());
+            assert!(
+                state.registry.prompt("s2#1").is_some(),
+                "other projects are left alone"
+            );
+            assert!(state.cfg.projects["proj"].topics.is_empty());
+        }
+        let jobs = queued_edits(&bridge);
+        assert_eq!(
+            send_question_keys(&jobs),
+            vec!["s2#1".to_string()],
+            "{jobs:?}"
+        );
+        assert!(
+            !jobs.iter().any(|job| matches!(job, Job::EditStatus { .. })),
+            "the old token is gone, so no edit may go out through the new bot: {jobs:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_bot_with_a_new_token_keeps_the_pending_prompts() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:1");
+        forwarded_for(&bridge, "proj", "s1");
+
+        let status = bridge.store_token("proj", "123456:renewed", 123456, "my_bot");
+
+        assert_eq!(status.chat_id, Some(CHAT));
+        let state = bridge.lock();
+        assert!(state.registry.prompt("s1#1").is_some());
+        assert_eq!(state.cfg.projects["proj"].topics.len(), 1);
+    }
+
+    #[test]
+    fn disconnect_drops_the_projects_pending_prompts() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:1");
+        forwarded_for(&bridge, "proj", "s1");
+        forwarded_for(&bridge, "other", "s2");
+
+        bridge.disconnect("proj");
+
+        let state = bridge.lock();
+        assert!(state.registry.prompt("s1#1").is_none());
+        assert!(state.registry.prompt("s2#1").is_some());
     }
 
     #[test]

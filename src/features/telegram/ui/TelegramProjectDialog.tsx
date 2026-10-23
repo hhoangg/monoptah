@@ -25,6 +25,10 @@ type Props = {
 
 const POLL_MS = 3000;
 const WEBHOOK_PROBLEM = "This bot has a webhook";
+const CHANGE_TOKEN_NOTE =
+  "A token for the same bot keeps the group and topic links. A different bot clears the group and topic links, and questions already sent stop working.";
+const DISCONNECT_NOTE =
+  "Topic links will be lost and questions already sent stop working.";
 const OPEN_GROUP_NOTE =
   "Any member of the group can answer the agent, and a text reply becomes its answer. Keep the group private.";
 const ADMIN_NOTE =
@@ -50,6 +54,8 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [changingToken, setChangingToken] = useState(false);
+  const [confirmingDisconnect, setConfirmingDisconnect] = useState(false);
   // A poll that started before a change must not overwrite the change.
   const revision = useRef(0);
   const alive = useRef(true);
@@ -109,12 +115,19 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
         const next = await telegramSetToken(project, token.trim());
         if (!alive.current) return;
         setToken("");
+        setChangingToken(false);
         observe(next);
         setStatus(next);
       } finally {
         invalidateTelegramStatus(project);
       }
     });
+
+  const cancelTokenChange = () => {
+    setChangingToken(false);
+    setToken("");
+    setError(null);
+  };
 
   const connect = () =>
     run(async () => {
@@ -153,6 +166,8 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
       if (!alive.current) return;
       setLink(null);
       setToken("");
+      setChangingToken(false);
+      setConfirmingDisconnect(false);
       const next = await telegramStatus(project);
       if (!alive.current) return;
       observe(next);
@@ -173,6 +188,58 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
     }, 1500);
   };
 
+  const renderTokenForm = (changing: boolean) => (
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (token.trim()) void saveToken();
+      }}
+      className="flex flex-col gap-3"
+    >
+      <label className="flex flex-col gap-1 text-[12px] text-content/65">
+        Bot token
+        <input
+          aria-label="Bot token"
+          type="password"
+          value={token}
+          onChange={(event) => setToken(event.target.value)}
+          placeholder="123456:ABC..."
+          disabled={busy}
+          autoComplete="off"
+          spellCheck={false}
+          className="h-8 w-full rounded-md border border-content/10 bg-transparent px-2 text-content outline-none focus:border-content/20"
+        />
+      </label>
+      {changing ? (
+        <p className="text-[11px] leading-relaxed text-content/45">
+          {CHANGE_TOKEN_NOTE}
+        </p>
+      ) : null}
+      <div className="flex items-center gap-3">
+        <SecondaryButton type="submit" disabled={busy || !token.trim()}>
+          {busy ? (
+            <Loader className="size-3.5 animate-spin" aria-hidden />
+          ) : null}
+          Save
+        </SecondaryButton>
+        {changing ? (
+          <SecondaryButton onClick={cancelTokenChange} disabled={busy}>
+            Cancel
+          </SecondaryButton>
+        ) : null}
+        <button
+          type="button"
+          onClick={() =>
+            void openUrl("https://t.me/BotFather").catch(() => undefined)
+          }
+          className="text-[12px] text-content/65 hover:text-content"
+        >
+          Create a bot with BotFather
+        </button>
+      </div>
+    </form>
+  );
+
   return (
     <Modal
       title="Telegram"
@@ -190,52 +257,29 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
         {status === null ? (
           <p className="text-[12px] text-content/45">Checking Telegram…</p>
         ) : !status.configured ? (
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (token.trim()) void saveToken();
-            }}
-            className="flex flex-col gap-3"
-          >
-            <label className="flex flex-col gap-1 text-[12px] text-content/65">
-              Bot token
-              <input
-                aria-label="Bot token"
-                type="password"
-                value={token}
-                onChange={(event) => setToken(event.target.value)}
-                placeholder="123456:ABC..."
-                disabled={busy}
-                autoComplete="off"
-                spellCheck={false}
-                className="h-8 w-full rounded-md border border-content/10 bg-transparent px-2 text-content outline-none focus:border-content/20"
-              />
-            </label>
-            <div className="flex items-center gap-3">
-              <SecondaryButton type="submit" disabled={busy || !token.trim()}>
-                {busy ? (
-                  <Loader className="size-3.5 animate-spin" aria-hidden />
-                ) : null}
-                Save
-              </SecondaryButton>
-              <button
-                type="button"
-                onClick={() =>
-                  void openUrl("https://t.me/BotFather").catch(() => undefined)
-                }
-                className="text-[12px] text-content/65 hover:text-content"
-              >
-                Create a bot with BotFather
-              </button>
-            </div>
-          </form>
+          renderTokenForm(false)
         ) : (
           <>
             <Row label="Bot">
-              <span className="text-[12px] text-content/65">
-                @{status.botUsername}
+              <span className="flex items-center gap-3">
+                <span className="text-[12px] text-content/65">
+                  @{status.botUsername}
+                </span>
+                {changingToken ? null : (
+                  <SecondaryButton
+                    onClick={() => {
+                      setConfirmingDisconnect(false);
+                      setError(null);
+                      setChangingToken(true);
+                    }}
+                    disabled={busy}
+                  >
+                    Change token
+                  </SecondaryButton>
+                )}
               </span>
             </Row>
+            {changingToken ? renderTokenForm(true) : null}
 
             {status.chatId == null ? (
               <div className="flex flex-col gap-3 border-t border-stroke pt-4">
@@ -338,14 +382,42 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
               </div>
             ) : null}
 
-            <div className="border-t border-stroke pt-4">
-              <SecondaryButton
-                danger
-                onClick={() => void disconnect()}
-                disabled={busy}
-              >
-                Disconnect
-              </SecondaryButton>
+            <div className="flex flex-col gap-2 border-t border-stroke pt-4">
+              {confirmingDisconnect ? (
+                <>
+                  <p className="text-[11px] leading-relaxed text-content/45">
+                    {DISCONNECT_NOTE}
+                  </p>
+                  <div className="flex items-center gap-3">
+                    <SecondaryButton
+                      onClick={() => setConfirmingDisconnect(false)}
+                      disabled={busy}
+                    >
+                      Cancel
+                    </SecondaryButton>
+                    <SecondaryButton
+                      danger
+                      onClick={() => void disconnect()}
+                      disabled={busy}
+                    >
+                      Disconnect
+                    </SecondaryButton>
+                  </div>
+                </>
+              ) : (
+                <div>
+                  <SecondaryButton
+                    danger
+                    onClick={() => {
+                      cancelTokenChange();
+                      setConfirmingDisconnect(true);
+                    }}
+                    disabled={busy}
+                  >
+                    Disconnect
+                  </SecondaryButton>
+                </div>
+              )}
             </div>
           </>
         )}

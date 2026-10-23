@@ -376,6 +376,22 @@ impl Registry {
         }
     }
 
+    /// Forgets every prompt of `project` without touching Telegram: used when the project
+    /// loses its bot or its group, so no prompt is left that routes replies or edits through
+    /// a bot that no longer belongs to it. Returns the keys that were dropped.
+    pub fn discard_project(&mut self, project: &str) -> Vec<String> {
+        let keys: Vec<String> = self
+            .prompts
+            .iter()
+            .filter(|(_, prompt)| prompt.payload.project == project)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &keys {
+            self.forget(key);
+        }
+        keys
+    }
+
     /// A group became a supergroup: its prompts now live under the new chat id, so taps and
     /// replies from the new chat still match and status edits go to the right place.
     pub fn migrate_chat(&mut self, from: i64, to: i64) {
