@@ -443,3 +443,30 @@ it("saves normally when only fields the app manages changed since the board load
   expect(stored()[0]).toMatchObject({ name: "Mine", lastRunId: "run-3", runRequested: true });
   expect(container.querySelector("[data-board-changed]")).toBeNull();
 });
+
+const filesChanged = () =>
+  act(async () => {
+    window.dispatchEvent(new CustomEvent("monocode:mono-files-changed"));
+  });
+
+it("drops the review banner when the workflow is approved elsewhere", async () => {
+  await renderBoard(ticketWorkflow({ enabled: true, needsReview: true }));
+  expect(container.textContent).toContain("Review this workflow before enabling it");
+  // The approval changes no part of the definition, only the mark.
+  files.set("workflows.json", JSON.stringify([ticketWorkflow({ enabled: true })]));
+  await filesChanged();
+  expect(container.textContent).not.toContain("Review this workflow before enabling it");
+  await rename();
+  expect(button("Save").disabled).toBe(false);
+  await act(async () => button("Save").click());
+  expect(stored()[0]).toMatchObject({ name: "Renamed", enabled: true });
+  expect(stored()[0].needsReview).toBeUndefined();
+});
+
+it("shows the review banner when the workflow is flagged elsewhere", async () => {
+  await renderBoard(ticketWorkflow({ enabled: true }));
+  expect(container.textContent).not.toContain("Review this workflow before enabling it");
+  files.set("workflows.json", JSON.stringify([ticketWorkflow({ enabled: true, needsReview: true })]));
+  await filesChanged();
+  expect(container.textContent).toContain("Review this workflow before enabling it");
+});

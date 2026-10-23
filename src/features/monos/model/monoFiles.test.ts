@@ -286,6 +286,8 @@ it("monoContext includes workflows_rules", () => {
   expect(full).toContain("Projects are always inputs, never paths.");
   expect(full).toContain("`workflows.resumeRun`");
   expect(full).toContain("show them the steps first");
+  expect(full).toContain("workflows.run needs the workflow to be resumed (not paused)");
+  expect(full).toContain("until the user reviews and enables it in the Workflows panel");
   expect(full.indexOf("</habits_rules>")).toBeLessThan(
     full.indexOf("<workflows_rules>"),
   );

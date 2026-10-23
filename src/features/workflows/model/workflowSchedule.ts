@@ -24,7 +24,8 @@ export function dueWorkflows(
   const run: Workflow[] = [];
   const advance: Workflow[] = [];
   for (const workflow of workflows) {
-    // Created through the CLI from a file: nothing starts it until the user has reviewed it.
+    // Made from a file: nothing starts it, on a schedule or on request, until the user has
+    // approved this exact version.
     if (workflow.needsReview) continue;
     const busy = isRunning(workflow.id);
     if (workflow.runRequested) {

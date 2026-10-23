@@ -326,6 +326,12 @@ function BoardEditor({ monoId, workflow, color, projects, onBack, onReview = () 
           .then((list) => {
             const stored = list.find((w) => w.id === live.current.current.id);
             if (!stored) return;
+            // A review (or a flag) changes no part of the definition, so the key does not see it.
+            setBase((b) => {
+              if (!!b.needsReview === !!stored.needsReview) return b;
+              const { needsReview: _flag, ...rest } = b;
+              return stored.needsReview ? { ...rest, needsReview: true } : rest;
+            });
             const key = definitionKey(stored);
             if (key === live.current.seen) return;
             live.current.seen = key;

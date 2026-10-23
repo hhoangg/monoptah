@@ -129,9 +129,9 @@ export type Workflow = {
   lastRunId?: string;
   importedFrom?: string;
   /**
-   * Set on a workflow the Mono created from a file through the CLI. Its commands and prompts
-   * came from elsewhere, so only the user, in the panel, may enable or run it; that clears
-   * the mark. Never exported.
+   * Set on a workflow made from a file (by the Mono through the CLI, or imported in the UI).
+   * Its commands and prompts came from elsewhere, so only the user, in the panel, may enable
+   * or run it, and only an approval of this exact version clears the mark. Never exported.
    */
   needsReview?: boolean;
 };
