@@ -196,27 +196,28 @@ it("loadRuns drops malformed entries and unreadable files", async () => {
   expect(await loadRuns("mono-1", "wf-abcd1234")).toEqual([]);
 });
 
-it("loadRuns keeps per-round history and drops malformed records", async () => {
+it("loadRuns keeps per-round history, drops malformed records and the output of old records", async () => {
   const history = [
     {
       round: 1,
       status: "done",
       sessionId: "s1",
-      output: { pr_url: "u1" },
       decision: { value: "loop", reason: "needs tests" },
       startedAt: 1,
       endedAt: 2,
     },
   ];
+  // Runs saved before a round stopped keeping its output still carry it.
+  const old = [{ ...history[0], output: { pr_url: "u1" } }];
   const withHistory = run("with");
   withHistory.nodes = [
-    { nodeId: "dev", branch: "", status: "pending", round: 2, history } as WorkflowRun["nodes"][number],
+    { nodeId: "dev", branch: "", status: "pending", round: 2, history: old } as WorkflowRun["nodes"][number],
     {
       nodeId: "review",
       branch: "",
       status: "pending",
       round: 3,
-      history: [history[0], { round: "x", status: "done" }, { round: 2, status: "nope" }, 7, null],
+      history: [old[0], { round: "x", status: "done" }, { round: 2, status: "nope" }, 7, null],
     } as unknown as WorkflowRun["nodes"][number],
   ];
   const without = run("without");

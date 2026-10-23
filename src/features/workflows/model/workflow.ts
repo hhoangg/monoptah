@@ -251,7 +251,6 @@ export type RoundRecord = {
   round: number;
   status: NodeStatus;
   sessionId?: string;
-  output?: Record<string, unknown>;
   error?: string;
   decision?: { value: string; reason?: string };
   startedAt?: number;

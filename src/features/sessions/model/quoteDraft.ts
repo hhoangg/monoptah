@@ -111,6 +111,8 @@ export function acknowledgeQuoteRequest(
 export function appendComposerPrefill(draft: string, text: string): string {
   const value = text.replace(/\r\n?/g, "\n");
   if (!value.trim()) return draft;
+  // Asking twice must not stack the same sentence start.
+  if (draft.endsWith(value)) return draft;
   return `${draft}${composerInsertSeparator(draft)}${value}`;
 }
 

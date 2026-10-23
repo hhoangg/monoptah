@@ -281,6 +281,42 @@ it("clicking a node shows its details and round history", async () => {
   expect(onOpenSession).toHaveBeenCalledWith("s-dev-1");
 });
 
+it("hides the old round's output and session while a loop has the node pending", async () => {
+  stored = [
+    run({
+      definition: linear,
+      status: "running",
+      nodes: [
+        nr("trigger"),
+        nr("dev", {
+          status: "pending",
+          round: 2,
+          sessionId: "s-old",
+          output: { summary: "old-round-summary" },
+          startedAt: 1000,
+          endedAt: 13000,
+          history: [{ round: 1, status: "done", sessionId: "s-old", startedAt: 1000, endedAt: 13000 }],
+        }),
+        nr("report", { status: "pending" }),
+      ],
+    }),
+  ];
+  await renderPage(linear);
+  await act(async () => cards().find((c) => c.getAttribute("data-board-node") === "dev")!.click());
+  const details = container.querySelector("[data-run-details]")!;
+  expect(details.textContent).toContain("Not started");
+  expect(details.textContent).not.toContain("old-round-summary");
+  expect(details.textContent).not.toContain("Output");
+  expect(details.textContent).not.toContain("Took");
+  expect(details.textContent).not.toContain("Started");
+  const labels = [...details.querySelectorAll("dt")].map((d) => d.textContent);
+  expect(labels).not.toContain("Session");
+  // The rounds the loop finished stay.
+  const record = details.querySelector("[data-round-record='1']")!;
+  expect(record.textContent).toContain("Round 1");
+  expect(record.textContent).toContain("Open session");
+});
+
 it("picking a card with the keyboard shows its details", async () => {
   stored = [
     run({

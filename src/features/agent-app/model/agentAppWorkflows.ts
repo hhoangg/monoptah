@@ -400,12 +400,22 @@ export async function handleWorkflows(
     }
     case "workflows.validate": {
       // The same parse and checks as workflows.add, without saving anything.
-      const { draft } = newWorkflowFrom(input, now);
+      const { draft: parsed } = newWorkflowFrom(input, now);
+      const list = await workflows.load(monoId);
+      const existing = input.id === undefined ? undefined : list.find((entry) => entry.id === id());
+      // Checking a change to an existing workflow (`id`) judges the values as update would: when
+      // the change gives none, the stored values of the inputs it still declares stay.
+      const given = isRec(input.workflow)
+        ? input.workflow.inputValues !== undefined
+        : input.values !== undefined;
+      const draft: Workflow =
+        existing && !given
+          ? { ...parsed, inputValues: declaredValues(parsed.inputs, existing.inputValues) }
+          : parsed;
       // Read only: add would be refused at the limit, so say so here instead of at save time.
       const issues = problems(draft);
-      // Checking a change to an existing workflow (`id`) adds nothing, so the limit does not apply.
-      const list = await workflows.load(monoId);
-      const updating = input.id !== undefined && list.some((entry) => entry.id === id());
+      // Checking a change to an existing workflow adds nothing, so the limit does not apply.
+      const updating = existing !== undefined;
       if (!updating && list.length >= WORKFLOWS_MAX)
         issues.push({
           message: `A Mono can have at most ${WORKFLOWS_MAX} workflows; remove one before adding another`,

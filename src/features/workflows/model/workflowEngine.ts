@@ -384,18 +384,16 @@ function finishNode(d: Draft, r: NodeRun, output?: Record<string, unknown>): voi
 
 /**
  * A snapshot of the round a node just finished, for `NodeRun.history`. A node that did not run in
- * that round (skipped, or never started) still holds an earlier round's session and output, so the
- * record leaves those out. A For each keeps no output of its own: its children's outputs stay in
- * the archived lanes.
+ * that round (skipped, or never started) still holds an earlier round's session, so the record
+ * leaves it out. A record keeps no output: it would multiply the size of a run by its rounds, and
+ * the archived lanes of a For each keep their children's outputs.
  */
-function roundRecord(d: Draft, r: NodeRun): RoundRecord {
+function roundRecord(r: NodeRun): RoundRecord {
   const ran = r.startedAt !== undefined && r.status !== "skipped";
-  const keepOutput = ran && r.output !== undefined && d.g.byId.get(r.nodeId)?.type !== "forEach";
   return {
     round: r.round,
     status: r.status,
     ...(ran && r.sessionId !== undefined ? { sessionId: r.sessionId } : {}),
-    ...(keepOutput ? { output: r.output } : {}),
     ...(ran && r.error !== undefined ? { error: r.error } : {}),
     ...(ran && r.decision !== undefined ? { decision: r.decision } : {}),
     ...(r.startedAt !== undefined ? { startedAt: r.startedAt } : {}),
@@ -415,7 +413,7 @@ function resetLoop(d: Draft, from: NodeRun, to: NodeId): void {
   for (const id of loopBody(d.g, from.nodeId, to)) {
     const r = d.index.get(slot(id, from.branch));
     if (!r) continue;
-    r.history = [...(r.history ?? []), roundRecord(d, r)];
+    r.history = [...(r.history ?? []), roundRecord(r)];
     r.status = "pending";
     r.round = round;
     delete r.error;

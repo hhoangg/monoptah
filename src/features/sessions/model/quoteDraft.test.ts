@@ -117,6 +117,12 @@ describe("prefill mode", () => {
     expect(appendComposerPrefill("draft", "  \n")).toBe("draft");
   });
 
+  it("is not added again when the draft already ends with it", () => {
+    expect(appendComposerPrefill("Start ", "Start ")).toBe("Start ");
+    expect(appendComposerPrefill("draft\n\nStart ", "Start ")).toBe("draft\n\nStart ");
+    expect(appendComposerPrefill("Start more", "Start ")).toBe("Start more\n\nStart ");
+  });
+
   it("is consumed once like any other request", () => {
     const request: QuoteRequest = { id: 4, text: "Start ", mode: "prefill" };
     expect(consumeQuoteRequest("", null, request)).toEqual({

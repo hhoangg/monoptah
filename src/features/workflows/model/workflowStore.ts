@@ -146,7 +146,6 @@ function isRoundRecord(raw: unknown): raw is RoundRecord {
     isOptionalString(raw.error) &&
     isOptionalNumber(raw.startedAt) &&
     isOptionalNumber(raw.endedAt) &&
-    (raw.output === undefined || isPlainObject(raw.output)) &&
     (decision === undefined ||
       (isPlainObject(decision) &&
         typeof decision.value === "string" &&
@@ -162,7 +161,13 @@ function withCleanHistory(run: WorkflowRun): WorkflowRun {
     nodes: run.nodes.map((n) => {
       if (!isPlainObject(n) || !("history" in n)) return n;
       const { history, ...rest } = n as NodeRun;
-      const kept = Array.isArray(history) ? history.filter(isRoundRecord) : [];
+      // Records saved before rounds stopped keeping their output still carry it; it is dropped.
+      const kept = Array.isArray(history)
+        ? history.filter(isRoundRecord).map((record) => {
+            const { output: _output, ...rest } = record as RoundRecord & { output?: unknown };
+            return rest;
+          })
+        : [];
       return kept.length > 0 ? { ...rest, history: kept } : rest;
     }),
   };

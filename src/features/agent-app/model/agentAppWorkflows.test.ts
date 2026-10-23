@@ -831,6 +831,31 @@ describe("workflows.validate", () => {
     expect(withValues.issues).toEqual([]);
   });
 
+  it("judges an existing workflow's input values the way update would", async () => {
+    const { call, seed, stored } = fixture();
+    const { id } = (await call("workflows.add", { workflow: definition() })) as Added;
+    const { inputValues: _values, ...bare } = definition({ name: "Renamed" });
+    const before = structuredClone(stored());
+    // The stored project value stays when the change leaves inputValues out, as update would keep it.
+    const kept = (await call("workflows.validate", { id, workflow: bare })) as {
+      issues: unknown[];
+    };
+    expect(kept.issues).toEqual([]);
+    // Without an id there is nothing stored to keep.
+    const fresh = (await call("workflows.validate", { workflow: bare })) as {
+      issues: { message: string }[];
+    };
+    expect(fresh.issues[0].message).toBe('Missing a value for input "project"');
+    // Given values win over the stored ones.
+    const given = (await call("workflows.validate", {
+      id,
+      workflow: { ...bare, inputValues: { project: "" } },
+    })) as { issues: { message: string }[] };
+    expect(given.issues.length).toBeGreaterThan(0);
+    expect(stored()).toEqual(before);
+    seed(before);
+  });
+
   it("never writes, for valid and invalid input", async () => {
     const f = fixture();
     await f.call("workflows.validate", { workflow: definition() });

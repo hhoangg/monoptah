@@ -147,7 +147,9 @@ export function RunNodeDetails({
   const node = nodeRunKey ? nodeRunsByKey(run).get(nodeRunKey) : undefined;
   const def = node ? run.definition.nodes.find((n) => n.id === node.nodeId) : undefined;
   const status = statusOf(node);
-  const output = node?.output ?? {};
+  // A loop resets a node to pending but leaves its last round's results; they are not current.
+  const notStarted = status === "pending";
+  const output = (!notStarted && node?.output) || {};
   const isCommand = def?.type === "command";
   const fields = Object.entries(output).filter(([name]) => !(isCommand && COMMAND_FIELDS.includes(name)));
   return (
@@ -178,8 +180,10 @@ export function RunNodeDetails({
                   <StatusLabel status={status} asking={isAsking(node)} />
                   {node.round > 1 ? <span className="ml-1 text-content/45">round {node.round}</span> : null}
                 </Property>
-                {node.startedAt !== undefined ? <Property label="Started">{when(node.startedAt)}</Property> : null}
-                {node.startedAt !== undefined ? (
+                {!notStarted && node.startedAt !== undefined ? (
+                  <Property label="Started">{when(node.startedAt)}</Property>
+                ) : null}
+                {!notStarted && node.startedAt !== undefined ? (
                   <Property label="Took">
                     {node.endedAt !== undefined ? (
                       duration(node.endedAt - node.startedAt)
@@ -198,7 +202,7 @@ export function RunNodeDetails({
                     </span>
                   </Property>
                 ) : null}
-                {node.sessionId ? (
+                {!notStarted && node.sessionId ? (
                   <Property label="Session">
                     <SessionButton id={node.sessionId} onOpen={onOpenSession} />
                   </Property>

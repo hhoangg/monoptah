@@ -408,9 +408,10 @@ describe("workflowEngine", () => {
         round: 1,
         status: "done",
         sessionId: "s-dev-1",
-        output: { pr_url: "u1" },
       }),
     ]);
+    // Keeping each round's output would multiply the size of a run, and nothing shows it.
+    expect(nodeOf(run, "dev").history?.[0]).not.toHaveProperty("output");
     expect(nodeOf(run, "review").history).toHaveLength(1);
     expect(nodeOf(run, "review").history?.[0].sessionId).toBe("s-rev-1");
     expect(nodeOf(run, "review").history?.[0].decision).toEqual({ value: "loop", reason: "needs tests" });
@@ -519,14 +520,16 @@ describe("workflowEngine", () => {
     run = complete(run, "review", {});
     run = decided(run, "review", "loop");
     const [a1, a2] = nodeOf(run, "fixA").history ?? [];
-    expect(a1).toMatchObject({ round: 1, status: "done", sessionId: "s-a", output: { fixed: "a" } });
+    expect(a1).toMatchObject({ round: 1, status: "done", sessionId: "s-a" });
+    expect(a1).not.toHaveProperty("output");
     expect(a2).toMatchObject({ round: 2, status: "skipped" });
     expect(a2).not.toHaveProperty("sessionId");
     expect(a2).not.toHaveProperty("output");
     const [b1, b2] = nodeOf(run, "fixB").history ?? [];
     expect(b1).toMatchObject({ round: 1, status: "skipped" });
     expect(b1).not.toHaveProperty("output");
-    expect(b2).toMatchObject({ round: 2, status: "done", output: { fixed: "b" } });
+    expect(b2).toMatchObject({ round: 2, status: "done" });
+    expect(b2).not.toHaveProperty("output");
   });
 
   it("loops inside a For each keep their rounds per branch", () => {
