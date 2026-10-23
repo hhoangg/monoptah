@@ -501,7 +501,16 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
     scope: Set<NodeId>,
     itemNames: Set<string>,
   ) => {
-    for (const v of templateVars(text)) {
+    checkVarList(templateVars(text), nodeId, scope, itemNames);
+  };
+
+  const checkVarList = (
+    vars: string[],
+    nodeId: NodeId | undefined,
+    scope: Set<NodeId>,
+    itemNames: Set<string>,
+  ) => {
+    for (const v of vars) {
       const [head, field] = v.split(".");
       const path = v.split(".");
       const label = `{{${v}}}`;
@@ -677,13 +686,32 @@ export function validateWorkflow(w: Workflow): WorkflowIssue[] {
       case "report": {
         if (node.parent !== undefined) add("The Report node cannot be inside a For each", node.id);
         if (node.template) {
-          // A report may quote the branches inside a For each it follows.
-          const inner = [...ancestors(node.id)].flatMap((a) =>
-            g.byId.get(a)?.type === "forEach"
-              ? w.nodes.filter((n) => n.parent === a).map((n) => n.id)
-              : [],
+          // The report is rendered with `inputs`, `run`, `results` and the outputs of top-level
+          // nodes (see composeReport). Steps inside a For each, and its loop variable, are not in
+          // that scope: their outputs reach the report through `results`.
+          const loopNames = new Set(
+            w.nodes.filter((n) => n.type === "forEach").map((n) => (n.type === "forEach" ? n.as ?? "item" : "")),
           );
-          checkText(node.template, node, inner);
+          const readable: string[] = [];
+          for (const v of templateVars(node.template)) {
+            const head = v.split(".")[0];
+            if (head === "results") continue;
+            const target = g.byId.get(head);
+            if (target?.parent !== undefined) {
+              add(
+                `The report cannot read "${v}": steps inside a For each are listed in {{results}}.`,
+                node.id,
+              );
+            } else if (!target && head !== "inputs" && head !== "run" && loopNames.has(head)) {
+              add(
+                `The report cannot read "${v}": the loop variable only exists inside a For each; use {{results}}.`,
+                node.id,
+              );
+            } else {
+              readable.push(v);
+            }
+          }
+          checkVarList(readable, node.id, scopeOf(node.id), new Set());
         }
         break;
       }

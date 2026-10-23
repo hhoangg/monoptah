@@ -344,6 +344,31 @@ describe("validateWorkflow", () => {
     expect(flags(patchNode(w, "ask", { question: "{{lint.nope}}" }), "{{lint.nope}}")).toBe(true);
   });
 
+  it("limits report templates to variables the report can read", () => {
+    const withTemplate = (template: string) => {
+      const w = example();
+      const report = w.nodes.find((n) => n.id === "report");
+      if (report?.type === "report") report.template = template;
+      return w;
+    };
+    // Readable: inputs, run, results (and its fields), top-level nodes with a declared field.
+    const ok = withTemplate(
+      "{{inputs.project}} {{run.id}} {{run.round}} {{results}} {{results.0.status}} {{fetch.tickets}} {{each.results}}",
+    );
+    expect(validateWorkflow(ok)).toEqual([]);
+    // A step inside a For each is only reachable through results.
+    expect(messages(withTemplate("{{dev.pr_url}}"))).toContain(
+      'The report cannot read "dev.pr_url": steps inside a For each are listed in {{results}}.',
+    );
+    expect(flags(withTemplate("{{dev}}"), 'The report cannot read "dev"')).toBe(true);
+    // The loop variable only exists inside the For each.
+    expect(flags(withTemplate("{{item.title}}"), 'The report cannot read "item.title"')).toBe(true);
+    // Undeclared fields of top-level nodes are still caught.
+    expect(flags(withTemplate("{{fetch.nope}}"), "{{fetch.nope}}")).toBe(true);
+    // The conditions of #if blocks are checked too.
+    expect(flags(withTemplate("{{#if dev.verdict}}x{{/if}}"), 'The report cannot read "dev.verdict"')).toBe(true);
+  });
+
   it("checks variables in if conditions, forEach 'in' and loop deciders", () => {
     expect(flags(patchNode(example(), "each", { in: "{{fetch.nope}}" }), "{{fetch.nope}}")).toBe(
       true,
