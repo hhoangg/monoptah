@@ -2,9 +2,6 @@
 //!
 //! Every call POSTs JSON to `{base}/bot{token}/{method}`. The token is part of the URL, so
 //! no error string built here may carry the URL or the token.
-// Later tasks (queue, poller, commands) consume this module; removed in Task 5.
-#![allow(dead_code)]
-
 use serde_json::{json, Value};
 use std::time::Duration;
 

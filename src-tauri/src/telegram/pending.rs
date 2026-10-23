@@ -7,8 +7,6 @@
 //! Commands (`/start`, `/connect`, `/link`) are matched leniently: the `@bot` suffix is
 //! ignored. The codes are random, single-use and expire, so a command that reaches the
 //! wrong bot cannot do harm, and the registry needs no bot username.
-// Consumed by Task 5, where this allow is removed.
-#![allow(dead_code)]
 
 use super::config::{CodePurpose, Codes};
 use super::render::{
@@ -107,7 +105,7 @@ pub struct Registry {
 const EXPIRED: &str = "This question has expired";
 const MAX_CUSTOM_CHARS: usize = 2000;
 
-fn key_of(session_id: &str, request_id: u64) -> String {
+pub fn key_of(session_id: &str, request_id: u64) -> String {
     format!("{session_id}#{request_id}")
 }
 
@@ -277,6 +275,18 @@ impl Registry {
         }
         self.prompts.insert(key.clone(), prompt);
         key
+    }
+
+    pub fn prompt(&self, key: &str) -> Option<&PendingPrompt> {
+        self.prompts.get(key)
+    }
+
+    /// A group became a supergroup: its prompts now live under the new chat id, so taps and
+    /// replies from the new chat still match and status edits go to the right place.
+    pub fn migrate_chat(&mut self, from: i64, to: i64) {
+        for prompt in self.prompts.values_mut().filter(|p| p.chat == from) {
+            prompt.chat = to;
+        }
     }
 
     pub fn set_message(&mut self, key: &str, q_index: usize, message_id: i64) {

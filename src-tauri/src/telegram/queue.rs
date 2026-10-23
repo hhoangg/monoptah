@@ -3,9 +3,8 @@
 //! The queue is pure: time is passed in as `now_ms`, nothing sleeps, and nothing does I/O.
 //! The caller asks `next_ready` for a job, sends it, and uses `next_wake` to know when to
 //! ask again. Releasing a job records it against the budgets, so callers never report sends.
-// Consumed by the bridge worker; removed in Task 5.
-#![allow(dead_code)]
 
+use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 
 /// Sends allowed per chat inside `CHAT_WINDOW_MS`.
@@ -28,12 +27,17 @@ pub enum Job {
         /// Key of the pending question in the bridge state.
         key: String,
     },
-    /// Rewrites a forwarded message and removes its keyboard.
+    /// Rewrites a forwarded message. `keyboard` is `None` once the question is settled, so
+    /// the buttons disappear; an open multi-select question keeps its (updated) keyboard.
     EditStatus {
         chat: i64,
         message_id: i64,
         html: String,
+        keyboard: Option<Value>,
     },
+    /// A plain message into the chat (command replies, confirmations). The chat is the
+    /// queue's own chat, so it cannot go stale when a group migrates.
+    Notice { thread: Option<i64>, html: String },
 }
 
 impl Job {
@@ -85,10 +89,6 @@ pub struct SendQueue {
 }
 
 impl SendQueue {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Queues a job. A queued `EditStatus` for the same message is replaced in place, so only
     /// the latest text is sent.
     pub fn push(&mut self, chat: i64, job: Job) {
@@ -218,12 +218,13 @@ mod tests {
             chat,
             message_id,
             html: html.into(),
+            keyboard: None,
         }
     }
 
     #[test]
     fn twenty_per_minute_then_waits() {
-        let mut q = SendQueue::new();
+        let mut q = SendQueue::default();
         for i in 0..21 {
             q.push(1, question(&format!("k{i}")));
         }
@@ -242,7 +243,7 @@ mod tests {
 
     #[test]
     fn one_second_spacing() {
-        let mut q = SendQueue::new();
+        let mut q = SendQueue::default();
         q.push(1, question("a"));
         q.push(1, question("b"));
         assert_eq!(q.next_ready(5_000), Some((1, question("a"))));
@@ -253,7 +254,7 @@ mod tests {
 
     #[test]
     fn questions_before_edits() {
-        let mut q = SendQueue::new();
+        let mut q = SendQueue::default();
         q.push(1, edit(1, 10, "edit"));
         q.push(1, question("q1"));
         q.push(
@@ -275,7 +276,7 @@ mod tests {
 
     #[test]
     fn edits_to_same_message_coalesce() {
-        let mut q = SendQueue::new();
+        let mut q = SendQueue::default();
         q.push(1, edit(1, 10, "first"));
         q.push(1, edit(1, 11, "other"));
         q.push(1, edit(1, 10, "second"));
@@ -289,7 +290,7 @@ mod tests {
 
     #[test]
     fn pause_blocks_until() {
-        let mut q = SendQueue::new();
+        let mut q = SendQueue::default();
         q.push(1, question("a"));
         q.push(2, question("b"));
         q.pause(1, 10_000);
@@ -308,7 +309,7 @@ mod tests {
 
     #[test]
     fn requeue_front_goes_first() {
-        let mut q = SendQueue::new();
+        let mut q = SendQueue::default();
         q.push(1, question("a"));
         q.push(1, question("b"));
         q.push(1, edit(1, 10, "e1"));
@@ -327,7 +328,7 @@ mod tests {
 
     #[test]
     fn rename_chat_moves_jobs() {
-        let mut q = SendQueue::new();
+        let mut q = SendQueue::default();
         q.push(1, question("a"));
         q.push(1, edit(1, 10, "e"));
         q.pause(1, 5_000);
@@ -341,7 +342,7 @@ mod tests {
 
     #[test]
     fn global_thirty_per_second() {
-        let mut q = SendQueue::new();
+        let mut q = SendQueue::default();
         for chat in 0..31 {
             q.push(chat, question(&format!("k{chat}")));
         }

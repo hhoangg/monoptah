@@ -1,9 +1,6 @@
 //! Pure rendering of question messages (Telegram HTML) and inline keyboards.
 //!
 //! Every piece of dynamic text is escaped here, so callers never build HTML by hand.
-// Consumed by Task 5, where this allow is removed.
-#![allow(dead_code)]
-
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;

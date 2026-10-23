@@ -306,6 +306,7 @@ pub fn run() {
             tui_hook::init(app.handle())?;
             mobile_access::init(app.handle())?;
             reminders::init(app.handle());
+            telegram::init(app.handle());
             checkpoint::init(app.handle())?;
             mail::init(app.handle());
             menu::install(app.handle())?;
@@ -378,6 +379,17 @@ pub fn run() {
             reminders::reminder_take_open,
             reminders::reminder_register_window,
             reminders::reminder_open,
+            telegram::telegram_status,
+            telegram::telegram_set_token,
+            telegram::telegram_connect_link,
+            telegram::telegram_set_enabled,
+            telegram::telegram_disconnect,
+            telegram::telegram_remove_webhook,
+            telegram::telegram_link_code,
+            telegram::telegram_session_topic,
+            telegram::telegram_forward_question,
+            telegram::telegram_question_closed,
+            telegram::telegram_answer_result,
             automations::automations_list,
             automations::automations_upsert,
             automations::automations_delete,

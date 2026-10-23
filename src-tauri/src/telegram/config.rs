@@ -2,9 +2,6 @@
 //!
 //! The file holds the bot token, so it is written 0600 and neither its content nor the
 //! token is ever logged.
-// Later tasks consume this module; removed in Task 5.
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,8 +11,14 @@ use std::path::{Path, PathBuf};
 pub struct ProjectConfig {
     pub token: String,
     pub bot_username: String,
+    /// The bot's own user id, needed to look up its rights in the group.
+    pub bot_id: i64,
     pub chat_id: Option<i64>,
     pub chat_title: Option<String>,
+    /// Whether the group has Topics enabled; `None` until checked.
+    pub is_forum: Option<bool>,
+    /// Whether the bot may create topics; `None` until checked.
+    pub can_manage_topics: Option<bool>,
     pub enabled: bool,
     /// sessionId -> message_thread_id
     pub topics: BTreeMap<String, i64>,
