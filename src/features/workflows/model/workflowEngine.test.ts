@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Workflow, WorkflowEdge, WorkflowNode } from "./workflow";
 import {
   applyEvent,
+  loopedNodeIds,
   markInterrupted,
   nextActions,
   resumeRun,
@@ -1022,5 +1023,54 @@ describe("workflowEngine", () => {
     const run = startRun(def([trigger, report], [{ from: "trigger", to: "report" }]), "manual", at, "r");
     const bogus: EngineEvent = { kind: "nodeFinished", nodeId: "ghost", branch: "", output: {}, at };
     expect(applyEvent(run, bogus)).toBe(run);
+  });
+});
+
+describe("loopedNodeIds", () => {
+  const loop = { maxRounds: 3, decide: "mono" } as const;
+
+  it("names every node from the loop's target to its source, and no other", () => {
+    const w = def(
+      [trigger, session("prep"), session("dev"), session("lint"), session("review"), session("ship"), report],
+      [
+        { from: "trigger", to: "prep" },
+        { from: "prep", to: "dev" },
+        { from: "dev", to: "lint" },
+        { from: "lint", to: "review" },
+        { from: "review", to: "ship" },
+        { from: "ship", to: "report" },
+        { from: "review", to: "dev", loop },
+      ],
+    );
+    expect([...loopedNodeIds(w)].sort()).toEqual(["dev", "lint", "review"]);
+  });
+
+  it("is empty without a loop", () => {
+    const w = def([trigger, session("a"), report], [
+      { from: "trigger", to: "a" },
+      { from: "a", to: "report" },
+    ]);
+    expect(loopedNodeIds(w).size).toBe(0);
+  });
+
+  it("stays within one For each", () => {
+    const w = def(
+      [
+        trigger,
+        session("fetch", { output: { tickets: { type: "list" } } }),
+        { id: "each", type: "forEach", in: "{{fetch.tickets}}", as: "item", maxParallel: 2 },
+        session("dev", { parent: "each" }),
+        session("review", { parent: "each" }),
+        report,
+      ],
+      [
+        { from: "trigger", to: "fetch" },
+        { from: "fetch", to: "each" },
+        { from: "dev", to: "review" },
+        { from: "each", to: "report" },
+        { from: "review", to: "dev", loop },
+      ],
+    );
+    expect([...loopedNodeIds(w)].sort()).toEqual(["dev", "review"]);
   });
 });

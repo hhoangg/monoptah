@@ -32,6 +32,7 @@ import {
   type WorkflowInput,
   type WorkflowNode,
 } from "../../model/workflow";
+import { loopedNodeIds } from "../../model/workflowEngine";
 import { fieldInReport } from "../../model/workflowReport";
 import { inputValueProblems } from "../../model/workflowYaml";
 import { FIELD, InputField } from "../WorkflowPage";
@@ -610,7 +611,7 @@ function NodeFields({
               }}
             />
           </dl>
-          {workflow.edges.some((e) => e.loop && e.from === node.id) ? (
+          {loopedNodeIds(workflow).has(node.id) ? (
             <div className="px-2">
               <SwitchRow
                 label="Reuse the session"

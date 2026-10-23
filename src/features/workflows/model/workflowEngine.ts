@@ -158,6 +158,14 @@ function loopBody(g: Graph, from: NodeId, to: NodeId): NodeId[] {
   return [...body];
 }
 
+/** Every node that lies in the body of a loop: the ones the engine runs again each round. */
+export function loopedNodeIds(def: Workflow): Set<NodeId> {
+  const g = graphOf(def);
+  const looped = new Set<NodeId>();
+  for (const [from, { to }] of g.loops) for (const id of loopBody(g, from, to)) looped.add(id);
+  return looped;
+}
+
 /** Longest distance from a node with no predecessors; breaks ties between equal end times. */
 function depthOf(g: Graph, id: NodeId, memo = new Map<NodeId, number>()): number {
   const known = memo.get(id);

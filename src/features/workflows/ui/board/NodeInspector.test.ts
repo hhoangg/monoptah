@@ -3,7 +3,7 @@ import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Workflow, WorkflowNode } from "../../model/workflow";
-import { workflow } from "../workflowUiFixtures";
+import { ticketWorkflow, workflow } from "../workflowUiFixtures";
 import { NodeInspector, type MonoModelDefault } from "./NodeInspector";
 
 vi.mock("../../../../integrations/harness/core/availability", () => ({
@@ -202,4 +202,36 @@ it("shows what the node picked, and Use Mono default clears it", async () => {
   expect(next).not.toHaveProperty("harness");
   expect(next).not.toHaveProperty("model");
   expect(next).not.toHaveProperty("effort");
+});
+
+async function renderIn(w: Workflow, id: string) {
+  await act(async () =>
+    root.render(
+      createElement(NodeInspector, {
+        view: { kind: "node", id },
+        workflow: w,
+        projects: [{ path: "/work/api", name: "api" }],
+        issues: [],
+        onNode: () => {},
+        onSettings: () => {},
+        onLoop: () => {},
+        onRemove: () => {},
+        onBack: () => {},
+      }),
+    ),
+  );
+}
+const reuseSwitch = () => container.querySelector("button[role='switch'][aria-label='Reuse the session']");
+
+it("shows the reuse switch on every session in a loop body", async () => {
+  // dev -> review, looping back to dev: the engine reuses both.
+  for (const id of ["dev", "review"]) {
+    await renderIn(ticketWorkflow(), id);
+    expect(reuseSwitch(), id).not.toBeNull();
+  }
+});
+
+it("does not show the reuse switch on a session outside any loop", async () => {
+  await renderIn(ticketWorkflow(), "fetch");
+  expect(reuseSwitch()).toBeNull();
 });
