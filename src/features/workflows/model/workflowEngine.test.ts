@@ -412,6 +412,7 @@ describe("workflowEngine", () => {
       }),
     ]);
     expect(nodeOf(run, "review").history).toHaveLength(1);
+    expect(nodeOf(run, "review").history?.[0].sessionId).toBe("s-rev-1");
     expect(nodeOf(run, "review").history?.[0].decision).toEqual({ value: "loop", reason: "needs tests" });
     expect(nodeOf(run, "review").round).toBe(2);
     // The current round is never part of the history.
@@ -474,6 +475,58 @@ describe("workflowEngine", () => {
     run = complete(run, "review", { verdict: "approve" });
     expect(nodeOf(run, "review").decision).toEqual({ value: "exit" });
     expect(nextActions(run)).toEqual([{ kind: "postReport" }]);
+  });
+
+  it("condition loops record the loop decision in history", () => {
+    let run = startRun(devReview('{{review.verdict}} != "approve"'), "manual", at, "r");
+    run = complete(run, "dev", { pr_url: "p1" });
+    run = complete(run, "review", { verdict: "changes" });
+    expect(nodeOf(run, "review").history).toEqual([
+      expect.objectContaining({ round: 1, status: "done", decision: { value: "loop" } }),
+    ]);
+    expect(nodeOf(run, "review").decision).toBeUndefined();
+  });
+
+  it("a round record leaves out what the node did in an earlier round", () => {
+    const w = def(
+      [
+        trigger,
+        session("dev"),
+        { id: "gate", type: "if", condition: "{{dev.ok}} == true" },
+        session("fixA"),
+        session("fixB"),
+        session("review"),
+        report,
+      ],
+      [
+        { from: "trigger", to: "dev" },
+        { from: "dev", to: "gate" },
+        { from: "gate", to: "fixA", handle: "true" },
+        { from: "gate", to: "fixB", handle: "false" },
+        { from: "fixA", to: "review" },
+        { from: "fixB", to: "review" },
+        { from: "review", to: "report" },
+        { from: "review", to: "dev", loop: { maxRounds: 3, decide: "mono" } },
+      ],
+    );
+    let run = complete(startRun(w, "manual", at, "r"), "dev", { ok: true });
+    run = started(run, "fixA", "", "s-a");
+    run = finished(run, "fixA", { fixed: "a" });
+    run = complete(run, "review", {});
+    run = decided(run, "review", "loop");
+    run = complete(run, "dev", { ok: false });
+    run = complete(run, "fixB", { fixed: "b" });
+    run = complete(run, "review", {});
+    run = decided(run, "review", "loop");
+    const [a1, a2] = nodeOf(run, "fixA").history ?? [];
+    expect(a1).toMatchObject({ round: 1, status: "done", sessionId: "s-a", output: { fixed: "a" } });
+    expect(a2).toMatchObject({ round: 2, status: "skipped" });
+    expect(a2).not.toHaveProperty("sessionId");
+    expect(a2).not.toHaveProperty("output");
+    const [b1, b2] = nodeOf(run, "fixB").history ?? [];
+    expect(b1).toMatchObject({ round: 1, status: "skipped" });
+    expect(b1).not.toHaveProperty("output");
+    expect(b2).toMatchObject({ round: 2, status: "done", output: { fixed: "b" } });
   });
 
   it("loops inside a For each keep their rounds per branch", () => {
@@ -671,6 +724,13 @@ describe("workflowEngine", () => {
       run = started(run, "review"); // the loop question went out
       return decided(run, "review", "loop");
     };
+
+    it("keeps no output on the For each's own round record", () => {
+      const run = afterRoundOne();
+      const [record] = nodeOf(run, "each").history ?? [];
+      expect(record).toMatchObject({ round: 1, status: "done" });
+      expect(record).not.toHaveProperty("output");
+    });
 
     it("archives the branches of the finished round instead of deleting them", () => {
       const run = afterRoundOne();

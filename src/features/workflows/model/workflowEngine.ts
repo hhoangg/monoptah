@@ -382,15 +382,22 @@ function finishNode(d: Draft, r: NodeRun, output?: Record<string, unknown>): voi
   if (output !== undefined) r.output = output;
 }
 
-/** A snapshot of the round a node just finished, for `NodeRun.history`. */
-function roundRecord(r: NodeRun): RoundRecord {
+/**
+ * A snapshot of the round a node just finished, for `NodeRun.history`. A node that did not run in
+ * that round (skipped, or never started) still holds an earlier round's session and output, so the
+ * record leaves those out. A For each keeps no output of its own: its children's outputs stay in
+ * the archived lanes.
+ */
+function roundRecord(d: Draft, r: NodeRun): RoundRecord {
+  const ran = r.startedAt !== undefined && r.status !== "skipped";
+  const keepOutput = ran && r.output !== undefined && d.g.byId.get(r.nodeId)?.type !== "forEach";
   return {
     round: r.round,
     status: r.status,
-    ...(r.sessionId !== undefined ? { sessionId: r.sessionId } : {}),
-    ...(r.output !== undefined ? { output: r.output } : {}),
-    ...(r.error !== undefined ? { error: r.error } : {}),
-    ...(r.decision !== undefined ? { decision: r.decision } : {}),
+    ...(ran && r.sessionId !== undefined ? { sessionId: r.sessionId } : {}),
+    ...(keepOutput ? { output: r.output } : {}),
+    ...(ran && r.error !== undefined ? { error: r.error } : {}),
+    ...(ran && r.decision !== undefined ? { decision: r.decision } : {}),
     ...(r.startedAt !== undefined ? { startedAt: r.startedAt } : {}),
     ...(r.endedAt !== undefined ? { endedAt: r.endedAt } : {}),
   };
@@ -408,7 +415,7 @@ function resetLoop(d: Draft, from: NodeRun, to: NodeId): void {
   for (const id of loopBody(d.g, from.nodeId, to)) {
     const r = d.index.get(slot(id, from.branch));
     if (!r) continue;
-    r.history = [...(r.history ?? []), roundRecord(r)];
+    r.history = [...(r.history ?? []), roundRecord(d, r)];
     r.status = "pending";
     r.round = round;
     delete r.error;
@@ -539,8 +546,9 @@ function pass(d: Draft): boolean {
         else if (result.value) {
           r.decision = { value: "loop" };
           resetLoop(d, r, spec.to);
+        } else {
+          r.decision = { value: "exit" };
         }
-        else r.decision = { value: "exit" };
         changed = true;
       }
       continue;
