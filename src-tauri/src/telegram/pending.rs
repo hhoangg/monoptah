@@ -10,7 +10,8 @@
 
 use super::config::{CodePurpose, Codes};
 use super::render::{
-    is_other, keyboard, new_token, question_html, status_html, ForwardPayload, CUSTOM_OPTION_ID,
+    is_other, keyboard, new_token, question_html, status_html, ForwardPayload, QuestionIn,
+    CUSTOM_OPTION_ID,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -165,6 +166,20 @@ fn thread_of(msg: &Value) -> Option<i64> {
     }
 }
 
+/// The id a custom answer is sent under: the question's own "Other" option when it has one
+/// (the desktop form does the same, and providers such as Cursor drop `__custom__` as an
+/// unknown option), else the app-wide custom marker.
+fn custom_id(q: &QuestionIn) -> &str {
+    q.options
+        .iter()
+        .find(|option| is_other(option))
+        .map_or(CUSTOM_OPTION_ID, |option| option.id.as_str())
+}
+
+fn is_custom_id(q: &QuestionIn, id: &str) -> bool {
+    id == CUSTOM_OPTION_ID || id == custom_id(q)
+}
+
 /// Option ids in option order, then the custom marker.
 fn selected_ids(prompt: &PendingPrompt, q_index: usize) -> Vec<String> {
     let selected = &prompt.selected[q_index];
@@ -174,7 +189,7 @@ fn selected_ids(prompt: &PendingPrompt, q_index: usize) -> Vec<String> {
         .filter(|option| selected.contains(&option.id))
         .map(|option| option.id.clone())
         .collect();
-    if selected.contains(CUSTOM_OPTION_ID) {
+    if selected.contains(CUSTOM_OPTION_ID) && !ids.iter().any(|id| id == CUSTOM_OPTION_ID) {
         ids.push(CUSTOM_OPTION_ID.to_string());
     }
     ids
@@ -185,8 +200,10 @@ fn selected_labels(prompt: &PendingPrompt, q_index: usize) -> Vec<String> {
     selected_ids(prompt, q_index)
         .iter()
         .filter_map(|id| {
-            if id == CUSTOM_OPTION_ID {
-                return prompt.custom[q_index].clone();
+            if is_custom_id(q, id) {
+                if let Some(text) = &prompt.custom[q_index] {
+                    return Some(text.clone());
+                }
             }
             q.options
                 .iter()
@@ -206,7 +223,7 @@ fn build_reply(prompt: &PendingPrompt) -> Value {
         if ids.is_empty() {
             continue;
         }
-        if ids.iter().any(|id| id == CUSTOM_OPTION_ID) {
+        if ids.iter().any(|id| is_custom_id(q, id)) {
             if let Some(text) = &prompt.custom[index] {
                 custom.insert(q.id.clone(), json!(text));
             }
@@ -605,11 +622,12 @@ impl Registry {
         };
         prompt.custom[q_index] = Some(text.chars().take(MAX_CUSTOM_CHARS).collect());
         prompt.awaiting_text[q_index] = false;
+        let custom = custom_id(&prompt.payload.questions[q_index]).to_string();
         if prompt.payload.questions[q_index].multi_select {
-            prompt.selected[q_index].insert(CUSTOM_OPTION_ID.to_string());
+            prompt.selected[q_index].insert(custom);
             return edit_open(prompt, q_index).into_iter().collect();
         }
-        prompt.selected[q_index] = BTreeSet::from([CUSTOM_OPTION_ID.to_string()]);
+        prompt.selected[q_index] = BTreeSet::from([custom]);
         self.finish_question(&key, q_index, &by)
     }
 }
@@ -1443,6 +1461,55 @@ mod tests {
         let effects = press(&mut reg, &key, 0, "o", Some(3));
         assert!(delivers(&effects).is_empty(), "{effects:?}");
         assert!(reg.prompts[&key].awaiting_text[0]);
+    }
+
+    #[test]
+    fn real_other_option_sends_its_own_id_with_the_text() {
+        let mut reg = Registry::default();
+        let mut q = question("q1", false, true);
+        q.options.push(option("z", "Other"));
+        let key = add(&mut reg, "s1", 7, vec![q]);
+        press(&mut reg, &key, 0, "o", Some(3));
+        let reply = reply_to_question(&mut reg, CHAT, "my own answer", &key, 0);
+        match delivers(&reply)[0] {
+            Effect::Deliver { reply, .. } => assert_eq!(
+                *reply,
+                json!({"kind": "answered",
+                    "answers": {"q1": ["z"]},
+                    "custom": {"q1": "my own answer"}})
+            ),
+            _ => unreachable!(),
+        }
+        let after = reg.delivered(&key, true);
+        match &after[0] {
+            Effect::Edit { html, .. } => {
+                assert!(html.contains("Answered by @bob: my own answer"), "{html}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_other_option_in_multi_select_keeps_other_picks() {
+        let mut reg = Registry::default();
+        let mut q = question("q1", true, true);
+        q.options.push(option("z", "other "));
+        let key = add(&mut reg, "s1", 7, vec![q]);
+        let t = token(&reg, &key, 0);
+        tap(&mut reg, &format!("o:{t}:1"));
+        tap(&mut reg, &format!("o:{t}:3"));
+        let added = reply_to_question(&mut reg, CHAT, "extra", &key, 0);
+        assert!(delivers(&added).is_empty(), "{added:?}");
+        let sent = tap(&mut reg, &format!("s:{t}"));
+        match delivers(&sent)[0] {
+            Effect::Deliver { reply, .. } => assert_eq!(
+                *reply,
+                json!({"kind": "answered",
+                    "answers": {"q1": ["b", "z"]},
+                    "custom": {"q1": "extra"}})
+            ),
+            _ => unreachable!(),
+        }
     }
 
     #[test]
