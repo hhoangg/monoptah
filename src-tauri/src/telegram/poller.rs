@@ -2374,6 +2374,74 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_job_of_a_replaced_prompt_is_dropped_when_requeued() {
+        let slot: Arc<std::sync::OnceLock<Arc<Bridge>>> = Arc::default();
+        let hook_slot = Arc::clone(&slot);
+        let three = |tag: &str| {
+            let mut prompt = payload("s1", 1);
+            let template = prompt.questions[0].clone();
+            prompt.questions = (1..=3)
+                .map(|i| QuestionIn {
+                    id: format!("{tag}{i}"),
+                    prompt: format!("{tag} number {i}?"),
+                    ..template.clone()
+                })
+                .collect();
+            prompt
+        };
+        let replacement = three("new");
+        let (base, server) = serve_script_with(
+            vec![
+                ok(json!({ "message_id": 1 })),
+                fail(429, "Too Many Requests", json!({ "retry_after": 1 })),
+                ok(json!({ "message_id": 2 })),
+                ok(json!({ "message_id": 3 })),
+                ok(json!({ "message_id": 4 })),
+                // The old prompt's first message is expired.
+                ok(json!(true)),
+            ],
+            move |number| {
+                // Old question 2 is on the wire: the window reloads and the key is reused.
+                if number == 1 {
+                    let bridge = hook_slot.get().unwrap();
+                    bridge.forward("main", replacement.clone()).unwrap();
+                }
+            },
+        );
+        let (bridge, _sink) = bridge_with(&base);
+        slot.set(Arc::clone(&bridge)).ok();
+        add_project(&bridge, "proj", true);
+        bind_topic(&bridge, "proj", "s1", 42);
+        bridge.forward("main", three("old")).unwrap();
+        assert!(bridge.pump(false), "old question 1 goes out");
+        bridge.skew_ms.fetch_add(1_100, Ordering::Relaxed);
+        // Answered with 429 after the purge, so the old job is requeued at the front.
+        assert!(bridge.pump(false), "old question 2 is in flight");
+        drain(&bridge);
+
+        let seen = server.join().unwrap();
+        let texts: Vec<String> = seen
+            .iter()
+            .filter(|call| method_of(call).ends_with("sendMessage"))
+            .map(|call| call.body["text"].as_str().unwrap().to_string())
+            .collect();
+        let expected = [
+            "old number 1?",
+            "old number 2?",
+            "new number 1?",
+            "new number 2?",
+            "new number 3?",
+        ];
+        assert_eq!(texts.len(), expected.len(), "{texts:?}");
+        for (text, expected) in texts.iter().zip(expected) {
+            assert!(text.contains(expected), "{texts:?}");
+        }
+        let state = bridge.lock();
+        let messages = &state.registry.prompt("s1#1").unwrap().messages;
+        assert_eq!(messages, &[Some(2), Some(3), Some(4)]);
+    }
+
+    #[test]
     fn topic_is_created_before_the_first_question_message() {
         let (base, server) = serve_script(vec![
             ok(json!({ "message_thread_id": 11 })),
