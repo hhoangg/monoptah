@@ -32,8 +32,9 @@ topic...**. The dialog shows a command like `/link@your_bot CODE`. Send it insid
 topic you want to use (not in General); the bot confirms in that topic and the dialog
 shows **Linked**. The code is valid for 15 minutes; select **New code** if it expires.
 You can link a session before or after it first asks a question. The menu item appears
-only for sessions of a project that has a bot and a connected group, and not for remote,
-terminal (TUI) or Mono sessions.
+only for sessions of a project that has a bot and a connected group, and not for remote
+or Mono sessions or open terminal (TUI) sessions. A terminal session that is closed and
+only saved may still show it, but its questions are never forwarded.
 
 ## How it behaves
 

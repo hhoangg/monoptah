@@ -78,6 +78,11 @@ export type SessionSummary = {
   draft?: boolean;
   linkedWorkItem?: LinkedWorkItem;
   automationId?: string;
+  /**
+   * Only set to "tui", and only on rows built from a live session: the saved
+   * rows from the backend carry no surface.
+   */
+  surface?: SessionSurface;
 };
 
 type SessionRecord = {

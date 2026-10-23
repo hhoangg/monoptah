@@ -4,6 +4,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import type { TelegramStatus } from "../../features/telegram/model/telegram";
+import {
+  historyWithLiveSessions,
+  summaryFromSession,
+} from "../../features/sessions/data/sessionHistory";
+import { newSession } from "../../features/sessions/model/session";
 import { Sidebar } from "./Sidebar";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -150,12 +155,15 @@ describe("sidebar Telegram topic link", () => {
     expect(menuItem("Link Telegram topic...")).toBeUndefined();
   });
 
-  it("hides the link for TUI sessions", async () => {
-    const tui = {
-      ...session("session-1", "/workspace/project"),
-      surface: "tui",
-    };
-    props = { ...props, sessions: [tui], openSessions: [tui] } as typeof props;
+  it("hides the link for a saved terminal session, built the way the app builds its rows", async () => {
+    const live = newSession("claude", "/workspace/project");
+    live.id = "session-1";
+    live.surface = "tui";
+    live.providerSessionId = "provider-1";
+    const saved = session("session-1", "/workspace/project");
+    // The backend's saved row has no surface; the live session supplies it.
+    const rows = historyWithLiveSessions([saved], [live], "/workspace/project");
+    props = { ...props, sessions: rows };
     await renderSidebar();
     await openMenu();
 
@@ -165,5 +173,18 @@ describe("sidebar Telegram topic link", () => {
       "telegram_status",
       expect.anything(),
     );
+  });
+
+  it("hides the link for a live terminal session that is not saved yet", async () => {
+    const live = newSession("claude", "/workspace/project");
+    live.id = "session-1";
+    live.surface = "tui";
+    live.providerSessionId = "provider-1";
+    props = { ...props, sessions: [summaryFromSession(live)] };
+    await renderSidebar();
+    await openMenu();
+
+    expect(menuItem("Rename")).toBeDefined();
+    expect(menuItem("Link Telegram topic...")).toBeUndefined();
   });
 });

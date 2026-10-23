@@ -7,6 +7,7 @@ import {
   mergeProjectHistorySummary,
   replaceProjectHistory,
   sameSessionSummaries,
+  summaryFromSession,
 } from "./sessionHistory";
 import { newSession } from "../model/session";
 import type { SessionSummary } from "./sessionStore";
@@ -26,6 +27,39 @@ function summary(id: string, cwd: string, updatedAt = 1): SessionSummary {
     deletions: 0,
   };
 }
+
+describe("terminal session surface", () => {
+  function tui() {
+    const session = newSession("claude", "/tmp/project-a");
+    session.surface = "tui";
+    session.providerSessionId = "provider-1";
+    return session;
+  }
+
+  it("summaryFromSession marks terminal sessions and leaves chats unmarked", () => {
+    expect(summaryFromSession(tui()).surface).toBe("tui");
+    expect(
+      summaryFromSession(newSession("claude", "/tmp/a")),
+    ).not.toHaveProperty("surface");
+  });
+
+  it("historyWithLiveSessions marks a saved terminal session from its live copy", () => {
+    const session = tui();
+    const saved = {
+      ...summary(session.id, session.cwd),
+      harness: "claude" as const,
+    };
+    const rows = historyWithLiveSessions([saved], [session], session.cwd);
+    expect(rows[0].surface).toBe("tui");
+    expect(
+      historyWithLiveSessions(
+        [saved],
+        [{ ...session, surface: "chat" }],
+        session.cwd,
+      )[0],
+    ).not.toHaveProperty("surface");
+  });
+});
 
 describe("historyWithLiveSessions", () => {
   it("carries visibility into both new and already-saved live summaries", () => {

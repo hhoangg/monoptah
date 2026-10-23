@@ -122,6 +122,7 @@ export function summaryFromSession(
       ? { linkedWorkItem: session.linkedWorkItem }
       : {}),
     ...(session.automationId ? { automationId: session.automationId } : {}),
+    ...(session.surface === "tui" ? { surface: session.surface } : {}),
     ...(!session.worktreeRemoved && (session.branch || git?.branch)
       ? { branch: session.branch || git?.branch }
       : {}),
@@ -215,7 +216,10 @@ export function historyWithLiveSessions(
       const automationId = session.automationId || stored.automationId;
       // Live title and work item land before the next persist, e.g. mid-turn.
       const linkedWorkItem = session.linkedWorkItem ?? stored.linkedWorkItem;
+      // Saved rows carry no surface; the live session knows it is a terminal one.
+      const tui = session.surface === "tui";
       if (
+        (stored.surface === "tui") !== tui ||
         !!stored.draft !== draft ||
         stored.automationId !== automationId ||
         stored.title !== session.title ||
@@ -229,6 +233,7 @@ export function historyWithLiveSessions(
           draft: draft || undefined,
           ...(automationId ? { automationId } : {}),
           ...(linkedWorkItem ? { linkedWorkItem } : {}),
+          surface: tui ? "tui" : undefined,
         };
       }
       continue;
