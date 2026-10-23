@@ -2,4 +2,6 @@
 
 pub mod api;
 pub mod config;
+pub mod pending;
 pub mod queue;
+pub mod render;
