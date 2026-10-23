@@ -10,6 +10,7 @@ import {
   dueForwards,
   forwardPayload,
   isForwardable,
+  isTopicLinkable,
   questionContext,
   sessionTicketId,
   topicTitle,
@@ -92,6 +93,32 @@ describe("isForwardable", () => {
         }),
       ),
     ).toBe(false);
+  });
+});
+
+describe("isTopicLinkable", () => {
+  it("ignores the pending question but excludes sessions that never forward", () => {
+    expect(isTopicLinkable(asking())).toBe(true);
+    expect(isTopicLinkable(asking({ pendingQuestion: undefined }))).toBe(true);
+    expect(
+      isTopicLinkable(
+        asking({
+          pendingQuestion: { ...prompt, autoResolveAt: Date.now() + 1 },
+        }),
+      ),
+    ).toBe(true);
+    expect(isTopicLinkable(asking({ orchestrationLeadId: "lead" }))).toBe(
+      false,
+    );
+    expect(isTopicLinkable(asking({ ephemeral: true }))).toBe(false);
+    expect(isTopicLinkable(asking({ surface: "tui" }))).toBe(false);
+    expect(isTopicLinkable(asking({ cwd: "remote://host/work/acme" }))).toBe(
+      false,
+    );
+    const mono = asking();
+    monoChats.add(mono.id);
+    expect(isTopicLinkable(mono)).toBe(false);
+    monoChats.delete(mono.id);
   });
 });
 

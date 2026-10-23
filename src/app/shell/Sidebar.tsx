@@ -14,6 +14,9 @@ import {
 } from "../../features/projects/ui/CurrentProjectIcon";
 import { OrchestrationSidebarAgents } from "../../features/orchestration/ui/OrchestrationSidebarAgents";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { LinkTelegramTopicDialog } from "../../features/telegram/ui/LinkTelegramTopicDialog";
+import { useTelegramLinkable } from "../../features/telegram/hooks/useTelegramLinkable";
+import { isTopicLinkable } from "../../features/telegram/model/telegramForward";
 import {
   Archive,
   Chatting,
@@ -80,6 +83,7 @@ import {
   type SidebarTabId,
 } from "../../features/settings/model/appearance";
 import { formatInteger } from "../../shared/lib/numbers";
+import { projectKey } from "../../shared/lib/paths";
 import {
   type GitFileDiffKind,
   type GitHistoryCommit,
@@ -735,6 +739,8 @@ function SidebarComponent({
   const [linkingSession, setLinkingSession] = useState<SessionSummary | null>(
     null,
   );
+  const [telegramLinkSession, setTelegramLinkSession] =
+    useState<SessionSummary | null>(null);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -1487,6 +1493,16 @@ function SidebarComponent({
     return session ? [session] : [];
   });
   const multipleMenuSessions = menuSessionIds.length > 1;
+  const telegramMenuSession = multipleMenuSessions
+    ? undefined
+    : menuSessions[0];
+  const canLinkTelegramTopic = useTelegramLinkable(
+    telegramMenuSession &&
+      !remoteProject &&
+      isTopicLinkable(telegramMenuSession)
+      ? projectKey(telegramMenuSession.cwd)
+      : null,
+  );
   const menuReminderTimes = [
     ...new Set(
       reminders
@@ -1581,6 +1597,15 @@ function SidebarComponent({
             label: menuSessions[0]?.linkedWorkItem
               ? "Edit GitHub issue or PR link…"
               : "Link GitHub issue or PR…",
+          },
+        ]
+      : []),
+    ...(canLinkTelegramTopic
+      ? [
+          {
+            kind: "item" as const,
+            id: "link-telegram-topic",
+            label: "Link Telegram topic...",
           },
         ]
       : []),
@@ -1724,6 +1749,10 @@ function SidebarComponent({
     }
     if (id === "link-work-item") {
       setLinkingSession(menuSessions[0] ?? null);
+      return;
+    }
+    if (id === "link-telegram-topic") {
+      setTelegramLinkSession(menuSessions[0] ?? null);
       return;
     }
     if (id === "folder-new") {
@@ -3279,6 +3308,17 @@ function SidebarComponent({
             setLinkingSession(null);
           }}
           onClose={() => setLinkingSession(null)}
+        />
+      ) : null}
+      {telegramLinkSession ? (
+        <LinkTelegramTopicDialog
+          project={projectKey(telegramLinkSession.cwd)}
+          sessionId={telegramLinkSession.id}
+          sessionTitle={sessionDisplayTitle(
+            telegramLinkSession.title,
+            telegramLinkSession.harness,
+          )}
+          onClose={() => setTelegramLinkSession(null)}
         />
       ) : null}
       <div

@@ -15,14 +15,25 @@ export const FORWARD_DELAY_MS = 5 * 60_000;
 const TOPIC_TITLE_MAX = 128;
 const CONTEXT_MAX = 600;
 
-/** Sessions whose questions go to Telegram: ones a person would answer in a project tab. */
-export function isForwardable(session: Session): boolean {
+/** Whether a session could ever post questions to Telegram, whatever it is asking now. */
+export function isTopicLinkable(
+  session: Pick<
+    Session,
+    "id" | "cwd" | "orchestrationLeadId" | "inboxAsk" | "ephemeral" | "surface"
+  >,
+): boolean {
   if (session.orchestrationLeadId) return false;
   if (session.inboxAsk) return false;
   if (session.ephemeral) return false;
   if (isTuiSession(session)) return false;
   if (isMonoSession(session.id)) return false;
   if (isRemoteProjectPath(session.cwd)) return false;
+  return true;
+}
+
+/** Sessions whose questions go to Telegram: ones a person would answer in a project tab. */
+export function isForwardable(session: Session): boolean {
+  if (!isTopicLinkable(session)) return false;
   // Codex questions that auto-skip never block the agent, so nobody needs the ping.
   if (session.pendingQuestion?.autoResolveAt !== undefined) return false;
   return true;

@@ -27,9 +27,13 @@ Telegram is set up per project. Right-click a project and choose **Telegram...**
 7. **Check the status.** The dialog shows whether Topics are on and whether the bot
    can manage topics, and explains what to fix if not.
 
-To use a topic you already have, open a session's menu, choose **Link Telegram
-topic...**, and send the `/link <code>` command it shows inside that topic. This
-option arrives with the session menu update.
+To use a topic you already have, open the session's menu and choose **Link Telegram
+topic...**. The dialog shows a command like `/link@your_bot CODE`. Send it inside the
+topic you want to use (not in General); the bot confirms in that topic and the dialog
+shows **Linked**. The code is valid for 15 minutes; select **New code** if it expires.
+You can link a session before or after it first asks a question. The menu item appears
+only for sessions of a project that has a bot and a connected group, and not for remote,
+terminal (TUI) or Mono sessions.
 
 ## How it behaves
 
