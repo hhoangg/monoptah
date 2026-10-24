@@ -117,7 +117,9 @@ function hideCodeSpans(text: string, spans: string[]): string {
     const close = closer[k];
     if (close < 0) continue;
     const start = runs[k].at + runs[k].size;
-    let content = text.slice(start, runs[close].at).replace(/\n/g, " ");
+    let content = text
+      .slice(start, runs[close].at)
+      .replace(/\s*\r?\n\s*/g, " ");
     // A single space on both sides only keeps backticks apart from the fence.
     if (/^ [\s\S]* $/.test(content) && content.trim()) {
       content = content.slice(1, -1);
@@ -189,7 +191,7 @@ const SCAN_MAX = 4000;
 function linesWithoutCode(raw: string): string[] {
   const lines: string[] = [];
   let fence: string | undefined;
-  for (const source of raw.split("\n")) {
+  for (const source of raw.split(/\r?\n/)) {
     const line = source.replace(/^\s*(?:>\s?)+/, "");
     const trimmed = line.trim();
     if (fence) {
@@ -208,14 +210,30 @@ function linesWithoutCode(raw: string): string[] {
   return lines;
 }
 
+type LineKind = "break" | "heading" | "item" | "table" | "prose";
+
+/** What a line is, by the same rules `messageUnits` reads it with. */
+function lineKind(line: string): LineKind {
+  const trimmed = line.trim();
+  if (!trimmed || HORIZONTAL_RULE.test(trimmed) || TABLE_RULE.test(trimmed)) {
+    return "break";
+  }
+  if (/^#{1,6}\s+/.test(trimmed)) return "heading";
+  if (LIST_ITEM.test(line)) return "item";
+  if (trimmed.startsWith("|")) return "table";
+  return "prose";
+}
+
 /**
- * Hides the code spans of each block of consecutive lines (a span never crosses a blank
- * line). Done on the whole message, before any window is cut, so a window can never
- * start inside a span.
+ * Hides the code spans of each block: a paragraph, list item (with its indented
+ * continuation lines), heading or table row. A span never crosses a block boundary, so
+ * a stray backtick cannot pair with one further down. Done on the whole message, before
+ * any window is cut, so a window can never start inside a span.
  */
 function hideSpansByBlock(lines: string[], spans: string[]): string[] {
   const out: string[] = [];
   let block: string[] = [];
+  let open: LineKind | undefined;
   const flushBlock = () => {
     if (block.length === 0) return;
     const hidden = hideCodeSpans(
@@ -224,17 +242,49 @@ function hideSpansByBlock(lines: string[], spans: string[]): string[] {
     );
     for (const line of hidden.split("\n")) out.push(line);
     block = [];
+    open = undefined;
   };
   for (const line of lines) {
-    if (line.trim()) {
-      block.push(line);
-    } else {
-      flushBlock();
-      out.push("");
+    const kind = lineKind(line);
+    const continues =
+      (kind === "prose" && open === "prose") ||
+      (kind === "prose" && open === "item" && /^\s/.test(line));
+    if (!continues) flushBlock();
+    if (kind === "break") {
+      out.push(line);
+      continue;
     }
+    block.push(line);
+    open = continues ? open : kind;
+    if (kind === "heading" || kind === "table") flushBlock();
   }
   flushBlock();
   return out;
+}
+
+/** Longest tail of a message that is cleaned at all; the rest is discarded first. */
+const CLEAN_MAX = 200_000;
+
+/** The last lines that fit CLEAN_MAX characters; a single longer line is cut at a space. */
+function lastChars(lines: string[]): { lines: string[]; cut: boolean } {
+  const kept: string[] = [];
+  let room = CLEAN_MAX;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (line.length + 1 <= room) {
+      kept.unshift(line);
+      room -= line.length + 1;
+      continue;
+    }
+    if (kept.length === 0) {
+      let tail = line.slice(-(CLEAN_MAX - 1));
+      if (/^[\udc00-\udfff]/.test(tail)) tail = tail.slice(1);
+      const space = tail.indexOf(" ");
+      return { lines: [space >= 0 ? tail.slice(space + 1) : tail], cut: true };
+    }
+    return { lines: kept, cut: true };
+  }
+  return { lines: kept, cut: false };
 }
 
 /**
@@ -297,7 +347,8 @@ function messageUnits(raw: string): { units: Unit[]; cut: boolean } {
     prose = [];
   };
   const stripInline = (text: string) => showCodeSpans(stripMarkup(text), spans);
-  const scanned = lastLines(hideSpansByBlock(linesWithoutCode(raw), spans));
+  const bounded = lastChars(linesWithoutCode(raw));
+  const scanned = lastLines(hideSpansByBlock(bounded.lines, spans));
   for (const line of scanned.lines) {
     const trimmed = line.trim();
     if (!trimmed || HORIZONTAL_RULE.test(trimmed) || TABLE_RULE.test(trimmed)) {
@@ -339,7 +390,7 @@ function messageUnits(raw: string): { units: Unit[]; cut: boolean } {
     prose.push(trimmed);
   }
   flush();
-  return { units, cut: scanned.cut };
+  return { units, cut: scanned.cut || bounded.cut };
 }
 
 function normalized(text: string): string {

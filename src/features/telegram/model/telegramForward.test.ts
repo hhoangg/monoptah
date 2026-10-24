@@ -545,6 +545,84 @@ describe("questionContext", () => {
     });
   });
 
+  describe("code spans stay inside their own block", () => {
+    it("does not pair a stray backtick with one in a later list item", () => {
+      const text = [
+        "I made these changes:",
+        "- Escaped the backtick (`) in the template",
+        "- Renamed `foo` to `bar`",
+        "- Updated `README.md` with the new flag",
+        "",
+        "Shall I commit this change?",
+      ].join("\n");
+      expect(said(text)).toBe(
+        [
+          "I made these changes:",
+          "- Escaped the backtick (`) in the template",
+          "- Renamed foo to bar",
+          "- Updated README.md with the new flag",
+          "Shall I commit this change?",
+        ].join("\n"),
+      );
+    });
+
+    it("does not pair a stray backtick in an ordered list item either", () => {
+      const text = "1. Typed a ` by mistake\n2. Ran `npm test` after";
+      expect(said(text)).toBe("- Typed a ` by mistake\n- Ran npm test after");
+    });
+
+    it("keeps a heading's stray backtick away from the prose below it", () => {
+      expect(said("## The ` char\nUse `real` span here.")).toBe(
+        "The ` char Use real span here.",
+      );
+    });
+
+    it("keeps a table row's stray backtick away from the next row", () => {
+      expect(said("| a | ` | c |\n| x | `npm test` | y |")).toBe(
+        "a, `, c x, npm test, y",
+      );
+    });
+
+    it("still joins a span that runs over several lines of one paragraph", () => {
+      expect(said("Run `npm\nrun build` now.")).toBe("Run npm run build now.");
+      expect(said("- Run `npm\n  run build` now")).toBe(
+        "- Run npm run build now",
+      );
+    });
+
+    it("handles Windows line endings", () => {
+      expect(said("Run `npm\r\nrun build` now.")).toBe(
+        "Run npm run build now.",
+      );
+      expect(said("Options:\r\n- Keep `a`\r\n- Drop `b`\r\n")).toBe(
+        "Options:\n- Keep a\n- Drop b",
+      );
+      expect(said("# Title\r\n\r\nBody `x`.\r\n")).toBe("Title Body x.");
+    });
+
+    it("bounds the work for a message of a couple of megabytes", () => {
+      const lines = Array.from(
+        { length: 30000 },
+        (_, i) =>
+          `Line ${i} has \`code\` and plenty of words for padding this test.`,
+      );
+      const many = `${lines.join("\n")}\nFinal answer is ready now. Shall I commit this change?`;
+      const oneLine = `${"word `x` ".repeat(250000)}Done. Final answer is ready now. Shall I commit this change?`;
+      for (const text of [many, oneLine]) {
+        expect(text.length).toBeGreaterThan(1_900_000);
+        const started = performance.now();
+        const context = said(text);
+        expect(performance.now() - started).toBeLessThan(500);
+        expect(context.startsWith("… ")).toBe(true);
+        expect(
+          context.endsWith(
+            "Final answer is ready now. Shall I commit this change?",
+          ),
+        ).toBe(true);
+      }
+    });
+  });
+
   it("is deterministic", () => {
     const text = "Alpha one. Beta two. ".repeat(40) + "```x```";
     expect(said(text)).toBe(said(text));
