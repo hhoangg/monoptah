@@ -146,6 +146,7 @@ mod tests {
             archived: false,
             pinned: false,
             work_item: None,
+            surface: Default::default(),
         };
         let working = Status {
             working: true,

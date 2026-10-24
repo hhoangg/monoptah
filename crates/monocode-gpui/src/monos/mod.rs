@@ -185,6 +185,25 @@ impl Monos {
         self.parent_window = Some(window.window_handle());
         self.sync_status(cx);
     }
+    /// The tray's Quit: the window's own quit path, so busy terminals and unsaved
+    /// files are asked about. The window is shown first so the dialog is seen.
+    pub(crate) fn request_quit(&mut self, cx: &mut Context<Self>) {
+        let (Some(handle), true) = (self.parent_window, self.owner.upgrade().is_some()) else {
+            crate::quit(cx);
+            return;
+        };
+        let owner = self.owner.clone();
+        let app: &mut App = cx;
+        app.defer(move |cx| {
+            let asked = handle.update(cx, |_, window, cx| {
+                window.activate_window();
+                let _ = owner.update(cx, |shell, cx| shell.request_quit(window, cx));
+            });
+            if asked.is_err() {
+                crate::quit(cx);
+            }
+        });
+    }
     fn sync_status(&mut self, _cx: &mut Context<Self>) {
         #[cfg(all(target_os = "macos", not(test)))]
         {
@@ -200,7 +219,7 @@ impl Monos {
             let run = std::rc::Rc::new(move |id: &str| {
                 let _ = entity.update(&mut *app.borrow_mut(), |this, cx| {
                     if id == "quit" {
-                        cx.quit();
+                        this.request_quit(cx);
                     } else if id == "composer" {
                         if let Some(handle) = this.parent_window {
                             let owner = this.owner.clone();
@@ -668,6 +687,7 @@ impl Monos {
                 .as_deref()
                 .and_then(Kind::parse)
                 .unwrap_or(Kind::Codex);
+            // Always a chat: the app drives this session, whatever the surface preference.
             let mut summary = db.create(provider.id(), &home)?;
             summary.title = mono.label();
             db.title(summary.id, &summary.title)?;

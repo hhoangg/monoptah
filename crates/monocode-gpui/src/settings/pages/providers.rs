@@ -6,7 +6,10 @@ use crate::{
     theme::*,
 };
 use gpui::{AnyElement, Context, SharedString, div, prelude::*, px};
-use monocode_core::provider::Kind;
+use monocode_core::{provider::Kind, surface::Surface};
+
+/// Shown instead of the session surface control when the database cannot store a terminal session.
+const NO_TERMINAL_HINT: &str = "Terminal sessions need a newer database.";
 impl SettingsView {
     pub(super) fn providers_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let p = self.prefs.clone();
@@ -219,6 +222,32 @@ impl SettingsView {
                     ),
                 );
             }
+            // How a new session opens. The icons of the web app's control have no
+            // native widget here, so both options are text.
+            if !self.ctx.no_terminal_sessions {
+                let surface = p
+                    .provider_surfaces
+                    .get(kind.id())
+                    .copied()
+                    .unwrap_or_default();
+                controls.push(self.segmented(
+                    format!("session-surface-{}", kind.id()),
+                    format!("{} session surface", kind.label()),
+                    surface.id(),
+                    &[
+                        (Surface::Chat.id(), "Chat"),
+                        (Surface::Tui.id(), "Terminal (TUI)"),
+                    ],
+                    cx,
+                    move |this, value, cx| {
+                        if let Some(surface) = Surface::parse(value) {
+                            this.update(cx, |p| {
+                                p.provider_surfaces.insert(kind.id().into(), surface);
+                            })
+                        }
+                    },
+                ));
+            }
             if installed.is_some() {
                 controls.push(
                     div()
@@ -274,7 +303,14 @@ impl SettingsView {
                         kind.login_hint()
                     )
                 });
-            clis.push(self.row(None, index == 0, label, Some(description.into()), controls));
+            let description = if self.ctx.no_terminal_sessions {
+                format!("{description} {NO_TERMINAL_HINT}")
+            } else {
+                description
+            };
+            // Search reveals the first provider row for the shared surface setting.
+            let id = (index == 0).then_some("session-surface");
+            clis.push(self.row(id, index == 0, label, Some(description.into()), controls));
         }
         if self.discovery_loading {
             clis.insert(0, note("Checking installed CLIs…"));

@@ -1142,3 +1142,144 @@ fn desktop_steers_restore_the_original_turn_without_needing_model_metadata() {
     assert_eq!(turns[&3].joined_turn, Some(1));
     assert_eq!(turns[&5].joined_turn, None);
 }
+
+fn listed(store: &Store, id: i64) -> Session {
+    store
+        .sessions()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap()
+}
+fn has_user_message(store: &Store, id: i64) -> bool {
+    store
+        .conn
+        .query_row(
+            "SELECT has_user_message FROM sessions WHERE id=?1",
+            [store.persisted_session_id(id).unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn surface_round_trips_and_survives_later_saves() {
+    use crate::surface::Surface;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("monocode.db");
+    let store = Store::open_monocode(&path).unwrap();
+    assert!(store.surface_supported());
+    let tui = store
+        .create_with_surface("claude", "/p", Surface::Tui)
+        .unwrap();
+    let chat = store.create("claude", "/p").unwrap();
+    assert_eq!((tui.surface, chat.surface), (Surface::Tui, Surface::Chat));
+    let raw: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT surface FROM sessions WHERE id=?1",
+            [store.persisted_session_id(tui.id).unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw.as_deref(), Some("tui"));
+    store.title(tui.id, "Renamed").unwrap();
+    store
+        .save_agent_settings(tui.id, &Settings::default())
+        .unwrap();
+    drop(store);
+    let store = Store::open_monocode(&path).unwrap();
+    assert_eq!(store.session_surface(tui.id).unwrap(), Surface::Tui);
+    assert_eq!(store.session_surface(chat.id).unwrap(), Surface::Chat);
+    let sessions = store.sessions().unwrap();
+    let find = |id| sessions.iter().find(|s| s.id == id).unwrap().surface;
+    assert_eq!(find(tui.id), Surface::Tui);
+    assert_eq!(find(chat.id), Surface::Chat);
+}
+
+#[test]
+fn terminal_session_is_listed_only_once_it_has_a_conversation_id() {
+    use crate::surface::Surface;
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let tui = store
+        .create_with_surface("claude", "/p", Surface::Tui)
+        .unwrap();
+    let chat = store.create("claude", "/p").unwrap();
+    assert!(!listed(&store, tui.id).has_messages);
+    assert!(store.set_terminal_conversation(tui.id, "  ").is_err());
+    assert!(!listed(&store, tui.id).has_messages);
+    store.set_terminal_conversation(tui.id, " conv-1 ").unwrap();
+    let row = listed(&store, tui.id);
+    assert!(row.has_messages);
+    assert_eq!(row.provider_id.as_deref(), Some("conv-1"));
+    assert!(has_user_message(&store, tui.id));
+    // An empty chat stays unlisted, and cannot be turned into a terminal row.
+    assert!(!listed(&store, chat.id).has_messages);
+    assert!(store.set_terminal_conversation(chat.id, "conv-1").is_err());
+    assert!(!has_user_message(&store, chat.id));
+}
+
+#[test]
+fn storing_blocks_never_unlists_or_fills_a_terminal_session() {
+    use crate::surface::Surface;
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let tui = store
+        .create_with_surface("claude", "/p", Surface::Tui)
+        .unwrap();
+    store.set_terminal_conversation(tui.id, "conv-1").unwrap();
+    store.shared_store_blocks(tui.id, &[]).unwrap();
+    assert!(has_user_message(&store, tui.id));
+    assert!(listed(&store, tui.id).has_messages);
+    let blocks = [json!({"id":"b","role":"user","text":"hi"})];
+    store.shared_store_blocks(tui.id, &blocks).unwrap();
+    assert!(store.shared_blocks(tui.id).unwrap().is_empty());
+    // A chat still records its blocks.
+    let chat = store.create("claude", "/p").unwrap();
+    store.shared_store_blocks(chat.id, &blocks).unwrap();
+    assert_eq!(store.shared_blocks(chat.id).unwrap().len(), 1);
+    assert!(has_user_message(&store, chat.id));
+}
+
+#[test]
+fn desktop_terminal_rows_open_as_terminals() {
+    use crate::surface::Surface;
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    for (id, surface, provider_id, listed_row) in [
+        ("tauri-tui", Some("tui"), Some("conv-1"), true),
+        ("tauri-chat", Some("chat"), None, false),
+        ("legacy", None, None, false),
+        ("junk", Some("terminal"), None, false),
+    ] {
+        store.conn.execute("INSERT INTO sessions(id,cwd,harness,model,runtime_mode,title,blocks_json,created_at,updated_at,has_user_message,surface,provider_session_id) VALUES(?1,'/p','claude','claude:default','supervised',?1,'[]',1,2,?4,?2,?3)",
+            params![id, surface, provider_id, listed_row]).unwrap();
+    }
+    let sessions = store.sessions().unwrap();
+    let find = |title: &str| sessions.iter().find(|s| s.title == title).unwrap();
+    assert_eq!(find("tauri-tui").surface, Surface::Tui);
+    assert!(find("tauri-tui").has_messages);
+    assert_eq!(find("tauri-chat").surface, Surface::Chat);
+    assert_eq!(find("legacy").surface, Surface::Chat);
+    assert_eq!(find("junk").surface, Surface::Chat);
+}
+
+#[test]
+fn database_without_the_surface_column_creates_chat_only() {
+    use crate::surface::Surface;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("monocode.db");
+    let store = Store::open_monocode(&path).unwrap();
+    store
+        .conn
+        .execute_batch("ALTER TABLE sessions DROP COLUMN surface;")
+        .unwrap();
+    drop(store);
+    let store = Store::open_monocode(&path).unwrap();
+    assert!(!store.surface_supported());
+    let session = store
+        .create_with_surface("claude", "/p", Surface::Tui)
+        .unwrap();
+    assert_eq!(session.surface, Surface::Chat);
+    assert_eq!(store.session_surface(session.id).unwrap(), Surface::Chat);
+    assert_eq!(listed(&store, session.id).surface, Surface::Chat);
+    assert!(store.set_terminal_conversation(session.id, "c").is_err());
+}

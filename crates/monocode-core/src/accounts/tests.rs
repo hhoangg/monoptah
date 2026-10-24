@@ -93,6 +93,67 @@ fn isolated_profiles_override_environment_and_cannot_escape_their_root() {
 }
 
 #[test]
+fn env_lists_the_exact_pairs_that_apply_sets_and_removes() {
+    use std::ffi::{OsStr, OsString};
+    let root = tempfile::tempdir().unwrap();
+    let profile = Profile::new("work-1", root.path());
+    let dir: OsString = profile.directory(Kind::Claude).unwrap().unwrap().into();
+    let (set, remove) = profile.env(Kind::Claude).unwrap();
+    assert_eq!(
+        set,
+        vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), dir.clone()),
+            ("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), dir)
+        ]
+    );
+    assert_eq!(
+        remove,
+        [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN"
+        ]
+    );
+    let (set, remove) = profile.env(Kind::Codex).unwrap();
+    assert_eq!(set.len(), 1);
+    assert_eq!(set[0].0, "CODEX_HOME");
+    assert_eq!(
+        remove,
+        ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"]
+    );
+    // apply and env cannot drift: the command carries exactly env's pairs.
+    for kind in [Kind::Claude, Kind::Codex] {
+        let (set, remove) = profile.env(kind).unwrap();
+        let mut command = Command::new("provider");
+        profile.apply(kind, &mut command).unwrap();
+        let applied: HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(applied.len(), set.len() + remove.len());
+        for (key, value) in &set {
+            assert_eq!(applied[OsStr::new(key)], Some(value.as_os_str()));
+        }
+        for key in remove {
+            assert_eq!(applied[OsStr::new(key)], None);
+        }
+    }
+}
+
+#[test]
+fn the_default_profile_and_unsupported_providers_need_no_env() {
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(
+        Profile::default().env(Kind::Claude).unwrap(),
+        (Vec::new(), Vec::new())
+    );
+    assert_eq!(
+        Profile::default().env(Kind::Devin).unwrap(),
+        (Vec::new(), Vec::new())
+    );
+    assert!(Profile::new("work-1", root.path())
+        .env(Kind::Devin)
+        .is_err());
+}
+
+#[test]
 fn removing_a_private_codex_profile_preserves_other_accounts() {
     let root = tempfile::tempdir().unwrap();
     let first = Profile::new("first", root.path());

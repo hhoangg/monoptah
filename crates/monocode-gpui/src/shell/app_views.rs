@@ -332,6 +332,7 @@ impl Shell {
         if let Some(view) = &self.automations {
             let cwd = self.workspace.project.clone();
             let projects = self.workspace.projects.clone();
+            let surface_supported = self.surface_supported;
             view.update(cx, |view, cx| {
                 view.set_appearances(self.workspace.project_appearance.clone(), cx);
                 let connections = self
@@ -343,6 +344,7 @@ impl Shell {
                     .map(|(provider, (connected, _))| (provider, connected))
                     .collect();
                 view.set_trigger_connections(connections, cx);
+                view.set_terminal_sessions(surface_supported, cx);
                 view.set_context(cwd, projects, cx);
                 view.refresh(cx);
             });
@@ -388,6 +390,7 @@ impl Shell {
         let revision = self.navigation_revision;
         let work = cx.background_executor().spawn(async move {
             let store = locked(&store)?;
+            // Always a chat: the app drives this session, whatever the surface preference.
             let mut summary = store.create(kind.id(), &cwd)?;
             if !note.title.trim().is_empty() {
                 store.title(summary.id, &note.title)?;
@@ -458,6 +461,10 @@ impl Shell {
                 .unwrap_or_default(),
             ..Default::default()
         };
+        // applyInboxStart: the provider's surface, kept as a terminal only when its
+        // CLI takes a first prompt (the start prompt becomes it); else a chat.
+        let preferred =
+            monocode_core::surface::automation_surface(kind, &cwd, self.provider_surface(kind));
         let store = self.store.clone();
         self.navigation_revision += 1;
         let revision = self.navigation_revision;
@@ -466,7 +473,7 @@ impl Shell {
                 return Err("Choose a project folder before starting work on this item".into());
             }
             let store = locked(&store)?;
-            let mut summary = store.create(kind.id(), &cwd)?;
+            let mut summary = store.create_with_surface(kind.id(), &cwd, preferred)?;
             summary.title = format!("{} · {}", item.reference(), item.title);
             summary.work_item = Some(item.work_item());
             store.title(summary.id, &summary.title)?;
@@ -479,10 +486,19 @@ impl Shell {
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok((summary, settings, prompt)) => {
                     let id = summary.id;
+                    let terminal = summary.surface.is_tui();
                     this.add(summary, cx);
-                    this.sessions[&id]
-                        .update(cx, |view, cx| view.quick_submit(prompt, settings, cx));
-                    if this.navigation_revision == revision {
+                    if terminal {
+                        if let Some(tui) = this.tui_sessions.get(&id) {
+                            tui.update(cx, |tui, _| tui.set_initial_prompt(prompt));
+                        }
+                    } else {
+                        this.sessions[&id]
+                            .update(cx, |view, cx| view.quick_submit(prompt, settings, cx));
+                    }
+                    // A terminal only runs while shown, so it is always opened; a chat
+                    // runs in the background if the user has moved on.
+                    if terminal || this.navigation_revision == revision {
                         this.activate_session(id, window, cx);
                     }
                     this.persist(cx);
@@ -494,5 +510,194 @@ impl Shell {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::surface_tests::{NoClis, all_terminal, assert_chat, known, since};
+    use gpui::TestAppContext;
+    use monocode_core::surface::Surface;
+
+    fn item(dir: &std::path::Path) -> monocode_core::inbox::Item {
+        monocode_core::inbox::Item {
+            provider: "github".into(),
+            kind: "pr".into(),
+            repo: "acme/web".into(),
+            number: 7,
+            title: "Fix retries".into(),
+            url: "https://github.com/acme/web/pull/7".into(),
+            project_path: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        }
+    }
+    fn dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "monocode-inbox-start-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn start(
+        cx: &mut TestAppContext,
+        provider: &str,
+        surface: Surface,
+        prompt: &str,
+    ) -> (
+        gpui::WindowHandle<Shell>,
+        std::collections::HashSet<i64>,
+        i64,
+    ) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let project = dir();
+        let before = window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.preferences.default_provider = Some(provider.into());
+                shell
+                    .workspace
+                    .preferences
+                    .provider_surfaces
+                    .insert(provider.into(), surface);
+                let before = known(shell);
+                shell.start_inbox_session(item(&project), prompt.into(), cx);
+                before
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let id = window
+            .update(cx, |shell, _, _| {
+                let ids = since(shell, &before);
+                assert_eq!(ids.len(), 1);
+                ids[0]
+            })
+            .unwrap();
+        (window, before, id)
+    }
+
+    #[gpui::test]
+    fn start_work_keeps_a_terminal_when_the_cli_takes_a_first_prompt(cx: &mut TestAppContext) {
+        let (window, _, id) = start(cx, "claude", Surface::Tui, "Work on this pull request");
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(shell.session_summaries[&id].surface, Surface::Tui);
+                assert!(shell.tui_sessions.contains_key(&id));
+                assert!(!shell.sessions.contains_key(&id));
+                assert_eq!(shell.workspace.active, Some(id));
+                let args: Vec<_> = shell.tui_sessions[&id]
+                    .read(cx)
+                    .terminal()
+                    .unwrap()
+                    .read(cx)
+                    .launched()
+                    .unwrap()
+                    .args
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(
+                    args.last().map(String::as_str),
+                    Some("Work on this pull request"),
+                    "the start prompt is the CLI's first prompt"
+                );
+                // The session still names and links the work item.
+                assert_eq!(shell.session_summaries[&id].title, "#7 · Fix retries");
+                assert_eq!(
+                    shell.session_summaries[&id]
+                        .work_item
+                        .as_ref()
+                        .map(|item| item.number),
+                    Some(7)
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn start_work_is_a_chat_when_the_cli_cannot_take_a_first_prompt(cx: &mut TestAppContext) {
+        let _clis = NoClis::new();
+        let (window, _, id) = start(cx, "codex", Surface::Tui, "Work on this pull request");
+        window
+            .update(cx, |shell, _, _| {
+                assert_chat(shell, id);
+                assert!(shell.tui_sessions.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn start_work_follows_a_chat_preference(cx: &mut TestAppContext) {
+        let _clis = NoClis::new();
+        let (window, _, id) = start(cx, "claude", Surface::Chat, "Work on this pull request");
+        window
+            .update(cx, |shell, _, _| assert_chat(shell, id))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn start_work_is_a_chat_on_a_database_without_terminal_support(cx: &mut TestAppContext) {
+        let _clis = NoClis::new();
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let project = dir();
+        let before = window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.preferences.default_provider = Some("claude".into());
+                all_terminal(shell);
+                shell.surface_supported = false;
+                let before = known(shell);
+                shell.start_inbox_session(item(&project), "Work on it".into(), cx);
+                before
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let ids = since(shell, &before);
+                assert_eq!(ids.len(), 1);
+                assert_chat(shell, ids[0]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_note_added_to_a_chat_is_a_chat_whatever_the_preference(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let before = window
+            .update(cx, |shell, window, cx| {
+                all_terminal(shell);
+                let before = known(shell);
+                shell.note_to_chat(
+                    monocode_core::notes::Note {
+                        id: "note-1".into(),
+                        slug: "plan".into(),
+                        title: "Plan".into(),
+                        body: "Body".into(),
+                        tags: Vec::new(),
+                        source_session_id: None,
+                        source_cwd: Some("/work/monocode".into()),
+                        slug_pending: false,
+                        created_at: 0,
+                        updated_at: 0,
+                    },
+                    window,
+                    cx,
+                );
+                before
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let ids = since(shell, &before);
+                assert_eq!(ids.len(), 1);
+                assert_chat(shell, ids[0]);
+                // The note rides on the chat composer, which a terminal would drop.
+                assert_eq!(
+                    shell.sessions[&ids[0]].read(cx).input.read(cx).content,
+                    "@note/plan "
+                );
+            })
+            .unwrap();
     }
 }

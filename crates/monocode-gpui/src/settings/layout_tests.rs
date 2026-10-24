@@ -194,3 +194,82 @@ fn mono_mascot_is_beside_name_and_sidebar_switch_stays_visible(cx: &mut TestAppC
     assert_eq!(switch.size, size(px(36.), px(20.)));
     assert!(switch.right() <= px(700.));
 }
+
+#[gpui::test]
+fn each_provider_chooses_the_surface_its_new_sessions_open_in(cx: &mut TestAppContext) {
+    use monocode_core::{provider::Kind, surface::Surface};
+    let window = window(Section::Providers, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    // Search lands on the first provider row.
+    assert!(
+        visual
+            .debug_bounds("settings-row-session-surface")
+            .is_some()
+    );
+    for kind in Kind::ALL {
+        for option in ["chat", "tui"] {
+            let selector: &'static str = Box::leak(
+                format!("settings-session-surface-{}-{option}", kind.id()).into_boxed_str(),
+            );
+            assert!(visual.debug_bounds(selector).is_some(), "{selector}");
+        }
+    }
+    let prefs = |visual: &mut VisualTestContext| {
+        window
+            .update(visual, |view, _, _| view.prefs.provider_surfaces.clone())
+            .unwrap()
+    };
+    assert!(
+        prefs(visual).is_empty(),
+        "nothing is saved until one is picked"
+    );
+    let tui = visual
+        .debug_bounds("settings-session-surface-claude-tui")
+        .unwrap();
+    visual.simulate_click(tui.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(prefs(visual).get("claude"), Some(&Surface::Tui));
+    assert_eq!(
+        prefs(visual).get("codex"),
+        None,
+        "other providers keep theirs"
+    );
+    let chat = visual
+        .debug_bounds("settings-session-surface-claude-chat")
+        .unwrap();
+    visual.simulate_click(chat.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(prefs(visual).get("claude"), Some(&Surface::Chat));
+}
+
+#[gpui::test]
+fn the_surface_control_gives_way_to_a_hint_when_terminals_cannot_be_stored(
+    cx: &mut TestAppContext,
+) {
+    let window = window(Section::Providers, cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.ctx.no_terminal_sessions = true;
+            cx.notify();
+        })
+        .unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("settings-session-surface-claude-tui")
+            .is_none()
+    );
+    assert!(
+        visual
+            .debug_bounds("settings-session-surface-claude-chat")
+            .is_none()
+    );
+    // The row stays, so search still finds it and shows why.
+    assert!(
+        visual
+            .debug_bounds("settings-row-session-surface")
+            .is_some()
+    );
+}

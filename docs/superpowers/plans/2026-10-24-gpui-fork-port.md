@@ -223,6 +223,69 @@ The new-session provider prompt (I) moves to Phase 4: it is only shown when the 
 
 ---
 
+## Phase 4 - Terminal (TUI) session surface
+
+Behavior contract: `docs/tui-sessions.md`. Reference survey with file:line for both apps: `.superpowers/sdd/2026-10-24-gpui-fork-port/phase4-survey.md` (git-ignored scratch; the facts below are the binding ones).
+
+**Phase rulings:**
+- A TUI session row gets a `TuiSession` entity in its own Shell map and never a `Conversation`; every path that would create, resume, preview or send to a `Conversation` checks `Session.surface` first. Cost if wrong: more guards later instead of fewer.
+- Surface storage: shared desktop DB uses the `sessions.surface` column when the table has it (the fork's Tauri app always adds it); if the column is missing, TUI is unavailable and new sessions are chat. `shared_schema.sql` gains `surface TEXT` for new installs. The native (non-shared) store keeps surface in the per-session agent settings JSON. Cost if wrong: TUI unavailable on DBs from upstream builds.
+- A TUI row with a non-blank provider id is listed (`has_user_message = 1` when the id is saved); blocks are never stored for TUI rows, so `shared_store_blocks` can never clear the flag.
+- Native writes Claude hook events to `<data_dir>/tui-hooks-native` (the path rides in each launch's argv), so the Tauri app and native never drain each other's spool.
+- Account env removal (`ANTHROPIC_API_KEY` etc.) uses an `/usr/bin/env -u KEY ... <program> <args>` wrapper on unix, because alacritty's `tty::Options` cannot remove variables. Windows sets env only and injects no hooks (as Tauri).
+- `--model` is omitted when the session has no model; access maps through the existing `AccessMode::claude()` (ReadOnly -> `plan`).
+- Quit: a confirmation only when terminal turns are busy, copy from `quitWhileBusyMessage(0, n)`: "N terminal turn(s) ... will stop, though its/their conversation(s) is/are saved". Native has no chat-turn quit confirmation today and this phase does not add one.
+- Moving a pane between tabs needs no PTY handoff natively (entities live in Shell maps keyed by session id).
+
+### Task 4.1: Core surface model
+
+**Files:** Create `crates/monocode-core/src/surface.rs`; modify `crates/monocode-core/src/lib.rs`, `store.rs` (`Session.surface`), `store/shared.rs` (read via `shared_field("surface", ...)`, `create` with surface only when the column exists, `set_terminal_conversation(id, provider_id)` sets `provider_session_id` and `has_user_message = 1`, guard `shared_store_blocks` for TUI rows), the native store equivalent (agent settings JSON), `store/shared_schema.sql`.
+**Interfaces:** `pub enum Surface { Chat, Tui }` (serde lowercase, default Chat, `parse(&str) -> Option<Surface>`); `pub struct TuiCaps { resume: bool, initial_prompt: bool, launch_flags: bool }`, `pub fn tui_caps(kind: provider::Kind) -> TuiCaps` (only Claude all true); `pub fn new_session_surface(kind, cwd: &str, preferred: Surface) -> Surface` (remote `remote://` -> Chat); `pub fn automation_surface(kind, cwd, preferred) -> Surface` (TUI only when preferred TUI, `initial_prompt`, not remote); `Store::create_session(provider, cwd, surface) -> Result<i64, String>` (or extend the existing create; falls back to Chat when TUI is unavailable and reports which it used); `Store::set_terminal_conversation(id, provider_id)`; `Store::surface_supported() -> bool`.
+- [ ] Port tests: Tauri `session_store.rs` surface tests (4), `sessionStoreSurface.test.ts` and `sessionSurface.test.ts` cases that apply to the store/model, `automationSession.test.ts` surface cases. RED, implement, GREEN (`cargo test ... -p monocode-core surface store`).
+
+### Task 4.2: Claude hook spool and `tui-hook` subcommand
+
+**Files:** Create `crates/monocode-core/src/tui_hook.rs` (port of `src-tauri/src/tui_hook.rs`: `classify`, `write_event`, `drain`, `prune`, `spool_arg`, `run`, `MAX_EVENT_AGE = 5 s`, `MAX_STDIN = 1 MiB`, file name `{nanos:020}-{pid:010}.json`, temp-then-rename); modify `crates/monocode-gpui/src/main.rs` dispatch (`tui-hook` beside `visual`/`app`, exits with `run`'s code, prints nothing).
+**Interfaces:** `pub fn spool_dir(data_dir: &Path) -> PathBuf` (= `<data_dir>/tui-hooks-native`), `pub struct HookEvent { provider_session_id: String, busy: bool }`, `pub fn drain(dir: &Path, now: SystemTime) -> Vec<HookEvent>`, `pub fn prune(dir: &Path, age: Duration)`, `pub fn run(args: impl Iterator<Item = String>) -> i32`.
+- [ ] Port the 12 Tauri tests verbatim (adapting only paths). RED, implement, GREEN.
+
+### Task 4.3: Core TUI launch builder
+
+**Files:** Create `crates/monocode-core/src/tui_launch.rs`; modify `crates/monocode-core/src/accounts.rs` (`Profile::env(kind) -> Result<(Vec<(String, OsString)>, Vec<&'static str>), String>` returning the same set/remove pairs `Profile::apply` uses; `apply` reuses it).
+**Interfaces:** `pub struct LaunchInput { kind, binary: PathBuf, model: Option<String>, access: AccessMode, provider_id: Option<String>, new_id: Option<String>, initial_prompt: Option<String>, hook: Option<(PathBuf /*cli*/, PathBuf /*spool*/)>, windows: bool }`, `pub struct TuiLaunch { program: OsString, args: Vec<OsString>, minted_id: Option<String> }`, `pub fn build(input: LaunchInput) -> TuiLaunch` (argument order exactly as `tuiLaunch.ts` :101-150: `--model`, `--permission-mode`, `--settings <json>`, `--resume <id>` or `--session-id <id>`, then `--` if the prompt starts with `-`, then the prompt, only when not resuming); `pub fn hook_settings_json(cli: &Path, spool: &Path) -> String` (exact JSON, five events, `async: true`); `pub fn shell_path(path: &Path) -> String` (bare when `^[A-Za-z0-9._/:-]+$` and absolute, else single-quoted with `'\''`); `pub fn tui_binary(kind) -> Result<PathBuf, String>` (`agy` literal for Antigravity, else `provider::resolve`); `pub fn no_conversation(text: &str) -> bool` (regex `no conversation found with session id`, case-insensitive); `pub const EARLY_EXIT: Duration = 5 s`; `pub fn exit_notice(...) -> String` ("Could not start X" / "Process exited (code N)" + hints); `pub fn can_start_fresh(...) -> bool`; `pub fn clean_title(raw: &str) -> Option<String>` (strip control and leading non-alphanumerics, max 80); `pub fn can_retitle(current: &str, last_cli_title: Option<&str>, placeholder: &str) -> bool`.
+- [ ] Port `tuiLaunch.test.ts` (25, incl. the exact command-string test), `tuiBinary.test.ts` (3), and the pure `tuiSession.test.ts` cases (notice, fresh-start, title, no-conversation) with exact copy. RED, implement, GREEN.
+
+### Task 4.4: Terminal program launch
+
+**Files:** Modify `crates/monocode-gpui/src/terminal.rs`; `crates/monocode-core/src/process.rs` (a pub way to register a pid so `shutdown_all` reaps it).
+**Interfaces:** `Terminal::launch(cwd: &Path, program: OsString, args: Vec<OsString>, env_set: Vec<(String, OsString)>, env_remove: Vec<&'static str>, cx) -> Terminal` (same base env as the dock shell: TERM, COLORTERM, COLORFGBG, `TERM_PROGRAM=Monoptah`, PATH, PWD; cwd falls back to home when missing); `TerminalEvent::{Changed, Started { at: Instant }, Exited { code: Option<i32>, error: Option<String>, tail: String }, Title(String)}` (tail = last 4000 chars of plain grid text); `Terminal::kill(&self)` (SIGHUP + SIGTERM to pid and group, SIGKILL after 1 s); a spawner seam so GPUI tests can fake a launch (the `cfg(test)` detached path stays for the dock).
+- [ ] Tests: program exits with code N reported in `Exited`; spawn error reported; title forwarded; env removal wrapper built correctly (pure function test). RED, implement, GREEN. Dock terminal behavior unchanged.
+
+### Task 4.5: `TuiSession` pane in the shell
+
+**Files:** Create `crates/monocode-gpui/src/tui_session.rs`; modify `shell.rs` (`tui_sessions: HashMap<i64, Entity<TuiSession>>`, `ensure_session`/`session_loading.rs` branch on surface, `session_surface` renders the TUI view in place of `chat_with_background`, `replace_blank_pane` and `ensure_project_session` never treat a TUI session as blank, `refresh_session_mark` ORs TUI busy, tab/pane close and `forget_session`/archive/delete kill the CLI, the exit-close plan: close the pane, or the tab, or turn the last project tab into a blank chat), sidebar row (no preview popover for TUI rows).
+**Behavior:** launch on first show: pin account, resolve binary, build launch (hooks when `claude_hooks` is on and not Windows; cli = `current_exe`), persist a minted id with `set_terminal_conversation` BEFORE spawning (save failure -> nothing spawns, error bar); exit within 5 s with the no-conversation text on a reused id -> relaunch once with `--session-id <same id>`; close only on code 0, no error, not early, no no-conversation; otherwise the bar with Restart, and "Start new conversation" when `can_start_fresh`; title follows the CLI title through `clean_title`/`can_retitle` and `store.title`; header "<Provider> terminal", cwd, disabled "New worktree".
+- [ ] Port the applicable `TuiSessionPane.test.ts` cases (skip xterm/attach/handoff ones, list them), `sessionRemovalTui.test.ts` (5), `projectReturn` TUI case, using the spawner seam. RED, implement, GREEN.
+
+### Task 4.6: Hook busy watcher
+
+**Files:** `crates/monocode-gpui/src/tui_session.rs` or a small `shell/tui_busy.rs`; `shell.rs` init.
+**Behavior:** one app-wide watcher: `prune(spool, MAX_EVENT_AGE)` at boot, then every 300 ms on the background executor `drain`; map `provider_session_id` to the open TUI session with that provider id; busy true/false feeds `refresh_session_mark`; process exit clears busy. Busy never persists across restarts.
+- [ ] Tests: event for an open session sets busy; unknown id ignored; exit clears; stale busy ignored (via core). RED, implement, GREEN.
+
+### Task 4.7: Surface preference, creation paths and the provider prompt
+
+**Files:** `settings/preferences.rs` (`provider_surfaces: HashMap<String, Surface>`), `desktop_preferences/workspace_preferences.rs` (import `monocode.providerSurface.v1`, keep valid kinds and values), `settings/pages/providers.rs` (segmented "Chat" / "Terminal (TUI)" per provider, settings search entry), `shell.rs` (`NewCodex`/New tab/sidebar + use `new_session_surface`; when `should_prompt_for_provider` open the "Choose a provider" modal; `split_session` follows the preference), every app-driven path in survey B12 pinned to Chat (continuation keeps the source surface), `start_inbox_session` keeps TUI only when the provider takes an initial prompt (prompt becomes the first prompt).
+**Interfaces:** `pub fn should_prompt_for_provider(cwd, default_kind, surfaces, available: &[Kind]) -> bool` (false for remote; false unless default surface is TUI; true when at least 2 providers qualify: shown in the picker, available or not yet probed, not hidden for the project); `move_highlight(index, len, delta) -> usize` (wraps). Modal copy: title "Choose a provider", description "For this session only", hint "The default provider opens as a terminal session, which can't switch providers afterwards.", row badge "TUI" or "Chat", default highlighted first, up/down/Enter/click; dropped if the project changes.
+- [ ] Port `providerSurface.test.ts` (6), `newSessionProviderPrompt.test.ts` (13), `NewSessionProviderDialog.test.ts` (4) as Rust/GPUI tests; a test per forced-chat path group (Inbox Ask, Monos, handoff, quick composer, mobile, orchestration, app control). RED, implement, GREEN.
+
+### Task 4.8: Automations in the terminal and quit count
+
+**Files:** `crates/monocode-gpui/src/shell/automation_runs.rs` (TUI path: never reuse a session, prompt becomes the initial prompt, "new worktree" created before launch, `running` written first, success after the CLI stays up 5 s, `failed` with the exit notice if it exits or cannot start first, `cancelled` if the session is gone), automations editor (Conversation reuse disabled for a TUI-surface provider), `shell.rs` `request_quit` (terminal-turn confirmation per the phase ruling).
+- [ ] Port `automationSession.test.ts` (6) and the `appLifecycleTui` quit-count cases. RED, implement, GREEN. Then `npm run native:check` -> 0 and `./scripts/check-fork-branding.sh` -> 0.
+
+**Phase 4 commit message:** `Native: terminal (TUI) session surface with Claude hook busy state`
+
 ## Phases 4 to 7 (sketch; detailed plan written when each starts)
 
 - **Phase 4 - TUI surface:** per-provider surface preference (`monocode.providerSurface.v1`); `sessions.surface` read/write in `store.rs`/`store/shared.rs` (Tauri TUI rows stop showing as chat); `terminal.rs` spawn of program+args+env with exit code; a session-bound terminal pane opened from `open`/`activate_session`; Claude launch args (`--model`, `--permission-mode`, `--resume`/`--session-id`, `--settings` hooks), `agy` exception; `tui-hook` subcommand + spool watcher + `classify` with 5 s busy staleness into `busy_sessions`; app-driven sessions forced to chat; new-session provider prompt; automations follow the surface; close-on-clean-exit.

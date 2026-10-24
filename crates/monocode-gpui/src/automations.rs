@@ -151,6 +151,8 @@ pub(crate) struct Automations {
     trigger_menu: Option<Entity<trigger_menu::TriggerMenu>>,
     trigger_subscription: Option<Subscription>,
     trigger_connections: HashMap<String, bool>,
+    /// The database can store a terminal session; when it cannot, no run is one.
+    terminal_sessions: bool,
     /// ClickUp spaces as (id, name), for the trigger filter picker.
     clickup_spaces: Vec<(String, String)>,
     clickup_spaces_loading: bool,
@@ -208,6 +210,7 @@ impl Automations {
             trigger_menu: None,
             trigger_subscription: None,
             trigger_connections: HashMap::new(),
+            terminal_sessions: true,
             clickup_spaces: Vec::new(),
             clickup_spaces_loading: false,
             request_generation: 0,
@@ -218,6 +221,12 @@ impl Automations {
     pub(crate) fn set_database(&mut self, database: Database, cx: &mut Context<Self>) {
         self.database = Some(database);
         self.load_folders(cx);
+    }
+    pub(crate) fn set_terminal_sessions(&mut self, supported: bool, cx: &mut Context<Self>) {
+        if self.terminal_sessions != supported {
+            self.terminal_sessions = supported;
+            cx.notify();
+        }
     }
     pub(crate) fn set_appearances(
         &mut self,
@@ -1319,5 +1328,82 @@ mod tests {
             })
             .unwrap();
         assert!(filter(cx).3.is_empty());
+    }
+
+    #[test]
+    fn a_terminal_run_cannot_continue_the_last_conversation() {
+        let row = editor::conversation_row(true, "current", true);
+        assert_eq!(row.label, "Start fresh");
+        assert_eq!(
+            row.hint,
+            "A terminal session always starts a new conversation"
+        );
+        assert!(row.locked);
+        assert_eq!(
+            row.options,
+            [("fresh".to_string(), "Start fresh".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_chat_run_can_continue_unless_it_makes_a_worktree() {
+        let row = editor::conversation_row(true, "current", false);
+        assert_eq!(row.label, "Continue last");
+        assert_eq!(row.hint, "New chat, or continue the last run");
+        assert!(!row.locked);
+        assert_eq!(row.options.len(), 2);
+        let row = editor::conversation_row(false, "current", false);
+        assert_eq!(row.label, "Start fresh");
+        let row = editor::conversation_row(true, "worktree", false);
+        assert!(row.locked);
+        assert_eq!(row.options.len(), 1);
+    }
+
+    #[gpui::test]
+    fn the_editor_knows_when_its_automation_runs_in_a_terminal(cx: &mut TestAppContext) {
+        use monocode_core::surface::Surface;
+        cx.update(|cx| {
+            let mut preferences = crate::settings::Preferences::default();
+            preferences
+                .provider_surfaces
+                .insert("claude".into(), Surface::Tui);
+            preferences
+                .provider_surfaces
+                .insert("codex".into(), Surface::Tui);
+            cx.set_global(preferences);
+        });
+        let service = Arc::new(Mutex::new(Service::open(Path::new(":memory:")).unwrap()));
+        let window = cx
+            .update(|cx| {
+                cx.open_window(WindowOptions::default(), |_, cx| {
+                    cx.new(|cx| Automations::new(service, "/repo".into(), vec![], cx))
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let terminal = |cx: &mut TestAppContext, harness: &str, cwd: &str, supported: bool| {
+            window
+                .update(cx, |this, _, cx| {
+                    this.begin(None, cx);
+                    let draft = &mut this.editor.as_mut().unwrap().draft;
+                    draft.harness = harness.into();
+                    draft.cwd = cwd.into();
+                    this.set_terminal_sessions(supported, cx);
+                    this.runs_in_terminal(cx)
+                })
+                .unwrap()
+        };
+        assert!(terminal(cx, "claude", "/repo", true));
+        // The CLI cannot take a first prompt, or the project is on another machine.
+        assert!(!terminal(cx, "codex", "/repo", true));
+        assert!(!terminal(cx, "claude", "remote://env/repo", true));
+        // The database cannot store a terminal session.
+        assert!(!terminal(cx, "claude", "/repo", false));
+        cx.update(|cx| {
+            cx.update_global::<crate::settings::Preferences, _>(|p, _| {
+                p.provider_surfaces.clear();
+            })
+        });
+        assert!(!terminal(cx, "claude", "/repo", true));
     }
 }

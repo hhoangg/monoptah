@@ -342,6 +342,7 @@ impl Shell {
                     }
                 }
                 let store = locked(&store)?;
+                // Always a chat: the app drives this session, whatever the surface preference.
                 let mut summary = store.create(&provider, &project)?;
                 summary.title = format!("Agent · {}", task.title);
                 store.title(summary.id, &summary.title)?;
@@ -444,6 +445,58 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 assert!(shell.sessions.values().all(|v| !v.read(cx).busy))
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn orchestration_workers_are_chats_whatever_the_preference(cx: &mut TestAppContext) {
+        use crate::shell::surface_tests::{NoClis, all_terminal, assert_chat, known, since};
+        let _clis = NoClis::new();
+        let checkout = std::env::temp_dir().join(format!(
+            "monocode-orchestration-surface-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir_all(&checkout).unwrap();
+        let (window, _, lead) = crate::shell::tests::window(cx);
+        let before = window
+            .update(cx, |shell, _, cx| {
+                all_terminal(shell);
+                shell.sessions[&lead].update(cx, |v, cx| {
+                    v.install_transfer(
+                        Settings {
+                            worktree_cwd: Some(checkout.to_string_lossy().into_owned()),
+                            ..Default::default()
+                        },
+                        None,
+                        cx,
+                    )
+                });
+                let before = known(shell);
+                shell.start_orchestration(
+                    lead,
+                    Plan {
+                        title: "Review".into(),
+                        summary: String::new(),
+                        tasks: vec![Task {
+                            id: "task-1".into(),
+                            title: "Assignment".into(),
+                            prompt: "Inspect and report".into(),
+                            files: vec!["src".into()],
+                            depends_on: Vec::new(),
+                        }],
+                    },
+                    cx,
+                );
+                before
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let ids = since(shell, &before);
+                assert_eq!(ids.len(), 1, "one worker");
+                assert_chat(shell, ids[0]);
             })
             .unwrap();
     }

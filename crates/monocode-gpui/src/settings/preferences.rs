@@ -1,7 +1,21 @@
 //! App-wide preferences the Settings pages edit. Defaults are the React
 //! app's (`settings.ts`, `appearance.ts`, `displayPrefs.ts`, `sounds.ts`).
-use serde::{Deserialize, Serialize};
+use monocode_core::{provider::Kind, surface::Surface};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+
+/// A saved entry naming a provider or surface this build does not know is
+/// dropped; it must not cost the user every other preference.
+fn known_surfaces<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashMap<String, Surface>, D::Error> {
+    let saved = HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    Ok(saved
+        .into_iter()
+        .filter(|(provider, _)| Kind::parse(provider).is_some())
+        .filter_map(|(provider, value)| Some((provider, Surface::parse(value.as_str()?)?)))
+        .collect())
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -68,6 +82,9 @@ pub(crate) struct Preferences {
     pub idle_agents: u32,
     pub claude_hooks: bool,
     pub binary_paths: HashMap<String, String>,
+    /// How a new session of each provider opens (`monocode.providerSurface.v1`).
+    #[serde(deserialize_with = "known_surfaces")]
+    pub provider_surfaces: HashMap<String, Surface>,
     pub disabled_skill_paths: Vec<String>,
     pub skill_source_paths: Vec<String>,
     pub default_provider: Option<String>,
@@ -149,6 +166,7 @@ impl Default for Preferences {
             idle_agents: 3,
             claude_hooks: true,
             binary_paths: HashMap::new(),
+            provider_surfaces: HashMap::new(),
             disabled_skill_paths: Vec::new(),
             skill_source_paths: Vec::new(),
             default_provider: None,
@@ -227,5 +245,38 @@ impl Preferences {
         hidden.sort();
         hidden.dedup();
         hidden
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surfaces_round_trip_and_default_to_none() {
+        assert!(Preferences::default().provider_surfaces.is_empty());
+        let mut prefs = Preferences::default();
+        prefs
+            .provider_surfaces
+            .insert("claude".into(), Surface::Tui);
+        let json = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(
+            json["provider_surfaces"],
+            serde_json::json!({"claude":"tui"})
+        );
+        let back: Preferences = serde_json::from_value(json).unwrap();
+        assert_eq!(back.provider_surfaces["claude"], Surface::Tui);
+    }
+
+    #[test]
+    fn unknown_providers_and_surfaces_are_dropped_without_losing_other_preferences() {
+        let saved = serde_json::json!({
+            "sounds": false,
+            "provider_surfaces": {"claude":"tui","codex":"pty","nobody":"tui","cursor":3}
+        });
+        let prefs: Preferences = serde_json::from_value(saved).unwrap();
+        assert!(!prefs.sounds);
+        assert_eq!(prefs.provider_surfaces.len(), 1);
+        assert_eq!(prefs.provider_surfaces["claude"], Surface::Tui);
     }
 }

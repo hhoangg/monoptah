@@ -7,6 +7,7 @@ mod edit;
 mod tests;
 
 use super::{Reminder, Session, Store};
+use crate::surface::Surface;
 use crate::{
     agent::Settings,
     context::Usage,
@@ -518,6 +519,7 @@ impl Store {
                 ("pinned", "0"),
                 ("linked_work_item_json", "NULL"),
                 ("sidebar_hidden", "0"),
+                ("surface", "NULL"),
             ]
             .into_iter()
             .map(|(name, default)| self.shared_field(name, default)),
@@ -560,6 +562,7 @@ impl Store {
                 archived: sql(row.get(7))?,
                 pinned: sql(row.get(8))?,
                 work_item: sql(row.get::<_, Option<String>>(9))?.and_then(|raw| parse(&raw).ok()),
+                surface: Surface::from_stored(sql(row.get::<_, Option<String>>(11))?.as_deref()),
             });
         }
         // Keep the source sidebar's compatibility exception for hidden
@@ -578,17 +581,56 @@ impl Store {
         });
         Ok(result)
     }
-    pub(super) fn shared_create(&self, provider: &str, cwd: &str) -> Result<Session, String> {
+    pub(super) fn shared_surface_supported(&self) -> bool {
+        self.shared.as_ref().unwrap().columns.contains("surface")
+    }
+    /// The `surface` column; rows without a value, or a database without the
+    /// column, are chats.
+    pub(super) fn shared_surface(&self, id: i64) -> Result<Surface, String> {
+        if !self.shared_surface_supported() {
+            return Ok(Surface::Chat);
+        }
+        let stored: Option<Option<String>> = sql(self
+            .conn
+            .query_row(
+                "SELECT surface FROM sessions WHERE id=?1",
+                [self.persisted_session_id(id)?],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(Surface::from_stored(stored.flatten().as_deref()))
+    }
+    pub(super) fn shared_create(
+        &self,
+        provider: &str,
+        cwd: &str,
+        surface: Surface,
+    ) -> Result<Session, String> {
         self.shared_writable()?;
+        let surface = if self.shared_surface_supported() {
+            surface
+        } else {
+            Surface::Chat
+        };
         let label = crate::provider::Kind::parse(provider)
             .ok_or_else(|| format!("Unknown provider: {provider}"))?
             .label();
         let original = crate::accounts::request_id();
         let now = crate::time::now_ms().min(i64::MAX as u64) as i64;
         let title = format!("New {label} session");
-        sql(self.conn.execute("INSERT INTO sessions(id,cwd,harness,model,model_settings,runtime_mode,title,blocks_json,created_at,updated_at)
-            VALUES(?1,?2,?3,?4,'{}','supervised',?5,'[]',?6,?6)",
-            params![original,cwd,provider,format!("{provider}:default"),title,now]))?;
+        let tui = surface.is_tui().then(|| surface.id());
+        let (column, value) = if tui.is_some() {
+            (",surface", ",?7")
+        } else {
+            ("", "")
+        };
+        sql(self.conn.execute(&format!("INSERT INTO sessions(id,cwd,harness,model,model_settings,runtime_mode,title,blocks_json,created_at,updated_at{column})
+            VALUES(?1,?2,?3,?4,'{{}}','supervised',?5,'[]',?6,?6{value})"),
+            rusqlite::params_from_iter(
+                [&original as &dyn rusqlite::ToSql, &cwd, &provider, &format!("{provider}:default"), &title, &now]
+                    .into_iter()
+                    .chain(tui.as_ref().map(|id| id as &dyn rusqlite::ToSql)),
+            )))?;
         Ok(Session {
             id: self.shared_register(&original)?,
             title,
@@ -600,6 +642,7 @@ impl Store {
             archived: false,
             pinned: false,
             work_item: None,
+            surface,
         })
     }
     pub(super) fn shared_agent(&self, id: i64) -> Result<Option<Settings>, String> {
@@ -1001,6 +1044,11 @@ impl Store {
         Ok(Transcript { rows })
     }
     pub(super) fn shared_store_blocks(&self, id: i64, blocks: &[Value]) -> Result<(), String> {
+        // A terminal session never stores blocks: writing them would clear
+        // `has_user_message`, which is what keeps it in the session list.
+        if id >= 0 && self.shared_surface(id)?.is_tui() {
+            return Ok(());
+        }
         let original = self.persisted_session_id(id)?;
         let indexed = has_table(&self.conn, "mono_transcripts")?
             && sql(self.conn.query_row(

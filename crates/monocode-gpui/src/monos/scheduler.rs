@@ -1320,6 +1320,7 @@ impl Monos {
         let work = cx.background_executor().spawn(async move {
             let db = locked(&store)?;
             let cwd = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            // Always a chat: the app drives this session, whatever the surface preference.
             let mut s = db.create(&provider, &cwd)?;
             s.title = format!("{} · {}", mono.label(), habit.name);
             db.title(s.id, &s.title)?;

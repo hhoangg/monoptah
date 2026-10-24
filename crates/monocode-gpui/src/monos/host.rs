@@ -236,6 +236,7 @@ impl Monos {
                 if let Some(mode)=input.get("runtimeMode").and_then(Value::as_str){settings.access=AccessMode::from_id(mode);}
                 let draft=flag(&input,"draft",false);let reveal=flag(&input,"reveal",false);
                 self.call_work(call,target,move|store|{
+                    // Always a chat: the app drives this session, whatever the surface preference.
                     let db=locked(&store)?;let mut summary=db.create(&provider,&project)?;
                     if let Some(cwd)=input.get("worktreeCwd").and_then(Value::as_str){let snapshot=monocode_core::git::snapshot(Path::new(&project))?;if !snapshot.worktrees.iter().any(|w|monocode_core::files::path_key(&w.path)==monocode_core::files::path_key(cwd)){return Err("Choose an existing worktree of the assigned project".into());}settings.worktree_cwd=Some(cwd.into());}
                     else if input.get("workspaceMode").and_then(Value::as_str)==Some("worktree"){settings.worktree_cwd=Some(monocode_core::git::create_worktree(Path::new(&project),input.get("worktreeBase").and_then(Value::as_str).unwrap_or("HEAD"),summary.id)?.to_string_lossy().into());}

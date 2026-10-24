@@ -702,6 +702,44 @@ mod tests {
     }
 
     #[test]
+    fn provider_surfaces_import_only_known_providers_and_values() {
+        let mut workspace = json!({});
+        prefs(&[]).apply_workspace(&mut workspace);
+        assert_eq!(workspace["preferences"]["provider_surfaces"], json!({}));
+        let source = prefs(&[(
+            "monocode.providerSurface.v1",
+            json!({"claude":"tui","codex":"chat","cursor":"pty","opencode":3,"nobody":"tui","pi":"TUI"}),
+        )]);
+        source.apply_workspace(&mut workspace);
+        assert_eq!(
+            workspace["preferences"]["provider_surfaces"],
+            json!({"claude":"tui","codex":"chat"})
+        );
+        // Malformed storage reads as nothing, like the desktop app.
+        for bad in [json!(["tui"]), json!("tui"), json!(null)] {
+            let mut workspace = json!({});
+            prefs(&[("monocode.providerSurface.v1", bad)]).apply_workspace(&mut workspace);
+            assert_eq!(workspace["preferences"]["provider_surfaces"], json!({}));
+        }
+        // A native edit survives until the desktop value for that provider changes.
+        workspace["preferences"]["provider_surfaces"]["claude"] = json!("chat");
+        source.apply_workspace(&mut workspace);
+        assert_eq!(
+            workspace["preferences"]["provider_surfaces"]["claude"],
+            "chat"
+        );
+        prefs(&[(
+            "monocode.providerSurface.v1",
+            json!({"claude":"chat","codex":"tui"}),
+        )])
+        .apply_workspace(&mut workspace);
+        assert_eq!(
+            workspace["preferences"]["provider_surfaces"],
+            json!({"claude":"chat","codex":"tui"})
+        );
+    }
+
+    #[test]
     fn editor_blame_settings_follow_the_desktop_app() {
         let mut workspace = json!({});
         prefs(&[]).apply_workspace(&mut workspace);

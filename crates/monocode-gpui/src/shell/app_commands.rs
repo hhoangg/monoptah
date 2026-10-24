@@ -174,6 +174,7 @@ impl Shell {
                 let id = session_id(&input, &self.store);
                 match id.and_then(|id| {
                     if !self.session_summaries.contains_key(&id) || self.session_metadata(id, cx).summary.cwd != project { return Err("Session is outside this project.".into()); }
+                    if self.is_terminal(id) { return Err("A terminal session takes no prompts.".into()); }
                     self.ensure_session(id, cx).ok_or("Session is outside this project.".into())
                 }) {
                     Ok(view) => {
@@ -207,6 +208,7 @@ impl Shell {
                 let draft = input.get("draft").and_then(Value::as_bool).unwrap_or(false);
                 let reveal = input.get("reveal").and_then(Value::as_bool).unwrap_or(true);
                 self.app_background(call, move |store| {
+                    // Always a chat: the app drives this session, whatever the surface preference.
                     let store = locked(&store)?; let mut summary = store.create(&kind, &project)?;
                     if let Some(title) = title { store.title(summary.id, &title)?; summary.title = title; }
                     store.save_agent_settings(summary.id, &inherited)?;
@@ -361,6 +363,48 @@ mod tests {
                         .unwrap()
                         .unwrap_err()
                         .contains("read-only")
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_session_an_agent_starts_is_a_chat_whatever_the_preference(cx: &mut TestAppContext) {
+        use crate::shell::surface_tests::{all_terminal, assert_chat, known, since};
+        let (window, _, active) = crate::shell::tests::window(cx);
+        let (result, before) = window
+            .update(cx, |shell, window, cx| {
+                all_terminal(shell);
+                shell.sessions[&active].update(cx, |v, cx| {
+                    v.install_transfer(Settings::default(), None, cx);
+                    v.enable_mode("operator", cx);
+                });
+                let before = known(shell);
+                let (reply, result) = std::sync::mpsc::channel();
+                shell.handle_app_call(
+                    Call {
+                        session: active,
+                        request_id: "start".into(),
+                        action: "sessions.start".into(),
+                        input: json!({"prompt":"Review the project","harness":"claude","draft":true}),
+                        reply,
+                    },
+                    window,
+                    cx,
+                );
+                (result, before)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let started = result.try_recv().unwrap().unwrap();
+        let id = started["sessionId"].as_i64().unwrap();
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(since(shell, &before), vec![id]);
+                assert_chat(shell, id);
+                assert_eq!(
+                    shell.sessions[&id].read(cx).input.read(cx).content,
+                    "Review the project"
                 );
             })
             .unwrap();

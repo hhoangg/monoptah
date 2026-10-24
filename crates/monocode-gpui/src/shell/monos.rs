@@ -22,7 +22,7 @@ impl Shell {
     }
     #[cfg(all(target_os = "macos", not(test)))]
     pub(crate) fn mono_quick_compose(&mut self, cx: &mut Context<Self>) {
-        self.create(Kind::Codex, cx);
+        self.create_chat(Kind::Codex, cx);
     }
     pub(super) fn mono_active(&self, cx: &App) -> bool {
         self.monos

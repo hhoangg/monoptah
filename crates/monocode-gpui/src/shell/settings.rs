@@ -4,7 +4,7 @@ use super::*;
 use crate::settings::{ArchivedSession, Section, SettingsContext, SettingsEvent, SettingsView};
 use std::path::Path;
 impl Shell {
-    fn settings_context(&self, cx: &App) -> SettingsContext {
+    pub(super) fn settings_context(&self, cx: &App) -> SettingsContext {
         let mut archived: Vec<_> = self
             .order
             .iter()
@@ -108,6 +108,7 @@ impl Shell {
             catalogs,
             classic: self.workspace.classic_layout,
             new_layout_boxy: self.workspace.new_layout_boxy,
+            no_terminal_sessions: !self.surface_supported,
             cwd: self.workspace.project.clone(),
             project_label: self.project_label(&self.workspace.project),
             archived,

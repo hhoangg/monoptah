@@ -1472,3 +1472,48 @@ fn sidebar_right_click_opens_mono_menu_outside_the_mono_and_edits_its_look(
         .unwrap();
     assert!(visual.debug_bounds("mono-mascot-0").is_none());
 }
+
+#[gpui::test]
+fn sessions_a_mono_makes_are_chats_whatever_the_preference(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    s.window
+        .update(cx, |shell, _, _| {
+            crate::shell::surface_tests::all_terminal(shell)
+        })
+        .unwrap();
+    // A new Mono's own conversation.
+    let handle: gpui::AnyWindowHandle = s.window.into();
+    handle
+        .update(cx, |_, w, cx| {
+            s.manager
+                .update(cx, |m, cx| m.create(vec![s.project.clone()], w, cx))
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let second = cx.update(|cx| s.manager.read(cx).current().unwrap().session_id.unwrap());
+    assert_ne!(second, s.session);
+    // A session a Mono starts for a project.
+    let start = call(
+        &s,
+        "start",
+        "sessions.start",
+        json!({"project":s.project,"prompt":"Review the project","draft":true}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap();
+    let child = start["sessionId"].as_i64().unwrap();
+    for id in [second, child] {
+        assert_eq!(
+            locked(&s.store).unwrap().session_surface(id).unwrap(),
+            monocode_core::surface::Surface::Chat,
+            "{id}"
+        );
+    }
+    cx.update(|cx| {
+        let owner = s.manager.read(cx).owner.upgrade().unwrap();
+        let shell = owner.read(cx);
+        assert!(shell.mono_session_entity(child).is_some());
+    });
+}

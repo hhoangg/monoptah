@@ -49,6 +49,9 @@ pub(crate) struct SettingsContext {
     pub monos: Vec<MonoSetting>,
     pub classic: bool,
     pub new_layout_boxy: bool,
+    /// The database cannot store a terminal session (a desktop database without
+    /// a `surface` column), so every provider's sessions open as a chat.
+    pub no_terminal_sessions: bool,
     /// The selected project, or empty outside one.
     pub cwd: String,
     pub project_label: String,
@@ -76,6 +79,7 @@ impl PartialEq for SettingsContext {
         self.monos == other.monos
             && self.classic == other.classic
             && self.new_layout_boxy == other.new_layout_boxy
+            && self.no_terminal_sessions == other.no_terminal_sessions
             && self.cwd == other.cwd
             && self.project_label == other.project_label
             && self.archived == other.archived

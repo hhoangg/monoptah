@@ -436,6 +436,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "codex opencode cursor grok pi omp fx hermes antigravity devin binary path",
     ),
     (
+        "session-surface",
+        Section::Providers,
+        "Session surface",
+        "chat tui terminal interactive cli surface",
+    ),
+    (
         "provider-accounts",
         Section::Providers,
         "Provider accounts",
@@ -604,6 +610,14 @@ mod tests {
             Section::Inbox.keywords().contains("clickup"),
             "section keywords"
         );
+        for query in ["session surface", "terminal", "tui"] {
+            assert!(
+                search(query).iter().any(
+                    |r| r.section == Section::Providers && r.setting == Some("session-surface")
+                ),
+                "{query}"
+            );
+        }
         let pages = search("archive");
         assert!(
             pages

@@ -17,6 +17,7 @@ use crate::provider::Kind;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -102,9 +103,12 @@ impl Profile {
             .or_else(|| home().map(|p| p.join(dir)))
             .ok_or_else(|| format!("Could not find the {} home directory", kind.label()))
     }
-    pub fn apply(&self, kind: Kind, command: &mut Command) -> Result<(), String> {
+    /// The variables a provider process needs for this account: (set, remove).
+    /// Creates the account directory. The default profile needs nothing.
+    #[allow(clippy::type_complexity)]
+    pub fn env(&self, kind: Kind) -> Result<(Vec<(String, OsString)>, Vec<&'static str>), String> {
         let Some(dir) = self.directory(kind)? else {
-            return Ok(());
+            return Ok((Vec::new(), Vec::new()));
         };
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("Could not create the account directory: {e}"))?;
@@ -114,23 +118,33 @@ impl Profile {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .map_err(|e| e.to_string())?;
         }
-        match kind {
-            Kind::Claude => {
-                command
-                    .env("CLAUDE_CONFIG_DIR", &dir)
-                    .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", &dir)
-                    .env_remove("ANTHROPIC_API_KEY")
-                    .env_remove("ANTHROPIC_AUTH_TOKEN")
-                    .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
-            }
-            Kind::Codex => {
-                command
-                    .env("CODEX_HOME", &dir)
-                    .env_remove("OPENAI_API_KEY")
-                    .env_remove("CODEX_API_KEY")
-                    .env_remove("CODEX_ACCESS_TOKEN");
-            }
+        let dir: OsString = dir.into();
+        Ok(match kind {
+            Kind::Claude => (
+                vec![
+                    ("CLAUDE_CONFIG_DIR".into(), dir.clone()),
+                    ("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), dir),
+                ],
+                vec![
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                ],
+            ),
+            Kind::Codex => (
+                vec![("CODEX_HOME".into(), dir)],
+                vec!["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"],
+            ),
             _ => unreachable!(),
+        })
+    }
+    pub fn apply(&self, kind: Kind, command: &mut Command) -> Result<(), String> {
+        let (set, remove) = self.env(kind)?;
+        for (key, value) in set {
+            command.env(key, value);
+        }
+        for key in remove {
+            command.env_remove(key);
         }
         Ok(())
     }

@@ -403,17 +403,18 @@ impl SettingsView {
     /// Segmented: equal-width options in a hairline frame.
     pub(super) fn segmented(
         &self,
-        id: &'static str,
-        label: &'static str,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
         value: &str,
         options: &[(&'static str, &str)],
         cx: &mut Context<Self>,
         change: impl Fn(&mut Self, &'static str, &mut Context<Self>) + Clone + 'static,
     ) -> AnyElement {
+        let id: SharedString = id.into();
         div()
             .id(SharedString::from(format!("segmented-{id}")))
             .role(Role::RadioGroup)
-            .aria_label(label)
+            .aria_label(label.into())
             .grid()
             .grid_cols(options.len() as u16)
             .flex_shrink_0()
@@ -427,9 +428,13 @@ impl SettingsView {
             .children(options.iter().map(|&(option, text)| {
                 let selected = value == option;
                 let change = change.clone();
+                let id = id.clone();
                 div()
                     .id(SharedString::from(format!("segmented-{id}-{option}")))
-                    .debug_selector(move || format!("settings-{id}-{option}"))
+                    .debug_selector({
+                        let id = id.clone();
+                        move || format!("settings-{id}-{option}")
+                    })
                     .role(Role::RadioButton)
                     .aria_label(text.to_owned())
                     .aria_selected(selected)

@@ -81,6 +81,7 @@ mod theme;
 #[cfg(target_os = "macos")]
 mod traffic_lights;
 mod transcript;
+mod tui_session;
 mod usage_footer;
 mod visuals;
 mod workspace;
@@ -204,6 +205,10 @@ fn main() {
             }
         }
         return;
+    }
+    // A Claude hook callback: never opens a window, prints, or touches the DB.
+    if cli_args.first().is_some_and(|a| a == "tui-hook") {
+        std::process::exit(monocode_core::tui_hook::run(cli_args.into_iter().skip(1)));
     }
     if cli_args.first().is_some_and(|a| a == "app") {
         match monocode_core::mono::bridge::client(&cli_args[1..]) {

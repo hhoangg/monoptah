@@ -1233,6 +1233,7 @@ impl Shell {
                 None => None,
             };
             let store = locked(&store)?;
+            // Always a chat: the app drives this session, whatever the surface preference.
             let summary = store.create(kind.id(), &cwd)?;
             let mut settings = session_loading::new_session_settings(
                 store

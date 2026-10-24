@@ -2,6 +2,8 @@
 use super::*;
 use monocode_core::automations::{self, DueAutomationRun, Service};
 
+mod tui;
+
 pub(super) type ServiceHandle = Arc<Mutex<Service>>;
 
 pub(super) struct Running {
@@ -25,6 +27,8 @@ pub(super) struct State {
     events_polling: bool,
     retry_revision: Arc<AtomicU64>,
     pub session_automations: HashMap<i64, String>,
+    /// Terminal runs not settled yet, by session.
+    tui_runs: HashMap<i64, tui::Run>,
 }
 
 impl Default for State {
@@ -44,6 +48,7 @@ impl Default for State {
             events_polling: false,
             retry_revision: Arc::new(AtomicU64::new(0)),
             session_automations: HashMap::new(),
+            tui_runs: HashMap::new(),
         }
     }
 }
@@ -283,6 +288,46 @@ impl Shell {
         .detach();
     }
 
+    /// A conversation a "reuse the session" run may continue.
+    pub(super) fn automation_can_continue(
+        &self,
+        id: i64,
+        automation: &monocode_core::automations::Automation,
+        cx: &App,
+    ) -> bool {
+        self.session_summaries.get(&id).is_some_and(|summary| {
+            summary.provider == automation.harness
+                && !summary.archived
+                // A terminal session has no conversation to continue, and a run
+                // would stamp it as the automation's.
+                && !self.is_terminal(id)
+                && !self.draft_sessions.contains(&id)
+                && self
+                    .sessions
+                    .get(&id)
+                    .is_none_or(|view| view.read(cx).available_for_managed_run(cx))
+                && match automation.workspace_mode.as_str() {
+                    "current" => {
+                        self.session_worktrees
+                            .get(&id)
+                            .and_then(Option::as_deref)
+                            .is_none()
+                            && monocode_core::files::path_key(&summary.cwd)
+                                == monocode_core::files::path_key(&automation.cwd)
+                    }
+                    "existing" => self
+                        .session_worktrees
+                        .get(&id)
+                        .and_then(Option::as_deref)
+                        .is_some_and(|cwd| {
+                            monocode_core::files::path_key(cwd)
+                                == monocode_core::files::path_key(&automation.worktree_cwd)
+                        }),
+                    _ => false,
+                }
+        })
+    }
+
     pub(super) fn launch_automation(
         &mut self,
         due: DueAutomationRun,
@@ -295,14 +340,26 @@ impl Shell {
                 .running
                 .values()
                 .any(|run| run.run_id == due.run.id)
+            || self
+                .automation_state
+                .tui_runs
+                .values()
+                .any(|run| run.run_id == due.run.id)
         {
             return;
         }
         self.automation_state.pending.insert(due.run.id.clone());
         let automation = &due.automation;
         let kind = Kind::from_id(&automation.harness);
-        let reuse = automation
-            .reuse_session
+        // A terminal run follows the provider's surface when its CLI takes a first
+        // prompt, and never continues a session: a resumed CLI already has its
+        // first prompt, so it would drop this one.
+        let surface = monocode_core::surface::automation_surface(
+            kind,
+            &automation.cwd,
+            self.provider_surface(kind),
+        );
+        let reuse = (automation.reuse_session && !surface.is_tui())
             .then_some(automation.last_session_id.as_deref())
             .flatten()
             .and_then(|id| locked(&self.store).ok()?.resolve_existing_session_id(id))
@@ -310,36 +367,7 @@ impl Shell {
                 !self.automation_state.running.contains_key(id)
                     && !self.automation_state.reserved.contains(id)
             })
-            .filter(|id| {
-                self.session_summaries.get(id).is_some_and(|summary| {
-                    summary.provider == automation.harness
-                        && !summary.archived
-                        && !self.draft_sessions.contains(id)
-                        && self
-                            .sessions
-                            .get(id)
-                            .is_none_or(|view| view.read(cx).available_for_managed_run(cx))
-                        && match automation.workspace_mode.as_str() {
-                            "current" => {
-                                self.session_worktrees
-                                    .get(id)
-                                    .and_then(Option::as_deref)
-                                    .is_none()
-                                    && monocode_core::files::path_key(&summary.cwd)
-                                        == monocode_core::files::path_key(&automation.cwd)
-                            }
-                            "existing" => self
-                                .session_worktrees
-                                .get(id)
-                                .and_then(Option::as_deref)
-                                .is_some_and(|cwd| {
-                                    monocode_core::files::path_key(cwd)
-                                        == monocode_core::files::path_key(&automation.worktree_cwd)
-                                }),
-                            _ => false,
-                        }
-                })
-            });
+            .filter(|id| self.automation_can_continue(*id, automation, cx));
         if let Some(id) = reuse {
             self.ensure_session(id, cx);
         }
@@ -405,36 +433,87 @@ impl Shell {
             {
                 return Err("The automation's worktree is unavailable".into());
             }
-            let store = locked(&store)?;
             let mut settings = settings;
-            let mut summary = if let Some(id) = reuse {
-                if let Some(previous) = store.agent_settings(id)? {
-                    settings.turns = previous.turns;
-                    settings.revision = previous.revision;
+            let mut summary = {
+                let store = locked(&store)?;
+                if let Some(id) = reuse {
+                    if let Some(previous) = store.agent_settings(id)? {
+                        settings.turns = previous.turns;
+                        settings.revision = previous.revision;
+                    }
+                    store
+                        .sessions()?
+                        .into_iter()
+                        .find(|session| session.id == id)
+                        .ok_or("The reusable session no longer exists")?
+                } else {
+                    let mut summary = store.create_with_surface(
+                        &launch.automation.harness,
+                        &launch.automation.cwd,
+                        surface,
+                    )?;
+                    if launch.run.trigger != "event" {
+                        summary.title = launch.automation.name.clone();
+                        store.title(summary.id, &summary.title)?;
+                    }
+                    summary
                 }
-                store
-                    .sessions()?
-                    .into_iter()
-                    .find(|session| session.id == id)
-                    .ok_or("The reusable session no longer exists")?
-            } else {
-                let mut summary =
-                    store.create(&launch.automation.harness, &launch.automation.cwd)?;
-                if launch.run.trigger != "event" {
-                    summary.title = launch.automation.name.clone();
-                    store.title(summary.id, &summary.title)?;
-                }
-                summary
             };
-            store.set_automation_id(summary.id, &launch.automation.id)?;
-            if let Some(item) = automation_work_item(&launch.run) {
-                store.set_work_item(summary.id, Some(&item))?;
-                summary.work_item = Some(item);
+            if summary.surface.is_tui() {
+                // The CLI starts in this folder and a terminal has no first send to
+                // create a worktree later, so a "new worktree" run makes it up front.
+                settings.new_worktree = false;
+                settings.worktree_base = None;
+                if launch.automation.workspace_mode == "worktree" {
+                    let made = monocode_core::git::create_worktree(
+                        std::path::Path::new(&launch.automation.cwd),
+                        "HEAD",
+                        summary.id,
+                    );
+                    match made {
+                        Ok(path) => {
+                            settings.worktree_cwd = Some(path.to_string_lossy().into_owned())
+                        }
+                        Err(error) => {
+                            // No run will own the session, so it must not stay listed.
+                            let _ = locked(&store).and_then(|mut store| store.delete(summary.id));
+                            return Err(error);
+                        }
+                    }
+                }
             }
-            if reuse.is_none() {
-                store.save_agent_settings(summary.id, &settings)?;
+            let mut made_tree = None;
+            if summary.surface.is_tui() && launch.automation.workspace_mode == "worktree" {
+                made_tree = settings.worktree_cwd.clone();
             }
-            let persisted = store.persisted_session_id(summary.id)?;
+            let saved = (|| {
+                let store = locked(&store)?;
+                store.set_automation_id(summary.id, &launch.automation.id)?;
+                if let Some(item) = automation_work_item(&launch.run) {
+                    store.set_work_item(summary.id, Some(&item))?;
+                    summary.work_item = Some(item);
+                }
+                if reuse.is_none() {
+                    store.save_agent_settings(summary.id, &settings)?;
+                }
+                store.persisted_session_id(summary.id)
+            })();
+            let persisted = match saved {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    // No run will own what this one made, so none of it may stay.
+                    if let Some(tree) = made_tree {
+                        let _ = monocode_core::worktree_management::remove(
+                            std::path::Path::new(&launch.automation.cwd),
+                            std::path::Path::new(&tree),
+                        );
+                    }
+                    if reuse.is_none() {
+                        let _ = locked(&store).and_then(|mut store| store.delete(summary.id));
+                    }
+                    return Err(error);
+                }
+            };
             Ok::<_, String>((summary, settings, persisted))
         });
         cx.spawn(async move |this, cx| {
@@ -447,6 +526,12 @@ impl Shell {
                 match result {
                     Ok((summary, settings, persisted)) => {
                         let id = summary.id;
+                        if summary.surface.is_tui() {
+                            this.begin_tui_run(
+                                summary, &settings, persisted, &due, reveal, revision, window, cx,
+                            );
+                            return;
+                        }
                         if reuse.is_some()
                             && this
                                 .sessions
@@ -484,18 +569,7 @@ impl Shell {
                             None,
                             cx,
                         );
-                        if !due.automation.session_folder_id.is_empty() {
-                            this.groups
-                                .entry(due.automation.cwd.clone())
-                                .or_default()
-                                .add_to_folder(&due.automation.session_folder_id, id);
-                            this.persist_automation_folder(&due.automation.cwd, cx);
-                        }
-                        // Background runs append a tab without changing the focused project.
-                        if !this.workspace.tabs.contains(&id) {
-                            this.workspace.tabs.push(id);
-                            this.workspace.title_order.push(TitleTab::Session(id));
-                        }
+                        this.place_automation_session(id, &due.automation, cx);
                         let prompt = due
                             .run
                             .prompt
@@ -529,6 +603,27 @@ impl Shell {
             });
         })
         .detach();
+    }
+
+    /// The run's session goes into its folder and gets a tab, without changing
+    /// the focused project.
+    fn place_automation_session(
+        &mut self,
+        id: i64,
+        automation: &monocode_core::automations::Automation,
+        cx: &mut Context<Self>,
+    ) {
+        if !automation.session_folder_id.is_empty() {
+            self.groups
+                .entry(automation.cwd.clone())
+                .or_default()
+                .add_to_folder(&automation.session_folder_id, id);
+            self.persist_automation_folder(&automation.cwd, cx);
+        }
+        if !self.workspace.tabs.contains(&id) {
+            self.workspace.tabs.push(id);
+            self.workspace.title_order.push(TitleTab::Session(id));
+        }
     }
 
     pub(super) fn automation_session_changed(&mut self, id: i64, cx: &mut Context<Self>) {

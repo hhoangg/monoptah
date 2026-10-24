@@ -45,6 +45,7 @@ impl Store {
                         work_item: row
                             .get::<_, Option<String>>(8)?
                             .and_then(|raw| serde_json::from_str(&raw).ok()),
+                        surface: Default::default(),
                     })
                 },
             )

@@ -282,6 +282,7 @@ impl Store {
             archived: false,
             pinned: false,
             work_item: None,
+            surface: Default::default(),
         };
         self.save_remote_session(&RemoteSession {
             summary: summary.clone(),
@@ -362,6 +363,7 @@ impl Store {
                 .get("linkedWorkItem")
                 .filter(|v| !v.is_null())
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            surface: Default::default(),
         };
         let imported = host_settings(project, host);
         let full_snapshot = value.get("session").is_some_and(Value::is_object);

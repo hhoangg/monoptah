@@ -365,8 +365,8 @@ impl Shell {
                                             cx.stop_propagation()
                                         })
                                         .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.create(this.default_kind(), cx)
+                                            cx.listener(|this, _, window, cx| {
+                                                this.request_new_session(window, cx)
                                             }),
                                         ),
                                     ),

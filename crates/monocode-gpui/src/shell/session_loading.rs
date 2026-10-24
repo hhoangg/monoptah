@@ -5,6 +5,8 @@ pub(super) struct Metadata<'a> {
     pub summary: &'a Session,
     pub busy: bool,
     live: Option<&'a Conversation>,
+    /// A terminal session's CLI is mid-turn.
+    terminal_busy: bool,
     draft: bool,
     remote_waiting: bool,
 }
@@ -17,7 +19,7 @@ impl Metadata<'_> {
         self.live.is_some_and(Conversation::needs_approval) || self.remote_waiting
     }
     pub(super) fn responding(&self) -> bool {
-        self.live.is_some_and(Conversation::responding)
+        self.live.is_some_and(Conversation::responding) || self.terminal_busy
     }
     pub(super) fn has_saved_draft(&self) -> bool {
         self.live.map_or(self.draft, Conversation::has_saved_draft)
@@ -27,11 +29,14 @@ impl Metadata<'_> {
 impl Shell {
     pub(super) fn session_metadata<'a>(&'a self, id: i64, cx: &'a App) -> Metadata<'a> {
         let live = self.sessions.get(&id).map(|view| view.read(cx));
+        let terminal_busy = self.terminal_busy(id, cx);
         Metadata {
             summary: live.map_or_else(|| &self.session_summaries[&id], |v| &v.summary),
             busy: live.is_some_and(|v| v.busy)
+                || terminal_busy
                 || self.remote_marks.get(&id).is_some_and(|state| state.0),
             live,
+            terminal_busy,
             draft: self.draft_sessions.contains(&id),
             remote_waiting: self.remote_marks.get(&id).is_some_and(|state| state.1),
         }
@@ -47,6 +52,10 @@ impl Shell {
             return Some(view.clone());
         }
         let summary = self.session_summaries.get(&id)?.clone();
+        // A terminal session is not a conversation: its pane is made when shown.
+        if runs_in_terminal(&summary) {
+            return None;
+        }
         self.add_loaded(summary, cx);
         self.sessions.get(&id).cloned()
     }

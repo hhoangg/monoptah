@@ -3431,6 +3431,7 @@ mod tests {
             archived: false,
             pinned: false,
             work_item: Some(item.work_item()),
+            surface: Default::default(),
         }
     }
     #[gpui::test]

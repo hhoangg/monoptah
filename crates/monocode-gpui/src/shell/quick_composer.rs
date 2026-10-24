@@ -99,6 +99,7 @@ impl Shell {
             .unwrap_or_default();
         let work = cx.background_executor().spawn(async move {
             let store = locked(&store)?;
+            // Always a chat: the app drives this session, whatever the surface preference.
             let summary = store.create(choice.kind.id(), &choice.cwd)?;
             let settings = monocode_core::agent::Settings {
                 account,
@@ -140,5 +141,46 @@ impl Shell {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::surface_tests::{all_terminal, assert_chat, known, since};
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn a_quick_composer_launch_is_a_chat_whatever_the_preference(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let before = window
+            .update(cx, |shell, window, cx| {
+                all_terminal(shell);
+                let before = known(shell);
+                // An empty prompt: the launch makes its session but sends nothing.
+                shell.launch_quick_composer(
+                    crate::quick_composer::Launch {
+                        cwd: "/work/monocode".into(),
+                        kind: Kind::Claude,
+                        model: None,
+                        access: Default::default(),
+                        prompt: String::new(),
+                        foreground: true,
+                    },
+                    window,
+                    cx,
+                );
+                before
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let ids = since(shell, &before);
+                assert_eq!(ids.len(), 1);
+                assert_chat(shell, ids[0]);
+                assert_eq!(shell.session_summaries[&ids[0]].provider, "claude");
+            })
+            .unwrap();
     }
 }

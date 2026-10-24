@@ -85,10 +85,14 @@ impl Shell {
         if self.deleting.contains(&owner) {
             return;
         }
-        let Some(session) = self.ensure_session(owner, cx) else {
-            return;
+        let cwd = match self.ensure_session(owner, cx) {
+            Some(session) => session.read(cx).summary.cwd.clone(),
+            None => match self.terminal_summary(owner) {
+                Some(summary) => summary.cwd.clone(),
+                None => return,
+            },
         };
-        self.workspace.project = session.read(cx).summary.cwd.clone();
+        self.workspace.project = cwd;
         if let Some(monos) = &self.monos {
             monos.update(cx, |m, cx| m.close(cx));
         }

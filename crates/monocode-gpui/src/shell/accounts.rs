@@ -128,6 +128,8 @@ impl Shell {
         let revision = self.navigation_revision;
         let work = cx.background_executor().spawn(async move {
             let store = locked(&store)?;
+            // A continuation keeps its source's surface. Only a chat gets here (a
+            // terminal session returns above), so this is a chat.
             let summary = store.create(kind.id(), &cwd)?;
             store.save_agent_settings(summary.id, &settings)?;
             Ok::<_, String>((summary, settings))
@@ -357,6 +359,51 @@ mod tests {
                         && v.summary.provider == "claude"
                         && v.settings.account.id == monocode_core::accounts::DEFAULT
                 }));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn switching_account_continues_in_the_sources_surface_a_chat(cx: &mut gpui::TestAppContext) {
+        use crate::shell::surface_tests::{all_terminal, assert_chat, known, since};
+        let (window, _, id) = crate::shell::tests::window(cx);
+        let before = window
+            .update(cx, |shell, _, cx| {
+                let center = crate::accounts::get(cx).unwrap();
+                let account = center.update(cx, |center, _| {
+                    center.book.add(Kind::Claude, "Work").unwrap()
+                });
+                locked(&shell.store)
+                    .unwrap()
+                    .save_provider_accounts(&center.read(cx).book)
+                    .unwrap();
+                shell.select_provider_account(
+                    Kind::Claude,
+                    &account.id,
+                    "/work/monocode",
+                    Some(id),
+                    cx,
+                );
+                // The conversation has messages, so the next switch continues in a new session.
+                shell.sessions[&id].update(cx, |v, _| v.summary.has_messages = true);
+                all_terminal(shell);
+                let before = known(shell);
+                shell.select_provider_account(
+                    Kind::Claude,
+                    monocode_core::accounts::DEFAULT,
+                    "/work/monocode",
+                    Some(id),
+                    cx,
+                );
+                before
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let ids = since(shell, &before);
+                assert_eq!(ids.len(), 1);
+                assert_chat(shell, ids[0]);
             })
             .unwrap();
     }

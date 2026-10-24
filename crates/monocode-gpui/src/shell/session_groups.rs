@@ -889,6 +889,7 @@ impl Shell {
             self.preview_close = None;
         }
         self.sessions.remove(&id);
+        self.stop_tui(id, cx);
         self.session_summaries.remove(&id);
         self.draft_sessions.remove(&id);
         self.history_recency.remove(&id);
@@ -1682,8 +1683,8 @@ impl Shell {
                         .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
                         .child(icon("plus", 12.))
                         .child("New session")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.create_in_folder(folder.clone(), cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.request_new_session_in_folder(folder.clone(), window, cx);
                         })),
                 ),
             )

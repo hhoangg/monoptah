@@ -14,6 +14,7 @@ pub use session_preview::SessionPreviewData;
 mod edit;
 mod shared;
 mod side_threads;
+use crate::surface::Surface;
 use crate::transcript::{Row, Transcript};
 pub use edit::EditSnapshot;
 pub use monocode_import::native_model;
@@ -21,6 +22,10 @@ pub use monocode_import::{monocode_database, ImportReport};
 use rusqlite::{params, Connection};
 pub use side_threads::DesktopSideThread;
 use std::path::Path;
+
+/// Upsert of a session's agent settings JSON. The surface is fixed at creation
+/// and `Settings` does not carry it, so a stored one is kept.
+const SAVE_AGENT_SETTINGS: &str = "INSERT INTO native_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=CASE WHEN json_valid(native_settings.value) AND json_type(native_settings.value,'$.surface')='text' THEN json_set(excluded.value,'$.surface',json_extract(native_settings.value,'$.surface')) ELSE excluded.value END";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Session {
@@ -35,6 +40,9 @@ pub struct Session {
     pub archived: bool,
     pub pinned: bool,
     pub work_item: Option<crate::session_groups::WorkItem>,
+    /// App chat, or the provider's own CLI in a terminal. Fixed at creation.
+    #[serde(default)]
+    pub surface: crate::surface::Surface,
 }
 
 /// A session's pending or delivered reminder.
@@ -395,7 +403,17 @@ impl Store {
             return self.shared_save_agent(id, settings);
         }
 
-        self.conn.execute("INSERT INTO native_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![format!("agent:{id}"), serde_json::to_string(settings).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+        // The surface is fixed at creation, so a save of settings that do not
+        // carry it keeps the stored one.
+        self.conn
+            .execute(
+                SAVE_AGENT_SETTINGS,
+                params![
+                    format!("agent:{id}"),
+                    serde_json::to_string(settings).map_err(|e| e.to_string())?
+                ],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
     pub fn configure_agent(
@@ -445,15 +463,18 @@ impl Store {
             return self.shared_sessions();
         }
 
+        // A terminal session has no rows: it is listed once it has a conversation id.
+        let surface = "(SELECT CASE WHEN json_valid(value) THEN json_extract(value,'$.surface') END FROM native_settings WHERE key='agent:'||native_sessions.id)";
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id,title,provider,cwd,provider_id,
                  (EXISTS(SELECT 1 FROM native_rows WHERE session_id=native_sessions.id)
-                  OR EXISTS(SELECT 1 FROM native_settings WHERE key='follow-up:'||native_sessions.id AND json_valid(value) AND (json_type(value,'$.draft')='object' OR json_array_length(value,'$.messages')>0))),updated_at,archived,
-                 pinned,work_item
-                 FROM native_sessions WHERE NOT EXISTS(SELECT 1 FROM native_settings WHERE key='inbox-ask:'||native_sessions.id) ORDER BY updated_at DESC,id DESC",
-            )
+                  OR EXISTS(SELECT 1 FROM native_settings WHERE key='follow-up:'||native_sessions.id AND json_valid(value) AND (json_type(value,'$.draft')='object' OR json_array_length(value,'$.messages')>0))
+                  OR (trim(COALESCE(provider_id,''))<>'' AND COALESCE({surface},'')='tui')),updated_at,archived,
+                 pinned,work_item,{surface}
+                 FROM native_sessions WHERE NOT EXISTS(SELECT 1 FROM native_settings WHERE key='inbox-ask:'||native_sessions.id) ORDER BY updated_at DESC,id DESC"
+            ))
             .map_err(|e| e.to_string())?;
         let result = stmt
             .query_map([], |r| {
@@ -470,6 +491,7 @@ impl Store {
                     work_item: r
                         .get::<_, Option<String>>(9)?
                         .and_then(|text| serde_json::from_str(&text).ok()),
+                    surface: Surface::from_stored(r.get::<_, Option<String>>(10)?.as_deref()),
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -557,8 +579,16 @@ impl Store {
         ids.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
     fn local_create(&self, provider: &str, cwd: &str) -> Result<Session, String> {
+        self.local_create_as(provider, cwd, Surface::Chat)
+    }
+    fn local_create_as(
+        &self,
+        provider: &str,
+        cwd: &str,
+        surface: Surface,
+    ) -> Result<Session, String> {
         if self.shared.is_some() {
-            return self.shared_create(provider, cwd);
+            return self.shared_create(provider, cwd, surface);
         }
 
         let updated_at = crate::response::now_ms();
@@ -568,14 +598,26 @@ impl Store {
                 .ok_or_else(|| format!("Unknown provider: {provider}"))?
                 .label()
         );
-        self.conn
-            .execute(
-                "INSERT INTO native_sessions(title,provider,cwd,updated_at) VALUES(?1,?2,?3,?4)",
-                params![title, provider, cwd, updated_at.min(i64::MAX as u64) as i64],
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO native_sessions(title,provider,cwd,updated_at) VALUES(?1,?2,?3,?4)",
+            params![title, provider, cwd, updated_at.min(i64::MAX as u64) as i64],
+        )
+        .map_err(|e| e.to_string())?;
+        let id = tx.last_insert_rowid();
+        if surface.is_tui() {
+            tx.execute(
+                    "INSERT INTO native_settings(key,value) VALUES(?1,json_object('surface',?2)) ON CONFLICT(key) DO UPDATE SET value=json_set(CASE WHEN json_valid(value) THEN value ELSE '{}' END,'$.surface',?2)",
+                params![format!("agent:{id}"), surface.id()],
             )
             .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(Session {
-            id: self.conn.last_insert_rowid(),
+            id,
             title,
             provider: provider.into(),
             cwd: cwd.into(),
@@ -585,7 +627,73 @@ impl Store {
             archived: false,
             pinned: false,
             work_item: None,
+            surface,
         })
+    }
+    /// Whether a terminal session can be stored: always natively, and on the
+    /// desktop database only when its `sessions` table has a `surface` column.
+    pub fn surface_supported(&self) -> bool {
+        self.shared.is_none() || self.shared_surface_supported()
+    }
+    /// Create a session in `surface`. Falls back to chat for a project on
+    /// another machine or when terminals cannot be stored; the returned
+    /// session's `surface` is the one actually used.
+    pub fn create_with_surface(
+        &self,
+        provider: &str,
+        cwd: &str,
+        surface: Surface,
+    ) -> Result<Session, String> {
+        let kind = crate::provider::Kind::parse(provider)
+            .ok_or_else(|| format!("Unknown provider: {provider}"))?;
+        let surface = crate::surface::new_session_surface(kind, cwd, surface);
+        if !surface.is_tui() || !self.surface_supported() {
+            return self.create(provider, cwd);
+        }
+        self.local_create_as(provider, cwd, surface)
+    }
+    /// A session's surface. Sessions without a stored one, and sessions on
+    /// another machine, are chats.
+    pub fn session_surface(&self, id: i64) -> Result<Surface, String> {
+        if id < 0 {
+            return Ok(Surface::Chat);
+        }
+        if self.shared.is_some() {
+            return self.shared_surface(id);
+        }
+
+        use rusqlite::OptionalExtension;
+        let stored: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(value) THEN json_extract(value,'$.surface') END FROM native_settings WHERE key=?1",
+                [format!("agent:{id}")],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(Surface::from_stored(stored.flatten().as_deref()))
+    }
+    /// Record the provider conversation a terminal session runs. That is what
+    /// lists a terminal session, which never has stored messages.
+    pub fn set_terminal_conversation(&self, id: i64, provider_id: &str) -> Result<(), String> {
+        let provider_id = provider_id.trim();
+        if provider_id.is_empty() {
+            return Err("A terminal conversation needs an id".into());
+        }
+        if !self.session_surface(id)?.is_tui() {
+            return Err("Not a terminal session".into());
+        }
+        if self.shared.is_some() {
+            return self.shared_patch(
+                id,
+                &[
+                    ("provider_session_id", serde_json::json!(provider_id)),
+                    ("has_user_message", serde_json::json!(true)),
+                ],
+            );
+        }
+        self.provider_id(id, provider_id)
     }
     /// A WAL reader for background search, independent of the writer's mutex.
     /// In-memory fixture stores must continue using their original connection.
@@ -1116,7 +1224,14 @@ impl Store {
                 params![session.id, session.cwd],
             )
             .map_err(|e| e.to_string())?;
-            tx.execute("INSERT INTO native_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![format!("agent:{}",session.id),serde_json::to_string(settings).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+            tx.execute(
+                SAVE_AGENT_SETTINGS,
+                params![
+                    format!("agent:{}", session.id),
+                    serde_json::to_string(settings).map_err(|e| e.to_string())?
+                ],
+            )
+            .map_err(|e| e.to_string())?;
             tx.execute(
                 "DELETE FROM native_settings WHERE key=?1",
                 [format!("context:{}", session.id)],
@@ -1487,6 +1602,143 @@ mod tests {
         assert_eq!(
             store.sessions().unwrap()[0].provider_id.as_deref(),
             Some("thread-1")
+        );
+    }
+    #[test]
+    fn native_terminal_session_round_trips_and_survives_agent_settings_saves() {
+        use crate::surface::Surface;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("native.db");
+        let store = Store::open(&path).unwrap();
+        assert!(store.surface_supported());
+        let chat = store.create("claude", "/p").unwrap();
+        assert_eq!(chat.surface, Surface::Chat);
+        let tui = store
+            .create_with_surface("claude", "/p", Surface::Tui)
+            .unwrap();
+        assert_eq!(tui.surface, Surface::Tui);
+        assert_eq!(store.session_surface(tui.id).unwrap(), Surface::Tui);
+        assert_eq!(store.session_surface(chat.id).unwrap(), Surface::Chat);
+        // Later settings saves must not turn the terminal back into a chat.
+        let settings = crate::agent::Settings {
+            model: Some("opus".into()),
+            ..Default::default()
+        };
+        store.save_agent_settings(tui.id, &settings).unwrap();
+        store.save_agent_settings(chat.id, &settings).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let by_id: std::collections::HashMap<_, _> = store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.id, s))
+            .collect();
+        assert_eq!(by_id[&tui.id].surface, Surface::Tui);
+        assert_eq!(by_id[&chat.id].surface, Surface::Chat);
+        assert_eq!(
+            store.agent_settings(tui.id).unwrap().unwrap().model,
+            Some("opus".into())
+        );
+    }
+
+    #[test]
+    fn native_terminal_session_is_listed_only_with_a_conversation_id() {
+        use crate::surface::Surface;
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let tui = store
+            .create_with_surface("claude", "/p", Surface::Tui)
+            .unwrap();
+        let chat = store.create("claude", "/p").unwrap();
+        let has_messages = |id| {
+            store
+                .sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .has_messages
+        };
+        assert!(!has_messages(tui.id));
+        store.provider_id(tui.id, "  ").unwrap();
+        assert!(!has_messages(tui.id));
+        store.set_terminal_conversation(tui.id, "conv-1").unwrap();
+        assert!(has_messages(tui.id));
+        assert_eq!(
+            store
+                .sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == tui.id)
+                .unwrap()
+                .provider_id
+                .as_deref(),
+            Some("conv-1")
+        );
+        // A provider id alone never lists an empty chat.
+        store.provider_id(chat.id, "conv-2").unwrap();
+        assert!(!has_messages(chat.id));
+        assert!(store.set_terminal_conversation(chat.id, "conv-2").is_err());
+        assert!(store.set_terminal_conversation(tui.id, "  ").is_err());
+    }
+
+    #[test]
+    fn native_rows_without_a_stored_surface_read_as_chat() {
+        use crate::surface::Surface;
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let session = store.create("codex", "/p").unwrap();
+        store
+            .save_setting(&format!("agent:{}", session.id), "invalid json")
+            .unwrap();
+        assert_eq!(store.session_surface(session.id).unwrap(), Surface::Chat);
+        assert_eq!(store.sessions().unwrap()[0].surface, Surface::Chat);
+        store
+            .save_setting(&format!("agent:{}", session.id), r#"{"surface":"bogus"}"#)
+            .unwrap();
+        assert_eq!(store.sessions().unwrap()[0].surface, Surface::Chat);
+    }
+    #[test]
+    fn native_terminal_surface_survives_detaching_its_worktree() {
+        use crate::surface::Surface;
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let tui = store
+            .create_with_surface("claude", "/project-worktrees/feature", Surface::Tui)
+            .unwrap();
+        let chat = store
+            .create("claude", "/project-worktrees/feature")
+            .unwrap();
+        let detached = store
+            .detach_worktree("/project-worktrees/feature", "/project")
+            .unwrap();
+        assert_eq!(detached.len(), 2);
+        assert_eq!(store.session_surface(tui.id).unwrap(), Surface::Tui);
+        assert_eq!(store.session_surface(chat.id).unwrap(), Surface::Chat);
+        let sessions = store.sessions().unwrap();
+        let find = |id| sessions.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(find(tui.id).surface, Surface::Tui);
+        assert_eq!(find(tui.id).cwd, "/project");
+        assert!(
+            store
+                .agent_settings(tui.id)
+                .unwrap()
+                .unwrap()
+                .worktree_removed
+        );
+    }
+
+    #[test]
+    fn native_terminal_conversation_id_is_stored_trimmed() {
+        use crate::surface::Surface;
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let tui = store
+            .create_with_surface("claude", "/p", Surface::Tui)
+            .unwrap();
+        store
+            .set_terminal_conversation(tui.id, "  conv-1\n")
+            .unwrap();
+        assert_eq!(
+            store.sessions().unwrap()[0].provider_id.as_deref(),
+            Some("conv-1")
         );
     }
 }

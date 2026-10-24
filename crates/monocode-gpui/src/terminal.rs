@@ -21,7 +21,16 @@ use gpui::{
     ScrollWheelEvent, ShapedLine, SharedString, Size, StrikethroughStyle, Style, Task, TextAlign,
     TextRun, UnderlineStyle, Window, actions, div, point, prelude::*, px, rgb, size,
 };
-use std::{borrow::Cow, cell::Cell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    cell::Cell,
+    collections::HashMap,
+    ffi::OsString,
+    path::Path,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 actions!(
     terminal,
@@ -77,10 +86,29 @@ impl Dimensions for GridSize {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TerminalEvent {
     /// Title, foreground process or running state changed.
     Changed,
+    /// A launched program is running. Only `Terminal::launch` emits the rest,
+    /// from the event task, so subscribe right after creating the entity.
+    Started { at: Instant },
+    /// The launched program ended, or never started (`error`, no `code`).
+    /// `tail` is the last `TAIL_CHARS` of grid text as the user saw it,
+    /// without the `[process exited]` note.
+    Exited {
+        code: Option<i32>,
+        error: Option<String>,
+        tail: String,
+    },
+    /// The CLI set its window title (raw, not cleaned); repeats are dropped.
+    Title(String),
 }
+
+/// Exit tails and `Terminal::text` keep this many trailing characters.
+const TAIL_CHARS: usize = 4000;
+/// A program that ignores the hangup gets SIGKILL after this long.
+const KILL_ESCALATE: Duration = Duration::from_secs(1);
 
 /// Where the grid was painted, for mapping the pointer to cells.
 #[derive(Clone, Copy, Default)]
@@ -103,13 +131,29 @@ pub(crate) struct Terminal {
     geometry: Rc<Cell<Option<Geometry>>>,
     master_fd: i32,
     shell_pid: u32,
+    /// Created by `launch`: reports start, title and exit instead of a shell prompt.
+    launched: bool,
+    /// When the launched program started.
+    pub started_at: Option<Instant>,
+    spawn_error: Option<String>,
+    /// `ChildExit` waits for `Exit`, which follows the final output drain.
+    child_code: Option<Option<i32>>,
+    last_title: Option<String>,
+    /// Lets `process::shutdown_all` reap the launched program on quit.
+    registration: Option<monocode_core::process::Registration>,
+    #[cfg(test)]
+    launch_spec: Option<LaunchSpec>,
     selecting: bool,
     selection_pointer: Option<gpui::Point<gpui::Pixels>>,
     selection_scroll: Option<Task<()>>,
     scroll_remainder: f32,
     pub(crate) visible: bool,
+    /// Has the keyboard (tracked from the first draw); a relaunch hands it on.
+    focused: bool,
+    _focus_watch: Vec<gpui::Subscription>,
     _events: Task<()>,
-    _poll: Task<()>,
+    /// The dock's foreground poll; a launched program has no shell to watch.
+    _poll: Option<Task<()>>,
 }
 impl EventEmitter<TerminalEvent> for Terminal {}
 impl Focusable for Terminal {
@@ -124,10 +168,118 @@ struct Spawned {
     master_fd: i32,
     shell_pid: u32,
     events: async_channel::Receiver<TermEvent>,
+    /// Why the program could not start (also written into the grid).
+    error: Option<String>,
 }
-/// Start the login shell on a PTY with TerminalView's environment. A failure
-/// is written into the grid, as TerminalView prints it.
-fn spawn(cwd: &str, size: GridSize, id: u64) -> Spawned {
+/// What runs on the PTY: the login shell, or a program launched by a session.
+struct Plan {
+    program: String,
+    args: Vec<String>,
+    /// Set on top of the base environment.
+    env: Vec<(String, String)>,
+    /// Read the output left in the PTY after the child exits.
+    drain: bool,
+    /// Names the program in the "could not start" note.
+    label: String,
+    /// The real program when it runs under the `env` wrapper: `env` would
+    /// start fine and then exit 127, so it is checked before spawning.
+    verify: Option<String>,
+}
+impl Plan {
+    fn shell() -> Self {
+        let (program, args) = default_shell();
+        Self {
+            program,
+            args,
+            env: Vec::new(),
+            drain: false,
+            label: "the shell".into(),
+            verify: None,
+        }
+    }
+    fn launch(
+        program: OsString,
+        args: Vec<OsString>,
+        env: Vec<(String, OsString)>,
+        remove: &[&str],
+    ) -> Self {
+        let label = program.to_string_lossy().into_owned();
+        let verify = (cfg!(unix) && !remove.is_empty()).then(|| label.clone());
+        let (program, args) = wrap_removals(program, args, remove);
+        Self {
+            program: lossy(program),
+            args: args.into_iter().map(lossy).collect(),
+            env: env.into_iter().map(|(k, v)| (k, lossy(v))).collect(),
+            // The last words a CLI prints before it dies are the exit tail.
+            drain: true,
+            label,
+            verify,
+        }
+    }
+}
+fn lossy(value: OsString) -> String {
+    value
+        .into_string()
+        .unwrap_or_else(|value| value.to_string_lossy().into_owned())
+}
+/// alacritty's `tty::Options` cannot remove a variable, so the program runs
+/// under `env -u KEY -- program` (which then execs it, keeping the pid).
+/// Windows only sets. A program name containing `=` cannot be expressed through
+/// `env`; resolved CLI paths never contain one.
+fn wrap_removals(
+    program: OsString,
+    args: Vec<OsString>,
+    remove: &[&str],
+) -> (OsString, Vec<OsString>) {
+    if !cfg!(unix) || remove.is_empty() {
+        return (program, args);
+    }
+    let mut wrapped = Vec::with_capacity(remove.len() * 2 + args.len() + 1);
+    for key in remove {
+        wrapped.push(OsString::from("-u"));
+        wrapped.push(OsString::from(key));
+    }
+    wrapped.push(OsString::from("--"));
+    wrapped.push(program);
+    wrapped.extend(args);
+    (OsString::from("/usr/bin/env"), wrapped)
+}
+/// What `execvp` would say about `program`: not found on the child's PATH (or
+/// at the given path), or found but not executable.
+#[cfg(unix)]
+fn program_problem(program: &str, path: &str, workdir: &Path) -> Option<std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+    let candidates: Vec<std::path::PathBuf> = if program.contains('/') {
+        vec![workdir.join(program)]
+    } else {
+        std::env::split_paths(path)
+            .map(|dir| dir.join(program))
+            .collect()
+    };
+    let mut denied = false;
+    for candidate in candidates {
+        if let Ok(meta) = std::fs::metadata(&candidate)
+            && meta.is_file()
+        {
+            if meta.permissions().mode() & 0o111 != 0 {
+                return None;
+            }
+            denied = true;
+        }
+    }
+    Some(std::io::Error::from_raw_os_error(if denied {
+        libc::EACCES
+    } else {
+        libc::ENOENT
+    }))
+}
+#[cfg(not(unix))]
+fn program_problem(_: &str, _: &str, _: &Path) -> Option<std::io::Error> {
+    None
+}
+/// Start `plan` on a PTY with TerminalView's environment. A failure is
+/// written into the grid, as TerminalView prints it.
+fn spawn(cwd: &str, size: GridSize, id: u64, plan: Plan) -> Spawned {
     let (tx, rx) = async_channel::unbounded();
     let listener = Listener(tx);
     let config = Config {
@@ -140,7 +292,6 @@ fn spawn(cwd: &str, size: GridSize, id: u64) -> Spawned {
     };
     let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
     let workdir = working_dir(cwd);
-    let (program, args) = default_shell();
     let mut env = HashMap::new();
     for (key, value) in [
         ("TERM", "xterm-256color".to_owned()),
@@ -152,8 +303,13 @@ fn spawn(cwd: &str, size: GridSize, id: u64) -> Spawned {
     ] {
         env.insert(key.to_owned(), value);
     }
+    env.extend(plan.env);
+    let problem = plan
+        .verify
+        .as_deref()
+        .and_then(|program| program_problem(program, &env["PATH"], &workdir));
     let options = tty::Options {
-        shell: Some(tty::Shell::new(program, args)),
+        shell: Some(tty::Shell::new(plan.program, plan.args)),
         working_directory: Some(workdir),
         drain_on_exit: false,
         env,
@@ -168,7 +324,12 @@ fn spawn(cwd: &str, size: GridSize, id: u64) -> Spawned {
     };
     let mut master_fd = -1;
     let mut shell_pid = 0;
-    let sender = match tty::new(&options, window, id) {
+    let mut failure = None;
+    let started = match problem {
+        Some(error) => Err(error),
+        None => tty::new(&options, window, id),
+    };
+    let sender = match started {
         Ok(pty) => {
             #[cfg(unix)]
             {
@@ -176,7 +337,7 @@ fn spawn(cwd: &str, size: GridSize, id: u64) -> Spawned {
                 master_fd = pty.file().as_raw_fd();
                 shell_pid = pty.child().id();
             }
-            match EventLoop::new(term.clone(), listener, pty, false, false) {
+            match EventLoop::new(term.clone(), listener, pty, plan.drain, false) {
                 Ok(event_loop) => {
                     let sender = event_loop.channel();
                     event_loop.spawn();
@@ -184,6 +345,7 @@ fn spawn(cwd: &str, size: GridSize, id: u64) -> Spawned {
                 }
                 Err(error) => {
                     write_note(&term, &format!("\x1b[31m{error}\x1b[0m"));
+                    failure = Some(error.to_string());
                     None
                 }
             }
@@ -191,8 +353,9 @@ fn spawn(cwd: &str, size: GridSize, id: u64) -> Spawned {
         Err(error) => {
             write_note(
                 &term,
-                &format!("\x1b[31mCould not start the shell: {error}\x1b[0m"),
+                &format!("\x1b[31mCould not start {}: {error}\x1b[0m", plan.label),
             );
+            failure = Some(error.to_string());
             None
         }
     };
@@ -202,6 +365,7 @@ fn spawn(cwd: &str, size: GridSize, id: u64) -> Spawned {
         master_fd,
         shell_pid,
         events: rx,
+        error: failure,
     }
 }
 
@@ -214,29 +378,89 @@ fn detached(size: GridSize) -> Spawned {
         master_fd: -1,
         shell_pid: 0,
         events: rx,
+        error: None,
     }
 }
 
+/// What `Terminal::launch` was asked to run, kept so tests can assert on it.
+#[cfg(test)]
+pub(crate) struct LaunchSpec {
+    pub program: OsString,
+    pub args: Vec<OsString>,
+    pub env_set: Vec<(String, OsString)>,
+    pub env_remove: Vec<&'static str>,
+}
+
+const GRID: GridSize = GridSize {
+    columns: 80,
+    lines: 24,
+};
+
 impl Terminal {
     pub(crate) fn new(cwd: String, cx: &mut Context<Self>) -> Self {
-        let size = GridSize {
-            columns: 80,
-            lines: 24,
+        let spawned = if cfg!(test) {
+            // GPUI's deterministic test scheduler rejects wakeups from the
+            // PTY thread; UI tests run the dock without a shell behind it.
+            detached(GRID)
+        } else {
+            spawn(&cwd, GRID, cx.entity_id().as_u64(), Plan::shell())
         };
+        Self::build(cwd, spawned, false, cx)
+    }
+
+    /// Run `program` instead of the login shell, with the dock's base
+    /// environment. `env_set` is added and `env_remove` removed (on unix by an
+    /// `env -u` wrapper). The directory falls back to home when missing.
+    /// Reports `Started`, `Title` and `Exited`; tests fake these with the
+    /// `fake_*` methods since GPUI tests cannot run a PTY.
+    pub(crate) fn launch(
+        cwd: &Path,
+        program: OsString,
+        args: Vec<OsString>,
+        env_set: Vec<(String, OsString)>,
+        env_remove: Vec<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        #[cfg(test)]
+        let spec = LaunchSpec {
+            program: program.clone(),
+            args: args.clone(),
+            env_set: env_set.clone(),
+            env_remove: env_remove.clone(),
+        };
+        let cwd = cwd.to_string_lossy().into_owned();
+        let plan = Plan::launch(program, args, env_set, &env_remove);
+        let spawned = if cfg!(test) {
+            detached(GRID)
+        } else {
+            spawn(&cwd, GRID, cx.entity_id().as_u64(), plan)
+        };
+        let mut terminal = Self::build(cwd, spawned, true, cx);
+        if terminal.shell_pid > 1 {
+            terminal.registration = Some(monocode_core::process::track(terminal.shell_pid));
+        }
+        #[cfg(test)]
+        {
+            terminal.launch_spec = Some(spec);
+        }
+        terminal
+    }
+
+    fn build(cwd: String, spawned: Spawned, launched: bool, cx: &mut Context<Self>) -> Self {
+        let size = GRID;
         let Spawned {
             term,
             sender,
             master_fd,
             shell_pid,
             events: rx,
-        } = if cfg!(test) {
-            // GPUI's deterministic test scheduler rejects wakeups from the
-            // PTY thread; UI tests run the dock without a shell behind it.
-            detached(size)
-        } else {
-            spawn(&cwd, size, cx.entity_id().as_u64())
-        };
+            error,
+        } = spawned;
         let events = cx.spawn(async move |this, cx| {
+            // Not in the constructor: nobody has subscribed yet.
+            if launched && !cfg!(test) {
+                let _ = this.update(cx, |this, cx| this.announce_launch(cx));
+            }
             while let Ok(event) = rx.recv().await {
                 // Output arrives in bursts; one repaint covers the burst.
                 let mut batch = vec![event];
@@ -256,28 +480,30 @@ impl Terminal {
             }
         });
         // TerminalView's 1s foreground poll; a hidden dock has no title to paint.
-        let poll = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                let Ok(Some((fd, pid))) = this.update(cx, |this, _| {
-                    (this.visible && !this.exited).then_some((this.master_fd, this.shell_pid))
-                }) else {
-                    if this.update(cx, |_, _| ()).is_err() {
+        let poll = (!launched).then(|| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let Ok(Some((fd, pid))) = this.update(cx, |this, _| {
+                        (this.visible && !this.exited).then_some((this.master_fd, this.shell_pid))
+                    }) else {
+                        if this.update(cx, |_, _| ()).is_err() {
+                            break;
+                        }
+                        continue;
+                    };
+                    let label = cx
+                        .background_executor()
+                        .spawn(async move { foreground_label(fd, pid) })
+                        .await;
+                    if this
+                        .update(cx, |this, cx| this.set_foreground(label, cx))
+                        .is_err()
+                    {
                         break;
                     }
-                    continue;
-                };
-                let label = cx
-                    .background_executor()
-                    .spawn(async move { foreground_label(fd, pid) })
-                    .await;
-                if this
-                    .update(cx, |this, cx| this.set_foreground(label, cx))
-                    .is_err()
-                {
-                    break;
                 }
-            }
+            })
         });
         Self {
             term,
@@ -291,11 +517,21 @@ impl Terminal {
             geometry: Rc::default(),
             master_fd,
             shell_pid,
+            launched,
+            started_at: None,
+            spawn_error: error,
+            child_code: None,
+            last_title: None,
+            registration: None,
+            #[cfg(test)]
+            launch_spec: None,
             selecting: false,
             selection_pointer: None,
             selection_scroll: None,
             scroll_remainder: 0.,
             visible: true,
+            focused: false,
+            _focus_watch: Vec::new(),
             _events: events,
             _poll: poll,
         }
@@ -334,19 +570,79 @@ impl Terminal {
                     .unwrap_or_default();
                 self.write(format(&text).into_bytes());
             }
-            TermEvent::ChildExit(status) => {
-                let code = status.code().map(|c| format!(" ({c})")).unwrap_or_default();
-                write_note(&self.term, &format!("\r\n[process exited{code}]"));
-                self.finish(cx);
+            TermEvent::ChildExit(status) => self.child_exited(status.code(), cx),
+            TermEvent::Exit if self.launched => {
+                let code = self.child_code.take().flatten();
+                self.finish_launch(code, None, cx);
             }
             TermEvent::Exit => self.finish(cx),
+            TermEvent::Title(title) if self.launched => {
+                if self.last_title.as_deref() != Some(&title) {
+                    self.last_title = Some(title.clone());
+                    cx.emit(TerminalEvent::Title(title));
+                }
+            }
             TermEvent::Title(_) | TermEvent::ResetTitle | TermEvent::Bell => {}
+        }
+    }
+    fn child_exited(&mut self, code: Option<i32>, cx: &mut Context<Self>) {
+        if self.launched {
+            // The output still in the PTY is read before `Exit` follows; the
+            // tail and the note wait for it.
+            self.child_code = Some(code);
+        } else {
+            write_note(&self.term, &Self::exit_note(code));
+            self.finish(cx);
+        }
+    }
+    fn exit_note(code: Option<i32>) -> String {
+        let code = code.map(|c| format!(" ({c})")).unwrap_or_default();
+        format!("\r\n[process exited{code}]")
+    }
+    fn announce_launch(&mut self, cx: &mut Context<Self>) {
+        match self.spawn_error.take() {
+            Some(error) => self.finish_launch(None, Some(error), cx),
+            None => self.start(cx),
+        }
+    }
+    fn start(&mut self, cx: &mut Context<Self>) {
+        let at = Instant::now();
+        self.started_at = Some(at);
+        cx.emit(TerminalEvent::Started { at });
+    }
+    /// A launched program ended or never started: report it once.
+    fn finish_launch(&mut self, code: Option<i32>, error: Option<String>, cx: &mut Context<Self>) {
+        if self.exited {
+            return;
+        }
+        let tail = tail(&grid_text(&self.term.lock()));
+        if error.is_none() {
+            write_note(&self.term, &Self::exit_note(code));
+        }
+        self.finish(cx);
+        cx.emit(TerminalEvent::Exited { code, error, tail });
+    }
+    /// The keyboard is here (tracked from the first draw).
+    pub(crate) fn has_focus(&self) -> bool {
+        self.focused
+    }
+    /// The grid as plain text (history included), last `TAIL_CHARS` characters.
+    #[cfg(test)]
+    pub(crate) fn text(&self) -> String {
+        tail(&grid_text(&self.term.lock()))
+    }
+    /// SIGHUP and SIGTERM to the program and its group, SIGKILL a second later
+    /// if it is still there. Never blocks; `Exited` follows when it dies.
+    pub(crate) fn kill(&self) {
+        if !self.exited {
+            terminate(self.shell_pid);
         }
     }
     fn finish(&mut self, cx: &mut Context<Self>) {
         if !self.exited {
             self.exited = true;
             self.sender = None;
+            self.registration = None;
             self.set_foreground(None, cx);
             cx.emit(TerminalEvent::Changed);
         }
@@ -601,10 +897,52 @@ impl Terminal {
         }
     }
 }
+/// The spawner seam: a launched terminal in a GPUI test has no process, and
+/// these play what the PTY thread and the child would do, through the real
+/// handlers.
+#[cfg(test)]
+impl Terminal {
+    pub(crate) fn launched(&self) -> Option<&LaunchSpec> {
+        self.launch_spec.as_ref()
+    }
+    /// The program started.
+    pub(crate) fn fake_started(&mut self, cx: &mut Context<Self>) {
+        self.start(cx);
+    }
+    /// The program printed `text` (ANSI and CRLF as a PTY would send them).
+    pub(crate) fn fake_output(&mut self, text: &str, cx: &mut Context<Self>) {
+        write_note(&self.term, text);
+        cx.notify();
+    }
+    pub(crate) fn fake_title(&mut self, title: &str, cx: &mut Context<Self>) {
+        self.on_event(TermEvent::Title(title.into()), cx);
+    }
+    /// The program ended (`None`: killed by a signal), as `ChildExit` then `Exit`.
+    pub(crate) fn fake_exit(&mut self, code: Option<i32>, cx: &mut Context<Self>) {
+        self.child_exited(code, cx);
+        self.on_event(TermEvent::Exit, cx);
+    }
+    /// The program could not be started.
+    pub(crate) fn fake_spawn_error(&mut self, error: &str, cx: &mut Context<Self>) {
+        let program = self
+            .launch_spec
+            .as_ref()
+            .map(|spec| spec.program.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        write_note(&self.term, &format!("Could not start {program}: {error}"));
+        self.spawn_error = Some(error.to_owned());
+        self.announce_launch(cx);
+    }
+}
+
 impl Drop for Terminal {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(Msg::Shutdown);
+        }
+        if self.launched {
+            self.kill();
+            return;
         }
         // The hangup a closing shell expects, for it and its job.
         #[cfg(unix)]
@@ -621,6 +959,22 @@ impl Drop for Terminal {
 impl Render for Terminal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
+        self.focused = focused;
+        // Tracked from the first draw on, so `has_focus` is right even while this
+        // view is cached and not drawn again.
+        if self._focus_watch.is_empty() {
+            let focus = self.focus.clone();
+            self._focus_watch = vec![
+                cx.on_focus_in(&focus, window, |this, _, cx| {
+                    this.focused = true;
+                    cx.notify();
+                }),
+                cx.on_blur(&focus, window, |this, _, cx| {
+                    this.focused = false;
+                    cx.notify();
+                }),
+            ];
+        }
         div()
             .id("terminal")
             .key_context("Terminal")
@@ -1196,6 +1550,75 @@ pub(crate) fn key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
     Some(text.as_bytes().to_vec())
 }
 
+/// Signal the program and its process group; escalate off the calling thread.
+#[cfg(unix)]
+fn terminate(pid: u32) {
+    if pid <= 1 {
+        return;
+    }
+    let pid = pid as i32;
+    let signal = move |sig: i32| unsafe {
+        libc::kill(pid, sig);
+        libc::kill(-pid, sig);
+    };
+    let alive = move || unsafe { libc::kill(pid, 0) == 0 || libc::kill(-pid, 0) == 0 };
+    signal(libc::SIGHUP);
+    signal(libc::SIGTERM);
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + KILL_ESCALATE;
+        while Instant::now() < deadline {
+            if !alive() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if alive() {
+            signal(libc::SIGKILL);
+        }
+    });
+}
+#[cfg(not(unix))]
+fn terminate(_: u32) {}
+
+/// The last `TAIL_CHARS` characters.
+fn tail(text: &str) -> String {
+    let skip = text.chars().count().saturating_sub(TAIL_CHARS);
+    text.chars().skip(skip).collect()
+}
+/// Everything in the grid, scrollback included, as the user read it: no styling,
+/// no padding, rows joined unless the line wrapped, trailing blank rows dropped.
+fn grid_text(term: &Term<Listener>) -> String {
+    let grid = term.grid();
+    let mut out = String::new();
+    for line in grid.topmost_line().0..=grid.bottommost_line().0 {
+        let row = &grid[alacritty_terminal::index::Line(line)];
+        let mut text = String::new();
+        for column in 0..grid.columns() {
+            let cell = &row[Column(column)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            text.push(cell.c);
+            for &mark in cell.zerowidth().unwrap_or_default() {
+                text.push(mark);
+            }
+        }
+        let wrapped = row[Column(grid.columns() - 1)]
+            .flags
+            .contains(Flags::WRAPLINE);
+        if wrapped {
+            out.push_str(&text);
+        } else {
+            out.push_str(text.trim_end());
+            out.push('\n');
+        }
+    }
+    out.trim_end().to_owned()
+}
+
 fn default_title(cwd: &str) -> String {
     let name = std::path::Path::new(cwd)
         .file_name()
@@ -1455,6 +1878,328 @@ mod tests {
         assert_eq!(hex(color_rgb(258, &colors)), ACCENT);
     }
 
+    fn collect(events: &Rc<std::cell::RefCell<Vec<TerminalEvent>>>) -> Vec<TerminalEvent> {
+        events.borrow().clone()
+    }
+    fn launched_terminal(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Terminal>, Rc<std::cell::RefCell<Vec<TerminalEvent>>>) {
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let terminal = cx.new(|cx| {
+            Terminal::launch(
+                Path::new("/tmp"),
+                "/bin/claude".into(),
+                vec!["--resume".into(), "abc".into()],
+                vec![("CLAUDE_CONFIG_DIR".into(), "/acct".into())],
+                vec!["ANTHROPIC_API_KEY"],
+                cx,
+            )
+        });
+        let sink = events.clone();
+        cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, event: &TerminalEvent, _| {
+                sink.borrow_mut().push(event.clone())
+            })
+            .detach()
+        });
+        (terminal, events)
+    }
+    #[gpui::test]
+    fn a_launch_reports_start_title_and_exit_with_the_screen_tail(cx: &mut gpui::TestAppContext) {
+        let (terminal, events) = launched_terminal(cx);
+        terminal.update(cx, |t, cx| {
+            let spec = t.launched().expect("the launch is recorded");
+            assert_eq!(spec.program, OsString::from("/bin/claude"));
+            assert_eq!(spec.args, ["--resume", "abc"].map(OsString::from));
+            assert_eq!(spec.env_remove, ["ANTHROPIC_API_KEY"]);
+            assert_eq!(
+                spec.env_set,
+                [("CLAUDE_CONFIG_DIR".to_owned(), OsString::from("/acct"))]
+            );
+            t.fake_started(cx);
+            t.fake_title("  Fix the bug", cx);
+            t.fake_title("  Fix the bug", cx);
+            t.fake_output("\x1b[31mno conversation\x1b[0m found\r\n", cx);
+            t.fake_exit(Some(3), cx);
+            assert!(t.exited);
+            assert_eq!(t.text(), "no conversation found\n\n[process exited (3)]");
+            // A late exit changes nothing.
+            t.fake_exit(Some(9), cx);
+        });
+        let seen = collect(&events);
+        assert!(matches!(seen[0], TerminalEvent::Started { .. }), "{seen:?}");
+        assert_eq!(seen[1], TerminalEvent::Title("  Fix the bug".into()));
+        let exits: Vec<_> = seen
+            .iter()
+            .filter(|e| matches!(e, TerminalEvent::Exited { .. }))
+            .collect();
+        assert_eq!(
+            exits,
+            [&TerminalEvent::Exited {
+                code: Some(3),
+                error: None,
+                tail: "no conversation found".into()
+            }]
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|e| matches!(e, TerminalEvent::Title(_)))
+                .count(),
+            1,
+            "a repeated title is not forwarded twice"
+        );
+    }
+    #[gpui::test]
+    fn a_spawn_error_is_reported_as_an_exit_without_a_start(cx: &mut gpui::TestAppContext) {
+        let (terminal, events) = launched_terminal(cx);
+        terminal.update(cx, |t, cx| t.fake_spawn_error("No such file", cx));
+        let seen = collect(&events);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::Started { .. }))
+        );
+        assert!(seen.contains(&TerminalEvent::Exited {
+            code: None,
+            error: Some("No such file".into()),
+            tail: "Could not start /bin/claude: No such file".into(),
+        }));
+        terminal.update(cx, |t, _| {
+            assert!(t.exited);
+            // Nothing to kill, and no panic.
+            t.kill();
+        });
+    }
+    #[gpui::test]
+    fn the_dock_terminal_forwards_no_title_and_no_exit_details(cx: &mut gpui::TestAppContext) {
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let terminal = cx.new(|cx| Terminal::new("/tmp".into(), cx));
+        let sink = events.clone();
+        cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, event: &TerminalEvent, _| {
+                sink.borrow_mut().push(event.clone())
+            })
+            .detach()
+        });
+        terminal.update(cx, |t, cx| {
+            t.on_event(TermEvent::Title("vim".into()), cx);
+            t.on_event(TermEvent::Exit, cx);
+        });
+        assert_eq!(collect(&events), [TerminalEvent::Changed]);
+        assert!(terminal.read_with(cx, |t, _| t.exited));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_removal_wraps_the_program_in_env_dash_u() {
+        let (program, args) = wrap_removals(
+            "/bin/claude".into(),
+            vec!["--resume".into(), "abc".into()],
+            &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+        );
+        assert_eq!(program, OsString::from("/usr/bin/env"));
+        assert_eq!(
+            args,
+            [
+                "-u",
+                "ANTHROPIC_API_KEY",
+                "-u",
+                "OPENAI_API_KEY",
+                "--",
+                "/bin/claude",
+                "--resume",
+                "abc"
+            ]
+            .map(OsString::from)
+        );
+        // Nothing to remove, nothing wrapped.
+        let (program, args) = wrap_removals("/bin/claude".into(), vec!["x".into()], &[]);
+        assert_eq!(program, OsString::from("/bin/claude"));
+        assert_eq!(args, [OsString::from("x")]);
+    }
+    #[test]
+    fn the_exit_tail_is_the_last_4000_characters() {
+        assert_eq!(tail("short"), "short");
+        let long = format!("{}{}", "a".repeat(100), "b".repeat(TAIL_CHARS));
+        assert_eq!(tail(&long), "b".repeat(TAIL_CHARS));
+        // Counted in characters, never cutting inside one.
+        let wide = "é".repeat(TAIL_CHARS + 5);
+        assert_eq!(tail(&wide).chars().count(), TAIL_CHARS);
+    }
+    #[test]
+    fn grid_text_is_what_the_user_saw_without_styling_or_padding() {
+        let size = GridSize {
+            columns: 10,
+            lines: 4,
+        };
+        let spawned = detached(size);
+        write_note(
+            &spawned.term,
+            "\x1b[31mred\x1b[0m line\r\nsecond   \r\n\r\n0123456789ABCDE\r\n",
+        );
+        // History is part of the text: the row scrolled off the top stays.
+        write_note(&spawned.term, "tail\r\nmore\r\n");
+        let text = grid_text(&spawned.term.lock());
+        assert_eq!(text, "red line\nsecond\n\n0123456789ABCDE\ntail\nmore");
+    }
+
+    /// Runs a real program on a PTY; a plain test because GPUI's test scheduler
+    /// refuses wakeups from the PTY thread.
+    #[cfg(unix)]
+    fn run_program(
+        program: &str,
+        args: &[&str],
+        remove: &[&'static str],
+    ) -> (String, Vec<TermEvent>) {
+        let plan = Plan::launch(
+            program.into(),
+            args.iter().map(OsString::from).collect(),
+            Vec::new(),
+            remove,
+        );
+        let size = GridSize {
+            columns: 60,
+            lines: 10,
+        };
+        let spawned = spawn("/tmp", size, 2, plan);
+        assert!(spawned.error.is_none(), "{:?}", spawned.error);
+        assert!(spawned.shell_pid > 1);
+        let mut events = Vec::new();
+        for _ in 0..500 {
+            match spawned.events.try_recv() {
+                Ok(event) => {
+                    let done = matches!(event, TermEvent::Exit);
+                    events.push(event);
+                    if done {
+                        break;
+                    }
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        (grid_text(&spawned.term.lock()), events)
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_launched_program_reports_its_exit_code_and_last_output() {
+        let (text, events) = run_program("/bin/sh", &["-c", "echo goodbye; exit 7"], &[]);
+        let code = events.iter().find_map(|e| match e {
+            TermEvent::ChildExit(status) => Some(status.code()),
+            _ => None,
+        });
+        assert_eq!(code, Some(Some(7)), "{events:?}");
+        // The final output is drained before Exit, so the tail has it.
+        assert!(matches!(events.last(), Some(TermEvent::Exit)));
+        assert_eq!(text, "goodbye");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn removed_env_vars_are_gone_in_the_launched_program() {
+        // HOME is always set by the PTY, so its removal is observable.
+        let (text, _) = run_program("/bin/sh", &["-c", "echo \"[${HOME-unset}]\""], &["HOME"]);
+        assert_eq!(text, "[unset]");
+        let (text, _) = run_program("/bin/sh", &["-c", "echo \"[${HOME-unset}]\""], &[]);
+        assert_ne!(text, "[unset]");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_program_is_a_spawn_error() {
+        let plan = Plan::launch(
+            "/nonexistent/monoptah-cli".into(),
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        let size = GridSize {
+            columns: 40,
+            lines: 5,
+        };
+        let spawned = spawn("/tmp", size, 3, plan);
+        assert!(spawned.sender.is_none());
+        let error = spawned.error.expect("spawn failed");
+        assert!(error.contains("No such file"), "{error}");
+        assert!(
+            grid_text(&spawned.term.lock())
+                .starts_with("Could not start /nonexistent/monoptah-cli")
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_program_is_a_spawn_error_even_under_the_env_wrapper() {
+        for program in ["/nonexistent/monoptah-cli", "monoptah-no-such-cli"] {
+            let plan = Plan::launch(
+                program.into(),
+                vec!["--resume".into()],
+                Vec::new(),
+                &["ANTHROPIC_API_KEY"],
+            );
+            // The wrapper would start fine and exit 127.
+            assert_eq!(plan.program, "/usr/bin/env");
+            let size = GridSize {
+                columns: 80,
+                lines: 5,
+            };
+            let spawned = spawn("/tmp", size, 4, plan);
+            assert!(spawned.sender.is_none() && spawned.shell_pid == 0);
+            let error = spawned.error.expect("reported as a spawn error");
+            assert!(error.contains("No such file"), "{error}");
+            let text = grid_text(&spawned.term.lock());
+            assert!(
+                text.starts_with(&format!("Could not start {program}:")),
+                "{text}"
+            );
+            assert!(!text.contains("/usr/bin/env"), "{text}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn program_lookup_follows_execvp() {
+        let tmp = std::env::temp_dir().join(format!("monoptah-lookup-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let plain = tmp.join("plain");
+        std::fs::write(&plain, "x").unwrap();
+        let path = "/nonexistent:/bin";
+        assert!(program_problem("sh", path, &tmp).is_none());
+        assert!(program_problem("/bin/sh", "", &tmp).is_none());
+        let missing = program_problem("nope-cli", path, &tmp).unwrap();
+        assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+        // A directory is not a program.
+        let dir = program_problem("/bin", "", &tmp).unwrap();
+        assert_eq!(dir.raw_os_error(), Some(libc::ENOENT));
+        let denied = program_problem(plain.to_str().unwrap(), "", &tmp).unwrap();
+        assert_eq!(denied.raw_os_error(), Some(libc::EACCES));
+        // A relative path is taken from the working directory.
+        assert_eq!(
+            program_problem("./plain", "/bin", &tmp)
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn kill_escalates_to_sigkill_when_hangup_and_terminate_are_ignored() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' HUP TERM; sleep 30"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        terminate(child.id());
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "still alive");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(started.elapsed() >= Duration::from_millis(900));
+    }
+
     #[test]
     fn a_login_shell_runs_and_its_output_reaches_the_grid() {
         let dir = std::env::temp_dir().to_string_lossy().into_owned();
@@ -1462,7 +2207,7 @@ mod tests {
             columns: 60,
             lines: 10,
         };
-        let spawned = spawn(&dir, size, 1);
+        let spawned = spawn(&dir, size, 1, Plan::shell());
         let sender = spawned.sender.expect("the shell started");
         assert!(spawned.shell_pid > 1);
         let _ = sender.send(Msg::Input(Cow::Borrowed(b"printf 'mono%scode\\n' -\r")));

@@ -21,6 +21,7 @@ mod picker_preferences;
 mod project_rail;
 mod project_removal;
 mod project_settings;
+mod provider_prompt;
 mod quick_composer;
 mod quick_open;
 mod quit_gate;
@@ -37,8 +38,12 @@ mod settings;
 mod shortcuts;
 mod sidebar_list;
 mod sidebar_peek;
+#[cfg(test)]
+pub(crate) mod surface_tests;
 mod terminal_dock;
 mod title_tabs;
+mod tui_busy;
+mod tui_sessions;
 mod worktrees;
 
 use crate::{
@@ -59,6 +64,7 @@ use crate::{
     session_mark::{SessionMark, State as MarkState},
     terminal::{Terminal, TerminalEvent},
     theme::*,
+    tui_session::{TuiSession, runs_in_terminal},
     usage_footer::UsageFooter,
     workspace::{DockSide, TitleTab, VisitHistory, Workspace, project_name},
 };
@@ -69,7 +75,7 @@ use gpui::{
     StyleRefinement, Subscription, Window, WindowControlArea, actions, canvas, div, prelude::*, px,
     rgb, rgba,
 };
-use monocode_core::{provider::Kind, store::Session};
+use monocode_core::{provider::Kind, store::Session, surface::Surface};
 use session_groups::local_reminder_label;
 use std::{
     collections::{HashMap, HashSet},
@@ -564,10 +570,20 @@ pub(crate) struct Shell {
     store: Database,
     remote: Arc<monocode_core::remote::Connections>,
     remote_project_picker: Option<remote_projects::Open>,
+    /// The "Choose a provider" dialog a new session opens first when the default provider is a terminal.
+    provider_prompt: Option<provider_prompt::Prompt>,
+    /// The CLIs found installed; `None` until the first probe answers.
+    installed_providers: Option<Vec<Kind>>,
+    /// The database can store a terminal session (see `Store::surface_supported`).
+    surface_supported: bool,
     remote_refreshing: bool,
     remote_marks: HashMap<i64, (bool, bool)>,
     _remote_clock: gpui::Task<()>,
     sessions: HashMap<i64, Entity<Conversation>>,
+    /// Sessions that run as their provider's CLI. A session is in exactly one of
+    /// this map and `sessions`; a terminal session never gets a `Conversation`.
+    tui_sessions: HashMap<i64, Entity<TuiSession>>,
+    tui_events: HashMap<i64, Subscription>,
     /// Lightweight history index; only opened or previewed chats own GPUI entities.
     session_summaries: HashMap<i64, Session>,
     draft_sessions: HashSet<i64>,
@@ -648,6 +664,9 @@ pub(crate) struct Shell {
     window_active: bool,
     window_glass: Option<bool>,
     quit_prompted: bool,
+    /// Set only while a terminal's clean exit closes its last tab: the blank
+    /// session that replaces it is a chat, or the CLI would simply come back.
+    blank_is_chat: bool,
     quit_gate: quit_gate::QuitGate,
     quit_gate_timer: Option<gpui::Task<()>>,
     pub(crate) menu: Option<ShellMenu>,
@@ -919,10 +938,15 @@ impl Shell {
             store,
             remote,
             remote_project_picker: None,
+            provider_prompt: None,
+            installed_providers: None,
+            surface_supported: true,
             remote_refreshing: false,
             remote_marks: HashMap::new(),
             _remote_clock: remote_clock,
             sessions: HashMap::new(),
+            tui_sessions: HashMap::new(),
+            tui_events: HashMap::new(),
             session_summaries: HashMap::new(),
             draft_sessions: sidebar_metadata.drafts,
             history_recency: HashMap::new(),
@@ -993,6 +1017,7 @@ impl Shell {
             window_active: false,
             window_glass: None,
             quit_prompted: false,
+            blank_is_chat: false,
             quit_gate: Default::default(),
             quit_gate_timer: None,
             menu: None,
@@ -1072,6 +1097,9 @@ impl Shell {
         }
         this.observe_accounts(cx);
         this.observe_picker_preferences(cx);
+        this.watch_tui_hooks(cx);
+        this.probe_installed_providers(cx);
+        this.probe_surface_support(cx);
         let mono_owner = cx.weak_entity();
         let mono_active =
             this.workspace
@@ -1216,6 +1244,7 @@ impl Shell {
             });
         }
         self.trim_session_histories(&shown, cx);
+        self.sync_tui(&shown, cx);
     }
     fn add(&mut self, summary: Session, cx: &mut Context<Self>) {
         self.workspace.add_project(&summary.cwd);
@@ -1224,10 +1253,15 @@ impl Shell {
     /// Loading history must not turn every session directory into a rail project.
     fn add_loaded(&mut self, summary: Session, cx: &mut Context<Self>) {
         let id = summary.id;
-        if self.sessions.contains_key(&id) {
+        if self.sessions.contains_key(&id) || self.tui_sessions.contains_key(&id) {
             return;
         }
         self.session_summaries.insert(id, summary.clone());
+        // A terminal session never gets a conversation; its pane is made when shown.
+        if runs_in_terminal(&summary) {
+            self.ensure_tui(id, cx);
+            return;
+        }
         self.session_marks
             .insert(id, cx.new(|_| SessionMark::new(summary.provider.clone())));
         self.tab_marks
@@ -1320,24 +1354,44 @@ impl Shell {
     }
     fn refresh_session_mark(&mut self, id: i64, cx: &mut Context<Self>) {
         let id = self.workspace.session_for_pane(id);
-        let Some(view) = self.sessions.get(&id) else {
-            return;
-        };
-        let session = view.read(cx);
-        let busy = session.responding();
+        // A terminal session is busy while its CLI runs a turn; it has no
+        // approvals and no cancellation of its own.
+        let (busy, cancelling, attention, archived, provider) =
+            if let Some(view) = self.sessions.get(&id) {
+                let session = view.read(cx);
+                (
+                    session.responding(),
+                    session.busy,
+                    session.needs_approval(),
+                    session.summary.archived,
+                    session.summary.provider.clone(),
+                )
+            } else if let (Some(tui), Some(summary)) =
+                (self.tui_sessions.get(&id), self.session_summaries.get(&id))
+            {
+                (
+                    tui.read(cx).busy(),
+                    false,
+                    false,
+                    summary.archived,
+                    summary.provider.clone(),
+                )
+            } else {
+                return;
+            };
         let focused = !self.app_view_open() && self.workspace.active == Some(id);
         if busy {
             self.busy_sessions.insert(id);
             self.unseen_finished.remove(&id);
-        } else if session.busy {
+        } else if cancelling {
             // Explicit cancellation is already idle in the UI. The worker is
             // only finishing its save, so it must not announce a completed turn.
             self.busy_sessions.remove(&id);
             self.unseen_finished.remove(&id);
-        } else if self.busy_sessions.remove(&id) && !focused && !session.summary.archived {
+        } else if self.busy_sessions.remove(&id) && !focused && !archived {
             self.unseen_finished.insert(id);
         }
-        if focused || session.summary.archived {
+        if focused || archived {
             self.unseen_finished.remove(&id);
         }
         let state = if busy {
@@ -1348,13 +1402,11 @@ impl Shell {
             MarkState::Idle
         };
         // A blocked turn is still busy, but the tab asks for attention first.
-        let attention = session.needs_approval();
         let tab_state = if attention {
             MarkState::Attention
         } else {
             state
         };
-        let provider = session.summary.provider.clone();
         self.session_marks[&id].update(cx, |mark, cx| mark.set(&provider, state, cx));
         self.tab_marks[&id].update(cx, |mark, cx| mark.set(&provider, tab_state, cx));
         self.push_inbox_busy(cx);
@@ -1443,6 +1495,7 @@ impl Shell {
                 });
                 None
             };
+            // Always a chat: the app drives this session, whatever the surface preference.
             let mut summary = locked(&store)?.create(&transfer.target.provider, &transfer.cwd)?;
             summary.title = if transfer.kind == TransferKind::SecondOpinion {
                 "Second opinion".into()
@@ -1844,20 +1897,23 @@ impl Shell {
         })
         .detach();
     }
-    fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.unsaved_files(cx) {
+    /// Menu Quit, the Cmd+Q gate and the window's close button all come here.
+    /// Quitting stops running terminals and drops unsaved file edits, so either
+    /// one asks first, in a single dialog.
+    pub(crate) fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.quit_prompt(cx) else {
             crate::quit(cx);
             return;
-        }
+        };
         if self.quit_prompted {
             return;
         }
         self.quit_prompted = true;
         let answer = window.prompt(
             gpui::PromptLevel::Warning,
-            "Quit with unsaved file edits?",
-            Some("Save your files before quitting to keep your changes."),
-            &["Quit Without Saving", "Cancel"],
+            &prompt.message,
+            prompt.detail.as_deref(),
+            &[prompt.confirm, "Cancel"],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -2136,6 +2192,12 @@ impl Shell {
             .sessions
             .get(&id)
             .map(|s| s.read(cx).display_title())
+            .or_else(|| {
+                self.terminal_summary(id).map(|summary| {
+                    monocode_core::session_title::display_title(&summary.title, &summary.provider)
+                        .replace('\n', " ")
+                })
+            })
             .unwrap_or_default();
         let focused = self.workspace.active == Some(id) && !self.review_focused;
         div()
@@ -2552,7 +2614,7 @@ impl Shell {
                 .when_some(split.filter(|p| *p > 0.), |d, p| {
                     d.child(self.split_header(id, p, true, cx))
                 })
-                .child(self.chat_with_background(id, chat, cx))
+                .child(self.session_body(id, chat, cx))
                 .into_any_element();
         };
         let state = review.read(cx).state.clone();
@@ -2620,7 +2682,7 @@ impl Shell {
                             }),
                         )
                         .child(self.split_header(id, header_shown, in_split, cx))
-                        .child(self.chat_with_background(id, chat, cx)),
+                        .child(self.session_body(id, chat, cx)),
                 )
             })
             .child(
@@ -3231,7 +3293,14 @@ impl Shell {
                 .insert(self.workspace.project.clone(), id);
             view.update(cx, |v, cx| v.load(cx));
             self.record_worktree_session(id, cx);
+        } else if let Some(summary) = self.terminal_summary(id) {
+            self.workspace.project = summary.cwd.clone();
+            self.workspace
+                .project_focus
+                .insert(self.workspace.project.clone(), id);
+            self.record_worktree_session(id, cx);
         }
+        self.drop_stale_provider_prompt(window, cx);
         if !self.review_focused {
             self.focus_active(window, cx);
         }
@@ -3270,11 +3339,17 @@ impl Shell {
             .workspace
             .active
             .and_then(|id| self.sessions.get(&id))
-            .map_or(Kind::Codex, |s| Kind::from_id(&s.read(cx).summary.provider));
+            .map(|s| Kind::from_id(&s.read(cx).summary.provider))
+            .or_else(|| {
+                let summary = self.terminal_summary(self.workspace.active?)?;
+                Some(Kind::from_id(&summary.provider))
+            })
+            .unwrap_or(Kind::Codex);
         let navigation_revision = self.navigation_revision;
         let target = self.workspace.active;
         let store = self.store.clone();
         let cwd = self.workspace.project.clone();
+        let preferred = self.provider_surface(kind);
         let worktree = target.and_then(|id| {
             let path = self.session_working_copy(id, cx);
             (path != cwd).then(|| crate::worktree_switcher::WorktreeFocus {
@@ -3285,7 +3360,7 @@ impl Shell {
         let worktree_cwd = worktree.as_ref().map(|f| f.path.clone());
         let work = cx.background_executor().spawn(async move {
             let store = locked(&store)?;
-            let summary = store.create(kind.id(), &cwd)?;
+            let summary = store.create_with_surface(kind.id(), &cwd, preferred)?;
             if worktree_cwd.is_some() {
                 store.save_agent_settings(
                     summary.id,
@@ -3730,6 +3805,7 @@ impl Shell {
         }
     }
     fn persist(&mut self, cx: &mut Context<Self>) {
+        self.forget_stale_provider_prompt();
         if let Some(id) = self.workspace.active {
             self.refresh_session_mark(id, cx);
         }
@@ -3810,6 +3886,11 @@ impl Shell {
         if let Some(view) = self.workspace.active.and_then(|id| self.sessions.get(&id)) {
             let focus = view.read(cx).input.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
+        } else if self
+            .workspace
+            .active
+            .is_some_and(|id| self.focus_tui(id, window, cx))
+        {
         } else {
             window.focus(&self.focus, cx);
         }
@@ -3840,8 +3921,10 @@ impl Shell {
         let cwd = &self.session_metadata(id, cx).summary.cwd;
         let working_copy = monocode_core::files::path_key(self.session_working_copy(id, cx));
         let blank = |pane: i64| {
+            // A terminal session is never blank: reusing its pane would kill its CLI.
             if self.workspace.review_owners.contains_key(&pane)
                 || !self.session_summaries.contains_key(&pane)
+                || self.is_terminal(pane)
             {
                 return false;
             }
@@ -3881,17 +3964,25 @@ impl Shell {
         self.leave_app_search(cx);
         self.close_preview(cx);
         self.dismiss_due_reminder(id, cx);
-        let Some(view) = self.ensure_session(id, cx) else {
+        let view = self.ensure_session(id, cx);
+        let Some(cwd) = view
+            .as_ref()
+            .map(|view| view.read(cx).summary.cwd.clone())
+            .or_else(|| self.terminal_summary(id).map(|summary| summary.cwd.clone()))
+        else {
             return;
         };
         self.history.record(id);
         self.workspace.open(id);
-        self.workspace.project = view.read(cx).summary.cwd.clone();
+        self.workspace.project = cwd;
+        self.drop_stale_provider_prompt(window, cx);
         self.workspace
             .project_focus
             .insert(self.workspace.project.clone(), id);
         self.workspace.collapsed.remove(&self.workspace.project);
-        view.update(cx, |v, cx| v.load(cx));
+        if let Some(view) = view {
+            view.update(cx, |v, cx| v.load(cx));
+        }
         self.record_worktree_session(id, cx);
         self.remember_title_tab(TitleTab::Session(self.workspace.tab_of(id).unwrap()));
         self.reveal_active_tab(cx);
@@ -4014,6 +4105,7 @@ impl Shell {
             .position(|p| *p == self.workspace.project);
         let changed = self.workspace.project != path;
         self.workspace.project = path.clone();
+        self.drop_stale_provider_prompt(window, cx);
         self.workspace.active = None;
         if let Some(ix) = self.workspace.projects.iter().position(|p| p == &path) {
             // Switching projects slides the sidebar the way the spaces run:
@@ -4103,6 +4195,7 @@ impl Shell {
                     == monocode_core::files::path_key(self.working_copy())
                 && !s.summary.archived
                 && !s.summary.has_messages
+                && !self.is_terminal(*id)
                 && !s.busy
                 && !s.has_saved_draft()
                 && self
@@ -4118,7 +4211,14 @@ impl Shell {
         }) {
             self.activate_session(id, window, cx);
         } else {
-            self.create_session(self.default_kind(), true, cx);
+            let kind = self.default_kind();
+            // A terminal that exited must not come back as another terminal.
+            let surface = if self.blank_is_chat {
+                Surface::Chat
+            } else {
+                self.provider_surface(kind)
+            };
+            self.create_session_target(kind, true, None, surface, cx);
         }
     }
     fn open_project(&mut self, cx: &mut Context<Self>) {
@@ -4148,20 +4248,31 @@ impl Shell {
         })
         .detach();
     }
+    /// A new session the user asked for: it opens as the provider's preferred surface.
     fn create(&mut self, kind: Kind, cx: &mut Context<Self>) {
         self.create_session(kind, false, cx);
     }
+    /// A new session the app opens for its own purposes: always a chat, whatever
+    /// the provider's preferred surface (a terminal would drop what it carries).
+    #[cfg(any(test, target_os = "macos"))]
+    fn create_chat(&mut self, kind: Kind, cx: &mut Context<Self>) {
+        self.create_session_target(kind, false, None, Surface::Chat, cx);
+    }
     fn create_session(&mut self, kind: Kind, only_if_empty: bool, cx: &mut Context<Self>) {
-        self.create_session_target(kind, only_if_empty, None, cx);
+        self.create_session_target(kind, only_if_empty, None, self.provider_surface(kind), cx);
     }
     fn create_in_folder(&mut self, folder: String, cx: &mut Context<Self>) {
-        self.create_session_target(self.default_kind(), false, Some(folder), cx);
+        let kind = self.default_kind();
+        self.create_session_target(kind, false, Some(folder), self.provider_surface(kind), cx);
     }
+    /// `preferred` is where the session would like to open; a project on another
+    /// machine, or a database that cannot store a terminal, makes it a chat.
     fn create_session_target(
         &mut self,
         kind: Kind,
         only_if_empty: bool,
         folder: Option<String>,
+        preferred: Surface,
         cx: &mut Context<Self>,
     ) {
         let store = self.store.clone();
@@ -4190,7 +4301,7 @@ impl Shell {
             let worktree_cwd = focus.as_ref().map(|f| f.path.clone());
             async move {
                 let store = locked(&store)?;
-                let summary = store.create(kind.id(), &cwd)?;
+                let summary = store.create_with_surface(kind.id(), &cwd, preferred)?;
                 let mut settings = session_loading::new_session_settings(
                     store
                         .desktop_preferences()
@@ -5464,6 +5575,8 @@ impl Shell {
                 if this.session_hover != Some(id)
                     || this.menu.is_some()
                     || !this.session_summaries.contains_key(&id)
+                    // A terminal session has no transcript to preview.
+                    || this.is_terminal(id)
                     || !anchor
                         .get()
                         .is_some_and(|bounds| bounds.contains(&window.mouse_position()))
@@ -6899,6 +7012,7 @@ impl Shell {
                 self.session_summaries.contains_key(id) && {
                     let s = self.session_metadata(*id, cx);
                     s.summary.has_messages
+                        || self.is_terminal(*id)
                         || s.busy
                         || s.has_saved_draft()
                         || self
@@ -7658,9 +7772,9 @@ impl Shell {
                                 icon("plus", 14.)
                                     .group_hover("new-tab", |s| s.text_color(content(1.))),
                             )
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.create(this.default_kind(), cx)),
-                            ),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.request_new_session(window, cx)
+                            })),
                     )
                     .child(titlebar_drag_area().flex_1().min_w_0()),
             )
@@ -7858,7 +7972,7 @@ impl Render for Shell {
                             crate::traffic_lights::hide(window);
                             return false;
                         }
-                        if shell.unsaved_files(cx) {
+                        if shell.close_needs_confirmation(cx) {
                             shell.request_quit(window, cx);
                             false
                         } else {
@@ -8053,7 +8167,7 @@ impl Render for Shell {
                 if this.dock_focused(window, cx).is_some() {
                     this.new_terminal(window, cx);
                 } else {
-                    this.create(this.default_kind(), cx);
+                    this.request_new_session(window, cx);
                 }
             }))
             .on_action(
@@ -8161,6 +8275,12 @@ impl Render for Shell {
                 }
                 if this.remote_project_picker.is_some() {
                     this.close_remote_project(window, cx);
+                    return;
+                }
+                // A dialog left from another project must not swallow the key.
+                this.drop_stale_provider_prompt(window, cx);
+                if this.provider_prompt.is_some() {
+                    this.close_provider_prompt(window, cx);
                     return;
                 }
                 if this.quick_open.is_some() {
@@ -8388,6 +8508,7 @@ impl Render for Shell {
             .children(self.resource_modal(window, cx))
             .children(self.quick_open_modal(window, cx))
             .children(self.remote_project_modal(window, cx))
+            .children(self.provider_prompt_modal(window, cx))
             .children(self.notice_modals(window, cx))
             .children(self.folder_picker_popover(window, cx))
             .children(crate::accounts::get(cx))

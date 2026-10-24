@@ -125,7 +125,13 @@ pub(crate) fn mark_idle(pid: u32, idle: bool) {
         };
     }
 }
-pub(crate) struct Registration(u32);
+/// Keeps a pid in the registry `shutdown_all` reaps; unregisters on drop.
+pub struct Registration(u32);
+/// Register a child spawned elsewhere (a terminal session's CLI) so quitting
+/// kills its process group. Hold the value for as long as the child lives.
+pub fn track(pid: u32) -> Registration {
+    register(pid)
+}
 pub(crate) fn register(pid: u32) -> Registration {
     let agent = OWNER.get().map(|session| Agent {
         session,
@@ -183,6 +189,16 @@ pub fn shutdown_all() {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn a_tracked_pid_is_listed_until_its_registration_drops() {
+        // A pid no process has: only the registry is under test, nothing is signalled.
+        const PID: u32 = 4_100_000;
+        let listed = || agents().iter().any(|a| a.pid == PID);
+        let registration = owned_by(77, || track(PID));
+        assert!(listed());
+        drop(registration);
+        assert!(!listed());
+    }
     #[test]
     fn provider_child_does_not_inherit_executor_signal_mask() {
         const CHILD: &str = "MONOCODE_SIGNAL_REGRESSION_CHILD";

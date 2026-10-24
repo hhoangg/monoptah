@@ -10,7 +10,8 @@ CREATE TABLE sessions (
  linked_work_item_json TEXT, provider_account_id TEXT,
  worktree_removed INTEGER NOT NULL DEFAULT 0, is_draft INTEGER NOT NULL DEFAULT 0,
  automation_id TEXT, queued_messages_json TEXT NOT NULL DEFAULT '[]',
- queue_status TEXT, sidebar_hidden INTEGER NOT NULL DEFAULT 0, inbox_ask TEXT
+ queue_status TEXT, sidebar_hidden INTEGER NOT NULL DEFAULT 0, inbox_ask TEXT,
+ surface TEXT
 );
 CREATE INDEX sessions_cwd_updated_idx ON sessions(cwd,updated_at DESC);
 CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);

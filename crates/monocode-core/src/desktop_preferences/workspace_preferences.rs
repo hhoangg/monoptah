@@ -231,6 +231,20 @@ impl DesktopPreferences {
             })
             .collect();
         reconcile_preference(target, baseline, next, "binary_paths", json!(paths));
+        // Like binary paths: a provider the app knows, set to a surface it knows.
+        let surfaces: Map<String, Value> = self
+            .json("monocode.providerSurface.v1")
+            .as_ref()
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(provider, _)| crate::provider::Kind::parse(provider).is_some())
+            .filter_map(|(provider, value)| {
+                let surface = crate::surface::Surface::parse(value.as_str()?)?;
+                Some((provider.clone(), json!(surface.id())))
+            })
+            .collect();
+        reconcile_preference(target, baseline, next, "provider_surfaces", json!(surfaces));
         let disabled = self
             .json("monocode.disabledSkillPaths")
             .as_ref()

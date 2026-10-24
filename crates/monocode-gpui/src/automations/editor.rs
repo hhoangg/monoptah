@@ -114,7 +114,61 @@ fn settings_row(label: &'static str, hint: &'static str, control: impl IntoEleme
         )
         .child(control)
 }
+/// The Conversation row: what it shows and what it offers.
+pub(super) struct ConversationRow {
+    pub label: &'static str,
+    pub hint: &'static str,
+    pub options: Vec<(String, String)>,
+    /// Nothing to choose: the run always starts a new conversation.
+    pub locked: bool,
+}
+
+/// A terminal run starts a new conversation every time (a resumed CLI already
+/// has its first prompt, so it would drop the run's), and so does a fresh
+/// worktree.
+pub(super) fn conversation_row(
+    reuse: bool,
+    workspace_mode: &str,
+    terminal: bool,
+) -> ConversationRow {
+    let locked = terminal || workspace_mode == "worktree";
+    let fresh = ("fresh".to_string(), "Start fresh".to_string());
+    ConversationRow {
+        label: if reuse && !terminal {
+            "Continue last"
+        } else {
+            "Start fresh"
+        },
+        hint: if terminal {
+            "A terminal session always starts a new conversation"
+        } else {
+            "New chat, or continue the last run"
+        },
+        options: if locked {
+            vec![fresh]
+        } else {
+            options(&[("fresh", "Start fresh"), ("reuse", "Continue last")])
+        },
+        locked,
+    }
+}
+
 impl Automations {
+    /// The draft would run as a terminal session: the provider prefers one, its
+    /// CLI takes a first prompt, the project is local and the database can store it.
+    pub(super) fn runs_in_terminal(&self, cx: &App) -> bool {
+        let Some(editor) = &self.editor else {
+            return false;
+        };
+        let kind = Kind::from_id(&editor.draft.harness);
+        let preferred = cx
+            .try_global::<crate::settings::Preferences>()
+            .and_then(|p| p.provider_surfaces.get(kind.id()).copied())
+            .unwrap_or_default();
+        self.terminal_sessions
+            && monocode_core::surface::automation_surface(kind, &editor.draft.cwd, preferred)
+                .is_tui()
+    }
     fn select_control(
         &self,
         id: impl Into<gpui::ElementId>,
@@ -161,10 +215,14 @@ impl Automations {
             .child(icon("chevron-down", 12.).text_color(content(0.45)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if matches!(field, Choice::Conversation)
-                    && this
-                        .editor
-                        .as_ref()
-                        .is_some_and(|e| e.draft.workspace_mode == "worktree")
+                    && this.editor.as_ref().is_some_and(|e| {
+                        conversation_row(
+                            e.draft.reuse_session,
+                            &e.draft.workspace_mode,
+                            this.runs_in_terminal(cx),
+                        )
+                        .locked
+                    })
                 {
                     return;
                 }
@@ -939,24 +997,20 @@ impl Automations {
             options(&[("current", "Current"), ("worktree", "Fresh worktree")]),
             cx,
         );
+        let row = conversation_row(
+            draft.reuse_session,
+            &draft.workspace_mode,
+            self.runs_in_terminal(cx),
+        );
         let conversation = self
             .select_control(
                 "automation-conversation",
-                if draft.reuse_session {
-                    "Continue last"
-                } else {
-                    "Start fresh"
-                }
-                .into(),
+                row.label.into(),
                 Choice::Conversation,
-                if draft.workspace_mode == "worktree" {
-                    vec![("fresh".into(), "Start fresh".into())]
-                } else {
-                    options(&[("fresh", "Start fresh"), ("reuse", "Continue last")])
-                },
+                row.options.clone(),
                 cx,
             )
-            .when(draft.workspace_mode == "worktree", |d| d.opacity(0.5));
+            .when(row.locked, |d| d.opacity(0.5));
         let session = div().child(section("Session")).child(
             div()
                 .mt(px(12.))
@@ -969,11 +1023,7 @@ impl Automations {
                     "This repo, or a fresh worktree",
                     workspace,
                 ))
-                .child(settings_row(
-                    "Conversation",
-                    "New chat, or continue the last run",
-                    conversation,
-                ))
+                .child(settings_row("Conversation", row.hint, conversation))
                 .child(
                     settings_row(
                         "Session folder",
