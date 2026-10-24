@@ -6,10 +6,11 @@ import {
   type Session,
 } from "../../sessions/model/session";
 import { isTuiSession } from "../../sessions/model/tuiSession";
-import type { ForwardPayload } from "./telegram";
+import type { ForwardPayload, TelegramStatus } from "./telegram";
 import { sessionTicket } from "./sessionTicket";
 import { workflowSessionContext } from "./workflowSessionContext";
 
+/** The wait before a question is sent when the project's setting is not known. */
 export const FORWARD_DELAY_MS = 5 * 60_000;
 
 const TOPIC_TITLE_MAX = 128;
@@ -82,6 +83,16 @@ export function questionContext(session: Session): string {
   return "";
 }
 
+/** The project's configured wait in milliseconds; 5 minutes while its status is unknown. */
+export function forwardDelayMs(
+  status: Partial<Pick<TelegramStatus, "delaySecs">> | undefined,
+): number {
+  const secs = status?.delaySecs;
+  return typeof secs === "number" && Number.isFinite(secs) && secs >= 0
+    ? secs * 1000
+    : FORWARD_DELAY_MS;
+}
+
 function headerOf(session: Session): string {
   const ticket = sessionTicketId(session);
   const first = [projectName(session.cwd), title(session, ticket), ticket]
@@ -103,6 +114,7 @@ function headerOf(session: Session): string {
 export function forwardPayload(
   session: Session,
   project: string,
+  delaySecs: number,
 ): ForwardPayload | undefined {
   const pending = session.pendingQuestion;
   if (!pending) return undefined;
@@ -113,6 +125,7 @@ export function forwardPayload(
     topicTitle: topicTitle(session),
     header: headerOf(session),
     context: questionContext(session),
+    delaySecs,
     questions: pending.questions.map((question) => ({
       id: question.id,
       ...(question.header ? { header: question.header } : {}),
@@ -128,12 +141,17 @@ export function forwardPayload(
   };
 }
 
-/** Sessions whose current question has waited long enough and was not sent yet. */
+/**
+ * Sessions whose current question has waited as long as their project's delay and was
+ * not sent yet. A question that was never seen (it appeared while forwarding was off) is
+ * never due, whatever the delay.
+ */
 export function dueForwards(
   sessions: Session[],
   firstSeen: Map<string, number>,
   sent: Set<string>,
   now: number,
+  delayMsFor: (session: Session) => number,
 ): Session[] {
   return sessions.filter((session) => {
     const pending = session.pendingQuestion;
@@ -141,6 +159,6 @@ export function dueForwards(
     const key = `${session.id}#${pending.requestId}`;
     if (sent.has(key)) return false;
     const seen = firstSeen.get(key);
-    return seen !== undefined && now - seen >= FORWARD_DELAY_MS;
+    return seen !== undefined && now - seen >= delayMsFor(session);
   });
 }

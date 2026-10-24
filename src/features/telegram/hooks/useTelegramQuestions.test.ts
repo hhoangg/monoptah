@@ -26,6 +26,7 @@ const enabled: TelegramStatus = {
   enabled: true,
   botUsername: "bot",
   chatId: -100,
+  delaySecs: 300,
 };
 
 function prompt(
@@ -182,6 +183,68 @@ describe("useTelegramQuestions", () => {
       payload: { sessionId: "s1", requestId: 1 },
     });
     await advance(TICK_MS * 4);
+    expect(callsTo("telegram_forward_question")).toHaveLength(1);
+  });
+
+  it("sends the configured delay in the payload", async () => {
+    status = { ...enabled, delaySecs: 120 };
+    await render([asking()]);
+    await advance(120_000 + TICK_MS);
+    expect(callsTo("telegram_forward_question")[0]).toMatchObject({
+      payload: { delaySecs: 120 },
+    });
+  });
+
+  it("forwards right away when the delay is zero", async () => {
+    status = { ...enabled, delaySecs: 0 };
+    await render([asking()]);
+    expect(callsTo("telegram_forward_question")).toHaveLength(1);
+    await advance(TICK_MS * 4);
+    expect(callsTo("telegram_forward_question")).toHaveLength(1);
+    expect(callsTo("telegram_forward_question")[0]).toMatchObject({
+      payload: { sessionId: "s1", requestId: 1, delaySecs: 0 },
+    });
+  });
+
+  it("never forwards a question first seen while disabled, even with no delay", async () => {
+    status = { ...enabled, enabled: false, delaySecs: 0 };
+    await render([asking()]);
+    await advance(TICK_MS);
+    status = { ...enabled, delaySecs: 0 };
+    invalidateTelegramStatus();
+    await advance(TICK_MS * 4);
+    expect(callsTo("telegram_forward_question")).toHaveLength(0);
+  });
+
+  it("waits for a short delay and not a tick longer", async () => {
+    status = { ...enabled, delaySecs: 60 };
+    await render([asking()]);
+    await advance(30_000);
+    expect(callsTo("telegram_forward_question")).toHaveLength(0);
+    await advance(30_000);
+    expect(callsTo("telegram_forward_question")).toHaveLength(1);
+  });
+
+  it("applies a delay changed while the question waits", async () => {
+    await render([asking()]);
+    await advance(60_000);
+    expect(callsTo("telegram_forward_question")).toHaveLength(0);
+    // The settings dialog saves the new value and drops the cached status.
+    status = { ...enabled, delaySecs: 0 };
+    invalidateTelegramStatus();
+    await advance(TICK_MS);
+    expect(callsTo("telegram_forward_question")).toHaveLength(1);
+  });
+
+  it("holds a question back when the delay is made longer", async () => {
+    status = { ...enabled, delaySecs: 60 };
+    await render([asking()]);
+    await advance(30_000);
+    status = { ...enabled, delaySecs: 600 };
+    invalidateTelegramStatus();
+    await advance(TICK_MS * 3);
+    expect(callsTo("telegram_forward_question")).toHaveLength(0);
+    await advance(600_000);
     expect(callsTo("telegram_forward_question")).toHaveLength(1);
   });
 

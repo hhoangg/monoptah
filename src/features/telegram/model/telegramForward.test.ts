@@ -8,6 +8,7 @@ import type { UserQuestionPrompt } from "../../sessions/model/userQuestion";
 import {
   FORWARD_DELAY_MS,
   dueForwards,
+  forwardDelayMs,
   forwardPayload,
   isForwardable,
   isTopicLinkable,
@@ -233,9 +234,9 @@ describe("questionContext", () => {
 
 describe("forwardPayload", () => {
   it("is undefined without a pending question", () => {
-    expect(forwardPayload(asking({ pendingQuestion: undefined }), "/p")).toBe(
-      undefined,
-    );
+    expect(
+      forwardPayload(asking({ pendingQuestion: undefined }), "/p", 300),
+    ).toBe(undefined);
   });
 
   it("maps the question and builds the header", () => {
@@ -250,7 +251,7 @@ describe("forwardPayload", () => {
       round: 2,
     });
     cleanup.push(session.id);
-    expect(forwardPayload(session, "/work/acme")).toEqual({
+    expect(forwardPayload(session, "/work/acme", 90)).toEqual({
       project: "/work/acme",
       sessionId: session.id,
       requestId: 7,
@@ -258,32 +259,95 @@ describe("forwardPayload", () => {
       header:
         "acme · Fix the login · #12\nWorkflow Triage · Fix · Crash · round 2",
       context: "Need input",
+      delaySecs: 90,
       questions: prompt.questions,
     });
   });
 
   it("header without ticket or workflow is one line", () => {
-    expect(forwardPayload(asking(), "/work/acme")?.header).toBe(
+    expect(forwardPayload(asking(), "/work/acme", 300)?.header).toBe(
       "acme · Fix the login",
     );
   });
 });
 
+describe("forwardDelayMs", () => {
+  it("uses the project's delay and falls back to 5 minutes when unknown", () => {
+    expect(forwardDelayMs({ delaySecs: 30 })).toBe(30_000);
+    expect(forwardDelayMs({ delaySecs: 0 })).toBe(0);
+    expect(forwardDelayMs(undefined)).toBe(FORWARD_DELAY_MS);
+    expect(forwardDelayMs({})).toBe(FORWARD_DELAY_MS);
+    expect(FORWARD_DELAY_MS).toBe(300_000);
+  });
+});
+
 describe("dueForwards", () => {
-  it("due only after 5 minutes and only once", () => {
+  const fiveMinutes = () => FORWARD_DELAY_MS;
+
+  it("due only after the delay and only once", () => {
     const session = asking();
     const key = `${session.id}#7`;
     const first = new Map([[key, 1_000]]);
     const sent = new Set<string>();
     expect(
-      dueForwards([session], first, sent, 1_000 + FORWARD_DELAY_MS - 1),
+      dueForwards(
+        [session],
+        first,
+        sent,
+        1_000 + FORWARD_DELAY_MS - 1,
+        fiveMinutes,
+      ),
     ).toEqual([]);
     expect(
-      dueForwards([session], first, sent, 1_000 + FORWARD_DELAY_MS),
+      dueForwards(
+        [session],
+        first,
+        sent,
+        1_000 + FORWARD_DELAY_MS,
+        fiveMinutes,
+      ),
     ).toEqual([session]);
     sent.add(key);
     expect(
-      dueForwards([session], first, sent, 1_000 + FORWARD_DELAY_MS),
+      dueForwards(
+        [session],
+        first,
+        sent,
+        1_000 + FORWARD_DELAY_MS,
+        fiveMinutes,
+      ),
+    ).toEqual([]);
+  });
+
+  it("uses the delay of each session", () => {
+    const quick = asking();
+    const slow = asking();
+    const first = new Map([
+      [`${quick.id}#7`, 1_000],
+      [`${slow.id}#7`, 1_000],
+    ]);
+    const delayMsFor = (session: Session) =>
+      session.id === quick.id ? 30_000 : 600_000;
+    expect(
+      dueForwards([quick, slow], first, new Set(), 1_000 + 29_999, delayMsFor),
+    ).toEqual([]);
+    expect(
+      dueForwards([quick, slow], first, new Set(), 1_000 + 30_000, delayMsFor),
+    ).toEqual([quick]);
+    expect(
+      dueForwards([quick, slow], first, new Set(), 1_000 + 600_000, delayMsFor),
+    ).toEqual([quick, slow]);
+  });
+
+  it("a zero delay is due as soon as the question was seen", () => {
+    const session = asking();
+    const first = new Map([[`${session.id}#7`, 1_000]]);
+    expect(dueForwards([session], first, new Set(), 1_000, () => 0)).toEqual([
+      session,
+    ]);
+    // Still never for a question that was not seen (disabled or unconfigured at first sight).
+    expect(
+      dueForwards([session], new Map(), new Set(), 1_000, () => 0),
     ).toEqual([]);
   });
 
@@ -301,6 +365,7 @@ describe("dueForwards", () => {
         first,
         new Set(),
         FORWARD_DELAY_MS * 2,
+        fiveMinutes,
       ),
     ).toEqual([]);
   });

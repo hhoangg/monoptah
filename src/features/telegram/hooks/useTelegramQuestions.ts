@@ -24,6 +24,7 @@ import {
 import { cachedTelegramStatus } from "../model/telegramStatusCache";
 import {
   dueForwards,
+  forwardDelayMs,
   forwardPayload,
   isForwardable,
 } from "../model/telegramForward";
@@ -103,7 +104,10 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
   replyRef.current = onQuestionReply;
   const nowRef = useRef(now);
   nowRef.current = now;
-  const runRef = useRef<{ sync: () => void; forward: () => void } | null>(null);
+  const runRef = useRef<{
+    sync: () => void;
+    forward: () => Promise<void>;
+  } | null>(null);
 
   useEffect(() => {
     let disposed = false;
@@ -115,9 +119,15 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
     const attempts = new Map<string, number>();
     const byTelegram = new Set<string>();
     const checking = new Set<string>();
+    // Delay in ms per project, from the last status that was read.
+    const delays = new Map<string, number>();
 
     function statusFor(project: string): Promise<TelegramStatus | undefined> {
       return cachedTelegramStatus(project, nowRef.current());
+    }
+
+    function learnDelay(project: string, status: TelegramStatus | undefined) {
+      if (status) delays.set(project, forwardDelayMs(status));
     }
 
     /**
@@ -128,11 +138,15 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
     function checkEligibility(key: string, session: Session) {
       if (checking.has(key)) return;
       checking.add(key);
-      void statusFor(projectKey(session.cwd)).then((status) => {
+      const project = projectKey(session.cwd);
+      void statusFor(project).then((status) => {
         checking.delete(key);
         if (disposed || eligibility.get(key) !== "checking") return;
         if (status === undefined) return;
+        learnDelay(project, status);
         eligibility.set(key, canForward(status) ? "yes" : "no");
+        // With no delay the question is due as soon as it is known to be eligible.
+        if (canForward(status)) void forward();
       });
     }
 
@@ -197,12 +211,18 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
       inFlight.add(key);
       try {
         const project = projectKey(session.cwd);
-        if (!canForward(await statusFor(project)) || disposed) return;
+        const status = await statusFor(project);
+        if (!status || !canForward(status) || disposed) return;
+        learnDelay(project, status);
         const latest = sessionsRef.current.find(
           (item) => item.id === session.id,
         );
         if (latest?.pendingQuestion?.requestId !== question.requestId) return;
-        const payload = forwardPayload(latest, project);
+        const payload = forwardPayload(
+          latest,
+          project,
+          forwardDelayMs(status) / 1000,
+        );
         if (!payload) return;
         try {
           await telegramForwardQuestion(payload);
@@ -220,9 +240,8 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
       }
     }
 
-    function forward() {
-      if (disposed) return;
-      const candidates = sessionsRef.current.filter((session) => {
+    function forwardCandidates(): Session[] {
+      return sessionsRef.current.filter((session) => {
         const question = session.pendingQuestion;
         if (!question) return false;
         const key = questionKey(session.id, question.requestId);
@@ -232,11 +251,29 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
           (attempts.get(key) ?? 0) < MAX_FORWARD_ATTEMPTS
         );
       });
+    }
+
+    async function forward() {
+      if (disposed) return;
+      // The cached status is cheap to ask again, and it is how a delay changed in the
+      // settings dialog reaches questions that are already waiting. It is read before
+      // deciding, so a delay made longer holds a question back on this very tick.
+      const projects = new Set(
+        forwardCandidates().map((session) => projectKey(session.cwd)),
+      );
+      await Promise.all(
+        [...projects].map(async (project) =>
+          learnDelay(project, await statusFor(project)),
+        ),
+      );
+      if (disposed) return;
       for (const session of dueForwards(
-        candidates,
+        forwardCandidates(),
         firstSeen,
         sent,
         nowRef.current(),
+        (session) =>
+          delays.get(projectKey(session.cwd)) ?? forwardDelayMs(undefined),
       )) {
         const key = questionKey(session.id, session.pendingQuestion!.requestId);
         void forwardOne(session, key);
@@ -247,7 +284,7 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
     sync();
     const timer = window.setInterval(() => {
       sync(true);
-      forward();
+      void forward();
     }, TICK_MS);
 
     let stopListening: UnlistenFn | undefined;

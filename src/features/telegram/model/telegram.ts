@@ -10,6 +10,8 @@ export type TelegramStatus = {
   isForum?: boolean;
   canManageTopics?: boolean;
   problem?: string;
+  /** Seconds an unanswered question waits before it is sent; 0 sends it at once. */
+  delaySecs: number;
 };
 
 export type ConnectLink = { code: string; url: string; fallback: string };
@@ -23,6 +25,8 @@ export type ForwardPayload = {
   topicTitle: string;
   header: string;
   context: string;
+  /** How long the question waited before it was sent; 0 omits the "Waiting for" line. */
+  delaySecs: number;
   questions: {
     id: string;
     header?: string;
@@ -66,6 +70,13 @@ export function telegramSetEnabled(
   enabled: boolean,
 ): Promise<TelegramStatus> {
   return invoke<TelegramStatus>("telegram_set_enabled", { project, enabled });
+}
+
+export function telegramSetDelay(
+  project: string,
+  delaySecs: number,
+): Promise<TelegramStatus> {
+  return invoke<TelegramStatus>("telegram_set_delay", { project, delaySecs });
 }
 
 export function telegramDisconnect(project: string): Promise<void> {
