@@ -88,20 +88,78 @@ interface Unit {
   list: boolean;
 }
 
-/** Inline markdown and html reduced to the words they carry. */
-function stripInline(text: string): string {
-  return text
+/** Brackets of a code span placeholder: private-use characters, removed from the input. */
+const SPAN_OPEN = "\uE000";
+const SPAN_CLOSE = "\uE001";
+const SPAN_MARKS = /[\uE000\uE001]/g;
+const SPAN_PLACEHOLDER = /\uE000(\d+)\uE001/g;
+
+/**
+ * Replaces each inline code span (any run of backticks, closed by a run of the same
+ * length) with a placeholder and records its contents, so no later step touches them.
+ * An unclosed run of backticks stays as plain text.
+ */
+function hideCodeSpans(text: string, spans: string[]): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const tick = text.indexOf("`", i);
+    if (tick < 0) break;
+    out += text.slice(i, tick);
+    let size = 0;
+    while (text[tick + size] === "`") size++;
+    let close = -1;
+    for (let from = tick + size; close < 0 && from < text.length;) {
+      const next = text.indexOf("`", from);
+      if (next < 0) break;
+      let run = 0;
+      while (text[next + run] === "`") run++;
+      if (run === size) close = next;
+      from = next + run;
+    }
+    if (close < 0) {
+      out += text.slice(tick, tick + size);
+      i = tick + size;
+      continue;
+    }
+    let content = text.slice(tick + size, close);
+    // A single space on both sides only keeps backticks apart from the fence.
+    if (/^ .* $/.test(content) && content.trim())
+      content = content.slice(1, -1);
+    out += `${SPAN_OPEN}${spans.push(content) - 1}${SPAN_CLOSE}`;
+    i = close + size;
+  }
+  return out + text.slice(i);
+}
+
+function showCodeSpans(text: string, spans: string[]): string {
+  return text.replace(
+    SPAN_PLACEHOLDER,
+    (_, index) => spans[Number(index)] ?? "",
+  );
+}
+
+/**
+ * Inline markdown and html reduced to the words they carry. Code spans come back
+ * unwrapped and unchanged, as placeholders until `showCodeSpans` is applied.
+ */
+function stripInlineKeepingCode(text: string, spans: string[]): string {
+  return hideCodeSpans(text.replace(SPAN_MARKS, ""), spans)
     .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/<(https?:\/\/[^>\s]+)>/g, "$1")
     .replace(/<\/?[A-Za-z][^<>]*>/g, "")
-    .replace(/`+([^`]+)`+/g, "$1")
     .replace(/(\*\*|__)(\S(?:.*?\S)?)\1/g, "$2")
     .replace(/~~(\S(?:.*?\S)?)~~/g, "$1")
     .replace(/\*(\S(?:[^*]*\S)?)\*/g, "$1")
     .replace(/(^|\W)_(\S(?:[^_]*\S)?)_(?!\w)/g, "$1$2")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function stripInline(text: string): string {
+  const spans: string[] = [];
+  return showCodeSpans(stripInlineKeepingCode(text, spans), spans);
 }
 
 function splitSentences(text: string): string[] {
@@ -132,24 +190,13 @@ function splitSentences(text: string): string[] {
   return sentences.filter(Boolean);
 }
 
-/** The message as units, with code, rules and markup noise left out. */
-function messageUnits(raw: string): Unit[] {
-  const units: Unit[] = [];
-  let prose: string[] = [];
-  let lastItem: Unit | undefined;
+/** How much of the end of a message is looked at; longer messages are cut before parsing. */
+const SCAN_MAX = 4000;
+
+/** The lines of the message without fenced code (a blank line stands in for each block). */
+function linesWithoutCode(raw: string): string[] {
+  const lines: string[] = [];
   let fence: string | undefined;
-  const standalone = (text: string, list = false): Unit | undefined => {
-    if (!text) return undefined;
-    const unit = { text, list };
-    units.push(unit);
-    return unit;
-  };
-  const flush = () => {
-    for (const sentence of splitSentences(stripInline(prose.join(" ")))) {
-      standalone(sentence);
-    }
-    prose = [];
-  };
   for (const source of raw.split("\n")) {
     const line = source.replace(/^\s*(?:>\s?)+/, "");
     const trimmed = line.trim();
@@ -160,11 +207,63 @@ function messageUnits(raw: string): Unit[] {
     const opener = /^(`{3,}|~{3,})(.*)$/.exec(trimmed);
     // ```x``` on one line is inline code, not a fence.
     if (opener && !(opener[1][0] === "`" && opener[2].includes("`"))) {
-      flush();
-      lastItem = undefined;
+      lines.push("");
       fence = opener[1];
       continue;
     }
+    lines.push(line);
+  }
+  return lines;
+}
+
+/**
+ * The last SCAN_MAX characters of the lines, cut at a word boundary, so the cost of
+ * cleaning a huge message is bounded. `cut` tells that something before was left out.
+ */
+function lastLines(lines: string[]): { lines: string[]; cut: boolean } {
+  const kept: string[] = [];
+  let room = SCAN_MAX;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (line.length + 1 <= room) {
+      kept.unshift(line);
+      room -= line.length + 1;
+      continue;
+    }
+    let tail = room > 1 ? line.slice(-(room - 1)) : "";
+    if (/^[\udc00-\udfff]/.test(tail)) tail = tail.slice(1);
+    const space = tail.indexOf(" ");
+    if (space >= 0) tail = tail.slice(space + 1);
+    if (tail.trim()) kept.unshift(tail);
+    return { lines: kept, cut: true };
+  }
+  return { lines: kept, cut: false };
+}
+
+/** The message as units, with code, rules and markup noise left out. */
+function messageUnits(raw: string): { units: Unit[]; cut: boolean } {
+  const units: Unit[] = [];
+  let prose: string[] = [];
+  let lastItem: Unit | undefined;
+  const standalone = (text: string, list = false): Unit | undefined => {
+    if (!text) return undefined;
+    const unit = { text, list };
+    units.push(unit);
+    return unit;
+  };
+  const flush = () => {
+    // Sentences are split with code spans still hidden, so a full stop inside one
+    // never ends a sentence; the text is restored before anything is measured.
+    const spans: string[] = [];
+    const text = stripInlineKeepingCode(prose.join(" "), spans);
+    for (const sentence of splitSentences(text)) {
+      standalone(showCodeSpans(sentence, spans));
+    }
+    prose = [];
+  };
+  const scanned = lastLines(linesWithoutCode(raw));
+  for (const line of scanned.lines) {
+    const trimmed = line.trim();
     if (!trimmed || HORIZONTAL_RULE.test(trimmed) || TABLE_RULE.test(trimmed)) {
       flush();
       lastItem = undefined;
@@ -204,7 +303,7 @@ function messageUnits(raw: string): Unit[] {
     prose.push(trimmed);
   }
   flush();
-  return units;
+  return { units, cut: scanned.cut };
 }
 
 function normalized(text: string): string {
@@ -274,7 +373,8 @@ export function questionContext(session: Session): string {
     if (block.role !== "assistant" || block.internal) continue;
     if (!block.text.trim()) continue;
     // A message that is only code has no summary; do not fall back to an older one.
-    let units = messageUnits(block.text);
+    const message = messageUnits(block.text);
+    let units = message.units;
     if (units.length === 0) return "";
     // Sentences at the end that only repeat the question add nothing; drop them when
     // something else was said.
@@ -304,7 +404,7 @@ export function questionContext(session: Session): string {
       picked.unshift(unit);
       used += cost;
     }
-    return (i >= 0 ? CUT_MARK : "") + joinUnits(picked);
+    return (i >= 0 || message.cut ? CUT_MARK : "") + joinUnits(picked);
   }
   return "";
 }

@@ -399,6 +399,84 @@ describe("questionContext", () => {
     expect(unbroken.startsWith("\u2026 ")).toBe(true);
   });
 
+  it("keeps the contents of inline code exactly as written", () => {
+    expect(said("Open `__init__.py` now.")).toBe("Open __init__.py now.");
+    expect(said("Edit `src/__tests__/foo.test.ts` first.")).toBe(
+      "Edit src/__tests__/foo.test.ts first.",
+    );
+    expect(said("Match `src/**/*.ts` files.")).toBe("Match src/**/*.ts files.");
+    expect(said("It returns `Result<T, E>` or `Vec<String>`.")).toBe(
+      "It returns Result<T, E> or Vec<String>.",
+    );
+    expect(said("Call `f(*args, **kwargs)` here.")).toBe(
+      "Call f(*args, **kwargs) here.",
+    );
+    expect(said("Use `a**b**c` there.")).toBe("Use a**b**c there.");
+    expect(said("Mail `<ops@example.com>` today.")).toBe(
+      "Mail <ops@example.com> today.",
+    );
+    expect(said("Link `[a](b)` and `![i](j)` stay.")).toBe(
+      "Link [a](b) and ![i](j) stay.",
+    );
+  });
+
+  it("unwraps code spans next to emphasis and handles longer fences", () => {
+    expect(said("Call **`init()`** then **bold**`tail`.")).toBe(
+      "Call init() then boldtail.",
+    );
+    expect(said("Use ``a`b`` and ```x``` here.")).toBe("Use a`b and x here.");
+    expect(said("Pad ` spaced ` ok.")).toBe("Pad spaced ok.");
+  });
+
+  it("leaves an unclosed backtick as plain text", () => {
+    expect(said("Use the `broken quote here.")).toBe(
+      "Use the `broken quote here.",
+    );
+    expect(said("Keep `ok` and a stray ` tick.")).toBe(
+      "Keep ok and a stray ` tick.",
+    );
+  });
+
+  it("does not split a sentence inside an inline code span", () => {
+    expect(said("Bump to `v1.2.3` in `src/app.ts`. Then rebuild.")).toBe(
+      "Bump to v1.2.3 in src/app.ts. Then rebuild.",
+    );
+    // The span's own full stop is not a sentence end, so the cut stays at a real one.
+    const long = `Start ${"w ".repeat(150)}then \`x. y\` end.`;
+    const context = said(long);
+    expect(context.startsWith("… ")).toBe(true);
+    expect(context.endsWith("then x. y end.")).toBe(true);
+    expect(Array.from(context).length).toBeGreaterThan(100);
+  });
+
+  it("never lets a placeholder leak, even for text that looks like one", () => {
+    expect(said("0 then `x`")).toBe("0 then x");
+    const spans = Array.from({ length: 80 }, (_, i) => `see \`file${i}.ts\``);
+    const context = said(`${spans.join(" ")} done`);
+    expect(context).not.toMatch(/[]/);
+    expect(context.endsWith("see file79.ts done")).toBe(true);
+  });
+
+  it("stays fast on a huge pathological message and keeps the end", () => {
+    const inputs = [
+      `${"*a ".repeat(7000)}the end.`,
+      `${"**a_ ".repeat(4000)}the end.`,
+      `${"[".repeat(20000)} the end.`,
+      `${"<a ".repeat(7000)}the end.`,
+      `x ${"`".repeat(20000)} the end.`,
+      `${"x ".repeat(10000)}the end.`,
+      `${"Sentence number one. ".repeat(1000)}Last sentence here.`,
+    ];
+    for (const input of inputs) {
+      const started = performance.now();
+      const context = said(input);
+      expect(performance.now() - started).toBeLessThan(100);
+      expect(Array.from(context).length).toBeLessThanOrEqual(300);
+      expect(context.startsWith("… ")).toBe(true);
+      expect(context).toMatch(/(the end\.|Last sentence here\.)$/);
+    }
+  });
+
   it("is deterministic", () => {
     const text = "Alpha one. Beta two. ".repeat(40) + "```x```";
     expect(said(text)).toBe(said(text));
