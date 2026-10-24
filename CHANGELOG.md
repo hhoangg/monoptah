@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-10-24
+
+### Added
+
+- Telegram questions: when an agent asks you a question and you are away, Monoptah can forward it to a Telegram group so you can answer from your phone. Set it up per project with **Telegram…** in the project menu: save a bot token from BotFather, connect a group with Topics on (the connect link asks for the bot's "Manage topics" admin right), then switch on **Forward questions**. See `docs/telegram.md`.
+- A question is forwarded once it has waited the project's **Send after** time without an answer on the desktop (default 5 minutes; Immediately up to 1 hour). Each session gets its own topic named `[ticket] title`, or you can link a session to an existing topic with **Link Telegram topic…** in the session menu.
+- Each message carries the project, session, ticket and workflow step, a short summary of what the agent said before asking, and one button per option. Multi-select questions toggle options and send; free-text answers are a reply to the question message; a prompt with several questions is sent as one message per question, each with its own Skip.
+- The first answer wins: answering on the desktop marks the Telegram messages "Answered on desktop", and an answer from Telegram goes to that exact pending question only. Any member of the group can answer, so keep the group private.
+- Sending respects Telegram's rate limits, retries when asked to slow down, follows a group that was upgraded to a supergroup, and recreates a deleted topic. Only questions are forwarded; approvals, plans, remote projects, terminal sessions, Mono chats and orchestration workers are not. The app must stay open to forward and receive answers.
+
 ## [0.32.0] - 2026-10-23
 
 ### Added
