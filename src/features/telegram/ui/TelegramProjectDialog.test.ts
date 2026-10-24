@@ -28,11 +28,13 @@ const NOT_CONFIGURED: TelegramStatus = {
   configured: false,
   enabled: false,
   botUsername: "",
+  delaySecs: 300,
 };
 const CONFIGURED: TelegramStatus = {
   configured: true,
   enabled: false,
   botUsername: "alpha_bot",
+  delaySecs: 300,
 };
 const CONNECTED: TelegramStatus = {
   ...CONFIGURED,
@@ -48,6 +50,7 @@ let container: HTMLDivElement;
 let status: TelegramStatus;
 /** What the bot token command leaves behind; defaults to a bot without a group. */
 let afterToken: TelegramStatus | null;
+let setDelayError: string | null;
 
 function mockInvoke() {
   vi.mocked(invoke).mockImplementation(async (command, args) => {
@@ -66,6 +69,14 @@ function mockInvoke() {
       };
     if (command === "telegram_set_enabled") {
       status = { ...status, enabled: (args as { enabled: boolean }).enabled };
+      return status;
+    }
+    if (command === "telegram_set_delay") {
+      if (setDelayError) throw setDelayError;
+      status = {
+        ...status,
+        delaySecs: (args as { delaySecs: number }).delaySecs,
+      };
       return status;
     }
     if (command === "telegram_disconnect") {
@@ -127,6 +138,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   status = NOT_CONFIGURED;
   afterToken = null;
+  setDelayError = null;
   vi.mocked(invoke).mockReset();
   vi.mocked(openUrl).mockReset();
   vi.mocked(openUrl).mockResolvedValue(undefined);
@@ -149,7 +161,7 @@ describe("telegram project dialog", () => {
   it("saves token and shows bot username", async () => {
     await renderDialog();
     expect(dialog().textContent).toContain(
-      "Questions that wait more than 5 minutes are sent to this group. Any member can answer.",
+      "Questions that are still unanswered after the chosen time are sent to this group. Any member can answer.",
     );
     await type("Bot token", ` ${SECRET} `);
     await submit();
@@ -243,7 +255,7 @@ describe("telegram project dialog", () => {
 
     expect(dialog().textContent).toContain("Forward questions");
     expect(dialog().textContent).toContain(
-      "Forwarding is off. Turn it on to send questions that wait more than 5 minutes.",
+      "Forwarding is off. Turn it on to send questions to this group.",
     );
     const toggle = dialog().querySelector<HTMLElement>('[role="switch"]')!;
     expect(toggle.getAttribute("aria-label")).toBe("Forward questions");
@@ -263,6 +275,128 @@ describe("telegram project dialog", () => {
 
     expect(dialog().textContent).toContain("Forward questions");
     expect(dialog().textContent).not.toContain("Forwarding is off");
+  });
+
+  function delayTrigger() {
+    return dialog().querySelector<HTMLButtonElement>(
+      'button[aria-label^="Send after"]',
+    );
+  }
+
+  async function chooseDelay(label: string) {
+    await act(async () => delayTrigger()!.click());
+    const option = [
+      ...document.querySelectorAll<HTMLButtonElement>('[role="option"]'),
+    ].find((candidate) => candidate.textContent?.trim() === label);
+    expect(option, label).toBeDefined();
+    await act(async () => option!.click());
+  }
+
+  it("shows the current delay in a Send after row", async () => {
+    status = CONNECTED;
+    await renderDialog();
+
+    expect(dialog().textContent).toContain("Send after");
+    expect(delayTrigger()?.getAttribute("aria-label")).toBe(
+      "Send after: 5 minutes",
+    );
+    await act(async () => delayTrigger()!.click());
+    const labels = [...document.querySelectorAll('[role="option"]')].map(
+      (option) => option.textContent?.trim(),
+    );
+    expect(labels).toEqual([
+      "Immediately",
+      "30 seconds",
+      "1 minute",
+      "2 minutes",
+      "5 minutes",
+      "10 minutes",
+      "15 minutes",
+      "30 minutes",
+      "1 hour",
+    ]);
+  });
+
+  it("saves a chosen delay, shows it and drops the cached status", async () => {
+    status = CONNECTED;
+    await renderDialog();
+    await chooseDelay("30 seconds");
+
+    expect(invoke).toHaveBeenCalledWith("telegram_set_delay", {
+      project: PROJECT,
+      delaySecs: 30,
+    });
+    expect(invalidateTelegramStatus).toHaveBeenCalledWith(PROJECT);
+    expect(delayTrigger()?.getAttribute("aria-label")).toBe(
+      "Send after: 30 seconds",
+    );
+  });
+
+  it("says questions are sent right away for Immediately and saves zero", async () => {
+    status = CONNECTED;
+    await renderDialog();
+    await chooseDelay("Immediately");
+
+    expect(invoke).toHaveBeenCalledWith("telegram_set_delay", {
+      project: PROJECT,
+      delaySecs: 0,
+    });
+    expect(delayTrigger()?.getAttribute("aria-label")).toBe(
+      "Send after: Immediately",
+    );
+    expect(dialog().textContent).toContain(
+      "Questions are sent to this group right away. Any member can answer.",
+    );
+    expect(dialog().textContent).not.toContain("still unanswered");
+  });
+
+  it("shows an immediate delay that was saved earlier", async () => {
+    status = { ...CONNECTED, delaySecs: 0 };
+    await renderDialog();
+
+    expect(delayTrigger()?.getAttribute("aria-label")).toBe(
+      "Send after: Immediately",
+    );
+  });
+
+  it("shows a stored value that is not a preset as a custom option", async () => {
+    status = { ...CONNECTED, delaySecs: 90 };
+    await renderDialog();
+
+    expect(delayTrigger()?.getAttribute("aria-label")).toBe(
+      "Send after: 90 seconds (custom)",
+    );
+    await act(async () => delayTrigger()!.click());
+    const labels = [...document.querySelectorAll('[role="option"]')].map(
+      (option) => option.textContent?.trim(),
+    );
+    expect(labels).toHaveLength(10);
+    expect(labels.indexOf("90 seconds (custom)")).toBe(
+      labels.indexOf("1 minute") + 1,
+    );
+  });
+
+  it("keeps the shown delay and reports the error when saving fails", async () => {
+    status = CONNECTED;
+    setDelayError = "Save a bot token first";
+    await renderDialog();
+    await chooseDelay("10 minutes");
+
+    expect(dialog().querySelector('[role="alert"]')?.textContent).toBe(
+      "Save a bot token first",
+    );
+    expect(delayTrigger()?.getAttribute("aria-label")).toBe(
+      "Send after: 5 minutes",
+    );
+    expect(invalidateTelegramStatus).toHaveBeenCalledWith(PROJECT);
+  });
+
+  it("offers no delay before a group is connected", async () => {
+    status = CONFIGURED;
+    await renderDialog();
+
+    expect(delayTrigger()).toBeNull();
+    expect(dialog().textContent).not.toContain("Send after");
   });
 
   it("never renders Connected to with an empty chat title", async () => {

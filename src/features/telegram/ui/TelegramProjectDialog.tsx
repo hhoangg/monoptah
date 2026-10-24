@@ -4,11 +4,12 @@ import { copyText } from "../../../platform/tauri/clipboard";
 import { Check, Copy, Loader } from "../../../shared/ui/icons";
 import { Modal } from "../../../shared/ui/Modal";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
-import { Toggle } from "../../settings/ui/primitives";
+import { Select, Toggle } from "../../settings/ui/primitives";
 import {
   telegramConnectLink,
   telegramDisconnect,
   telegramRemoveWebhook,
+  telegramSetDelay,
   telegramSetEnabled,
   telegramSetToken,
   telegramStatus,
@@ -33,6 +34,49 @@ const OPEN_GROUP_NOTE =
   "Any member of the group can answer the agent, and a text reply becomes its answer. Keep the group private.";
 const ADMIN_NOTE =
   "Make the bot an admin with Manage topics so it can create a topic per session.";
+
+const DELAY_PRESETS: { secs: number; label: string }[] = [
+  { secs: 0, label: "Immediately" },
+  { secs: 30, label: "30 seconds" },
+  { secs: 60, label: "1 minute" },
+  { secs: 120, label: "2 minutes" },
+  { secs: 300, label: "5 minutes" },
+  { secs: 600, label: "10 minutes" },
+  { secs: 900, label: "15 minutes" },
+  { secs: 1800, label: "30 minutes" },
+  { secs: 3600, label: "1 hour" },
+];
+
+function plural(count: number, unit: string): string {
+  return `${count} ${unit}${count === 1 ? "" : "s"}`;
+}
+
+/** Wording for a stored value that is not one of the presets. */
+function customDelayLabel(secs: number): string {
+  const text =
+    secs % 3600 === 0
+      ? plural(secs / 3600, "hour")
+      : secs % 60 === 0
+        ? plural(secs / 60, "minute")
+        : plural(secs, "second");
+  return `${text} (custom)`;
+}
+
+/** The presets, plus the stored value in its place when it is not one of them. */
+function delayOptions(secs: number): { value: string; label: string }[] {
+  const options = DELAY_PRESETS.map((preset) => ({
+    secs: preset.secs,
+    label: preset.label,
+  }));
+  if (!options.some((option) => option.secs === secs)) {
+    options.push({ secs, label: customDelayLabel(secs) });
+    options.sort((a, b) => a.secs - b.secs);
+  }
+  return options.map((option) => ({
+    value: String(option.secs),
+    label: option.label,
+  }));
+}
 
 /** Whether a status change affects if the question hook may forward. */
 function gateChanged(before: TelegramStatus, after: TelegramStatus): boolean {
@@ -147,6 +191,19 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
       }
     });
 
+  const setDelay = (delaySecs: number) =>
+    run(async () => {
+      try {
+        const next = await telegramSetDelay(project, delaySecs);
+        if (!alive.current) return;
+        observe(next);
+        setStatus(next);
+      } finally {
+        // The question hook reads the delay from the cached status.
+        invalidateTelegramStatus(project);
+      }
+    });
+
   const removeWebhook = () =>
     run(async () => {
       await telegramRemoveWebhook(project);
@@ -250,8 +307,9 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
     >
       <div className="flex flex-col gap-5 p-4">
         <p className="text-[12px] leading-relaxed text-content/45">
-          Questions that wait more than 5 minutes are sent to this group. Any
-          member can answer.
+          {status?.configured && status.delaySecs === 0
+            ? "Questions are sent to this group right away. Any member can answer."
+            : "Questions that are still unanswered after the chosen time are sent to this group. Any member can answer."}
         </p>
 
         {status === null ? (
@@ -338,10 +396,20 @@ export function TelegramProjectDialog({ project, name, onClose }: Props) {
                 </Row>
                 {status.enabled ? null : (
                   <p className="text-[11px] leading-relaxed text-content/45">
-                    Forwarding is off. Turn it on to send questions that wait
-                    more than 5 minutes.
+                    Forwarding is off. Turn it on to send questions to this
+                    group.
                   </p>
                 )}
+                <Row label="Send after">
+                  <Select
+                    label="Send after"
+                    value={String(status.delaySecs)}
+                    options={delayOptions(status.delaySecs)}
+                    onChange={(next) => {
+                      if (!busy) void setDelay(Number(next));
+                    }}
+                  />
+                </Row>
                 <dl className="flex flex-col gap-1 text-[12px]">
                   <StatusLine
                     label="Topics"

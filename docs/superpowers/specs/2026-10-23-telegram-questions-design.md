@@ -65,7 +65,8 @@ existing per-project settings). Fields and actions:
   group with the "Manage topics" right (section 13.4). The app records `chat_id` and confirms in the
   group. Shows whether the group has Topics enabled and whether the bot is an admin with
   "Manage topics" (`getChatMember`); if not, a clear note explains how to fix it.
-- **Enabled** toggle. Delay is fixed at 5 minutes in v1 (constant, not a setting).
+- **Enabled** toggle. Delay is fixed at 5 minutes in v1 (constant, not a setting). Superseded:
+  the delay is now a per-project setting (section 14).
 - Warning when the same bot token is configured in two projects with different groups is
   fine (one poller per token, routing by chat), and a note that running two Monoptah
   instances (installed + dev) on the same bot makes `getUpdates` conflict (HTTP 409); the
@@ -104,7 +105,7 @@ of the prompt is answered or the prompt is skipped). Content (HTML parse mode, e
 
 - Header: project, session title, ticket, and when part of a workflow: workflow name,
   node, item, round.
-- "Waiting for 5 min".
+- "Waiting for <delay>" (the configured delay, omitted when it is 0; section 14).
 - Context: the tail of the agent's last assistant message before the question (why it is
   asking), trimmed (about 600 characters).
 - The question header and prompt, then option labels with descriptions.
@@ -266,3 +267,18 @@ module boundaries; copy.
    - Every message in a topic carries `reply_to_message` (pointing at the topic creation
      message when it is not a real reply); free-text answers match only when
      `reply_to_message.message_id` equals a pending question's message id.
+
+## 14. Follow-ups (2026-10-24)
+
+1. **The delay is a per-project setting.** It replaces the fixed 5 minutes of sections
+   5.1 and 5.2 (and the "5 minutes" in sections 2 and 10). `ProjectConfig.delay_secs`,
+   default 300 (5 minutes), range 0 to 3600 seconds ("Immediately" to 1 hour). A config
+   file saved before the setting existed, and a fresh or reset config, both read as 300;
+   an explicit 0 is kept. The dialog offers Immediately, 30 seconds, 1, 2, 5, 10, 15 and
+   30 minutes, and 1 hour, and shows any other stored value as a custom option. The
+   app checks it per question: a question is due once it has been pending as long as its
+   project's delay, with 0 meaning on the first check after it appeared. A change applies
+   to questions already waiting. The rule that a question first seen while forwarding was
+   off or unconfigured is never sent later is unchanged. The message line reads
+   "Waiting for 30 s / 1 min / 5 min / 1 h" and is left out when the delay is 0.
+2. **Context summary.** (Decision recorded with the context summary follow-up.)

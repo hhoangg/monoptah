@@ -24,7 +24,10 @@ Telegram is set up per project. Right-click a project and choose **Telegram…**
 6. **Turn on Forward questions.** Connecting a group does not start forwarding. Switch
    on **Forward questions**; it starts off. Switch it off again at any time to pause
    forwarding without disconnecting.
-7. **Check the status.** The dialog shows whether Topics are on and whether the bot
+7. **Choose when questions are sent.** The **Send after** setting decides how long a
+   question waits for an answer on the desktop before it goes to the group. The default
+   is 5 minutes; see "How it behaves".
+8. **Check the status.** The dialog shows whether Topics are on and whether the bot
    can manage topics, and explains what to fix if not.
 
 To use a topic you already have, open the session's menu and choose **Link Telegram
@@ -57,8 +60,15 @@ it. Only add people you trust to the group.
 
 ## How it behaves
 
-- A question is forwarded only after it has waited **5 minutes** without an answer.
-  Questions answered, skipped or cancelled sooner are never sent.
+- A question is forwarded only after it has waited the **Send after** time without an
+  answer. The default is **5 minutes**; choose Immediately, 30 seconds, 1, 2, 5, 10, 15
+  or 30 minutes, or 1 hour in the Telegram dialog of the project. **Immediately** sends
+  a question as soon as it appears. Questions answered, skipped or cancelled before
+  the time is up are never sent. The message says how long it waited ("Waiting for
+  5 min"), and says nothing when you chose Immediately. A change applies to questions
+  that are already waiting.
+- A question that was already waiting when you turned **Forward questions** on (or
+  before the project had a group) is never sent, whatever the setting.
 - Each session gets **one topic**, created when its first question is forwarded and
   named `[ticket] title` (or just the title when no ticket is linked).
 - **Any member** of the group can answer.
