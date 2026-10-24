@@ -250,6 +250,16 @@ impl Conversation {
     pub(crate) fn mono_stop(&mut self, cx: &mut Context<Self>) {
         self.stop_if_busy(cx);
     }
+    /// Stops the running turn; unlike `mono_stop` it never stops at cancelling a pending edit.
+    pub(crate) fn mono_stop_turn(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            self.stop(cx);
+        }
+    }
+    /// No turn is running, and none that was stopped is still finishing its writes.
+    pub(crate) fn mono_settled(&self) -> bool {
+        !self.busy && !self.stopping
+    }
     pub(crate) fn mono_post(
         &mut self,
         role: &str,

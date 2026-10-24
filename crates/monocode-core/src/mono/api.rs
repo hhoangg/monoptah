@@ -5,8 +5,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "models.list"|"soul.read"|"habits.list"=>"",
         "sessions.list"|"folders.list"|"worktrees.list"=>"project",
         "sessions.read"=>"sessionId project before limit maxChars",
-        "sessions.start"=>"prompt project harness model modelSettings runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd notifyOnComplete",
-        "sessions.send"=>"sessionId prompt project notifyOnComplete",
+        "sessions.start"=>"prompt project harness model modelSettings runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd notifyOnComplete completionDelivery parentSessionId folderName folderId",
+        "sessions.send"=>"sessionId prompt project notifyOnComplete completionDelivery",
         "sessions.draft"=>"sessionId prompt project",
         "sessions.stop"|"sessions.archive"|"sessions.delete"=>"sessionId project",
         "worktrees.create"=>"branch base existing project",
@@ -22,6 +22,32 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     for (key, value) in input.as_object().ok_or("Input must be an object")? {
         if !fields.split_whitespace().any(|f| f == key) {
             return Err(format!("{action} does not take {key}"));
+        }
+        match key.as_str() {
+            "completionDelivery" if !matches!(value.as_str(), Some("group" | "each")) => {
+                return Err("completionDelivery must be \"group\" or \"each\"".into());
+            }
+            // Native session IDs are positive integers, sent as a number or numeric text.
+            "parentSessionId"
+                if !value
+                    .as_i64()
+                    .or_else(|| value.as_str()?.parse().ok())
+                    .is_some_and(|n| n > 0) =>
+            {
+                return Err("parentSessionId must be a session ID (a positive number)".into());
+            }
+            _ => (),
+        }
+        if let "folderId" | "folderName" = key.as_str() {
+            let max = if key == "folderId" { 256 } else { 100 };
+            if value
+                .as_str()
+                .is_none_or(|s| s.trim().is_empty() || s.chars().count() > max)
+            {
+                return Err(format!(
+                    "{key} must be a non-empty string of at most {max} characters"
+                ));
+            }
         }
         if ["draft", "reveal", "notifyOnComplete", "existing", "enabled"].contains(&key.as_str())
             && !value.is_boolean()
@@ -50,6 +76,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "schedule",
             "tags",
             "options",
+            "parentSessionId",
         ]
         .contains(&key.as_str())
             && !value.is_string()
@@ -94,5 +121,63 @@ mod tests {
             &json!({"prompt":"x","project":"/code","draft":true})
         )
         .is_ok());
+    }
+    #[test]
+    fn start_fields_for_delivery_parent_and_folders() {
+        let ok = |input| validate("sessions.start", &input);
+        assert!(ok(json!({"prompt":"x","completionDelivery":"each"})).is_ok());
+        assert!(ok(json!({"prompt":"x","completionDelivery":"group"})).is_ok());
+        for bad in [json!("all"), json!(true), json!("")] {
+            assert_eq!(
+                ok(json!({"prompt":"x","completionDelivery":bad})).unwrap_err(),
+                "completionDelivery must be \"group\" or \"each\""
+            );
+        }
+        assert!(validate(
+            "sessions.send",
+            &json!({"sessionId":1,"prompt":"x","completionDelivery":"each"})
+        )
+        .is_ok());
+        assert!(validate(
+            "sessions.draft",
+            &json!({"sessionId":1,"prompt":"x","completionDelivery":"each"})
+        )
+        .is_err());
+        assert!(ok(json!({"prompt":"x","parentSessionId":7})).is_ok());
+        assert!(ok(json!({"prompt":"x","parentSessionId":"7"})).is_ok());
+        for bad in [
+            json!(0),
+            json!(-3),
+            json!(1.5),
+            json!(""),
+            json!("abc"),
+            json!(true),
+            json!(null),
+        ] {
+            assert_eq!(
+                ok(json!({"prompt":"x","parentSessionId":bad})).unwrap_err(),
+                "parentSessionId must be a session ID (a positive number)"
+            );
+        }
+        assert!(ok(json!({"prompt":"x","folderId":"f1","folderName":"Ticket 1"})).is_ok());
+        assert!(ok(json!({"prompt":"x","folderName":"n".repeat(100)})).is_ok());
+        // Limits count characters, not bytes.
+        assert!(ok(json!({"prompt":"x","folderName":"\u{e9}".repeat(100)})).is_ok());
+        assert!(ok(json!({"prompt":"x","folderName":"\u{e9}".repeat(101)})).is_err());
+        for (key, bad) in [
+            ("folderName", json!("n".repeat(101))),
+            ("folderName", json!("")),
+            ("folderName", json!("   ")),
+            ("folderName", json!(5)),
+            ("folderId", json!(5)),
+            ("folderId", json!(" ")),
+            ("folderId", json!("i".repeat(257))),
+        ] {
+            let error = ok(json!({"prompt":"x", key: bad})).unwrap_err();
+            assert!(
+                error.starts_with(&format!("{key} must be a non-empty string")),
+                "{error}"
+            );
+        }
     }
 }

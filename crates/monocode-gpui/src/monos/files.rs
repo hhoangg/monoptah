@@ -213,40 +213,6 @@ impl Monos {
         })
         .detach();
     }
-    pub(super) fn reset_conversation(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let prompt = window.prompt(
-            gpui::PromptLevel::Warning,
-            "Reset conversation?",
-            Some("The chat will be cleared. Its soul, memory and habits stay."),
-            &["Cancel", "Reset"],
-            cx,
-        );
-        let id = id.to_string();
-        cx.spawn(async move |this, cx| {
-            if prompt.await.ok() != Some(1) {
-                return;
-            }
-            let _ = this.update(cx, |this, cx| {
-                if let Some(view) = this.chats.remove(&id) {
-                    view.update(cx, |v, cx| v.mono_stop(cx));
-                }
-                if let Some(mono) = this.roster.get_mut(&id) {
-                    mono.session_id = None;
-                    mono.unavailable_session = None;
-                    mono.seen_rows = 0;
-                    mono.outbox.clear();
-                }
-                this.save(cx);
-                this.ensure_chat(&id, cx);
-            });
-        })
-        .detach();
-    }
     pub(super) fn delete_mono(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = window.prompt(
             gpui::PromptLevel::Warning,

@@ -71,10 +71,8 @@ pub fn parse(v: &Value) -> Result<Value, String> {
             json!({"type":"choices","options":options})
         }
         "habit" => {
-            let schedule: super::habits::Schedule =
-                serde_json::from_value(v.get("schedule").cloned().ok_or("Provide schedule")?)
-                    .map_err(|e| e.to_string())?;
-            schedule.validate()?;
+            let schedule =
+                super::habits::Schedule::from_cli(v.get("schedule").ok_or("Provide schedule")?)?;
             json!({"type":"habit","name":text(v,"name",80)?,"instructions":text(v,"instructions",4000)?,"schedule":schedule})
         }
         _ => unreachable!(),

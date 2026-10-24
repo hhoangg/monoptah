@@ -2,6 +2,9 @@
 //! `tree`) and the sessions an /operator thread started hang off a line under
 //! its row. Each rail opens while its thread, or one of the thread's
 //! sessions, is in view, chosen or working, and RevealHeight grows it in.
+use super::started_rail::{
+    StartedRailState, started_rail_open, started_rail_sets, sync_started_rail, toggle_started_rail,
+};
 use super::*;
 use crate::reveal::{Disclosure, bezier};
 use std::time::{Duration, Instant};
@@ -18,6 +21,13 @@ pub(crate) struct Rails {
     /// This frame's /operator groups, and the sessions they took from the list.
     pub(super) started: HashMap<i64, Vec<i64>>,
     pub(super) children: HashSet<i64>,
+    /// Which started-session rails stay open, and which the user collapsed.
+    /// In memory only, as the Sidebar's state is.
+    pub(super) started_rail: StartedRailState<i64>,
+    /// Parents whose rail shows open for now (latched or working).
+    auto: HashSet<i64>,
+    /// The session in view at the last sync: only a change of it re-enters a group.
+    focused: Option<i64>,
     frames: Option<gpui::Task<()>>,
 }
 #[derive(Clone, Copy)]
@@ -67,10 +77,29 @@ impl Shell {
     fn in_play(&self, id: i64, cx: &App) -> bool {
         (self.workspace.active == Some(id) && !self.mono_active(cx))
             || self.selected_sessions.contains(&id)
-            || self
-                .sessions
-                .get(&id)
-                .is_some_and(|s| s.read(cx).responding())
+            || self.responding(id, cx)
+    }
+    /// startedViewing: in view or chosen.
+    fn in_view(&self, id: i64, cx: &App) -> bool {
+        self.highlighted(cx) == Some(id) || self.selected_sessions.contains(&id)
+    }
+    /// highlightedSessionId: the active session unless a Mono or another view covers it.
+    fn highlighted(&self, cx: &App) -> Option<i64> {
+        self.workspace
+            .active
+            .filter(|_| !self.mono_active(cx) && !self.app_view_open())
+    }
+    fn responding(&self, id: i64, cx: &App) -> bool {
+        self.sessions
+            .get(&id)
+            .is_some_and(|s| s.read(cx).responding())
+    }
+    /// Collapses or expands a thread's started sessions; the user's choice
+    /// holds while the thread stays in play.
+    pub(super) fn toggle_started(&mut self, id: i64, cx: &mut Context<Self>) {
+        let auto = self.rails.auto.contains(&id);
+        self.rails.started_rail = toggle_started_rail(&self.rails.started_rail, id, auto);
+        self.invalidate_chrome(cx);
     }
     /// groupStartedSessions: each listed session another started joins the
     /// listed session at the top of its chain; one whose caller is not listed
@@ -107,6 +136,12 @@ impl Shell {
             .values()
             .any(|s| s.tasks.iter().any(|t| t.session == Some(id)))
     }
+    /// An orchestrator with agents has a rail of its own kind.
+    fn orchestrated(&self, id: i64) -> bool {
+        self.orchestration_summaries
+            .get(&id)
+            .is_some_and(|summary| !summary.tasks.is_empty())
+    }
     fn rail(&self, id: i64, started: &HashMap<i64, Vec<i64>>) -> Option<Rail> {
         if let Some(summary) = self.orchestration_summaries.get(&id)
             && !summary.tasks.is_empty()
@@ -122,8 +157,8 @@ impl Shell {
         match rail {
             // orchestrationExpanded: the lead in view, chosen or working.
             Rail::Agents(_) => self.in_play(id, cx),
-            Rail::Started(children) => {
-                self.in_play(id, cx) || children.iter().any(|c| self.in_play(*c, cx))
+            Rail::Started(_) => {
+                started_rail_open(&self.rails.started_rail, id, self.rails.auto.contains(&id))
             }
         }
     }
@@ -136,6 +171,26 @@ impl Shell {
         } else {
             self.started_groups(ids)
         };
+        // Orchestrators keep their derived expansion.
+        let by_parent: HashMap<i64, Vec<i64>> = started
+            .iter()
+            .filter(|(id, _)| !self.orchestrated(**id))
+            .map(|(id, children)| (*id, children.clone()))
+            .collect();
+        let highlighted = self.highlighted(cx);
+        let sets = started_rail_sets(
+            &by_parent,
+            |_| false,
+            |id| self.in_view(id, cx),
+            |id| self.responding(id, cx),
+            highlighted,
+            self.rails.focused,
+        );
+        self.rails.focused = highlighted;
+        if let Some(next) = sync_started_rail(&self.rails.started_rail, &sets) {
+            self.rails.started_rail = next;
+        }
+        self.rails.auto = sets.auto;
         let now = Instant::now();
         let mut animating = false;
         let mut seen = HashSet::new();
@@ -994,7 +1049,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, VisualTestContext, WindowHandle};
 
     fn bounds(cx: &mut VisualTestContext, selector: String) -> Option<gpui::Bounds<Pixels>> {
         cx.debug_bounds(Box::leak(selector.into_boxed_str()))
@@ -1069,8 +1124,8 @@ mod tests {
             bounds(cx, format!("rail-agent-{other}-0")).is_none(),
             "an orchestrator's rail is closed while it is out of play"
         );
-        // Clicking the orchestrator opens its agents and folds the other rail;
-        // the click does not also land on an agent that grows in under it.
+        // Clicking the orchestrator opens its agents and leaves the other rail
+        // open; the click does not also land on an agent that grows in under it.
         let row = bounds(cx, format!("sidebar-session-{other}")).unwrap();
         let clicked = Instant::now();
         cx.simulate_click(row.center(), Default::default());
@@ -1115,8 +1170,163 @@ mod tests {
             })
             .unwrap();
         assert!(
-            bounds(cx, format!("sidebar-session-{child}")).is_none(),
-            "the operator rail folds away once its thread leaves play"
+            bounds(cx, format!("sidebar-session-{child}")).is_some(),
+            "the operator rail stays open once its thread leaves play"
         );
+    }
+
+    /// A lead with one started session, an unrelated session, and the lead in view.
+    fn operator(
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<Shell>, VisualTestContext, i64, i64, i64) {
+        let (window, _, lead) = crate::shell::tests::window(cx);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let (child, other) = window
+            .update(&mut cx, |shell, _, cx| {
+                let mut ids = Vec::new();
+                for _ in 0..2 {
+                    let summary = locked(&shell.store)
+                        .unwrap()
+                        .create("codex", &shell.workspace.project)
+                        .unwrap();
+                    ids.push(summary.id);
+                    shell.add(summary, cx);
+                }
+                for id in ids.iter().copied().chain([lead]) {
+                    shell.sessions[&id].update(cx, |s, _| s.summary.has_messages = true);
+                }
+                shell.started_by.insert(ids[0], lead);
+                shell.selected_sessions.clear();
+                shell.workspace.active = Some(lead);
+                shell.invalidate_chrome(cx);
+                (ids[0], ids[1])
+            })
+            .unwrap();
+        settle(window, &mut cx);
+        (window, cx, lead, child, other)
+    }
+    fn view(
+        window: WindowHandle<Shell>,
+        cx: &mut VisualTestContext,
+        active: Option<i64>,
+        selected: &[i64],
+    ) {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.active = active;
+                shell.selected_sessions = selected.iter().copied().collect();
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        settle(window, cx);
+    }
+    fn click_chevron(window: WindowHandle<Shell>, cx: &mut VisualTestContext, lead: i64) {
+        let chevron =
+            bounds(cx, format!("started-toggle-{lead}")).expect("the thread has a chevron");
+        cx.simulate_click(chevron.center(), Default::default());
+        cx.run_until_parked();
+        settle(window, cx);
+    }
+
+    #[gpui::test]
+    fn the_chevron_collapses_and_expands_a_started_rail(cx: &mut TestAppContext) {
+        let (window, mut cx, lead, child, other) = operator(cx);
+        let cx = &mut cx;
+        assert!(bounds(cx, format!("sidebar-session-{child}")).is_some());
+        click_chevron(window, cx, lead);
+        assert!(
+            bounds(cx, format!("sidebar-session-{child}")).is_none(),
+            "collapsed while the thread is still in view"
+        );
+        window
+            .read_with(cx, |shell, _| {
+                assert_eq!(
+                    shell.workspace.active,
+                    Some(lead),
+                    "the click does not select"
+                );
+                assert!(shell.rails.started_rail.closed.contains(&lead));
+            })
+            .unwrap();
+        click_chevron(window, cx, lead);
+        assert!(bounds(cx, format!("sidebar-session-{child}")).is_some());
+        window
+            .read_with(cx, |shell, _| {
+                assert!(shell.rails.started_rail.open.contains(&lead));
+                assert!(!shell.rails.started_rail.closed.contains(&lead));
+            })
+            .unwrap();
+        // Another session in view: the latched rail collapses without the
+        // click selecting its thread.
+        view(window, cx, Some(other), &[]);
+        assert!(bounds(cx, format!("sidebar-session-{child}")).is_some());
+        click_chevron(window, cx, lead);
+        assert!(bounds(cx, format!("sidebar-session-{child}")).is_none());
+        window
+            .read_with(cx, |shell, _| {
+                assert_eq!(shell.workspace.active, Some(other));
+                assert!(shell.selected_sessions.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_started_rail_stays_open_while_a_child_is_selected_and_after(cx: &mut TestAppContext) {
+        let (window, mut cx, _lead, child, other) = operator(cx);
+        let cx = &mut cx;
+        view(window, cx, Some(other), &[child]);
+        assert!(bounds(cx, format!("sidebar-session-{child}")).is_some());
+        view(window, cx, Some(other), &[]);
+        assert!(
+            bounds(cx, format!("sidebar-session-{child}")).is_some(),
+            "latched open once the user moves away"
+        );
+    }
+
+    #[gpui::test]
+    fn a_user_collapse_is_forgotten_once_the_thread_is_out_of_play(cx: &mut TestAppContext) {
+        let (window, mut cx, lead, child, other) = operator(cx);
+        let cx = &mut cx;
+        click_chevron(window, cx, lead);
+        assert!(bounds(cx, format!("sidebar-session-{child}")).is_none());
+        view(window, cx, Some(other), &[]);
+        window
+            .read_with(cx, |shell, _| {
+                assert!(
+                    !shell.rails.started_rail.closed.contains(&lead),
+                    "forgotten"
+                );
+                assert!(!shell.rails.started_rail.open.contains(&lead));
+            })
+            .unwrap();
+        assert!(bounds(cx, format!("sidebar-session-{child}")).is_none());
+        view(window, cx, Some(child), &[]);
+        assert!(
+            bounds(cx, format!("sidebar-session-{child}")).is_some(),
+            "reopens when one of its sessions is in view"
+        );
+    }
+
+    #[gpui::test]
+    fn started_sessions_group_under_the_top_of_their_chain(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, _| {
+                // startedSessions.test.ts: a launch's own launches join the
+                // top-level session, and a launch whose caller is not listed
+                // stays where it is.
+                shell.started_by.extend([(2, 1), (3, 2), (6, 5), (9, 8)]);
+                let (groups, children) = shell.started_groups(&[1, 2, 3, 4, 6, 7, 9]);
+                assert_eq!(groups[&1], [2, 3]);
+                assert!(!groups.contains_key(&2));
+                assert_eq!(children, HashSet::from([2, 3]));
+                // 6 is started by 5, which is not listed.
+                // A reviewer nests under its dev when the Mono's chat is not listed.
+                shell.started_by.extend([(11, 10)]);
+                let (groups, children) = shell.started_groups(&[10, 11]);
+                assert_eq!(groups[&10], [11]);
+                assert_eq!(children, HashSet::from([11]));
+            })
+            .unwrap();
     }
 }

@@ -81,6 +81,29 @@ pub fn remove_clean(path: &Path) -> Result<(), String> {
     // check above, or one holding submodules.
     crate::git::git(main, &["worktree", "remove", "--", &tree.path]).map(|_| ())
 }
+/// Undoes a worktree `git::create_worktree` just made for a session whose
+/// start then failed: the worktree and its fresh `mc/native-` branch (which
+/// holds no commits of its own) go, so a failed start leaves nothing behind.
+pub fn discard_new(path: &Path) -> Result<(), String> {
+    let snapshot = crate::git::snapshot(path)?;
+    let main = snapshot
+        .worktrees
+        .first()
+        .ok_or("No main working copy found")?;
+    let main = Path::new(&main.path);
+    let tree = check(main, path)?;
+    let branch = tree
+        .branch
+        .filter(|b| b.starts_with("mc/native-"))
+        .ok_or("Not a worktree made for a native session")?;
+    remove(main, path)?;
+    crate::git::git(main, &["branch", "-D", "--", &branch])?;
+    // The parent folder goes too when it was made for this worktree alone.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -114,6 +137,26 @@ mod tests {
             &["show-ref", "--verify", "refs/heads/settings-parity"]
         )
         .is_ok());
+        let _ = std::fs::remove_dir(default_root(dir.path()));
+    }
+    #[test]
+    fn a_new_session_worktree_is_discarded_with_its_branch() {
+        let dir = repo();
+        let path = crate::git::create_worktree(dir.path(), "HEAD", 4242).unwrap();
+        assert!(path.is_dir());
+        discard_new(&path).unwrap();
+        assert!(!path.exists());
+        assert!(
+            crate::git::git(dir.path(), &["branch", "--list", "mc/native-4242-*"])
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        // Only worktrees made for native sessions are touched.
+        let named = crate::git::create_named_worktree(dir.path(), "keep-me").unwrap();
+        assert!(discard_new(Path::new(&named.path)).is_err());
+        assert!(Path::new(&named.path).is_dir());
+        remove(dir.path(), Path::new(&named.path)).unwrap();
         let _ = std::fs::remove_dir(default_root(dir.path()));
     }
     #[test]

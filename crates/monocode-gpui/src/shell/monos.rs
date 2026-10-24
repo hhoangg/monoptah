@@ -79,6 +79,15 @@ impl Shell {
         });
         self.invalidate_chrome(cx);
     }
+    /// Hangs a Mono's launch under the session it was started beneath; the link is saved by the caller.
+    pub(crate) fn mono_link_started(&mut self, child: i64, parent: i64, cx: &mut Context<Self>) {
+        self.started_by.insert(child, parent);
+        self.invalidate_chrome(cx);
+    }
+    #[cfg(test)]
+    pub(crate) fn mono_started_by(&self, id: i64) -> Option<i64> {
+        self.started_by.get(&id).copied()
+    }
     pub(crate) fn mono_groups(&self, project: &str) -> monocode_core::session_groups::Groups {
         self.groups.get(project).cloned().unwrap_or_default()
     }

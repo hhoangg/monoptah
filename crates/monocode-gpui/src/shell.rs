@@ -38,6 +38,7 @@ mod settings;
 mod shortcuts;
 mod sidebar_list;
 mod sidebar_peek;
+mod started_rail;
 #[cfg(test)]
 pub(crate) mod surface_tests;
 mod terminal_dock;
@@ -5697,9 +5698,11 @@ impl Shell {
         if let Some(row) = self.rename_row(&session_groups::RenameTarget::Session(id), cx) {
             return row;
         }
-        // A collapsed thread shows a chevron in its mark's place on hover:
-        // selecting it opens the rail below.
-        let expandable = rail.is_some_and(|(_, open)| !open);
+        // An /operator thread's chevron collapses or expands its rail; a
+        // collapsed orchestrator shows one too, and selecting it opens its rail.
+        let started_toggle = matches!(rail, Some((rails::Rail::Started(_), _)));
+        let started_open = rail.is_some_and(|(_, open)| open);
+        let expandable = started_toggle || rail.is_some_and(|(_, open)| !open);
         let mode = rail.map(|(rail, _)| match rail {
             rails::Rail::Agents(summary) => (
                 "share",
@@ -5830,19 +5833,54 @@ impl Shell {
                         .child(mark),
                 )
                 .when(expandable, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .opacity(0.)
-                            .group_hover("session-row", |s| s.opacity(1.))
-                            .child(icon("chevron-down", 14.).text_color(content(0.6))),
-                    )
+                    let chevron = div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .opacity(0.)
+                        .group_hover("session-row", |s| s.opacity(1.));
+                    d.child(if started_toggle {
+                        // Keeps the click off the row, which would select the thread.
+                        chevron
+                            .id(("started-toggle", id as usize))
+                            .debug_selector(move || format!("started-toggle-{id}"))
+                            .role(Role::Button)
+                            .aria_label(if started_open {
+                                "Collapse started sessions"
+                            } else {
+                                "Expand started sessions"
+                            })
+                            .aria_expanded(started_open)
+                            .cursor_pointer()
+                            .rounded_sm()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_started(id, cx);
+                            }))
+                            .child(
+                                icon(
+                                    if started_open {
+                                        "chevron-up"
+                                    } else {
+                                        "chevron-down"
+                                    },
+                                    14.,
+                                )
+                                .text_color(content(0.6))
+                                .group_hover("started-toggle-icon", |s| s.text_color(content(1.))),
+                            )
+                            .group("started-toggle-icon")
+                            .into_any_element()
+                    } else {
+                        chevron
+                            .child(icon("chevron-down", 14.).text_color(content(0.6)))
+                            .into_any_element()
+                    })
                 })
         };
         let title = div()

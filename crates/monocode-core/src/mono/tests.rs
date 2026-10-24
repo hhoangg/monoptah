@@ -160,3 +160,53 @@ fn delivery_receipt_is_saved_with_the_user_message() {
         Some("1")
     );
 }
+#[test]
+fn a_launch_saved_before_completion_delivery_loads_as_group() {
+    let old = r#"{"sessionId":7,"cwd":"/p","title":"t","harness":"codex","model":null,"originTurn":4294967297,"notifyOnComplete":true}"#;
+    let launch: Launch = serde_json::from_str(old).unwrap();
+    assert!(!launch.each);
+    let saved = serde_json::to_value(Launch {
+        each: true,
+        ..launch
+    })
+    .unwrap();
+    assert_eq!(saved["each"], true);
+}
+#[test]
+fn the_prompt_and_help_describe_each_delivery_and_habit_reporting() {
+    let mut roster = Roster::default();
+    let mono = roster.create(vec!["/p".into()]).clone();
+    let files = files::AgentFiles {
+        id: mono.id.clone(),
+        dir: String::new(),
+        soul: None,
+        soul_hash: String::new(),
+        memory: String::new(),
+        memory_hash: String::new(),
+        memory_path: String::new(),
+        topics: Vec::new(),
+    };
+    let context = context(&mono, &files, std::path::Path::new("/bin/app"));
+    for needle in [
+        "completionDelivery",
+        "\"each\"",
+        "habit run",
+        "not to the run",
+        "parentSessionId",
+        "folderName",
+    ] {
+        assert!(context.contains(needle), "context lacks {needle}");
+    }
+    assert!(!context.contains("app-<"), "Tauri id scheme leaked");
+    for needle in [
+        "\"each\" delivers",
+        "habit run",
+        "report to the Mono's chat",
+        "draft:true with notifyOnComplete:true still records a launch that reports",
+        "sessions.start notifyOnComplete defaults to true",
+        "sessions.send notifyOnComplete defaults to false",
+    ] {
+        assert!(bridge::HELP.contains(needle), "help lacks {needle}");
+    }
+    assert!(!bridge::HELP.contains("Ignored for drafts"));
+}

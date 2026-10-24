@@ -7,6 +7,7 @@ mod color_picker;
 mod files;
 mod filters;
 mod floating;
+mod habit_stop;
 mod host;
 mod html;
 mod memory_ui;
@@ -14,6 +15,7 @@ mod notifications;
 mod overview;
 mod panel_stack;
 mod panels;
+mod reset;
 mod scheduler;
 mod search;
 #[cfg(all(target_os = "macos", not(test)))]
@@ -69,7 +71,12 @@ struct RunningHabit {
     failure: Option<String>,
     waiting_since: Option<u64>,
     cards: Vec<serde_json::Value>,
-    mailbox: Vec<String>,
+    /// Sessions the run started or asked to report; the run does not wait for them.
+    sessions: Vec<i64>,
+    /// The ones among them the run created, as opposed to ones it only wrote to.
+    created: Vec<i64>,
+    /// The user's stop request; it belongs to this run alone.
+    stop: Option<habit_stop::StopMode>,
 }
 pub(crate) struct Monos {
     #[cfg(all(target_os = "macos", not(test)))]
@@ -90,6 +97,8 @@ pub(crate) struct Monos {
     loading_chats: HashSet<String>,
     work: work::Cache,
     pub(crate) error: Option<String>,
+    reset: Option<reset::ResetDialog>,
+    cleanup: reset::CleanupRunner,
     notice_region: AnchorSlot,
     pub(crate) details: Entity<overview::Overview>,
     original_chrome: bool,
@@ -126,7 +135,7 @@ pub(crate) struct Monos {
     rail_ids: Vec<String>,
     running: HashMap<i64, RunningHabit>,
     active_run: Option<i64>,
-    completion_work: HashSet<(String, u64)>,
+    completion_work: HashSet<(String, host::Batch)>,
     /// The open background dialog, centred in the window it opened in.
     background: Option<(
         Entity<crate::project_settings::BackgroundDialog>,
@@ -335,6 +344,8 @@ impl Monos {
             loading_chats: HashSet::new(),
             work: work::Cache::default(),
             error: roster_error,
+            reset: None,
+            cleanup: reset::default_cleanup(),
             notice_region,
             details,
             original_chrome: false,
@@ -935,6 +946,11 @@ impl Monos {
         if changed {
             self.save(cx);
             self.configure_chat(id, cx);
+        }
+        // A reset is deleting this conversation: reports and queued messages
+        // wait for the fresh one instead of starting work on the old row.
+        if self.resetting(id) {
+            return;
         }
 
         if let Some(view) = self
@@ -1602,6 +1618,7 @@ impl gpui::Render for Monos {
                     .when(!self.original_chrome, |d| d.child(self.topbar(&mono, cx))),
             )
             .children(self.settings_modal(&mono, window, cx))
+            .children(self.reset_modal(window, cx))
             .children(self.picker_surface(cx))
             .children(self.options_surface(cx))
             .children(self.background_modal())

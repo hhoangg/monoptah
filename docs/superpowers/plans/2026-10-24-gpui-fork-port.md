@@ -286,6 +286,65 @@ Behavior contract: `docs/tui-sessions.md`. Reference survey with file:line for b
 
 **Phase 4 commit message:** `Native: terminal (TUI) session surface with Claude hook busy state`
 
+## Phase 5 - Mono extensions and Telegram questions
+
+Reference survey with file:line for both apps: `.superpowers/sdd/2026-10-24-gpui-fork-port/phase5-survey.md` (git-ignored scratch; the facts below are the binding ones). Two commits: 5a = Tasks 5.1-5.7 (Mono), 5b = Tasks 5.8-5.10 (Telegram).
+
+**Phase rulings:**
+- Data-loss fix first: native `mono/habits.rs` `parse`/`update` currently drop habits they cannot validate and rewrite `habits.json`, deleting interval habits saved by the Tauri app. Unreadable entries must be kept verbatim on every write.
+- Native session ids are integers. `parentSessionId` takes a native session id (number or numeric string). The Tauri `app-<parent>-<requestId>` id scheme, its 255-character limit and its "no hyphens" advice do not apply; HELP and the Mono prompt describe the native rule. The parent link is stored with the existing `save_started_link(child, parent)`, so it shows in the sidebar as a started session.
+- Parent validation uses the persisted `Mono.launches` (TS keeps an in-memory registry lost on restart): the parent must be a session this Mono (or its habit run) started, listed in the same project, and must not itself have a parent ("a child of a child is not allowed"). Error copy follows TS.
+- Habit semantics follow the fork: sessions a habit run starts report to the Mono's chat with `each` delivery; the run does not wait for them; a run timeout or approval wait stops the run but not the sessions it started; the post says what it started ("Started N sessions." etc.).
+- Mono reset with "Also delete ... session files" deletes the old conversation row (as Tauri's reset does) after reading its provider ids, then runs the provider-file cleanup in the background; problems show as a non-blocking notice. Without the box ticked, the old row is also deleted (Tauri parity). Native records retired provider ids on rotation in the setting `mono-retired:<session>` (newest last, cap 200) and, on desktop data, also reads Tauri's `monocode:mono-rotations[<persisted id>].retired`.
+- Folder colors use the existing palette index (`Groups::set_color`), not TS hex custom colors.
+- Telegram uses the same `<data_dir>/telegram-config.json` as the Tauri app (shapes unchanged). If both apps poll one bot, Telegram answers HTTP 409 for one of them; the existing `api.rs` classification surfaces it as the project's `problem` ("Another app is reading this bot" or the Tauri wording). No cross-app lock.
+- Question mapping: Telegram `request_id: u64` = stable hash of the native question id; option ids map to native answer labels; `__custom__` + text becomes typed text; session keys in `topics` use `store.persisted_session_id(id)` so Tauri and native share topic bindings.
+- Workflow context in Telegram headers and workflow tickets stays empty until Phase 7.
+
+### Task 5.1: Interval schedule in core (and stop losing habits)
+**Files:** `crates/monocode-core/src/mono/habits.rs` (Schedule gains `interval_hours: Option<u8>`, `interval_from: Option<String>` serde camelCase defaults; `Schedule::from_cli(&Value) -> Result<Schedule, String>` with the TS error strings; `anchor(now)`; interval `next()` per `nextIntervalRunAt`; label "Every hour from HH:MM" / "Every N hours from HH:MM"; `parse`/`update` keep unreadable entries verbatim), CLI schedule call sites (`monos/host.rs` habits.add/update, `mono/cards.rs`, `monos/cards.rs`) use `from_cli`; `anchor` applied on add and on update when the schedule changes; `mono/bridge.rs` HELP habits line.
+**Tests:** port `monoHabits.test.ts` interval cases (8) and the `agentAppMemory` CLI round-trip (1); a test that updating a file containing an interval habit and an unknown-kind habit keeps both bytes-equivalent.
+
+### Task 5.2: Interval editor in GPUI
+**Files:** `crates/monocode-gpui/src/monos/scheduler.rs` (`schedule_controls`, `habit_schedule`): kind "Every N hours", default 4, "Hours between runs" picker "1 hour".."24 hours", "from" instead of "at", Next preview via `anchor`.
+**Tests:** editor builds an interval schedule with the anchor date; label shown in the list.
+
+### Task 5.3: `sessions.start` fields: no-commit worktree, folders, parent
+**Files:** `mono/api.rs` (fields `completionDelivery`, `parentSessionId`, `folderName`, `folderId`; `completionDelivery` must be "group"|"each" with the TS error; `parentSessionId` non-text), `monos/host.rs` sessions.start: unborn-HEAD check ("This project has no commits yet; make an initial commit before using workspaceMode worktree") and every validation BEFORE `db.create` (fixes the orphan row on worktree failure); `folderChoice`/`fileLaunchInFolder` semantics on `Groups` (existing `folderId` wins, never renamed; `folderName` creates; unknown `folderId` alone -> "Folder was not found in this project"; Mono palette color; result `folderId`/`folderName`; hidden launches validated but not filed); `parentSessionId` validation per phase ruling + `save_started_link` + `Shell::mono_link_started`; `crates/monocode-core/src/git.rs` `unborn(cwd) -> bool`.
+**Tests:** port the folder, parent and no-commit cases of `agentApp.test.ts` as host tests (`monos/tests.rs` setup/call).
+
+### Task 5.4: Completion delivery and habit reporting
+**Files:** `mono.rs` `Launch` gains `#[serde(default)] each: bool` (and parent if needed); `monos/host.rs` `check_completions` groups by `origin_turn` for group and per launch for each; `sessions.send` `completionDelivery`; habit-run launches report to the Mono chat (origin = the chat session) with forced each; `monos/scheduler.rs` `check_habits` no longer stops children on timeout/approval wait, `habit_changed` no longer waits for children, post text per TS ("Started a session." / "Started N sessions."); prompt text in `mono.rs` context, the habit run prompt (`scheduler.rs`), and `bridge.rs` HELP (sessions.start/send lines) describe each/group, parent and folders in native terms.
+**Tests:** port `monoCompletionBatches.test.ts` (8) semantics and the habit reporting cases of `useMonoHabits.test.ts`.
+
+### Task 5.5: Habit Stop sheet
+**Files:** `monos/mod.rs` `RunningHabit` gains `stop: Option<StopMode>` and `started: Vec<i64>`; `monos/scheduler.rs` `habit_actions` Stop button (only while running), 3-button prompt: text `Stop "<name>"? Sessions it already started can keep running.`, buttons "Stop run only", "Stop run and its sessions", "Keep running"; "Stopping..." disabled after request; `"<name>" already finished, so there was nothing to stop.` if it ended meanwhile; `check_habits` applies the stop (record "failed" with "Stopped by the user."; mode all stops the sessions the run created; post "Stopped. Started N session that keeps / sessions that keep running." and "Could not stop N session(s): ids.").
+**Tests:** port `habitStop.test.ts` (7) and the stop cases of `useMonoHabits.test.ts`.
+
+### Task 5.6: Started rail latch
+**Files:** create `crates/monocode-gpui/src/shell/started_rail.rs` (pure port of `src/app/shell/startedRail.ts`: `{open, closed}`, `started_rail_open`, `sync_started_rail`, `toggle_started_rail`), `shell/rails.rs` `rail_open` uses it, row hover chevron "Collapse started sessions" / "Expand started sessions".
+**Tests:** port `startedRail.test.ts` (18) verbatim and `startedSessions.test.ts` (3).
+
+### Task 5.7: Mono reset deletes provider files
+**Files:** `crates/monocode-core/src/provider_cleanup.rs` (`ProviderSessionRef`, `plan_reset_cleanup`, `run_cleanup_report(data_dir, &[CleanupRequest], include_mono_stores)`, `mono_codex_homes`), retired-id store (setting `mono-retired:<session>`, cap 200, + desktop read of `monocode:mono-rotations`), `crates/monocode-gpui/src/runtime.rs` rotation records the retired id, `monos/files.rs` `reset_conversation` custom modal with the checkbox ("Also delete the <label> session files on this computer", note "They can't be recovered." + provider note from `monoProviderFiles`), deletes the old row, background cleanup, problem notice copy from `providerFilesProblemMessage`.
+**Tests:** port the 11 reset Rust tests left out in Phase 3, `monoProviderFiles.test.ts` (13), `monoRotation.test.ts` retired cases (8), and reset-flow cases from `monoWorkspace.test.ts`. Then `npm run native:check` -> 0 and commit 5a.
+
+**Phase 5a commit message:** `Native: Mono pipeline controls, interval habits, habit stop and reset cleanup`
+
+### Task 5.8: Telegram core
+**Files:** move `src-tauri/src/telegram/{api,config,queue,render,pending,poller}.rs` into `crates/monocode-core/src/telegram/` with a Tauri-free `mod.rs` (functions taking `data_dir`, an `EventSink` that the GPUI side implements); do not modify `src-tauri/` (copy, not move: Tauri stays production).
+**Tests:** all 154 Rust tests pass in core.
+
+### Task 5.9: Forwarding model and question API
+**Files:** `crates/monocode-core/src/telegram/forward.rs` (port of `telegramForward.ts`: `is_topic_linkable`, `is_forwardable`, `session_ticket_id`, `topic_title`, `question_context`, `forward_delay`, `header_of`, `forward_payload`, `due_forwards`), `telegram/forwarder.rs` (state machine of `useTelegramQuestions.ts`: 15 s tick, 2 attempts, eligibility on first sight, close reporting with "Answered on desktop" / "Skipped" / "Cancelled", answer validation); `Conversation::pending_question`, `answer_question`, and an outcome hook; ticket registry set in `start_inbox_session`.
+**Tests:** port `telegramForward.test.ts` (56) and the portable `useTelegramQuestions.test.ts` cases.
+
+### Task 5.10: Telegram in the GPUI app
+**Files:** bridge started once per app with the native sink; answers applied through `answer_question`; project menu "Telegram..." dialog (token, connect link, enable toggle, "Send after" presets 0/30/60/120/300/600/900/1800/3600 s with "(custom)", status rows, Change token, Disconnect confirm, Remove webhook, any-group-member warning; hidden for remote projects; polls status every 3 s while open); session menu "Link Telegram topic..." (only when configured with a chat) and its dialog.
+**Tests:** port the logic of `TelegramProjectDialog.test.ts` and `LinkTelegramTopicDialog.test.ts` that is not DOM-specific. Then `npm run native:check` -> 0 and commit 5b.
+
+**Phase 5b commit message:** `Native: forward agent questions to Telegram`
+
 ## Phases 4 to 7 (sketch; detailed plan written when each starts)
 
 - **Phase 4 - TUI surface:** per-provider surface preference (`monocode.providerSurface.v1`); `sessions.surface` read/write in `store.rs`/`store/shared.rs` (Tauri TUI rows stop showing as chat); `terminal.rs` spawn of program+args+env with exit code; a session-bound terminal pane opened from `open`/`activate_session`; Claude launch args (`--model`, `--permission-mode`, `--resume`/`--session-id`, `--settings` hooks), `agy` exception; `tui-hook` subcommand + spool watcher + `classify` with 5 s busy staleness into `busy_sessions`; app-driven sessions forced to chat; new-session provider prompt; automations follow the surface; close-on-clean-exit.

@@ -21,9 +21,12 @@ Actions:
 models.list {}
 sessions.list {project?}
 sessions.read {sessionId,project?,before?,limit?,maxChars?}
-sessions.start {prompt,project?,harness?,model?,modelSettings?,runtimeMode?,title?,draft?,reveal?,workspaceMode?,worktreeBase?,worktreeCwd?,notifyOnComplete?}
-sessions.send {sessionId,prompt,project?,notifyOnComplete?}
+sessions.start {prompt,project?,harness?,model?,modelSettings?,runtimeMode?,title?,draft?,reveal?,workspaceMode?,worktreeBase?,worktreeCwd?,notifyOnComplete?,completionDelivery?,parentSessionId?,folderName?,folderId?}
+sessions.send {sessionId,prompt,project?,notifyOnComplete?,completionDelivery?}
 sessions.draft {sessionId,prompt,project?}
+sessions.start folders: folderName (up to 100 characters) files the new session into a new folder of that name; folderId files it into an existing folder of the project, which is never renamed and wins over folderName; an unknown folderId alone is an error. Sessions are only filed when the Mono shows started sessions in the sidebar.
+sessions.start parentSessionId: a session ID (a number) of a session this Mono started in the same project; the new session shows under it in the sidebar. A session started under a parent cannot be a parent itself. Combine with folderId to keep a reviewer in its dev's folder.
+completionDelivery: "group" (default) delivers one report after every session of the calling turn has stopped; "each" delivers a session's report as soon as it stops, without waiting for the turn or its siblings (use it when one result starts the next step). A habit run always uses "each": the sessions it starts report to the Mono's chat, not to the run, even after the run has ended, so start them, mention what you started and finish. sessions.start notifyOnComplete defaults to true, or to false for a draft, and sessions.send notifyOnComplete defaults to false; draft:true with notifyOnComplete:true still records a launch that reports. Not used when notifyOnComplete is false.
 sessions.stop / sessions.archive / sessions.delete {sessionId,project?}
 worktrees.list {project?}
 worktrees.create {branch,base?,existing?,project?}
@@ -33,7 +36,8 @@ notes.list {limit?,offset?}; notes.read {id}; notes.write {id?,title,body,tags?}
 artifacts.list {kind?,limit?,offset?}; artifacts.read {id}; artifacts.write {id?,kind,title,body,summary?}
 soul.read {}; soul.update {text,expectedHash}
 memory.read {topic?}; memory.search {query,since?}; memory.add {fact,topic?,until?}; memory.replace {find,fact,topic?,until?}; memory.remove {find,topic?}
-habits.list {}; habits.add {name,instructions,schedule:{kind,time?,minute?,dayOfWeek?}}; habits.update {id,name?,instructions?,schedule?,enabled?}; habits.run {id}; habits.remove {id}
+habits.list {}; habits.add {name,instructions,schedule:{kind,time?,minute?,dayOfWeek?,hours?}}; habits.update {id,name?,instructions?,schedule?,enabled?}; habits.run {id}; habits.remove {id}
+Habit schedule kind: hourly (with minute), daily, weekdays, weekly (dayOfWeek 0 = Sunday) or interval (hours 1 to 24; {"kind":"interval","hours":4,"time":"09:00"} runs at 09:00, 13:00, 17:00, 21:00, 01:00 and on across days; time is the anchor, default 00:00). time is local 24-hour HH:MM.
 chat.card {type:"pr",repo?,number,note?} / {type:"session",sessionId,note?} / {type:"choices",options:[text]} / {type:"habit",name,instructions,schedule}
 The CLI returns {ok,result,requestId}. Retry uncertain mutations with the same request ID.
 Assigned projects alone may be addressed. Credentials are provided in the environment; never print them.

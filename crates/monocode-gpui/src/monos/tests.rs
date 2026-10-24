@@ -357,9 +357,19 @@ fn call(
     input: Value,
     cx: &mut TestAppContext,
 ) -> mpsc::Receiver<Result<Value, String>> {
+    call_from(s, s.session, request, action, input, cx)
+}
+fn call_from(
+    s: &Setup,
+    session: i64,
+    request: &str,
+    action: &str,
+    input: Value,
+    cx: &mut TestAppContext,
+) -> mpsc::Receiver<Result<Value, String>> {
     let (reply, rx) = mpsc::channel();
     let call = mono::bridge::Call {
-        session: s.session,
+        session,
         request_id: request.into(),
         action: action.into(),
         input,
@@ -1106,6 +1116,126 @@ fn long_habit_draft_keeps_fields_and_schedule_inside_the_scrolling_page(cx: &mut
 }
 
 #[gpui::test]
+fn interval_habit_editor_builds_an_anchored_schedule_and_saves_it(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    cx.update(|cx| {
+        cx.set_reduce_motion(true);
+        input::bind(cx);
+        crate::popover::bind(cx);
+    });
+    s.window
+        .update(cx, |shell, _, cx| {
+            shell.workspace.right_panel_width = 320.;
+            s.manager.update(cx, |m, cx| {
+                m.settings = None;
+                m.overview_tab = OverviewTab::Habits;
+                m.route = Some(Route::NewHabit);
+                cx.notify();
+            });
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    // Other kinds carry no interval fields and have no hours picker.
+    assert!(visual.debug_bounds("mono-habit-hours-picker").is_none());
+    s.manager.update(visual, |m, cx| {
+        let daily = m.habit_schedule(cx);
+        assert_eq!((daily.interval_hours, daily.interval_from), (None, None));
+        m.fields["habit-name"].update(cx, |f, cx| f.set_text("Every few hours".into(), cx));
+        m.fields["habit-instructions"].update(cx, |f, cx| f.set_text("Check builds.".into(), cx));
+        m.fields["habit-kind"].update(cx, |f, cx| f.set_text("interval".into(), cx));
+        m.fields["habit-time"].update(cx, |f, cx| f.set_text("08:30".into(), cx));
+        cx.notify();
+    });
+    visual.run_until_parked();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let draft = s.manager.read_with(visual, |m, cx| m.habit_schedule(cx));
+    assert_eq!(draft.schedule_kind, "interval");
+    assert_eq!(draft.interval_hours, Some(4));
+    assert_eq!(draft.interval_from.as_deref(), Some(today.as_str()));
+    assert_eq!(draft.time, "08:30");
+    assert_eq!(draft.label(), "Every 4 hours from 08:30");
+    let schedule = visual.debug_bounds("mono-habit-schedule").unwrap();
+    let hours = visual.debug_bounds("mono-habit-hours-picker").unwrap();
+    assert!(hours.left() >= schedule.left());
+    assert!(hours.right() <= schedule.right() + px(1.));
+    visual.simulate_click(hours.center(), Default::default());
+    visual.run_until_parked();
+    let six = visual.debug_bounds("menu-action-6").unwrap();
+    visual.simulate_click(six.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(
+        s.manager
+            .read_with(visual, |m, cx| m.value("habit-hours", cx)),
+        "6"
+    );
+    let create = visual.debug_bounds("mono-habit-save").unwrap();
+    visual.simulate_click(create.center(), Default::default());
+    visual.run_until_parked();
+    let saved = habits::load(&s.root, &s.id).unwrap();
+    assert_eq!(saved.len(), 1);
+    let schedule = &saved[0].schedule;
+    assert_eq!(schedule.schedule_kind, "interval");
+    assert_eq!(schedule.interval_hours, Some(6));
+    assert_eq!(schedule.interval_from.as_deref(), Some(today.as_str()));
+    assert_eq!(schedule.time, "08:30");
+    assert_eq!(schedule.label(), "Every 6 hours from 08:30");
+    assert!(saved[0].next_run_at > monocode_core::time::now_ms());
+    assert!(s.manager.read_with(visual, |m, _| m.route.is_none()));
+}
+
+#[gpui::test]
+fn existing_interval_habit_keeps_its_hours_time_and_anchor_through_page_actions(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let mut h = Habit::new(
+        "Interval".into(),
+        "Check builds.".into(),
+        habits::Schedule {
+            schedule_kind: "interval".into(),
+            time: "08:30".into(),
+            interval_hours: Some(1),
+            ..Default::default()
+        },
+        monocode_core::time::now_ms(),
+    )
+    .unwrap();
+    h.id = "interval-keep".into();
+    let before = h.schedule.clone();
+    assert_eq!(before.label(), "Every hour from 08:30");
+    habits::update(&s.root, &s.id, |all| {
+        all.push(h.clone());
+        Ok(())
+    })
+    .unwrap();
+    s.window
+        .update(cx, |_, _, cx| {
+            s.manager.update(cx, |m, cx| {
+                m.settings = None;
+                m.overview_tab = OverviewTab::Habits;
+                m.habits = vec![h.clone()];
+                m.route = Some(Route::Habit(h.id.clone()));
+                cx.notify();
+            });
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    // Pause and resume rewrite the file and recompute the next run.
+    for _ in 0..2 {
+        let toggle = visual.debug_bounds("mono-habit-toggle").unwrap();
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+    }
+    let saved = habits::load(&s.root, &s.id).unwrap();
+    assert_eq!(saved[0].schedule, before);
+    assert!(saved[0].enabled);
+    assert!(saved[0].next_run_at > monocode_core::time::now_ms());
+}
+
+#[gpui::test]
 fn habit_detail_preserves_long_content_history_and_actions_without_edit_fields(
     cx: &mut TestAppContext,
 ) {
@@ -1516,4 +1646,1955 @@ fn sessions_a_mono_makes_are_chats_whatever_the_preference(cx: &mut TestAppConte
         let shell = owner.read(cx);
         assert!(shell.mono_session_entity(child).is_some());
     });
+}
+
+// sessions.start: folders, parent sessions and the no-commit worktree check
+// (ports of agentApp.test.ts's folder, parent and "no commits" cases).
+fn start(s: &Setup, request: &str, input: Value, cx: &mut TestAppContext) -> Result<Value, String> {
+    call(s, request, "sessions.start", input, cx)
+        .try_recv()
+        .unwrap()
+}
+fn session_count(s: &Setup) -> usize {
+    locked(&s.store).unwrap().sessions().unwrap().len()
+}
+fn groups_of(s: &Setup, cx: &mut TestAppContext) -> monocode_core::session_groups::Groups {
+    cx.update(|cx| {
+        s.manager
+            .read(cx)
+            .owner
+            .upgrade()
+            .unwrap()
+            .read(cx)
+            .mono_groups(&s.project)
+    })
+}
+fn edit_mono(s: &Setup, cx: &mut TestAppContext, edit: impl FnOnce(&mut mono::Mono)) {
+    cx.update(|cx| {
+        s.manager.update(cx, |m, cx| {
+            edit(m.roster.get_mut(&s.id).unwrap());
+            m.save(cx);
+        })
+    });
+}
+fn seed_folder(s: &Setup, cx: &mut TestAppContext, id: &str, name: &str, sessions: &[i64]) {
+    let mut groups = groups_of(s, cx);
+    let folder = groups.create_folder(sessions, id.into()).unwrap();
+    groups.rename_folder(&folder, name);
+    cx.update(|cx| {
+        let owner = s.manager.read(cx).owner.upgrade().unwrap();
+        owner.update(cx, |o, cx| {
+            o.mono_apply_groups(s.project.clone(), groups, cx)
+        });
+    });
+}
+fn visible_launches(s: &Setup, cx: &mut TestAppContext) {
+    edit_mono(s, cx, |m| m.show_started_sessions_in_sidebar = true);
+}
+fn launch_count(s: &Setup, cx: &mut TestAppContext) -> usize {
+    cx.update(|cx| s.manager.read(cx).roster.get(&s.id).unwrap().launches.len())
+}
+fn git_init(dir: &str) {
+    let out = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+}
+fn started_link(s: &Setup, child: i64) -> Option<i64> {
+    locked(&s.store)
+        .unwrap()
+        .started_links()
+        .unwrap()
+        .get(&child)
+        .copied()
+}
+
+#[gpui::test]
+fn worktree_start_in_a_project_without_commits_is_rejected_before_anything_exists(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    git_init(&s.project);
+    visible_launches(&s, cx);
+    let before = session_count(&s);
+    let error = start(
+        &s,
+        "no-commit",
+        json!({"project":s.project,"prompt":"Add a file","draft":true,"workspaceMode":"worktree","folderName":"Tickets"}),
+        cx,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "This project has no commits yet; make an initial commit before using workspaceMode worktree"
+    );
+    assert_eq!(session_count(&s), before, "no orphan session row");
+    assert_eq!(launch_count(&s, cx), 0);
+    assert!(groups_of(&s, cx).folders.is_empty());
+    // The current checkout still starts.
+    let started = start(
+        &s,
+        "current",
+        json!({"project":s.project,"prompt":"Add a file","draft":true,"workspaceMode":"current"}),
+        cx,
+    )
+    .unwrap();
+    assert!(started["sessionId"].as_i64().is_some());
+    assert_eq!(session_count(&s), before + 1);
+}
+
+#[gpui::test]
+fn failed_worktree_start_leaves_no_session_row(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let before = session_count(&s);
+    // Not a repository: the worktree cannot be created.
+    assert!(
+        start(
+            &s,
+            "worktree",
+            json!({"project":s.project,"prompt":"x","draft":true,"workspaceMode":"worktree"}),
+            cx,
+        )
+        .is_err()
+    );
+    assert_eq!(session_count(&s), before);
+    assert_eq!(launch_count(&s, cx), 0);
+    // An unknown worktreeCwd is refused before the row exists as well.
+    let error = start(
+        &s,
+        "cwd",
+        json!({"project":s.project,"prompt":"x","draft":true,"worktreeCwd":"/not/a/worktree"}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(!error.is_empty());
+    assert_eq!(session_count(&s), before);
+}
+
+#[gpui::test]
+fn start_files_into_an_existing_folder_without_renaming_it(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    visible_launches(&s, cx);
+    seed_folder(&s, cx, "f1", "Ticket 1", &[9001]);
+    let result = start(
+        &s,
+        "dev",
+        json!({"project":s.project,"prompt":"Fix","draft":true,"folderId":"f1","folderName":"Something else"}),
+        cx,
+    )
+    .unwrap();
+    let child = result["sessionId"].as_i64().unwrap();
+    assert_eq!(result["folderId"], "f1");
+    assert_eq!(result["folderName"], "Ticket 1");
+    let groups = groups_of(&s, cx);
+    assert_eq!(groups.folders.len(), 1);
+    assert_eq!(groups.folders[0].name, "Ticket 1");
+    assert_eq!(groups.folders[0].session_ids, vec![9001, child]);
+    assert_eq!(
+        locked(&s.store).unwrap().groups(&s.project).unwrap(),
+        groups,
+        "the folder is saved"
+    );
+}
+
+#[gpui::test]
+fn start_creates_a_folder_for_an_unknown_id_with_a_name_and_the_mono_color(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    visible_launches(&s, cx);
+    edit_mono(&s, cx, |m| m.color = mono::COLORS_MONO[2]);
+    let result = start(
+        &s,
+        "dev",
+        json!({"project":s.project,"prompt":"Fix","draft":true,"folderId":"gone","folderName":"  Ticket 2 "}),
+        cx,
+    )
+    .unwrap();
+    let child = result["sessionId"].as_i64().unwrap();
+    let groups = groups_of(&s, cx);
+    assert_eq!(groups.folders.len(), 1);
+    let folder = &groups.folders[0];
+    assert_eq!(folder.name, "Ticket 2");
+    assert_eq!(folder.session_ids, vec![child]);
+    assert_eq!(
+        folder.color_index,
+        Some(3),
+        "the palette position the Mono default folder uses"
+    );
+    assert_eq!(result["folderId"], folder.id.as_str());
+    assert_eq!(result["folderName"], "Ticket 2");
+    assert_ne!(folder.id, "gone");
+}
+
+#[gpui::test]
+fn start_rejects_an_unknown_folder_id_alone_before_creating_a_session(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    visible_launches(&s, cx);
+    let before = session_count(&s);
+    let error = start(
+        &s,
+        "dev",
+        json!({"project":s.project,"prompt":"Fix","draft":true,"folderId":"gone"}),
+        cx,
+    )
+    .unwrap_err();
+    assert_eq!(error, "Folder was not found in this project");
+    assert_eq!(session_count(&s), before);
+    assert_eq!(launch_count(&s, cx), 0);
+}
+
+#[gpui::test]
+fn launches_sharing_a_folder_name_never_merge(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    visible_launches(&s, cx);
+    for request in ["a", "b"] {
+        start(
+            &s,
+            request,
+            json!({"project":s.project,"prompt":"Fix","draft":true,"folderName":"Ticket 7 (2026-10-21)"}),
+            cx,
+        )
+        .unwrap();
+    }
+    let groups = groups_of(&s, cx);
+    assert_eq!(groups.folders.len(), 2);
+    assert!(
+        groups
+            .folders
+            .iter()
+            .all(|f| f.name == "Ticket 7 (2026-10-21)")
+    );
+    assert_ne!(groups.folders[0].id, groups.folders[1].id);
+}
+
+#[gpui::test]
+fn start_rejects_bad_folder_fields_before_creating_a_session(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    visible_launches(&s, cx);
+    let before = session_count(&s);
+    for fields in [
+        json!({"folderName":"n".repeat(101)}),
+        json!({"folderName":""}),
+        json!({"folderName":"   "}),
+        json!({"folderName":5}),
+        json!({"folderId":5}),
+    ] {
+        let mut input = json!({"project":s.project,"prompt":"Fix","draft":true});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let error = start(&s, "dev", input, cx).unwrap_err();
+        assert!(error.contains("must be a non-empty string"), "{error}");
+    }
+    assert_eq!(session_count(&s), before);
+    assert!(groups_of(&s, cx).folders.is_empty());
+}
+
+#[gpui::test]
+fn a_launch_hidden_from_the_sidebar_is_validated_but_not_filed(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    // show_started_sessions_in_sidebar is off by default.
+    let result = start(
+        &s,
+        "dev",
+        json!({"project":s.project,"prompt":"Fix","draft":true,"folderName":"Ticket"}),
+        cx,
+    )
+    .unwrap();
+    assert!(groups_of(&s, cx).folders.is_empty());
+    assert!(result.get("folderId").is_none());
+    assert!(result.get("folderName").is_none());
+    let before = session_count(&s);
+    let error = start(
+        &s,
+        "dev2",
+        json!({"project":s.project,"prompt":"Fix","draft":true,"folderId":"gone"}),
+        cx,
+    )
+    .unwrap_err();
+    assert_eq!(error, "Folder was not found in this project");
+    assert_eq!(session_count(&s), before);
+}
+
+#[gpui::test]
+fn the_mono_default_folder_stays_when_no_folder_field_is_given(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    edit_mono(&s, cx, |m| {
+        m.show_started_sessions_in_sidebar = true;
+        m.use_sidebar_folders = true;
+    });
+    let result = start(
+        &s,
+        "dev",
+        json!({"project":s.project,"prompt":"Fix","draft":true}),
+        cx,
+    )
+    .unwrap();
+    let child = result["sessionId"].as_i64().unwrap();
+    let groups = groups_of(&s, cx);
+    assert_eq!(groups.folders.len(), 1);
+    assert_eq!(groups.folders[0].session_ids, vec![child]);
+    assert!(result.get("folderId").is_none());
+    assert!(result.get("folderName").is_none());
+}
+
+#[gpui::test]
+fn start_under_a_parent_records_the_link_and_files_into_the_parent_folder(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    visible_launches(&s, cx);
+    let dev = start(
+        &s,
+        "dev",
+        json!({"project":s.project,"prompt":"Fix","draft":true}),
+        cx,
+    )
+    .unwrap()["sessionId"]
+        .as_i64()
+        .unwrap();
+    seed_folder(&s, cx, "f1", "Ticket 1", &[dev]);
+    let review = start(
+        &s,
+        "rev",
+        json!({"project":s.project,"prompt":"Review","draft":true,"parentSessionId":dev,"folderId":"f1"}),
+        cx,
+    )
+    .unwrap()["sessionId"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(started_link(&s, review), Some(dev));
+    assert_eq!(started_link(&s, dev), None);
+    assert_eq!(groups_of(&s, cx).folders[0].session_ids, vec![dev, review]);
+    assert_eq!(launch_count(&s, cx), 2);
+    cx.update(|cx| {
+        let owner = s.manager.read(cx).owner.upgrade().unwrap();
+        assert_eq!(owner.read(cx).mono_started_by(review), Some(dev));
+    });
+    // The id may also be sent as numeric text.
+    let again = start(
+        &s,
+        "rev2",
+        json!({"project":s.project,"prompt":"Review","draft":true,"parentSessionId":dev.to_string()}),
+        cx,
+    )
+    .unwrap()["sessionId"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(started_link(&s, again), Some(dev));
+}
+
+#[gpui::test]
+fn start_rejects_a_parent_this_mono_did_not_start(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let user_session = locked(&s.store)
+        .unwrap()
+        .create("codex", &s.project)
+        .unwrap()
+        .id;
+    // Another Mono's launch.
+    let handle: gpui::AnyWindowHandle = s.window.into();
+    handle
+        .update(cx, |_, w, cx| {
+            s.manager
+                .update(cx, |m, cx| m.create(vec![s.project.clone()], w, cx))
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let other_launch = locked(&s.store)
+        .unwrap()
+        .create("codex", &s.project)
+        .unwrap()
+        .id;
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            let other = m.roster.monos.iter_mut().find(|x| x.id != s.id).unwrap();
+            other.launches.push(mono::Launch {
+                session_id: other_launch,
+                cwd: s.project.clone(),
+                title: "x".into(),
+                harness: "codex".into(),
+                model: None,
+                origin_turn: 0,
+                notify_on_complete: false,
+                each: false,
+                completed: false,
+                dismissed: false,
+            });
+        })
+    });
+    let before = session_count(&s);
+    for parent in [user_session, s.session, 987_654, other_launch] {
+        let error = start(
+            &s,
+            &format!("rev-{parent}"),
+            json!({"project":s.project,"prompt":"Review","draft":true,"parentSessionId":parent}),
+            cx,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error, "parentSessionId must be a session this Mono started",
+            "{parent}"
+        );
+    }
+    assert_eq!(session_count(&s), before);
+    assert_eq!(launch_count(&s, cx), 0);
+}
+
+#[gpui::test]
+fn start_rejects_a_parent_outside_the_project_or_already_a_child(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let dev = start(
+        &s,
+        "dev",
+        json!({"project":s.project,"prompt":"Fix","draft":true}),
+        cx,
+    )
+    .unwrap()["sessionId"]
+        .as_i64()
+        .unwrap();
+    let review = start(
+        &s,
+        "rev",
+        json!({"project":s.project,"prompt":"Review","draft":true,"parentSessionId":dev}),
+        cx,
+    )
+    .unwrap()["sessionId"]
+        .as_i64()
+        .unwrap();
+    let before = session_count(&s);
+    let error = start(
+        &s,
+        "deep",
+        json!({"project":s.project,"prompt":"Review","draft":true,"parentSessionId":review}),
+        cx,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "parentSessionId cannot be a session started under another one; a child of a child is not allowed"
+    );
+    // A launch whose session no longer exists in the project is not listed.
+    locked(&s.store).unwrap().delete(dev).unwrap();
+    let error = start(
+        &s,
+        "gone",
+        json!({"project":s.project,"prompt":"Review","draft":true,"parentSessionId":dev}),
+        cx,
+    )
+    .unwrap_err();
+    assert_eq!(error, "Session was not found in this project");
+    assert_eq!(session_count(&s), before - 1);
+}
+
+#[gpui::test]
+fn start_rejects_a_malformed_parent_id(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let before = session_count(&s);
+    for parent in [json!(0), json!(-1), json!(""), json!("abc"), json!(true)] {
+        let error = start(
+            &s,
+            "rev",
+            json!({"project":s.project,"prompt":"Review","draft":true,"parentSessionId":parent}),
+            cx,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "parentSessionId must be a session ID (a positive number)"
+        );
+    }
+    assert_eq!(session_count(&s), before);
+}
+
+fn launch_of(session: i64, cwd: &str) -> mono::Launch {
+    mono::Launch {
+        session_id: session,
+        cwd: cwd.into(),
+        title: "x".into(),
+        harness: "codex".into(),
+        model: None,
+        origin_turn: 0,
+        notify_on_complete: false,
+        each: false,
+        completed: false,
+        dismissed: false,
+    }
+}
+
+#[test]
+fn only_a_link_to_another_launch_makes_a_child() {
+    // The shared (Tauri) database links `app-<chat>-<id>` launches to the Mono chat (1).
+    let launches = [launch_of(10, "/p"), launch_of(11, "/p")];
+    let links = std::collections::HashMap::from([(10, 1), (11, 10), (12, 11)]);
+    assert!(
+        !host::is_child_launch(&links, &launches, 10),
+        "linked to the chat"
+    );
+    assert!(
+        host::is_child_launch(&links, &launches, 11),
+        "linked to a launch"
+    );
+    assert!(!host::is_child_launch(&links, &launches, 99), "no link");
+}
+
+#[gpui::test]
+fn a_launch_linked_to_the_mono_chat_is_a_valid_parent(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let direct = locked(&s.store)
+        .unwrap()
+        .create("codex", &s.project)
+        .unwrap()
+        .id;
+    // How a Tauri Mono's direct launch looks once persisted.
+    locked(&s.store)
+        .unwrap()
+        .save_started_link(direct, s.session)
+        .unwrap();
+    edit_mono(&s, cx, |m| {
+        m.launches.push(launch_of(direct, &m.projects[0].clone()))
+    });
+    let review = start(
+        &s,
+        "rev",
+        json!({"project":s.project,"prompt":"Review","draft":true,"parentSessionId":direct}),
+        cx,
+    )
+    .unwrap()["sessionId"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(started_link(&s, review), Some(direct));
+}
+
+// Completion delivery (ports of monoCompletionBatches.test.ts onto the launch
+// flags: native batches are derived from `Launch`, there is no watch/accept/discard).
+fn pending(session: i64, origin: u64, each: bool) -> mono::Launch {
+    mono::Launch {
+        session_id: session,
+        title: format!("s{session}"),
+        origin_turn: origin,
+        notify_on_complete: true,
+        each,
+        ..launch_of(session, "/p")
+    }
+}
+const TURN: u64 = (7 << 32) | 1;
+fn plan(
+    launches: &[mono::Launch],
+    source_busy: bool,
+    running: &[i64],
+) -> Vec<(host::Batch, Vec<i64>)> {
+    host::ready_batches(launches, |_| source_busy, |id| !running.contains(&id))
+        .into_iter()
+        .map(|(batch, sessions)| (batch, sessions.into_iter().map(|(id, _)| id).collect()))
+        .collect()
+}
+
+#[test]
+fn a_group_waits_for_its_turn_and_every_child_then_reports_all_in_launch_order() {
+    let launches = [
+        pending(1, TURN, false),
+        pending(2, TURN, false),
+        pending(3, TURN, false),
+    ];
+    // A fast child stopped, but the launching turn is still active.
+    assert!(plan(&launches, true, &[2, 3]).is_empty());
+    // The turn ended while siblings still run.
+    assert!(plan(&launches, false, &[2]).is_empty());
+    assert_eq!(
+        plan(&launches, false, &[]),
+        [(host::Batch::Group(TURN), vec![1, 2, 3])]
+    );
+}
+
+#[test]
+fn a_single_session_group_reports_alone() {
+    assert_eq!(
+        plan(&[pending(9, TURN, false)], false, &[]),
+        [(host::Batch::Group(TURN), vec![9])]
+    );
+}
+
+#[test]
+fn later_turns_and_other_callers_do_not_wait_for_a_slow_earlier_group() {
+    let later = (7 << 32) | 2;
+    let other = (8 << 32) | 1;
+    let launches = [
+        pending(1, TURN, false),
+        pending(2, TURN, false),
+        pending(3, later, false),
+        pending(4, other, false),
+    ];
+    let plan = host::ready_batches(&launches, |_| false, |id| id != 1);
+    let batches: Vec<_> = plan.iter().map(|(b, _)| *b).collect();
+    assert_eq!(
+        batches,
+        [host::Batch::Group(later), host::Batch::Group(other)]
+    );
+}
+
+#[test]
+fn a_dismissed_session_is_dropped_without_losing_the_others() {
+    let mut launches = [pending(1, TURN, false), pending(2, TURN, false)];
+    launches[0].dismissed = true;
+    assert_eq!(
+        plan(&launches, false, &[]),
+        [(host::Batch::Group(TURN), vec![2])]
+    );
+    launches[1].dismissed = true;
+    assert!(plan(&launches, false, &[]).is_empty());
+}
+
+#[test]
+fn a_session_without_notification_or_already_reported_is_not_waited_for() {
+    let mut launches = [pending(1, TURN, false), pending(2, TURN, false)];
+    launches[0].notify_on_complete = false;
+    launches[1].completed = true;
+    assert!(plan(&launches, false, &[]).is_empty());
+}
+
+#[test]
+fn finishing_a_group_marks_only_that_group_and_is_idempotent() {
+    let mut launches = [
+        pending(1, TURN, false),
+        pending(2, TURN, true),
+        pending(3, (7 << 32) | 2, false),
+    ];
+    host::finish_batch(&mut launches, host::Batch::Group(TURN));
+    host::finish_batch(&mut launches, host::Batch::Group(TURN));
+    assert_eq!(
+        launches.iter().map(|l| l.completed).collect::<Vec<_>>(),
+        [true, false, false],
+        "an each launch sharing the turn is not part of the group"
+    );
+    assert!(plan(&launches[1..], true, &[3]).len() == 1);
+}
+
+#[test]
+fn an_each_session_reports_as_soon_as_it_stops_without_the_turn_or_siblings() {
+    let launches = [pending(1, TURN, false), pending(2, TURN, true)];
+    // The launching turn is still active and the group sibling is running.
+    assert_eq!(
+        plan(&launches, true, &[1]),
+        [(host::Batch::Each(2), vec![2])]
+    );
+    // The group follows on its own once the turn ends and the sibling stops.
+    assert_eq!(
+        plan(&launches[..1], false, &[]),
+        [(host::Batch::Group(TURN), vec![1])]
+    );
+}
+
+#[test]
+fn an_each_session_still_running_or_dismissed_reports_nothing() {
+    let mut launches = [pending(2, TURN, true)];
+    assert!(plan(&launches, false, &[2]).is_empty());
+    launches[0].dismissed = true;
+    assert!(plan(&launches, false, &[]).is_empty());
+}
+
+#[test]
+fn each_sessions_report_separately_and_once() {
+    let mut launches = [
+        pending(1, TURN, false),
+        pending(2, TURN, true),
+        pending(3, TURN, true),
+    ];
+    assert_eq!(
+        plan(&launches, true, &[1]),
+        [
+            (host::Batch::Each(2), vec![2]),
+            (host::Batch::Each(3), vec![3])
+        ]
+    );
+    host::finish_batch(&mut launches, host::Batch::Each(2));
+    host::finish_batch(&mut launches, host::Batch::Each(2));
+    assert_eq!(
+        plan(&launches, true, &[1]),
+        [(host::Batch::Each(3), vec![3])]
+    );
+    assert!(!launches[2].completed && !launches[0].completed);
+}
+
+#[test]
+fn a_large_group_keeps_every_session_with_bounded_results() {
+    let results: Vec<_> = (0..40)
+        .map(|i| (i, format!("worker-{i}"), "x".repeat(20_000)))
+        .collect();
+    let message = host::completion_message(host::Batch::Group(TURN), &results);
+    assert!(message.len() < 60_000, "{}", message.len());
+    for i in 0..40 {
+        assert!(message.contains(&format!("Session {i}: worker-{i}")));
+    }
+    assert!(message.contains("[truncated]"));
+    // One session keeps the full per-session cap.
+    let one = host::completion_message(
+        host::Batch::Each(1),
+        &[(1, "big".into(), "y".repeat(12_000))],
+    );
+    assert!(!one.contains("[truncated]"));
+    assert!(one.contains("Session 1: big"));
+}
+
+#[test]
+fn group_and_each_messages_say_what_to_do() {
+    let results = [(1, "a".to_string(), "done".to_string())];
+    let group = host::completion_message(host::Batch::Group(TURN), &results);
+    let each = host::completion_message(host::Batch::Each(1), &results);
+    assert!(group.starts_with("[Delegated work completed]"));
+    assert!(group.contains("All sessions in this group have stopped"));
+    assert!(each.starts_with("[Delegated work completed]"));
+    assert!(each.contains("This session has stopped"));
+    assert!(!each.contains("group"));
+    assert!(each.ends_with("Session 1: a\ndone"));
+}
+
+#[test]
+fn a_chat_caller_keeps_its_turn_and_a_habit_run_reports_each_to_the_chat() {
+    let each = json!({"completionDelivery":"each"});
+    let group = json!({"completionDelivery":"group"});
+    // Mono chat 7, turn 3.
+    assert_eq!(
+        host::report_to(7, 3, None, &json!({})),
+        ((7 << 32) | 3, false)
+    );
+    assert_eq!(host::report_to(7, 3, None, &group), ((7 << 32) | 3, false));
+    assert_eq!(host::report_to(7, 3, None, &each), ((7 << 32) | 3, true));
+    // Habit run 21 of the Mono whose chat is 7: always each, to the chat.
+    for input in [json!({}), group.clone(), each.clone()] {
+        assert_eq!(host::report_to(21, 5, Some(7), &input), (7 << 32, true));
+    }
+}
+
+#[test]
+fn what_a_run_started_is_named_in_its_post() {
+    assert_eq!(
+        scheduler::run_post(Some("Fixed it."), 3).as_deref(),
+        Some("Fixed it.")
+    );
+    assert_eq!(scheduler::run_post(None, 0), None);
+    assert_eq!(
+        scheduler::run_post(None, 1).as_deref(),
+        Some("Started a session.")
+    );
+    assert_eq!(
+        scheduler::run_post(None, 4).as_deref(),
+        Some("Started 4 sessions.")
+    );
+}
+
+#[test]
+fn the_habit_run_prompt_sends_session_reports_to_the_chat() {
+    let prompt = scheduler::habit_prompt("Triage", "Look at CI");
+    assert!(prompt.starts_with("[Scheduled habit: Triage]\nLook at CI"));
+    assert!(prompt.contains("NOTHING_TO_REPORT"));
+    assert!(prompt.contains("report to your chat, not to this run"));
+    assert!(prompt.contains("do not wait for them or poll"));
+    assert!(prompt.contains("Mention in your reply what you started"));
+    assert!(!prompt.contains("belongs to this habit"));
+}
+
+fn launches_of(s: &Setup, cx: &mut TestAppContext) -> Vec<mono::Launch> {
+    cx.update(|cx| {
+        s.manager
+            .read(cx)
+            .roster
+            .get(&s.id)
+            .unwrap()
+            .launches
+            .clone()
+    })
+}
+/// A habit run of the Mono, driven through its chat view (nothing is sent).
+fn fake_run(s: &Setup, cx: &mut TestAppContext) -> i64 {
+    let run = locked(&s.store)
+        .unwrap()
+        .create("codex", &s.project)
+        .unwrap()
+        .id;
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            let view = m.chats.get(&s.id).unwrap().clone();
+            m.running.insert(
+                run,
+                RunningHabit {
+                    mono: s.id.clone(),
+                    habit: "h1".into(),
+                    view,
+                    started: monocode_core::time::now_ms(),
+                    launched: monocode_core::time::now_ms(),
+                    failure: None,
+                    waiting_since: None,
+                    cards: Vec::new(),
+                    sessions: Vec::new(),
+                    created: Vec::new(),
+                    stop: None,
+                },
+            );
+        })
+    });
+    run
+}
+fn run_sessions(s: &Setup, run: i64, cx: &mut TestAppContext) -> Vec<i64> {
+    cx.update(|cx| {
+        s.manager
+            .read(cx)
+            .running
+            .get(&run)
+            .map(|r| r.sessions.clone())
+    })
+    .unwrap_or_default()
+}
+fn notifying(extra: Value) -> Value {
+    let mut input = json!({"prompt":"Review","draft":true,"notifyOnComplete":true});
+    for (key, value) in extra.as_object().unwrap() {
+        input[key] = value.clone();
+    }
+    input
+}
+
+#[gpui::test]
+fn a_chat_launch_reports_under_its_turn_as_a_group_unless_asked_for_each(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    for (request, extra) in [
+        ("plain", json!({})),
+        ("group", json!({"completionDelivery":"group"})),
+        ("each", json!({"completionDelivery":"each"})),
+    ] {
+        let mut input = notifying(extra);
+        input["project"] = json!(s.project);
+        start(&s, request, input, cx).unwrap();
+    }
+    let launches = launches_of(&s, cx);
+    assert_eq!(
+        launches.iter().map(|l| l.each).collect::<Vec<_>>(),
+        [false, false, true]
+    );
+    assert!(launches.iter().all(|l| l.notify_on_complete));
+    assert!(
+        launches
+            .iter()
+            .all(|l| (l.origin_turn >> 32) as i64 == s.session)
+    );
+    let mut bad = notifying(json!({"completionDelivery":"sometimes"}));
+    bad["project"] = json!(s.project);
+    assert_eq!(
+        start(&s, "bad", bad, cx).unwrap_err(),
+        "completionDelivery must be \"group\" or \"each\""
+    );
+    assert_eq!(launch_count(&s, cx), 3);
+}
+
+#[gpui::test]
+fn a_habit_runs_sessions_report_each_to_the_chat_and_the_run_notes_them(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    for (request, extra) in [
+        ("plain", json!({})),
+        ("group", json!({"completionDelivery":"group"})),
+    ] {
+        let mut input = notifying(extra);
+        input["project"] = json!(s.project);
+        call_from(&s, run, request, "sessions.start", input, cx)
+            .try_recv()
+            .unwrap()
+            .unwrap();
+    }
+    let launches = launches_of(&s, cx);
+    assert_eq!(launches.len(), 2);
+    for launch in &launches {
+        assert!(launch.each, "forced each");
+        assert_eq!(
+            launch.origin_turn,
+            (s.session as u64) << 32,
+            "origin is the chat"
+        );
+    }
+    assert_eq!(
+        run_sessions(&s, run, cx),
+        launches.iter().map(|l| l.session_id).collect::<Vec<_>>()
+    );
+}
+
+#[gpui::test]
+fn a_run_timeout_stops_the_run_but_not_the_sessions_it_started(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let child = locked(&s.store)
+        .unwrap()
+        .create("codex", &s.project)
+        .unwrap()
+        .id;
+    // Both shapes: reporting to the chat, and the old "belongs to the run" origin.
+    // Not notifying, so the tick sends no report (that would start a provider turn).
+    edit_mono(&s, cx, |m| {
+        m.launches.push(mono::Launch {
+            origin_turn: (m.session_id.unwrap() as u64) << 32,
+            notify_on_complete: false,
+            ..pending(child, 0, true)
+        });
+        m.launches.push(mono::Launch {
+            origin_turn: (run as u64) << 32,
+            notify_on_complete: false,
+            ..pending(child + 1000, 0, false)
+        });
+    });
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            let run = m.running.get_mut(&run).unwrap();
+            run.sessions.push(child);
+            run.started = 0;
+        })
+    });
+    let handle: gpui::AnyWindowHandle = s.window.into();
+    handle
+        .update(cx, |_, w, cx| s.manager.update(cx, |m, cx| m.tick(w, cx)))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        cx.update(|cx| s.manager.read(cx).running.is_empty()),
+        "the run ended"
+    );
+    for launch in launches_of(&s, cx) {
+        assert!(!launch.dismissed, "{} was dismissed", launch.session_id);
+    }
+    let rows = locked(&s.store).unwrap().load(s.session).unwrap().rows;
+    assert!(
+        rows.iter().any(|r| r.text.ends_with("Started a session.")),
+        "{:?}",
+        rows.iter().map(|r| &r.text).collect::<Vec<_>>()
+    );
+}
+
+#[gpui::test]
+fn a_run_ends_without_waiting_for_the_sessions_it_started(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let mut input = notifying(json!({}));
+    input["project"] = json!(s.project);
+    call_from(&s, run, "one", "sessions.start", input.clone(), cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+    input["prompt"] = json!("Review again");
+    call_from(&s, run, "two", "sessions.start", input, cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+    // Both are pending (draft sessions never stop with messages) yet the run is done.
+    cx.update(|cx| s.manager.update(cx, |m, cx| m.habit_changed(run, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|cx| s.manager.read(cx).running.is_empty()));
+    assert!(
+        launches_of(&s, cx)
+            .iter()
+            .all(|l| !l.completed && !l.dismissed)
+    );
+    let rows = locked(&s.store).unwrap().load(s.session).unwrap().rows;
+    assert!(
+        rows.iter().any(|r| r.text.ends_with("Started 2 sessions.")),
+        "{:?}",
+        rows.iter().map(|r| &r.text).collect::<Vec<_>>()
+    );
+}
+
+// Task 5.5: the habit Stop sheet and what a stopped run does.
+
+#[test]
+fn the_stop_sheet_offers_the_three_choices() {
+    assert_eq!(
+        habit_stop::CHOICES,
+        ["Stop run only", "Stop run and its sessions", "Keep running"]
+    );
+    let text = habit_stop::stop_text("PR check");
+    assert_eq!(
+        text,
+        "Stop \"PR check\"? Sessions it already started can keep running."
+    );
+    assert_eq!(
+        habit_stop::finished_text("PR check"),
+        "\"PR check\" already finished, so there was nothing to stop."
+    );
+}
+
+#[test]
+fn keep_running_is_the_cancel_button_so_escape_keeps_the_run() {
+    let buttons = habit_stop::buttons();
+    assert_eq!(
+        buttons
+            .iter()
+            .map(|b| b.label().to_string())
+            .collect::<Vec<_>>(),
+        habit_stop::CHOICES
+    );
+    assert_eq!(
+        buttons.iter().map(|b| b.is_cancel()).collect::<Vec<_>>(),
+        [false, false, true]
+    );
+    let cancel = buttons.iter().position(|b| b.is_cancel());
+    assert_eq!(habit_stop::mode_for(cancel), None);
+}
+
+#[test]
+fn a_stop_asked_before_the_turn_works_ends_it_once_it_does() {
+    use habit_stop::{StopMode, stop_pending};
+    let stop = Some(StopMode::Run);
+    let (none, failed) = (None, Some("x".to_string()));
+    assert!(stop_pending(stop, &none, true));
+    assert!(!stop_pending(stop, &none, false), "not working yet");
+    assert!(!stop_pending(stop, &failed, true), "already ending");
+    assert!(!stop_pending(None, &none, true), "nothing asked");
+}
+
+#[test]
+fn each_button_maps_to_a_stop_mode_and_keeping_or_closing_to_none() {
+    use habit_stop::{StopMode, mode_for};
+    assert_eq!(mode_for(Some(0)), Some(StopMode::Run));
+    assert_eq!(mode_for(Some(1)), Some(StopMode::All));
+    assert_eq!(mode_for(Some(2)), None);
+    // Closing the sheet some other way is also keeping it running.
+    assert_eq!(mode_for(Some(9)), None);
+    assert_eq!(mode_for(None), None);
+}
+
+fn seed_habit(s: &Setup) {
+    let mut h = Habit::new(
+        "PR check".into(),
+        "Look at open PRs".into(),
+        habits::Schedule::default(),
+        monocode_core::time::now_ms(),
+    )
+    .unwrap();
+    h.id = "h1".into();
+    h.running_since = Some(monocode_core::time::now_ms());
+    habits::update(&s.root, &s.id, |all| {
+        all.push(h.clone());
+        Ok(())
+    })
+    .unwrap();
+}
+fn stop_of(s: &Setup, run: i64, cx: &mut TestAppContext) -> Option<habit_stop::StopMode> {
+    cx.update(|cx| s.manager.read(cx).running.get(&run).and_then(|r| r.stop))
+}
+fn choose(s: &Setup, answer: Option<usize>, cx: &mut TestAppContext) -> habit_stop::StopChoice {
+    cx.update(|cx| {
+        s.manager
+            .update(cx, |m, cx| m.choose_stop("h1", answer, cx))
+    })
+}
+
+#[gpui::test]
+fn the_chosen_stop_is_requested_and_keeping_requests_nothing(cx: &mut TestAppContext) {
+    use habit_stop::{StopChoice, StopMode};
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    assert_eq!(choose(&s, Some(2), cx), StopChoice::Kept);
+    assert_eq!(choose(&s, None, cx), StopChoice::Kept);
+    assert_eq!(stop_of(&s, run, cx), None);
+    assert_eq!(choose(&s, Some(1), cx), StopChoice::Requested);
+    assert_eq!(stop_of(&s, run, cx), Some(StopMode::All));
+}
+
+#[gpui::test]
+fn it_does_not_ask_again_once_a_stop_was_requested(cx: &mut TestAppContext) {
+    use habit_stop::StopMode;
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let wants =
+        |cx: &mut TestAppContext| cx.update(|cx| s.manager.read(cx).wants_stop_prompt("h1"));
+    assert!(wants(cx));
+    choose(&s, Some(0), cx);
+    assert!(!wants(cx));
+    // A later choice cannot change the request.
+    choose(&s, Some(1), cx);
+    assert_eq!(stop_of(&s, run, cx), Some(StopMode::Run));
+}
+
+#[gpui::test]
+fn it_tells_the_user_instead_when_the_run_ended_while_they_were_choosing(cx: &mut TestAppContext) {
+    use habit_stop::StopChoice;
+    let s = setup(cx);
+    // No run at all: nothing to stop and nothing recorded.
+    assert_eq!(choose(&s, Some(1), cx), StopChoice::Finished);
+    assert!(!cx.update(|cx| s.manager.read(cx).habit_stopping("h1")));
+    // Keeping it running says nothing, even with no run.
+    assert_eq!(choose(&s, Some(2), cx), StopChoice::Kept);
+    // The run ended after the sheet opened.
+    let run = fake_run(&s, cx);
+    cx.update(|cx| s.manager.update(cx, |m, _| m.running.remove(&run)));
+    assert_eq!(choose(&s, Some(0), cx), StopChoice::Finished);
+}
+
+#[gpui::test]
+fn a_stop_asked_while_the_turn_is_idle_waits_for_it_to_work(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    choose(&s, Some(0), cx);
+    cx.update(|cx| s.manager.update(cx, |m, cx| m.enforce_stop(run, cx)));
+    // Idle: the request stands, nothing is failed yet.
+    cx.update(|cx| {
+        let r = &s.manager.read(cx).running[&run];
+        assert!(r.stop.is_some() && r.failure.is_none());
+    });
+}
+
+#[gpui::test]
+fn it_reports_whether_a_stop_is_pending(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let pending = |cx: &mut TestAppContext| cx.update(|cx| s.manager.read(cx).habit_stopping("h1"));
+    assert!(!pending(cx));
+    fake_run(&s, cx);
+    assert!(!pending(cx));
+    choose(&s, Some(0), cx);
+    assert!(pending(cx));
+}
+
+/// A run the user stopped while it was working: `apply_stop` with `busy`.
+fn user_stop(s: &Setup, run: i64, mode: habit_stop::StopMode, cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            let r = m.running.get_mut(&run).unwrap();
+            habit_stop::apply_stop(&mut r.stop, &mut r.failure, mode, true)
+        })
+    });
+}
+/// A session started through the host as `caller`; the run notes it as created.
+fn child(s: &Setup, caller: i64, request: &str, cx: &mut TestAppContext) -> i64 {
+    let mut input = json!({"prompt":"Review","draft":true,"notifyOnComplete":false});
+    input["project"] = json!(s.project);
+    call_from(s, caller, request, "sessions.start", input, cx)
+        .try_recv()
+        .unwrap()
+        .unwrap()["sessionId"]
+        .as_i64()
+        .unwrap()
+}
+/// A session the run only wrote to (the chat started it).
+fn messaged(s: &Setup, run: i64, request: &str, cx: &mut TestAppContext) -> i64 {
+    let id = child(s, s.session, request, cx);
+    cx.update(|cx| {
+        s.manager
+            .update(cx, |m, _| m.note_run_session(run, id, false))
+    });
+    id
+}
+fn finish_run(s: &Setup, run: i64, cx: &mut TestAppContext) {
+    cx.update(|cx| s.manager.update(cx, |m, cx| m.habit_changed(run, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|cx| s.manager.read(cx).running.is_empty()));
+}
+fn chat_rows(s: &Setup) -> Vec<String> {
+    locked(&s.store)
+        .unwrap()
+        .load(s.session)
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r.text)
+        .collect()
+}
+fn stored_habit(s: &Setup) -> Habit {
+    habits::load(&s.root, &s.id).unwrap().remove(0)
+}
+fn dismissed(s: &Setup, id: i64, cx: &mut TestAppContext) -> bool {
+    launches_of(s, cx)
+        .iter()
+        .find(|l| l.session_id == id)
+        .unwrap()
+        .dismissed
+}
+
+#[gpui::test]
+fn stop_run_only_ends_the_run_keeps_its_sessions_and_says_where_they_are(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    seed_habit(&s);
+    let run = fake_run(&s, cx);
+    let (a, b) = (child(&s, run, "a", cx), child(&s, run, "b", cx));
+    user_stop(&s, run, habit_stop::StopMode::Run, cx);
+    finish_run(&s, run, cx);
+    assert!(!dismissed(&s, a, cx) && !dismissed(&s, b, cx));
+    let rows = chat_rows(&s);
+    assert!(
+        rows.iter()
+            .any(|r| r.ends_with("Stopped. Started 2 sessions that keep running.")),
+        "{rows:?}"
+    );
+    let habit = stored_habit(&s);
+    assert_eq!(habit.last_outcome.as_deref(), Some("failed"));
+    assert_eq!(habit.last_error.as_deref(), Some("Stopped by the user."));
+}
+
+#[gpui::test]
+fn stopping_a_run_that_started_no_sessions_posts_nothing(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    seed_habit(&s);
+    let run = fake_run(&s, cx);
+    user_stop(&s, run, habit_stop::StopMode::Run, cx);
+    finish_run(&s, run, cx);
+    assert!(!chat_rows(&s).iter().any(|r| r.contains("Habit report")));
+    let habit = stored_habit(&s);
+    assert_eq!(habit.last_outcome.as_deref(), Some("failed"));
+    assert_eq!(habit.last_error.as_deref(), Some("Stopped by the user."));
+}
+
+#[gpui::test]
+fn a_single_kept_session_is_named_in_the_singular_and_a_messaged_one_is_not_counted(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    seed_habit(&s);
+    let run = fake_run(&s, cx);
+    child(&s, run, "a", cx);
+    messaged(&s, run, "r", cx);
+    user_stop(&s, run, habit_stop::StopMode::Run, cx);
+    finish_run(&s, run, cx);
+    assert!(
+        chat_rows(&s)
+            .iter()
+            .any(|r| r.ends_with("Stopped. Started 1 session that keeps running.")),
+        "{:?}",
+        chat_rows(&s)
+    );
+}
+
+#[gpui::test]
+fn stop_run_and_its_sessions_stops_only_the_ones_it_created(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    seed_habit(&s);
+    let run = fake_run(&s, cx);
+    let a = child(&s, run, "a", cx);
+    let reviewer = messaged(&s, run, "r", cx);
+    user_stop(&s, run, habit_stop::StopMode::All, cx);
+    finish_run(&s, run, cx);
+    assert!(dismissed(&s, a, cx), "its report is dropped");
+    // The dismissal is saved, so a restart cannot deliver the stopped session's report.
+    let saved = mono::Roster::load(&locked(&s.store).unwrap()).unwrap();
+    let launch = |id| {
+        saved
+            .get(&s.id)
+            .unwrap()
+            .launches
+            .iter()
+            .find(|l| l.session_id == id)
+            .unwrap()
+            .dismissed
+    };
+    assert!(launch(a) && !launch(reviewer));
+    assert!(
+        !dismissed(&s, reviewer, cx),
+        "a messaged session is not its to stop"
+    );
+    assert!(!chat_rows(&s).iter().any(|r| r.contains("Habit report")));
+    assert_eq!(
+        stored_habit(&s).last_error.as_deref(),
+        Some("Stopped by the user.")
+    );
+}
+
+#[gpui::test]
+fn it_says_which_sessions_would_not_stop(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    seed_habit(&s);
+    let run = fake_run(&s, cx);
+    let a = child(&s, run, "a", cx);
+    // A Mono chat is never stopped from a habit.
+    let chat = s.session;
+    cx.update(|cx| {
+        s.manager
+            .update(cx, |m, _| m.note_run_session(run, chat, true))
+    });
+    edit_mono(&s, cx, |m| {
+        m.launches.push(mono::Launch {
+            notify_on_complete: false,
+            ..pending(chat, 0, true)
+        })
+    });
+    let c = child(&s, run, "c", cx);
+    user_stop(&s, run, habit_stop::StopMode::All, cx);
+    finish_run(&s, run, cx);
+    assert!(dismissed(&s, a, cx) && dismissed(&s, c, cx));
+    assert!(!dismissed(&s, chat, cx));
+    let expected = format!("Could not stop 1 session: {chat}.");
+    assert!(
+        chat_rows(&s).iter().any(|r| r.ends_with(&expected)),
+        "{:?}",
+        chat_rows(&s)
+    );
+}
+
+#[gpui::test]
+fn a_run_that_finished_as_the_user_chose_still_stops_its_sessions(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    seed_habit(&s);
+    let run = fake_run(&s, cx);
+    let a = child(&s, run, "a", cx);
+    // The turn was already over when the choice came: not busy, so no failure is recorded.
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            let r = m.running.get_mut(&run).unwrap();
+            habit_stop::apply_stop(
+                &mut r.stop,
+                &mut r.failure,
+                habit_stop::StopMode::All,
+                false,
+            )
+        })
+    });
+    finish_run(&s, run, cx);
+    assert!(dismissed(&s, a, cx));
+    assert_ne!(
+        stored_habit(&s).last_error.as_deref(),
+        Some("Stopped by the user.")
+    );
+}
+
+#[test]
+fn a_stop_while_working_fails_the_run_and_one_after_it_ended_does_not() {
+    use habit_stop::{StopMode, apply_stop};
+    let run = |busy| {
+        let (mut stop, mut failure) = (None, None);
+        apply_stop(&mut stop, &mut failure, StopMode::Run, busy);
+        (stop, failure)
+    };
+    let (stop, failure) = run(true);
+    assert_eq!(stop, Some(StopMode::Run));
+    assert_eq!(failure.as_deref(), Some("Stopped by the user."));
+    let (stop, failure) = run(false);
+    assert_eq!(stop, Some(StopMode::Run));
+    assert_eq!(failure, None);
+    // An earlier failure (a timeout) is kept.
+    let (mut stop, mut failure) = (None, Some("Habit timed out".to_string()));
+    apply_stop(&mut stop, &mut failure, StopMode::All, true);
+    assert_eq!(failure.as_deref(), Some("Habit timed out"));
+    // A request already made stands.
+    apply_stop(&mut stop, &mut failure, StopMode::Run, true);
+    assert_eq!(stop, Some(StopMode::All));
+}
+
+#[test]
+fn the_post_says_what_a_stopped_or_finished_run_left_behind() {
+    use habit_stop::{StopMode, post_text};
+    let post = |report, mode, stopped, created, remaining, stuck: &[i64]| {
+        post_text(report, mode, stopped, created, remaining, stuck)
+    };
+    assert_eq!(
+        post(None, Some(StopMode::Run), true, 2, 2, &[]).as_deref(),
+        Some("Stopped. Started 2 sessions that keep running.")
+    );
+    assert_eq!(
+        post(None, Some(StopMode::Run), true, 1, 1, &[]).as_deref(),
+        Some("Stopped. Started 1 session that keeps running.")
+    );
+    assert_eq!(post(None, Some(StopMode::Run), true, 0, 0, &[]), None);
+    assert_eq!(post(None, Some(StopMode::All), true, 2, 0, &[]), None);
+    assert_eq!(
+        post(None, Some(StopMode::All), true, 3, 1, &[7]).as_deref(),
+        Some("Could not stop 1 session: 7.")
+    );
+    assert_eq!(
+        post(None, Some(StopMode::All), true, 3, 2, &[7, 9]).as_deref(),
+        Some("Could not stop 2 sessions: 7, 9.")
+    );
+    // Not stopped by the user: the report, or what is left running.
+    assert_eq!(
+        post(Some("CI is red."), None, false, 1, 1, &[]).as_deref(),
+        Some("CI is red.")
+    );
+    assert_eq!(
+        post(None, Some(StopMode::All), false, 1, 1, &[]).as_deref(),
+        Some("Started a session.")
+    );
+    assert_eq!(post(None, None, false, 0, 0, &[]), None);
+    assert_eq!(
+        post(Some("CI is red."), Some(StopMode::All), false, 2, 1, &[4]).as_deref(),
+        Some("CI is red. Could not stop 1 session: 4.")
+    );
+}
+
+#[gpui::test]
+fn a_new_run_starts_without_a_stop_request(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    assert_eq!(stop_of(&s, run, cx), None);
+    assert!(cx.update(|cx| s.manager.read(cx).running[&run].created.is_empty()));
+}
+
+#[gpui::test]
+fn every_follow_up_is_counted_but_only_created_sessions_are_started(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let note = |session: i64, created: bool, cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            s.manager
+                .update(cx, |m, _| m.note_run_session(run, session, created))
+        })
+    };
+    note(10, false, cx);
+    note(11, true, cx);
+    // A follow-up to a session it created keeps it created; repeats are not double counted.
+    note(11, false, cx);
+    note(10, false, cx);
+    let (sessions, created) = cx.update(|cx| {
+        let r = &s.manager.read(cx).running[&run];
+        (r.sessions.clone(), r.created.clone())
+    });
+    assert_eq!(sessions, [10, 11]);
+    assert_eq!(created, [11]);
+    // Sessions of a caller that is not a habit run are ignored.
+    cx.update(|cx| {
+        s.manager
+            .update(cx, |m, _| m.note_run_session(run + 1, 12, true))
+    });
+    assert!(cx.update(|cx| s.manager.read(cx).running[&run].sessions.len() == 2));
+}
+
+#[gpui::test]
+fn a_session_the_run_started_is_created_and_reported_with_it(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let mut input = notifying(json!({}));
+    input["project"] = json!(s.project);
+    call_from(&s, run, "one", "sessions.start", input, cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+    let (sessions, created) = cx.update(|cx| {
+        let r = &s.manager.read(cx).running[&run];
+        (r.sessions.clone(), r.created.clone())
+    });
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions, created);
+}
+
+#[gpui::test]
+fn the_stop_button_shows_only_while_the_habit_runs(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    seed_habit(&s);
+    let h = stored_habit(&s);
+    s.window
+        .update(cx, |_, _, cx| {
+            s.manager.update(cx, |m, cx| {
+                m.settings = None;
+                m.overview_tab = OverviewTab::Habits;
+                m.habits = vec![h.clone()];
+                m.route = Some(Route::Habit(h.id.clone()));
+                cx.notify();
+            });
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("mono-habit-run").is_some());
+    assert!(visual.debug_bounds("mono-habit-stop").is_none());
+    let run = fake_run(&s, visual);
+    visual.update(|_, cx| s.manager.update(cx, |_, cx| cx.notify()));
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("mono-habit-stop").is_some());
+    // Once asked, the button stays but is disabled ("Stopping...").
+    user_stop(&s, run, habit_stop::StopMode::Run, visual);
+    visual.update(|_, cx| s.manager.update(cx, |_, cx| cx.notify()));
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("mono-habit-stop").is_some());
+    assert!(visual.update(|_, cx| s.manager.read(cx).habit_stopping("h1")));
+}
+
+mod reset_flow {
+    use super::*;
+    use monocode_core::{
+        mono::provider_files::{self, retire_session},
+        provider::Kind,
+    };
+
+    const A: &str = "11111111-1111-4111-8111-111111111111";
+    const B: &str = "22222222-2222-4222-8222-222222222222";
+    const C: &str = "33333333-3333-4333-8333-333333333333";
+
+    /// The old conversation's title. Ids are reused once the newest row is deleted,
+    /// so the old row is told apart by what it holds, not by its id.
+    const OLD: &str = "old conversation";
+
+    /// Every call a cleanup runner got: the requests, and whether the old row was already gone.
+    type Calls = Arc<Mutex<Vec<(Vec<(Kind, Vec<String>)>, bool)>>>;
+
+    /// The Mono's chat on `provider`, with `current` as its provider session and `retired` rotated out.
+    fn conversation(s: &Setup, provider: &str, current: Option<&str>, retired: &[(&str, &str)]) {
+        let db = locked(&s.store).unwrap();
+        db.title(s.session, OLD).unwrap();
+        db.change_provider(s.session, provider).unwrap();
+        if let Some(id) = current {
+            db.provider_id(s.session, id).unwrap();
+        }
+        for (harness, id) in retired {
+            retire_session(&db, s.session, harness, id).unwrap();
+        }
+    }
+    /// Replaces the cleanup with a recorder that reports `problems`.
+    fn recorder(s: &Setup, problems: Vec<String>, cx: &mut TestAppContext) -> Calls {
+        let calls: Calls = Default::default();
+        let log = calls.clone();
+        let store = s.store.clone();
+        cx.update(|cx| {
+            s.manager.update(cx, |m, _| {
+                m.cleanup = Arc::new(move |_, requests| {
+                    let gone = !old_exists_in(&store);
+                    log.lock().unwrap().push((
+                        requests
+                            .iter()
+                            .map(|r| (r.provider(), r.ids().to_vec()))
+                            .collect(),
+                        gone,
+                    ));
+                    problems.clone()
+                });
+            })
+        });
+        calls
+    }
+    fn ask(s: &Setup, cx: &mut TestAppContext) {
+        let handle: gpui::AnyWindowHandle = s.window.into();
+        handle
+            .update(cx, |_, w, cx| {
+                s.manager.update(cx, |m, cx| m.request_reset(&s.id, w, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+    fn confirm(s: &Setup, cx: &mut TestAppContext) {
+        let handle: gpui::AnyWindowHandle = s.window.into();
+        handle
+            .update(cx, |_, w, cx| {
+                s.manager.update(cx, |m, cx| m.confirm_reset(w, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+    fn session_of(s: &Setup, cx: &mut TestAppContext) -> Option<i64> {
+        cx.update(|cx| s.manager.read(cx).roster.get(&s.id).unwrap().session_id)
+    }
+    fn old_exists_in(store: &Database) -> bool {
+        locked(store)
+            .unwrap()
+            .sessions()
+            .unwrap()
+            .iter()
+            .any(|session| session.title == OLD)
+    }
+    fn old_exists(s: &Setup) -> bool {
+        old_exists_in(&s.store)
+    }
+    fn rows(s: &Setup) -> Vec<i64> {
+        locked(&s.store)
+            .unwrap()
+            .sessions()
+            .unwrap()
+            .iter()
+            .map(|session| session.id)
+            .collect()
+    }
+    fn dialog<T>(
+        s: &Setup,
+        cx: &mut TestAppContext,
+        read: impl FnOnce(&reset::ResetDialog) -> T,
+    ) -> Option<T> {
+        cx.update(|cx| s.manager.read(cx).reset.as_ref().map(read))
+    }
+
+    #[test]
+    fn the_dialog_copy_follows_the_desktop_app() {
+        assert_eq!(reset::title("Broski"), "Reset Broski's conversation?");
+        assert_eq!(
+            reset::BODY,
+            "All messages in this Mono's conversation will be deleted and any active reply will be stopped. This can't be undone."
+        );
+        assert_eq!(reset::KEPT, "Its soul, memory and habits will be kept.");
+        let files = provider_files::mono_provider_files("claude", Some(A), &[]);
+        assert_eq!(
+            reset::option_label(&files),
+            "Also delete the Claude Code session files on this computer"
+        );
+        assert_eq!(reset::option_note(&files), "They can't be recovered.");
+        let cursor = provider_files::mono_provider_files("cursor", Some(A), &[]);
+        assert_eq!(
+            reset::option_note(&cursor),
+            "Monoptah can't delete Cursor session files yet."
+        );
+        let mixed = provider_files::mono_provider_files(
+            "cursor",
+            Some(A),
+            &[provider_files::provider_session_ref("claude", B).unwrap()],
+        );
+        assert_eq!(
+            reset::option_note(&mixed),
+            "They can't be recovered. Files from the current Cursor session are not covered."
+        );
+        assert_eq!(
+            reset::failure("Storage unavailable"),
+            "Could not reset the conversation. Storage unavailable"
+        );
+    }
+
+    #[gpui::test]
+    fn asking_shows_the_box_checked_for_claude_code_and_names_every_provider(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[("codex", B)]);
+        ask(&s, cx);
+        let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+        visual.run_until_parked();
+        let (label, checked, supported) = dialog(&s, visual, |d| {
+            let files = d.files.as_ref().unwrap();
+            (files.label.clone(), d.delete_files, files.supported)
+        })
+        .unwrap();
+        assert_eq!(label, "Claude Code and Codex");
+        assert!(checked && supported);
+        assert!(visual.debug_bounds("mono-reset-dialog").is_some());
+        assert!(visual.debug_bounds("mono-reset-files").is_some());
+        // Nothing happens until the user confirms.
+        assert_eq!(session_of(&s, visual), Some(s.session));
+        assert!(old_exists(&s));
+    }
+
+    #[gpui::test]
+    fn clicking_the_box_toggles_it_and_cancel_changes_nothing(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        let calls = recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+        visual.run_until_parked();
+        let checkbox = visual.debug_bounds("mono-reset-files").unwrap();
+        visual.simulate_click(checkbox.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(dialog(&s, visual, |d| d.delete_files), Some(false));
+        let cancel = visual.debug_bounds("mono-reset-cancel").unwrap();
+        visual.simulate_click(cancel.center(), Default::default());
+        visual.run_until_parked();
+        assert!(dialog(&s, visual, |_| ()).is_none());
+        assert_eq!(session_of(&s, visual), Some(s.session));
+        assert!(old_exists(&s));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn resetting_with_the_box_ticked_deletes_the_row_then_cleans_current_and_retired_files(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[("claude", B), ("codex", C)]);
+        let calls = recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        confirm(&s, cx);
+        cx.run_until_parked();
+
+        assert!(dialog(&s, cx, |_| ()).is_none());
+        assert!(!old_exists(&s), "the old row is deleted");
+        let fresh = session_of(&s, cx).expect("a fresh conversation");
+        assert!(rows(&s).contains(&fresh));
+        let hidden = cx.update(|cx| s.manager.read(cx).roster.hidden_sessions.clone());
+        assert_eq!(
+            hidden.iter().filter(|&&id| id == fresh).count(),
+            1,
+            "the new conversation is hidden once, even when it reuses the old id"
+        );
+        let mut calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let (mut requests, gone) = calls.remove(0);
+        requests.sort_by_key(|(kind, _)| kind.id());
+        assert_eq!(
+            requests,
+            vec![
+                (Kind::Claude, vec![A.to_string(), B.to_string()]),
+                (Kind::Codex, vec![C.to_string()]),
+            ]
+        );
+        assert!(gone, "the cleanup runs after the row is gone");
+        assert!(
+            locked(&s.store)
+                .unwrap()
+                .setting(&format!("mono-retired:{}", s.session))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cx.update(|cx| s.manager.read(cx).error.clone()), None);
+    }
+
+    #[gpui::test]
+    fn resetting_with_the_box_unticked_still_deletes_the_row_but_keeps_the_files(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "codex", Some(A), &[("codex", B)]);
+        let calls = recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        cx.update(|cx| {
+            s.manager
+                .update(cx, |m, _| m.reset.as_mut().unwrap().delete_files = false)
+        });
+        confirm(&s, cx);
+        cx.run_until_parked();
+
+        assert!(!old_exists(&s));
+        assert!(session_of(&s, cx).is_some());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn cleanup_problems_become_a_notice_after_the_reset(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, vec!["one".into(), "two".into()], cx);
+        ask(&s, cx);
+        confirm(&s, cx);
+        cx.run_until_parked();
+
+        assert!(!old_exists(&s), "problems never undo the reset");
+        assert_eq!(
+            cx.update(|cx| s.manager.read(cx).error.clone()).as_deref(),
+            Some(provider_files::problem_message("Claude Code", 2).as_str())
+        );
+    }
+
+    #[gpui::test]
+    fn a_harness_without_deletable_files_offers_a_disabled_box(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "cursor", Some(A), &[]);
+        let calls = recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+        visual.run_until_parked();
+        assert_eq!(dialog(&s, visual, |d| d.delete_files), Some(false));
+        let checkbox = visual.debug_bounds("mono-reset-files").unwrap();
+        visual.simulate_click(checkbox.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(dialog(&s, visual, |d| d.delete_files), Some(false));
+        confirm(&s, visual);
+        visual.run_until_parked();
+        assert!(!old_exists(&s));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn a_failed_deletion_keeps_the_conversation_and_says_why(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        let calls = recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        // A poisoned store lock makes the deletion fail.
+        let store = s.store.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = store.lock().unwrap();
+            panic!("poison the store");
+        })
+        .join();
+        confirm(&s, cx);
+        cx.run_until_parked();
+        s.store.clear_poison();
+
+        assert_eq!(session_of(&s, cx), Some(s.session));
+        assert!(old_exists(&s));
+        let (busy, error) = dialog(&s, cx, |d| (d.busy, d.error.clone())).unwrap();
+        assert!(!busy, "the dialog can be used again");
+        assert!(error.is_some_and(|e| e.starts_with("Could not reset the conversation. ")));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "files stay when the row stays"
+        );
+    }
+
+    #[gpui::test]
+    fn a_mono_without_a_saved_conversation_resets_to_a_fresh_one(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        let calls = recorder(&s, Vec::new(), cx);
+        cx.update(|cx| {
+            s.manager.update(cx, |m, _| {
+                let mono = m.roster.get_mut(&s.id).unwrap();
+                mono.session_id = None;
+                mono.unavailable_session = Some("missing".into());
+            })
+        });
+        ask(&s, cx);
+        assert!(dialog(&s, cx, |d| d.files.is_none()).unwrap());
+        confirm(&s, cx);
+        cx.run_until_parked();
+        let unavailable = cx.update(|cx| {
+            s.manager
+                .read(cx)
+                .roster
+                .get(&s.id)
+                .unwrap()
+                .unavailable_session
+                .clone()
+        });
+        assert_eq!(unavailable, None);
+        assert!(session_of(&s, cx).is_some());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+    #[gpui::test]
+    fn a_reply_that_will_not_stop_keeps_the_conversation_and_says_so(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        let calls = recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        // A turn that never reports back stays stopping.
+        cx.update(|cx| {
+            let chat = s.manager.read(cx).chats[&s.id].clone();
+            chat.update(cx, |chat, cx| {
+                chat.busy = true;
+                chat.mono_stop(cx);
+            });
+        });
+        confirm(&s, cx);
+        assert!(
+            old_exists(&s),
+            "nothing is deleted while the reply may still write"
+        );
+        cx.executor().advance_clock(Duration::from_secs(11));
+        cx.run_until_parked();
+
+        assert!(old_exists(&s));
+        assert_eq!(session_of(&s, cx), Some(s.session));
+        let (busy, error) = dialog(&s, cx, |d| (d.busy, d.error.clone())).unwrap();
+        assert!(!busy);
+        assert_eq!(
+            error.as_deref(),
+            Some("Could not reset the conversation. The reply did not stop in time. Try again.")
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+    #[gpui::test]
+    fn queued_messages_and_reports_wait_for_the_fresh_conversation(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        let queued = mono::Message {
+            id: "queued".into(),
+            text: "do it later".into(),
+            sent_at: None,
+            internal: false,
+            // Never sent, so no provider process is started by this test.
+            error: Some("not sent".into()),
+            attachments: Vec::new(),
+        };
+        let handle: gpui::AnyWindowHandle = s.window.into();
+        handle
+            .update(cx, |_, w, cx| {
+                s.manager.update(cx, |m, cx| {
+                    let mono = m.roster.get_mut(&s.id).unwrap();
+                    mono.outbox.push(queued);
+                    mono.pending_reports.push("Habit finished.".into());
+                    m.confirm_reset(w, cx);
+                    // The reset is deleting the old row: nothing may reach it now.
+                    m.dispatch(&s.id, cx);
+                    let mono = m.roster.get(&s.id).unwrap();
+                    assert_eq!(mono.pending_reports, vec!["Habit finished.".to_string()]);
+                    assert_eq!(mono.outbox.len(), 1);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(!old_exists(&s));
+        let outbox = cx.update(|cx| s.manager.read(cx).roster.get(&s.id).unwrap().outbox.len());
+        assert_eq!(
+            outbox, 1,
+            "the queued message is kept for the new conversation"
+        );
+        let posted = cx.update(|cx| {
+            let m = s.manager.read(cx);
+            let pending = m.roster.get(&s.id).unwrap().pending_reports.clone();
+            let rows = m.chats[&s.id]
+                .read(cx)
+                .transcript
+                .read(cx)
+                .source_rows()
+                .to_vec();
+            (pending, rows.iter().any(|r| r.text == "Habit finished."))
+        });
+        assert!(
+            posted.1 || posted.0 == vec!["Habit finished.".to_string()],
+            "the report is delivered to, or still queued for, the new conversation"
+        );
+    }
+    #[gpui::test]
+    fn the_notice_names_the_dialogs_provider_when_the_record_vanished(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        let calls = recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        let mut db = locked(&s.store).unwrap();
+        db.delete(s.session).unwrap();
+        // An id retired by an earlier rotation is all that is left of it.
+        retire_session(&db, s.session, "claude", B).unwrap();
+        drop(db);
+        confirm(&s, cx);
+        cx.run_until_parked();
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "nothing is deleted without the record"
+        );
+        assert_eq!(
+            cx.update(|cx| s.manager.read(cx).error.clone()).as_deref(),
+            Some(provider_files::problem_message("Claude Code", 1).as_str())
+        );
+    }
+    #[gpui::test]
+    fn a_report_held_back_by_a_failed_reset_is_delivered_to_the_kept_conversation(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        // The row cannot be deleted, while the store keeps working for the report.
+        let path = locked(&s.store).unwrap().database_path().to_path_buf();
+        let blocked = std::process::Command::new("sqlite3")
+            .arg(&path)
+            .arg("CREATE TRIGGER keep_rows BEFORE DELETE ON native_sessions BEGIN SELECT RAISE(ABORT, 'kept'); END;")
+            .status();
+        if !blocked.is_ok_and(|status| status.success()) {
+            eprintln!("skipped: the sqlite3 command is not available");
+            return;
+        }
+        let handle: gpui::AnyWindowHandle = s.window.into();
+        handle
+            .update(cx, |_, w, cx| {
+                s.manager.update(cx, |m, cx| {
+                    m.roster
+                        .get_mut(&s.id)
+                        .unwrap()
+                        .pending_reports
+                        .push("Habit finished.".into());
+                    m.confirm_reset(w, cx);
+                    m.dispatch(&s.id, cx);
+                    assert_eq!(m.roster.get(&s.id).unwrap().pending_reports.len(), 1);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(session_of(&s, cx), Some(s.session));
+        let (busy, pending, posted) = cx.update(|cx| {
+            let m = s.manager.read(cx);
+            let rows = m.chats[&s.id]
+                .read(cx)
+                .transcript
+                .read(cx)
+                .source_rows()
+                .to_vec();
+            (
+                m.reset.as_ref().unwrap().busy,
+                m.roster.get(&s.id).unwrap().pending_reports.clone(),
+                rows.iter().any(|r| r.text == "Habit finished."),
+            )
+        });
+        assert!(!busy);
+        assert!(pending.is_empty() && posted, "{pending:?} posted={posted}");
+    }
 }

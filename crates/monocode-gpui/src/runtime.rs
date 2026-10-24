@@ -384,8 +384,17 @@ fn run_turn_using(
             mono_fingerprint = Some(fingerprint.clone());
             let rotated = provider_id.is_some() && context.ratio().is_some_and(|r| r >= 0.8);
             if rotated {
-                provider_id = None;
-                locked(&store)?.reset_provider_id(summary.id)?;
+                // The replaced session keeps its files; remember it for a later reset.
+                let old = provider_id.take().unwrap_or_default();
+                let db = locked(&store)?;
+                if let Some(problem) = monocode_core::mono::provider_files::rotate(
+                    &db,
+                    summary.id,
+                    &summary.provider,
+                    &old,
+                )? {
+                    eprintln!("Could not record the rotated provider session: {problem}");
+                }
             }
             let receipt = locked(&store)?.setting(&format!("mono-context:{}", summary.id))?;
             let expected =

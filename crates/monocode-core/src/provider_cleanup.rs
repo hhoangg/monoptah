@@ -14,6 +14,7 @@ use crate::{
     provider::Kind,
     store::Session,
 };
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// What to remove for one deleted session, captured before its record is gone.
@@ -32,10 +33,18 @@ impl CleanupRequest {
     }
 }
 
+/// One provider session id a Mono reset also removes, such as an id retired by
+/// context rotation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSessionRef {
+    pub harness: String,
+    pub id: String,
+}
+
 /// Both CLIs name their sessions with canonical UUIDs. Anything else, such as a
 /// corrupt id that equals a real directory name like `memory`, must never be
 /// turned into a path.
-fn is_uuid(id: &str) -> bool {
+pub fn is_uuid(id: &str) -> bool {
     id.len() == 36
         && id.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',
@@ -76,12 +85,109 @@ pub fn cleanup_request(session: &Session, side_threads: &[String]) -> Option<Cle
     Some(CleanupRequest { provider, ids })
 }
 
+/// Shortens text that came from the caller before it goes into a message.
+fn clip(text: &str) -> String {
+    text.chars().take(40).collect()
+}
+
+/// Merges the record's own request with the extra sessions of a Mono reset,
+/// grouped per provider. Anything that is not a canonical UUID of a supported
+/// provider is skipped and reported, never turned into a path. When the record
+/// does not exist the extras are ignored and one problem is reported.
+pub fn plan_reset_cleanup(
+    own: Option<CleanupRequest>,
+    extra: &[ProviderSessionRef],
+    record_exists: bool,
+) -> (Vec<CleanupRequest>, Vec<String>) {
+    // Without the record to vouch for the conversation, nothing is deleted on
+    // the word of the extra ids alone.
+    if !record_exists {
+        let problems = if extra.is_empty() {
+            Vec::new()
+        } else {
+            vec!["conversation record not found; provider session files were kept".to_string()]
+        };
+        return (Vec::new(), problems);
+    }
+    let mut requests: Vec<CleanupRequest> = own.into_iter().collect();
+    let mut problems = Vec::new();
+    for session in extra {
+        let provider = match session.harness.as_str() {
+            "claude" => Kind::Claude,
+            "codex" => Kind::Codex,
+            other => {
+                problems.push(format!(
+                    "skipped {} session: unsupported provider",
+                    clip(other)
+                ));
+                continue;
+            }
+        };
+        if !is_uuid(&session.id) {
+            problems.push(format!(
+                "skipped {} session: invalid session id",
+                clip(&session.harness)
+            ));
+            continue;
+        }
+        match requests.iter_mut().find(|r| r.provider == provider) {
+            Some(request) => {
+                if !request.ids.contains(&session.id) {
+                    request.ids.push(session.id.clone());
+                }
+            }
+            None => requests.push(CleanupRequest {
+                provider,
+                ids: vec![session.id.clone()],
+            }),
+        }
+    }
+    (requests, problems)
+}
+
 /// Runs the cleanup against the default home and every account home under
 /// `data_dir`, and returns whatever could not be removed as short messages.
 pub fn run_cleanup(data_dir: &Path, request: &CleanupRequest) -> Vec<String> {
-    report_with_homes(std::slice::from_ref(request), &|kind| {
-        Ok(provider_homes(data_dir, kind))
+    run_cleanup_report(data_dir, std::slice::from_ref(request), false)
+}
+
+/// Runs the requests like [`run_cleanup`]. `include_mono_stores` adds the
+/// private Codex stores that Mono conversations keep their rollouts in.
+pub fn run_cleanup_report(
+    data_dir: &Path,
+    requests: &[CleanupRequest],
+    include_mono_stores: bool,
+) -> Vec<String> {
+    report_with_homes(requests, &|kind| {
+        let mut homes = provider_homes(data_dir, kind);
+        add_mono_stores(&mut homes, data_dir, kind, include_mono_stores);
+        Ok(homes)
     })
+}
+
+fn add_mono_stores(homes: &mut Vec<ProviderHome>, data_dir: &Path, kind: Kind, include: bool) {
+    if include && kind == Kind::Codex {
+        homes.extend(mono_codex_homes(data_dir));
+    }
+}
+
+/// Every real directory under `<data dir>/codex-monos/`, where Mono Codex
+/// conversations keep a private home per account. Links and files are ignored.
+fn mono_codex_homes(data_dir: &Path) -> Vec<ProviderHome> {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("codex-monos")) else {
+        return Vec::new();
+    };
+    let mut homes: Vec<ProviderHome> = entries
+        .flatten()
+        // `DirEntry::file_type` does not follow symlinks.
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| ProviderHome {
+            path: entry.path(),
+            is_default: false,
+        })
+        .collect();
+    homes.sort_by(|a, b| a.path.cmp(&b.path));
+    homes
 }
 
 fn report_with_homes(
@@ -980,5 +1086,236 @@ mod tests {
 
         assert!(result.is_err());
         assert!(outside.join("precious").is_file());
+    }
+
+    fn session_ref(harness: &str, id: &str) -> ProviderSessionRef {
+        ProviderSessionRef {
+            harness: harness.to_string(),
+            id: id.to_string(),
+        }
+    }
+
+    fn own_request(harness: &str, ids: &[String]) -> CleanupRequest {
+        let mut request = cleanup_request(&session(harness, Some(&ids[0])), &[]).unwrap();
+        request.ids = ids.to_vec();
+        request
+    }
+
+    #[test]
+    fn reset_plan_merges_retired_ids_and_dedupes() {
+        let (live, retired1, retired2) = (id(1), id(2), id(3));
+        let own = own_request("claude", std::slice::from_ref(&live));
+        let extra = [
+            session_ref("claude", &retired1),
+            session_ref("claude", &live),
+            session_ref("claude", &retired2),
+            session_ref("claude", &retired1),
+        ];
+
+        let (requests, problems) = plan_reset_cleanup(Some(own), &extra, true);
+
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].provider, Kind::Claude);
+        assert_eq!(requests[0].ids, vec![live, retired1, retired2]);
+    }
+
+    #[test]
+    fn reset_plan_ignores_extras_when_the_record_is_gone() {
+        let extra = [session_ref("codex", &id(1)), session_ref("claude", &id(2))];
+
+        let (requests, problems) = plan_reset_cleanup(None, &extra, false);
+
+        assert!(requests.is_empty(), "{requests:?}");
+        assert_eq!(
+            problems,
+            vec!["conversation record not found; provider session files were kept".to_string()]
+        );
+        assert!(plan_reset_cleanup(None, &[], false).1.is_empty());
+    }
+
+    #[test]
+    fn reset_plan_honours_extras_when_the_record_exists() {
+        let (a, b) = (id(1), id(2));
+        let extra = [session_ref("codex", &a), session_ref("claude", &b)];
+
+        let (requests, problems) = plan_reset_cleanup(None, &extra, true);
+
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(requests.len(), 2);
+        let claude = requests.iter().find(|r| r.provider == Kind::Claude);
+        let codex = requests.iter().find(|r| r.provider == Kind::Codex);
+        assert_eq!(claude.unwrap().ids, vec![b]);
+        assert_eq!(codex.unwrap().ids, vec![a]);
+    }
+
+    #[test]
+    fn reset_plan_keeps_the_record_provider_separate_from_extras_of_another() {
+        let (own_id, other) = (id(1), id(2));
+        let own = own_request("codex", std::slice::from_ref(&own_id));
+
+        let (requests, _) = plan_reset_cleanup(Some(own), &[session_ref("claude", &other)], true);
+
+        assert_eq!(requests.len(), 2);
+        let codex = requests.iter().find(|r| r.provider == Kind::Codex);
+        assert_eq!(codex.unwrap().ids, vec![own_id]);
+    }
+
+    #[test]
+    fn reset_plan_skips_unsupported_providers_and_invalid_ids() {
+        let good = id(1);
+        let long = "a".repeat(37);
+        let extra = [
+            session_ref("cursor", &id(2)),
+            session_ref("claude", "../../etc"),
+            session_ref("claude", "memory"),
+            session_ref("codex", ""),
+            session_ref("codex", &long),
+            session_ref("claude", &good),
+        ];
+
+        let (requests, problems) = plan_reset_cleanup(None, &extra, true);
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].provider, Kind::Claude);
+        assert_eq!(requests[0].ids, vec![good]);
+        assert_eq!(problems.len(), 5, "{problems:?}");
+        assert_eq!(problems[0], "skipped cursor session: unsupported provider");
+        assert!(problems[1..]
+            .iter()
+            .all(|p| p.ends_with("session: invalid session id")));
+        assert!(problems[1].starts_with("skipped claude session"));
+        assert!(problems[3].starts_with("skipped codex session"));
+    }
+
+    #[test]
+    fn reset_plan_never_echoes_more_than_forty_characters() {
+        let long_harness = "h".repeat(200);
+        let (requests, problems) =
+            plan_reset_cleanup(None, &[session_ref(&long_harness, &id(1))], true);
+
+        assert!(requests.is_empty());
+        assert_eq!(problems.len(), 1);
+        assert!(!problems[0].contains(&"h".repeat(41)), "{}", problems[0]);
+    }
+
+    #[test]
+    fn reset_plan_accepts_a_mixed_case_uuid_like_is_uuid_does() {
+        let upper = "0190F3A2-7B1C-7D4E-9A3B-123456789ABC";
+        assert!(is_uuid(upper));
+
+        let (requests, problems) = plan_reset_cleanup(None, &[session_ref("claude", upper)], true);
+
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(requests[0].ids, vec![upper.to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mono_codex_homes_lists_only_real_directories() {
+        let fixture = Fixture::new();
+        let monos = fixture.0.join("codex-monos");
+        std::fs::create_dir_all(monos.join("default")).unwrap();
+        std::fs::create_dir_all(monos.join("work")).unwrap();
+        fixture.file(&monos.join("stray.txt"));
+        let outside = fixture.0.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, monos.join("linked")).unwrap();
+
+        let mut homes: Vec<PathBuf> = mono_codex_homes(&fixture.0)
+            .into_iter()
+            .map(|home| {
+                assert!(!home.is_default);
+                home.path
+            })
+            .collect();
+        homes.sort();
+
+        assert_eq!(homes, vec![monos.join("default"), monos.join("work")]);
+    }
+
+    #[test]
+    fn mono_codex_homes_is_empty_without_the_directory() {
+        let fixture = Fixture::new();
+        assert!(mono_codex_homes(&fixture.0).is_empty());
+    }
+
+    #[test]
+    fn mono_stores_are_added_for_codex_only_and_only_when_asked() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.0.join("codex-monos").join("default")).unwrap();
+        let count = |kind, include| {
+            let mut homes = Vec::new();
+            add_mono_stores(&mut homes, &fixture.0, kind, include);
+            homes.len()
+        };
+
+        assert_eq!(count(Kind::Codex, true), 1);
+        assert_eq!(count(Kind::Codex, false), 0);
+        assert_eq!(count(Kind::Claude, true), 0);
+    }
+
+    #[test]
+    fn codex_rollout_in_a_mono_store_is_removed_and_other_threads_stay() {
+        let fixture = Fixture::new();
+        let mono_home = fixture.0.join("codex-monos").join("default");
+        let (target, other) = (id(1), id(2));
+        state_db_with_threads(&mono_home, &[target.clone(), other.clone()], &[]);
+        let gone = fixture.rollout(&mono_home, "sessions", &target, "jsonl", None);
+        let kept = fixture.rollout(&mono_home, "sessions", &other, "jsonl", None);
+
+        let homes = mono_codex_homes(&fixture.0);
+        let request = CleanupRequest {
+            provider: Kind::Codex,
+            ids: vec![target],
+        };
+        let problems = report_with_homes(&[request], &|provider| {
+            assert_eq!(provider, Kind::Codex);
+            Ok(vec![ProviderHome {
+                path: homes[0].path.clone(),
+                is_default: homes[0].is_default,
+            }])
+        });
+
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!gone.exists());
+        assert!(kept.is_file());
+        assert_eq!(count(&mono_home, "SELECT count(*) FROM threads"), 1);
+    }
+
+    #[test]
+    fn codex_keeps_a_mono_store_thread_that_a_normal_home_rollout_continues_from() {
+        let fixture = Fixture::new();
+        let mono_home = fixture.0.join("codex-monos").join("default");
+        let normal_home = fixture.home();
+        let (target, fork, other) = (id(1), id(2), id(3));
+        state_db_with_threads(&mono_home, &[target.clone(), other.clone()], &[]);
+        let mono_target = fixture.rollout(&mono_home, "sessions", &target, "jsonl", None);
+        let mono_other = fixture.rollout(&mono_home, "sessions", &other, "jsonl", None);
+        // A rollout in an ordinary home, not being deleted, continues from the target.
+        let fork_rollout = fixture.rollout(&normal_home, "sessions", &fork, "jsonl", Some(&target));
+        let request = CleanupRequest {
+            provider: Kind::Codex,
+            ids: vec![target.clone()],
+        };
+
+        let mono_homes = mono_codex_homes(&fixture.0);
+        let problems = report_with_homes(&[request], &|_| {
+            let mut homes = vec![ProviderHome {
+                path: normal_home.clone(),
+                is_default: false,
+            }];
+            homes.extend(mono_homes.iter().map(|home| ProviderHome {
+                path: home.path.clone(),
+                is_default: home.is_default,
+            }));
+            Ok(homes)
+        });
+
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(mono_target.is_file(), "the continued thread must stay");
+        assert!(mono_other.is_file());
+        assert!(fork_rollout.is_file());
+        assert_eq!(count(&mono_home, "SELECT count(*) FROM threads"), 2);
     }
 }

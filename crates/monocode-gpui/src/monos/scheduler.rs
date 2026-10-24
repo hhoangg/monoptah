@@ -37,6 +37,17 @@ fn when(at: u64, now: u64) -> String {
         at.format("%b %-d, %H:%M").to_string()
     }
 }
+fn habit_subtitle(h: &Habit, since: Option<u64>, busy: bool, now: u64) -> String {
+    if let Some(since) = since {
+        format!("Running now · {}", duration(now.saturating_sub(since)))
+    } else if busy {
+        "Starting…".into()
+    } else if h.enabled {
+        h.schedule.label()
+    } else {
+        format!("Paused · {}", h.schedule.label())
+    }
+}
 fn same_day(a: u64, b: u64) -> bool {
     let day = |at| {
         chrono::DateTime::from_timestamp_millis(at as i64)
@@ -220,15 +231,7 @@ impl Monos {
     fn habit_row(&self, h: &Habit, mono: &Mono, cx: &mut Context<Self>) -> AnyElement {
         let id = h.id.clone();
         let since = self.habit_running_since(h);
-        let subtitle = if let Some(since) = since {
-            format!("Running now · {}", duration(now_ms().saturating_sub(since)))
-        } else if self.habit_busy(h) {
-            "Starting…".into()
-        } else if h.enabled {
-            h.schedule.label()
-        } else {
-            format!("Paused · {}", h.schedule.label())
-        };
+        let subtitle = habit_subtitle(h, since, self.habit_busy(h), now_ms());
         div()
             .id(SharedString::from(format!("mono-habit-{id}")))
             .debug_selector({
@@ -313,6 +316,9 @@ impl Monos {
     fn habit_actions(&self, h: &Habit, page: bool, cx: &mut Context<Self>) -> gpui::Div {
         let busy = self.habit_busy(h);
         let running = self.habit_running_since(h).is_some();
+        let live = self.habit_run(&h.id).is_some();
+        let stopping = self.habit_stopping(&h.id);
+        let stop = h.id.clone();
         let run = h.id.clone();
         let toggle = h.id.clone();
         let remove = h.id.clone();
@@ -351,6 +357,25 @@ impl Monos {
                     }
                 })),
             )
+            .when(live, |d| {
+                d.child(
+                    habit_icon_button(
+                        SharedString::from(format!("mono-habit-stop{suffix}")),
+                        if stopping { "Stopping..." } else { "Stop" },
+                        "square",
+                    )
+                    .debug_selector({
+                        let suffix = suffix.clone();
+                        move || format!("mono-habit-stop{suffix}")
+                    })
+                    .when(stopping, |d| d.opacity(0.35))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if !stopping {
+                            this.stop_habit(&stop, window, cx);
+                        }
+                    })),
+                )
+            })
             .child(
                 habit_icon_button(
                     SharedString::from(format!("mono-habit-toggle{suffix}")),
@@ -726,6 +751,7 @@ impl Monos {
             ("habit-time", "09:00"),
             ("habit-minute", "0"),
             ("habit-weekday", "1"),
+            ("habit-hours", "4"),
         ] {
             self.field(key, key, text.into(), false, cx);
         }
@@ -834,13 +860,19 @@ impl Monos {
             )
             .into_any_element()
     }
-    fn habit_schedule(&self, cx: &App) -> Schedule {
+    pub(super) fn habit_schedule(&self, cx: &App) -> Schedule {
+        let interval = self.value("habit-kind", cx) == "interval";
         Schedule {
             schedule_kind: self.value("habit-kind", cx),
             time: self.value("habit-time", cx).trim().into(),
             minute: self.value("habit-minute", cx).parse().unwrap_or(60),
             day_of_week: self.value("habit-weekday", cx).parse().unwrap_or(7),
+            interval_hours: interval
+                .then(|| self.value("habit-hours", cx).parse().ok())
+                .flatten(),
+            interval_from: None,
         }
+        .anchor(now_ms())
     }
     fn schedule_picker(
         &self,
@@ -996,9 +1028,28 @@ impl Monos {
                     ("weekdays", "Weekdays"),
                     ("weekly", "Weekly"),
                     ("hourly", "Hourly"),
+                    ("interval", "Every N hours"),
                 ]),
                 cx,
             ))
+            .when(kind == "interval", |d| {
+                d.child(
+                    self.schedule_picker(
+                        "habit-hours",
+                        "Hours between runs",
+                        self.value("habit-hours", cx),
+                        (1..=24)
+                            .map(|h| {
+                                (
+                                    h.to_string(),
+                                    format!("{h} hour{}", if h == 1 { "" } else { "s" }),
+                                )
+                            })
+                            .collect(),
+                        cx,
+                    ),
+                )
+            })
             .when(kind == "weekly", |d| {
                 d.child(div().text_color(content(0.45)).child("on")).child(
                     self.schedule_picker(
@@ -1013,7 +1064,11 @@ impl Monos {
                     ),
                 )
             })
-            .child(div().text_color(content(0.45)).child("at"))
+            .child(
+                div()
+                    .text_color(content(0.45))
+                    .child(if kind == "interval" { "from" } else { "at" }),
+            )
             .when(kind == "hourly", |d| {
                 d.child(
                     self.schedule_picker(
@@ -1190,6 +1245,15 @@ impl Monos {
             self.refresh_work(&id, cx);
         }
         self.refresh_cards(cx);
+        let asked: Vec<_> = self
+            .running
+            .iter()
+            .filter(|(_, r)| r.stop.is_some())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in asked {
+            self.enforce_stop(id, cx);
+        }
         let waiting_monos = self
             .running
             .values()
@@ -1215,27 +1279,9 @@ impl Monos {
         for id in timed_out {
             if let Some(run) = self.running.get_mut(&id) {
                 run.failure = Some("Habit timed out while waiting for work or an answer".into());
-                run.mailbox.clear();
                 run.view.update(cx, |v, cx| v.mono_stop(cx));
             }
-            let children = self
-                .roster
-                .monos
-                .iter_mut()
-                .flat_map(|m| m.launches.iter_mut())
-                .filter(|l| (l.origin_turn >> 32) as i64 == id && !l.completed && !l.dismissed)
-                .map(|l| {
-                    l.dismissed = true;
-                    l.session_id
-                })
-                .collect::<Vec<_>>();
-            if let Some(owner) = self.owner.upgrade() {
-                for child in children {
-                    if let Some(view) = owner.read(cx).mono_session_entity(child) {
-                        view.update(cx, |v, cx| v.stop_if_busy(cx));
-                    }
-                }
-            }
+            // Only the run stops: sessions it started report to the chat on their own.
             self.habit_changed(id, cx);
         }
         self.check_completions(cx);
@@ -1326,20 +1372,73 @@ impl Monos {
             db.title(s.id, &s.title)?;
             Ok::<_, String>((s, mono, inherited, habit))
         });
-        cx.spawn(async move|this,cx|{let result=work.await;let _=this.update(cx,|this,cx|{
-            match result{Err(e)=>{this.active_run=None;this.error=Some(e);},Ok((summary,mono,mut settings,habit))=>{
-                let session=summary.id;let view=cx.new(|cx|Conversation::new(summary,this.store.clone(),cx));let root=this.root.clone();let env=this.bridge.as_ref().map(|b|b.environment(session)).unwrap_or_default();
-                settings.access=AccessMode::FullAccess;settings.internal_message=true;settings.mono=None;settings.environment.clear();
-                view.update(cx,|v,cx|{v.install_transfer(settings,None,cx);v.configure_mono(mono,root,env,cx);});
-                this.observations.push(cx.subscribe(&view,move|this,_,_:&SessionChanged,cx|this.habit_changed(session,cx)));
-                this.running.insert(session,RunningHabit{mono:target.clone(),habit:habit.id.clone(),view:view.clone(),started:now_ms(),launched:now_ms(),failure:None,waiting_since:None,cards:Vec::new(),mailbox:Vec::new()});this.active_run=Some(session);
-                this.roster.hidden_sessions.push(session);
-                if let Some(m)=this.roster.get_mut(&target){m.habit_sessions.push(session);}
-                this.save(cx);
-                let message=Message{sent_at:Some(monocode_core::time::now_ms()),id:mono::new_id(),text:format!("[Scheduled habit: {}]\n{}\n\nDo this scheduled work independently. Return a concise report; if nothing requires attention, reply exactly NOTHING_TO_REPORT. Any session you start belongs to this habit. Do not change the habit unless asked.",habit.name,habit.instructions),internal:true,error:None,attachments:Vec::new()};
-                view.update(cx,|v,cx|v.mono_dispatch(&message,cx));
-            }}this.changed(cx);
-        });}).detach();
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Err(e) => {
+                        this.active_run = None;
+                        this.error = Some(e);
+                    }
+                    Ok((summary, mono, mut settings, habit)) => {
+                        let session = summary.id;
+                        let view = cx.new(|cx| Conversation::new(summary, this.store.clone(), cx));
+                        let root = this.root.clone();
+                        let env = this
+                            .bridge
+                            .as_ref()
+                            .map(|b| b.environment(session))
+                            .unwrap_or_default();
+                        settings.access = AccessMode::FullAccess;
+                        settings.internal_message = true;
+                        settings.mono = None;
+                        settings.environment.clear();
+                        view.update(cx, |v, cx| {
+                            v.install_transfer(settings, None, cx);
+                            v.configure_mono(mono, root, env, cx);
+                        });
+                        this.observations.push(
+                            cx.subscribe(&view, move |this, _, _: &SessionChanged, cx| {
+                                this.habit_changed(session, cx)
+                            }),
+                        );
+                        this.running.insert(
+                            session,
+                            RunningHabit {
+                                mono: target.clone(),
+                                habit: habit.id.clone(),
+                                view: view.clone(),
+                                started: now_ms(),
+                                launched: now_ms(),
+                                failure: None,
+                                waiting_since: None,
+                                cards: Vec::new(),
+                                sessions: Vec::new(),
+                                created: Vec::new(),
+                                stop: None,
+                            },
+                        );
+                        this.active_run = Some(session);
+                        this.roster.hidden_sessions.push(session);
+                        if let Some(m) = this.roster.get_mut(&target) {
+                            m.habit_sessions.push(session);
+                        }
+                        this.save(cx);
+                        let message = Message {
+                            sent_at: Some(monocode_core::time::now_ms()),
+                            id: mono::new_id(),
+                            text: habit_prompt(&habit.name, &habit.instructions),
+                            internal: true,
+                            error: None,
+                            attachments: Vec::new(),
+                        };
+                        view.update(cx, |v, cx| v.mono_dispatch(&message, cx));
+                    }
+                }
+                this.changed(cx);
+            });
+        })
+        .detach();
     }
     pub(super) fn habit_changed(&mut self, session: i64, cx: &mut Context<Self>) {
         cx.emit(NotificationChanged);
@@ -1347,40 +1446,7 @@ impl Monos {
             return;
         };
         if run.view.read(cx).busy {
-            self.changed(cx);
-            return;
-        }
-        if let Some(text) = self.running.get_mut(&session).and_then(|r| {
-            if r.mailbox.is_empty() {
-                None
-            } else {
-                Some(r.mailbox.remove(0))
-            }
-        }) {
-            let view = self.running[&session].view.clone();
-            let message = Message {
-                id: mono::new_id(),
-                text,
-                sent_at: Some(monocode_core::time::now_ms()),
-                internal: true,
-                error: None,
-                attachments: Vec::new(),
-            };
-            view.update(cx, |v, cx| v.mono_dispatch(&message, cx));
-            return;
-        }
-        if self
-            .roster
-            .monos
-            .iter()
-            .flat_map(|m| m.launches.iter())
-            .any(|l| {
-                (l.origin_turn >> 32) as i64 == session
-                    && l.notify_on_complete
-                    && !l.completed
-                    && !l.dismissed
-            })
-        {
+            self.enforce_stop(session, cx);
             self.changed(cx);
             return;
         }
@@ -1397,10 +1463,29 @@ impl Monos {
         };
         cx.emit(completion);
         let (mut ok, mut text) = run.view.read(cx).external_outcome(cx);
+        let user_stopped =
+            run.stop.is_some() && run.failure.as_deref() == Some(habit_stop::STOPPED_BY_USER);
         if let Some(error) = run.failure {
             ok = false;
             text = error;
         }
+        // Chosen as late as possible: the choice also applies to a run that was
+        // finishing, and only sessions the run created are its to stop.
+        let (mut stopped, mut stuck) = (HashSet::new(), Vec::new());
+        if run.stop == Some(habit_stop::StopMode::All) {
+            for &session in &run.created {
+                match self.stop_created(&run.mono, session, cx) {
+                    Ok(()) => {
+                        stopped.insert(session);
+                    }
+                    Err(error) => {
+                        eprintln!("Could not stop session {session}: {error}");
+                        stuck.push(session);
+                    }
+                }
+            }
+        }
+        let remaining = run.sessions.iter().filter(|s| !stopped.contains(s)).count();
         let report = ok
             .then(|| {
                 habits::report(&monocode_core::response::prose(
@@ -1439,10 +1524,17 @@ impl Monos {
             },
             cx,
         );
-        if let Some(report) = report {
+        if let Some(post) = habit_stop::post_text(
+            report.as_deref(),
+            run.stop,
+            user_stopped,
+            run.created.len(),
+            remaining,
+            &stuck,
+        ) {
             if let Some(m) = self.roster.get_mut(&run.mono) {
                 m.pending_reports
-                    .push(format!("**Habit report**\n\n{report}"));
+                    .push(format!("**Habit report**\n\n{post}"));
                 for card in &run.cards {
                     m.pending_reports.push(format!("mono-card:{card}"));
                 }
@@ -1453,6 +1545,22 @@ impl Monos {
         }
         self.changed(cx);
     }
+}
+
+/// What a habit run is told to do.
+pub(super) fn habit_prompt(name: &str, instructions: &str) -> String {
+    format!(
+        "[Scheduled habit: {name}]\n{instructions}\n\nDo this scheduled work independently. Return a concise report; if nothing requires attention, reply exactly NOTHING_TO_REPORT. Sessions you start with app sessions.start report to your chat, not to this run, and their reports still arrive after this run has ended. Once you have started them, hand the work off and finish this run: do not wait for them or poll, and do not do their work yourself. Mention in your reply what you started. Do not change the habit unless asked."
+    )
+}
+/// What a finished run posts to the chat: its report, or failing that what it
+/// started, so sessions it started stay findable even after a quiet or timed out run.
+pub(super) fn run_post(report: Option<&str>, started: usize) -> Option<String> {
+    report.map(str::to_owned).or_else(|| match started {
+        0 => None,
+        1 => Some("Started a session.".into()),
+        n => Some(format!("Started {n} sessions.")),
+    })
 }
 
 #[cfg(test)]
@@ -1499,6 +1607,44 @@ mod tests {
         assert_eq!(
             grouped_habits(&habits, now, |h| (h.id == "Running").then_some(at(12, 11))),
             [vec![5, 4, 1], vec![2], vec![0, 3]]
+        );
+    }
+
+    #[test]
+    fn habit_rows_show_the_interval_label_and_keep_it_when_paused() {
+        let now = 1_700_000_000_000;
+        let habit = |hours| {
+            Habit::new(
+                "Interval".into(),
+                "Check builds".into(),
+                Schedule {
+                    schedule_kind: "interval".into(),
+                    time: "08:30".into(),
+                    interval_hours: Some(hours),
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap()
+        };
+        let mut h = habit(4);
+        assert_eq!(
+            habit_subtitle(&h, None, false, now),
+            "Every 4 hours from 08:30"
+        );
+        assert_eq!(
+            habit_subtitle(&habit(1), None, false, now),
+            "Every hour from 08:30"
+        );
+        h.enabled = false;
+        assert_eq!(
+            habit_subtitle(&h, None, false, now),
+            "Paused · Every 4 hours from 08:30"
+        );
+        assert_eq!(habit_subtitle(&h, None, true, now), "Starting…");
+        assert_eq!(
+            habit_subtitle(&h, Some(now - 72_000), false, now),
+            "Running now · 1m 12s"
         );
     }
 

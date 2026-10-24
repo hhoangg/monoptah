@@ -4,6 +4,10 @@ use super::*;
 use crate::desktop_preferences::DesktopPreferences;
 use serde_json::Value;
 
+/// Fields that only make sense together: a native change to one keeps the
+/// native value of the others, or the desktop's stale value would contradict it.
+const PAIRED_FIELDS: &[&[&str]] = &[&["sessionId", "unavailableSession"]];
+
 const IDENTITY_FIELDS: &[&str] = &[
     "sessionId",
     "unavailableSession",
@@ -74,19 +78,34 @@ impl Roster {
                 .map(serde_json::to_value)
                 .transpose()
                 .map_err(|e| e.to_string())?;
-            for &field in IDENTITY_FIELDS {
-                // Preserve native changes only when a baseline proves that
-                // the native value was changed. Old sidecars never hide the
-                // authoritative roster on the first compatible launch.
-                if baseline
+            // Preserve native changes only when a baseline proves that the
+            // native value was changed. Old sidecars never hide the
+            // authoritative roster on the first compatible launch.
+            let changed = |field: &str| {
+                baseline
                     .as_ref()
-                    .is_none_or(|old| value.get(field) == old.get(field))
-                {
-                    if let Some(next) = latest.get(field) {
-                        value[field] = next.clone();
-                    } else if let Some(object) = value.as_object_mut() {
-                        object.remove(field);
-                    }
+                    .is_some_and(|old| value.get(field) != old.get(field))
+            };
+            let kept: Vec<&str> = IDENTITY_FIELDS
+                .iter()
+                .copied()
+                .filter(|&field| {
+                    PAIRED_FIELDS
+                        .iter()
+                        .find(|group| group.contains(&field))
+                        .map_or([field].as_slice(), |group| *group)
+                        .iter()
+                        .any(|&member| changed(member))
+                })
+                .collect();
+            for &field in IDENTITY_FIELDS {
+                if kept.contains(&field) {
+                    continue;
+                }
+                if let Some(next) = latest.get(field) {
+                    value[field] = next.clone();
+                } else if let Some(object) = value.as_object_mut() {
+                    object.remove(field);
                 }
             }
             merged.push(serde_json::from_value(value).map_err(|e| e.to_string())?);
@@ -307,6 +326,59 @@ mod tests {
         assert!(roster.get("removed").is_none());
         roster.merge_desktop(Vec::new()).unwrap();
         assert!(roster.monos.is_empty());
+    }
+
+    #[test]
+    fn a_native_reset_keeps_the_new_conversation_after_the_desktop_row_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop.db");
+        let mut store = Store::open_monocode(&path).unwrap();
+        let session = store.create("codex", "/project").unwrap();
+        let original = store.persisted_session_id(session.id).unwrap();
+        let entry = json!({"id":"mono-original", "sessionId":original, "name":"Big Boss"});
+        let mut roster = Roster::default();
+        roster
+            .merge_desktop(vec![desktop_mono(&store, &entry, None).unwrap()])
+            .unwrap();
+        // Native reset: the old row is deleted and a new conversation takes over.
+        store.delete(session.id).unwrap();
+        let fresh = store.create("codex", "/project").unwrap();
+        roster.get_mut("mono-original").unwrap().session_id = Some(fresh.id);
+        let raw = serde_json::to_string(&roster).unwrap();
+        let mut roster: Roster = serde_json::from_str(&raw).unwrap();
+        // The next launch: the desktop roster still names the deleted row.
+        drop(store);
+        let store = Store::open_monocode(&path).unwrap();
+        let source = desktop_mono(&store, &entry, None).unwrap();
+        assert_eq!(
+            source.unavailable_session.as_deref(),
+            Some(original.as_str())
+        );
+
+        roster.merge_desktop(vec![source]).unwrap();
+
+        let mono = roster.get("mono-original").unwrap();
+        assert_eq!(mono.session_id, Some(fresh.id));
+        assert_eq!(mono.unavailable_session, None);
+        assert_eq!(mono.name, "Big Boss");
+    }
+
+    #[test]
+    fn desktop_changes_to_the_session_still_apply_when_native_did_not_touch_it() {
+        let mono = |session: Option<i64>, missing: Option<&str>| Mono {
+            id: "m".into(),
+            session_id: session,
+            unavailable_session: missing.map(str::to_owned),
+            ..Default::default()
+        };
+        let mut roster = Roster::default();
+        roster
+            .merge_desktop(vec![mono(None, Some("gone"))])
+            .unwrap();
+        roster.merge_desktop(vec![mono(Some(7), None)]).unwrap();
+        let found = roster.get("m").unwrap();
+        assert_eq!(found.session_id, Some(7));
+        assert_eq!(found.unavailable_session, None);
     }
 
     #[test]

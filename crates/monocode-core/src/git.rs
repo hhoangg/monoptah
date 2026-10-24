@@ -127,6 +127,14 @@ pub fn worktrees(cwd: &Path) -> Result<Vec<Worktree>, String> {
     }
     Ok(trees)
 }
+/// A repository whose main working copy has no commits yet (HEAD is all zeros),
+/// where a new worktree has nothing to start from. Anything else is false.
+pub fn unborn(cwd: &Path) -> bool {
+    worktrees(cwd)
+        .ok()
+        .and_then(|trees| trees.into_iter().find(|tree| tree.main))
+        .is_some_and(|tree| !tree.head.is_empty() && tree.head.bytes().all(|b| b == b'0'))
+}
 fn valid_branch(cwd: &Path, name: &str) -> Result<(), String> {
     if name.is_empty() || name.starts_with(['-', '@']) {
         return Err("Enter a valid branch name".into());
@@ -310,6 +318,36 @@ pub fn create_project_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unborn_is_true_only_for_a_repository_without_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let plain = temp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert!(!unborn(&plain), "not a repository");
+        assert!(!unborn(&temp.path().join("missing")));
+        let cwd = temp.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        git(&cwd, &["init", "-b", "main"]).unwrap();
+        assert!(unborn(&cwd));
+        std::fs::write(cwd.join("file"), "x\n").unwrap();
+        git(&cwd, &["add", "file"]).unwrap();
+        git(
+            &cwd,
+            &[
+                "-c",
+                "user.name=Native test",
+                "-c",
+                "user.email=native@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Initial",
+            ],
+        )
+        .unwrap();
+        assert!(!unborn(&cwd));
+    }
     #[test]
     fn sidebar_named_copies_preserve_dirty_files_and_refuse_collisions() {
         let temp = tempfile::tempdir().unwrap();
