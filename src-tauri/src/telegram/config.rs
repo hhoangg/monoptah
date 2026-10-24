@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+/// How long an unanswered question waits before it is sent, unless the project says otherwise.
+pub const DEFAULT_DELAY_SECS: u64 = 300;
+/// The longest delay a project may choose.
+pub const MAX_DELAY_SECS: u64 = 3600;
+
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct ProjectConfig {
     pub token: String,
@@ -23,6 +28,28 @@ pub struct ProjectConfig {
     /// sessionId -> message_thread_id
     pub topics: BTreeMap<String, i64>,
     pub problem: Option<String>,
+    /// Seconds an unanswered question waits before it is sent; 0 sends it right away.
+    pub delay_secs: u64,
+}
+
+// Not derived: a derived default would make `delay_secs` 0, which means "send at once", for
+// every config saved before the setting existed and for a fresh one.
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        ProjectConfig {
+            token: String::new(),
+            bot_username: String::new(),
+            bot_id: 0,
+            chat_id: None,
+            chat_title: None,
+            is_forum: None,
+            can_manage_topics: None,
+            enabled: false,
+            topics: BTreeMap::new(),
+            problem: None,
+            delay_secs: DEFAULT_DELAY_SECS,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -311,6 +338,36 @@ mod tests {
         assert_eq!(project.token, "123:secret");
         assert!(!project.enabled);
         assert!(project.topics.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delay_defaults_to_five_minutes_everywhere() {
+        assert_eq!(DEFAULT_DELAY_SECS, 300);
+        assert_eq!(ProjectConfig::default().delay_secs, 300);
+
+        // A config saved before the setting existed keeps the old fixed 5 minutes.
+        let dir = temp_dir();
+        let path = config_path(&dir);
+        std::fs::write(
+            &path,
+            r#"{"projects":{"proj":{"token":"123:secret","enabled":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(load(&path).projects["proj"].delay_secs, 300);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_delay_round_trips_including_zero() {
+        let dir = temp_dir();
+        let path = config_path(&dir);
+        for secs in [0, 30, 3600] {
+            let mut cfg = sample();
+            cfg.projects.get_mut("proj").unwrap().delay_secs = secs;
+            save(&path, &cfg).unwrap();
+            assert_eq!(load(&path).projects["proj"].delay_secs, secs);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

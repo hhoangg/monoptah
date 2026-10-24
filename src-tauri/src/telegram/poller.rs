@@ -60,6 +60,7 @@ pub struct TelegramStatus {
     pub can_manage_topics: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+    pub delay_secs: u64,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -83,7 +84,10 @@ pub struct LinkCode {
 /// Builds the status the UI sees. The only way a project config leaves this module.
 pub fn status_of(project: Option<&ProjectConfig>) -> TelegramStatus {
     let Some(p) = project else {
-        return TelegramStatus::default();
+        return TelegramStatus {
+            delay_secs: config::DEFAULT_DELAY_SECS,
+            ..TelegramStatus::default()
+        };
     };
     TelegramStatus {
         configured: !p.token.is_empty(),
@@ -94,6 +98,7 @@ pub fn status_of(project: Option<&ProjectConfig>) -> TelegramStatus {
         is_forum: p.is_forum,
         can_manage_topics: p.can_manage_topics,
         problem: p.problem.clone(),
+        delay_secs: p.delay_secs,
     }
 }
 
@@ -1429,6 +1434,28 @@ impl Bridge {
         Ok(status)
     }
 
+    /// Sets how long an unanswered question of the project waits before it is sent.
+    /// Questions already on screen pick the new value up on the next check.
+    pub fn set_delay(&self, project: &str, delay_secs: u64) -> Result<TelegramStatus, String> {
+        if delay_secs > config::MAX_DELAY_SECS {
+            return Err(format!(
+                "The delay can be at most {} seconds",
+                config::MAX_DELAY_SECS
+            ));
+        }
+        let mut state = self.lock();
+        let p = state
+            .cfg
+            .projects
+            .get_mut(project)
+            .filter(|p| !p.token.is_empty())
+            .ok_or("Save a bot token first")?;
+        p.delay_secs = delay_secs;
+        let status = status_of(Some(p));
+        self.persist(&state);
+        Ok(status)
+    }
+
     /// Forgets the pending prompts of a project and every job queued for it.
     fn drop_project_prompts(&self, state: &mut State, project: &str) {
         let keys = state.registry.discard_project(project);
@@ -1645,8 +1672,80 @@ mod tests {
         assert_eq!(value["canManageTopics"], false);
         assert_eq!(
             serde_json::to_value(status_of(None)).unwrap(),
-            json!({ "configured": false, "enabled": false, "botUsername": "" })
+            json!({
+                "configured": false,
+                "enabled": false,
+                "botUsername": "",
+                "delaySecs": 300
+            })
         );
+    }
+
+    #[test]
+    fn status_reports_the_delay() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:9");
+        add_project(&bridge, "proj", true);
+        assert_eq!(bridge.status("proj").delay_secs, 300);
+        bridge
+            .lock()
+            .cfg
+            .projects
+            .get_mut("proj")
+            .unwrap()
+            .delay_secs = 0;
+        let json = serde_json::to_value(bridge.status("proj")).unwrap();
+        assert_eq!(json["delaySecs"], 0);
+    }
+
+    #[test]
+    fn set_delay_stores_and_persists_the_value() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:9");
+        add_project(&bridge, "proj", true);
+        add_project(&bridge, "other", true);
+        for secs in [0, 30, 3600] {
+            let status = bridge.set_delay("proj", secs).unwrap();
+            assert_eq!(status.delay_secs, secs);
+            assert_eq!(bridge.status("proj").delay_secs, secs);
+            assert_eq!(config::load(&bridge.path).projects["proj"].delay_secs, secs);
+        }
+        assert_eq!(bridge.status("other").delay_secs, 300, "other project");
+    }
+
+    #[test]
+    fn set_delay_rejects_a_value_over_an_hour_and_unknown_projects() {
+        let (bridge, _sink) = bridge_with("http://127.0.0.1:9");
+        add_project(&bridge, "proj", true);
+        bridge.set_delay("proj", 60).unwrap();
+        assert!(bridge.set_delay("proj", 3601).is_err());
+        assert!(bridge.set_delay("proj", u64::MAX).is_err());
+        assert_eq!(bridge.status("proj").delay_secs, 60, "unchanged");
+        assert_eq!(config::load(&bridge.path).projects["proj"].delay_secs, 60);
+        assert!(bridge.set_delay("missing", 60).is_err());
+        {
+            bridge
+                .lock()
+                .cfg
+                .projects
+                .get_mut("proj")
+                .unwrap()
+                .token
+                .clear();
+        }
+        assert!(bridge.set_delay("proj", 60).is_err(), "no bot token");
+    }
+
+    #[test]
+    fn same_bot_keeps_the_delay_and_a_new_bot_gets_the_default() {
+        let old = ProjectConfig {
+            token: "1:old".into(),
+            bot_id: 1,
+            delay_secs: 0,
+            ..ProjectConfig::default()
+        };
+        let same = apply_token(Some(old.clone()), "1:new", 1, "bot");
+        assert_eq!(same.delay_secs, 0, "same bot keeps an explicit 0");
+        let other = apply_token(Some(old), "2:new", 2, "other");
+        assert_eq!(other.delay_secs, 300);
     }
 
     #[test]
@@ -2202,6 +2301,7 @@ mod tests {
             topic_title: "Fix login".into(),
             header: "proj - Session".into(),
             context: "ctx".into(),
+            delay_secs: 300,
             questions: vec![QuestionIn {
                 id: "q1".into(),
                 header: None,

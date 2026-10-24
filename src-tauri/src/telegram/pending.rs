@@ -874,6 +874,7 @@ mod tests {
             topic_title: "Topic".into(),
             header: "proj - Session".into(),
             context: "ctx".into(),
+            delay_secs: 300,
             questions,
         }
     }

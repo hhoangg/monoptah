@@ -84,6 +84,15 @@ pub fn telegram_set_enabled(
 }
 
 #[tauri::command]
+pub fn telegram_set_delay(
+    bridge: Shared<'_>,
+    project: String,
+    delay_secs: u64,
+) -> Result<TelegramStatus, String> {
+    bridge.set_delay(&project, delay_secs)
+}
+
+#[tauri::command]
 pub fn telegram_disconnect(bridge: Shared<'_>, project: String) -> Result<(), String> {
     bridge.disconnect(&project);
     Ok(())

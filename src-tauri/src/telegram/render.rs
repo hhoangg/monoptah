@@ -21,7 +21,27 @@ pub struct ForwardPayload {
     pub header: String,
     /// Tail of the agent's last message, at most 600 characters.
     pub context: String,
+    /// How long the question waited before it was sent; 0 omits the "Waiting for" line.
+    /// Payloads from before the setting existed carry none and meant 5 minutes.
+    #[serde(default = "default_delay_secs")]
+    pub delay_secs: u64,
     pub questions: Vec<QuestionIn>,
+}
+
+fn default_delay_secs() -> u64 {
+    super::config::DEFAULT_DELAY_SECS
+}
+
+/// "30 s", "1 min", "5 min", "1 h": the compact form of a wait. Whole hours and whole
+/// minutes use the larger unit, anything else is shown in seconds.
+pub fn wait_label(secs: u64) -> String {
+    if secs > 0 && secs.is_multiple_of(3600) {
+        format!("{} h", secs / 3600)
+    } else if secs > 0 && secs.is_multiple_of(60) {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -247,7 +267,9 @@ pub fn question_html(p: &ForwardPayload, q_index: usize, selected: &BTreeSet<Str
     let reserve = if q.multi_select { SELECTED_RESERVE } else { 0 };
     let mut out = fit(MESSAGE_LIMIT - reserve, q.options.len(), |caps| {
         let mut out = header_lines(p, caps);
-        out.push_str("Waiting for 5 min\n");
+        if p.delay_secs > 0 {
+            out.push_str(&format!("Waiting for {}\n", wait_label(p.delay_secs)));
+        }
         if caps.context > 0 && !p.context.trim().is_empty() {
             out.push_str(&format!(
                 "\n<blockquote>{}</blockquote>\n",
@@ -385,6 +407,7 @@ mod tests {
             topic_title: "Topic".into(),
             header: "proj - Session".into(),
             context: "Because of the build".into(),
+            delay_secs: 300,
             questions,
         }
     }
@@ -414,6 +437,73 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("Waiting for 5 min"), "{html}");
+    }
+
+    #[test]
+    fn wait_label_is_compact() {
+        for (secs, label) in [
+            (1, "1 s"),
+            (30, "30 s"),
+            (60, "1 min"),
+            (90, "90 s"),
+            (120, "2 min"),
+            (300, "5 min"),
+            (1800, "30 min"),
+            (3600, "1 h"),
+            (7200, "2 h"),
+        ] {
+            assert_eq!(wait_label(secs), label, "{secs}");
+        }
+    }
+
+    #[test]
+    fn header_shows_the_configured_delay() {
+        for (secs, line) in [
+            (30, "Waiting for 30 s"),
+            (60, "Waiting for 1 min"),
+            (300, "Waiting for 5 min"),
+            (3600, "Waiting for 1 h"),
+        ] {
+            let mut p = payload(vec![question("q1", false, vec![option("a", "A")])]);
+            p.delay_secs = secs;
+            let html = question_html(&p, 0, &BTreeSet::new());
+            assert!(html.contains(line), "{secs}: {html}");
+            if secs != 300 {
+                assert!(!html.contains("Waiting for 5 min"), "{secs}: {html}");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_delay_omits_the_waiting_line() {
+        let mut p = payload(vec![question("q1", false, vec![option("a", "A")])]);
+        p.delay_secs = 0;
+        let html = question_html(&p, 0, &BTreeSet::new());
+        assert!(!html.contains("Waiting"), "{html}");
+        // The header and the context still read as separate blocks.
+        assert!(html.starts_with("<b>proj - Session</b>\n"), "{html}");
+        assert!(html.contains("<blockquote>Because of the build</blockquote>"));
+    }
+
+    #[test]
+    fn zero_delay_message_still_fits_the_limit() {
+        let mut q = question("q1", false, vec![option("a", "Alpha")]);
+        q.prompt = "word ".repeat(5000);
+        let mut p = payload(vec![q]);
+        p.delay_secs = 0;
+        p.context = "c".repeat(600);
+        assert_fits(&question_html(&p, 0, &BTreeSet::new()));
+    }
+
+    #[test]
+    fn payload_without_delay_secs_still_parses_as_five_minutes() {
+        let old = r#"{"project":"p","sessionId":"s","requestId":1,"topicTitle":"t",
+            "header":"h","context":"","questions":[]}"#;
+        let parsed: ForwardPayload = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.delay_secs, 300);
+        let zero = old.replace("\"questions\"", "\"delaySecs\":0,\"questions\"");
+        let parsed: ForwardPayload = serde_json::from_str(&zero).unwrap();
+        assert_eq!(parsed.delay_secs, 0);
     }
 
     #[test]

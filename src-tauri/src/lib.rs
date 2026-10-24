@@ -383,6 +383,7 @@ pub fn run() {
             telegram::telegram_set_token,
             telegram::telegram_connect_link,
             telegram::telegram_set_enabled,
+            telegram::telegram_set_delay,
             telegram::telegram_disconnect,
             telegram::telegram_remove_webhook,
             telegram::telegram_link_code,
