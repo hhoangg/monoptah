@@ -107,8 +107,8 @@ of the prompt is answered or the prompt is skipped). Content (HTML parse mode, e
 - Header: project, session title, ticket, and when part of a workflow: workflow name,
   node, item, round.
 - "Waiting for <delay>" (the configured delay, omitted when it is 0; section 14).
-- Context: the tail of the agent's last assistant message before the question (why it is
-  asking), trimmed (about 600 characters).
+- Context: a short summary of what the agent said just before asking, from its last
+  assistant message (why it is asking); about 280 characters, at most 300 (section 14).
 - The question header and prompt, then option labels with descriptions.
 - Inline keyboard:
   - single select: one button per option, plus "Skip";
@@ -282,4 +282,16 @@ module boundaries; copy.
    to questions already waiting. The rule that a question first seen while forwarding was
    off or unconfigured is never sent later is unchanged. The message line reads
    "Waiting for 30 s / 1 min / 5 min / 1 h" and is left out when the delay is 0.
-2. **Context summary.** (Decision recorded with the context summary follow-up.)
+2. **Context summary.** The context quoted in the message was the raw last 600
+   characters of the agent's last message, cut mid-sentence and full of markdown. It is
+   now a short summary made locally and deterministically (an extractive summary, no
+   model call, so no cost, latency or new dependency): `questionContext` removes code
+   blocks, headings, links, emphasis, inline code, html and table markup, then takes
+   whole sentences (or list items as "- item" lines) from the end of the message until
+   about 280 characters, and starts with "…" when earlier text was left out. A single
+   sentence longer than that is cut at a word boundary, keeping its end. A closing
+   sentence that only repeats the question prompt is skipped when something else was
+   said. A message that is only code gives no context, so the message has no quote. The
+   hard cap is 300 characters on both sides (`CONTEXT_MAX`; the Rust renderer clips
+   anything longer and still trims the quote first when the message nears 4096). A
+   model-written summary is a possible later follow-up.

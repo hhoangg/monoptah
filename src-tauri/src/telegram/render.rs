@@ -19,7 +19,7 @@ pub struct ForwardPayload {
     pub topic_title: String,
     /// project, session, ticket and workflow line.
     pub header: String,
-    /// Tail of the agent's last message, at most 600 characters.
+    /// Short summary of what the agent said just before asking, at most 300 characters.
     pub context: String,
     /// How long the question waited before it was sent; 0 omits the "Waiting for" line.
     /// Payloads from before the setting existed carry none and meant 5 minutes.
@@ -90,6 +90,9 @@ const SELECTED_RESERVE: usize = 600;
 /// Room for the status line of a settled question.
 const STATUS_RESERVE: usize = 600;
 const ELLIPSIS: char = '\u{2026}';
+/// Longest context shown, in characters (mirrors `CONTEXT_MAX` in `telegramForward.ts`).
+/// The app sends a summary that already fits; this only guards against a longer one.
+const CONTEXT_MAX: usize = 300;
 
 /// Length Telegram could count: the escaped HTML (tags and entities included, which is
 /// more than the parsed text) in UTF-16 units, so emoji count as two.
@@ -154,7 +157,7 @@ struct Caps {
 impl Caps {
     fn loose() -> Self {
         Caps {
-            context: MESSAGE_LIMIT,
+            context: CONTEXT_MAX,
             description: MESSAGE_LIMIT,
             prompt: MESSAGE_LIMIT,
             label: MESSAGE_LIMIT,
@@ -630,13 +633,38 @@ mod tests {
     #[test]
     fn very_long_context_is_trimmed_first() {
         let mut q = question("q1", false, vec![option("a", "Alpha")]);
-        q.prompt = "p".repeat(3000);
+        q.prompt = "p".repeat(3900);
         let mut p = payload(vec![q]);
-        p.context = "c".repeat(5000);
+        p.context = "c".repeat(300);
         let html = question_html(&p, 0, &BTreeSet::new());
         assert_fits(&html);
         // The prompt survives whole: context is trimmed before the prompt.
-        assert!(html.contains(&"p".repeat(3000)), "prompt was trimmed");
+        assert!(html.contains(&"p".repeat(3900)), "prompt was trimmed");
+        assert!(!html.contains(&"c".repeat(300)), "context was not trimmed");
+    }
+
+    #[test]
+    fn context_is_capped_at_the_summary_size() {
+        let mut p = payload(vec![question("q1", false, vec![option("a", "Alpha")])]);
+        p.context = "c".repeat(5000);
+        let html = question_html(&p, 0, &BTreeSet::new());
+        assert_fits(&html);
+        let expected = format!(
+            "<blockquote>{}\u{2026}</blockquote>",
+            "c".repeat(CONTEXT_MAX - 1)
+        );
+        assert!(html.contains(&expected), "{html}");
+    }
+
+    #[test]
+    fn context_of_exactly_the_cap_is_kept_whole() {
+        let mut p = payload(vec![question("q1", false, vec![option("a", "Alpha")])]);
+        p.context = "c".repeat(CONTEXT_MAX);
+        let html = question_html(&p, 0, &BTreeSet::new());
+        assert!(
+            html.contains(&format!("<blockquote>{}</blockquote>", p.context)),
+            "{html}"
+        );
     }
 
     #[test]

@@ -210,25 +210,231 @@ describe("topicTitle", () => {
 });
 
 describe("questionContext", () => {
-  it("context takes last assistant text tail 600", () => {
+  function said(text: string, overrides: Partial<Session> = {}): string {
+    return questionContext(
+      asking({ blocks: [block("assistant", text)], ...overrides }),
+    );
+  }
+
+  /** Every whole word of the output must be a whole word of the source. */
+  function expectWholeWords(output: string, source: string) {
+    const words = new Set(source.split(/\s+/));
+    for (const word of output.replace(/^\u2026 /, "").split(/\s+/)) {
+      expect(words.has(word), `cut word: ${word}`).toBe(true);
+    }
+  }
+
+  it("uses the last assistant text that is not internal", () => {
     const session = asking({
       blocks: [
         block("assistant", "old reply"),
-        block("assistant", "z".repeat(700) + "END"),
+        block("assistant", "The plan is ready."),
         block("tool", "tool output"),
         block("assistant", "internal note", { internal: true }),
         block("user", "user text"),
       ],
     });
-    const context = questionContext(session);
-    expect(context).toHaveLength(600);
-    expect(context.endsWith("zzzEND")).toBe(true);
+    expect(questionContext(session)).toBe("The plan is ready.");
     expect(questionContext(asking())).toBe("");
   });
 
-  it("counts characters, not UTF-16 units", () => {
-    const session = asking({ blocks: [block("assistant", "😀".repeat(700))] });
-    expect(Array.from(questionContext(session))).toHaveLength(600);
+  it("passes a short message through untouched", () => {
+    expect(said("  I updated the parser. It now handles quotes.  ")).toBe(
+      "I updated the parser. It now handles quotes.",
+    );
+  });
+
+  it("keeps whole sentences from the end and marks the cut with an ellipsis", () => {
+    const sentences = Array.from(
+      { length: 30 },
+      (_, i) => `Sentence number ${i} explains one more detail.`,
+    );
+    const context = said(sentences.join(" "));
+    expect(Array.from(context).length).toBeLessThanOrEqual(300);
+    expect(Array.from(context).length).toBeGreaterThan(200);
+    expect(context.startsWith("\u2026 Sentence number ")).toBe(true);
+    expect(
+      context.endsWith("Sentence number 29 explains one more detail."),
+    ).toBe(true);
+    // Only whole sentences: what follows the marker is a full sentence from the source.
+    const kept = context.slice(2).split(/(?<=\.) /);
+    for (const sentence of kept) expect(sentences).toContain(sentence);
+  });
+
+  it("does not add the marker when the selection starts at the beginning", () => {
+    const context = said("First point. Second point. Third point.");
+    expect(context.startsWith("\u2026")).toBe(false);
+    expect(context).toBe("First point. Second point. Third point.");
+  });
+
+  it("strips headings, links, images, emphasis, inline code and html", () => {
+    const text = [
+      "## Findings",
+      "",
+      "I checked [the docs](https://example.com/docs) and ![diagram](x.png) with <b>care</b>.",
+      "The **bold** and __also bold__ and *italic* and _more italic_ words use `npm run check` and ~~old~~ names.",
+    ].join("\n");
+    expect(said(text)).toBe(
+      "Findings I checked the docs and with care. The bold and also bold and italic and more italic words use npm run check and old names.",
+    );
+  });
+
+  it("keeps snake_case identifiers and multiplication stars intact", () => {
+    expect(said("Rename some_var_name and compute 2 * 3 * 4.")).toBe(
+      "Rename some_var_name and compute 2 * 3 * 4.",
+    );
+  });
+
+  it("drops fenced code blocks, including an unterminated one", () => {
+    const fenced = [
+      "I changed the loader.",
+      "```ts",
+      "const secret = 1;",
+      "```",
+      "Tests pass now.",
+    ].join("\n");
+    expect(said(fenced)).toBe("I changed the loader. Tests pass now.");
+    const open = ["Here is the patch.", "~~~", "diff --git a b", "+x"].join(
+      "\n",
+    );
+    expect(said(open)).toBe("Here is the patch.");
+  });
+
+  it("gives an empty context when the message is only code or markup", () => {
+    expect(said("```\nconst a = 1;\n```")).toBe("");
+    expect(said("---\n\n| --- | --- |")).toBe("");
+    expect(said("   \n  ")).toBe("");
+  });
+
+  it("does not reach back to an older message when the last one is only code", () => {
+    const session = asking({
+      blocks: [
+        block("assistant", "An older explanation."),
+        block("assistant", "```\nconst a = 1;\n```"),
+      ],
+    });
+    expect(questionContext(session)).toBe("");
+  });
+
+  it("keeps list items as plain dash lines", () => {
+    const text = [
+      "Two options are open:",
+      "",
+      "* Keep the cache",
+      "1. Drop the cache",
+      "",
+      "I lean towards the first.",
+    ].join("\n");
+    expect(said(text)).toBe(
+      "Two options are open:\n- Keep the cache\n- Drop the cache\nI lean towards the first.",
+    );
+  });
+
+  it("turns table rows into plain text and drops the rules", () => {
+    const text = [
+      "| File | Change |",
+      "| --- | --- |",
+      "| a.ts | rename |",
+    ].join("\n");
+    expect(said(text)).toBe("File, Change a.ts, rename");
+  });
+
+  it("skips a last paragraph that only repeats the question when an earlier one adds context", () => {
+    const text = [
+      "The migration touches three tables and takes a few minutes on a large database.",
+      "",
+      "Which files?",
+    ].join("\n");
+    expect(said(text)).toBe(
+      "The migration touches three tables and takes a few minutes on a large database.",
+    );
+  });
+
+  it("skips a trailing sentence that repeats the question inside a paragraph", () => {
+    const text = "I found two loaders. Which files? ";
+    expect(said(text)).toBe("I found two loaders.");
+  });
+
+  it("keeps the question text when nothing else was said", () => {
+    expect(said("Which files?")).toBe("Which files?");
+    expect(said("Which files?\n\nWhich files?")).toBe(
+      "Which files? Which files?",
+    );
+  });
+
+  it("keeps a last paragraph that goes beyond the question", () => {
+    const text = "Scanning is done. Which files should I touch first?";
+    expect(said(text)).toBe(
+      "Scanning is done. Which files should I touch first?",
+    );
+  });
+
+  it("cuts a single huge sentence at a word boundary and keeps its end", () => {
+    const words = Array.from({ length: 400 }, (_, i) => `word${i}`);
+    const text = words.join(" ");
+    const context = said(text);
+    expect(Array.from(context).length).toBeLessThanOrEqual(300);
+    expect(context.startsWith("\u2026 word")).toBe(true);
+    expect(context.endsWith("word399")).toBe(true);
+    expectWholeWords(context, text);
+  });
+
+  it("never splits a multi-byte character and counts characters, not UTF-16 units", () => {
+    const emoji = said(
+      Array.from({ length: 200 }, () => "ok \u{1F600}").join(" "),
+    );
+    expect(Array.from(emoji).length).toBeLessThanOrEqual(300);
+    expect(emoji).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
+    expect(emoji).not.toMatch(/(?<![\ud800-\udbff])[\udc00-\udfff]/);
+
+    const cjk = said(
+      "\u4eca\u65e5\u306f\u5929\u6c17\u304c\u3044\u3044\u3002".repeat(60),
+    );
+    expect(Array.from(cjk).length).toBeLessThanOrEqual(300);
+    expect(cjk.startsWith("\u2026 ")).toBe(true);
+    expect(cjk.endsWith("\u3002")).toBe(true);
+
+    const unbroken = said("\u{1F600}".repeat(700));
+    expect(Array.from(unbroken).length).toBeLessThanOrEqual(300);
+    expect(unbroken.startsWith("\u2026 ")).toBe(true);
+  });
+
+  it("is deterministic", () => {
+    const text = "Alpha one. Beta two. ".repeat(40) + "```x```";
+    expect(said(text)).toBe(said(text));
+  });
+
+  it("caps a long realistic message below CONTEXT_MAX", () => {
+    const text = [
+      "## Plan",
+      "I read `src/app.ts` and the **loader**. Both call `init()` twice.",
+      "```ts",
+      "init(); init();",
+      "```",
+      "- Remove the second call in the loader to stop the double start",
+      "- Keep the one in app.ts because tests rely on it being there",
+      "That keeps behaviour the same. It also removes a race that showed up in CI last week. I verified it with the full suite and it passes on every platform we build for.",
+      "Should I go ahead and remove the second call?",
+    ].join("\n");
+    const context = said(text, {
+      pendingQuestion: {
+        requestId: 9,
+        questions: [
+          {
+            id: "q",
+            prompt: "Should I go ahead and remove the second call?",
+            multiSelect: false,
+            allowCustom: false,
+            options: [{ id: "y", label: "Yes" }],
+          },
+        ],
+      },
+    });
+    expect(Array.from(context).length).toBeLessThanOrEqual(300);
+    expect(context).not.toMatch(/[`*#]|init\(\); init/);
+    expect(context.endsWith("passes on every platform we build for.")).toBe(
+      true,
+    );
   });
 });
 

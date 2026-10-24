@@ -67,6 +67,12 @@ it. Only add people you trust to the group.
   the time is up are never sent. The message shows the wait you chose ("Waiting for
   5 min"), and says nothing when you chose Immediately. A change applies to questions
   that are already waiting.
+- Each message quotes a **short summary of what the agent said just before asking**:
+  a few whole sentences from the end of its last message (about 280 characters),
+  starting with "…" when earlier text was left out. Code blocks, headings, links and
+  other formatting are removed, and a closing sentence that only repeats the question
+  is skipped. The summary is made on your computer from the message text, with no
+  extra model call; nothing is quoted when the message has only code.
 - A question that was already waiting when you turned **Forward questions** on (or
   before the project had a group) is never sent, whatever the setting.
 - Each session gets **one topic**, created when its first question is forwarded and
