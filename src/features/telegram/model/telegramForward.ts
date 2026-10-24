@@ -95,41 +95,38 @@ const SPAN_MARKS = /[\uE000\uE001]/g;
 const SPAN_PLACEHOLDER = /\uE000(\d+)\uE001/g;
 
 /**
- * Replaces each inline code span (any run of backticks, closed by a run of the same
- * length) with a placeholder and records its contents, so no later step touches them.
- * An unclosed run of backticks stays as plain text.
+ * Replaces each inline code span (any run of backticks, closed by the next run of the
+ * same length) with a placeholder and records its contents, so no later step touches
+ * them. An unclosed run of backticks stays as plain text. Linear in the text length.
  */
 function hideCodeSpans(text: string, spans: string[]): string {
-  let out = "";
-  let i = 0;
-  while (i < text.length) {
-    const tick = text.indexOf("`", i);
-    if (tick < 0) break;
-    out += text.slice(i, tick);
-    let size = 0;
-    while (text[tick + size] === "`") size++;
-    let close = -1;
-    for (let from = tick + size; close < 0 && from < text.length;) {
-      const next = text.indexOf("`", from);
-      if (next < 0) break;
-      let run = 0;
-      while (text[next + run] === "`") run++;
-      if (run === size) close = next;
-      from = next + run;
-    }
-    if (close < 0) {
-      out += text.slice(tick, tick + size);
-      i = tick + size;
-      continue;
-    }
-    let content = text.slice(tick + size, close);
-    // A single space on both sides only keeps backticks apart from the fence.
-    if (/^ .* $/.test(content) && content.trim())
-      content = content.slice(1, -1);
-    out += `${SPAN_OPEN}${spans.push(content) - 1}${SPAN_CLOSE}`;
-    i = close + size;
+  const runs = Array.from(text.matchAll(/`+/g), (match) => ({
+    at: match.index ?? 0,
+    size: match[0].length,
+  }));
+  // For each run, the next run of the same length: the one that would close it.
+  const closer: number[] = new Array(runs.length).fill(-1);
+  const nextOfSize = new Map<number, number>();
+  for (let k = runs.length - 1; k >= 0; k--) {
+    closer[k] = nextOfSize.get(runs[k].size) ?? -1;
+    nextOfSize.set(runs[k].size, k);
   }
-  return out + text.slice(i);
+  let out = "";
+  let from = 0;
+  for (let k = 0; k < runs.length; k++) {
+    const close = closer[k];
+    if (close < 0) continue;
+    const start = runs[k].at + runs[k].size;
+    let content = text.slice(start, runs[close].at).replace(/\n/g, " ");
+    // A single space on both sides only keeps backticks apart from the fence.
+    if (/^ [\s\S]* $/.test(content) && content.trim()) {
+      content = content.slice(1, -1);
+    }
+    out += `${text.slice(from, runs[k].at)}${SPAN_OPEN}${spans.push(content) - 1}${SPAN_CLOSE}`;
+    from = runs[close].at + runs[close].size;
+    k = close;
+  }
+  return out + text.slice(from);
 }
 
 function showCodeSpans(text: string, spans: string[]): string {
@@ -140,11 +137,11 @@ function showCodeSpans(text: string, spans: string[]): string {
 }
 
 /**
- * Inline markdown and html reduced to the words they carry. Code spans come back
- * unwrapped and unchanged, as placeholders until `showCodeSpans` is applied.
+ * Inline markdown and html reduced to the words they carry. Code spans are already
+ * hidden as placeholders, so they pass through untouched.
  */
-function stripInlineKeepingCode(text: string, spans: string[]): string {
-  return hideCodeSpans(text.replace(SPAN_MARKS, ""), spans)
+function stripMarkup(text: string): string {
+  return text
     .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/<(https?:\/\/[^>\s]+)>/g, "$1")
@@ -155,11 +152,6 @@ function stripInlineKeepingCode(text: string, spans: string[]): string {
     .replace(/(^|\W)_(\S(?:[^_]*\S)?)_(?!\w)/g, "$1$2")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-function stripInline(text: string): string {
-  const spans: string[] = [];
-  return showCodeSpans(stripInlineKeepingCode(text, spans), spans);
 }
 
 function splitSentences(text: string): string[] {
@@ -217,27 +209,71 @@ function linesWithoutCode(raw: string): string[] {
 }
 
 /**
- * The last SCAN_MAX characters of the lines, cut at a word boundary, so the cost of
- * cleaning a huge message is bounded. `cut` tells that something before was left out.
+ * Hides the code spans of each block of consecutive lines (a span never crosses a blank
+ * line). Done on the whole message, before any window is cut, so a window can never
+ * start inside a span.
+ */
+function hideSpansByBlock(lines: string[], spans: string[]): string[] {
+  const out: string[] = [];
+  let block: string[] = [];
+  const flushBlock = () => {
+    if (block.length === 0) return;
+    const hidden = hideCodeSpans(
+      block.join("\n").replace(SPAN_MARKS, ""),
+      spans,
+    );
+    for (const line of hidden.split("\n")) out.push(line);
+    block = [];
+  };
+  for (const line of lines) {
+    if (line.trim()) {
+      block.push(line);
+    } else {
+      flushBlock();
+      out.push("");
+    }
+  }
+  flushBlock();
+  return out;
+}
+
+/**
+ * The end of the (span-hiding) lines that fits SCAN_MAX characters, so the cost of
+ * cleaning a huge message is bounded. It starts at a line boundary, or after the first
+ * blank line of the window when there is one; only a last line that is too long by
+ * itself is cut, at a word boundary (a placeholder holds no space, so none is split).
+ * `cut` tells that something before was left out.
  */
 function lastLines(lines: string[]): { lines: string[]; cut: boolean } {
   const kept: string[] = [];
   let room = SCAN_MAX;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    if (line.length + 1 <= room) {
-      kept.unshift(line);
-      room -= line.length + 1;
-      continue;
-    }
-    let tail = room > 1 ? line.slice(-(room - 1)) : "";
+  let i = lines.length - 1;
+  for (; i >= 0 && lines[i].length + 1 <= room; i--) {
+    kept.unshift(lines[i]);
+    room -= lines[i].length + 1;
+  }
+  if (i < 0) return { lines: kept, cut: false };
+  if (kept.length === 0) {
+    let tail = lines[i].slice(-(SCAN_MAX - 1));
     if (/^[\udc00-\udfff]/.test(tail)) tail = tail.slice(1);
     const space = tail.indexOf(" ");
-    if (space >= 0) tail = tail.slice(space + 1);
-    if (tail.trim()) kept.unshift(tail);
-    return { lines: kept, cut: true };
+    if (space >= 0) {
+      tail = tail.slice(space + 1);
+    } else {
+      // No word boundary: at least do not start in the middle of a placeholder.
+      const close = tail.indexOf(SPAN_CLOSE);
+      const open = tail.indexOf(SPAN_OPEN);
+      if (close >= 0 && (open < 0 || close < open))
+        tail = tail.slice(close + 1);
+    }
+    return { lines: tail.trim() ? [tail] : [], cut: true };
   }
-  return { lines: kept, cut: false };
+  const blank = kept.findIndex((line) => !line.trim());
+  const fromParagraph = blank >= 0 ? kept.slice(blank + 1) : kept;
+  return {
+    lines: fromParagraph.some((line) => line.trim()) ? fromParagraph : kept,
+    cut: true,
+  };
 }
 
 /** The message as units, with code, rules and markup noise left out. */
@@ -251,17 +287,17 @@ function messageUnits(raw: string): { units: Unit[]; cut: boolean } {
     units.push(unit);
     return unit;
   };
+  const spans: string[] = [];
   const flush = () => {
     // Sentences are split with code spans still hidden, so a full stop inside one
     // never ends a sentence; the text is restored before anything is measured.
-    const spans: string[] = [];
-    const text = stripInlineKeepingCode(prose.join(" "), spans);
-    for (const sentence of splitSentences(text)) {
+    for (const sentence of splitSentences(stripMarkup(prose.join(" ")))) {
       standalone(showCodeSpans(sentence, spans));
     }
     prose = [];
   };
-  const scanned = lastLines(linesWithoutCode(raw));
+  const stripInline = (text: string) => showCodeSpans(stripMarkup(text), spans);
+  const scanned = lastLines(hideSpansByBlock(linesWithoutCode(raw), spans));
   for (const line of scanned.lines) {
     const trimmed = line.trim();
     if (!trimmed || HORIZONTAL_RULE.test(trimmed) || TABLE_RULE.test(trimmed)) {
@@ -373,7 +409,7 @@ export function questionContext(session: Session): string {
     if (block.role !== "assistant" || block.internal) continue;
     if (!block.text.trim()) continue;
     // A message that is only code has no summary; do not fall back to an older one.
-    const message = messageUnits(block.text);
+    const message = messageUnits(block.text.trimEnd());
     let units = message.units;
     if (units.length === 0) return "";
     // Sentences at the end that only repeat the question add nothing; drop them when

@@ -450,10 +450,10 @@ describe("questionContext", () => {
   });
 
   it("never lets a placeholder leak, even for text that looks like one", () => {
-    expect(said("0 then `x`")).toBe("0 then x");
+    expect(said("\uE000" + "0" + "\uE001 then `x`")).toBe("0 then x");
     const spans = Array.from({ length: 80 }, (_, i) => `see \`file${i}.ts\``);
     const context = said(`${spans.join(" ")} done`);
-    expect(context).not.toMatch(/[]/);
+    expect(context).not.toMatch(/[\uE000\uE001]/);
     expect(context.endsWith("see file79.ts done")).toBe(true);
   });
 
@@ -465,6 +465,10 @@ describe("questionContext", () => {
       `${"<a ".repeat(7000)}the end.`,
       `x ${"`".repeat(20000)} the end.`,
       `${"x ".repeat(10000)}the end.`,
+      `${"[a ".repeat(7000)}the end.`,
+      `${"`a ".repeat(7000)}the end.`,
+      `${"x `a` ".repeat(30000)}the end.`,
+      `${Array.from({ length: 20000 }, (_, i) => `${"`".repeat(1 + (i % 7))}a `).join("")}the end.`,
       `${"Sentence number one. ".repeat(1000)}Last sentence here.`,
     ];
     for (const input of inputs) {
@@ -475,6 +479,70 @@ describe("questionContext", () => {
       expect(context.startsWith("… ")).toBe(true);
       expect(context).toMatch(/(the end\.|Last sentence here\.)$/);
     }
+  });
+
+  describe("windowing a message longer than the scan window", () => {
+    const lineOf = (i: number) =>
+      `Step ${i}: the loader in \`src/app.ts\` stops \`if (!ready)\` early, then \`init()\` runs twice.`;
+    const QUESTION = "Shall I commit this change?";
+
+    function wordsOf(source: string): Set<string> {
+      return new Set(source.replace(/`/g, "").split(/\s+/));
+    }
+
+    /** No unpaired code and no glued words: every output word is a source word. */
+    function expectFaithful(output: string, source: string) {
+      const known = wordsOf(source);
+      expect(output.endsWith(QUESTION), output).toBe(true);
+      expect(output).not.toMatch(/`/);
+      for (const word of output.replace(/^… /, "").split(/\s+/)) {
+        expect(
+          known.has(word),
+          `glued or cut word "${word}" in: ${output}`,
+        ).toBe(true);
+      }
+      expect(output).toContain("src/app.ts");
+    }
+
+    it("never shifts code spans when the window cuts a multi-line paragraph", () => {
+      for (let pad = 0; pad < 60; pad++) {
+        const lines = Array.from({ length: 60 }, (_, i) => lineOf(i));
+        const text = `${lines.join("\n")}\n${"p ".repeat(pad)}${QUESTION}`;
+        expectFaithful(
+          questionContext(asking({ blocks: [block("assistant", text)] })),
+          text,
+        );
+      }
+    });
+
+    it("never shifts code spans in one huge line", () => {
+      for (let pad = 0; pad < 60; pad++) {
+        const text = `${Array.from({ length: 60 }, (_, i) => lineOf(i)).join(" ")} ${"p ".repeat(pad)}${QUESTION}`;
+        expectFaithful(
+          questionContext(asking({ blocks: [block("assistant", text)] })),
+          text,
+        );
+      }
+    });
+
+    it("starts at a paragraph boundary when the window has one", () => {
+      const first = Array.from({ length: 30 }, (_, i) => lineOf(i)).join("\n");
+      const second = Array.from({ length: 20 }, (_, i) => lineOf(100 + i)).join(
+        "\n",
+      );
+      const text = `${first}\n\n${second}\n${QUESTION}`;
+      const context = questionContext(
+        asking({ blocks: [block("assistant", text)] }),
+      );
+      expectFaithful(context, text);
+      expect(context.startsWith("… ")).toBe(true);
+    });
+
+    it("does not drop a short final message after a huge one", () => {
+      const text = `${"word ".repeat(3000)}\n\nDone. ${QUESTION}`;
+      // Text before the paragraph was left out, so the marker stays.
+      expect(said(text)).toBe(`\u2026 Done. ${QUESTION}`);
+    });
   });
 
   it("is deterministic", () => {
