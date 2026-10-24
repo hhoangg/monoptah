@@ -9,7 +9,8 @@ Agents stop and wait whenever they ask the user a question (Claude `AskUserQuest
 desk, a workflow or a long session sits idle until they come back. The mobile companion
 only works on the same network and cannot answer questions.
 
-This feature forwards a question that has gone unanswered for 5 minutes to a Telegram
+This feature forwards a question that has gone unanswered for 5 minutes (the default of a
+per-project setting, section 14) to a Telegram
 group over the internet, with enough context to answer it, and routes the answer given
 in Telegram back to the exact session and question, so the agent continues.
 
@@ -18,7 +19,7 @@ in Telegram back to the exact session and question, so the agent continues.
 1. Per-project Telegram configuration: each project has its own bot token and its own
    group (a supergroup with Topics enabled).
 2. Forward **questions** (not approvals) from **every session of a configured project**,
-   when a question is still pending **5 minutes** after it was asked.
+   when a question is still pending **5 minutes** after it was asked (a default; section 14).
 3. One forum topic per session. Default: the bot creates it, named `[<ticket id>] <title>`
    when the session has a ticket, otherwise `<title>`. Alternatively the user links an
    existing topic to a session.
@@ -76,8 +77,8 @@ existing per-project settings). Fields and actions:
 
 - A session of a configured project gets a pending question (`Session.pendingQuestion`).
 - A per-question timer starts at the moment it was asked. If the question is answered,
-  skipped or cancelled within 5 minutes, nothing is sent.
-- After 5 minutes still pending: the app forwards it (section 5.3). Codex non-blocking
+  skipped or cancelled within the delay (5 minutes by default, section 14), nothing is sent.
+- After the delay (5 minutes by default) still pending: the app forwards it (section 5.3). Codex non-blocking
   questions are not forwarded (section 13.3).
 - If the question was asked while Telegram was disabled or unconfigured, nothing is sent
   later for it.
@@ -205,7 +206,7 @@ changing `requestId`, not the `onQuestionReply` call, because some answers bypas
 ## 10. Decided by the user
 
 Questions only first; every session of a configured project; send after 5 minutes
-unanswered; any group member can answer; first answer wins; per-project bot and group;
+unanswered (by default; now a setting, section 14); any group member can answer; first answer wins; per-project bot and group;
 bot auto-creates one topic per session named `[ticket id] title` or `title`; user can link
 an existing topic; the user is told the bot needs admin "Manage topics"; Telegram over the
 internet (not the mobile companion); the app is assumed to stay open; handle rate limits
@@ -240,7 +241,7 @@ module boundaries; copy.
    case). Excluded: orchestration workers (their lead answers them), hidden/ephemeral
    sessions (habit runs, Ask Mono sessions), Mono chats, Inbox Ask conversations, TUI
    sessions. Topics are created lazily, only when a question is actually forwarded, so a
-   large For each only creates topics for sessions that really wait 5 minutes.
+   large For each only creates topics for sessions that really wait out the delay (5 minutes by default).
 3. **Codex non-blocking questions** (the ones attached to a running turn that auto-skip
    after 120 s) are left alone: no `keepQuestionOpen`, so they auto-skip as today and are
    never forwarded. This avoids changing how queued follow-ups steer the turn. Codex
@@ -271,7 +272,7 @@ module boundaries; copy.
 ## 14. Follow-ups (2026-10-24)
 
 1. **The delay is a per-project setting.** It replaces the fixed 5 minutes of sections
-   5.1 and 5.2 (and the "5 minutes" in sections 2 and 10). `ProjectConfig.delay_secs`,
+   5.1 and 5.2 (and every other fixed "5 minutes": sections 1, 2, 5.1, 5.2, 10 and 13.2, which now describe the default). `ProjectConfig.delay_secs`,
    default 300 (5 minutes), range 0 to 3600 seconds ("Immediately" to 1 hour). A config
    file saved before the setting existed, and a fresh or reset config, both read as 300;
    an explicit 0 is kept. The dialog offers Immediately, 30 seconds, 1, 2, 5, 10, 15 and

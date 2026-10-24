@@ -64,7 +64,7 @@ it. Only add people you trust to the group.
   answer. The default is **5 minutes**; choose Immediately, 30 seconds, 1, 2, 5, 10, 15
   or 30 minutes, or 1 hour in the Telegram dialog of the project. **Immediately** sends
   a question as soon as it appears. Questions answered, skipped or cancelled before
-  the time is up are never sent. The message says how long it waited ("Waiting for
+  the time is up are never sent. The message shows the wait you chose ("Waiting for
   5 min"), and says nothing when you chose Immediately. A change applies to questions
   that are already waiting.
 - A question that was already waiting when you turned **Forward questions** on (or

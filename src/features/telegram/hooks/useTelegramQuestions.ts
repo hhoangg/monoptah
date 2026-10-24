@@ -337,6 +337,6 @@ export function useTelegramQuestions(input: UseTelegramQuestionsInput): void {
 
   useEffect(() => {
     runRef.current?.sync();
-    runRef.current?.forward();
+    void runRef.current?.forward();
   }, [sessions]);
 }

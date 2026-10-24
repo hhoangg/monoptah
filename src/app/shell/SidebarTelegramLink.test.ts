@@ -34,6 +34,7 @@ const CONNECTED: TelegramStatus = {
   enabled: true,
   botUsername: "alpha_bot",
   chatId: -100123,
+  delaySecs: 300,
 };
 
 let container: HTMLDivElement;
@@ -139,7 +140,12 @@ describe("sidebar Telegram topic link", () => {
   });
 
   it("hides the link when Telegram is not set up for the project", async () => {
-    status = { configured: false, enabled: false, botUsername: "" };
+    status = {
+      configured: false,
+      enabled: false,
+      botUsername: "",
+      delaySecs: 300,
+    };
     await renderSidebar();
     await openMenu();
 

@@ -12,6 +12,7 @@ const ready: TelegramStatus = {
   configured: true,
   enabled: true,
   botUsername: "bot",
+  delaySecs: 300,
 };
 
 describe("telegram status cache", () => {

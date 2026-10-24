@@ -13,6 +13,7 @@ const connected: TelegramStatus = {
   enabled: false,
   botUsername: "bot",
   chatId: -100,
+  delaySecs: 300,
 };
 
 let root: Root;
