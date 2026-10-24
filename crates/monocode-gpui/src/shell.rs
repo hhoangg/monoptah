@@ -23,6 +23,7 @@ mod project_removal;
 mod project_settings;
 mod quick_composer;
 mod quick_open;
+mod quit_gate;
 mod rails;
 mod remote_projects;
 mod remote_sessions;
@@ -590,6 +591,11 @@ pub(crate) struct Shell {
     reminders: Vec<monocode_core::store::Reminder>,
     renaming: Option<session_groups::Renaming>,
     link_dialog: Option<session_groups::LinkDialog>,
+    delete_dialog: Option<project_removal::DeleteDialog>,
+    /// A worktree check is running before the delete dialog opens.
+    delete_checking: bool,
+    /// Removes a deleted session's provider files; tests swap it for a recorder.
+    provider_cleanup: project_removal::CleanupRunner,
     action_dialog: Option<actions::ActionDialog>,
     actions_anchor: AnchorSlot,
     /// The dock terminal each action last ran in, by project and action id.
@@ -642,6 +648,8 @@ pub(crate) struct Shell {
     window_active: bool,
     window_glass: Option<bool>,
     quit_prompted: bool,
+    quit_gate: quit_gate::QuitGate,
+    quit_gate_timer: Option<gpui::Task<()>>,
     pub(crate) menu: Option<ShellMenu>,
     background_dialog: Option<project_settings::OpenBackground>,
     backgrounds: HashMap<i64, Entity<crate::project_background::ProjectBackground>>,
@@ -934,6 +942,9 @@ impl Shell {
             reminders: sidebar_metadata.reminders,
             renaming: None,
             link_dialog: None,
+            delete_dialog: None,
+            delete_checking: false,
+            provider_cleanup: project_removal::default_cleanup(),
             action_dialog: None,
             actions_anchor: AnchorSlot::default(),
             action_terminals: HashMap::new(),
@@ -982,6 +993,8 @@ impl Shell {
             window_active: false,
             window_glass: None,
             quit_prompted: false,
+            quit_gate: Default::default(),
+            quit_gate_timer: None,
             menu: None,
             background_dialog: None,
             backgrounds: HashMap::new(),
@@ -1344,6 +1357,14 @@ impl Shell {
         let provider = session.summary.provider.clone();
         self.session_marks[&id].update(cx, |mark, cx| mark.set(&provider, state, cx));
         self.tab_marks[&id].update(cx, |mark, cx| mark.set(&provider, tab_state, cx));
+        self.push_inbox_busy(cx);
+    }
+    /// Tells the Inbox which sessions are running, for its row and chip spinners.
+    fn push_inbox_busy(&self, cx: &mut Context<Self>) {
+        if let Some(inbox) = &self.inbox {
+            let busy = self.busy_sessions.clone();
+            inbox.update(cx, |inbox, cx| inbox.set_busy(busy, cx));
+        }
     }
     fn toggle_archive(&mut self, id: i64, cx: &mut Context<Self>) {
         if !self.archiving.insert(id) {
@@ -1807,7 +1828,7 @@ impl Shell {
         };
         let answer = window.prompt(
             gpui::PromptLevel::Warning,
-            "Reload Monocode Native?",
+            "Reload Monoptah Native?",
             Some(detail),
             &["Reload", "Cancel"],
             cx,
@@ -7925,7 +7946,7 @@ impl Render for Shell {
         div()
             .id("monocode-workspace")
             .role(Role::Application)
-            .aria_label("Monocode Native")
+            .aria_label("Monoptah Native")
             .key_context("Workspace")
             .track_focus(&self.focus)
             .on_action(
@@ -7948,6 +7969,9 @@ impl Render for Shell {
             .bg(shell_fill())
             .text_color(content(1.))
             .font_family(crate::fonts::UI)
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.quit_hotkey_down(event, cfg!(target_os = "macos"), window, cx)
+            }))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
                 if this.session_preview.as_ref().is_some_and(|preview| {
                     !preview
@@ -8010,13 +8034,13 @@ impl Render for Shell {
             }))
             .on_action(|_: &About, window, cx| {
                 let detail = format!("Version {}", crate::notifications::updater::version());
-                let _ = window.prompt(
+                drop(window.prompt(
                     gpui::PromptLevel::Info,
-                    "Monocode Native",
+                    monocode_core::brand::NATIVE_PRODUCT,
                     Some(&detail),
                     &["OK"],
                     cx,
-                );
+                ));
             })
             .on_action(|_: &ZoomWindow, window, _| window.zoom_window())
             .on_action(
@@ -8035,6 +8059,15 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &crate::file_editor::ToggleAutosave, _, cx| {
                     this.workspace.preferences.autosave = !this.workspace.preferences.autosave;
+                    this.apply_preferences(cx);
+                    this.persist(cx);
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::file_editor::ToggleGitBlame, _, cx| {
+                    let prefs = &mut this.workspace.preferences;
+                    prefs.editor_blame_column = !prefs.editor_blame_column;
                     this.apply_preferences(cx);
                     this.persist(cx);
                     cx.notify();
@@ -8136,6 +8169,10 @@ impl Render for Shell {
                 }
                 if this.app_search.is_some() {
                     this.close_app_search(window, cx);
+                    return;
+                }
+                if this.delete_dialog.is_some() {
+                    this.close_delete_dialog(window, cx);
                     return;
                 }
                 if this.link_dialog.is_some() {
@@ -8320,6 +8357,7 @@ impl Render for Shell {
             .children(self.layout_body(sidebar_width, right_shown, right_width, full, window, cx))
             .children(self.peek_watch(window, cx))
             .child(self.notices_overlay(cx))
+            .children(self.quit_notice())
             .children(self.menu.as_ref().map(|open| {
                 let point = matches!(open.anchor, Anchor::Point(_));
                 let beside = matches!(open.target, MenuTarget::Project { .. });
@@ -8345,6 +8383,7 @@ impl Render for Shell {
             .children(self.drag_ghost(cx))
             .children(self.background_modal(window, cx))
             .children(self.link_modal(window, cx))
+            .children(self.delete_modal(window, cx))
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))
             .children(self.quick_open_modal(window, cx))

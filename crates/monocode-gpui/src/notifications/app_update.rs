@@ -246,7 +246,7 @@ impl WhatsNew {
 impl Render for WhatsNew {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let description = format!(
-            "MonoCode {}{}",
+            "Monoptah {}{}",
             self.version,
             self.date
                 .as_ref()

@@ -1,6 +1,6 @@
-# Monocode Native preview
+# Monoptah Native preview
 
-Monocode Native is the experimental Rust + GPUI app. The production app still
+Monoptah Native is the experimental Rust + GPUI app. The production app still
 uses React/Tauri. Native builds have their own Cargo workspace and lockfile.
 
 ## Requirements
@@ -33,7 +33,7 @@ Type `r` then Enter in the terminal to rebuild and restart. The current app stay
 open until the new build succeeds. Ctrl+C stops the app and runner. There is no
 hot reload or automatic rebuild on save.
 
-On macOS, the command packages and launches `Monocode Native.app`. Other
+On macOS, the command packages and launches `Monoptah Native.app`. Other
 platforms launch the executable directly.
 
 ## Build
@@ -43,16 +43,16 @@ npm run native:build
 ```
 
 This creates an optimized build without launching it. **The release app uses the
-installed MonoCode database, and changes save there.** No extra flags are needed.
+installed Monoptah database, and changes save there.** No extra flags are needed.
 
 On macOS, open:
 
 ```sh
-open "crates/monocode-gpui/target/release/Monocode Native.app"
+open "crates/monocode-gpui/target/release/Monoptah Native.app"
 ```
 
-The app has a separate name and application ID (`dev.usemono.gpui`) so it can be
-installed alongside MonoCode. Local source builds are signed locally, without
+The app has a separate name and application ID (`com.monoptah.native`) so it can be
+installed alongside Monoptah. Local source builds are signed locally, without
 Apple notarization or configured automatic updates. Linux and Windows builds
 produce a standalone executable
 under `crates/monocode-gpui/target/release/`. `CARGO_TARGET_DIR` and
@@ -67,13 +67,13 @@ Development stores `monocode.db` under:
 
 | Platform | Development directory |
 | --- | --- |
-| macOS | `~/Library/Application Support/Monocode Development/` |
-| Linux | `$XDG_DATA_HOME/Monocode Development/`, or `~/.local/share/Monocode Development/` |
-| Windows | `%LOCALAPPDATA%\Monocode Development\` |
+| macOS | `~/Library/Application Support/Monoptah Development/` |
+| Linux | `$XDG_DATA_HOME/Monoptah Development/`, or `~/.local/share/Monoptah Development/` |
+| Windows | `%LOCALAPPDATA%\Monoptah Development\` |
 
 `MONOCODE_NATIVE_DATA_DIR` overrides this development directory.
 
-Release builds open `com.monocode.desktop/monocode.db` under macOS Application
+Release builds open `com.monoptah.desktop/monocode.db` under macOS Application
 Support, Linux's XDG data directory, or Windows' `%APPDATA%`. The app uses the
 existing desktop schema and session IDs. GPUI preferences are saved beside the
 database in `monocode.db.gpui.json`.

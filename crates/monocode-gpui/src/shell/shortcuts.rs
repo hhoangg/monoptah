@@ -33,6 +33,7 @@ fn workspace_action(action: &dyn Action) -> bool {
             "workspace::FocusNext" | "workspace::FocusPrevious" | "workspace::DismissMenu"
         ))
         || name == "application::Quit"
+        || name == "file_editor::ToggleGitBlame"
 }
 
 /// Keymap owns precedence, disabled bindings, physical-key matching and chords.
@@ -49,11 +50,41 @@ fn candidates(keys: &[Keystroke], cx: &App) -> Vec<KeyBinding> {
         .collect()
 }
 
+/// What the key monitor calls for every Cmd+Q key-down, repeats included.
+/// Returns false when no Shell can show the notice, so the press goes on to
+/// quit as it always did instead of vanishing.
+#[cfg(target_os = "macos")]
+fn quit_press(
+    owner: &WeakEntity<Shell>,
+    window: &Window,
+    cx: &App,
+) -> Rc<dyn Fn(bool, Instant) -> bool> {
+    let owner = owner.clone();
+    let handle = window.window_handle().downcast::<Shell>();
+    let app = cx.to_async();
+    Rc::new(move |repeat, now| {
+        let (Some(handle), true) = (handle, owner.upgrade().is_some()) else {
+            return false;
+        };
+        // The monitor runs inside AppKit's event dispatch, so the update waits
+        // for the next turn rather than re-entering the app.
+        let mut cx = app.clone();
+        app.foreground_executor()
+            .spawn(async move {
+                let _ = handle.update(&mut cx, |shell, window, cx| {
+                    shell.quit_gate_press(repeat, now, window, cx)
+                });
+            })
+            .detach();
+        true
+    })
+}
+
 pub(super) fn install(owner: WeakEntity<Shell>, window: &Window, cx: &mut App) -> Shortcuts {
     let window_id = window.window_handle().window_id();
     let forwarding = Rc::new(Forwarding::default());
     #[cfg(target_os = "macos")]
-    let native = macos::NativeKeys::new(window, forwarding.clone());
+    let native = macos::NativeKeys::new(window, forwarding.clone(), quit_press(&owner, window, cx));
     let pending = RefCell::new(Vec::<Keystroke>::new());
     let keys = cx.intercept_keystrokes(move |event, window, cx| {
         if window.window_handle().window_id() != window_id {
@@ -195,5 +226,52 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+    #[gpui::test]
+    fn toggle_git_blame_flips_the_column_from_the_shortcut_and_the_menu_action(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            super::super::bind_keys(cx);
+            crate::file_editor::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (window, _, _) = super::super::tests::window(cx);
+        cx.refresh().unwrap();
+        let column = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |shell, _, _| {
+                    shell.workspace.preferences.editor_blame_column
+                })
+                .unwrap()
+        };
+        assert!(!column(cx), "off by default");
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(window.into(), &format!("{modifier}-alt-b"));
+        cx.run_until_parked();
+        assert!(column(cx));
+        // The menu item dispatches the same action.
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(crate::file_editor::ToggleGitBlame), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(!column(cx));
+        // And the shortcut still works once focus is lost.
+        window
+            .update(cx, |_, window, cx| {
+                let orphan = cx.focus_handle();
+                window.focus(&orphan, cx);
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), &format!("{modifier}-alt-b"));
+        cx.run_until_parked();
+        assert!(column(cx));
     }
 }

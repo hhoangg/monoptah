@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-pub const HELP: &str = r#"MonoCode app access
+pub const HELP: &str = r#"Monoptah app access
 Usage: monocode-gpui app ACTION --json '{...}' [--request-id ID]
 Pass --input FILE or --input - to read a JSON object instead.
 Actions:

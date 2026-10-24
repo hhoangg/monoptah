@@ -278,6 +278,29 @@ impl Store {
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())
     }
+    /// Where every stored session row works (its worktree, else its folder),
+    /// hidden, worker and inbox sessions included. Rows whose worktree is
+    /// already removed are left out. Unlike `sessions()`, nothing is filtered.
+    pub fn working_dirs(&self) -> Result<Vec<(i64, String)>, String> {
+        if self.shared.is_some() {
+            return self.shared_working_dirs();
+        }
+
+        self.conn
+            .prepare("SELECT s.id, CASE WHEN json_valid(a.value) AND json_extract(a.value, '$.worktree_removed') IN (1, 'true') THEN NULL ELSE COALESCE(NULLIF(CASE WHEN json_valid(a.value) AND json_type(a.value, '$.worktree_cwd')='text' THEN json_extract(a.value, '$.worktree_cwd') END, ''), s.cwd) END FROM native_sessions s LEFT JOIN native_settings a ON a.key='agent:'||s.id")
+            .map_err(|e| e.to_string())?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|row| match row {
+                Ok((id, Some(dir))) => Some(Ok((id, dir))),
+                Ok((_, None)) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())
+    }
     pub fn context_usage(&self, id: i64) -> Result<Option<crate::context::Usage>, String> {
         if self.shared.is_some() {
             return self.shared_context(id);

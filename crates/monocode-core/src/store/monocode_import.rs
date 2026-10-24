@@ -29,7 +29,7 @@ pub fn monocode_database() -> PathBuf {
                 .unwrap_or_default()
                 .join(".local/share")
         });
-    base.join("com.monocode.desktop/monocode.db")
+    base.join(crate::brand::DESKTOP_APP_ID).join("monocode.db")
 }
 
 #[derive(Debug, Default)]
@@ -87,7 +87,7 @@ fn import_sessions(
     ] {
         if !columns.contains(required) {
             return Err(invalid(format!(
-                "Not a Monocode session database (missing {required})"
+                "Not a Monoptah session database (missing {required})"
             )));
         }
     }
@@ -354,6 +354,11 @@ mod tests {
     }
 
     #[test]
+    fn desktop_database_uses_the_monoptah_identifier() {
+        assert!(monocode_database().ends_with("com.monoptah.desktop/monocode.db"));
+    }
+
+    #[test]
     fn copies_committed_wal_history_and_settings_without_changing_the_source() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("monocode.db");
@@ -574,7 +579,7 @@ mod tests {
         let error = store
             .import_monocode(&dir.path().join("native.sqlite3"))
             .unwrap_err();
-        assert!(error.contains("Not a Monocode session database"));
+        assert!(error.contains("Not a Monoptah session database"));
     }
 
     #[test]

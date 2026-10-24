@@ -4,11 +4,13 @@ mod avatar;
 mod media;
 pub use media::png as media_png;
 pub mod azure_devops;
+pub mod clickup;
 pub use avatar::png as avatar_png;
 mod github;
 pub mod gitlab;
 pub mod jira;
 pub mod linear;
+mod secret_file;
 
 use crate::{desktop_preferences::DesktopPreferences, session_groups::WorkItem, store::Store};
 use chrono::{Datelike, Local, TimeZone};
@@ -19,18 +21,26 @@ use std::{
     process::Command,
 };
 
-pub const PROVIDERS: [&str; 5] = ["github", "linear", "jira", "gitlab", "azuredevops"];
+pub const PROVIDERS: [&str; 6] = [
+    "github",
+    "linear",
+    "jira",
+    "clickup",
+    "gitlab",
+    "azuredevops",
+];
 pub fn provider_label(provider: &str) -> &'static str {
     match provider {
         "linear" => "Linear",
         "jira" => "Jira",
+        "clickup" => "ClickUp",
         "gitlab" => "GitLab",
         "azuredevops" => "ADO",
         _ => "GitHub",
     }
 }
 pub fn is_tracker(provider: &str) -> bool {
-    matches!(provider, "linear" | "jira")
+    matches!(provider, "linear" | "jira" | "clickup")
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +102,18 @@ impl Item {
             };
             if id.is_empty() {
                 format!("jira:{}", self.number)
+            } else {
+                id.to_lowercase()
+            }
+        } else if self.provider == "clickup" {
+            // Display identifiers change with custom ids, so identity is the raw id.
+            let id = if self.id.trim().is_empty() {
+                self.identifier.trim()
+            } else {
+                self.id.trim()
+            };
+            if id.is_empty() {
+                format!("clickup:{}", self.number)
             } else {
                 id.to_lowercase()
             }
@@ -420,6 +442,7 @@ pub struct ViewState {
     pub seen: Seen,
     pub hidden_linear_teams: Vec<String>,
     pub hidden_jira_projects: Vec<String>,
+    pub hidden_clickup_spaces: Vec<String>,
     pub list_width: f32,
 }
 impl Default for ViewState {
@@ -430,6 +453,7 @@ impl Default for ViewState {
             seen: Seen::default(),
             hidden_linear_teams: vec![],
             hidden_jira_projects: vec![],
+            hidden_clickup_spaces: vec![],
             list_width: 280.,
         }
     }
@@ -446,28 +470,46 @@ impl ViewState {
         teams.sort();
         let mut jira = self.hidden_jira_projects.clone();
         jira.sort();
+        let mut clickup = self.hidden_clickup_spaces.clone();
+        clickup.sort();
         format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             self.filters.assigned_to_me,
             self.filters.fetch_state(),
             paths.join("|"),
             teams.join(","),
-            jira.join(",")
+            jira.join(","),
+            clickup.join(",")
         )
     }
     pub fn load(store: &Store) -> Self {
-        if let Some(state) = store
-            .setting("native-inbox-state")
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str(&s).ok())
-        {
+        let desktop = || {
+            store
+                .data_dir()
+                .map(DesktopPreferences::load)
+                .unwrap_or_default()
+        };
+        let saved = store.setting("native-inbox-state").ok().flatten();
+        if let Some(state) = saved.and_then(|raw| Self::from_saved(&raw, desktop)) {
             return state;
         }
-        let desktop = store
-            .data_dir()
-            .map(DesktopPreferences::load)
-            .unwrap_or_default();
+        Self::from_desktop(&desktop())
+    }
+    /// A saved state wins over the desktop keys. One saved before a field
+    /// existed lacks it, so that field alone is imported from the desktop.
+    fn from_saved(raw: &str, desktop: impl FnOnce() -> DesktopPreferences) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let has_clickup = value.get("hidden_clickup_spaces").is_some();
+        let mut state: Self = serde_json::from_value(value).ok()?;
+        if !has_clickup {
+            state.hidden_clickup_spaces = hidden_clickup_spaces(&desktop());
+        }
+        Some(state)
+    }
+    fn to_json(&self) -> Result<String, String> {
+        serde_json::to_string(self).map_err(|e| e.to_string())
+    }
+    fn from_desktop(desktop: &DesktopPreferences) -> Self {
         let mut state = Self::default();
         if let Some(source) = desktop
             .get("monocode.inboxSource")
@@ -495,14 +537,22 @@ impl ViewState {
             .json("monocode.jiraHiddenProjects")
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
+        state.hidden_clickup_spaces = hidden_clickup_spaces(desktop);
         state
     }
     pub fn save(&self, store: &Store) -> Result<(), String> {
-        store.save_setting(
-            "native-inbox-state",
-            &serde_json::to_string(self).map_err(|e| e.to_string())?,
-        )
+        store.save_setting("native-inbox-state", &self.to_json()?)
     }
+}
+/// The desktop stores a JSON array of space ids; anything else is ignored.
+fn hidden_clickup_spaces(desktop: &DesktopPreferences) -> Vec<String> {
+    desktop
+        .json("monocode.clickupHiddenSpaces")
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| id.as_str().filter(|id| !id.is_empty()).map(String::from))
+        .collect()
 }
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -511,6 +561,7 @@ pub struct Snapshot {
     pub connections: BTreeMap<String, Status>,
     pub linear_teams: Vec<OptionRow>,
     pub jira_projects: Vec<OptionRow>,
+    pub clickup_spaces: Vec<OptionRow>,
 }
 
 /// The Tauri InboxNotificationTracker: provider baselines and revisions are
@@ -537,27 +588,7 @@ impl NotificationTracker {
             if at == 0 {
                 continue;
             }
-            let project = match item.provider.as_str() {
-                "linear" if !item.project_id.is_empty() => {
-                    format!("linear:project:{}", item.project_id)
-                }
-                "linear" => format!("linear:team:{}:unassigned", item.team_id),
-                "jira" => format!(
-                    "jira:{}:project:{}",
-                    item.url
-                        .split('/')
-                        .nth(2)
-                        .unwrap_or("unknown")
-                        .to_lowercase(),
-                    if item.team_id.is_empty() {
-                        &item.repo
-                    } else {
-                        &item.team_id
-                    }
-                ),
-                _ if !item.project_path.is_empty() => crate::files::path_key(&item.project_path),
-                _ => format!("{}:{}", item.provider, item.repo.to_lowercase()),
-            };
+            let project = notification_project(item);
             let id = if item.id.is_empty() {
                 item.number.to_string()
             } else {
@@ -579,10 +610,94 @@ impl NotificationTracker {
     }
 }
 
+fn notification_project(item: &Item) -> String {
+    match item.provider.as_str() {
+        "linear" if !item.project_id.is_empty() => {
+            format!("linear:project:{}", item.project_id)
+        }
+        "linear" => format!("linear:team:{}:unassigned", item.team_id),
+        "jira" => format!(
+            "jira:{}:project:{}",
+            item.url
+                .split('/')
+                .nth(2)
+                .unwrap_or("unknown")
+                .to_lowercase(),
+            if item.team_id.is_empty() {
+                &item.repo
+            } else {
+                &item.team_id
+            }
+        ),
+        "clickup" => format!(
+            "clickup:{}:space:{}",
+            item.url
+                .split('/')
+                .nth(2)
+                .unwrap_or("unknown")
+                .to_lowercase(),
+            if !item.team_id.is_empty() {
+                item.team_id.clone()
+            } else if !item.repo.is_empty() {
+                item.repo.to_lowercase()
+            } else {
+                "unknown".into()
+            }
+        ),
+        _ if !item.project_path.is_empty() => crate::files::path_key(&item.project_path),
+        _ => format!("{}:{}", item.provider, item.repo.to_lowercase()),
+    }
+}
+
 #[derive(Clone)]
 pub struct Service {
     pub data_dir: PathBuf,
     pub cwd: PathBuf,
+}
+fn clickup_status_row(status: clickup::ClickUpStatus) -> Status {
+    Status {
+        connected: status.connected,
+        organization: status.team_name,
+        email: status.username,
+        ..Default::default()
+    }
+}
+fn clickup_item(issue: clickup::ClickUpIssue) -> Item {
+    Item {
+        provider: "clickup".into(),
+        kind: "clickup".into(),
+        id: issue.id,
+        identifier: issue.identifier,
+        number: issue.number,
+        title: issue.title,
+        url: issue.url,
+        state: issue.state,
+        state_type: issue.state_type,
+        updated_at: issue.updated_at,
+        labels: issue
+            .labels
+            .into_iter()
+            .map(|label| Label {
+                name: label.name,
+                color: label.color,
+            })
+            .collect(),
+        assignees: issue
+            .assignees
+            .into_iter()
+            .map(|person| Person {
+                login: person.login,
+                avatar_url: person.avatar_url,
+            })
+            .collect(),
+        draft: issue.draft,
+        repo: issue.repo,
+        team_id: issue.team_id,
+        team_name: issue.team_name,
+        // The list name is display only: a project path would become a cwd.
+        project_name: issue.list_name,
+        ..Item::default()
+    }
 }
 fn convert<T: Serialize, U: DeserializeOwned>(value: T) -> Result<U, String> {
     serde_json::from_value(serde_json::to_value(value).map_err(|e| e.to_string())?)
@@ -593,6 +708,9 @@ impl Service {
         match provider {
             "linear" => convert(linear::linear_status(self.data_dir.clone())?),
             "jira" => convert(jira::jira_status(self.data_dir.clone())?),
+            "clickup" => Ok(clickup_status_row(clickup::clickup_status(
+                self.data_dir.clone(),
+            )?)),
             "gitlab" => convert(gitlab::gitlab_status(self.data_dir.clone())?),
             "azuredevops" => convert(azure_devops::azure_devops_status(self.data_dir.clone())?),
             _ => {
@@ -628,6 +746,7 @@ impl Service {
                 email,
                 token,
             )?),
+            "clickup" => self.connect_clickup(token, None),
             "gitlab" => convert(gitlab::gitlab_set_config(
                 self.data_dir.clone(),
                 url,
@@ -640,6 +759,34 @@ impl Service {
             )?),
             _ => self.status("github"),
         }
+    }
+    /// Saves the ClickUp token and workspace. An empty token disconnects. Without
+    /// `team_id` the token must reach exactly one workspace.
+    pub fn connect_clickup(
+        &self,
+        token: String,
+        team_id: Option<String>,
+    ) -> Result<Status, String> {
+        Ok(clickup_status_row(clickup::clickup_set_config(
+            self.data_dir.clone(),
+            token,
+            team_id,
+        )?))
+    }
+    /// Workspaces a typed token can reach, before anything is saved. An empty
+    /// token uses the saved connection.
+    pub fn clickup_workspaces(&self, token: String) -> Result<Vec<OptionRow>, String> {
+        let token = Some(token.trim().to_string()).filter(|token| !token.is_empty());
+        Ok(
+            clickup::clickup_list_workspaces(self.data_dir.clone(), token)?
+                .into_iter()
+                .map(|workspace| OptionRow {
+                    id: workspace.id,
+                    name: workspace.name,
+                    key: String::new(),
+                })
+                .collect(),
+        )
     }
     pub fn list(&self, projects: &[PathBuf], state: &ViewState) -> Snapshot {
         let mut snapshot = Snapshot::default();
@@ -657,6 +804,7 @@ impl Service {
                 }
             };
             let connected = status.connected;
+            let username = status.email.clone();
             snapshot.connections.insert(provider.into(), status);
             if !connected {
                 continue;
@@ -707,6 +855,41 @@ impl Service {
                         },
                         Some(limit),
                     )?);
+                }
+                if provider == "clickup" {
+                    let hidden = &state.hidden_clickup_spaces;
+                    // Only a hidden space needs the list to fetch correctly.
+                    let spaces = match clickup::clickup_list_spaces(self.data_dir.clone()) {
+                        Ok(spaces) => spaces,
+                        Err(_) if hidden.is_empty() => vec![],
+                        Err(error) => return Err(error),
+                    };
+                    snapshot.clickup_spaces = spaces
+                        .iter()
+                        .map(|space| OptionRow {
+                            id: space.id.clone(),
+                            name: space.name.clone(),
+                            key: String::new(),
+                        })
+                        .collect();
+                    return Ok(clickup::inbox_issues(
+                        &spaces,
+                        hidden,
+                        &username,
+                        state.filters.assigned_to_me,
+                        state.filters.fetch_state() == "all",
+                        |space_ids, include_closed, limit| {
+                            clickup::clickup_list_issues(
+                                self.data_dir.clone(),
+                                space_ids,
+                                include_closed,
+                                limit,
+                            )
+                        },
+                    )?
+                    .into_iter()
+                    .map(clickup_item)
+                    .collect());
                 }
                 let mut items = Vec::new();
                 let mut visited = HashSet::new();
@@ -817,6 +1000,10 @@ impl Service {
                 self.data_dir.clone(),
                 item.identifier.clone(),
             )?),
+            "clickup" => convert(clickup::clickup_issue_details(
+                self.data_dir.clone(),
+                item.id.clone(),
+            )?),
             "gitlab" => convert(gitlab::gitlab_work_item_details(
                 self.data_dir.clone(),
                 item.repo.clone(),
@@ -854,6 +1041,10 @@ impl Service {
                 self.data_dir.clone(),
                 item.identifier.clone(),
             )?),
+            "clickup" => convert(clickup::clickup_issue_thread(
+                self.data_dir.clone(),
+                item.id.clone(),
+            )?),
             "gitlab" => convert(gitlab::gitlab_work_item_thread(
                 self.data_dir.clone(),
                 item.repo.clone(),
@@ -881,6 +1072,9 @@ impl Service {
             }
             "jira" => {
                 jira::jira_issue_comment(self.data_dir.clone(), item.identifier.clone(), body)
+            }
+            "clickup" => {
+                clickup::clickup_issue_comment(self.data_dir.clone(), item.id.clone(), body)
             }
             "gitlab" => gitlab::gitlab_work_item_comment(
                 self.data_dir.clone(),
@@ -1084,5 +1278,328 @@ mod notification_tests {
         linear.id = "stable-id".into();
         linear.identifier = "MON-7".into();
         assert_eq!(linear.key(), "linear:mon-7");
+    }
+}
+
+#[cfg(test)]
+mod clickup_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn task(id: &str) -> Item {
+        Item {
+            provider: "clickup".into(),
+            kind: "clickup".into(),
+            id: id.into(),
+            identifier: "ENG-42".into(),
+            number: 42,
+            title: "Fix auth".into(),
+            url: format!("https://app.clickup.com/t/{id}"),
+            state: "in progress".into(),
+            state_type: "indeterminate".into(),
+            updated_at: "2026-09-23T10:00:00Z".into(),
+            repo: "Engineering".into(),
+            team_id: "1001".into(),
+            team_name: "Engineering".into(),
+            ..Item::default()
+        }
+    }
+    fn service(dir: &Path) -> Service {
+        Service {
+            data_dir: dir.to_path_buf(),
+            cwd: dir.to_path_buf(),
+        }
+    }
+    fn write_config(dir: &Path) {
+        std::fs::write(
+            dir.join("clickup-config.json"),
+            r#"{"token":"pk_1","teamId":"9","teamName":"Acme","username":"Ada"}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn clickup_is_a_labelled_tracker_provider() {
+        assert!(PROVIDERS.contains(&"clickup"));
+        assert_eq!(PROVIDERS.len(), 6);
+        assert_eq!(provider_label("clickup"), "ClickUp");
+        assert!(is_tracker("clickup"));
+    }
+
+    #[test]
+    fn clickup_items_key_on_task_id() {
+        let mut a = task("86abc12");
+        let mut b = task("86abc13");
+        // Neither task has a custom id: both show `#id` identifiers and number 0.
+        a.identifier = "#86abc12".into();
+        b.identifier = "#86abc13".into();
+        a.number = 0;
+        b.number = 0;
+        assert_eq!(a.key(), "clickup:86abc12");
+        assert_ne!(a.key(), b.key());
+        // The display identifier changes with custom ids, the key must not.
+        let mut renamed = task("86abc12");
+        renamed.identifier = "ENG-43".into();
+        assert_eq!(task("86abc12").key(), renamed.key());
+        let mut no_id = task("");
+        no_id.identifier = "#X1".into();
+        assert_eq!(no_id.key(), "clickup:#x1");
+        let mut nothing = task("");
+        nothing.identifier.clear();
+        assert_eq!(nothing.key(), "clickup:clickup:42");
+    }
+
+    #[test]
+    fn clickup_issue_maps_to_an_inbox_item_without_a_project_path() {
+        let issue = clickup::ClickUpIssue {
+            provider: "clickup".into(),
+            kind: "clickup".into(),
+            id: "86abc12".into(),
+            identifier: "ENG-42".into(),
+            number: 42,
+            title: "Fix auth".into(),
+            url: "https://app.clickup.com/t/86abc12".into(),
+            state: "in progress".into(),
+            state_type: "indeterminate".into(),
+            updated_at: "2026-09-23T10:00:00Z".into(),
+            labels: vec![clickup::ClickUpLabel {
+                name: "bug".into(),
+                color: "#f00".into(),
+            }],
+            assignees: vec![clickup::ClickUpAssignee {
+                login: "ada".into(),
+                avatar_url: "https://x/ada.png".into(),
+            }],
+            draft: false,
+            repo: "Engineering".into(),
+            team_id: "1001".into(),
+            team_name: "Engineering".into(),
+            list_name: "Sprint 12".into(),
+        };
+        let item = clickup_item(issue);
+        assert_eq!(item.provider, "clickup");
+        assert_eq!(item.kind, "clickup");
+        assert_eq!(item.id, "86abc12");
+        assert_eq!(item.identifier, "ENG-42");
+        assert_eq!(item.repo, "Engineering");
+        assert_eq!(item.team_id, "1001");
+        assert_eq!(item.team_name, "Engineering");
+        // The list name is display only: a project path would become a cwd.
+        assert_eq!(item.project_name, "Sprint 12");
+        assert_eq!(item.project_path, "");
+        assert_eq!(
+            item.labels,
+            vec![Label {
+                name: "bug".into(),
+                color: "#f00".into()
+            }]
+        );
+        assert_eq!(item.assignees[0].login, "ada");
+        assert_eq!(item.assignees[0].avatar_url, "https://x/ada.png");
+        assert_eq!(item.status(), "Open");
+        let done = Item {
+            state_type: "done".into(),
+            ..item
+        };
+        assert_eq!(done.status(), "Closed");
+    }
+
+    #[test]
+    fn clickup_status_maps_workspace_and_username() {
+        let status = clickup_status_row(clickup::ClickUpStatus {
+            connected: true,
+            team_id: "9".into(),
+            team_name: "Acme".into(),
+            username: "Ada".into(),
+        });
+        assert!(status.connected);
+        assert_eq!(status.organization, "Acme");
+        assert_eq!(status.email, "Ada");
+        assert!(
+            !clickup_status_row(clickup::ClickUpStatus {
+                connected: false,
+                team_id: String::new(),
+                team_name: String::new(),
+                username: String::new(),
+            })
+            .connected
+        );
+    }
+
+    #[test]
+    fn clickup_prompt_names_the_task_for_a_session_draft() {
+        let prompt = task("86abc12").prompt("Steps", false);
+        assert!(prompt.contains("ClickUp ENG-42: Fix auth"));
+        assert!(prompt.contains("Steps"));
+    }
+
+    #[test]
+    fn clickup_hidden_spaces_import_from_desktop_prefs() {
+        let desktop = DesktopPreferences::from_values(&[(
+            "monocode.clickupHiddenSpaces",
+            json!(["1001", "", 7]),
+        )]);
+        // First run: no saved state.
+        assert_eq!(
+            ViewState::from_desktop(&desktop).hidden_clickup_spaces,
+            vec!["1001".to_string()]
+        );
+        // A saved state from before the field existed picks the pref up too.
+        let old = serde_json::to_value(ViewState::default())
+            .map(|mut v| {
+                v.as_object_mut().unwrap().remove("hidden_clickup_spaces");
+                v.to_string()
+            })
+            .unwrap();
+        let state = ViewState::from_saved(&old, || desktop.clone()).unwrap();
+        assert_eq!(state.hidden_clickup_spaces, vec!["1001".to_string()]);
+        // Other saved fields survive the import.
+        assert_eq!(state.list_width, ViewState::default().list_width);
+        // An empty list the user saved deliberately is not overwritten.
+        let chosen = ViewState::default().to_json().unwrap();
+        let state = ViewState::from_saved(&chosen, || desktop.clone()).unwrap();
+        assert!(state.hidden_clickup_spaces.is_empty());
+        // The desktop is not even read when the saved state has the field.
+        assert!(ViewState::from_saved(&chosen, || panic!("read desktop")).is_some());
+        // Unparseable saved state falls back to the caller's first-run path.
+        assert!(ViewState::from_saved("nope", DesktopPreferences::default).is_none());
+    }
+
+    #[test]
+    fn clickup_hidden_spaces_pref_ignores_malformed_values() {
+        let read = |value| {
+            ViewState::from_desktop(&DesktopPreferences::from_values(&[(
+                "monocode.clickupHiddenSpaces",
+                value,
+            )]))
+            .hidden_clickup_spaces
+        };
+        assert!(read(json!({"a": 1})).is_empty());
+        assert!(read(json!("not an array")).is_empty());
+        assert_eq!(read(json!(["1001", 7, ""])), vec!["1001".to_string()]);
+        assert!(ViewState::from_desktop(&DesktopPreferences::default())
+            .hidden_clickup_spaces
+            .is_empty());
+    }
+
+    #[test]
+    fn clickup_hidden_spaces_change_the_fetch_scope() {
+        let mut state = ViewState::default();
+        let none = state.fetch_scope(&[]);
+        state.hidden_clickup_spaces = vec!["1002".into(), "1001".into()];
+        let hidden = state.fetch_scope(&[]);
+        assert_ne!(none, hidden);
+        // Order of the hidden ids does not matter.
+        state.hidden_clickup_spaces = vec!["1001".into(), "1002".into()];
+        assert_eq!(hidden, state.fetch_scope(&[]));
+    }
+
+    #[test]
+    fn clickup_view_state_round_trips_the_hidden_spaces() {
+        let state = ViewState {
+            hidden_clickup_spaces: vec!["1001".into()],
+            ..ViewState::default()
+        };
+        let back =
+            ViewState::from_saved(&state.to_json().unwrap(), DesktopPreferences::default).unwrap();
+        assert_eq!(back.hidden_clickup_spaces, vec!["1001".to_string()]);
+    }
+
+    #[test]
+    fn clickup_notifications_group_by_host_and_space() {
+        assert_eq!(
+            notification_project(&task("86abc12")),
+            "clickup:app.clickup.com:space:1001"
+        );
+        let mut no_team = task("86abc12");
+        no_team.team_id.clear();
+        no_team.repo = "Engineering".into();
+        assert_eq!(
+            notification_project(&no_team),
+            "clickup:app.clickup.com:space:engineering"
+        );
+        let mut bare = task("1");
+        bare.url.clear();
+        bare.team_id.clear();
+        bare.repo.clear();
+        assert_eq!(notification_project(&bare), "clickup:unknown:space:unknown");
+    }
+
+    #[test]
+    fn clickup_new_task_in_a_primed_scope_appears_once() {
+        let mut tracker = NotificationTracker::default();
+        let snap = |items| Snapshot {
+            items,
+            ..Snapshot::default()
+        };
+        assert!(tracker
+            .observe(&snap(vec![task("86abc12")]), "s".into())
+            .is_empty());
+        let appeared = tracker.observe(&snap(vec![task("86abc12"), task("86abc13")]), "s".into());
+        assert_eq!(appeared.len(), 1);
+        assert_eq!(appeared[0].id, "86abc13");
+    }
+
+    #[test]
+    fn clickup_status_is_offline_and_reports_corrupt_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path());
+        assert!(!svc.status("clickup").unwrap().connected);
+        write_config(dir.path());
+        let status = svc.status("clickup").unwrap();
+        assert!(status.connected);
+        assert_eq!(status.organization, "Acme");
+        assert_eq!(status.email, "Ada");
+        // Service::list records this per provider, so other sources still load.
+        std::fs::write(dir.path().join("clickup-config.json"), "nope").unwrap();
+        assert_eq!(
+            svc.status("clickup").unwrap_err(),
+            "ClickUp settings are invalid"
+        );
+    }
+
+    #[test]
+    fn clickup_disconnect_clears_the_saved_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let svc = service(dir.path());
+        let status = svc.connect_clickup("  ".into(), None).unwrap();
+        assert!(!status.connected);
+        assert!(!dir.path().join("clickup-config.json").exists());
+        write_config(dir.path());
+        // The generic entry point delegates, so existing callers still work.
+        let status = svc
+            .connect("clickup", String::new(), String::new(), String::new())
+            .unwrap();
+        assert!(!status.connected);
+        assert!(!dir.path().join("clickup-config.json").exists());
+    }
+
+    #[test]
+    fn clickup_workspaces_without_a_token_need_a_saved_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        // No network: an empty token falls back to the saved connection, which is absent.
+        assert_eq!(
+            service(dir.path())
+                .clickup_workspaces("  ".into())
+                .unwrap_err(),
+            "Connect ClickUp in Settings"
+        );
+    }
+
+    #[test]
+    fn clickup_refuses_to_fall_back_to_the_display_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let svc = service(dir.path());
+        let mut item = task("");
+        item.identifier = "ENG-42".into();
+        // The raw id is validated before any request is made.
+        assert_eq!(svc.details(&item).unwrap_err(), "Missing ClickUp task");
+        assert_eq!(svc.thread(&item).unwrap_err(), "Missing ClickUp task");
+        assert_eq!(
+            svc.comment(&item, "hi".into(), String::new()).unwrap_err(),
+            "Missing ClickUp task"
+        );
     }
 }

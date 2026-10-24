@@ -694,6 +694,110 @@ fn history_revision_keeps_numeric_types_and_normalizes_float_zero() {
 }
 
 #[test]
+fn working_dirs_cover_every_row_even_the_ones_the_sidebar_hides() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    store.conn.execute_batch("CREATE TABLE orchestration_workers(session_id TEXT PRIMARY KEY, lead_id TEXT NOT NULL)").unwrap();
+    for (id, cwd, worktree, removed) in [
+        ("plain", "/project", None, 0),
+        ("worker", "/project", Some("/wt/worker"), 0),
+        ("hidden", "/project", Some("/wt/hidden"), 0),
+        ("inbox", "/project", Some("/wt/inbox"), 0),
+        ("gone", "/project", Some("/wt/gone"), 1),
+        ("blank", "/project", Some(""), 0),
+    ] {
+        store.conn.execute("INSERT INTO sessions(id,cwd,harness,model,runtime_mode,title,blocks_json,created_at,updated_at,has_user_message,sidebar_hidden,worktree_cwd,worktree_removed) VALUES(?1,?2,'codex','codex:model','supervised',?1,'[]',1,2,1,?5,?3,?4)", params![id, cwd, worktree, removed, id == "hidden"]).unwrap();
+    }
+    store
+        .conn
+        .execute(
+            "INSERT INTO orchestration_workers VALUES('worker','plain')",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute("UPDATE sessions SET inbox_ask='ask' WHERE id='inbox'", [])
+        .unwrap();
+
+    let listed: HashSet<_> = store
+        .sessions()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.cwd)
+        .collect();
+    assert_eq!(listed.len(), 1, "the sidebar view leaves most rows out");
+    let mut dirs: Vec<_> = store
+        .working_dirs()
+        .unwrap()
+        .into_iter()
+        .map(|d| d.1)
+        .collect();
+    dirs.sort();
+    assert_eq!(
+        dirs,
+        [
+            "/project",
+            "/project",
+            "/wt/hidden",
+            "/wt/inbox",
+            "/wt/worker"
+        ]
+    );
+}
+
+#[test]
+fn working_dirs_of_a_plain_store_prefer_the_worktree_and_skip_removed_ones() {
+    let store = Store::open(Path::new(":memory:")).unwrap();
+    let (a, b, c) = (
+        store.create("codex", "/project").unwrap(),
+        store.create("codex", "/project").unwrap(),
+        store.create("codex", "/other").unwrap(),
+    );
+    for (session, worktree, removed) in [(&a, "/wt/a", false), (&b, "/wt/b", true)] {
+        let settings = crate::agent::Settings {
+            worktree_cwd: Some(worktree.into()),
+            worktree_removed: removed,
+            ..Default::default()
+        };
+        store.save_agent_settings(session.id, &settings).unwrap();
+    }
+    let mut dirs = store.working_dirs().unwrap();
+    dirs.sort();
+    assert_eq!(
+        dirs,
+        [(a.id, "/wt/a".to_string()), (c.id, "/other".to_string())]
+    );
+}
+
+#[test]
+fn codex_side_thread_ids_follow_the_thread_or_session_harness() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let (session, _) = saved(
+        &store,
+        json!([
+            {"id":"u1","role":"user","text":"Q","btwThreads":[
+                {"id":"a","providerThreadId":"inherits"},
+                {"id":"b","harness":"codex","providerThreadId":"explicit"},
+                {"id":"c","harness":"claude","providerThreadId":"other-cli"},
+                {"id":"d"}
+            ]},
+            {"id":"a1","role":"assistant","text":"A"}
+        ]),
+    );
+
+    assert_eq!(
+        store.codex_side_thread_ids(session, "codex").unwrap(),
+        ["inherits", "explicit"]
+    );
+    assert_eq!(
+        store.codex_side_thread_ids(session, "claude").unwrap(),
+        ["explicit"]
+    );
+    let plain = Store::open(Path::new(":memory:")).unwrap();
+    assert!(plain.codex_side_thread_ids(1, "codex").unwrap().is_empty());
+}
+
+#[test]
 fn existing_side_questions_import_their_exact_source_bound_without_writes() {
     let store = Store::open_monocode(Path::new(":memory:")).unwrap();
     let thread = json!({

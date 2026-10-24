@@ -29,10 +29,19 @@ mod editor;
 mod gallery;
 mod trigger_menu;
 
+/// Providers whose mark keeps its own colours instead of taking the text colour.
+fn color_artwork(kind: &str) -> Option<&'static str> {
+    match kind {
+        "gitlab" => Some("inbox-gitlab-color.svg"),
+        "clickup" => Some("inbox-clickup.svg"),
+        _ => None,
+    }
+}
+
 /// Event providers and schedules are separate from agent harness branding.
 fn trigger_mark(kind: &str, side: f32) -> AnyElement {
-    if kind == "gitlab" {
-        return gpui::img("inbox-gitlab-color.svg")
+    if let Some(path) = color_artwork(kind) {
+        return gpui::img(path)
             .size(px(side))
             .flex_shrink_0()
             .object_fit(gpui::ObjectFit::Contain)
@@ -98,6 +107,7 @@ enum Choice {
     Time(String),
     Minute(String),
     Weekday(String),
+    Space(String),
     ModelSetting(String),
 }
 struct ChoiceMenu {
@@ -141,6 +151,9 @@ pub(crate) struct Automations {
     trigger_menu: Option<Entity<trigger_menu::TriggerMenu>>,
     trigger_subscription: Option<Subscription>,
     trigger_connections: HashMap<String, bool>,
+    /// ClickUp spaces as (id, name), for the trigger filter picker.
+    clickup_spaces: Vec<(String, String)>,
+    clickup_spaces_loading: bool,
     request_generation: u64,
 }
 impl EventEmitter<Event> for Automations {}
@@ -195,6 +208,8 @@ impl Automations {
             trigger_menu: None,
             trigger_subscription: None,
             trigger_connections: HashMap::new(),
+            clickup_spaces: Vec::new(),
+            clickup_spaces_loading: false,
             request_generation: 0,
         };
         this.refresh(cx);
@@ -484,6 +499,44 @@ impl Automations {
                 actor,
             });
         }
+        self.load_clickup_spaces(cx);
+    }
+    /// Fills the ClickUp space picker off the UI thread. A failed lookup leaves
+    /// the picker on the saved ids and is retried the next time triggers change.
+    fn load_clickup_spaces(&mut self, cx: &mut Context<Self>) {
+        let wanted = self.editor.as_ref().is_some_and(|editor| {
+            editor
+                .draft
+                .triggers
+                .iter()
+                .flatten()
+                .any(|trigger| trigger.kind == "clickup")
+        });
+        if !wanted || self.clickup_spaces_loading || !self.clickup_spaces.is_empty() {
+            return;
+        }
+        let Some(database) = self.database.clone() else {
+            return;
+        };
+        self.clickup_spaces_loading = true;
+        let work = cx.background_executor().spawn(async move {
+            let root = locked(&database)?
+                .data_dir()
+                .map(std::path::Path::to_path_buf)
+                .ok_or("No data directory")?;
+            monocode_core::inbox::clickup::clickup_list_spaces(root)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.clickup_spaces_loading = false;
+                if let Ok(spaces) = result {
+                    this.clickup_spaces = spaces.into_iter().map(|s| (s.id, s.name)).collect();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
     fn collected(&self, cx: &App) -> Option<AutomationUpsert> {
         let editor = self.editor.as_ref()?;
@@ -654,6 +707,10 @@ impl Automations {
         self.model_controls.clear();
         self.request_generation += 1;
         let generation = self.request_generation;
+        // Tests must not run real catalog discovery (it fills the shared cache).
+        if cfg!(test) {
+            return;
+        }
         let Some(editor) = &self.editor else {
             return;
         };
@@ -1168,5 +1225,99 @@ impl Render for Automations {
             );
         }
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, WindowOptions};
+    use std::path::Path;
+
+    fn spaces() -> Vec<(String, String)> {
+        vec![("901".into(), "Engineering".into())]
+    }
+
+    #[test]
+    fn space_options_keep_a_saved_id_that_is_not_listed() {
+        let options = editor::space_options(&spaces(), "901");
+        assert_eq!(
+            options,
+            [
+                ("".to_string(), "Any space".to_string()),
+                ("901".to_string(), "Engineering".to_string())
+            ]
+        );
+        let options = editor::space_options(&spaces(), " 77 ");
+        assert_eq!(
+            options.last(),
+            Some(&("77".to_string(), "Space 77".to_string()))
+        );
+        assert_eq!(editor::space_label(&spaces(), "901"), "Engineering");
+        assert_eq!(editor::space_label(&spaces(), ""), "Any space");
+        assert_eq!(editor::space_label(&spaces(), "77"), "Space 77");
+    }
+
+    #[test]
+    fn clickup_is_a_trigger_with_one_task_event() {
+        assert_eq!(
+            editor::events("clickup"),
+            [("issue_created".to_string(), "Task appeared".to_string())]
+        );
+        assert_eq!(
+            automations::event_label("clickup", "issue_created"),
+            "Task appeared"
+        );
+    }
+
+    #[gpui::test]
+    fn editor_saves_the_chosen_space_id_as_the_trigger_filter(cx: &mut TestAppContext) {
+        let service = Arc::new(Mutex::new(Service::open(Path::new(":memory:")).unwrap()));
+        let window = cx
+            .update(|cx| {
+                cx.open_window(WindowOptions::default(), |_, cx| {
+                    cx.new(|cx| Automations::new(service, "/repo".into(), vec![], cx))
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let filter = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |this, _, cx| {
+                    let draft = this.collected(cx).unwrap();
+                    let trigger = draft.triggers.unwrap().pop().unwrap();
+                    (trigger.kind, trigger.event, trigger.repo, trigger.repos)
+                })
+                .unwrap()
+        };
+        let id = window
+            .update(cx, |this, _, cx| {
+                this.begin(None, cx);
+                this.clickup_spaces = spaces();
+                this.apply_choice(Choice::AddTrigger, "clickup:issue_created".into(), cx);
+                let triggers = this.editor.as_ref().unwrap().draft.triggers.clone();
+                triggers.unwrap().pop().unwrap().id
+            })
+            .unwrap();
+        // Lays out the editor, including the ClickUp space row.
+        cx.refresh().unwrap();
+        window
+            .update(cx, |this, _, cx| {
+                this.apply_choice(Choice::Space(id.clone()), "901".into(), cx)
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        let (kind, event, repo, repos) = filter(cx);
+        assert_eq!(
+            (kind.as_str(), event.as_str()),
+            ("clickup", "issue_created")
+        );
+        assert_eq!((repo.as_str(), repos), ("", vec!["901".to_string()]));
+        window
+            .update(cx, |this, _, cx| {
+                this.apply_choice(Choice::Space(id), String::new(), cx)
+            })
+            .unwrap();
+        assert!(filter(cx).3.is_empty());
     }
 }

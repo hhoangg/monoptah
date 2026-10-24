@@ -470,7 +470,7 @@ fn publish_with_environment(
     let get = |key| {
         environment
             .get(key)
-            .ok_or("Visual publication requires a running MonoCode session")
+            .ok_or("Visual publication requires a running Monoptah session")
     };
     let endpoint: SocketAddr = get(ENV_ENDPOINT)?
         .parse()

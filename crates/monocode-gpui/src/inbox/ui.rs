@@ -10,12 +10,15 @@ fn action(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Statef
 }
 /// An [`action`] without its hover, for callers that set their own.
 fn plain_action(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Stateful<Div> {
-    let id: SharedString = id.into();
     let label = label.into();
+    action_frame(id, label.clone()).child(label)
+}
+/// The button box of an [`action`] named `label`, for callers that fill it themselves.
+fn action_frame(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Stateful<Div> {
     div()
-        .id(id)
+        .id(id.into())
         .role(Role::Button)
-        .aria_label(label.clone())
+        .aria_label(label.into())
         .h(px(28.))
         .px(px(10.))
         .flex()
@@ -26,7 +29,6 @@ fn plain_action(id: impl Into<SharedString>, label: impl Into<SharedString>) -> 
         .text_size(px(12.))
         .text_color(content(0.7))
         .cursor_pointer()
-        .child(label)
 }
 fn icon_action(id: impl Into<SharedString>, label: &str, name: &'static str) -> Stateful<Div> {
     icon_action_ink(id, label, name, content(0.7))
@@ -212,15 +214,96 @@ fn message(text: impl Into<SharedString>) -> Div {
 fn error(text: impl Into<SharedString>) -> Div {
     message(text).text_color(rgb(0xf87171))
 }
-fn provider_mark(provider: &str) -> gpui::Svg {
-    let (path, color) = match provider {
+fn provider_art(provider: &str) -> (&'static str, Hsla) {
+    match provider {
         "linear" => ("inbox-linear", content(0.8)),
         "jira" => ("inbox-jira", rgb(0x2684ff).into()),
+        "clickup" => ("inbox-clickup", rgb(0x8930fd).into()),
         "gitlab" => ("inbox-gitlab", rgb(0xfc6d26).into()),
         "azuredevops" => ("inbox-azuredevops", content(0.8)),
         _ => ("inbox-github", content(0.8)),
-    };
+    }
+}
+fn provider_mark(provider: &str) -> gpui::Svg {
+    let (path, color) = provider_art(provider);
     icon(path, 14.).text_color(color)
+}
+/// "Assigned to me" is a 100-item window for ClickUp, filtered locally.
+fn assigned_label(source: &str) -> &'static str {
+    match source {
+        "gitlab" | "azuredevops" => "Needs my attention",
+        "clickup" => "Assigned to me (newest 100)",
+        _ => "Assigned to me",
+    }
+}
+fn item_kind_label(item: &Item) -> &'static str {
+    if item.kind == "pr" {
+        if item.provider == "gitlab" {
+            "Merge request"
+        } else {
+            "Pull request"
+        }
+    } else if item.provider == "clickup" {
+        "Task"
+    } else {
+        "Issue"
+    }
+}
+/// The space, plus the list for ClickUp (the list name travels in `project_name`).
+fn source_label(item: &Item, tracker: bool) -> String {
+    if tracker {
+        let space = if item.team_name.is_empty() {
+            &item.repo
+        } else {
+            &item.team_name
+        };
+        if item.provider == "clickup" {
+            return [space.as_str(), item.project_name.as_str()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" / ");
+        }
+        if !space.is_empty() {
+            return space.clone();
+        }
+    }
+    if item.repo.is_empty() {
+        project_name(std::path::Path::new(&item.project_path))
+    } else {
+        item.repo.clone()
+    }
+}
+const CLICKUP_TOKEN_URL: &str = "https://app.clickup.com/settings/apps";
+struct ConnectFields {
+    url: bool,
+    email: bool,
+    token: bool,
+}
+fn connect_fields(provider: &str) -> ConnectFields {
+    ConnectFields {
+        url: !matches!(provider, "github" | "linear" | "clickup"),
+        email: provider == "jira",
+        token: provider != "github",
+    }
+}
+fn connect_hint(provider: &str) -> &'static str {
+    match provider {
+        "github" => {
+            "Install GitHub CLI, then run gh auth login in a terminal. Check again when signed in."
+        }
+        "linear" => "Create a personal API key in Linear → Settings → Security & Access.",
+        "jira" => "Connect your Jira Cloud site with your Atlassian email and an API token.",
+        "clickup" => {
+            "Connect ClickUp with a personal API token. Disconnect deletes the saved token."
+        }
+        "gitlab" => {
+            "Connect GitLab.com or your GitLab instance with a personal access token with API access."
+        }
+        _ => {
+            "Connect your ADO organization using a personal access token with Boards and Repos read & write access."
+        }
+    }
 }
 fn status_color(item: &Item) -> Hsla {
     match item.status() {
@@ -487,29 +570,22 @@ impl Inbox {
                 let key = item.key();
                 let active = self.selected.as_ref() == Some(&key);
                 let unread = self.state.seen.unseen(&item);
-                let sessions = self.related_sessions(&item).len();
+                let related = self.related_sessions(&item);
+                let sessions = related.len();
+                let running = running::running_in(&related, &self.busy);
+                let related_label = running::related_threads_label(sessions, running);
                 let tracker = model::is_tracker(&item.provider);
-                let kind = if item.kind == "pr" {
-                    if item.provider == "gitlab" {
-                        "Merge request"
-                    } else {
-                        "Pull request"
-                    }
-                } else {
-                    "Issue"
-                };
-                let source = if tracker && !item.team_name.is_empty() {
-                    item.team_name.clone()
-                } else if !item.repo.is_empty() {
-                    item.repo.clone()
-                } else {
-                    project_name(std::path::Path::new(&item.project_path))
-                };
+                let kind = item_kind_label(&item);
+                let source = source_label(&item, tracker);
                 let attention = attention_label(&item.attention_reason);
                 div()
                     .id(SharedString::from(format!("inbox-item-{key}")))
                     .role(Role::Button)
-                    .aria_label(item.title.clone())
+                    .aria_label(if sessions > 0 {
+                        format!("{}, {related_label}", item.title)
+                    } else {
+                        item.title.clone()
+                    })
                     .px(px(10.))
                     .py(px(8.))
                     .rounded(px(6.))
@@ -543,10 +619,24 @@ impl Inbox {
                                         .items_center()
                                         .gap(px(2.))
                                         .text_color(accent_color())
-                                        .child(
+                                        .child(if running > 0 {
+                                            div()
+                                                .size(px(12.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(crate::session_mark::spinner(
+                                                    SharedString::from(format!(
+                                                        "inbox-row-spinner-{key}"
+                                                    )),
+                                                    crate::pulse::Rate::Half,
+                                                ))
+                                                .into_any_element()
+                                        } else {
                                             icon("message-multiple", 12.)
-                                                .text_color(accent_color()),
-                                        )
+                                                .text_color(accent_color())
+                                                .into_any_element()
+                                        })
                                         .child(sessions.to_string()),
                                 )
                             })
@@ -618,6 +708,7 @@ impl Inbox {
                     .min_h_0()
                     .flex_1()
                     .overflow_y_scroll()
+                    .track_scroll(&self.list_scroll)
                     .p(px(6.))
                     .flex()
                     .flex_col()
@@ -648,19 +739,21 @@ impl Inbox {
             .into_any_element()
     }
 
-    fn related_sessions(&self, item: &Item) -> Vec<Session> {
+    /// How many of the item's linked sessions are running a turn right now.
+    #[cfg(test)]
+    fn running_sessions(&self, item: &Item) -> usize {
+        running::running_in(&self.related_sessions(item), &self.busy)
+    }
+
+    fn related_sessions(&self, item: &Item) -> Vec<&Session> {
         let work_item = item.work_item();
         self.sessions
             .iter()
             .filter(|s| {
-                s.work_item.as_ref().is_some_and(|work| {
-                    (!work.url.is_empty() && work.url == work_item.url)
-                        || (work.kind == work_item.kind
-                            && work.number == work_item.number
-                            && work.repo.eq_ignore_ascii_case(&work_item.repo))
-                })
+                s.work_item
+                    .as_ref()
+                    .is_some_and(|work| running::same_work_item(work, &work_item))
             })
-            .cloned()
             .collect()
     }
 
@@ -678,6 +771,7 @@ impl Inbox {
                 .into_any_element();
         };
         let is_pr = item.kind == "pr";
+        let related = self.related_sessions(&item);
         let details = self.details.clone().unwrap_or_default();
         let assignees = item
             .assignees
@@ -728,15 +822,7 @@ impl Inbox {
                             .text_size(px(12.))
                             .text_color(content(0.5))
                             .child(provider_mark(&item.provider))
-                            .child(if is_pr {
-                                if item.provider == "gitlab" {
-                                    "Merge request"
-                                } else {
-                                    "Pull request"
-                                }
-                            } else {
-                                "Issue"
-                            })
+                            .child(item_kind_label(&item))
                             .child(item.reference())
                             .child(
                                 div()
@@ -857,7 +943,7 @@ impl Inbox {
                                 d.child("·").child(review_label(&details.review_decision))
                             }),
                     )
-                    .when(!self.related_sessions(&item).is_empty(), |d| {
+                    .when(!related.is_empty(), |d| {
                         d.child(
                             div()
                                 .min_w_0()
@@ -872,23 +958,40 @@ impl Inbox {
                                         .text_color(content(0.45))
                                         .child("Related threads"),
                                 )
-                                .children(self.related_sessions(&item).into_iter().map(
-                                    |session| {
-                                        action(
-                                            format!("inbox-session-{}", session.id),
-                                            session.title,
-                                        )
+                                .children(related.into_iter().cloned().map(|session| {
+                                    let running = self.busy.contains(&session.id);
+                                    let label = if running {
+                                        format!("{} (running)", session.title)
+                                    } else {
+                                        session.title.clone()
+                                    };
+                                    action_frame(format!("inbox-session-{}", session.id), label)
+                                        .hover(|s| s.bg(content(0.07)).text_color(content(1.)))
                                         .h(px(24.))
                                         .bg(content(0.05))
                                         .max_w(px(256.))
-                                        .truncate()
-                                        .on_click(
-                                            cx.listener(move |_, _, _, cx| {
-                                                cx.emit(Event::OpenSession(session.id))
-                                            }),
-                                        )
-                                    },
-                                )),
+                                        .when(running, |d| {
+                                            d.child(
+                                                div()
+                                                    .size(px(12.))
+                                                    .flex_shrink_0()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(crate::session_mark::spinner(
+                                                        SharedString::from(format!(
+                                                            "inbox-chip-spinner-{}",
+                                                            session.id
+                                                        )),
+                                                        crate::pulse::Rate::Half,
+                                                    )),
+                                            )
+                                        })
+                                        .child(div().min_w_0().truncate().child(session.title))
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.emit(Event::OpenSession(session.id))
+                                        }))
+                                })),
                         )
                     })
                     .child(
@@ -898,23 +1001,21 @@ impl Inbox {
                             .flex_wrap()
                             .items_center()
                             .gap(px(8.))
-                            .when(!is_pr, |d| {
-                                d.child(
-                                    action("inbox-send-agent", "Send to agent")
-                                        .px(px(12.))
-                                        .bg(content(1.))
-                                        .text_color(shell_fill())
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .when(self.detail_loading || self.details.is_none(), |d| {
-                                            d.opacity(0.4)
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if !this.detail_loading && this.details.is_some() {
-                                                this.start(cx);
-                                            }
-                                        })),
-                                )
-                            })
+                            .child(
+                                action("inbox-send-agent", "Send to agent")
+                                    .px(px(12.))
+                                    .bg(content(1.))
+                                    .text_color(shell_fill())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .when(self.detail_loading || self.details.is_none(), |d| {
+                                        d.opacity(0.4)
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if !this.detail_loading && this.details.is_some() {
+                                            this.start(cx);
+                                        }
+                                    })),
+                            )
                             .when(!is_pr && item.project_path.is_empty(), |d| {
                                 d.child(
                                     icon_action(
@@ -2044,6 +2145,48 @@ impl Inbox {
             || f.status.merged
             || (self.state.source == "linear" && !self.state.hidden_linear_teams.is_empty())
             || (self.state.source == "jira" && !self.state.hidden_jira_projects.is_empty())
+            || (self.state.source == "clickup" && !self.state.hidden_clickup_spaces.is_empty())
+    }
+    /// Caption and (id, name, visible) rows of the source's team/project/space list.
+    fn tracker_options(&self) -> (&'static str, Vec<(String, String, bool)>) {
+        let (caption, options, hidden) = match self.state.source.as_str() {
+            "linear" => (
+                "TEAMS",
+                &self.snapshot.linear_teams,
+                &self.state.hidden_linear_teams,
+            ),
+            "clickup" => (
+                "SPACES",
+                &self.snapshot.clickup_spaces,
+                &self.state.hidden_clickup_spaces,
+            ),
+            _ => (
+                "PROJECTS",
+                &self.snapshot.jira_projects,
+                &self.state.hidden_jira_projects,
+            ),
+        };
+        let rows = options
+            .iter()
+            .map(|o| (o.id.clone(), o.name.clone(), !hidden.contains(&o.id)))
+            .collect();
+        (caption, rows)
+    }
+    fn toggle_tracker_option(&mut self, id: String) {
+        toggle(
+            match self.state.source.as_str() {
+                "linear" => &mut self.state.hidden_linear_teams,
+                "clickup" => &mut self.state.hidden_clickup_spaces,
+                _ => &mut self.state.hidden_jira_projects,
+            },
+            id,
+        );
+    }
+    fn clear_tracker_filters(&mut self) {
+        self.state.filters = model::Filters::default();
+        self.state.hidden_linear_teams.clear();
+        self.state.hidden_jira_projects.clear();
+        self.state.hidden_clickup_spaces.clear();
     }
     fn filters_changed(&mut self, refetch: bool, cx: &mut Context<Self>) {
         self.save();
@@ -2063,11 +2206,7 @@ impl Inbox {
             caption("FILTER INBOX").into_any_element(),
             menu_row(
                 "inbox-assigned",
-                if matches!(self.state.source.as_str(), "gitlab" | "azuredevops") {
-                    "Needs my attention"
-                } else {
-                    "Assigned to me"
-                },
+                assigned_label(&self.state.source),
                 f.assigned_to_me,
             )
             .on_click(cx.listener(|this, _, _, cx| {
@@ -2162,42 +2301,17 @@ impl Inbox {
                 );
             }
         }
-        let provider_options = if self.state.source == "linear" {
-            &self.snapshot.linear_teams
-        } else {
-            &self.snapshot.jira_projects
-        };
-        if tracker && !provider_options.is_empty() {
-            rows.push(
-                caption(if self.state.source == "linear" {
-                    "TEAMS"
-                } else {
-                    "PROJECTS"
-                })
-                .into_any_element(),
-            );
-            for (ix, option) in provider_options.iter().enumerate() {
-                let id = option.id.clone();
-                let hidden = if self.state.source == "linear" {
-                    &self.state.hidden_linear_teams
-                } else {
-                    &self.state.hidden_jira_projects
-                };
+        let (tracker_caption, tracker_rows) = self.tracker_options();
+        if tracker && !tracker_rows.is_empty() {
+            rows.push(caption(tracker_caption).into_any_element());
+            for (ix, (id, name, visible)) in tracker_rows.into_iter().enumerate() {
                 rows.push(
-                    menu_row(
-                        format!("inbox-tracker-filter-{ix}"),
-                        option.name.clone(),
-                        !hidden.contains(&id),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.state.source == "linear" {
-                            toggle(&mut this.state.hidden_linear_teams, id.clone());
-                        } else {
-                            toggle(&mut this.state.hidden_jira_projects, id.clone());
-                        }
-                        this.filters_changed(true, cx);
-                    }))
-                    .into_any_element(),
+                    menu_row(format!("inbox-tracker-filter-{ix}"), name, visible)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_tracker_option(id.clone());
+                            this.filters_changed(true, cx);
+                        }))
+                        .into_any_element(),
                 );
             }
         }
@@ -2245,9 +2359,7 @@ impl Inbox {
                 .justify_start()
                 .mt(px(8.))
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.state.filters = model::Filters::default();
-                    this.state.hidden_linear_teams.clear();
-                    this.state.hidden_jira_projects.clear();
+                    this.clear_tracker_filters();
                     this.filters_changed(true, cx);
                 }))
                 .into_any_element(),
@@ -2337,19 +2449,8 @@ impl Inbox {
             if connected { "Manage" } else { "Connect" },
             model::provider_label(&provider)
         );
-        let hint = match provider.as_str() {
-            "github" => {
-                "Install GitHub CLI, then run gh auth login in a terminal. Check again when signed in."
-            }
-            "linear" => "Create a personal API key in Linear → Settings → Security & Access.",
-            "jira" => "Connect your Jira Cloud site with your Atlassian email and an API token.",
-            "gitlab" => {
-                "Connect GitLab.com or your GitLab instance with a personal access token with API access."
-            }
-            _ => {
-                "Connect your ADO organization using a personal access token with Boards and Repos read & write access."
-            }
-        };
+        let hint = connect_hint(&provider);
+        let fields = connect_fields(&provider);
         div()
             .absolute()
             .inset_0()
@@ -2390,6 +2491,7 @@ impl Inbox {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if !this.connecting {
                                             this.connect_provider = None;
+                                            this.reset_workspaces();
                                             this.connect_token.update(cx, |input, cx| {
                                                 input.set_text(String::new(), cx)
                                             });
@@ -2405,7 +2507,7 @@ impl Inbox {
                             .text_color(content(0.5))
                             .child(hint),
                     )
-                    .when(provider != "github" && provider != "linear", |d| {
+                    .when(fields.url, |d| {
                         d.child(
                             div()
                                 .px(px(10.))
@@ -2416,7 +2518,7 @@ impl Inbox {
                                 .child(self.connect_url.clone()),
                         )
                     })
-                    .when(provider == "jira", |d| {
+                    .when(fields.email, |d| {
                         d.child(
                             div()
                                 .px(px(10.))
@@ -2427,7 +2529,7 @@ impl Inbox {
                                 .child(self.connect_email.clone()),
                         )
                     })
-                    .when(provider != "github", |d| {
+                    .when(fields.token, |d| {
                         d.child(
                             div()
                                 .px(px(10.))
@@ -2438,12 +2540,21 @@ impl Inbox {
                                 .child(self.connect_token.clone()),
                         )
                     })
+                    .when(!self.connect_workspaces.is_empty(), |d| {
+                        d.child(self.workspace_choice(cx))
+                    })
                     .when_some(self.connect_error.clone(), |d, text| d.child(error(text)))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(8.))
+                            .when(provider == "clickup", |d| {
+                                d.child(
+                                    action("inbox-clickup-token-link", "Create API token")
+                                        .on_click(|_, _, cx| cx.open_url(CLICKUP_TOKEN_URL)),
+                                )
+                            })
                             .when(connected && provider != "github", |d| {
                                 d.child(
                                     action("inbox-disconnect", "Disconnect")
@@ -2480,6 +2591,35 @@ impl Inbox {
                     ),
             ))
             .into_any_element()
+    }
+
+    /// The workspaces a ClickUp token reaches, shown once it reaches several.
+    fn workspace_choice(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .child(caption("WORKSPACE"))
+            .children(self.connect_workspaces.iter().enumerate().map(|(ix, w)| {
+                let id = w.id.clone();
+                menu_row(
+                    format!("inbox-connect-workspace-{ix}"),
+                    w.name.clone(),
+                    self.connect_team.as_deref() == Some(w.id.as_str()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.connect_team = Some(id.clone());
+                    cx.notify();
+                }))
+            }))
+            .child(
+                div()
+                    .px(px(8.))
+                    .pt(px(4.))
+                    .text_size(px(12.))
+                    .line_height(px(19.))
+                    .text_color(content(0.5))
+                    .child("This token reaches several workspaces. Pick one, then select Connect."),
+            )
     }
 
     fn project_menu(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2858,6 +2998,7 @@ mod tests {
         point, size,
     };
     use std::sync::{Arc, Mutex};
+    use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
     struct Fixture {
         inbox: Entity<Inbox>,
@@ -3051,6 +3192,459 @@ mod tests {
                 })
             })
             .unwrap();
+    }
+
+    fn space(id: &str, name: &str) -> model::OptionRow {
+        model::OptionRow {
+            id: id.into(),
+            name: name.into(),
+            key: String::new(),
+        }
+    }
+    #[gpui::test]
+    fn clickup_filters_list_the_spaces_and_hiding_one_updates_the_state(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, _| {
+                    inbox.state.source = "clickup".into();
+                    inbox.snapshot.clickup_spaces = vec![space("901", "Eng"), space("902", "Ops")];
+                    let (caption, rows) = inbox.tracker_options();
+                    assert_eq!(caption, "SPACES");
+                    assert_eq!(
+                        rows,
+                        [
+                            ("901".to_string(), "Eng".to_string(), true),
+                            ("902".to_string(), "Ops".to_string(), true)
+                        ]
+                    );
+                    assert!(!inbox.filters_active());
+                    inbox.toggle_tracker_option("902".into());
+                    assert_eq!(inbox.state.hidden_clickup_spaces, ["902"]);
+                    assert!(inbox.state.hidden_jira_projects.is_empty());
+                    assert!(inbox.filters_active());
+                    assert!(!inbox.tracker_options().1[1].2);
+                    inbox.toggle_tracker_option("902".into());
+                    assert!(inbox.state.hidden_clickup_spaces.is_empty());
+                })
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn hidden_clickup_spaces_survive_the_view_state_save_path(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, _| {
+                    inbox.state.source = "clickup".into();
+                    inbox.toggle_tracker_option("901".into());
+                    inbox.save();
+                    assert!(inbox.error.is_none());
+                    let loaded = ViewState::load(&locked(&inbox.store).unwrap());
+                    assert_eq!(loaded.hidden_clickup_spaces, ["901"]);
+                    inbox.clear_tracker_filters();
+                    assert!(inbox.state.hidden_clickup_spaces.is_empty());
+                })
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn jira_and_linear_filters_keep_their_own_lists(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, _| {
+                    inbox.snapshot.jira_projects = vec![space("PRJ", "Project")];
+                    inbox.snapshot.linear_teams = vec![space("t1", "Team")];
+                    inbox.state.source = "jira".into();
+                    assert_eq!(inbox.tracker_options().0, "PROJECTS");
+                    inbox.toggle_tracker_option("PRJ".into());
+                    assert_eq!(inbox.state.hidden_jira_projects, ["PRJ"]);
+                    inbox.state.source = "linear".into();
+                    assert_eq!(inbox.tracker_options().0, "TEAMS");
+                    inbox.toggle_tracker_option("t1".into());
+                    assert_eq!(inbox.state.hidden_linear_teams, ["t1"]);
+                    assert!(inbox.state.hidden_clickup_spaces.is_empty());
+                })
+            })
+            .unwrap();
+    }
+    fn tracker_item(provider: &str, id: &str, title: &str) -> Item {
+        Item {
+            provider: provider.into(),
+            kind: provider.into(),
+            id: id.into(),
+            identifier: id.into(),
+            title: title.into(),
+            ..Default::default()
+        }
+    }
+    fn two_source_inbox(inbox: &mut Inbox) {
+        inbox.snapshot.items = vec![
+            tracker_item("clickup", "a1", "Fix export"),
+            tracker_item("clickup", "b2", "Logo refresh"),
+            tracker_item("clickup", "c3", "Logo colours"),
+            tracker_item("linear", "ENG-1", "Linear one"),
+            tracker_item("linear", "ENG-2", "Linear two"),
+        ];
+        inbox.state.source = "clickup".into();
+        inbox.selected = None;
+    }
+    fn typed(inbox: &Inbox, cx: &App) -> String {
+        inbox.search.read(cx).content.to_string()
+    }
+    fn selected_title(inbox: &Inbox) -> Option<String> {
+        inbox.item().map(|item| item.title)
+    }
+    #[gpui::test]
+    fn each_source_gets_its_search_and_selection_back(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    two_source_inbox(inbox);
+                    inbox
+                        .search
+                        .update(cx, |input, cx| input.set_text("logo".into(), cx));
+                    inbox.select(tracker_item("clickup", "c3", "").key(), cx);
+                    assert_eq!(selected_title(inbox).as_deref(), Some("Logo colours"));
+
+                    inbox.change_source("linear".into(), cx);
+                    assert_eq!(typed(inbox, cx), "");
+                    assert_eq!(selected_title(inbox).as_deref(), Some("Linear one"));
+                    inbox
+                        .search
+                        .update(cx, |input, cx| input.set_text("linear".into(), cx));
+                    inbox.select(tracker_item("linear", "ENG-2", "").key(), cx);
+
+                    inbox.change_source("clickup".into(), cx);
+                    assert_eq!(typed(inbox, cx), "logo");
+                    assert_eq!(selected_title(inbox).as_deref(), Some("Logo colours"));
+
+                    inbox.change_source("linear".into(), cx);
+                    assert_eq!(typed(inbox, cx), "linear");
+                    assert_eq!(selected_title(inbox).as_deref(), Some("Linear two"));
+                })
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn a_remembered_row_that_the_search_hides_falls_back_to_the_first_row(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    two_source_inbox(inbox);
+                    inbox.memory.set(
+                        "linear",
+                        memory::ViewMemory {
+                            search: "two".into(),
+                            selected_key: Some(tracker_item("linear", "ENG-1", "").key()),
+                            ..Default::default()
+                        },
+                    );
+                    inbox.change_source("linear".into(), cx);
+                    assert_eq!(typed(inbox, cx), "two");
+                    assert_eq!(selected_title(inbox).as_deref(), Some("Linear two"));
+                })
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn each_source_gets_its_scroll_offset_back(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    two_source_inbox(inbox);
+                    inbox.memory.set(
+                        "linear",
+                        memory::ViewMemory {
+                            scroll: 50.,
+                            ..Default::default()
+                        },
+                    );
+                    inbox.list_scroll.set_offset(point(px(0.), px(-80.)));
+
+                    inbox.change_source("linear".into(), cx);
+                    assert_eq!(inbox.list_scroll.offset().y, px(-50.));
+                    // The offset the first source was left at comes back with it.
+                    inbox.change_source("clickup".into(), cx);
+                    assert_eq!(inbox.list_scroll.offset().y, px(-80.));
+                })
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn losing_a_connection_keeps_the_old_sources_view_and_restores_the_new_ones(
+        cx: &mut TestAppContext,
+    ) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    two_source_inbox(inbox);
+                    inbox.memory.set(
+                        "linear",
+                        memory::ViewMemory {
+                            search: "gh".into(),
+                            ..Default::default()
+                        },
+                    );
+                    inbox
+                        .search
+                        .update(cx, |input, cx| input.set_text("logo".into(), cx));
+
+                    inbox.leave_source("linear".into(), cx);
+                    assert_eq!(inbox.state.source, "linear");
+                    assert_eq!(typed(inbox, cx), "gh");
+                    assert_eq!(inbox.memory.get("clickup").search, "logo");
+                    assert_eq!(inbox.memory.get("linear").search, "gh");
+                })
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn a_fresh_inbox_selects_the_first_row_with_an_empty_search(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    two_source_inbox(inbox);
+                    inbox.change_source("clickup".into(), cx);
+                    assert_eq!(typed(inbox, cx), "");
+                    assert_eq!(selected_title(inbox).as_deref(), Some("Fix export"));
+                })
+            })
+            .unwrap();
+    }
+
+    fn linked(id: i64, item: &Item) -> Session {
+        Session {
+            id,
+            title: format!("Thread {id}"),
+            provider: "claude".into(),
+            cwd: "/repo".into(),
+            provider_id: None,
+            has_messages: true,
+            updated_at: 0,
+            archived: false,
+            pinned: false,
+            work_item: Some(item.work_item()),
+        }
+    }
+    #[gpui::test]
+    fn a_busy_linked_session_counts_as_running_for_its_item(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    let item = Item {
+                        provider: "github".into(),
+                        kind: "issue".into(),
+                        repo: "acme/web".into(),
+                        number: 9,
+                        url: "https://github.com/acme/web/issues/9".into(),
+                        ..Default::default()
+                    };
+                    let other = Item {
+                        number: 10,
+                        url: "https://github.com/acme/web/issues/10".into(),
+                        ..item.clone()
+                    };
+                    inbox.sessions = vec![linked(1, &item), linked(2, &item), linked(3, &other)];
+                    assert_eq!(inbox.running_sessions(&item), 0);
+                    inbox.set_busy(HashSet::from([2, 3, 77]), cx);
+                    assert_eq!(inbox.running_sessions(&item), 1);
+                    assert_eq!(inbox.running_sessions(&other), 1);
+                    inbox.set_busy(HashSet::new(), cx);
+                    assert_eq!(inbox.running_sessions(&item), 0);
+                })
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn clickup_tasks_without_a_custom_id_do_not_share_related_threads(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    let task = |id: &str| Item {
+                        provider: "clickup".into(),
+                        kind: "clickup".into(),
+                        repo: "Design".into(),
+                        number: 0,
+                        id: id.into(),
+                        url: format!("https://app.clickup.com/t/{id}"),
+                        ..Default::default()
+                    };
+                    let (a, b) = (task("a1"), task("b2"));
+                    inbox.sessions = vec![linked(1, &a)];
+                    inbox.set_busy(HashSet::from([1]), cx);
+                    assert_eq!(inbox.related_sessions(&a).len(), 1);
+                    assert_eq!(inbox.running_sessions(&a), 1);
+                    assert_eq!(inbox.related_sessions(&b).len(), 0);
+                    assert_eq!(inbox.running_sessions(&b), 0);
+                })
+            })
+            .unwrap();
+    }
+    struct ListFixture {
+        inbox: Entity<Inbox>,
+    }
+    impl Render for ListFixture {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let inbox = self.inbox.clone();
+            div()
+                .size_full()
+                .child(inbox.update(cx, |inbox, cx| inbox.list_view(cx)))
+        }
+    }
+    #[gpui::test]
+    fn the_list_draws_a_running_rows_spinner_and_tracks_its_scroll(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(500.), px(700.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| {
+                    let inbox = cx.new(|cx| {
+                        let store = Arc::new(Mutex::new(
+                            monocode_core::store::Store::open(std::path::Path::new(":memory:"))
+                                .unwrap(),
+                        ));
+                        let mut view = Inbox::new_inner(
+                            store,
+                            vec![],
+                            PathBuf::from("/private/tmp/inbox-regression"),
+                            false,
+                            cx,
+                        );
+                        let mut item = tracker_item("clickup", "a1", "Fix export");
+                        item.url = "https://app.clickup.com/t/a1".into();
+                        view.sessions = vec![linked(4, &item)];
+                        view.snapshot.items = vec![item];
+                        view.snapshot.connections.insert(
+                            "clickup".into(),
+                            model::Status {
+                                connected: true,
+                                ..Default::default()
+                            },
+                        );
+                        view.state.source = "clickup".into();
+                        view.busy = HashSet::from([4]);
+                        view
+                    });
+                    cx.new(|_| ListFixture { inbox })
+                },
+            )
+            .unwrap()
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |fixture, _, cx| {
+                let inbox = fixture.inbox.read(cx);
+                assert_eq!(inbox.running_sessions(&inbox.snapshot.items[0]), 1);
+                assert!(inbox.list_scroll.bounds().size.height > px(0.));
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn send_to_agent_on_a_pull_request_starts_a_session_for_it(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        let started = Rc::new(RefCell::new(vec![]));
+        window
+            .update(cx, |fixture, _, cx| {
+                let seen = started.clone();
+                cx.subscribe(&fixture.inbox, move |_, _, event: &Event, _| {
+                    if let Event::StartSession { item, prompt } = event {
+                        seen.borrow_mut().push((
+                            item.kind.clone(),
+                            item.work_item().number,
+                            prompt.clone(),
+                        ));
+                    }
+                })
+                .detach();
+                fixture.inbox.update(cx, |inbox, cx| {
+                    inbox.snapshot.items = vec![Item {
+                        provider: "github".into(),
+                        kind: "pr".into(),
+                        repo: "acme/web".into(),
+                        number: 7,
+                        title: "Fix retries".into(),
+                        url: "https://github.com/acme/web/pull/7".into(),
+                        ..Default::default()
+                    }];
+                    inbox.selected = Some(inbox.snapshot.items[0].key());
+                    inbox.start(cx);
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            *started.borrow(),
+            [(
+                "pr".to_string(),
+                7,
+                "Work on this GitHub pull request:\n\n#7 Fix retries\nhttps://github.com/acme/web/pull/7\n"
+                    .to_string()
+            )]
+        );
+    }
+    #[test]
+    fn clickup_wording_follows_the_react_inbox() {
+        assert_eq!(assigned_label("clickup"), "Assigned to me (newest 100)");
+        assert_eq!(assigned_label("jira"), "Assigned to me");
+        assert_eq!(assigned_label("gitlab"), "Needs my attention");
+        let task = Item {
+            provider: "clickup".into(),
+            kind: "clickup".into(),
+            team_name: "Eng".into(),
+            project_name: "Sprint 4".into(),
+            ..Default::default()
+        };
+        assert_eq!(item_kind_label(&task), "Task");
+        assert_eq!(source_label(&task, true), "Eng / Sprint 4");
+        let no_list = Item {
+            project_name: String::new(),
+            ..task.clone()
+        };
+        assert_eq!(source_label(&no_list, true), "Eng");
+        let jira = Item {
+            provider: "jira".into(),
+            kind: "issue".into(),
+            team_name: "PRJ".into(),
+            project_name: "ignored".into(),
+            ..Default::default()
+        };
+        assert_eq!(item_kind_label(&jira), "Issue");
+        assert_eq!(source_label(&jira, true), "PRJ");
+    }
+    #[test]
+    fn clickup_has_its_own_mark_and_needs_only_a_token() {
+        assert_eq!(provider_art("clickup").0, "inbox-clickup");
+        assert!(
+            crate::assets::Assets
+                .load("inbox-clickup")
+                .unwrap()
+                .is_some()
+        );
+        let clickup = connect_fields("clickup");
+        assert!(clickup.token && !clickup.url && !clickup.email);
+        let jira = connect_fields("jira");
+        assert!(jira.token && jira.url && jira.email);
+        let linear = connect_fields("linear");
+        assert!(linear.token && !linear.url && !linear.email);
+        let github = connect_fields("github");
+        assert!(!github.token && !github.url && !github.email);
+        assert!(connect_hint("clickup").contains("ClickUp"));
+        assert!(!connect_hint("clickup").to_lowercase().contains("email"));
+        assert_eq!(CLICKUP_TOKEN_URL, "https://app.clickup.com/settings/apps");
     }
 
     #[test]

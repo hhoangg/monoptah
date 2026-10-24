@@ -4,11 +4,12 @@
 use super::*;
 use crate::popover::{Menu, MenuAction, MenuEvent, MenuItem, Popover, menu_popover};
 
-const CATEGORIES: [(&str, &str, &str); 6] = [
+const CATEGORIES: [(&str, &str, &str); 7] = [
     ("time", "Scheduled", "clock"),
     ("github", "GitHub", "inbox-github"),
     ("linear", "Linear", "inbox-linear"),
     ("jira", "Jira", "inbox-jira"),
+    ("clickup", "ClickUp", "inbox-clickup"),
     ("gitlab", "GitLab", "inbox-gitlab"),
     ("azuredevops", "Azure DevOps", "inbox-azuredevops"),
 ];
@@ -60,14 +61,14 @@ impl TriggerMenu {
             let ready = kind == "time" || connected.get(kind).copied().unwrap_or(false);
             let color = match kind {
                 "jira" => rgb(0x2684ff).into(),
+                "clickup" => rgb(0x8930fd).into(),
                 "gitlab" => rgb(0xfc6d26).into(),
                 _ => content(if ready { 0.8 } else { 0.35 }),
             };
             let action = MenuAction::new(kind, label).icon(mark).icon_color(color);
-            let action = if kind == "gitlab" {
-                action.icon_artwork("inbox-gitlab-color.svg")
-            } else {
-                action
+            let action = match color_artwork(kind) {
+                Some(path) => action.icon_artwork(path),
+                None => action,
             };
             let action = if ready {
                 action.submenu(
@@ -182,5 +183,66 @@ impl Automations {
         self.project_picker = None;
         self.trigger_menu = Some(menu);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, WindowOptions};
+
+    struct Host;
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    fn actions(connected: bool, cx: &mut TestAppContext) -> Vec<MenuAction> {
+        let window = cx
+            .update(|cx| cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Host)))
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                let connections = HashMap::from([("clickup".to_string(), connected)]);
+                let menu = cx.new(|cx| TriggerMenu::new(connections, window, cx));
+                let menu = menu.read(cx);
+                TriggerMenu::items(&menu.search, &menu.connected, cx)
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        MenuItem::Action(action) => Some(*action),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn connected_clickup_offers_task_appeared(cx: &mut TestAppContext) {
+        let actions = actions(true, cx);
+        let clickup = actions
+            .iter()
+            .find(|action| &*action.id == "clickup")
+            .expect("ClickUp category");
+        assert_eq!(&*clickup.label, "ClickUp");
+        assert!(!clickup.disabled);
+        assert_eq!(clickup.icon_artwork, Some("inbox-clickup.svg"));
+        let events: Vec<_> = clickup
+            .submenu
+            .iter()
+            .map(|action| (&*action.id, &*action.label))
+            .collect();
+        assert_eq!(events, [("clickup:issue_created", "Task appeared")]);
+    }
+
+    #[gpui::test]
+    fn disconnected_clickup_is_not_selectable(cx: &mut TestAppContext) {
+        let actions = actions(false, cx);
+        let clickup = actions
+            .iter()
+            .find(|action| &*action.id == "clickup")
+            .expect("ClickUp category");
+        assert!(clickup.disabled && clickup.submenu.is_empty());
     }
 }

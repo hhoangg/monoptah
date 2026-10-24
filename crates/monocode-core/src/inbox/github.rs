@@ -122,41 +122,59 @@ pub struct GitHubPrChecks {
     pub checks: Vec<GitHubPrCheck>,
 }
 
+/// `HOST/OWNER/NAME` for a git remote URL, the form `gh` takes for a repository
+/// argument. The host is carried along so an Enterprise checkout is not asked
+/// about on github.com.
+fn git_remote_repo_target(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    // scheme://[user@]host/owner/name, or the scp-like git@host:owner/name.
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let rest = rest.split_once('@').map(|(_, rest)| rest).unwrap_or(rest);
+    let (host, path) = rest.split_once([':', '/'])?;
+    let (owner, name) = path.trim_matches('/').split_once('/')?;
+    if host.is_empty() || owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    if [host, owner, name]
+        .iter()
+        .any(|part| part.chars().any(char::is_whitespace))
+    {
+        return None;
+    }
+    Some(format!("{host}/{owner}/{name}"))
+}
+
 pub(super) fn git_github_repositories_for(root: &Path) -> Result<Vec<String>, String> {
-    let json = gh_checked(root, &["repo", "view", "--json", "nameWithOwner,parent"])?;
+    // Name the repository rather than letting `gh` pick one: with no argument it
+    // prefers a remote called `upstream` over `origin`, so a fork that tracks its
+    // parent would list the parent's issues. Without a parseable origin the bare
+    // call keeps working as before.
+    let target = super::run_git(root, &["remote", "get-url", "origin"])
+        .ok()
+        .as_deref()
+        .and_then(git_remote_repo_target);
+    let mut args = vec!["repo", "view"];
+    if let Some(target) = target.as_deref() {
+        args.push(target);
+    }
+    args.extend(["--json", "nameWithOwner"]);
+    let json = gh_checked(root, &args)?;
     parse_github_repositories(&json)
 }
 
+/// The one repository a project belongs to. A fork's parent is deliberately left
+/// out: its issues and pull requests are somebody else's work.
 fn parse_github_repositories(json: &str) -> Result<Vec<String>, String> {
-    #[derive(Deserialize)]
-    struct Owner {
-        login: String,
-    }
-    #[derive(Deserialize)]
-    struct Parent {
-        name: String,
-        owner: Owner,
-    }
     #[derive(Deserialize)]
     struct View {
         #[serde(rename = "nameWithOwner")]
         name_with_owner: String,
-        #[serde(default)]
-        parent: Option<Parent>,
     }
 
     let view: View = serde_json::from_str(json).map_err(|error| error.to_string())?;
     let (owner, name) = split_github_repo(&view.name_with_owner)?;
-    let mut repos = vec![format!("{owner}/{name}")];
-    if let Some(parent) = view.parent {
-        let parent = format!("{}/{}", parent.owner.login, parent.name);
-        let (owner, name) = split_github_repo(&parent)?;
-        let parent = format!("{owner}/{name}");
-        if !repos[0].eq_ignore_ascii_case(&parent) {
-            repos.push(parent);
-        }
-    }
-    Ok(repos)
+    Ok(vec![format!("{owner}/{name}")])
 }
 
 pub(super) fn git_github_work_items_for(
@@ -1347,5 +1365,72 @@ fn git_diff_full_context(root: &Path, base: &str, head: &str) -> Result<(String,
         Ok((String::new(), true))
     } else {
         Ok((output, false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_github_repositories_leaves_a_forks_parent_out() {
+        let json = r#"{
+            "nameWithOwner": "EricRasputin/monocode-eric",
+            "parent": {
+                "name": "monocode",
+                "owner": { "login": "hardbeat920" }
+            }
+        }"#;
+        assert_eq!(
+            parse_github_repositories(json).unwrap(),
+            vec!["EricRasputin/monocode-eric"]
+        );
+    }
+
+    #[test]
+    fn parse_github_repositories_reads_a_repo_of_its_own() {
+        let json = r#"{ "nameWithOwner": "hhoangg/monoptah" }"#;
+        assert_eq!(
+            parse_github_repositories(json).unwrap(),
+            vec!["hhoangg/monoptah"]
+        );
+    }
+
+    #[test]
+    fn remote_url_names_the_repo_with_its_host() {
+        for url in [
+            "https://github.com/hhoangg/monoptah.git",
+            "https://github.com/hhoangg/monoptah",
+            "https://user@github.com/hhoangg/monoptah.git",
+            "git@github.com:hhoangg/monoptah.git",
+            "ssh://git@github.com/hhoangg/monoptah.git",
+            "  https://github.com/hhoangg/monoptah.git/  ",
+        ] {
+            assert_eq!(
+                git_remote_repo_target(url).as_deref(),
+                Some("github.com/hhoangg/monoptah"),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enterprise_host_is_kept_so_gh_asks_the_right_server() {
+        assert_eq!(
+            git_remote_repo_target("git@github.acme.com:team/web.git").as_deref(),
+            Some("github.acme.com/team/web")
+        );
+    }
+
+    #[test]
+    fn a_url_without_an_owner_and_name_names_nothing() {
+        for url in [
+            "",
+            "https://github.com/",
+            "https://github.com/monoptah",
+            "   ",
+        ] {
+            assert!(git_remote_repo_target(url).is_none(), "{url}");
+        }
     }
 }

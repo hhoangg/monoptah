@@ -3,6 +3,8 @@
 mod avatar;
 mod diff;
 mod document;
+mod memory;
+mod running;
 mod ui;
 
 use crate::{
@@ -14,13 +16,14 @@ use crate::{
 };
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
-    ListState, Pixels, Subscription, px,
+    ListState, Pixels, ScrollHandle, Subscription, point, px,
 };
 use monocode_core::{
     inbox::{self as model, Checks, Details, Diff, Item, Service, Snapshot, Thread, ViewState},
     store::Session,
 };
 use std::{
+    collections::HashSet,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -52,6 +55,11 @@ pub(crate) struct Inbox {
     search: Entity<Input>,
     comment: Entity<Input>,
     summary_scroll: ListState,
+    /// Tracks the item list so each source's scroll offset can be remembered.
+    list_scroll: ScrollHandle,
+    memory: memory::ViewMemories,
+    /// Ids of the sessions running a turn right now, pushed by the shell.
+    busy: HashSet<i64>,
     summary_width: std::rc::Rc<std::cell::Cell<Pixels>>,
     activity: Vec<ui::Activity>,
     activity_revision: u64,
@@ -90,6 +98,11 @@ pub(crate) struct Inbox {
     connect_url: Entity<Input>,
     connect_email: Entity<Input>,
     connect_token: Entity<Input>,
+    /// ClickUp workspaces the typed token reaches, when it reaches several.
+    connect_workspaces: Vec<model::OptionRow>,
+    connect_team: Option<String>,
+    /// The token `connect_workspaces` was looked up for.
+    connect_lookup: String,
     connecting: bool,
     connect_error: Option<String>,
     start_project: PathBuf,
@@ -226,6 +239,9 @@ impl Inbox {
             search,
             comment,
             summary_scroll: ListState::new(0, ListAlignment::Top, px(200.)),
+            list_scroll: ScrollHandle::new(),
+            memory: Default::default(),
+            busy: HashSet::new(),
             summary_width: Default::default(),
             activity: vec![],
             activity_revision: 0,
@@ -264,6 +280,9 @@ impl Inbox {
             connect_url,
             connect_email,
             connect_token,
+            connect_workspaces: vec![],
+            connect_team: None,
+            connect_lookup: String::new(),
             connecting: false,
             connect_error: None,
             start_project: cwd,
@@ -301,6 +320,13 @@ impl Inbox {
         }
     }
 
+    pub(crate) fn set_busy(&mut self, busy: HashSet<i64>, cx: &mut Context<Self>) {
+        if self.busy != busy {
+            self.busy = busy;
+            cx.notify();
+        }
+    }
+
     pub(crate) fn set_appearances(
         &mut self,
         appearances: std::collections::HashMap<
@@ -324,8 +350,8 @@ impl Inbox {
             if let Some(item) = self.item() {
                 self.state.seen.mark(&item);
                 self.save();
-            } else if let Some(item) = self.visible_items(cx).first() {
-                self.select(item.key(), cx);
+            } else if let Some(key) = self.initial_key(cx) {
+                self.select(key, cx);
             }
         }
         cx.notify();
@@ -434,7 +460,7 @@ impl Inbox {
                             .is_some_and(|s| s.connected)
                     })
                 {
-                    this.state.source = source.into();
+                    this.leave_source(source.into(), cx);
                 }
                 this.save();
                 cx.emit(Event::ItemsChanged(appeared));
@@ -449,9 +475,9 @@ impl Inbox {
                 }
                 if this.active
                     && this.selected.is_none()
-                    && let Some(item) = this.visible_items(cx).first()
+                    && let Some(key) = this.initial_key(cx)
                 {
-                    this.select(item.key(), cx);
+                    this.select(key, cx);
                 }
                 if std::mem::take(&mut this.refresh_queued) {
                     this.refresh(cx);
@@ -530,18 +556,45 @@ impl Inbox {
         cx.notify();
     }
     fn change_source(&mut self, source: String, cx: &mut Context<Self>) {
+        self.leave_source(source, cx);
+        if let Some(key) = self.initial_key(cx) {
+            self.select(key, cx);
+        }
+        self.save();
+        cx.notify();
+    }
+    /// Saves the view of the current source and shows `source` with the search
+    /// and scroll it was left with. The selection is left for the caller.
+    fn leave_source(&mut self, source: String, cx: &mut Context<Self>) {
+        self.remember_view(cx);
         self.state.source = source;
         self.selected = None;
         self.details = None;
         self.document = None;
         self.comments.clear();
+        let view = self.memory.get(&self.state.source);
         self.search
-            .update(cx, |input, cx| input.set_text(String::new(), cx));
-        if let Some(item) = self.visible_items(cx).first() {
-            self.select(item.key(), cx);
-        }
-        self.save();
-        cx.notify();
+            .update(cx, |input, cx| input.set_text(view.search, cx));
+        self.list_scroll.set_offset(point(px(0.), px(-view.scroll)));
+    }
+    fn remember_view(&mut self, cx: &App) {
+        let view = memory::ViewMemory {
+            search: self.search.read(cx).content.to_string(),
+            selected_key: self.selected.clone(),
+            scroll: -f32::from(self.list_scroll.offset().y),
+            list_limit: None,
+        };
+        self.memory.set(&self.state.source, view);
+    }
+    /// The row to show for the current source: the one it was left on when that
+    /// row is still listed, else the first.
+    fn initial_key(&self, cx: &App) -> Option<String> {
+        let items = self.visible_items(cx);
+        self.memory
+            .get(&self.state.source)
+            .selected_key
+            .filter(|key| items.iter().any(|item| item.key() == *key))
+            .or_else(|| items.first().map(Item::key))
     }
     fn load_detail(&mut self, clear: bool, cx: &mut Context<Self>) {
         let Some(item) = self.item() else {
@@ -760,7 +813,7 @@ impl Inbox {
                 .map(|(c, _)| format!("{}: {}", c.author, c.body))
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let prompt = item.prompt(&format!("{body}\n\n{discussion}"), false);
+            let prompt = start_prompt(&item, &format!("{body}\n\n{discussion}"));
             cx.emit(Event::StartSession {
                 item: Box::new(item),
                 prompt,
@@ -793,8 +846,14 @@ impl Inbox {
             .update(cx, |input, cx| input.set_text(status.email, cx));
         self.connect_token
             .update(cx, |input, cx| input.set_text(String::new(), cx));
+        self.reset_workspaces();
         self.connect_provider = Some(provider);
         cx.notify();
+    }
+    fn reset_workspaces(&mut self) {
+        self.connect_workspaces.clear();
+        self.connect_team = None;
+        self.connect_lookup.clear();
     }
     fn connect(&mut self, disconnect: bool, cx: &mut Context<Self>) {
         if self.connecting {
@@ -815,22 +874,49 @@ impl Inbox {
             cx.notify();
             return;
         }
+        // Choices looked up for another token no longer apply.
+        if self.connect_lookup != token {
+            self.reset_workspaces();
+        }
+        let team = if provider == "clickup" && !disconnect && !self.connect_workspaces.is_empty() {
+            let Some(team) = self.connect_team.clone() else {
+                self.connect_error = Some("Choose a workspace".into());
+                cx.notify();
+                return;
+            };
+            Some(team)
+        } else {
+            None
+        };
         self.connecting = true;
         self.connect_error = None;
         let service = self.service.clone();
         let source = provider.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { service.connect(&source, url, email, token) });
+        let typed = token.clone();
+        let task = cx.background_executor().spawn(async move {
+            if source == "clickup" {
+                clickup_connect(&service, token, team)
+            } else {
+                service
+                    .connect(&source, url, email, token)
+                    .map(Connected::Status)
+            }
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.connecting = false;
                 match result {
-                    Ok(status) => {
+                    Ok(Connected::Workspaces(workspaces)) => {
+                        this.connect_workspaces = workspaces;
+                        this.connect_team = None;
+                        this.connect_lookup = typed;
+                    }
+                    Ok(Connected::Status(status)) => {
                         let connected = status.connected;
                         this.snapshot.connections.insert(provider.clone(), status);
                         this.connect_token.update(cx, |input, cx| input.set_text(String::new(), cx));
+                        this.reset_workspaces();
                         if connected || disconnect {
                             this.connect_provider = None;
                             if connected { this.change_source(provider, cx); }
@@ -882,5 +968,172 @@ impl Inbox {
         })
         .detach();
         cx.notify();
+    }
+}
+
+enum Connected {
+    Status(model::Status),
+    Workspaces(Vec<model::OptionRow>),
+}
+#[derive(Debug, PartialEq)]
+enum WorkspaceStep {
+    Connect(Option<String>),
+    Choose,
+}
+/// One workspace connects directly; none is left to the backend to explain.
+fn workspace_step(workspaces: &[model::OptionRow]) -> WorkspaceStep {
+    match workspaces {
+        [] => WorkspaceStep::Connect(None),
+        [only] => WorkspaceStep::Connect(Some(only.id.clone())),
+        _ => WorkspaceStep::Choose,
+    }
+}
+/// Blocking: looks the token's workspaces up unless the team is already known.
+/// An empty token disconnects.
+fn clickup_connect(
+    service: &Service,
+    token: String,
+    team: Option<String>,
+) -> Result<Connected, String> {
+    if team.is_some() || token.trim().is_empty() {
+        return service.connect_clickup(token, team).map(Connected::Status);
+    }
+    let workspaces = service.clickup_workspaces(token.clone())?;
+    match workspace_step(&workspaces) {
+        WorkspaceStep::Choose => Ok(Connected::Workspaces(workspaces)),
+        WorkspaceStep::Connect(team) => service.connect_clickup(token, team).map(Connected::Status),
+    }
+}
+/// Mirrors inboxStartDraft for pull requests: no body, the agent reads it itself.
+fn pull_request_prompt(item: &Item) -> String {
+    let (provider, kind) = match item.provider.as_str() {
+        "gitlab" => ("GitLab", "merge request"),
+        "azuredevops" => ("ADO", "pull request"),
+        _ => ("GitHub", "pull request"),
+    };
+    let title = item.title.trim();
+    let title = if title.is_empty() {
+        format!("{provider} {kind} #{}", item.number)
+    } else {
+        title.to_string()
+    };
+    let mut lines = vec![
+        format!("Work on this {provider} {kind}:"),
+        String::new(),
+        format!("#{} {title}", item.number),
+    ];
+    if !item.url.trim().is_empty() {
+        lines.push(item.url.trim().to_string());
+    }
+    format!("{}\n", lines.join("\n"))
+}
+/// Mirrors inboxStartDraft for ClickUp tasks; other providers use the generic prompt.
+fn start_prompt(item: &Item, context: &str) -> String {
+    if item.kind == "pr" {
+        return pull_request_prompt(item);
+    }
+    if item.provider != "clickup" {
+        return item.prompt(context, false);
+    }
+    let id = item.reference();
+    let title = item.title.trim();
+    let mut lines = vec![
+        "Work on this ClickUp task:".to_string(),
+        String::new(),
+        format!("{id} {}", if title.is_empty() { &id } else { title }),
+    ];
+    if !item.url.trim().is_empty() {
+        lines.push(item.url.trim().to_string());
+    }
+    if !context.trim().is_empty() {
+        lines.push(String::new());
+        lines.push(context.trim().to_string());
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn row(id: &str, name: &str) -> model::OptionRow {
+        model::OptionRow {
+            id: id.into(),
+            name: name.into(),
+            key: String::new(),
+        }
+    }
+    #[test]
+    fn a_token_reaching_one_workspace_connects_directly() {
+        assert_eq!(
+            workspace_step(&[row("1", "A")]),
+            WorkspaceStep::Connect(Some("1".into()))
+        );
+        // No workspace: let the backend explain why.
+        assert_eq!(workspace_step(&[]), WorkspaceStep::Connect(None));
+    }
+    #[test]
+    fn a_token_reaching_several_workspaces_asks_which_one() {
+        assert_eq!(
+            workspace_step(&[row("1", "A"), row("2", "B")]),
+            WorkspaceStep::Choose
+        );
+    }
+    #[test]
+    fn pull_request_drafts_name_the_request_like_the_react_app() {
+        let pr = |provider: &str, title: &str| Item {
+            provider: provider.into(),
+            kind: "pr".into(),
+            number: 12,
+            title: title.into(),
+            url: "https://example.com/12".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            start_prompt(&pr("github", "Fix retries"), "Body text"),
+            "Work on this GitHub pull request:\n\n#12 Fix retries\nhttps://example.com/12\n"
+        );
+        assert_eq!(
+            start_prompt(&pr("gitlab", "Fix retries"), ""),
+            "Work on this GitLab merge request:\n\n#12 Fix retries\nhttps://example.com/12\n"
+        );
+        assert_eq!(
+            start_prompt(&pr("azuredevops", ""), ""),
+            "Work on this ADO pull request:\n\n#12 ADO pull request #12\nhttps://example.com/12\n"
+        );
+    }
+    #[test]
+    fn clickup_drafts_name_the_task_like_the_react_app() {
+        let item = Item {
+            provider: "clickup".into(),
+            kind: "clickup".into(),
+            identifier: "ENG-42".into(),
+            title: "Fix auth".into(),
+            url: "https://app.clickup.com/t/86abc".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            start_prompt(&item, "Body text\n\nAda: hi"),
+            "Work on this ClickUp task:\n\nENG-42 Fix auth\nhttps://app.clickup.com/t/86abc\n\nBody text\n\nAda: hi\n"
+        );
+        let bare = Item {
+            identifier: String::new(),
+            number: 7,
+            url: String::new(),
+            ..item.clone()
+        };
+        assert_eq!(
+            start_prompt(&bare, "  "),
+            "Work on this ClickUp task:\n\n#7 Fix auth\n"
+        );
+    }
+    #[test]
+    fn other_providers_keep_the_generic_prompt() {
+        let item = Item {
+            provider: "jira".into(),
+            title: "T".into(),
+            identifier: "PRJ-1".into(),
+            ..Default::default()
+        };
+        assert_eq!(start_prompt(&item, "b"), item.prompt("b", false));
     }
 }

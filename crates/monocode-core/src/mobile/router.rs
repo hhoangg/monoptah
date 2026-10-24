@@ -46,7 +46,7 @@ impl Mapping {
                     *port,
                     *local,
                     3600,
-                    "MonoCode mobile",
+                    "Monoptah mobile",
                 )
                 .map_err(|e| e.to_string()),
         }
@@ -134,7 +134,7 @@ fn map() -> Result<Mapping, String> {
             igd_next::PortMappingProtocol::UDP,
             local,
             3600,
-            "MonoCode mobile",
+            "Monoptah mobile",
         )
         .map_err(|e| e.to_string())?;
     Ok(Mapping::Upnp {

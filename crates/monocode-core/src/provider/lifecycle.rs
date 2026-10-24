@@ -12,7 +12,7 @@ impl Protocol {
     ) -> Result<(), String> {
         let confirmation = mcp_confirmation(&request);
         let Some((title, content)) = confirmation else {
-            events.push(Event::Status("This MCP server requested a form or browser sign-in that MonoCode does not support yet. Complete it in the server's own interface.".into()));
+            events.push(Event::Status("This MCP server requested a form or browser sign-in that Monoptah does not support yet. Complete it in the server's own interface.".into()));
             return write_json(
                 stdin,
                 json!({"id":wire,"result":{"action":"cancel","content":null,"_meta":null}}),

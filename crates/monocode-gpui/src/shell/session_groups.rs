@@ -1,5 +1,6 @@
 //! Sidebar.tsx's session actions: pins, renames, GitHub links, reminders,
 //! folders and deletion, and the grouped list they shape.
+use super::project_removal::{DeleteOptions, provider_cleanup_request, remove_unused_worktree};
 use super::*;
 use chrono::{Local, NaiveDateTime, TimeZone};
 use gpui::EventEmitter;
@@ -173,10 +174,9 @@ impl Shell {
         }
     }
     pub(super) fn delete_sidebar_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ids: Vec<_> = self.selected_sessions.iter().copied().collect();
-        for id in ids {
-            self.delete_session(id, window, cx);
-        }
+        let mut ids: Vec<_> = self.selected_sessions.iter().copied().collect();
+        ids.sort_unstable();
+        self.request_delete_sessions(ids, window, cx);
     }
     pub(super) fn sidebar_drop_at(
         &self,
@@ -447,7 +447,7 @@ impl Shell {
                     .submenu(vec![
                         MenuAction::new("copy-harness-session-id", "Harness session ID")
                             .disabled(summary.provider_id.is_none()),
-                        MenuAction::new("copy-monocode-session-id", "MonoCode session ID"),
+                        MenuAction::new("copy-monocode-session-id", "Monoptah session ID"),
                     ])
                     .into(),
                 MenuAction::new(
@@ -612,11 +612,7 @@ impl Shell {
                     }
                 }
             }
-            "delete" => {
-                for id in ids {
-                    self.delete_session(id, window, cx);
-                }
-            }
+            "delete" => self.request_delete_sessions(ids, window, cx),
             _ => {}
         }
     }
@@ -748,6 +744,17 @@ impl Shell {
     }
 
     pub(super) fn delete_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_session_with(id, DeleteOptions::default(), window, cx);
+    }
+    /// Deletes the session, then, on the same background task, what `options`
+    /// asks for. The record is read before its row goes.
+    pub(super) fn delete_session_with(
+        &mut self,
+        id: i64,
+        options: DeleteOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.workspace.review_owners.iter().any(|(pane, owner)| {
             *owner == id
                 && (self.workspace.tab_of(*pane).is_some()
@@ -783,19 +790,36 @@ impl Shell {
             if let Some(previous) = previous {
                 previous.await;
             }
+            let removed = store.clone();
             let work = cx.background_executor().spawn(async move {
-                locked(&store)?.delete(id)?;
+                let (request, data_dir) = {
+                    let store = locked(&removed)?;
+                    let request = options
+                        .provider_files
+                        .then(|| provider_cleanup_request(&store, id))
+                        .flatten();
+                    (request, store.data_dir().map(std::path::Path::to_path_buf))
+                };
+                locked(&removed)?.delete(id)?;
                 // Drop the session's recorded turns and their Git refs.
                 if let Some(checkpoints) = monocode_core::checkpoint::store() {
                     let _ = checkpoints.exclusive(|c| c.forget(&id.to_string()));
                 }
-                Ok::<_, String>(())
+                Ok::<_, String>((request, data_dir))
             });
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.deleting.remove(&id);
                 match result {
-                    Ok(()) => this.forget_session(id, cx),
+                    Ok((request, data_dir)) => {
+                        this.forget_session(id, cx);
+                        // The row is gone, so the file cleanup and the worktree
+                        // removal run apart from the group writes: they can be
+                        // slow and nothing queued behind them depends on them.
+                        if request.is_some() || options.worktree.is_some() {
+                            this.finish_delete(store, request, data_dir, options.worktree, cx);
+                        }
+                    }
                     Err(error) => {
                         this.error = Some(format!("Could not delete the session: {error}"))
                     }
@@ -805,6 +829,51 @@ impl Shell {
                 cx.notify();
             });
         }));
+    }
+    /// Removes a deleted session's provider files and unused worktree. Problems
+    /// are only logged or noted: the row is already gone.
+    fn finish_delete(
+        &mut self,
+        store: Database,
+        request: Option<monocode_core::provider_cleanup::CleanupRequest>,
+        data_dir: Option<std::path::PathBuf>,
+        worktree: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let cleanup = self.provider_cleanup.clone();
+        let work = cx.background_executor().spawn(async move {
+            if let Some(request) = request {
+                for problem in cleanup(data_dir.as_deref(), &request) {
+                    eprintln!("Provider session cleanup: {problem}");
+                }
+            }
+            worktree.map(|path| {
+                remove_unused_worktree(&store, &path)
+                    .map(|()| path.clone())
+                    .map_err(|error| (path, error))
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let worktree = work.await;
+            let _ = this.update(cx, |this, cx| {
+                match worktree {
+                    Some(Ok(path)) => {
+                        use monocode_core::files::is_equal_or_inside;
+                        this.worktree_focus
+                            .retain(|_, focus| !is_equal_or_inside(&focus.path, &path));
+                        this.sync_git(cx);
+                    }
+                    Some(Err((_, error))) => {
+                        this.error = Some(format!(
+                            "The session was deleted. Its worktree was kept: {error} You can manage it in Settings > Worktrees."
+                        ))
+                    }
+                    None => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
     fn forget_session(&mut self, id: i64, cx: &mut Context<Self>) {
         // A tab opened on it while the store was deleting keeps it alive.
@@ -826,7 +895,9 @@ impl Shell {
         self.session_marks.remove(&id);
         self.tab_marks.remove(&id);
         self.order.retain(|s| *s != id);
-        self.busy_sessions.remove(&id);
+        if self.busy_sessions.remove(&id) {
+            self.push_inbox_busy(cx);
+        }
         self.unseen_finished.remove(&id);
         self.selected_sessions.remove(&id);
         self.reminders.retain(|r| r.session_id != id);
@@ -2380,6 +2451,8 @@ mod tests {
                 });
                 shell.open(a, w, cx);
                 shell.run_menu(MenuTarget::Session(a), "delete", None, w, cx);
+                assert!(shell.session_summaries.contains_key(&a), "asks first");
+                shell.confirm_delete_dialog(w, cx);
                 shell.open(a, w, cx);
                 assert_ne!(
                     shell.workspace.active,

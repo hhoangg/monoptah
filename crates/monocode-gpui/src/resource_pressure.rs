@@ -398,9 +398,9 @@ impl ResourceMonitor {
                                     .line_height(px(19.5))
                                     .text_color(content(0.5))
                                     .child(if active {
-                                        "No running work found in MonoCode. Other apps may be using these resources."
+                                        "No running work found in Monoptah. Other apps may be using these resources."
                                     } else {
-                                        "No running work found in MonoCode."
+                                        "No running work found in Monoptah."
                                     }),
                             )
                         },

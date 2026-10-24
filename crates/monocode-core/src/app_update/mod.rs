@@ -5,6 +5,7 @@ mod install;
 #[cfg(test)]
 mod tests;
 
+use crate::brand::NATIVE_PRODUCT;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use minisign_verify::{PublicKey, Signature};
 use semver::Version;
@@ -17,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-pub const APP_ID: &str = "dev.usemono.gpui";
+pub const APP_ID: &str = crate::brand::NATIVE_APP_ID;
 pub const CHANNEL: &str = "native-preview";
 const MAX_FEED: u64 = 2 * 1024 * 1024;
 const MAX_PACKAGE: u64 = 1024 * 1024 * 1024;
@@ -60,9 +61,9 @@ impl Installation {
                 .nth(3)
                 .ok_or("Cannot locate the app bundle")?;
             let plist = std::fs::read_to_string(app.join("Contents/Info.plist"))
-                .map_err(|_| "Updates require an installed Monocode Native app bundle")?;
+                .map_err(|_| format!("Updates require an installed {NATIVE_PRODUCT} app bundle"))?;
             if !plist.contains(&format!("<string>{APP_ID}</string>")) {
-                return Err("This is not a Monocode Native bundle".into());
+                return Err(format!("This is not a {NATIVE_PRODUCT} bundle"));
             }
             Ok(Self {
                 kind: PackageKind::App,
@@ -90,11 +91,11 @@ impl Installation {
                 app_id: String,
                 kind: PackageKind,
             }
-            let marker: Marker = serde_json::from_slice(
-                &std::fs::read(marker)
-                    .map_err(|_| "Updates require an installed Monocode Native package")?,
-            )
-            .map_err(|e| e.to_string())?;
+            let marker: Marker =
+                serde_json::from_slice(&std::fs::read(marker).map_err(|_| {
+                    format!("Updates require an installed {NATIVE_PRODUCT} package")
+                })?)
+                .map_err(|e| e.to_string())?;
             let supported = if cfg!(windows) {
                 marker.kind == PackageKind::Nsis
             } else {
@@ -296,7 +297,7 @@ fn request(url: &str) -> Result<ureq::Response, String> {
         .timeout_read(Duration::from_secs(60))
         .build()
         .get(url)
-        .set("User-Agent", "Monocode-Native-Updater")
+        .set("User-Agent", "Monoptah-Native-Updater")
         .set("Accept-Encoding", "identity")
         .call()
         .map_err(|e| e.to_string())?;

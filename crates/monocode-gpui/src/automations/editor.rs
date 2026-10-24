@@ -46,12 +46,32 @@ pub(super) fn events(kind: &str) -> Vec<(String, String)> {
         ],
         "linear" => &[("issue_created", "Issue created")],
         "jira" => &[("issue_created", "Issue appeared")],
+        "clickup" => &[("issue_created", "Task appeared")],
         "azuredevops" => &[
             ("pull_request_appeared", "Pull request appeared"),
             ("work_item_appeared", "Work item appeared"),
         ],
         _ => &[],
     })
+}
+/// Picker rows for a ClickUp trigger. The trigger stores the space id so a
+/// rename keeps the filter working; the name is only what the user reads.
+pub(super) fn space_options(spaces: &[(String, String)], saved: &str) -> Vec<(String, String)> {
+    let mut options = vec![(String::new(), "Any space".to_string())];
+    options.extend(spaces.iter().cloned());
+    let saved = saved.trim();
+    // Not in the live list (deleted, or still loading): keep the saved id
+    // selectable rather than silently widening the filter.
+    if !saved.is_empty() && !options.iter().any(|(id, _)| id == saved) {
+        options.push((saved.to_string(), format!("Space {saved}")));
+    }
+    options
+}
+pub(super) fn space_label(spaces: &[(String, String)], saved: &str) -> String {
+    space_options(spaces, saved)
+        .into_iter()
+        .find(|(id, _)| id == saved.trim())
+        .map_or_else(|| "Any space".into(), |(_, name)| name)
 }
 fn section(label: &'static str) -> gpui::Div {
     div()
@@ -221,6 +241,14 @@ impl Automations {
                 if let Some(fields) = editor.fields.iter().find(|f| f.id == id) {
                     fields
                         .time
+                        .update(cx, |input, cx| input.set_text(value, cx));
+                }
+            }
+            Choice::Space(id) => {
+                // The input is what `collected` saves, so the choice goes there.
+                if let Some(fields) = editor.fields.iter().find(|f| f.id == id) {
+                    fields
+                        .repos
                         .update(cx, |input, cx| input.set_text(value, cx));
                 }
             }
@@ -464,7 +492,30 @@ impl Automations {
                     })),
             );
         let mut result = div().child(row);
-        if trigger.kind != "time"
+        if trigger.kind == "clickup"
+            && let Some(fields) = fields
+        {
+            let saved = fields.repos.read(cx).content.to_string();
+            let saved = saved.split(',').next().unwrap_or_default().trim();
+            result = result.child(
+                div()
+                    .pl(px(24.))
+                    .pb(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(11.))
+                    .text_color(content(0.4))
+                    .child("Space")
+                    .child(self.select_control(
+                        ("trigger-space", index),
+                        space_label(&self.clickup_spaces, saved),
+                        Choice::Space(trigger.id.clone()),
+                        space_options(&self.clickup_spaces, saved),
+                        cx,
+                    )),
+            );
+        } else if trigger.kind != "time"
             && let Some(fields) = fields
         {
             result = result.child(

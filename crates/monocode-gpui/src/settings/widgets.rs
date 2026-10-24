@@ -265,6 +265,7 @@ impl SettingsView {
                     | "paced-reveal"
                     | "composer-autocorrect"
                     | "format-on-save"
+                    | "inline-blame"
                     | "composer-mascot"
                     | "empty-session-games"
                     | "show-remaining-usage"

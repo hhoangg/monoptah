@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 const UNAVAILABLE: &str = "This isn’t available for projects on another machine yet.";
-const OUTDATED: &str = "Update MonoCode Host in Connections settings to use this project’s files.";
+const OUTDATED: &str = "Update Monoptah Host in Connections settings to use this project’s files.";
 
 pub fn is_remote(path: &Path) -> bool {
     path.to_str()
@@ -72,6 +72,7 @@ fn host_arguments(command: &str, args: Value) -> Result<(String, Value), String>
             | "git_diff_index"
             | "git_diff_files"
             | "git_diff_stats"
+            | "git_blame"
             | "git_file_diff"
             | "git_stage_contents"
             | "git_stage_file"
@@ -274,6 +275,12 @@ mod tests {
             json!({"from":"remote://a/home/code/a", "destParent":"/tmp"})
         )
         .is_err());
+        let (_, args) = host_arguments(
+            "git_blame",
+            json!({"cwd":"remote://linux/home/code","relative":"a.txt"}),
+        )
+        .unwrap();
+        assert_eq!(args, json!({"cwd":"/home/code","relative":"a.txt"}));
         assert!(host_arguments("terminal_spawn", json!({"cwd":"remote://a/home/code"})).is_err());
     }
 

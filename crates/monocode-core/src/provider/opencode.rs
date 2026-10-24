@@ -232,7 +232,7 @@ fn generation(request: &Request, cancel: &AtomicBool) -> Result<bool, String> {
     let re = regex::Regex::new(r"(\d+)\.(\d+)\.(\d+)").unwrap();
     let version = re.captures(&output).ok_or_else(|| {
         format!(
-            "Unable to determine OpenCode version from {:?}. MonoCode requires v1.14.19 or newer.",
+            "Unable to determine OpenCode version from {:?}. Monoptah requires v1.14.19 or newer.",
             output.trim().chars().take(200).collect::<String>()
         )
     })?;
@@ -249,7 +249,7 @@ fn generation(request: &Request, cancel: &AtomicBool) -> Result<bool, String> {
             &version[0]
         )),
         _ => Err(format!(
-            "OpenCode v{} is not supported. MonoCode supports OpenCode v1 and v2.",
+            "OpenCode v{} is not supported. Monoptah supports OpenCode v1 and v2.",
             &version[0]
         )),
     }

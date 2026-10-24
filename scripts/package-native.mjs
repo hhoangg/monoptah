@@ -64,7 +64,7 @@ async function linuxTree(directory, binary, kind) {
   await chmod(join(app, "monocode-gpui"), 0o755);
   await writeFile(
     join(app, "native-install.json"),
-    JSON.stringify({ app_id: "dev.usemono.gpui", kind }),
+    JSON.stringify({ app_id: "com.monoptah.native", kind }),
   );
   await notices(join(app, "licenses"));
   await mkdir(join(directory, "usr/bin"), { recursive: true });
@@ -75,7 +75,7 @@ async function linuxTree(directory, binary, kind) {
   );
   await mkdir(join(directory, "usr/share/applications"), { recursive: true });
   const desktop =
-    "[Desktop Entry]\nType=Application\nName=Monocode Native\nExec=monocode-native %F\nIcon=monocode-native\nCategories=Development;\nTerminal=false\nStartupWMClass=dev.usemono.gpui\n";
+    "[Desktop Entry]\nType=Application\nName=Monoptah Native\nExec=monocode-native %F\nIcon=monocode-native\nCategories=Development;\nTerminal=false\nStartupWMClass=com.monoptah.native\n";
   await writeFile(
     join(directory, "usr/share/applications/monocode-native.desktop"),
     desktop,
@@ -103,7 +103,7 @@ export async function packageNative({
     encoding: "utf8",
     stdio: ["ignore", "pipe", "inherit"],
   }).stdout.trim();
-  if (embedded !== `Monocode Native ${version}`)
+  if (embedded !== `Monoptah Native ${version}`)
     throw new Error(`Native executable version does not match ${version}`);
   await mkdir(out, { recursive: true });
   const work = join(out, "work");
@@ -138,7 +138,7 @@ export async function packageNative({
         },
       },
     );
-    const app = join(dirname(binary), "Monocode Native.app");
+    const app = join(dirname(binary), "Monoptah Native.app");
     if (
       !process.env.APPLE_SIGNING_IDENTITY ||
       process.env.APPLE_SIGNING_IDENTITY === "-"
@@ -184,18 +184,18 @@ export async function packageNative({
       `MonocodeNative_${version}_${name}.app.tar.gz`,
       `darwin-${arch}-app`,
     );
-    run("tar", ["-czf", archive, "-C", dirname(app), "Monocode Native.app"], {
+    run("tar", ["-czf", archive, "-C", dirname(app), "Monoptah Native.app"], {
       env: { ...process.env, COPYFILE_DISABLE: "1" },
     });
     const imageRoot = join(work, "dmg");
     await mkdir(imageRoot);
-    run("ditto", [app, join(imageRoot, "Monocode Native.app")]);
+    run("ditto", [app, join(imageRoot, "Monoptah Native.app")]);
     run("ln", ["-s", "/Applications", join(imageRoot, "Applications")]);
     const dmg = add(`MonocodeNative_${version}_${name}.dmg`);
     run("hdiutil", [
       "create",
       "-volname",
-      "Monocode Native",
+      "Monoptah Native",
       "-srcfolder",
       imageRoot,
       "-ov",
@@ -216,7 +216,7 @@ export async function packageNative({
     await mkdir(join(debRoot, "DEBIAN"));
     await writeFile(
       join(debRoot, "DEBIAN/control"),
-      `Package: monocode-native\nVersion: ${version.replace("-preview.", "~preview.")}\nArchitecture: amd64\nMaintainer: Monocode maintainers\nSection: devel\nPriority: optional\nDepends: libasound2, libfontconfig1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-xcb1, libxcb1, libxcb-shape0, libxcb-xfixes0, libxcb-randr0, libegl1, libvulkan1, libdbus-1-3, pkexec | policykit-1\nDescription: Monocode Native experimental preview\n`,
+      `Package: monocode-native\nVersion: ${version.replace("-preview.", "~preview.")}\nArchitecture: amd64\nMaintainer: Monoptah maintainers\nSection: devel\nPriority: optional\nDepends: libasound2, libfontconfig1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-xcb1, libxcb1, libxcb-shape0, libxcb-xfixes0, libxcb-randr0, libegl1, libvulkan1, libdbus-1-3, pkexec | policykit-1\nDescription: Monoptah Native experimental preview\n`,
     );
     run("dpkg-deb", [
       "--build",
@@ -261,7 +261,7 @@ export async function packageNative({
     const spec = join(top, "SPECS/monocode-native.spec");
     await writeFile(
       spec,
-      `Name: monocode-native\nVersion: ${parsed.base}\nRelease: 0.preview.${parsed.sequence}%{?dist}\nSummary: Monocode Native experimental preview\nLicense: MIT AND Apache-2.0\nBuildArch: x86_64\nRequires: polkit\n%description\nMonocode Native experimental preview.\n%install\nmkdir -p %{buildroot}\ncp -a %{_sourcedir}/tree/. %{buildroot}/\n%files\n/usr/bin/monocode-native\n/usr/lib/monocode-native\n/usr/share/applications/monocode-native.desktop\n/usr/share/icons/hicolor/256x256/apps/monocode-native.png\n`,
+      `Name: monocode-native\nVersion: ${parsed.base}\nRelease: 0.preview.${parsed.sequence}%{?dist}\nSummary: Monoptah Native experimental preview\nLicense: MIT AND Apache-2.0\nBuildArch: x86_64\nRequires: polkit\n%description\nMonoptah Native experimental preview.\n%install\nmkdir -p %{buildroot}\ncp -a %{_sourcedir}/tree/. %{buildroot}/\n%files\n/usr/bin/monocode-native\n/usr/lib/monocode-native\n/usr/share/applications/monocode-native.desktop\n/usr/share/icons/hicolor/256x256/apps/monocode-native.png\n`,
     );
     run("rpmbuild", [
       "--define",
@@ -288,7 +288,7 @@ export async function packageNative({
     await cp(binary, join(stage, "monocode-gpui.exe"));
     await writeFile(
       join(stage, "native-install.json"),
-      JSON.stringify({ app_id: "dev.usemono.gpui", kind: "nsis" }),
+      JSON.stringify({ app_id: "com.monoptah.native", kind: "nsis" }),
     );
     await notices(join(stage, "licenses"));
     const installer = add(

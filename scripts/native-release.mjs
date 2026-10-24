@@ -48,7 +48,7 @@ export function nativeManifest({ version, baseUrl, artifacts, notes = "" }) {
     if (!platforms[target])
       throw new Error(`Missing native package: ${target}`);
   return {
-    app_id: "dev.usemono.gpui",
+    app_id: "com.monoptah.native",
     channel: "native-preview",
     version,
     notes,

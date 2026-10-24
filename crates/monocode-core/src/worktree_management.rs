@@ -61,6 +61,26 @@ pub fn remove(cwd: &Path, path: &Path) -> Result<(), String> {
     crate::provider::discard_worktree(Path::new(&tree.path));
     crate::git::git(cwd, &["worktree", "remove", "--force", "--", &tree.path]).map(|_| ())
 }
+/// Deletes a worktree a deleted session left behind, only when nothing is lost:
+/// a linked worktree on a branch, not locked, without uncommitted or untracked
+/// changes (re-checked by Git, which is run without `--force`). The branch and
+/// its commits stay.
+pub fn remove_clean(path: &Path) -> Result<(), String> {
+    let snapshot = crate::git::snapshot(path)?;
+    let main = snapshot
+        .worktrees
+        .first()
+        .ok_or("No main working copy found")?;
+    let main = Path::new(&main.path);
+    let tree = check(main, path)?;
+    if status(main, &tree).1 != Some(false) {
+        return Err("This worktree has uncommitted or untracked changes.".into());
+    }
+    crate::provider::discard_worktree(Path::new(&tree.path));
+    // No `--force`: Git itself refuses a worktree that gained changes since the
+    // check above, or one holding submodules.
+    crate::git::git(main, &["worktree", "remove", "--", &tree.path]).map(|_| ())
+}
 
 #[cfg(test)]
 mod tests {
@@ -94,6 +114,37 @@ mod tests {
             &["show-ref", "--verify", "refs/heads/settings-parity"]
         )
         .is_ok());
+        let _ = std::fs::remove_dir(default_root(dir.path()));
+    }
+    #[test]
+    fn a_clean_leftover_worktree_is_removed_with_its_branch_kept() {
+        let dir = repo();
+        let tree = crate::git::create_named_worktree(dir.path(), "session-leftover").unwrap();
+        let path = Path::new(&tree.path);
+
+        remove_clean(path).unwrap();
+
+        assert!(!path.exists());
+        assert!(crate::git::git(
+            dir.path(),
+            &["show-ref", "--verify", "refs/heads/session-leftover"]
+        )
+        .is_ok());
+        let _ = std::fs::remove_dir(default_root(dir.path()));
+    }
+    #[test]
+    fn a_leftover_worktree_with_changes_or_the_main_copy_is_kept() {
+        let dir = repo();
+        let tree = crate::git::create_named_worktree(dir.path(), "session-dirty").unwrap();
+        let path = Path::new(&tree.path);
+        std::fs::write(path.join("untracked"), "work in progress").unwrap();
+
+        assert!(remove_clean(path).unwrap_err().contains("uncommitted"));
+        assert!(path.join("untracked").is_file());
+        assert!(remove_clean(dir.path()).unwrap_err().contains("main"));
+        assert!(dir.path().join("file").is_file());
+
+        remove(dir.path(), path).unwrap();
         let _ = std::fs::remove_dir(default_root(dir.path()));
     }
     #[test]

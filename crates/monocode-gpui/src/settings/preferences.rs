@@ -55,6 +55,10 @@ pub(crate) struct Preferences {
     pub autocorrect: bool,
     pub format_on_save: bool,
     pub autosave: bool,
+    /// The cursor line's author, age and subject after its text.
+    pub editor_inline_blame: bool,
+    /// A blame column before the line numbers.
+    pub editor_blame_column: bool,
     pub diff_view: String,
     pub composer_mascot: bool,
     pub empty_session_games: bool,
@@ -135,6 +139,8 @@ impl Default for Preferences {
             autocorrect: true,
             format_on_save: true,
             autosave: false,
+            editor_inline_blame: true,
+            editor_blame_column: false,
             diff_view: "editor".into(),
             composer_mascot: true,
             empty_session_games: true,

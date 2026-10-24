@@ -280,7 +280,7 @@ impl Store {
         ] {
             if !columns.contains(required) {
                 return Err(format!(
-                    "Unsupported Monocode database: missing sessions.{required}. No schema changes were made."
+                    "Unsupported Monoptah database: missing sessions.{required}. No schema changes were made."
                 ));
             }
         }
@@ -420,7 +420,7 @@ impl Store {
     }
     pub(super) fn shared_writable(&self) -> Result<(), String> {
         if self.shared.as_ref().unwrap().read_only {
-            Err("This Monocode store is read-only".into())
+            Err("This Monoptah store is read-only".into())
         } else {
             Ok(())
         }
@@ -1244,6 +1244,21 @@ impl Store {
         }))? {
             let (id, path) = sql(row)?;
             out.insert(self.shared_register(&id)?, path);
+        }
+        Ok(out)
+    }
+    pub(super) fn shared_working_dirs(&self) -> Result<Vec<(i64, String)>, String> {
+        let mut query = sql(self.conn.prepare(&format!(
+            "SELECT id, COALESCE(NULLIF({},''), cwd) FROM sessions WHERE {}=0",
+            self.shared_field("worktree_cwd", "NULL"),
+            self.shared_field("worktree_removed", "0")
+        )))?;
+        let rows =
+            sql(query.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, dir) = sql(row)?;
+            out.push((self.shared_register(&id)?, dir));
         }
         Ok(out)
     }

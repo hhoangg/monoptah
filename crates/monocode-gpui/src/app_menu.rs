@@ -3,7 +3,9 @@
 //! view cannot handle are disabled.
 use crate::{
     Quit,
-    file_editor::{Find, Format, ReloadFile, Replace, Save, ToggleAutosave, ToggleWordWrap},
+    file_editor::{
+        Find, Format, ReloadFile, Replace, Save, ToggleAutosave, ToggleGitBlame, ToggleWordWrap,
+    },
     input,
     shell::*,
 };
@@ -16,7 +18,7 @@ actions!(application, [Hide, HideOthers, ShowAll]);
 #[action(namespace = application, no_json)]
 pub(crate) struct OpenUrl(pub &'static str);
 
-const REPO: &str = "https://github.com/hardbeat920/monocode";
+const REPO: &str = "https://github.com/hhoangg/monoptah";
 
 pub(crate) fn bind(cx: &mut App) {
     cx.on_action(|_: &Hide, cx| cx.hide());
@@ -34,17 +36,17 @@ pub(crate) fn bind(cx: &mut App) {
 
 pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
     cx.set_menus(vec![
-        Menu::new("Monocode Native").items([
-            MenuItem::action("About Monocode Native", About),
+        Menu::new("Monoptah Native").items([
+            MenuItem::action("About Monoptah Native", About),
             MenuItem::separator(),
             MenuItem::action("Settings…", OpenSettings),
             MenuItem::action("Check for Updates…", CheckForUpdates),
             MenuItem::separator(),
-            MenuItem::action("Hide Monocode Native", Hide),
+            MenuItem::action("Hide Monoptah Native", Hide),
             MenuItem::action("Hide Others", HideOthers),
             MenuItem::action("Show All", ShowAll),
             MenuItem::separator(),
-            MenuItem::action("Quit Monocode Native", Quit),
+            MenuItem::action("Quit Monoptah Native", Quit),
         ]),
         Menu::new("File").items([
             MenuItem::action("Open Project…", OpenProject),
@@ -97,6 +99,7 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
             MenuItem::action("Inbox", OpenInbox),
             MenuItem::action("Notes", OpenNotes),
             MenuItem::action("Toggle Terminal", ToggleTerminal),
+            MenuItem::action("Toggle Git Blame", ToggleGitBlame).checked(prefs.editor_blame_column),
             MenuItem::action("Switch Model…", SwitchModel),
             MenuItem::separator(),
             MenuItem::action("Previous Session", PreviousSession),
@@ -122,20 +125,20 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
             MenuItem::action("Zoom", ZoomWindow),
         ]),
         Menu::new("Help").items([
-            MenuItem::action("MonoCode Website", OpenUrl("https://usemono.dev")),
+            MenuItem::action("Monoptah Website", OpenUrl("https://zptah.app")),
             MenuItem::action("View on GitHub", OpenUrl(REPO)),
             MenuItem::separator(),
             MenuItem::action(
                 "Report a Bug…",
                 OpenUrl(concat!(
-                    "https://github.com/hardbeat920/monocode",
+                    "https://github.com/hhoangg/monoptah",
                     "/issues/new?template=bug_report.yml"
                 )),
             ),
             MenuItem::action(
                 "Request a Feature…",
                 OpenUrl(concat!(
-                    "https://github.com/hardbeat920/monocode",
+                    "https://github.com/hhoangg/monoptah",
                     "/issues/new?template=feature_request.yml"
                 )),
             ),

@@ -76,6 +76,13 @@ pub struct Changed;
 pub(crate) enum CodeAction {
     Stage(usize),
     Revert(usize),
+    /// A blame cell or annotation was clicked.
+    OpenCommit(BlameCommit),
+}
+pub(crate) struct BlameCommit {
+    pub sha: String,
+    pub short_sha: String,
+    pub subject: String,
 }
 pub struct Rejected(pub &'static str);
 
@@ -494,7 +501,7 @@ impl Input {
         self.clear_folds();
         self.content = text.into();
         self.lines.clear();
-        self.code_changed();
+        self.code_changed(None);
         self.selection = self.content.len()..self.content.len();
         self.reversed = false;
         self.marked = None;
@@ -1015,7 +1022,10 @@ impl Input {
     fn mouse_down(&mut self, e: &MouseDownEvent, w: &mut Window, cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         crate::traffic_lights::focus_content(w);
-        if self.code_fold_down(e, cx) || self.code_scrollbar_down(e, w, cx) {
+        if self.code_fold_down(e, cx)
+            || self.code_scrollbar_down(e, w, cx)
+            || self.blame_down(e, cx)
+        {
             return;
         }
         w.focus(&self.focus, cx);
@@ -1049,6 +1059,7 @@ impl Input {
     }
     fn mouse_move(&mut self, e: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.code_hover(e, cx);
+        self.blame_hover(e, cx);
         if self.code_scrollbar_move(e, cx) {
             return;
         }
@@ -1204,7 +1215,7 @@ impl EntityInputHandler for Input {
         )
         .into();
         let end = r.start + text.len();
-        self.code_changed();
+        self.code_changed(Some((r.clone(), text.len())));
         self.selection = end..end;
         self.reversed = false;
         self.marked = None;
@@ -1257,7 +1268,7 @@ impl EntityInputHandler for Input {
         )
         .into();
         let text = text.to_owned();
-        self.code_changed();
+        self.code_changed(Some((r.clone(), text.len())));
         self.marked = (!text.is_empty()).then_some(r.start..r.start + text.len());
         let selection = selection
             .map(|s| r.start + from16(&text, s.start)..r.start + from16(&text, s.end))
@@ -1723,6 +1734,11 @@ impl Render for Input {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.blame_leave(cx);
+                }
+            }))
             .child(if self.code.is_some() {
                 code::CodeElement { input: cx.entity() }.into_any_element()
             } else {

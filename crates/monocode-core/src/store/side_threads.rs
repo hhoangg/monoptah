@@ -193,6 +193,24 @@ fn provider(blocks: &[Value], owner: usize, thread: &Value, fallback: &str) -> O
     (!matches!(kind, Kind::Fx | Kind::Hermes | Kind::Antigravity)).then(|| kind.id().into())
 }
 impl Store {
+    /// Provider thread ids of every saved side (btw) conversation that ran on
+    /// Codex, whether or not it can be shown. `harness` is the session's own,
+    /// which a thread without one inherits. Empty outside the desktop store.
+    pub fn codex_side_thread_ids(&self, id: i64, harness: &str) -> Result<Vec<String>, String> {
+        if self.shared.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        for block in self.shared_blocks(id)? {
+            for thread in block["btwThreads"].as_array().into_iter().flatten() {
+                let on_codex = thread["harness"].as_str().unwrap_or(harness) == "codex";
+                if let Some(thread_id) = thread["providerThreadId"].as_str().filter(|_| on_codex) {
+                    ids.push(thread_id.to_owned());
+                }
+            }
+        }
+        Ok(ids)
+    }
     pub fn desktop_side_threads(&self, id: i64) -> Result<Vec<DesktopSideThread>, String> {
         if self.shared.is_none() {
             return Ok(Vec::new());

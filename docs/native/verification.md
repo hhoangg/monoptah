@@ -20,7 +20,7 @@ remaining runtime and platform work.
 | Production Rust workspace | 698 tests passed, 1 SSH fixture ignored; formatting and strict Clippy passed |
 | Production macOS packaging | Tauri release `.app` built and its local ad-hoc signature verified |
 | Native macOS commands | `native:dev` built and launched; `native:build` produced an optimized app without launching it; both bundle signatures verified |
-| Native database defaults | Dev opened `Monocode Development/monocode.db`; release `--check-data` read the production database without migration |
+| Native database defaults | Dev opened `Monoptah Development/monocode.db`; release `--check-data` read the production database without migration |
 | Native UI and chat | Provider order, live Codex streaming, Stop, saved history after relaunch, resumed provider context, and file preview/source passed |
 | Native release UI | Restored existing workspace and conversation history from a consistent production database snapshot |
 | macOS notifications | Reminder appeared in Notification Center; opening it returned from Settings to the matching chat and cleared the reminder |

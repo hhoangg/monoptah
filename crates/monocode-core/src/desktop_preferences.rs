@@ -702,6 +702,25 @@ mod tests {
     }
 
     #[test]
+    fn editor_blame_settings_follow_the_desktop_app() {
+        let mut workspace = json!({});
+        prefs(&[]).apply_workspace(&mut workspace);
+        assert_eq!(workspace["preferences"]["editor_inline_blame"], true);
+        assert_eq!(workspace["preferences"]["editor_blame_column"], false);
+        let changed = prefs(&[
+            ("monocode.editorInlineBlame", json!(false)),
+            ("monocode.editorBlameColumn", json!(true)),
+        ]);
+        changed.apply_workspace(&mut workspace);
+        assert_eq!(workspace["preferences"]["editor_inline_blame"], false);
+        assert_eq!(workspace["preferences"]["editor_blame_column"], true);
+        // A native edit survives until the desktop value changes.
+        workspace["preferences"]["editor_blame_column"] = json!(false);
+        changed.apply_workspace(&mut workspace);
+        assert_eq!(workspace["preferences"]["editor_blame_column"], false);
+    }
+
+    #[test]
     fn unavailable_preferences_preserve_the_entire_workspace() {
         let mut workspace = json!({
             "projects": ["/code/native"],
@@ -727,8 +746,7 @@ mod tests {
             return;
         };
         let linux = dir.join("localstorage/tauri_localhost_0.localstorage");
-        let macos = crate::accounts::home()
-            .map(|home| home.join("Library/WebKit/com.monocode.desktop/WebsiteData/Default"));
+        let macos = crate::accounts::home().map(|home| webview::webkit_root(&home));
         if !linux.is_file() && macos.as_ref().is_none_or(|root| !root.is_dir()) {
             return;
         }

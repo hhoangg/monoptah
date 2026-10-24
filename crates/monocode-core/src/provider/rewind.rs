@@ -97,7 +97,7 @@ pub fn rewind_last_turn(
         let state = rpc.call("get_state", json!({}))?;
         return pi_binding(&state).ok_or_else(|| "Pi did not expose the forked session".into());
     }
-    rpc.call("initialize", json!({"clientInfo":{"name":"monocode_native","title":"MonoCode Native","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}))?;
+    rpc.call("initialize", json!({"clientInfo":{"name":"monocode_native","title":"Monoptah Native","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}))?;
     write_json(&mut rpc.wire.stdin, json!({"method":"initialized"}))?;
     let resumed = rpc.call(
         "thread/resume",

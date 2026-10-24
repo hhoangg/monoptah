@@ -78,7 +78,7 @@ fn rows(cwd: &str, state: Option<&Snapshot>, query: &str) -> Vec<Row> {
     });
     rows
 }
-fn pretty_path(path: &str) -> String {
+pub(crate) fn pretty_path(path: &str) -> String {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
         && let Ok(rest) = Path::new(path).strip_prefix(home)
     {

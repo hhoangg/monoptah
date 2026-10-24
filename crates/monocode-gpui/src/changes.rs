@@ -746,7 +746,7 @@ impl Changes {
         }
         if self.amend.is_some() && index.as_ref().is_some_and(|i| i.head_pushed) {
             questions.push((
-                "Amend a commit that is already pushed? MonoCode cannot push the result. You will need a force push from the terminal.".into(),
+                "Amend a commit that is already pushed? Monoptah cannot push the result. You will need a force push from the terminal.".into(),
                 "Amend",
             ));
         }

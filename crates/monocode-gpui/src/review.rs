@@ -461,6 +461,23 @@ impl ReviewPane {
                 if let FileEvent::WordWrap(wrap) = event {
                     cx.emit(ReviewEvent::WordWrap(*wrap));
                 }
+                if let FileEvent::OpenCommit {
+                    cwd,
+                    sha,
+                    short_sha,
+                    subject,
+                } = event
+                {
+                    this.open(
+                        ReviewTab::Commit {
+                            cwd: cwd.clone(),
+                            sha: sha.clone(),
+                            short_sha: short_sha.clone(),
+                            subject: subject.clone(),
+                        },
+                        cx,
+                    );
+                }
                 if matches!(event, FileEvent::SaveFailed) {
                     this.pending_close = None;
                     this.close_prompted = false;
@@ -2293,6 +2310,60 @@ mod tests {
                     cx,
                 );
                 assert_eq!(pane.sources.len(), 2);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn clicking_blame_in_a_file_tab_opens_the_commit_beside_it(cx: &mut gpui::TestAppContext) {
+        let repo = Repo::new();
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        let cwd = repo.cwd();
+        let path = repo.0.join("a.txt").to_string_lossy().into_owned();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                cx.new(|cx| {
+                    let mut pane = ReviewPane::new(git, Default::default(), cx);
+                    pane.open(
+                        ReviewTab::File {
+                            cwd: cwd.clone(),
+                            path: path.clone(),
+                        },
+                        cx,
+                    );
+                    pane
+                })
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |pane, _, cx| {
+                let input = pane.active_editor().unwrap().read(cx).input.clone();
+                input.update(cx, |_, cx| {
+                    cx.emit(crate::input::CodeAction::OpenCommit(
+                        crate::input::BlameCommit {
+                            sha: "abcdef1234567890".into(),
+                            short_sha: "abcdef1".into(),
+                            subject: "Fix the thing".into(),
+                        },
+                    ))
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |pane, _, _| {
+                assert_eq!(pane.state.tabs.len(), 2);
+                assert_eq!(
+                    pane.state.tabs[pane.state.active],
+                    ReviewTab::Commit {
+                        cwd: cwd.clone(),
+                        sha: "abcdef1234567890".into(),
+                        short_sha: "abcdef1".into(),
+                        subject: "Fix the thing".into(),
+                    }
+                );
             })
             .unwrap();
     }

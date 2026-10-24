@@ -3,7 +3,7 @@ mod desktop;
 mod identity;
 pub(crate) use desktop::DesktopOverrides;
 pub(crate) mod login;
-mod transfer;
+pub(crate) mod transfer;
 pub use identity::Identity;
 pub use login::arguments as login_arguments;
 pub use login::{authenticate, AuthAction};

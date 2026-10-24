@@ -421,7 +421,7 @@ impl SettingsView {
                                 )
                                 .child(self.toggle(
                                     "include-skill",
-                                    format!("Include {} in MonoCode catalog", skill.name),
+                                    format!("Include {} in Monoptah catalog", skill.name),
                                     enabled,
                                     false,
                                     cx,
@@ -524,7 +524,7 @@ impl SettingsView {
             );
         }
         list = list.child(div().pt_3().text_size(px(12.)).line_height(px(16.)).text_color(content(0.4))
-            .child("Hidden skills stay on disk but leave MonoCode's picker. Provider-managed skills and commands are unchanged."));
+            .child("Hidden skills stay on disk but leave Monoptah's picker. Provider-managed skills and commands are unchanged."));
         let surface = self.skill_surface.clone();
         let view = cx.weak_entity();
         let mut layout = div()

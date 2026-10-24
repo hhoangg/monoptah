@@ -19,7 +19,7 @@ function manifest(changes = {}) {
 
 test("all native architectures and installation types have isolated versioned URLs", () => {
   const result = manifest();
-  assert.equal(result.app_id, "dev.usemono.gpui");
+  assert.equal(result.app_id, "com.monoptah.native");
   assert.equal(result.channel, "native-preview");
   assert.deepEqual(
     Object.keys(result.platforms).sort(),

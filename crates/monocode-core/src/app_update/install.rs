@@ -142,7 +142,7 @@ fn extract_app(package: &Path, directory: &Path) -> Result<(), String> {
         let mut entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
         let mut components = path.components();
-        if components.next() != Some(Component::Normal("Monocode Native.app".as_ref()))
+        if components.next() != Some(Component::Normal("Monoptah Native.app".as_ref()))
             || components.any(|c| !matches!(c, Component::Normal(_)))
         {
             return Err("The update archive contains an invalid app path".into());
@@ -182,7 +182,7 @@ fn install_mac(update: &Update, package: &Path, target: &Path) -> Result<Install
         Err(e) => return Err(e.to_string()),
     };
     extract_app(package, stage.path())?;
-    let prepared = stage.path().join("Monocode Native.app");
+    let prepared = stage.path().join("Monoptah Native.app");
     let plist =
         fs::read_to_string(prepared.join("Contents/Info.plist")).map_err(|e| e.to_string())?;
     for expected in [
@@ -270,17 +270,17 @@ mod tests {
         fs::create_dir(&stage).unwrap();
         archive(
             &package,
-            "Monocode Native.app/Contents/MacOS/monocode-gpui",
+            "Monoptah Native.app/Contents/MacOS/monocode-gpui",
             false,
         );
         extract_app(&package, &stage).unwrap();
         assert_eq!(
-            fs::read(stage.join("Monocode Native.app/Contents/MacOS/monocode-gpui")).unwrap(),
+            fs::read(stage.join("Monoptah Native.app/Contents/MacOS/monocode-gpui")).unwrap(),
             b"hello"
         );
         archive(&package, "Another.app/Contents/file", false);
         assert!(extract_app(&package, &stage).is_err());
-        archive(&package, "Monocode Native.app/escape", true);
+        archive(&package, "Monoptah Native.app/escape", true);
         assert!(extract_app(&package, &stage).is_err());
         assert!(!temp.path().join("outside").exists());
     }

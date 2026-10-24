@@ -280,7 +280,7 @@ impl Render for RemoteProjectPicker {
             }))
             .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child("Open folder on a machine"))
             .child(div().text_size(px(12.)).line_height(px(17.)).text_color(content(0.55))
-                .child("Sessions in this project run on that machine, using its checkout and its Codex or Claude Code sign-in. They keep running when you close MonoCode here."));
+                .child("Sessions in this project run on that machine, using its checkout and its Codex or Claude Code sign-in. They keep running when you close Monoptah here."));
         if !self.loaded {
             view = view.child(
                 div()

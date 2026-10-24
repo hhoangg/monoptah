@@ -8,6 +8,8 @@ use crate::{
 use gpui::{AnyElement, Task};
 use std::{cell::Cell, sync::Arc};
 
+mod blame;
+
 const TOP_PADDING: f32 = 8.;
 const BOTTOM_PADDING: f32 = 32.;
 
@@ -50,6 +52,16 @@ pub(super) struct Code {
     markers: Vec<MarkerHit>,
     hovered_marker: Option<usize>,
     affinity: Cell<Option<(usize, bool)>>,
+    blame: crate::file_editor::blame::State,
+    blame_inline: bool,
+    blame_column: bool,
+    blame_hits: Vec<blame::BlameHit>,
+    hovered_blame: Option<usize>,
+    /// The next change is these exact edits, one per line (indent, outdent),
+    /// as an editor reporting one change per line would give them.
+    line_edits: Option<Vec<crate::file_editor::blame::Splice>>,
+    /// The element's bounds as last painted, which the blame card is placed in.
+    frame: Option<Bounds<Pixels>>,
 }
 impl Code {
     fn new() -> Self {
@@ -83,6 +95,13 @@ impl Code {
             markers: Vec::new(),
             hovered_marker: None,
             affinity: Cell::new(None),
+            blame: Default::default(),
+            blame_inline: false,
+            blame_column: false,
+            blame_hits: Vec::new(),
+            hovered_blame: None,
+            line_edits: None,
+            frame: None,
         }
     }
     fn row(&self, offset: usize) -> usize {
@@ -136,7 +155,7 @@ impl Code {
         if self.diff {
             4. + 12. + digits * 7.5 + 5. + 16. + 1. + 6.
         } else {
-            4. + (digits * 7.5 + 12.).max(36.) + 12. + 1. + 6.
+            self.blame_width() + 4. + (digits * 7.5 + 12.).max(36.) + 12. + 1. + 6.
         }
     }
     fn top(&self, row: usize, line_height: f32) -> f32 {
@@ -200,6 +219,9 @@ impl Input {
         }
         self.record_undo();
         self.map_code_folds(&range, text.len());
+        // Format and replace all rewrite the whole buffer; their changes are
+        // found by diffing, not read off a range that covers everything.
+        let reported = (range != (0..self.content.len())).then(|| (range.clone(), text.len()));
         self.content = format!(
             "{}{}{}",
             &self.content[..range.start],
@@ -210,7 +232,7 @@ impl Input {
         let at = range.start + cursor.min(text.len());
         self.selection = at..at;
         self.reversed = false;
-        self.code_changed();
+        self.code_changed(reported);
         if let Some(code) = &mut self.code {
             code.suppress_completion = true;
         }
@@ -702,16 +724,22 @@ impl Input {
             }
         })
     }
-    pub(super) fn code_changed(&mut self) {
+    /// `edit` is the range of the old text a typing, paste or delete replaced
+    /// and the length of what went in; blame maps through it exactly. Without
+    /// it (undo, redo, reload, Format) the lines are diffed.
+    pub(super) fn code_changed(&mut self, edit: Option<(Range<usize>, usize)>) {
         if let Some(code) = &mut self.code {
             code.completions.clear();
             code.completion_task = None;
             code.completion_source = None;
             code.deleted_rows.clear();
             code.hovered_change = None;
-            code.offsets = std::iter::once(0)
-                .chain(self.content.match_indices('\n').map(|(at, _)| at + 1))
-                .collect();
+            let old_offsets = std::mem::replace(
+                &mut code.offsets,
+                std::iter::once(0)
+                    .chain(self.content.match_indices('\n').map(|(at, _)| at + 1))
+                    .collect(),
+            );
             code.visible.clear();
             code.reveal = true;
             code.max_width = px(0.);
@@ -725,6 +753,30 @@ impl Input {
             if let Some(edit) = crate::editor_analysis::Edit::between(&previous, &self.content) {
                 code.analysis = Arc::new(code.analysis.remapped(edit));
             }
+            if code.blame.has_lines() {
+                use crate::file_editor::blame::{Splice, diff_splices};
+                let exact = code.line_edits.take().filter(|splices| {
+                    let delta: isize = splices
+                        .iter()
+                        .map(|s| (s.to_b - s.from_b) as isize - (s.to_a - s.from_a) as isize)
+                        .sum();
+                    previous.len() as isize + delta == self.content.len() as isize
+                });
+                let splices = match (exact, edit) {
+                    (Some(exact), _) => exact,
+                    (None, Some((range, inserted)))
+                        if range.end <= previous.len()
+                            && previous.len() - range.len() + inserted == self.content.len() =>
+                    {
+                        vec![Splice::edit(&range, inserted)]
+                    }
+                    _ => diff_splices(&previous, &self.content, &old_offsets, &code.offsets),
+                };
+                code.blame
+                    .map_starts(&splices, &old_offsets, previous.len(), &code.offsets);
+            }
+            code.blame_hits.clear();
+            code.hovered_blame = None;
             code.markers.clear();
             code.affinity.set(None);
         }
@@ -778,7 +830,7 @@ impl Input {
         self.content = text;
         self.selection = selection;
         self.reversed = false;
-        self.code_changed();
+        self.code_changed(None);
         cx.emit(Changed);
         cx.notify();
     }
@@ -824,15 +876,36 @@ impl Input {
         let end = self.content[last..]
             .find('\n')
             .map_or(self.content.len(), |n| last + n);
+        // Each line changes only inside its leading whitespace, so blame is
+        // told exactly that rather than left to guess from the joined text.
+        let mut splices = Vec::new();
+        let mut shift = 0isize;
+        let mut line_start = start;
         let replacement = self.content[start..end]
             .split('\n')
             .map(|line| {
-                if outdent {
+                let (remove, add) = if outdent {
                     let remove = if line.starts_with('\t') {
                         1
                     } else {
                         line.bytes().take(4).take_while(|c| *c == b' ').count()
                     };
+                    (remove, 0)
+                } else {
+                    (0, 4)
+                };
+                if remove + add > 0 {
+                    let from_b = (line_start as isize + shift) as usize;
+                    splices.push(crate::file_editor::blame::Splice {
+                        from_a: line_start,
+                        to_a: line_start + remove,
+                        from_b,
+                        to_b: from_b + add,
+                    });
+                }
+                shift += add as isize - remove as isize;
+                line_start += line.len() + 1;
+                if outdent {
                     line[remove..].to_owned()
                 } else {
                     format!("    {line}")
@@ -842,7 +915,13 @@ impl Input {
             .join("\n");
         let removed = (end - start).saturating_sub(replacement.len());
         let inserted = replacement.len();
+        if let Some(code) = &mut self.code {
+            code.line_edits = Some(splices);
+        }
         self.replace_text_in_range(Some(self.range16(start..end)), &replacement, w, cx);
+        if let Some(code) = &mut self.code {
+            code.line_edits = None;
+        }
         if selection.is_empty() {
             self.move_to(selection.start.saturating_sub(removed).max(start), cx);
         } else {
@@ -1134,6 +1213,9 @@ impl Input {
         )
     }
     pub(super) fn code_tooltip(&self) -> Option<AnyElement> {
+        if let Some(tip) = self.blame_tooltip() {
+            return Some(tip);
+        }
         let code = self.code.as_ref()?;
         let marker = code.markers.get(code.hovered_marker?)?;
         let rail = code.rail?;
@@ -1791,6 +1873,9 @@ impl Element for CodeElement {
             point(bounds.right() - px(WIDTH), bounds.top()),
             size(px(WIDTH), bounds.size.height),
         );
+        let column = blame::column_rows(code, &state.lines, &tops, lh);
+        let inline = i.blame_inline(focused, blame::now_ms());
+        let mut blame_hits = Vec::new();
         let markers = paint_rail(i, rail, state.scroll.y, w, cx);
         let content_len = i.content.len();
         let mut snapshot = Code::new();
@@ -1807,6 +1892,14 @@ impl Element for CodeElement {
             cx,
         );
         w.with_content_mask(Some(ContentMask { bounds }), |w| {
+            blame_hits.extend(blame::paint_column(
+                &column,
+                bounds,
+                state.scroll.y,
+                lh,
+                w,
+                cx,
+            ));
             if code.diff {
                 for (top, line, number) in &state.deleted {
                     let y = bounds.top() + px(*top) - state.scroll.y;
@@ -2034,6 +2127,20 @@ impl Element for CodeElement {
                             crate::theme::content(1.),
                         ));
                     }
+                    if let Some(inline) = &inline
+                        && cursor >= start
+                        && cursor <= code.source_end(*row, content_len)
+                    {
+                        blame_hits.extend(blame::paint_inline(
+                            inline,
+                            line,
+                            point(x, y),
+                            state.text_bounds,
+                            lh,
+                            w,
+                            cx,
+                        ));
+                    }
                 }
             },
         );
@@ -2045,6 +2152,11 @@ impl Element for CodeElement {
             code.reveal = false;
             code.rail = Some(rail);
             code.markers = markers;
+            code.frame = Some(bounds);
+            if code.blame_hits != blame_hits {
+                code.hovered_blame = None;
+                code.blame_hits = blame_hits;
+            }
             for (_, line) in &state.lines {
                 code.max_width = code
                     .max_width

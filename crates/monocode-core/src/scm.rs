@@ -136,6 +136,41 @@ pub fn diff_stats(cwd: &Path) -> Result<DiffStats, String> {
     Ok(diff_stats_for(&expand_home(cwd)))
 }
 
+/// One run of consecutive working-tree lines last changed by the same commit.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlameHunk {
+    /// Full sha; all zeros for lines that are not committed yet.
+    pub sha: String,
+    pub short_sha: String,
+    pub author: String,
+    /// Unix seconds.
+    pub author_time: i64,
+    /// Commit subject.
+    pub summary: String,
+    pub uncommitted: bool,
+    /// 1-based line in the working-tree file.
+    pub start_line: usize,
+    pub line_count: usize,
+}
+
+/// The host's `git_blame` result.
+#[derive(Deserialize)]
+struct BlameResponse {
+    hunks: Vec<BlameHunk>,
+}
+
+/// Blame for the working-tree version of `relative`; empty for untracked,
+/// binary, or oversized files.
+pub fn blame(cwd: &str, relative: &str) -> Result<Vec<BlameHunk>, String> {
+    if remote_workspace::is_remote(Path::new(cwd)) {
+        let response: BlameResponse =
+            remote_workspace::command("git_blame", json!({"cwd":cwd,"relative":relative}))?;
+        return Ok(response.hunks);
+    }
+    blame_for(&expand_home(Path::new(cwd)), relative)
+}
+
 /// Changed files under `cwd` (paths relative to it), with per-file line counts,
 /// status, and branch/upstream synchronization metadata.
 pub fn diff_index(cwd: &Path) -> Result<DiffIndex, String> {
@@ -982,7 +1017,7 @@ fn with_signing_hint(error: String) -> String {
         return error;
     }
     format!(
-        "{error}\n\nGit couldn't sign this commit. MonoCode runs git without a terminal, \
+        "{error}\n\nGit couldn't sign this commit. Monoptah runs git without a terminal, \
          so your signer needs a GUI passphrase prompt (e.g. pinentry-mac) or an unlocked agent."
     )
 }
@@ -1360,6 +1395,147 @@ pub fn git_dirs(root: &Path) -> Vec<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = text.lines().map(Into::into).collect();
     dirs.dedup();
     dirs
+}
+
+fn blame_for(root: &Path, relative: &str) -> Result<Vec<BlameHunk>, String> {
+    let relative = resolve_repo_path(root, relative)?;
+    if !git_is_work_tree(root) {
+        return Err("Not a git repository".into());
+    }
+    if !blame_candidate(&root.join(&relative)) {
+        return Ok(Vec::new());
+    }
+    let output = git_cmd()
+        .arg("--no-pager")
+        .arg("-C")
+        .arg(root)
+        .args(["blame", "--porcelain", "--", &relative])
+        // The untracked check below reads git's English error text.
+        .env("LC_ALL", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(parse_blame_porcelain(&String::from_utf8_lossy(
+            &output.stdout,
+        )));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let msg = stderr.trim();
+    // A file git has never seen (untracked, or any file before the first commit)
+    // has nothing to blame.
+    if msg.contains("no such path") || msg.contains("no such ref: HEAD") {
+        return Ok(Vec::new());
+    }
+    Err(if msg.is_empty() {
+        "git blame failed".into()
+    } else {
+        msg.to_string()
+    })
+}
+
+/// False for working-tree files that are oversized or look binary (a NUL byte
+/// in the first 8 KiB). A file that cannot be inspected is left to git, which
+/// reports why.
+fn blame_candidate(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return true;
+    };
+    if file
+        .metadata()
+        .map(|meta| meta.len() > MAX_TEXT_FILE_BYTES)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let mut head = Vec::with_capacity(8192);
+    if file.take(8192).read_to_end(&mut head).is_err() {
+        return true;
+    }
+    !head.contains(&0)
+}
+
+/// Parse `git blame --porcelain` output. Commit metadata is printed only the
+/// first time a sha appears, so it is cached by sha; consecutive lines from
+/// the same commit are merged into one hunk.
+fn parse_blame_porcelain(text: &str) -> Vec<BlameHunk> {
+    struct Meta {
+        author: String,
+        author_time: i64,
+        summary: String,
+    }
+    let mut metas: HashMap<&str, Meta> = HashMap::new();
+    // (sha, final line) for every blamed line, in output order.
+    let mut lines: Vec<(&str, usize)> = Vec::new();
+    let mut current: Option<&str> = None;
+    for line in text.lines() {
+        // File content is prefixed with a tab and may look like anything.
+        if line.starts_with('\t') {
+            continue;
+        }
+        if let Some((sha, final_line)) = blame_header(line) {
+            metas.entry(sha).or_insert(Meta {
+                author: String::new(),
+                author_time: 0,
+                summary: String::new(),
+            });
+            lines.push((sha, final_line));
+            current = Some(sha);
+            continue;
+        }
+        let Some(meta) = current.and_then(|sha| metas.get_mut(sha)) else {
+            continue;
+        };
+        if let Some(value) = line.strip_prefix("author ") {
+            meta.author = value.to_string();
+        } else if let Some(value) = line.strip_prefix("author-time ") {
+            meta.author_time = value.trim().parse().unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("summary ") {
+            meta.summary = value.to_string();
+        }
+    }
+    lines.sort_by_key(|(_, line)| *line);
+    let mut hunks: Vec<BlameHunk> = Vec::new();
+    for (sha, line) in lines {
+        if let Some(last) = hunks.last_mut() {
+            if last.sha == sha && last.start_line + last.line_count == line {
+                last.line_count += 1;
+                continue;
+            }
+        }
+        let meta = &metas[sha];
+        hunks.push(BlameHunk {
+            sha: sha.to_string(),
+            short_sha: sha.chars().take(7).collect(),
+            author: meta.author.clone(),
+            author_time: meta.author_time,
+            summary: meta.summary.clone(),
+            uncommitted: sha.bytes().all(|b| b == b'0'),
+            start_line: line,
+            line_count: 1,
+        });
+    }
+    hunks
+}
+
+/// `<sha> <original line> <final line> [<group size>]`, returning the sha and
+/// the final (working-tree) line number.
+fn blame_header(line: &str) -> Option<(&str, usize)> {
+    let mut parts = line.split(' ');
+    let sha = parts.next()?;
+    if !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let _original: usize = parts.next()?.parse().ok()?;
+    let final_line: usize = parts.next()?.parse().ok()?;
+    if let Some(group) = parts.next() {
+        group.parse::<usize>().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((sha, final_line))
 }
 
 fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {

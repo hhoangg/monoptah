@@ -24,6 +24,8 @@ impl DesktopPreferences {
             ("autocorrect", "composerAutocorrect", true),
             ("format_on_save", "formatOnSave", true),
             ("autosave", "autosave", false),
+            ("editor_inline_blame", "editorInlineBlame", true),
+            ("editor_blame_column", "editorBlameColumn", false),
             ("composer_mascot", "composerRunner", true),
             ("empty_session_games", "gridArcadeEnabled", true),
             ("show_remaining_usage", "showRemainingUsage", false),

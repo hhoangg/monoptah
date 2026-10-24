@@ -574,7 +574,7 @@ impl Completion {
                 (
                     "operator",
                     "Operator",
-                    "Give this thread access to MonoCode",
+                    "Give this thread access to Monoptah",
                 ),
                 (
                     "orchestrator",

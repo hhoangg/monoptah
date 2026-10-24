@@ -55,7 +55,7 @@ impl Shell {
                 kind: gpui::WindowKind::PopUp,
                 titlebar: None,
                 is_resizable: false,
-                app_id: Some("dev.usemono.quick-composer".into()),
+                app_id: Some("com.monoptah.native.quick-composer".into()),
                 ..Default::default()
             },
             move |window, cx| {

@@ -144,7 +144,7 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share")
         });
-    base.join("Monocode Development")
+    base.join("Monoptah Development")
 }
 // The packaged app runs this binary directly: a launcher that execs it changes the
 // process's pid version, and macOS then refuses its menu bar item. The bundle
@@ -176,7 +176,11 @@ fn main() {
         .first()
         .is_some_and(|arg| arg == "--version" || arg == "-V")
     {
-        println!("Monocode Native {}", notifications::updater::version());
+        println!(
+            "{} {}",
+            monocode_core::brand::NATIVE_PRODUCT,
+            notifications::updater::version()
+        );
         return;
     }
     if cli_args.first().is_some_and(|a| a == "visual-mcp") {
@@ -244,7 +248,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "monocode-gpui [--cwd PATH] [--dev-data | --monocode-data | --monocode-db PATH]\nDevelopment builds use a separate database; release builds use the installed MonoCode database.\n--dev-data opens an isolated development database using Monocode's existing schema.\n--monocode-data opens the existing desktop monocode.db directly.\n--monocode-db PATH opens a specific desktop database.\n--fixture, --chat-fixture and --visual-fixture add local samples to isolated development data only.\nvisual docs prints the native visual SDK reference.\nvisual check/show --input FILE validates or publishes native session visuals.\nvisual-mcp runs the session visual tool server over standard input/output.\n--check-data validates and lists the selected store read-only, then exits."
+                    "monocode-gpui [--cwd PATH] [--dev-data | --monocode-data | --monocode-db PATH]\nDevelopment builds use a separate database; release builds use the installed Monoptah database.\n--dev-data opens an isolated development database using Monoptah's existing schema.\n--monocode-data opens the existing desktop monocode.db directly.\n--monocode-db PATH opens a specific desktop database.\n--fixture, --chat-fixture and --visual-fixture add local samples to isolated development data only.\nvisual docs prints the native visual SDK reference.\nvisual check/show --input FILE validates or publishes native session visuals.\nvisual-mcp runs the session visual tool server over standard input/output.\n--check-data validates and lists the selected store read-only, then exits."
                 );
                 return;
             }
@@ -256,7 +260,7 @@ fn main() {
     }
     if use_monocode && (fixture || chat_fixture || visual_fixture) {
         eprintln!(
-            "Fixtures require --dev-data; they cannot be written into your Monocode database."
+            "Fixtures require --dev-data; they cannot be written into your Monoptah database."
         );
         std::process::exit(2);
     }
@@ -298,7 +302,7 @@ fn main() {
     if check_data {
         match db.sessions() {
             Ok(sessions) => eprintln!(
-                "Database: {}\n{} saved sessions; existing Monocode schema; no import or migration.",
+                "Database: {}\n{} saved sessions; existing Monoptah schema; no import or migration.",
                 database.display(),
                 sessions.len()
             ),
@@ -410,12 +414,13 @@ fn main() {
             history::bind(cx);
             diff_view::bind(cx);
             terminal::bind(cx);
-            let modifier = if cfg!(target_os = "macos") {
-                "cmd"
-            } else {
-                "ctrl"
-            };
-            cx.bind_keys([KeyBinding::new(&format!("{modifier}-q"), Quit, None)]);
+            // Kept so the app menu shows its Cmd+Q hint. The window's key
+            // monitor takes the key press first (shell/quit_gate.rs), so this
+            // only quits directly when no monitor could be installed. Off
+            // macOS Ctrl+Q is not bound at all: the quit gate reads it as a
+            // key event, and a binding would quit before it could.
+            #[cfg(target_os = "macos")]
+            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
             shell::bind_keys(cx);
             app_menu::bind(cx);
             usage_footer::bind(cx);
@@ -439,7 +444,7 @@ fn main() {
                     // its controls as native titlebar double-click/drag gestures.
                     app_owns_titlebar_drag: cfg!(target_os = "macos"),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Monocode Native".into()),
+                        title: Some(monocode_core::brand::NATIVE_PRODUCT.into()),
                         appears_transparent: cfg!(target_os = "macos"),
                         traffic_light_position: if cfg!(target_os = "macos") {
                             // Original macOS chrome: 12 pt left inset, with

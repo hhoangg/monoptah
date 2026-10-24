@@ -6,17 +6,27 @@ use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use std::path::PathBuf;
 use std::{collections::BTreeMap, path::Path};
 
+/// The installed desktop app's WebKit storage, keyed by its bundle identifier.
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn webkit_root(home: &Path) -> std::path::PathBuf {
+    home.join("Library/WebKit")
+        .join(crate::brand::DESKTOP_APP_ID)
+        .join("WebsiteData/Default")
+}
+
+/// The installed desktop app's WebView2 profile under `%LOCALAPPDATA%`.
+#[cfg(any(windows, test))]
+fn webview2_root(local_app_data: &Path) -> PathBuf {
+    local_app_data.join(crate::brand::DESKTOP_APP_ID)
+}
+
 impl DesktopPreferences {
     pub(super) fn load_installed(data_dir: &Path) -> Self {
         #[cfg(target_os = "macos")]
         {
             let _ = data_dir;
             crate::accounts::home()
-                .map(|home| {
-                    Self::load_webkit(
-                        &home.join("Library/WebKit/com.monocode.desktop/WebsiteData/Default"),
-                    )
-                })
+                .map(|home| Self::load_webkit(&webkit_root(&home)))
                 .unwrap_or_default()
         }
         #[cfg(target_os = "linux")]
@@ -132,8 +142,7 @@ impl DesktopPreferences {
         let Some(base) = std::env::var_os("LOCALAPPDATA") else {
             return Self::default();
         };
-        let root = PathBuf::from(base).join("com.monocode.desktop");
-        Self::load_webview2_from(&root)
+        Self::load_webview2_from(&webview2_root(Path::new(&base)))
     }
 
     #[cfg(any(windows, test))]
@@ -464,6 +473,22 @@ mod tests {
         assert_eq!(
             decode_chromium_string(b"monocode.workspaceTheme").as_deref(),
             Some("monocode.workspaceTheme")
+        );
+    }
+
+    #[test]
+    fn webview2_root_uses_the_monoptah_identifier() {
+        assert_eq!(
+            webview2_root(Path::new("/local")),
+            Path::new("/local/com.monoptah.desktop")
+        );
+    }
+
+    #[test]
+    fn webkit_root_uses_the_monoptah_identifier() {
+        assert_eq!(
+            webkit_root(Path::new("/home/a")),
+            Path::new("/home/a/Library/WebKit/com.monoptah.desktop/WebsiteData/Default")
         );
     }
 

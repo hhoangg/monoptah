@@ -13,6 +13,10 @@ fn config(version: &str) -> Config {
 }
 
 #[test]
+fn updater_matches_the_native_bundle_identifier() {
+    assert_eq!(APP_ID, "com.monoptah.native");
+}
+#[test]
 fn signed_tauri_key_and_packages_work_for_each_native_target() {
     for target in [
         "darwin-aarch64-app",

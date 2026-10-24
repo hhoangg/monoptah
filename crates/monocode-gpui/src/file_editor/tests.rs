@@ -147,3 +147,196 @@ fn saving_a_clean_file_still_applies_the_format_on_save_preference(cx: &mut Test
     );
     std::fs::remove_file(path).unwrap();
 }
+
+mod blame {
+    use super::*;
+    use crate::file_editor::blame::State;
+    use monocode_core::scm::BlameHunk;
+
+    fn hunk(sha: &str, start: usize, count: usize) -> BlameHunk {
+        BlameHunk {
+            sha: format!("{sha:0<40}"),
+            short_sha: sha.into(),
+            author: format!("author-{sha}"),
+            author_time: 0,
+            summary: "summary".into(),
+            uncommitted: false,
+            start_line: start,
+            line_count: count,
+        }
+    }
+
+    /// A shown, clean editor on a file inside its project. Tests feed hunks
+    /// to `receive_blame`; `request_blame` never runs git under `cfg(test)`.
+    fn shown(
+        cx: &mut TestAppContext,
+        prefs: crate::settings::Preferences,
+    ) -> (gpui::WindowHandle<FileEditor>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("monocode-blame-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!(
+            "{}.txt",
+            cx.test_function_name().unwrap_or("blame")
+        ));
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        cx.update(|cx| cx.set_global(prefs));
+        let project = dir.to_string_lossy().into_owned();
+        let file = path.to_string_lossy().into_owned();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                let git = cx.new(|cx| ProjectGit::new(project, cx));
+                cx.new(|cx| FileEditor::new(file, git, cx))
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |e, _, cx| {
+                e.visible = true;
+                e.sync_blame_options(cx);
+            })
+            .unwrap();
+        (window, path)
+    }
+    fn state_of(e: &FileEditor, cx: &App) -> &'static str {
+        match e.input.read(cx).editor_blame_state() {
+            State::Loading => "loading",
+            State::Absent => "absent",
+            State::Lines { .. } => "lines",
+        }
+    }
+
+    #[gpui::test]
+    fn an_answer_applies_only_to_the_request_and_document_it_was_for(cx: &mut TestAppContext) {
+        let (window, path) = shown(cx, crate::settings::Preferences::default());
+        window
+            .update(cx, |e, _, cx| {
+                let text = e.input.read(cx).content.clone();
+                e.request_blame(cx);
+                let current = e.blame_generation;
+                // An older request's answer is dropped.
+                e.receive_blame(current - 1, text.clone(), Ok(vec![hunk("aaa", 1, 3)]), cx);
+                assert_eq!(state_of(e, cx), "loading");
+                e.receive_blame(current, text.clone(), Ok(vec![hunk("aaa", 1, 3)]), cx);
+                assert_eq!(state_of(e, cx), "lines");
+                // Untracked, binary, oversized and failing files have none.
+                e.request_blame(cx);
+                e.receive_blame(e.blame_generation, text.clone(), Ok(vec![]), cx);
+                assert_eq!(state_of(e, cx), "absent");
+                e.request_blame(cx);
+                e.receive_blame(e.blame_generation, text.clone(), Err("boom".into()), cx);
+                assert_eq!(state_of(e, cx), "absent");
+                // Unsaved edits: blame describes the saved file, so it waits.
+                e.request_blame(cx);
+                let before = e.blame_generation;
+                e.dirty = true;
+                e.receive_blame(before, text.clone(), Ok(vec![hunk("aaa", 1, 3)]), cx);
+                assert_eq!(state_of(e, cx), "absent");
+                let generation = e.blame_generation;
+                e.request_blame(cx);
+                assert_eq!(e.blame_generation, generation, "no fetch while dirty");
+                // The buffer changed under an answer: ask again.
+                e.dirty = false;
+                e.request_blame(cx);
+                let asked = e.blame_generation;
+                e.receive_blame(asked, "stale".into(), Ok(vec![hunk("aaa", 1, 3)]), cx);
+                assert_eq!(state_of(e, cx), "absent");
+                assert_eq!(e.blame_generation, asked + 1);
+            })
+            .unwrap();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[gpui::test]
+    fn nothing_is_requested_when_hidden_or_when_both_modes_are_off(cx: &mut TestAppContext) {
+        let off = crate::settings::Preferences {
+            editor_inline_blame: false,
+            ..Default::default()
+        };
+        let (window, path) = shown(cx, off);
+        window
+            .update(cx, |e, _, cx| {
+                let start = e.blame_generation;
+                e.request_blame(cx);
+                assert_eq!(e.blame_generation, start, "both modes off");
+                assert_eq!(e.input.read(cx).editor_blame_options(), (false, false));
+                cx.update_global::<crate::settings::Preferences, _>(|p, _| {
+                    p.editor_blame_column = true
+                });
+                e.sync_blame(cx);
+                assert_eq!(e.input.read(cx).editor_blame_options(), (false, true));
+                assert_eq!(e.blame_generation, start + 1, "turning a mode on fetches");
+                e.visible = false;
+                e.request_blame(cx);
+                assert_eq!(e.blame_generation, start + 1, "hidden editors wait");
+                assert!(e.blame_stale);
+                e.visible = true;
+                cx.update_global::<crate::settings::Preferences, _>(|p, _| {
+                    p.editor_blame_column = false
+                });
+                e.sync_blame(cx);
+                assert_eq!(state_of(e, cx), "loading", "off drops the blame");
+            })
+            .unwrap();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[gpui::test]
+    fn the_defaults_are_inline_on_and_column_off(cx: &mut TestAppContext) {
+        let (window, path) = shown(cx, crate::settings::Preferences::default());
+        window
+            .update(cx, |e, _, cx| {
+                assert_eq!(e.input.read(cx).editor_blame_options(), (true, false));
+            })
+            .unwrap();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[gpui::test]
+    fn review_tabs_and_files_outside_the_project_have_no_blame(cx: &mut TestAppContext) {
+        let (window, path) = shown(cx, crate::settings::Preferences::default());
+        window
+            .update(cx, |e, _, cx| {
+                e.show_diff = true;
+                e.sync_blame_options(cx);
+                assert_eq!(e.input.read(cx).editor_blame_options(), (false, false));
+                e.show_diff = false;
+                e.path = "/elsewhere/file.txt".into();
+                assert!(e.blame_target().is_none());
+            })
+            .unwrap();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[gpui::test]
+    fn a_hidden_editor_fetches_once_when_shown_and_not_when_nothing_changed(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, path) = shown(cx, crate::settings::Preferences::default());
+        window
+            .update(cx, |e, _, cx| {
+                let text = e.input.read(cx).content.clone();
+                e.request_blame(cx);
+                e.receive_blame(e.blame_generation, text, Ok(vec![hunk("aaa", 1, 3)]), cx);
+                assert!(e.blame_loaded && !e.blame_stale);
+                // Hidden: a change only marks the blame stale.
+                e.visible = false;
+                let generation = e.blame_generation;
+                e.request_blame(cx);
+                assert_eq!(e.blame_generation, generation);
+                assert!(e.blame_stale);
+                // Shown again, it catches up once.
+                e.visible = true;
+                e.catch_up_blame(cx);
+                assert_eq!(e.blame_generation, generation + 1);
+                assert!(!e.blame_stale);
+                // Shown again with nothing changed: no fetch.
+                let text = e.input.read(cx).content.clone();
+                e.receive_blame(e.blame_generation, text, Ok(vec![hunk("aaa", 1, 3)]), cx);
+                e.catch_up_blame(cx);
+                assert_eq!(e.blame_generation, generation + 1);
+            })
+            .unwrap();
+        std::fs::remove_file(path).ok();
+    }
+}

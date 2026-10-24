@@ -171,13 +171,21 @@ impl Preferences {
         p["disabled"] = json!(disabled);
     }
 }
+/// Trackers only raise issue notifications; local folders have no PRs or issues.
+fn category_applies(kind: &str, category: &str) -> bool {
+    match kind {
+        "linear" | "jira" | "clickup" => category == "issues",
+        "local" => !["pullRequests", "issues"].contains(&category),
+        _ => true,
+    }
+}
 fn valid_project(p: &Value) -> bool {
     ["id", "name", "detail"]
         .iter()
         .all(|key| p[*key].is_string())
-        && p["kind"]
-            .as_str()
-            .is_some_and(|kind| ["repository", "local", "linear", "jira"].contains(&kind))
+        && p["kind"].as_str().is_some_and(|kind| {
+            ["repository", "local", "linear", "jira", "clickup"].contains(&kind)
+        })
         && p["paths"]
             .as_array()
             .is_some_and(|paths| paths.iter().all(Value::is_string))
@@ -657,11 +665,7 @@ impl SettingsView {
             let muted = self.prefs.project_muted(&id, monocode_core::time::now_ms());
             let categories: Vec<_> = CATEGORIES
                 .iter()
-                .filter(|(cat, _)| match project.kind.as_str() {
-                    "linear" | "jira" => *cat == "issues",
-                    "local" => !["pullRequests", "issues"].contains(cat),
-                    _ => true,
-                })
+                .filter(|(cat, _)| category_applies(&project.kind, cat))
                 .collect();
             let enabled_count = categories
                 .iter()
@@ -1212,5 +1216,29 @@ impl SettingsView {
                     .children(weeks),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn project(kind: &str) -> Value {
+        json!({"id": format!("{kind}:x"), "name": "N", "detail": "D", "kind": kind, "paths": []})
+    }
+    #[test]
+    fn tracker_projects_are_valid_and_only_offer_the_issues_category() {
+        for kind in ["linear", "jira", "clickup"] {
+            assert!(valid_project(&project(kind)), "{kind}");
+            let offered: Vec<_> = CATEGORIES
+                .iter()
+                .filter(|(cat, _)| category_applies(kind, cat))
+                .map(|(cat, _)| *cat)
+                .collect();
+            assert_eq!(offered, ["issues"], "{kind}");
+        }
+        assert!(!valid_project(&project("gitlab")));
+        assert!(category_applies("repository", "pullRequests"));
+        assert!(!category_applies("local", "issues"));
+        assert!(category_applies("local", "agentFinished"));
     }
 }

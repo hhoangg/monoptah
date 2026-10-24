@@ -296,7 +296,7 @@ fn validate_upsert(input: &AutomationUpsert, now: i64) -> Result<(), String> {
     }
     if !matches!(
         input.trigger_kind.as_str(),
-        "time" | "github" | "linear" | "jira" | "gitlab" | "azuredevops"
+        "time" | "github" | "linear" | "jira" | "clickup" | "gitlab" | "azuredevops"
     ) {
         return Err("Invalid automation trigger.".into());
     }
@@ -335,7 +335,7 @@ fn validate_upsert(input: &AutomationUpsert, now: i64) -> Result<(), String> {
 fn validate_trigger(trigger: &AutomationTrigger) -> Result<(), String> {
     if !matches!(
         trigger.kind.as_str(),
-        "time" | "github" | "linear" | "jira" | "gitlab" | "azuredevops"
+        "time" | "github" | "linear" | "jira" | "clickup" | "gitlab" | "azuredevops"
     ) {
         return Err("Invalid automation trigger.".into());
     }
@@ -792,7 +792,7 @@ impl Service {
             if run.status == "running" {
                 run.status = "cancelled".into();
                 run.completed_at = Some(now);
-                run.error = Some("Interrupted when MonoCode last stopped.".into());
+                run.error = Some("Interrupted when Monoptah last stopped.".into());
                 apply_run_summary(&mut automation, &run);
                 write_run(&tx, &run)?;
                 write_automation(&tx, &automation)?;
@@ -910,7 +910,7 @@ impl Service {
         validate_event_key(&claim.event_key)?;
         if !matches!(
             claim.event_kind.as_str(),
-            "github" | "linear" | "jira" | "gitlab" | "azuredevops"
+            "github" | "linear" | "jira" | "clickup" | "gitlab" | "azuredevops"
         ) {
             return Err("Invalid automation trigger.".into());
         }
@@ -1120,6 +1120,7 @@ impl AutomationTrigger {
 pub fn event_label(kind: &str, event: &str) -> String {
     match (kind, event) {
         ("jira", "issue_created") => "Issue appeared",
+        ("clickup", "issue_created") => "Task appeared",
         (_, "draft_opened") => "Draft opened",
         (_, "pull_request_opened") => "Pull request opened",
         (_, "issue_opened") => "Issue opened",
@@ -1307,7 +1308,7 @@ pub fn claim_inbox_events_retry(
             ("github", "pr", false) => "pull_request_opened",
             ("github" | "gitlab", "issue", _) => "issue_opened",
             ("gitlab", "pr", _) => "merge_request_opened",
-            ("linear" | "jira", _, _) => "issue_created",
+            ("linear" | "jira" | "clickup", _, _) => "issue_created",
             ("azuredevops", "pr", _) => "pull_request_appeared",
             ("azuredevops", "issue", _) => "work_item_appeared",
             _ => continue,
@@ -1320,7 +1321,13 @@ pub fn claim_inbox_events_retry(
             } else {
                 item.number.to_string()
             };
-            format!("{}:issue:{id}", item.provider)
+            // ClickUp keeps the desktop app's `task` segment: both apps share one claim ledger.
+            let noun = if item.provider == "clickup" {
+                "task"
+            } else {
+                "issue"
+            };
+            format!("{}:{noun}:{id}", item.provider)
         } else {
             format!(
                 "{}:{}:{}:{}",
@@ -1379,16 +1386,21 @@ pub fn claim_inbox_events_retry(
                     .map(|repo| repo.trim())
                     .filter(|repo| !repo.is_empty())
                     .collect();
-                repos.is_empty()
-                    || repos
-                        .iter()
-                        .any(|repo| repo.eq_ignore_ascii_case(item.repo.trim()))
+                // A ClickUp filter holds space ids; `repo` is only the space name.
+                let scope = if item.provider == "clickup" {
+                    item.team_id.trim()
+                } else {
+                    item.repo.trim()
+                };
+                repos.is_empty() || repos.iter().any(|repo| repo.eq_ignore_ascii_case(scope))
             });
             let Some(trigger) = trigger else {
                 continue;
             };
             let provider = crate::inbox::provider_label(&item.provider);
-            let kind = if crate::inbox::is_tracker(&item.provider) || item.kind != "pr" {
+            let kind = if item.provider == "clickup" {
+                "task"
+            } else if crate::inbox::is_tracker(&item.provider) || item.kind != "pr" {
                 "issue"
             } else if item.provider == "gitlab" {
                 "merge request"
@@ -1569,6 +1581,85 @@ mod tests {
         assert!(claim_inbox_events(&mut service, &[item(4)], now_millis())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn accepts_clickup_triggers() {
+        let trigger = trigger_from_fields(
+            "clickup-trigger",
+            "clickup",
+            "issue_created",
+            "weekdays",
+            0,
+            "09:00",
+            1,
+        );
+        assert!(validate_trigger(&trigger).is_ok());
+        // The legacy single-trigger fields go through the upsert allowlist too.
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&directory.path().join("sessions.sqlite")).unwrap();
+        let saved = save(&mut service, vec![trigger]);
+        assert_eq!(saved.trigger_kind, "clickup");
+    }
+
+    fn clickup_item(id: &str) -> crate::inbox::Item {
+        crate::inbox::Item {
+            provider: "clickup".into(),
+            kind: "clickup".into(),
+            id: id.into(),
+            identifier: "#86abc12".into(),
+            repo: "Engineering".into(),
+            team_id: "901".into(),
+            title: "Fix login".into(),
+            created_at: "2026-09-19T10:00:00Z".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn clickup_event_key_matches_desktop() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&directory.path().join("sessions.sqlite")).unwrap();
+        save(
+            &mut service,
+            vec![AutomationTrigger::new("clickup", "issue_created")],
+        );
+        let claims =
+            claim_inbox_events(&mut service, &[clickup_item("86ABC12")], now_millis()).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(
+            claims[0].run.event_key.as_deref(),
+            Some("clickup:task:86abc12")
+        );
+        let prompt = claims[0].run.prompt.as_deref().unwrap();
+        assert!(prompt.contains("Work on this ClickUp task:"), "{prompt}");
+        assert!(prompt.contains("#86abc12 Fix login"), "{prompt}");
+        assert_eq!(event_label("clickup", "issue_created"), "Task appeared");
+        assert_eq!(event_label("jira", "issue_created"), "Issue appeared");
+    }
+
+    #[test]
+    fn clickup_space_filter_matches_space_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&directory.path().join("sessions.sqlite")).unwrap();
+        let trigger = AutomationTrigger {
+            repos: vec!["901".into()],
+            ..AutomationTrigger::new("clickup", "issue_created")
+        };
+        save(&mut service, vec![trigger]);
+        let mut other = clickup_item("1");
+        other.team_id = "902".into();
+        // The space name is not what a ClickUp filter holds.
+        let mut by_name = clickup_item("2");
+        by_name.team_id = "903".into();
+        by_name.repo = "901".into();
+        assert!(
+            claim_inbox_events(&mut service, &[other, by_name], now_millis())
+                .unwrap()
+                .is_empty()
+        );
+        let claims = claim_inbox_events(&mut service, &[clickup_item("3")], now_millis()).unwrap();
+        assert_eq!(claims.len(), 1);
     }
 
     #[test]

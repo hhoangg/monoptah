@@ -36,6 +36,13 @@ impl SettingsView {
                 "Connect your Jira Cloud site with your email and an API token.",
             ),
             (
+                "clickup",
+                "ClickUp",
+                "Tasks from the spaces you pick.",
+                "API token",
+                "Connect ClickUp with a personal API token. Disconnect deletes the saved token.",
+            ),
+            (
                 "linear",
                 "Linear",
                 "Issues assigned to you, from the teams you pick.",
@@ -102,6 +109,7 @@ impl SettingsView {
                             match id {
                                 "linear" => "inbox-linear",
                                 "jira" => "inbox-jira",
+                                "clickup" => "inbox-clickup",
                                 "gitlab" => "inbox-gitlab",
                                 "azuredevops" => "inbox-azuredevops",
                                 _ => "inbox-github",

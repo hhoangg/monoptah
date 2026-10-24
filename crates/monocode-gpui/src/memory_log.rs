@@ -1,6 +1,6 @@
 //! A memory readout for profiling: launched with `MONOCODE_MEMORY_LOG=<file>`,
 //! the app appends its footprint and GPU usage to that file every 10 seconds.
-//! `open --env MONOCODE_MEMORY_LOG=/tmp/monocode-memory.log "Monocode Native.app"`
+//! `open --env MONOCODE_MEMORY_LOG=/tmp/monocode-memory.log "Monoptah Native.app"`
 use gpui::App;
 use std::{io::Write, time::Duration};
 

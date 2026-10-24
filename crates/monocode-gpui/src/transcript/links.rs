@@ -63,7 +63,7 @@ impl Target {
                     "Open Containing Folder"
                 };
                 let mut items = vec![
-                    MenuAction::new("open-monocode", "Open in MonoCode").into(),
+                    MenuAction::new("open-monocode", "Open in Monoptah").into(),
                     MenuAction::new("open-default", "Open in Default App").into(),
                     MenuAction::new("reveal", reveal).into(),
                     MenuItem::Separator,

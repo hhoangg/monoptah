@@ -15,6 +15,7 @@ use gpui::{
 use monocode_core::files::document::{self, Document, TextDocument};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+pub(crate) mod blame;
 mod chrome;
 mod diff;
 mod media;
@@ -42,7 +43,8 @@ actions!(
         Format,
         PreviousChange,
         NextChange,
-        RevertChange
+        RevertChange,
+        ToggleGitBlame
     ]
 );
 pub(crate) fn bind(cx: &mut App) {
@@ -67,6 +69,7 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(&format!("{m}-g"), FindNext, Some("FileEditor")),
         KeyBinding::new(&format!("{m}-shift-g"), FindPrevious, Some("FileEditor")),
         KeyBinding::new("escape", DismissSearch, Some("FileEditor")),
+        KeyBinding::new(&format!("{m}-alt-b"), ToggleGitBlame, None),
     ]);
 }
 #[derive(Clone, Debug, PartialEq, gpui::Action)]
@@ -124,6 +127,13 @@ pub(crate) enum FileEvent {
     SaveFailed,
     WordWrap(bool),
     AddToChat(String),
+    /// A blame cell was clicked: open its commit.
+    OpenCommit {
+        cwd: String,
+        sha: String,
+        short_sha: String,
+        subject: String,
+    },
 }
 
 pub(crate) struct FileEditor {
@@ -134,6 +144,12 @@ pub(crate) struct FileEditor {
     git_staged: bool,
     git_line_ending: &'static str,
     git_task: Option<Task<()>>,
+    blame_task: Option<Task<()>>,
+    /// Bumped by each request, so a slow answer for an older file is ignored.
+    blame_generation: u64,
+    blame_loaded: bool,
+    /// A change arrived while hidden; the next time it is shown it fetches.
+    blame_stale: bool,
     analysis: Option<Task<()>>,
     /// The Tree-sitter parser and last tree, reused by each incremental pass.
     syntax: Arc<std::sync::Mutex<Option<crate::editor_syntax::Session>>>,
@@ -212,6 +228,15 @@ impl FileEditor {
                 let (index, stage) = match action {
                     input::CodeAction::Stage(index) => (*index, true),
                     input::CodeAction::Revert(index) => (*index, false),
+                    input::CodeAction::OpenCommit(commit) => {
+                        cx.emit(FileEvent::OpenCommit {
+                            cwd: this.cwd.clone(),
+                            sha: commit.sha.clone(),
+                            short_sha: commit.short_sha.clone(),
+                            subject: commit.subject.clone(),
+                        });
+                        return;
+                    }
                 };
                 this.change_index = index;
                 this.apply_change(stage, cx);
@@ -239,6 +264,7 @@ impl FileEditor {
             cx.subscribe(&git, |this, _, _: &GitChanged, cx| {
                 if this.visible {
                     this.refresh_git(cx);
+                    this.request_blame(cx);
                 }
             }),
             cx.observe_global::<crate::settings::Preferences>(|this, cx| {
@@ -246,6 +272,7 @@ impl FileEditor {
                 this.input
                     .update(cx, |input, cx| input.set_word_wrap(wrap, cx));
                 this.schedule_autosave(cx);
+                this.sync_blame(cx);
                 cx.notify();
             }),
         ];
@@ -279,6 +306,10 @@ impl FileEditor {
             git_staged: false,
             git_line_ending: "\n",
             git_task: None,
+            blame_task: None,
+            blame_generation: 0,
+            blame_loaded: false,
+            blame_stale: false,
             analysis: None,
             syntax: Default::default(),
             focus: cx.focus_handle(),
@@ -367,6 +398,7 @@ impl FileEditor {
         if visible && !was {
             self.load(false, cx);
             self.refresh_git(cx);
+            self.catch_up_blame(cx);
         }
     }
     fn is_markdown(&self) -> bool {
@@ -417,6 +449,8 @@ impl FileEditor {
                             input.reload_file(text, !first && !force, cx);
                         });
                         this.dirty = false;
+                        this.sync_blame_options(cx);
+                        this.request_blame(cx);
                         if first && !this.show_diff && (this.is_markdown() || this.is_svg()) {
                             this.preview = cx
                                 .try_global::<crate::settings::Preferences>()
@@ -548,6 +582,10 @@ impl FileEditor {
         if self.dirty != dirty {
             self.dirty = dirty;
             cx.emit(FileEvent::Dirty);
+            if !dirty {
+                // Saved or undone back to the file on disk: blame is current.
+                self.request_blame(cx);
+            }
         }
         self.schedule_analysis(cx);
         self.schedule_autosave(cx);
@@ -604,6 +642,114 @@ impl FileEditor {
                 }
             });
         }));
+    }
+    /// The repository and repo-relative path to blame. Blame follows the same
+    /// repository rules as the git diff and stays off in review tabs, so it
+    /// does not compete with the diff gutter.
+    fn blame_target(&self) -> Option<(String, String)> {
+        if self.show_diff || self.cwd.is_empty() || self.cwd == "~" {
+            return None;
+        }
+        let relative = PathBuf::from(&self.path)
+            .strip_prefix(&self.cwd)
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        (!relative.is_empty()).then(|| (self.cwd.clone(), relative))
+    }
+    fn blame_preferences(&self, cx: &App) -> (bool, bool) {
+        let prefs = cx.try_global::<crate::settings::Preferences>();
+        (
+            prefs.is_none_or(|p| p.editor_inline_blame),
+            prefs.is_some_and(|p| p.editor_blame_column),
+        )
+    }
+    /// What the editor paints follows the settings and whether the file can
+    /// be blamed at all.
+    fn sync_blame_options(&mut self, cx: &mut Context<Self>) {
+        let available = self.blame_target().is_some();
+        let (inline, column) = self.blame_preferences(cx);
+        self.input.update(cx, |input, cx| {
+            input.set_editor_blame_options(available && inline, available && column, cx)
+        });
+    }
+    /// Shown after being hidden: fetch if something changed meanwhile.
+    fn catch_up_blame(&mut self, cx: &mut Context<Self>) {
+        self.sync_blame_options(cx);
+        if self.blame_stale || !self.blame_loaded {
+            self.request_blame(cx);
+        }
+    }
+    /// A settings change: repaint, and fetch when blame just turned on or
+    /// drop it when both modes are off.
+    fn sync_blame(&mut self, cx: &mut Context<Self>) {
+        self.sync_blame_options(cx);
+        let (inline, column) = self.blame_preferences(cx);
+        if inline || column {
+            if !self.blame_loaded {
+                self.request_blame(cx);
+            }
+        } else {
+            self.blame_generation += 1;
+            self.blame_task = None;
+            self.blame_loaded = false;
+            self.input
+                .update(cx, |input, cx| input.set_editor_blame(None, cx));
+        }
+    }
+    /// Blame describes the file as saved, so it is requested only for a clean
+    /// editor that is on screen. A hidden one fetches when it is shown.
+    fn request_blame(&mut self, cx: &mut Context<Self>) {
+        let (inline, column) = self.blame_preferences(cx);
+        if self.dirty || self.document.is_none() || !(inline || column) {
+            return;
+        }
+        let Some((cwd, relative)) = self.blame_target() else {
+            return;
+        };
+        if !self.visible {
+            self.blame_stale = true;
+            return;
+        }
+        self.blame_stale = false;
+        self.blame_generation += 1;
+        let generation = self.blame_generation;
+        let requested = self.input.read(cx).content.clone();
+        // Tests feed hunks to `receive_blame` instead of running git.
+        if cfg!(test) {
+            return;
+        }
+        let work = cx
+            .background_executor()
+            .spawn(async move { monocode_core::scm::blame(&cwd, &relative) });
+        self.blame_task = Some(cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.receive_blame(generation, requested, result, cx)
+            });
+        }));
+    }
+    fn receive_blame(
+        &mut self,
+        generation: u64,
+        requested: SharedString,
+        result: Result<Vec<monocode_core::scm::BlameHunk>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.blame_generation || self.dirty {
+            return;
+        }
+        if self.input.read(cx).content != requested {
+            // The document moved on; fetch again for the one on screen.
+            self.request_blame(cx);
+            return;
+        }
+        // Untracked, binary and oversized files come back empty, and a file
+        // git cannot blame has none.
+        let hunks = result.unwrap_or_default();
+        self.blame_loaded = true;
+        self.input
+            .update(cx, |input, cx| input.set_editor_blame(Some(&hunks), cx));
     }
     fn schedule_analysis(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).content.clone();

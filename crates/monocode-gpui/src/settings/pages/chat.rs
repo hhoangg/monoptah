@@ -93,20 +93,39 @@ impl SettingsView {
                 )],
             ),
         ];
-        let editor = vec![self.row(
-            Some("format-on-save"),
-            true,
-            "Format on save",
-            Some("Format supported files with Prettier before saving.".into()),
-            vec![self.toggle(
-                "format-on-save",
+        let editor = vec![
+            self.row(
+                Some("format-on-save"),
+                true,
                 "Format on save",
-                p.format_on_save,
-                false,
-                cx,
-                |this, on, cx| this.update(cx, |p| p.format_on_save = on),
-            )],
-        )];
+                Some("Format supported files with Prettier before saving.".into()),
+                vec![self.toggle(
+                    "format-on-save",
+                    "Format on save",
+                    p.format_on_save,
+                    false,
+                    cx,
+                    |this, on, cx| this.update(cx, |p| p.format_on_save = on),
+                )],
+            ),
+            self.row(
+                Some("inline-blame"),
+                true,
+                "Inline blame",
+                Some(
+                    "Show who last changed the line under the cursor, and when, at the end of that line."
+                        .into(),
+                ),
+                vec![self.toggle(
+                    "inline-blame",
+                    "Inline blame",
+                    p.editor_inline_blame,
+                    false,
+                    cx,
+                    |this, on, cx| this.update(cx, |p| p.editor_inline_blame = on),
+                )],
+            ),
+        ];
         let review = vec![self.row(
             Some("diff-view"),
             true,

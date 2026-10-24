@@ -70,7 +70,7 @@ impl Job {
             inner: Mutex::new(JobData {
                 view: JobView {
                     id: uuid::Uuid::new_v4().to_string(),
-                    message: "Connecting to SSH and setting up MonoCode Host…".into(),
+                    message: "Connecting to SSH and setting up Monoptah Host…".into(),
                     prompt: None,
                     done: false,
                     error: None,
@@ -649,9 +649,9 @@ pub fn device_name() -> String {
         .take(80)
         .collect();
     if name.is_empty() {
-        "MonoCode desktop".into()
+        "Monoptah desktop".into()
     } else {
-        format!("MonoCode on {name}")
+        format!("Monoptah on {name}")
     }
 }
 
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn device_names_are_bounded_single_lines() {
         let name = device_name();
-        assert!(name.starts_with("MonoCode"));
+        assert!(name.starts_with("Monoptah"));
         assert!(name.chars().count() <= 100);
         assert!(!name.chars().any(char::is_control));
     }

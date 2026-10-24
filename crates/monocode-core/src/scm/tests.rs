@@ -9,7 +9,7 @@ fn git(dir: &Path, args: &[&str]) -> bool {
     Command::new("git")
         .args([
             "-c",
-            "user.name=MonoCode",
+            "user.name=Monoptah",
             "-c",
             "user.email=monocode@test",
             "-c",
@@ -17,9 +17,9 @@ fn git(dir: &Path, args: &[&str]) -> bool {
         ])
         .args(args)
         .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "MonoCode")
+        .env("GIT_AUTHOR_NAME", "Monoptah")
         .env("GIT_AUTHOR_EMAIL", "monocode@test")
-        .env("GIT_COMMITTER_NAME", "MonoCode")
+        .env("GIT_COMMITTER_NAME", "Monoptah")
         .env("GIT_COMMITTER_EMAIL", "monocode@test")
         .status()
         .map(|status| status.success())
@@ -32,7 +32,7 @@ fn init_git(dir: &Path, branch: &str) -> bool {
             dir,
             &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
         )
-        && git(dir, &["config", "user.name", "MonoCode"])
+        && git(dir, &["config", "user.name", "Monoptah"])
         && git(dir, &["config", "user.email", "monocode@test"])
         && git(dir, &["config", "commit.gpgsign", "false"])
         && git(dir, &["config", "core.autocrlf", "false"])
@@ -348,7 +348,7 @@ fn history_lists_commits_parents_and_head() {
     );
     assert!(history.commits[0].head);
     assert!(!history.commits[1].head);
-    assert_eq!(history.commits[0].author, "MonoCode");
+    assert_eq!(history.commits[0].author, "Monoptah");
     assert!(history.commits[0]
         .refs
         .iter()
@@ -814,7 +814,7 @@ fn sync_pulls_then_pushes() {
         ]
     ));
     for args in [
-        ["config", "user.name", "MonoCode"],
+        ["config", "user.name", "Monoptah"],
         ["config", "user.email", "monocode@test"],
         ["config", "commit.gpgsign", "false"],
     ] {
@@ -1031,4 +1031,193 @@ fn commit_files_and_diffs_include_the_root_commit() {
     );
     assert_eq!(commit_files(dir.path(), &root).unwrap().len(), 1);
     assert!(commit_files(dir.path(), "not-a-sha").is_err());
+}
+
+const BLAME_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const BLAME_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const BLAME_ZERO: &str = "0000000000000000000000000000000000000000";
+
+fn blame_sample() -> String {
+    // Lines 1-2 and 5 come from A, 3-4 from B, 6 is uncommitted. A's
+    // metadata appears once; line content that looks like a header and
+    // like metadata must be ignored.
+    format!(
+        "{BLAME_A} 1 1 2\n\
+author Alice\n\
+author-mail <alice@example.com>\n\
+author-time 1700000000\n\
+author-tz +0000\n\
+summary first commit\n\
+filename f.txt\n\
+\tone\n\
+{BLAME_A} 2 2\n\
+\t{BLAME_B} 9 9 9\n\
+{BLAME_B} 7 3 2\n\
+author Bob\n\
+author-time 1700000500\n\
+summary second: fix\n\
+filename f.txt\n\
+\tauthor Mallory\n\
+{BLAME_B} 8 4\n\
+\tsummary nope\n\
+{BLAME_A} 5 5 1\n\
+\tfive\n\
+{BLAME_ZERO} 6 6 1\n\
+author Not Committed Yet\n\
+author-time 1700001000\n\
+summary Version of f.txt from f.txt\n\
+filename f.txt\n\
+\tsix\n"
+    )
+}
+
+#[test]
+fn blame_parser_merges_groups_and_reuses_metadata() {
+    let hunks = parse_blame_porcelain(&blame_sample());
+    let spans: Vec<_> = hunks
+        .iter()
+        .map(|h| (h.sha.as_str(), h.start_line, h.line_count))
+        .collect();
+    assert_eq!(
+        spans,
+        vec![
+            (BLAME_A, 1, 2),
+            (BLAME_B, 3, 2),
+            (BLAME_A, 5, 1),
+            (BLAME_ZERO, 6, 1)
+        ]
+    );
+    assert_eq!(hunks[0].author, "Alice");
+    assert_eq!(hunks[0].author_time, 1_700_000_000);
+    assert_eq!(hunks[0].summary, "first commit");
+    assert_eq!(hunks[0].short_sha, "aaaaaaa");
+    assert!(!hunks[0].uncommitted);
+    assert_eq!(hunks[1].author, "Bob");
+    assert_eq!(hunks[1].summary, "second: fix");
+    // Metadata was only printed with A's first line; later groups reuse it.
+    assert_eq!(hunks[2].author, "Alice");
+    assert_eq!(hunks[2].author_time, 1_700_000_000);
+    assert_eq!(hunks[2].summary, "first commit");
+    assert!(hunks[3].uncommitted);
+    assert_eq!(hunks[3].short_sha, "0000000");
+}
+
+#[test]
+fn blame_parser_merges_adjacent_groups_of_one_commit() {
+    let text = format!(
+        "{BLAME_A} 1 1 1\nauthor A\nauthor-time 1\nsummary s\nfilename f\n\tx\n\
+{BLAME_A} 4 2 1\n\ty\n"
+    );
+    let hunks = parse_blame_porcelain(&text);
+    assert_eq!(hunks.len(), 1);
+    assert_eq!((hunks[0].start_line, hunks[0].line_count), (1, 2));
+    assert!(parse_blame_porcelain("").is_empty());
+}
+
+#[test]
+fn blame_attributes_lines_to_commits_and_uncommitted_edits() {
+    let dir = tmp();
+    if !init_git_commit(dir.path(), &[("a.txt", "one\ntwo\nthree\n")]) {
+        return;
+    }
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    assert!(git(dir.path(), &["commit", "-am", "add four"]));
+    std::fs::write(dir.path().join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+
+    let history = history_for(dir.path(), Some(2)).unwrap();
+    let (second, first) = (&history.commits[0].sha, &history.commits[1].sha);
+    let hunks = blame(dir.path().to_str().unwrap(), "a.txt").unwrap();
+    let spans: Vec<_> = hunks
+        .iter()
+        .map(|h| (h.sha.as_str(), h.start_line, h.line_count, h.uncommitted))
+        .collect();
+    assert_eq!(
+        spans,
+        vec![
+            (first.as_str(), 1, 1, false),
+            (BLAME_ZERO, 2, 1, true),
+            (first.as_str(), 3, 1, false),
+            (second.as_str(), 4, 1, false),
+        ]
+    );
+    assert_eq!(hunks[0].author, "Monoptah");
+    assert_eq!(hunks[0].summary, "init");
+    assert_eq!(hunks[3].summary, "add four");
+    assert_eq!(hunks[0].short_sha, first[..7]);
+}
+
+#[test]
+fn blame_untracked_binary_and_bad_inputs() {
+    let dir = tmp();
+    if !init_git_commit(dir.path(), &[("a.txt", "one\n")]) {
+        return;
+    }
+    std::fs::write(dir.path().join("new.txt"), "fresh\n").unwrap();
+    assert!(blame(dir.path().to_str().unwrap(), "new.txt")
+        .unwrap()
+        .is_empty());
+    // Once staged, git blames every line as uncommitted.
+    assert!(git(dir.path(), &["add", "new.txt"]));
+    let staged = blame(dir.path().to_str().unwrap(), "new.txt").unwrap();
+    assert_eq!(staged.len(), 1);
+    assert!(staged[0].uncommitted);
+
+    std::fs::write(dir.path().join("bin.dat"), b"a\0b\n").unwrap();
+    assert!(git(dir.path(), &["add", "bin.dat"]));
+    assert!(git(dir.path(), &["commit", "-m", "bin"]));
+    assert!(blame(dir.path().to_str().unwrap(), "bin.dat")
+        .unwrap()
+        .is_empty());
+
+    assert!(blame(dir.path().to_str().unwrap(), "../secret.txt").is_err());
+    // Tracked but deleted from disk: git cannot read it, and says so.
+    std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+    assert!(blame(dir.path().to_str().unwrap(), "a.txt")
+        .unwrap_err()
+        .contains("Cannot lstat"));
+    let plain = tmp();
+    assert_eq!(
+        blame(plain.path().to_str().unwrap(), "a.txt").unwrap_err(),
+        "Not a git repository"
+    );
+}
+
+#[test]
+fn blame_skips_files_over_the_size_limit() {
+    let dir = tmp();
+    if !init_git_commit(dir.path(), &[("a.txt", "one\n")]) {
+        return;
+    }
+    let big = vec![b'x'; MAX_TEXT_FILE_BYTES as usize + 1];
+    std::fs::write(dir.path().join("a.txt"), big).unwrap();
+    assert!(blame(dir.path().to_str().unwrap(), "a.txt")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn blame_is_empty_before_the_first_commit() {
+    let dir = tmp();
+    if !init_git(dir.path(), "main") {
+        return;
+    }
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    assert!(blame(dir.path().to_str().unwrap(), "a.txt")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn blame_reads_the_host_result_shape() {
+    let host = json!({"hunks":[{
+        "sha": BLAME_A, "shortSha": "aaaaaaa", "author": "Alice", "authorTime": 5,
+        "summary": "s", "uncommitted": false, "startLine": 2, "lineCount": 3
+    }]});
+    let parsed: BlameResponse = serde_json::from_value(host).unwrap();
+    assert_eq!(parsed.hunks.len(), 1);
+    assert_eq!(parsed.hunks[0].author_time, 5);
+    assert_eq!(
+        (parsed.hunks[0].start_line, parsed.hunks[0].line_count),
+        (2, 3)
+    );
 }

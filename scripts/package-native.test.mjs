@@ -28,7 +28,7 @@ test(
     const binary = join(release, "monocode-gpui");
     await writeFile(
       binary,
-      "#!/bin/sh\nprintf 'Monocode Native 0.16.0-preview.2\\n'\n",
+      "#!/bin/sh\nprintf 'Monoptah Native 0.16.0-preview.2\\n'\n",
     );
     await chmod(binary, 0o755);
     const fakeTool = `#!/usr/bin/env node
@@ -97,7 +97,7 @@ if (name === 'xcrun' && args[0] === 'notarytool') console.log(JSON.stringify({ s
     for (const artifact of artifacts)
       await access(join(out, artifact.filename));
     const plist = await readFile(
-      join(release, "Monocode Native.app/Contents/Info.plist"),
+      join(release, "Monoptah Native.app/Contents/Info.plist"),
       "utf8",
     );
     assert.ok(
@@ -111,7 +111,7 @@ if (name === 'xcrun' && args[0] === 'notarytool') console.log(JSON.stringify({ s
         "<key>MonocodeNativeVersion</key><string>0.16.0-preview.2</string>",
       ),
     );
-    assert.ok(plist.includes("<string>dev.usemono.gpui</string>"));
+    assert.ok(plist.includes("<string>com.monoptah.native</string>"));
     process.env.NATIVE_TEST_NOTARY_STATUS = "Invalid";
     await assert.rejects(
       () =>
@@ -126,7 +126,7 @@ if (name === 'xcrun' && args[0] === 'notarytool') console.log(JSON.stringify({ s
     );
     await writeFile(
       binary,
-      "#!/bin/sh\nprintf 'Monocode Native 0.16.0-preview.3\\n'\n",
+      "#!/bin/sh\nprintf 'Monoptah Native 0.16.0-preview.3\\n'\n",
     );
     await assert.rejects(
       () =>

@@ -124,7 +124,7 @@ impl gpui::Render for Floating {
                                 .child(
                                     icon_button(
                                         "floating-reveal",
-                                        "Open in MonoCode",
+                                        "Open in Monoptah",
                                         "external-link",
                                     )
                                     .on_click(cx.listener(

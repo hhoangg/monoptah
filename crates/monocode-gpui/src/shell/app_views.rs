@@ -288,9 +288,11 @@ impl Shell {
         if let Some(inbox) = &self.inbox {
             let projects = self.workspace.projects.iter().map(Into::into).collect();
             let cwd = self.workspace.project.clone().into();
+            let busy = self.busy_sessions.clone();
             inbox.update(cx, |inbox, cx| {
                 inbox.set_appearances(self.workspace.project_appearance.clone(), cx);
                 inbox.set_context(projects, cwd, cx);
+                inbox.set_busy(busy, cx);
             });
         }
     }

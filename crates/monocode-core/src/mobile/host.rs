@@ -404,7 +404,7 @@ impl MobileHost {
                 // Another copy of the app (or the earlier desktop) holds the
                 // port; phones would reach it instead of this one.
                 if error.contains("in use") || error.contains("os error 48") {
-                    format!("Another MonoCode window or app is already accepting phone connections on port {PORT}. Quit it, then turn Accept connections off and on.")
+                    format!("Another Monoptah window or app is already accepting phone connections on port {PORT}. Quit it, then turn Accept connections off and on.")
                 } else {
                     error
                 }
@@ -517,7 +517,7 @@ impl MobileHost {
 
     async fn handle(&self, peer: &str, request: Value) -> Result<Value, String> {
         if request["version"] != VERSION {
-            return Err("Update MonoCode on both devices".into());
+            return Err("Update Monoptah on both devices".into());
         }
         let method = request["method"].as_str().ok_or("Invalid mobile method")?;
         let params = request["params"].clone();
@@ -601,7 +601,7 @@ impl MobileHost {
     /// every change, until the phone goes or the watch is stopped.
     async fn watch(&self, peer: &str, request: Value, sink: WatchSink) -> Result<(), String> {
         if request["version"] != VERSION {
-            return Err("Update MonoCode on both devices".into());
+            return Err("Update Monoptah on both devices".into());
         }
         if request["method"] != "conversation.watch" {
             return Err("Unsupported mobile operation".into());

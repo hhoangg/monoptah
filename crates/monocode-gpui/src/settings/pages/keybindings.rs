@@ -289,6 +289,12 @@ pub(crate) const BINDINGS: &[Binding] = &[
         fixed: false,
     },
     Binding {
+        command: "Editor: Toggle Git Blame",
+        keys: "⌘⌥B",
+        when: "Always",
+        fixed: false,
+    },
+    Binding {
         command: "Editor: Find",
         keys: "⌘F",
         when: "editorFocus",
