@@ -1,5 +1,6 @@
 import type { HarnessEvent } from "../../integrations/harness/core/types";
 import { noteStreamArrival } from "../../features/sessions/model/streamingPerformance";
+import { recordQuestionOutcome } from "../../features/telegram/model/questionOutcome";
 
 export type ScheduledFlush = { kind: "raf" | "timeout"; id: number };
 
@@ -46,6 +47,9 @@ export class HarnessEventQueue {
   enqueue = (sessionId: string, event: HarnessEvent) => {
     const foreground = this.visible(sessionId);
     noteStreamArrival(event, foreground);
+    if (event.type === "question.resolved") {
+      recordQuestionOutcome(sessionId, event.requestId, event.decision);
+    }
     const events = this.queued.get(sessionId);
     if (events) events.push(event);
     else this.queued.set(sessionId, [event]);

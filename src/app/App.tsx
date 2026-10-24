@@ -830,6 +830,8 @@ import {
   inboxComposerCard,
   type InboxItem,
 } from "../features/inbox/model/githubTasks";
+import { setSessionTicket } from "../features/telegram/model/sessionTicket";
+import { useTelegramQuestions } from "../features/telegram/hooks/useTelegramQuestions";
 import {
   linkedWorkItemFromAutomationEvent,
   linkedWorkItemFromInboxItem,
@@ -3291,6 +3293,7 @@ function Workspace({
           title: `${ref} ${item.title}`,
           ...(linkedWorkItem ? { linkedWorkItem } : {}),
         };
+        setSessionTicket(session.id, ref);
         const tab = newTab(session.id);
         setSessions((prev) => [...prev, session]);
         appendTab(tab, cwd);
@@ -11726,6 +11729,10 @@ function Workspace({
     },
     [],
   );
+
+  // Declared here rather than beside useInputNotifications because it needs
+  // onQuestionReply, which is defined above.
+  useTelegramQuestions({ sessions: promptableSessions, onQuestionReply });
 
   const onQuestionInteraction = useCallback(
     (sessionId: string, requestId: number) => {

@@ -7,6 +7,7 @@ import {
   HarnessEventQueue,
   scheduleHarnessFlush,
 } from "./harnessFlush";
+import { takeQuestionOutcome } from "../../features/telegram/model/questionOutcome";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -219,4 +220,18 @@ describe("harness event queue", () => {
     queue.flush();
     expect([...apply.mock.calls[0][0].keys()]).toEqual(["front", "back"]);
   });
+});
+
+it("notes how a question ended for the Telegram mirror", () => {
+  const queue = new HarnessEventQueue(
+    () => true,
+    () => {},
+  );
+  queue.enqueue("session-1", {
+    type: "question.resolved",
+    requestId: 7,
+    decision: "skipped",
+  });
+  expect(takeQuestionOutcome("session-1", 7)).toBe("skipped");
+  expect(takeQuestionOutcome("session-1", 7)).toBeUndefined();
 });

@@ -11,6 +11,7 @@ import {
 import {
   DEFAULT_COMMAND_TIMEOUT_MINUTES,
   DEFAULT_SESSION_TIMEOUT_MINUTES,
+  parseBranch,
   type NodeId,
   type SessionNode,
   type Workflow,
@@ -25,6 +26,11 @@ import {
   type EngineAction,
   type EngineEvent,
 } from "../../features/workflows/model/workflowEngine";
+import {
+  clearWorkflowSessionContext,
+  setWorkflowSessionContext,
+  workflowItemInfo,
+} from "../../features/telegram/model/workflowSessionContext";
 import {
   outputReask,
   parseWorkflowOutput,
@@ -298,6 +304,28 @@ export async function executeRun(
         (n) => n.nodeId === nodeId && n.branch === "" && n.sessionId,
       )
     )?.sessionId;
+  /** Tells Telegram forwarding which workflow, node and item a session belongs to. */
+  const rememberSessionContext = (
+    nodeId: NodeId,
+    branch: BranchKey,
+    sessionId: string,
+  ) => {
+    const node = nodeOf(nodeId);
+    const split = parseBranch(branch);
+    const entry = run.nodes.find(
+      (n) => n.nodeId === nodeId && n.branch === branch,
+    );
+    setWorkflowSessionContext(sessionId, {
+      workflowName: run.definition.name,
+      nodeTitle: node?.title?.trim() || nodeId,
+      ...(split
+        ? workflowItemInfo(run.items[split.groupId]?.[split.index])
+        : {}),
+      ...(entry && run.definition.edges.some((edge) => edge.loop)
+        ? { round: entry.round }
+        : {}),
+    });
+  };
   const projectFor = (
     node: { project: string },
     nodeId: NodeId,
@@ -475,6 +503,7 @@ export async function executeRun(
       }
     }
     patchNode(nodeId, branch, { sessionId });
+    rememberSessionContext(nodeId, branch, sessionId);
 
     let outcome = await watchTurn(nodeId, branch, sessionId, turn, timeoutMs);
     if (!live()) return;
@@ -870,6 +899,11 @@ export async function executeRun(
     }
     // These must happen whatever went wrong above or in the approvals clean-up below.
     registry?.remove(run.id);
+    for (const n of run.nodes) {
+      if (n.sessionId) clearWorkflowSessionContext(n.sessionId);
+      for (const past of n.history ?? [])
+        if (past.sessionId) clearWorkflowSessionContext(past.sessionId);
+    }
     try {
       for (const n of run.nodes)
         if (n.sessionId) getHost().endApprovals(n.sessionId);
