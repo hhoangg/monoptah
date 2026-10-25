@@ -2,11 +2,13 @@
 pub mod accounts;
 pub mod agent;
 pub mod app_update;
+pub mod attachment;
 pub mod automations;
 pub mod brand;
 pub mod catalog;
 pub mod checkpoint;
 pub mod context;
+pub mod contributors;
 pub mod desktop_preferences;
 pub mod diff;
 pub mod external_editor;

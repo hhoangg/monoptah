@@ -10,7 +10,7 @@ mod github;
 pub mod gitlab;
 pub mod jira;
 pub mod linear;
-mod secret_file;
+pub(crate) mod secret_file;
 
 use crate::{desktop_preferences::DesktopPreferences, session_groups::WorkItem, store::Store};
 use chrono::{Datelike, Local, TimeZone};

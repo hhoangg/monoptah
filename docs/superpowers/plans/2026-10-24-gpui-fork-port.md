@@ -345,6 +345,66 @@ Reference survey with file:line for both apps: `.superpowers/sdd/2026-10-24-gpui
 
 **Phase 5b commit message:** `Native: forward agent questions to Telegram`
 
+## Phase 6 - Contributors and Ticket Contributors
+
+Reference survey with file:line for both apps: `.superpowers/sdd/2026-10-24-gpui-fork-port/phase6-survey.md` (git-ignored scratch; the facts below are the binding ones). Two commits: 6a = core (Tasks 6.1-6.5), 6b = GPUI (Tasks 6.6-6.13).
+
+**Phase rulings:**
+- Contributors lives in a core module `crates/monocode-core/src/contributors/` (not a new crate), so `npm run native:check` covers it without script changes.
+- Storage: a dedicated `ContributorsDb { write: Mutex<Connection>, read: Option<Mutex<Connection>> }` opened on the same database file the store uses (`Store::database_path()`), with `busy_timeout` 5 s and a query-only read connection, exposing the `SessionStore` surface the Tauri code uses (`with_read_conn`, `lock_conn`, `open_in_memory`). It runs the Tauri `CREATE TABLE IF NOT EXISTS contrib_*` DDL verbatim (including the coverage migration), like `automations::Service`. Never through the shell `Database` mutex. DDL and JSON shapes must be byte-identical with the Tauri app.
+- The Tauri Rust modules move with their 369 tests; only the 23 command wrappers, the two `TauriSink`s, `AppRunner`, `AppDeps` and the app-data path change. `crate::harness::*` -> `scm::resolve_gui_binary`/`scm::shell::apply_gui_env`, `crate::clickup::*` -> `inbox::clickup::*` (raise visibility where needed), Claude binary via `provider::resolve(Kind::Claude)`, secret files via `inbox::secret_file::write_secret_file`, `contributors-ai.json` under `store.data_dir()`.
+- Job events go through injectable sinks into an `async_channel` drained by one app-wide GPUI task (same events and 150 ms throttle as Tauri).
+- TS pure logic is translated with its tests; hook/view tests become behaviour tests of the native state where they test rules (auto top-up once per head, background repair, save queue, previous-window fetch before export), not DOM.
+- Local time via chrono `Local` (DST-safe calendar math as in `period.ts`); tests build local dates. Sorting ties use the same keys as TS; names compare with a case-insensitive comparison and tests use ASCII names (JS `localeCompare` is not reproduced).
+- Preferences: read the Tauri keys (`monocode.contributors.range`, `monocode.contributors.mergeIdentities`, `monocode.ticketContributors.settings`, `monocode.ticketContributors.range`) as defaults; native changes are saved under `native-contributors-*` settings (inbox precedent); keys are never renamed.
+- Default tab from the sidebar is Ticket (Tauri parity); the project menu and footer chip open the GitHub tab for that project.
+- Report export: save dialog (`prompt_for_new_path`) + write + reveal; no in-app preview.
+- Ask Agent: a core `write_attachment` (port of Tauri `fs.rs` `write_attachment`, `$TMPDIR/monocode-attachments/<pid>-<nanos>-<safe name>`, 0600, create_new) and a `Conversation` submit that carries attachments; providers without attachments get the file path in the prompt (`composeSessionPrompt`). Snapshot file name `contributors-<period id>.json`.
+- The footer sync chip gets its own slot in the footer row so it shows while an app view is open.
+
+### Task 6.1: DB adapter and the git/GitHub sync modules in core
+Move `contributors.rs` (minus commands), `gh.rs`, `pr_heads.rs`, `store.rs`, `sync.rs` into `crates/monocode-core/src/contributors/`; add `db.rs` (`ContributorsDb`); keep `expand_home` via the native helper. Tests: the 84 + 40 + 17 + 30 + 48 Tauri tests pass in core.
+
+### Task 6.2: Sync jobs and the sync API facade
+Move `jobs.rs` with a native `DbRunner` and a pub sink trait; `contributors/api.rs` with one fn per sync command (`read_config`, `read_mailmap`, `write_config`, `branches`, `first_commit`, `git_user`, `load`, `sync_estimate`, `sync_start`, `sync_cancel`, `sync_status`, `clear`) and `pub struct Contributors` owning the db and managers. Tests: jobs 37 + command-level validation.
+
+### Task 6.3: Ticket scoring core
+Move `clickup_tickets.rs`, `ticket_store.rs`, `rubric.rs`, `assessor.rs`, `ticket_jobs.rs` with native deps; ticket API fns (`tickets_fetch`, `tickets_assess`, `tickets_estimate`, `tickets_cancel`, `tickets_status`, `tickets_window_covered`, `tickets_load`, `ticket_override`, `ai_config_get`, `ai_config_set`, `clickup_spaces`) incl. `ticket_period`/`clickup_id` validation. Tests: 15 + 22 + 12 + 9 + 55.
+
+### Task 6.4: Contributors model (TS -> Rust)
+`contributors/model/{config, patterns, identity, period, scoring, leaderboard, stats, unmapped, pipeline, snapshot, ask, agent_session, palette, format, axis, prefs, sync_indicator, sync_jobs}.rs` + `test_fixtures.rs`; core `write_attachment`. Tests: port the ~560 cases listed in the survey (B.1).
+
+### Task 6.5: Ticket model and report (TS -> Rust)
+`contributors/tickets/{tickets, board, prefs, report}.rs` + the pure `useTicketBoard` helpers (`period_of`, `window_of`, `fetch_key`, `should_fetch`, `job_error_after`, `scope_fetch_id`). Tests: 24 + 35 + 20 + 57 + helper cases. Then `npm run native:check` -> 0 and commit 6a.
+
+**Phase 6a commit message:** `Native: Contributors and ticket scoring core`
+
+### Task 6.6: App view, entries, event bridge and footer chip
+`AppView::Contributors` (label "Contributors", icon `chart-square`) with every match site; `open_contributors(tab, project)`; sidebar item + visibility toggle, rail button, project menu "Contributors"; app-wide event receiver updating a `SyncJobs` model (port `syncJobs.ts` rules); footer chip (percent, red "Contributors sync stopped" until clicked, tooltip one line per job, click opens that project). Tests: sidebar/rail/menu entries, syncJobs rules, footer chip.
+
+### Task 6.7: Page shell and GitHub view
+Header, Ticket/GitHub segmented control, project select, Escape; GitHub toolbar (branch, period segmented + prev/next, merge toggle, refresh, More > Clear synced data with confirm, Ask Agent), alerts, NotSynced/SyncedBar/GhNotice, the `useContributors` rules (config save queue with revert, save blocked on config error, estimate only when not synced, auto top-up once per head, background repair, first-commit re-read for All time, midnight rollover). Tests: those rules.
+
+### Task 6.8: Stats tab
+KPI cards with deltas (arrow + text + colour), stacked commit chart (canvas quads or div bars, legend + "+N", axis ticks <= 8, tooltips), contributors table with expandable identities and per-row Ask. Tests: from `StatsTab.test.ts`.
+
+### Task 6.9: Leaderboard and formula sidebar
+Podium, ranking table (movement, You chip, badges), formula sidebar copy from the scoring constants, weights editor (0..5, disabled when locked). Tests: from `LeaderboardTab.test.ts`, `FormulaSidebar.test.ts`.
+
+### Task 6.10: Identities tab
+Suggestions, unmapped, person cards (rename, menus Merge into / Move to / Exclude identity / Exclude person), drag an identity to another card, excluded list with Include. Tests: from `IdentitiesTab.test.ts`, `useIdentityDrag.test.ts`.
+
+### Task 6.11: Ask Agent
+Dialog (subtitle, context chips, options, suggestions, question, provider select, Start session Cmd/Ctrl+Enter, inline errors) and the session start with the snapshot attachment. Tests: from `AskAgentDialog.test.ts` and the Ask wiring.
+
+### Task 6.12: Ticket view and report export
+Workspace select, period (no 7d), refresh, scope panel, job progress, score card (coverage slider, estimate, Score), leaderboard with member tickets, overrides, reassess; Export report (previous-window fetch and wait up to 120 s, render, save dialog, reveal). Tests: from `TicketContributorsView.test.ts` and `useTicketBoard*.test.ts` orchestration.
+
+### Task 6.13: Ticket scoring settings
+Settings > Inbox > Ticket scoring (runner radio, model field, API key field only for API, Save/Remove, never reads the key back) + search entry. Tests: from `TicketScoringSettings.test.ts`. Then `npm run native:check` -> 0 and commit 6b.
+
+**Phase 6b commit message:** `Native: Contributors page with GitHub and Ticket tabs`
+
 ## Phases 4 to 7 (sketch; detailed plan written when each starts)
 
 - **Phase 4 - TUI surface:** per-provider surface preference (`monocode.providerSurface.v1`); `sessions.surface` read/write in `store.rs`/`store/shared.rs` (Tauri TUI rows stop showing as chat); `terminal.rs` spawn of program+args+env with exit code; a session-bound terminal pane opened from `open`/`activate_session`; Claude launch args (`--model`, `--permission-mode`, `--resume`/`--session-id`, `--settings` hooks), `agy` exception; `tui-hook` subcommand + spool watcher + `classify` with 5 s busy staleness into `busy_sessions`; app-driven sessions forced to chat; new-session provider prompt; automations follow the surface; close-on-clean-exit.
