@@ -65,6 +65,7 @@ impl Shell {
             }
         }
         SettingsContext {
+            data_dir: self.data_dir.clone(),
             remote: Some(self.remote.clone()),
             mobile: self.mobile_status(),
             mobile_invite: self.mobile.invite.clone(),
@@ -140,6 +141,7 @@ impl Shell {
             return;
         }
         self.navigation_revision += 1;
+        self.hide_contributors(cx);
         let context = self.settings_context(cx);
         let prefs = self.workspace.preferences.clone();
         let view = cx.new(|cx| SettingsView::new(section, prefs, context, cx));
@@ -294,6 +296,7 @@ impl Shell {
         } else {
             0.
         };
+        self.reveal_contributors(cx);
         self.focus_active(window, cx);
         this_update(self, cx);
     }
@@ -329,9 +332,13 @@ impl Shell {
         .detach();
     }
     pub(super) fn default_kind(&self) -> Kind {
+        self.default_kind_in(&self.workspace.project)
+    }
+    /// The provider a new session in `project` starts with.
+    pub(super) fn default_kind_in(&self, project: &str) -> Kind {
         let p = &self.workspace.preferences;
         p.project_providers
-            .get(&self.workspace.project)
+            .get(project)
             .and_then(|p| p.provider.as_deref())
             .or(p.default_provider.as_deref())
             .and_then(Kind::parse)

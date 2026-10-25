@@ -51,6 +51,35 @@ pub fn path_key(path: &str) -> String {
     }
 }
 
+/// `prettyCwd(path) === "~"` of paths.ts: a user's home folder, `/Users/<x>`,
+/// `/home/<x>` or `C:/Users/<x>`, is shown as `~`.
+fn is_home_folder(path: &str) -> bool {
+    let trimmed = trim_slash(path);
+    if trimmed == "~" {
+        return true;
+    }
+    let parts: Vec<&str> = trimmed.split('/').filter(|part| !part.is_empty()).collect();
+    match parts.as_slice() {
+        [first, _] => matches!(*first, "Users" | "home"),
+        [drive, users, _] => is_drive(drive) && *users == "Users",
+        _ => false,
+    }
+}
+
+/// `looksLikeProject` of recents.ts: a folder worth treating as a project,
+/// so not a root, a drive, a home folder or the inside of an app bundle.
+pub fn looks_like_project(path: &str) -> bool {
+    if path.is_empty() || path == "~" {
+        return false;
+    }
+    let key = path_key(path);
+    !(key == "/"
+        || is_drive(&key)
+        || is_home_folder(path)
+        || path.contains(".app/")
+        || path.contains(".app\\"))
+}
+
 /// Text after the first `chars` characters.
 fn skip_chars(text: &str, chars: usize) -> &str {
     text.char_indices()
@@ -221,6 +250,41 @@ mod tests {
         assert_eq!(join_path("C:/Users/me", "code/app"), "C:/Users/me/code/app");
         assert_eq!(join_path("C:/Users/me/code", ".."), "C:/Users/me");
         assert_eq!(join_path("C:/", "Users"), "C:/Users");
+    }
+
+    #[test]
+    fn project_folders_exclude_roots_drives_homes_and_app_bundles() {
+        for path in [
+            "",
+            "/",
+            "~",
+            "//",
+            "C:",
+            "c:/",
+            "C:\\",
+            "/Users/me",
+            "/Users/me/",
+            "/home/me",
+            "C:\\Users\\me",
+            "c:/Users/me/",
+            "/Users/me/Foo.app/Contents",
+            "C:\\Foo.app\\Contents",
+        ] {
+            assert!(!looks_like_project(path), "{path:?}");
+        }
+        for path in [
+            "/work/app",
+            "/Users",
+            "/Users/me/code",
+            "/home/me/code",
+            "/srv/app",
+            "C:/Users/me/code",
+            "C:/work",
+            "//server/share/app",
+            "remote://box/work/app",
+        ] {
+            assert!(looks_like_project(path), "{path:?}");
+        }
     }
 
     #[test]

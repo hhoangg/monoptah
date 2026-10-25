@@ -605,6 +605,7 @@ impl Shell {
                     ("Inbox", "inbox"),
                     ("Notes", "file"),
                     ("Automations", "zap"),
+                    ("Contributors", "chart-square"),
                 ]
                 .into_iter()
                 .filter(|(label, _)| match *label {
@@ -613,6 +614,7 @@ impl Shell {
                         self.workspace.preferences.notes && self.workspace.sidebar_notes_visible
                     }
                     "Automations" => self.workspace.sidebar_automations_visible,
+                    "Contributors" => self.workspace.sidebar_contributors_visible,
                     _ => true,
                 })
                 .map(|(label, glyph)| {
@@ -653,6 +655,7 @@ impl Shell {
                             "Inbox" => this.open_inbox(w, cx),
                             "Notes" => this.open_notes(w, cx),
                             "Automations" => this.open_automations(w, cx),
+                            "Contributors" => this.open_contributors(None, None, w, cx),
                             _ => (),
                         }))
                 }),
@@ -833,6 +836,10 @@ impl Shell {
                         workspace::AppView::Automations,
                         self.workspace.sidebar_automations_visible,
                     ),
+                    (
+                        workspace::AppView::Contributors,
+                        self.workspace.sidebar_contributors_visible,
+                    ),
                 ]
                 .into_iter()
                 .filter(|(_, v)| *v)
@@ -843,40 +850,42 @@ impl Shell {
                     } else {
                         view.icon()
                     };
-                    icon_button(
-                        match view {
-                            workspace::AppView::Inbox => "rail-inbox",
-                            workspace::AppView::Notes => "rail-notes",
-                            workspace::AppView::Automations => "rail-automations",
-                        },
-                        view.label(),
-                        glyph,
-                    )
-                    .size(px(32.))
-                    .relative()
-                    .when(selected, |d| d.bg(content(0.1)))
-                    .when(view == workspace::AppView::Inbox && inbox_unread, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .right(px(6.))
-                                .top(px(6.))
-                                .size(px(6.))
-                                .rounded_full()
-                                .bg(accent_color()),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        if this.app_view_label() == Some(view.label()) {
-                            this.close_app_view(w, cx);
-                        } else {
-                            match view {
-                                workspace::AppView::Inbox => this.open_inbox(w, cx),
-                                workspace::AppView::Notes => this.open_notes(w, cx),
-                                workspace::AppView::Automations => this.open_automations(w, cx),
+                    let rail_id = match view {
+                        workspace::AppView::Inbox => "rail-inbox",
+                        workspace::AppView::Notes => "rail-notes",
+                        workspace::AppView::Automations => "rail-automations",
+                        workspace::AppView::Contributors => "rail-contributors",
+                    };
+                    icon_button(rail_id, view.label(), glyph)
+                        .debug_selector(move || rail_id.into())
+                        .size(px(32.))
+                        .relative()
+                        .when(selected, |d| d.bg(content(0.1)))
+                        .when(view == workspace::AppView::Inbox && inbox_unread, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .right(px(6.))
+                                    .top(px(6.))
+                                    .size(px(6.))
+                                    .rounded_full()
+                                    .bg(accent_color()),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            if this.app_view_label() == Some(view.label()) {
+                                this.close_app_view(w, cx);
+                            } else {
+                                match view {
+                                    workspace::AppView::Inbox => this.open_inbox(w, cx),
+                                    workspace::AppView::Notes => this.open_notes(w, cx),
+                                    workspace::AppView::Automations => this.open_automations(w, cx),
+                                    workspace::AppView::Contributors => {
+                                        this.open_contributors(None, None, w, cx)
+                                    }
+                                }
                             }
-                        }
-                    }))
+                        }))
                 }),
             )
             .into_any()

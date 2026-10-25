@@ -7,6 +7,9 @@ mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
+mod contributors;
+#[cfg(test)]
+mod contributors_tests;
 mod file_panes;
 mod idle_agents;
 #[cfg(test)]
@@ -639,7 +642,16 @@ pub(crate) struct Shell {
     notes: Option<Entity<Notes>>,
     inbox: Option<Entity<crate::inbox::Inbox>>,
     automations: Option<Entity<crate::automations::Automations>>,
+    contributors: Option<Entity<crate::contributors::ContributorsPage>>,
+    /// The app-wide Contributors job model, fed by the core's sinks.
+    sync_jobs: Entity<crate::contributors::SyncJobs>,
+    contributors_core: Option<std::sync::Arc<monocode_core::contributors::api::Contributors>>,
+    contributors_opening: bool,
+    /// Keeps an in-memory store's private data folder alive with the core.
+    contributors_scratch: Option<contributors::ScratchDir>,
     active_app_view: Option<app_views::AppView>,
+    /// The app data folder, `None` for an in-memory store.
+    data_dir: Option<std::path::PathBuf>,
     app_view_events: Vec<Subscription>,
     automation_state: automation_runs::State,
     settings: Option<Entity<crate::settings::SettingsView>>,
@@ -791,12 +803,12 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Self {
         crate::accounts::install(store.clone(), cx);
-        let remote_dir = locked(&store)
+        let data_dir = locked(&store)
             .ok()
-            .and_then(|store| store.data_dir().map(std::path::Path::to_path_buf))
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("monocode-remote-{}", std::process::id()))
-            });
+            .and_then(|store| store.data_dir().map(std::path::Path::to_path_buf));
+        let remote_dir = data_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("monocode-remote-{}", std::process::id()))
+        });
         let remote = Arc::new(monocode_core::remote::Connections::new(remote_dir));
         monocode_core::remote::set_default_connections(remote.clone());
         let quit_remote = remote.clone();
@@ -997,7 +1009,13 @@ impl Shell {
             notes: None,
             inbox: None,
             automations: None,
+            contributors: None,
+            sync_jobs: cx.new(crate::contributors::SyncJobs::new),
+            contributors_core: None,
+            contributors_opening: false,
+            contributors_scratch: None,
             active_app_view: None,
+            data_dir,
             app_view_events: Vec::new(),
             automation_state: Default::default(),
             settings: None,
@@ -1206,6 +1224,7 @@ impl Shell {
         this.apply_preferences(cx);
         this.poll_reminders(cx);
         this.initialize_automations(cx);
+        this.init_contributors(cx);
         if this.workspace.active.is_none() {
             cx.spawn(async move |this, cx| {
                 let _ = this.update_in(cx, |this, window, cx| {
@@ -8014,6 +8033,14 @@ impl Render for Shell {
             self.observations
                 .push(cx.observe_window_activation(window, |this, window, cx| {
                     this.window_active = window.is_window_active();
+                    if this.window_active {
+                        this.reconcile_sync_jobs(cx);
+                        if this.active_app_view == Some(app_views::AppView::Contributors)
+                            && let Some(page) = this.contributors.clone()
+                        {
+                            page.update(cx, |page, cx| page.window_activated(cx));
+                        }
+                    }
                     this.refresh_notification_permission();
                     cx.notify();
                 }));

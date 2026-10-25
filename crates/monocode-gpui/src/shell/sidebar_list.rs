@@ -559,6 +559,10 @@ impl Shell {
                 .icon("inbox")
                 .toggle(self.workspace.sidebar_inbox_visible)
                 .into(),
+            MenuAction::new("sidebar-contributors", "Contributors")
+                .icon("chart-square")
+                .toggle(self.workspace.sidebar_contributors_visible)
+                .into(),
             MenuAction::new("sidebar-monos", "Monos")
                 .icon("ghost")
                 .toggle(self.workspace.preferences.monos)
@@ -581,6 +585,7 @@ impl Shell {
             "sidebar-notes" => &mut self.workspace.sidebar_notes_visible,
             "sidebar-automations" => &mut self.workspace.sidebar_automations_visible,
             "sidebar-inbox" => &mut self.workspace.sidebar_inbox_visible,
+            "sidebar-contributors" => &mut self.workspace.sidebar_contributors_visible,
             "sidebar-monos" => &mut self.workspace.preferences.monos,
             "sidebar-activity" => &mut self.workspace.sidebar_activity_visible,
             "compact-session-cards" => &mut self.workspace.compact_session_cards,
@@ -685,6 +690,7 @@ impl Shell {
                     ("Inbox", "inbox"),
                     ("Notes", "note"),
                     ("Automations", "zap"),
+                    ("Contributors", "chart-square"),
                 ]
                 .into_iter()
                 .filter(|(label, _)| match *label {
@@ -692,6 +698,7 @@ impl Shell {
                         self.workspace.preferences.notes && self.workspace.sidebar_notes_visible
                     }
                     "Automations" => self.workspace.sidebar_automations_visible,
+                    "Contributors" => self.workspace.sidebar_contributors_visible,
                     "Inbox" => self.workspace.sidebar_inbox_visible,
                     _ => true,
                 })
@@ -752,6 +759,7 @@ impl Shell {
                             "Inbox" => this.open_inbox(window, cx),
                             "Notes" => this.open_notes(window, cx),
                             "Automations" => this.open_automations(window, cx),
+                            "Contributors" => this.open_contributors(None, None, window, cx),
                             _ => (),
                         }))
                         .on_hover(cx.listener(move |this, hovered, _, cx| {

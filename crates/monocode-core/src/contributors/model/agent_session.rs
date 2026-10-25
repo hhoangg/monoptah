@@ -43,6 +43,12 @@ pub fn resolve_harness(raw: Option<&str>, known: &[Kind]) -> Result<Option<Kind>
         .ok_or_else(|| format!("The provider \"{raw}\" is not available."))
 }
 
+/// Whether the provider takes attached files (`harnessSupportsAttachments`):
+/// fx does not, so it is told the path instead.
+pub fn attachments_supported(kind: Kind) -> bool {
+    kind != Kind::Fx
+}
+
 /// Turns any failure into one readable line: `Could not <step>: <detail>`.
 pub fn failure_message(step: &str, error: Option<&str>) -> String {
     let detail = js_trim(error.unwrap_or(""));
@@ -126,6 +132,13 @@ mod tests {
         );
         // A real provider that the caller did not list is not available either.
         assert!(resolve_harness(Some("cursor"), &known).is_err());
+    }
+
+    #[test]
+    fn only_fx_cannot_take_attached_files() {
+        for kind in Kind::ALL {
+            assert_eq!(attachments_supported(kind), kind != Kind::Fx, "{kind:?}");
+        }
     }
 
     #[test]

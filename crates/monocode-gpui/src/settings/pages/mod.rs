@@ -11,12 +11,14 @@ mod mobile;
 mod monos;
 mod providers;
 mod skills;
+mod ticket_scoring;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
 pub(super) use connections::ConnectionsState;
 pub(crate) use keybindings::command_shortcut;
 pub(super) use mobile::MobileState;
+pub(super) use ticket_scoring::ScoringState;
 
 use super::{Section, SettingsView};
 use gpui::{AnyElement, Context, Window};

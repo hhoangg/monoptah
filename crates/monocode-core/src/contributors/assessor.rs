@@ -386,7 +386,7 @@ impl Default for AiConfig {
 }
 
 /// What the UI may see: the key itself never leaves the backend.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiConfigStatus {
     pub runner: String,

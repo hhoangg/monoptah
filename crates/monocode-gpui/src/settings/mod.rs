@@ -46,6 +46,8 @@ pub(crate) struct ArchivedSession {
 pub(crate) struct SettingsContext {
     /// The desktop's shared remote connection and SSH setup service.
     pub remote: Option<std::sync::Arc<monocode_core::remote::Connections>>,
+    /// The app data folder (`contributors-ai.json`), `None` for an in-memory store.
+    pub data_dir: Option<std::path::PathBuf>,
     pub monos: Vec<MonoSetting>,
     pub classic: bool,
     pub new_layout_boxy: bool,
@@ -76,7 +78,8 @@ impl PartialEq for SettingsContext {
             (None, Some(_)) | (Some(_), None) => return false,
             _ => {}
         }
-        self.monos == other.monos
+        self.data_dir == other.data_dir
+            && self.monos == other.monos
             && self.classic == other.classic
             && self.new_layout_boxy == other.new_layout_boxy
             && self.no_terminal_sessions == other.no_terminal_sessions
@@ -257,6 +260,7 @@ pub(crate) struct SettingsView {
     accent_custom_open: bool,
     accent_anchor: AnchorSlot,
     mobile: pages::MobileState,
+    ticket_scoring: pages::ScoringState,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -392,6 +396,7 @@ impl SettingsView {
             accent_custom_open: false,
             accent_anchor: AnchorSlot::default(),
             mobile: pages::MobileState::default(),
+            ticket_scoring: pages::ScoringState::default(),
             _subscriptions: subscriptions,
         };
         this.watch_mobile(cx);

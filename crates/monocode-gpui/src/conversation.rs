@@ -772,6 +772,18 @@ impl Conversation {
         settings: Settings,
         cx: &mut Context<Self>,
     ) {
+        self.quick_submit_with(prompt, settings, Vec::new(), cx);
+    }
+    /// `quick_submit` that also carries `attachments`: files the caller already
+    /// checked with `composer::validate_attachments`, sent and recorded exactly
+    /// like the composer's own.
+    pub(crate) fn quick_submit_with(
+        &mut self,
+        prompt: String,
+        settings: Settings,
+        attachments: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         if self.editing_last_turn.pending() {
             self.defer_edit_transfer(settings, Some(prompt), cx);
             return;
@@ -783,12 +795,17 @@ impl Conversation {
                         this.install_transfer(settings, None, cx);
                         this.enqueue_restored_prompt(prompt, cx);
                     } else {
-                        this.quick_submit(prompt, settings, cx);
+                        this.quick_submit_with(prompt, settings, attachments, cx);
                     }
                 },
                 cx,
             );
             return;
+        }
+        for path in attachments {
+            if !self.attachments.contains(&path) {
+                self.attachments.push(path);
+            }
         }
         self.loaded = true;
         self.model = settings.model.clone();

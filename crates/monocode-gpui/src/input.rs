@@ -253,6 +253,14 @@ impl Input {
     pub(crate) fn is_secret(&self) -> bool {
         self.secret
     }
+    #[cfg(test)]
+    pub(crate) fn placeholder(&self) -> &str {
+        &self.placeholder
+    }
+    #[cfg(test)]
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only
+    }
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             code: None,
@@ -359,6 +367,16 @@ impl Input {
         input.height = 40.;
         input.min_height = 40.;
         input.max_height = 144.;
+        input
+    }
+    /// The Ask Agent dialog's `rows={4}` textarea at `text-[13px]`; Cmd/Ctrl+Enter submits.
+    pub(crate) fn ask_question(cx: &mut Context<Self>) -> Self {
+        let mut input = Self::commit_message(cx);
+        input.label = "Question".into();
+        input.placeholder = "Ask anything about this data...".into();
+        input.height = 80.;
+        input.min_height = 80.;
+        input.max_height = 160.;
         input
     }
     /// AutomationEditor uses a proportional, naturally growing prompt field.

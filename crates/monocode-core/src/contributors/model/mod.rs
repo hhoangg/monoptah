@@ -50,7 +50,7 @@ pub(crate) fn js_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// A close stand-in for `String.prototype.localeCompare` on the names and ids
 /// the model sorts: case-insensitive, and for text equal ignoring case the
 /// lowercase form first, as ICU does. Accents and scripts are not collated.
-pub(crate) fn locale_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+pub fn locale_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     a.to_lowercase()
         .cmp(&b.to_lowercase())
         .then_with(|| b.cmp(a))
@@ -98,7 +98,7 @@ pub(crate) fn serialize_opt_number<S: serde::Serializer>(
 /// `Number.prototype.toString`: the shortest digits that read back to the same
 /// number, plain up to 21 integer digits and down to 1e-6, else `1e-7` or
 /// `1.5e+21`. Used for template strings and JSON alike.
-pub(crate) fn js_number_text(value: f64) -> String {
+pub fn js_number_text(value: f64) -> String {
     if value.is_nan() {
         return "NaN".into();
     }

@@ -14,6 +14,7 @@ mod composer_completion;
 mod composer_motion;
 mod composer_runner;
 mod context_meter;
+mod contributors;
 mod conversation;
 #[cfg(debug_assertions)]
 mod dev_reload;

@@ -23,7 +23,7 @@ pub use name::{
 };
 pub use paths::{
     create_parent_of, dirs_touched_by_create, dirs_touched_by_move, display_path,
-    is_equal_or_inside, join_path, parent_path, path_key, rebase_path,
+    is_equal_or_inside, join_path, looks_like_project, parent_path, path_key, rebase_path,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

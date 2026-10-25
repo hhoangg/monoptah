@@ -11,6 +11,7 @@ pub(crate) enum AppView {
     Inbox,
     Notes,
     Automations,
+    Contributors,
 }
 impl AppView {
     pub fn label(self) -> &'static str {
@@ -18,6 +19,7 @@ impl AppView {
             Self::Inbox => "Inbox",
             Self::Notes => "Notes",
             Self::Automations => "Automations",
+            Self::Contributors => "Contributors",
         }
     }
     pub fn icon(self) -> &'static str {
@@ -25,6 +27,7 @@ impl AppView {
             Self::Inbox => "inbox",
             Self::Notes => "note",
             Self::Automations => "zap",
+            Self::Contributors => "chart-square",
         }
     }
 }
@@ -93,6 +96,7 @@ pub(crate) struct Workspace {
     pub compact_session_cards: bool,
     pub sidebar_notes_visible: bool,
     pub sidebar_automations_visible: bool,
+    pub sidebar_contributors_visible: bool,
     pub sidebar_inbox_visible: bool,
     pub sidebar_activity_visible: bool,
     /// The inset right panel: open state, tab, width and tab order.
@@ -303,6 +307,7 @@ impl Default for Workspace {
             compact_session_cards: true,
             sidebar_notes_visible: true,
             sidebar_automations_visible: true,
+            sidebar_contributors_visible: true,
             sidebar_inbox_visible: true,
             sidebar_activity_visible: true,
             right_panel_open: false,

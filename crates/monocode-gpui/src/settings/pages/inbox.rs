@@ -89,6 +89,7 @@ impl SettingsView {
                         false,
                         false,
                     )
+                    .debug_selector(move || format!("connect-{id}"))
                     .child(if connected { "Manage" } else { "Connect" })
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(SettingsEvent::ManageInboxProvider(id.into()))
@@ -122,6 +123,9 @@ impl SettingsView {
                     vec![row],
                 ),
             );
+            if id == "clickup" {
+                page.push(self.ticket_scoring_group(cx));
+            }
         }
         page
     }

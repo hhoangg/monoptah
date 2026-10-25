@@ -86,6 +86,11 @@ impl Contributors {
     pub fn db(&self) -> &Arc<ContributorsDb> {
         &self.db
     }
+
+    /// The app data directory (`clickup-config.json`, `contributors-ai.json`).
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
 }
 
 /// Every cwd a caller gives may start with `~`.
@@ -319,7 +324,13 @@ pub fn ticket_override(
 
 /// The AI settings without the key: the caller learns only whether one is set.
 pub fn ai_config_get(contributors: &Contributors) -> Result<AiConfigStatus, String> {
-    Ok(assessor::read_ai_config(&contributors.data_dir)?.status())
+    ai_config_get_at(&contributors.data_dir)
+}
+
+/// [`ai_config_get`] for a data directory, for Settings: it needs neither the
+/// database nor the job queue.
+pub fn ai_config_get_at(data_dir: &Path) -> Result<AiConfigStatus, String> {
+    Ok(assessor::read_ai_config(data_dir)?.status())
 }
 
 /// Saves the AI settings. `api_key` of `None` keeps the stored key, `Some("")`
@@ -330,7 +341,16 @@ pub fn ai_config_set(
     model: &str,
     api_key: Option<&str>,
 ) -> Result<AiConfigStatus, String> {
-    let dir = &contributors.data_dir;
+    ai_config_set_at(&contributors.data_dir, runner, model, api_key)
+}
+
+/// [`ai_config_set`] for a data directory.
+pub fn ai_config_set_at(
+    dir: &Path,
+    runner: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<AiConfigStatus, String> {
     // Keeping the stored key needs the stored settings: if they cannot be
     // read, say so rather than save over them and lose the key. When a new
     // key is given (or the old one is being deleted) an unreadable file is
@@ -929,6 +949,19 @@ mod tests {
             (fallback.runner.as_str(), fallback.model.as_str()),
             ("claude-code", "claude-opus-5-5")
         );
+    }
+
+    #[test]
+    fn the_ai_config_can_be_read_and_saved_by_data_directory_alone() {
+        let (_app, _events, dir) = ticket_app();
+        let set = ai_config_set_at(dir.path(), "api", "m", Some("sk-x")).unwrap();
+        assert_eq!(
+            (set.runner.as_str(), set.model.as_str(), set.has_api_key),
+            ("api", "m", true)
+        );
+        assert_eq!(ai_config_get_at(dir.path()).unwrap(), set);
+        let removed = ai_config_set_at(dir.path(), "api", "m", Some("")).unwrap();
+        assert!(!removed.has_api_key);
     }
 
     #[test]

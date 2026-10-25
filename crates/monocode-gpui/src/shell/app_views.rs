@@ -14,6 +14,7 @@ impl Shell {
             AppView::Inbox => "Inbox",
             AppView::Notes => "Notes",
             AppView::Automations => "Automations",
+            AppView::Contributors => "Contributors",
         })
     }
 
@@ -129,8 +130,28 @@ impl Shell {
         {
             notes.update(cx, |notes, cx| notes.flush(cx));
         }
+        self.hide_contributors(cx);
         self.active_app_view = None;
         self.invalidate_chrome(cx);
+    }
+
+    /// The Contributors page leaves the screen (another view, Settings over it):
+    /// its Ticket tab unmounts and stops listening to ClickUp jobs.
+    pub(super) fn hide_contributors(&self, cx: &mut Context<Self>) {
+        if self.active_app_view == Some(AppView::Contributors)
+            && let Some(page) = &self.contributors
+        {
+            page.update(cx, |page, cx| page.hide(cx));
+        }
+    }
+
+    /// Settings closed over the Contributors page: it is on screen again.
+    pub(super) fn reveal_contributors(&self, cx: &mut Context<Self>) {
+        if self.active_app_view == Some(AppView::Contributors)
+            && let Some(page) = &self.contributors
+        {
+            page.update(cx, |page, cx| page.reveal(cx));
+        }
     }
 
     pub(super) fn close_app_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -194,6 +215,7 @@ impl Shell {
             AppView::Notes => self.notes.clone().map(IntoElement::into_any_element),
             AppView::Inbox => self.inbox.clone().map(IntoElement::into_any_element),
             AppView::Automations => self.automations.clone().map(IntoElement::into_any_element),
+            AppView::Contributors => self.contributors.clone().map(IntoElement::into_any_element),
         }
     }
 
@@ -203,6 +225,9 @@ impl Shell {
             Some(AppView::Inbox) => self.inbox.as_ref().map(|view| view.focus_handle(cx)),
             Some(AppView::Automations) => {
                 self.automations.as_ref().map(|view| view.focus_handle(cx))
+            }
+            Some(AppView::Contributors) => {
+                self.contributors.as_ref().map(|view| view.focus_handle(cx))
             }
             None => return false,
         };
@@ -352,6 +377,69 @@ impl Shell {
         self.show_app_view(AppView::Automations, window, cx);
     }
 
+    /// Opens the Contributors page on `tab` (Ticket when `None`)
+    /// showing `project` (`None` leaves it to the page). Opening it again with
+    /// neither keeps the tab and project already chosen. It never changes the
+    /// current project.
+    pub(super) fn open_contributors(
+        &mut self,
+        tab: Option<crate::contributors::Tab>,
+        project: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keep = tab.is_none()
+            && project.is_none()
+            && self.active_app_view == Some(AppView::Contributors);
+        self.prepare_app_view(window, cx);
+        let page = match self.contributors.clone() {
+            Some(page) => page,
+            None => {
+                let jobs = self.sync_jobs.clone();
+                let page = cx.new(|cx| crate::contributors::ContributorsPage::new(jobs, cx));
+                self.app_view_events.push(cx.subscribe_in(
+                    &page,
+                    window,
+                    |this, _, event: &crate::contributors::Event, window, cx| match event {
+                        crate::contributors::Event::Close => this.close_app_view(window, cx),
+                        crate::contributors::Event::Ask {
+                            project,
+                            scope,
+                            view,
+                        } => this.open_contributors_ask(project, scope, view, cx),
+                        crate::contributors::Event::StartSession {
+                            project,
+                            request,
+                            start,
+                        } => this.start_contributors_ask(project, request, *start, cx),
+                        // The page stays under Settings (hidden by `open_settings`) and
+                        // comes back when Settings closes, as Tauri's return view does.
+                        crate::contributors::Event::OpenSettings => {
+                            this.open_settings(crate::settings::Section::Inbox, window, cx)
+                        }
+                    },
+                ));
+                self.contributors = Some(page.clone());
+                page
+            }
+        };
+        let projects = self.workspace.projects.clone();
+        let active = self.workspace.project.clone();
+        let store = self.store.clone();
+        page.update(cx, |page, cx| {
+            page.set_store(store);
+            page.set_context(projects, active, cx);
+            if !keep {
+                page.show(tab, project, cx);
+            }
+            if let Some(core) = &self.contributors_core {
+                page.set_core(Ok(core.clone()), cx);
+            }
+        });
+        self.ensure_contributors_core(cx);
+        self.show_app_view(AppView::Contributors, window, cx);
+    }
+
     fn note_to_chat(
         &mut self,
         note: monocode_core::notes::Note,
@@ -427,24 +515,20 @@ impl Shell {
         self.focus_active(window, cx);
     }
 
-    fn start_inbox_session(
-        &mut self,
-        item: monocode_core::inbox::Item,
-        prompt: String,
-        cx: &mut Context<Self>,
-    ) {
-        let cwd = if item.project_path.is_empty() {
-            self.workspace.project.clone()
-        } else {
-            item.project_path.clone()
-        };
-        let kind = self.default_kind();
-        let settings = monocode_core::agent::Settings {
+    /// The settings a new session of `kind` in `cwd` starts with: the project's
+    /// model, else the default one, and the default effort, access and account.
+    pub(super) fn project_session_settings(
+        &self,
+        kind: Kind,
+        cwd: &str,
+        cx: &App,
+    ) -> monocode_core::agent::Settings {
+        monocode_core::agent::Settings {
             model: self
                 .workspace
                 .preferences
                 .project_providers
-                .get(&cwd)
+                .get(cwd)
                 .and_then(|preferences| preferences.models.get(kind.id()))
                 .or(self.workspace.preferences.default_models.get(kind.id()))
                 .cloned(),
@@ -457,10 +541,25 @@ impl Shell {
                 .map(monocode_core::agent::AccessMode::from_id)
                 .unwrap_or_default(),
             account: crate::accounts::get(cx)
-                .map(|accounts| accounts.read(cx).selected(kind, &cwd))
+                .map(|accounts| accounts.read(cx).selected(kind, cwd))
                 .unwrap_or_default(),
             ..Default::default()
+        }
+    }
+
+    fn start_inbox_session(
+        &mut self,
+        item: monocode_core::inbox::Item,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = if item.project_path.is_empty() {
+            self.workspace.project.clone()
+        } else {
+            item.project_path.clone()
         };
+        let kind = self.default_kind();
+        let settings = self.project_session_settings(kind, &cwd, cx);
         // applyInboxStart: the provider's surface, kept as a terminal only when its
         // CLI takes a first prompt (the start prompt becomes it); else a chat.
         let preferred =

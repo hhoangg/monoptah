@@ -508,6 +508,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "api token tasks spaces workspace connect",
     ),
     (
+        "ticket-scoring",
+        Section::Inbox,
+        "Ticket scoring",
+        "contributors leaderboard clickup ai runner claude code anthropic api key model haiku opus",
+    ),
+    (
         "linear",
         Section::Inbox,
         "Linear",

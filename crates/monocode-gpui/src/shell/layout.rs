@@ -783,6 +783,7 @@ impl Shell {
                     .cached(StyleRefinement::default().flex_1().min_w_0().h(px(height))),
             )
             .children(self.pressure_chip(cx))
+            .children(self.sync_chip(cx))
             .children(self.terminal_footer(cx))
     }
     /// ResourcePressureNotice's chip, just before the terminal controls.
