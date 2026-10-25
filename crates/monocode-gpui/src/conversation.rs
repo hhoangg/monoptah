@@ -12,6 +12,8 @@ mod history;
 mod mobile;
 mod mono;
 mod notifications;
+mod question_api;
+pub(crate) use question_api::{QuestionAsked, QuestionSettled};
 mod remote;
 pub(crate) mod remote_plans;
 mod response_menu;
@@ -1053,7 +1055,7 @@ impl Conversation {
         let (controls, control_rx) = std::sync::mpsc::channel();
         self.controls = Some(controls);
         self.approvals.clear();
-        self.questions.clear();
+        self.cancel_questions(cx);
         let (tx, rx) = async_channel::bounded(8);
         let mut turn_model_id = settings
             .turn_model
@@ -1229,73 +1231,9 @@ impl Conversation {
                         for id in update.approvals_resolved {
                             this.approvals.retain(|approval| approval.id != id);
                         }
-                        for id in update.questions_resolved {
-                            this.questions.retain(|(card, _)| card.read(cx).id() != id);
-                        }
+                        this.drop_resolved_questions(update.questions_resolved, cx);
                         for request in update.questions.into_iter().filter(|_| !stopping) {
-                            let card =
-                                cx.new(|cx| crate::questions::QuestionCard::new(request, cx));
-                            let events = cx.subscribe(
-                                &card,
-                                |this, _, reply: &crate::questions::Answered, cx| {
-                                    if this
-                                        .questions
-                                        .front()
-                                        .is_none_or(|(card, _)| card.read(cx).id() != reply.id)
-                                    {
-                                        return;
-                                    }
-                                    let before = this.needs_approval();
-                                    let decision = reply
-                                        .answers
-                                        .clone()
-                                        .map_or(Decision::Deny, Decision::Answer);
-                                    if this.controls.as_ref().is_none_or(|controls| {
-                                        controls
-                                            .send(Control {
-                                                id: reply.id.clone(),
-                                                decision,
-                                            })
-                                            .is_err()
-                                    }) {
-                                        this.status =
-                                            "The provider is no longer waiting for this answer"
-                                                .into();
-                                        cx.notify();
-                                        return;
-                                    }
-                                    if let Some((card, _)) = this.questions.pop_front() {
-                                        this.question_overlay.release(card, cx);
-                                    }
-                                    this.status = if !this.approvals.is_empty() {
-                                        "Waiting for approval"
-                                    } else if !this.questions.is_empty() {
-                                        "Waiting for your answer"
-                                    } else {
-                                        "Working…"
-                                    }
-                                    .into();
-                                    if before != this.needs_approval() {
-                                        cx.emit(SessionChanged);
-                                    }
-                                    cx.notify();
-                                },
-                            );
-                            let keep_open = cx.subscribe(
-                                &card,
-                                |this, _, request: &crate::questions::KeptOpen, cx| {
-                                    if let Some(controls) = &this.controls {
-                                        let _ = controls.send(Control {
-                                            id: request.id.clone(),
-                                            decision: Decision::KeepOpen,
-                                        });
-                                    }
-                                    cx.emit(SessionChanged);
-                                    cx.notify();
-                                },
-                            );
-                            this.questions.push_back((card, vec![events, keep_open]));
-                            this.status = "Waiting for your answer".into();
+                            this.push_question(request, cx);
                         }
                         if !finished && !this.approvals.is_empty() {
                             this.status = "Waiting for approval".into();
@@ -1347,7 +1285,7 @@ impl Conversation {
                                 this.save_follow_ups(cx);
                             }
                             this.approvals.clear();
-                            this.questions.clear();
+                            this.cancel_questions(cx);
                             this.controls = None;
                             this.transcript.update(cx, |v, cx| v.streaming(false, cx));
                             let model_id = turn_model_id.clone();
@@ -2570,7 +2508,7 @@ impl Conversation {
         self.follow_ups.ready = false;
         self.clear_background();
         self.approvals.clear();
-        self.questions.clear();
+        self.cancel_questions(cx);
         self.controls = None;
         self.status = "Ready".into();
         self.transcript

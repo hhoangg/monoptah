@@ -76,6 +76,7 @@ mod sound;
 mod syntax;
 mod tab_label;
 mod tab_motion;
+mod telegram_dialog;
 mod terminal;
 mod theme;
 #[cfg(target_os = "macos")]

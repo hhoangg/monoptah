@@ -41,6 +41,7 @@ mod sidebar_peek;
 mod started_rail;
 #[cfg(test)]
 pub(crate) mod surface_tests;
+mod telegram;
 mod terminal_dock;
 mod title_tabs;
 mod tui_busy;
@@ -541,6 +542,9 @@ pub(crate) struct Shell {
     orchestration_summaries: HashMap<i64, monocode_core::orchestration::Summary>,
     /// Sessions an /operator thread started, by the session that started them.
     started_by: HashMap<i64, i64>,
+    /// Ticket id of the inbox item a session was started from, which Telegram questions name.
+    session_tickets: HashMap<i64, String>,
+    telegram: telegram::Telegram,
     /// The sidebar rails under orchestrators and /operator threads.
     rails: rails::Rails,
     usage_footer: Entity<UsageFooter>,
@@ -914,6 +918,8 @@ impl Shell {
             orchestrations: HashMap::new(),
             orchestration_summaries: sidebar_metadata.orchestrations,
             started_by: sidebar_metadata.started_by,
+            session_tickets: HashMap::new(),
+            telegram: telegram::Telegram::new(),
             rails: Default::default(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
@@ -1171,6 +1177,10 @@ impl Shell {
         this.monos = Some(monos);
         this.bind_notices(cx);
         this.init_app_bridge(cx);
+        let telegram_dir = locked(&this.store)
+            .ok()
+            .and_then(|store| store.data_dir().map(std::path::Path::to_path_buf));
+        this.telegram_start(telegram_dir, cx);
         for summary in summaries {
             if this
                 .monos
@@ -1331,6 +1341,7 @@ impl Shell {
             }));
         self.observe_orchestration(&view, id, cx);
         self.observe_session_folders(&view, id, cx);
+        self.observe_telegram(&view, id, cx);
         self.sessions.insert(id, view);
         if !self.order.contains(&id) {
             self.order.push(id);
@@ -4991,6 +5002,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.close_preview(cx);
+        if matches!(target, MenuTarget::Session(_)) {
+            // The menu reads what the last look found; look again for the next time.
+            self.telegram_refresh_linkable(cx);
+        }
         // Close the previous menu first, so the new one remembers the focus
         // that was there before either opened.
         self.menu = None;
@@ -5379,6 +5394,13 @@ impl Shell {
                         .icon("image-add")
                         .into(),
                 ];
+                if !path.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX) {
+                    items.push(
+                        MenuAction::new("telegram", "Telegram…")
+                            .icon("paper-plane")
+                            .into(),
+                    );
+                }
                 if *rail {
                     let mut groups = vec![MenuAction::new("project-group:new", "New group…")];
                     if self.workspace.project_rail_assignments.contains_key(path) {
@@ -5529,6 +5551,8 @@ impl Shell {
                     }
                 } else if action == "background" {
                     self.open_background_dialog(path, window, cx);
+                } else if action == "telegram" {
+                    self.open_telegram_dialog(path, window, cx);
                 } else if action == "archive" {
                     self.archive_project(&path, window, cx);
                 } else if action == "delete" {
@@ -8337,6 +8361,14 @@ impl Render for Shell {
                     this.close_link_dialog(window, cx);
                     return;
                 }
+                if this.telegram.dialog.is_some() {
+                    this.close_telegram_dialog(window, cx);
+                    return;
+                }
+                if this.telegram.topic.is_some() {
+                    this.close_telegram_topic(window, cx);
+                    return;
+                }
                 if this.action_dialog.is_some() {
                     this.close_action_dialog(window, cx);
                     return;
@@ -8541,6 +8573,8 @@ impl Render for Shell {
             .children(self.drag_ghost(cx))
             .children(self.background_modal(window, cx))
             .children(self.link_modal(window, cx))
+            .children(self.telegram_modal(window, cx))
+            .children(self.telegram_topic_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))

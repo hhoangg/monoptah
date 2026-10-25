@@ -215,6 +215,10 @@ fn icon_body(path: &str) -> Option<&'static str> {
             "<path d='M14 4H6a2 2 0 0 0-2 2v8'/><rect x='8' y='8' width='12' height='12' rx='2'/>"
         }
         "code" => "<path d='m8 7-5 5 5 5m8-10 5 5-5 5m-3-14-2 18'/>",
+        // Lucide Send.
+        "paper-plane" => {
+            "<path d='M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z'/><path d='m21.854 2.147-10.94 10.939'/>"
+        }
         "minus" => "<path d='M6 12h12'/>",
         "pencil-line" => "<path d='M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L9 17l-4 1 1-4Z'/>",
         "circle-dashed" => {

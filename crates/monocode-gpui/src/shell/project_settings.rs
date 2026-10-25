@@ -89,7 +89,7 @@ impl Shell {
                 if let MenuEvent::Picked(action, row) = event {
                     this.run_menu(target.clone(), action, *row, window, cx);
                 }
-                if this.background_dialog.is_none() {
+                if this.background_dialog.is_none() && !this.telegram.dialog_open() {
                     this.focus_workspace(window, cx);
                 }
                 cx.notify();

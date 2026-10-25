@@ -2588,6 +2588,32 @@ impl TranscriptView {
         crate::notifications::delivery::clip_body(&text)
     }
 
+    /// The latest assistant message in full, including its virtualized continuation rows.
+    /// Only its last 200000 characters are collected: the Telegram summary reads no more.
+    pub(crate) fn last_assistant_text(&self) -> String {
+        let Some(end) = self
+            .source
+            .iter()
+            .rposition(|row| row.role == "assistant" && !row.text.trim().is_empty())
+        else {
+            return String::new();
+        };
+        let mut start = end;
+        let mut size = self.source[end].text.len();
+        while start > 0
+            && size < 200_000
+            && !self.source[start].first
+            && self.source[start - 1].role == "assistant"
+        {
+            start -= 1;
+            size += self.source[start].text.len();
+        }
+        self.source[start..=end]
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect()
+    }
+
     /// Tauri's appendUser: paint the prompt and working receipt in the send
     /// handler. The worker replaces these same rows after saving them. Build
     /// the attachment manifest without touching the filesystem on the UI thread.
@@ -5888,6 +5914,34 @@ mod scroll_tests {
             assert_eq!(view.hovered_turn.map(|(t, _)| t), Some(1));
             view.mono_hover(false, 1, 1, (1, usize::MAX - 1), false, cx);
             assert!(view.hovered_turn.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn the_last_assistant_text_joins_its_continuation_rows(cx: &mut TestAppContext) {
+        let view = cx.new(|_| TranscriptView::new());
+        view.update(cx, |view, cx| {
+            assert_eq!(view.last_assistant_text(), "");
+            let continued = |text: &str| Row {
+                first: false,
+                ..row("assistant", text)
+            };
+            view.patch(
+                0,
+                vec![
+                    row("user", "Hi"),
+                    row("assistant", "An older reply."),
+                    row("user", "More"),
+                    row("assistant", "Start "),
+                    continued("middle "),
+                    continued("end."),
+                    row("user", "Thanks"),
+                ],
+                cx,
+            );
+            assert_eq!(view.last_assistant_text(), "Start middle end.");
+            view.patch(7, vec![row("assistant", "   ")], cx);
+            assert_eq!(view.last_assistant_text(), "Start middle end.");
         });
     }
 

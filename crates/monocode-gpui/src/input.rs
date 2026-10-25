@@ -249,6 +249,10 @@ impl Input {
     pub(crate) fn set_secret(&mut self, secret: bool) {
         self.secret = secret;
     }
+    #[cfg(test)]
+    pub(crate) fn is_secret(&self) -> bool {
+        self.secret
+    }
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             code: None,

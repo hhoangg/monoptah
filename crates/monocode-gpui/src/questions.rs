@@ -119,6 +119,9 @@ impl QuestionCard {
     pub(crate) fn id(&self) -> &str {
         &self.request.id
     }
+    pub(crate) fn request(&self) -> &Question {
+        &self.request
+    }
     pub(crate) fn blocks_steering(&self) -> bool {
         self.request.auto_resolve_at.is_none()
     }

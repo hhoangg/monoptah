@@ -45,6 +45,7 @@ approval for every edit. Native Supervised mode does not add that guarantee.
 | Remote connections | Real-machine installation/update, existing-data restoration and cross-platform checks; the existing host's feature limits still apply |
 | Integrations | Completion/approval notifications, sounds and Dock badges; Quick Composer attachments/shortcut checks, MCP/skills checks and remaining app-control endpoints. macOS reminder delivery and click routing passed on Oct 22 |
 | Shared data | Concurrent Tauri/native use with active scheduled tasks or phone connections remains unverified and deferred |
+| Telegram | A release native build reads and writes the installed app's Telegram settings. Run only one of the two apps while Telegram forwarding is on: both would read the same bots (HTTP 409, answers picked up by the wrong app) and either can undo the other's Telegram changes (topic links, token, group, forwarding) |
 
 ## Platform and distribution
 
