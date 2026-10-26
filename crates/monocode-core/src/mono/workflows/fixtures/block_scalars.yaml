@@ -1,0 +1,263 @@
+monoptahWorkflow: 1
+name: Block scalars
+inputs:
+  project:
+    type: project
+nodes:
+  - id: start
+    type: manual
+  - id: s0
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: one line
+    output: {}
+  - id: s1
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      two
+      lines
+    output: {}
+  - id: s2
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |
+      ends with newline
+    output: {}
+  - id: s3
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |+
+      ends with two
+
+    output: {}
+  - id: s4
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |+
+      ends with three
+
+
+    output: {}
+  - id: s5
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      
+      starts with newline
+    output: {}
+  - id: s6
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      
+
+      starts with two
+    output: {}
+  - id: s7
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |2-
+        starts with spaces
+      second
+    output: {}
+  - id: s8
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |2-
+      
+        newline then spaces
+      x
+    output: {}
+  - id: s9
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |2
+       
+       x
+    output: {}
+  - id: s10
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |+
+      text
+       
+    output: {}
+  - id: s11
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: "text\n   "
+    output: {}
+  - id: s12
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: "text\n\t"
+    output: {}
+  - id: s13
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      text   
+      more
+    output: {}
+  - id: s14
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      a
+
+
+      b
+
+
+      c
+    output: {}
+  - id: s15
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |
+      a
+        b
+          c
+    output: {}
+  - id: s16
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |+
+      
+    output: {}
+  - id: s17
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |+
+      
+
+    output: {}
+  - id: s18
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |
+      - list
+      - like
+    output: {}
+  - id: s19
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |
+      key: value
+      other: v2
+    output: {}
+  - id: s20
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      #comment
+      line
+    output: {}
+  - id: s21
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      line
+      #comment
+    output: {}
+  - id: s22
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      ---
+      doc
+    output: {}
+  - id: s23
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      text
+      ---
+      more
+    output: {}
+  - id: s24
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      text
+      ...
+      more
+    output: {}
+  - id: s25
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      %directive
+      x
+    output: {}
+  - id: s26
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |-
+      tab	here
+      second	line
+    output: {}
+  - id: s27
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: "ctrl\x01\nsecond"
+    output: {}
+  - id: s28
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |
+      xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z 
+    output: {}
+  - id: s29
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |
+      unicode 日本語
+      and more 🎉
+    output: {}
+  - id: s30
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: "cr\r\nlf"
+    output: {}
+  - id: s31
+    type: session
+    project: "{{inputs.project}}"
+    checkout: root
+    prompt: |
+      last line has trailing space 
+    output: {}
+edges: []

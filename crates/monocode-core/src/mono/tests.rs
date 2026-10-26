@@ -173,6 +173,24 @@ fn a_launch_saved_before_completion_delivery_loads_as_group() {
     assert_eq!(saved["each"], true);
 }
 #[test]
+fn a_launch_is_shown_only_when_a_workflow_run_made_it() {
+    let old = r#"{"sessionId":7,"cwd":"/p","title":"t","harness":"codex","model":null,"originTurn":4294967297,"notifyOnComplete":true}"#;
+    let launch: Launch = serde_json::from_str(old).unwrap();
+    assert!(!launch.visible);
+    // The flag is only written when set, so saved Monos keep their shape.
+    assert!(serde_json::to_value(&launch)
+        .unwrap()
+        .get("visible")
+        .is_none());
+    let shown = serde_json::to_value(Launch {
+        visible: true,
+        ..launch
+    })
+    .unwrap();
+    assert_eq!(shown["visible"], true);
+    assert!(serde_json::from_value::<Launch>(shown).unwrap().visible);
+}
+#[test]
 fn the_prompt_and_help_describe_each_delivery_and_habit_reporting() {
     let mut roster = Roster::default();
     let mono = roster.create(vec!["/p".into()]).clone();
@@ -209,4 +227,81 @@ fn the_prompt_and_help_describe_each_delivery_and_habit_reporting() {
         assert!(bridge::HELP.contains(needle), "help lacks {needle}");
     }
     assert!(!bridge::HELP.contains("Ignored for drafts"));
+}
+#[test]
+fn the_prompt_and_help_describe_workflows() {
+    let mut roster = Roster::default();
+    let mono = roster.create(vec!["/p".into()]).clone();
+    let files = files::AgentFiles {
+        id: mono.id.clone(),
+        dir: String::new(),
+        soul: None,
+        soul_hash: String::new(),
+        memory: String::new(),
+        memory_hash: String::new(),
+        memory_path: String::new(),
+        topics: Vec::new(),
+    };
+    let context = context(&mono, &files, std::path::Path::new("/bin/app"));
+    for needle in [
+        "workflows.guide",
+        "workflows.validate",
+        "workflows.resumeRun",
+        "{{nodeId.field}}",
+        "{{run.round}}",
+        "Projects are always inputs, never paths.",
+        "show them the steps first",
+        "only then save it with workflows.add or workflows.update",
+        "A workflow you add is always saved paused, however clean it is: the user enables it in the Workflows panel",
+        "workflows.run needs the workflow to be resumed (not paused)",
+        "its model is written `<harness>:<id from models.list>`, for Claude without the `claude-` prefix (for example claude:sonnet-5, as in workflows.guide)",
+        "workflows.validate flags one it does not",
+    ] {
+        assert!(context.contains(needle), "context lacks {needle}");
+    }
+    // The paragraph follows the habits and keeps the native CLI's words (no React `app ` prefix).
+    assert!(
+        context.find("Habits are scheduled work").unwrap()
+            < context.find("Workflows are graphs of steps").unwrap()
+    );
+    assert!(!context.contains("`app workflows"));
+    assert!(!context.contains("workflows_rules"));
+    for action in [
+        "list",
+        "get",
+        "add",
+        "validate",
+        "guide",
+        "update",
+        "setInputs",
+        "run",
+        "stop",
+        "pause",
+        "resume",
+        "resumeRun",
+        "remove",
+        "export",
+        "import",
+        "runs",
+    ] {
+        let name = format!("workflows.{action}");
+        assert!(
+            bridge::HELP.contains(&format!("{name} {{")),
+            "help lacks {name}"
+        );
+        assert!(
+            api::validate(&name, &serde_json::json!({})).is_ok(),
+            "{name} is not an app action"
+        );
+    }
+    for needle in [
+        "always saved paused, however clean it is",
+        "needing review",
+        "returns at once",
+        "<harness>:<id from models.list>\", for Claude without the \"claude-\" prefix, for example \"claude:sonnet-5\" as in workflows.guide",
+        "workflows.validate flags an effort the model does not offer",
+        "limit 1 to 20, default 5",
+    ] {
+        assert!(bridge::HELP.contains(needle), "help lacks {needle}");
+    }
 }

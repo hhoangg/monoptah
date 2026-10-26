@@ -1,0 +1,111 @@
+{
+  "id": "wf-fixture1",
+  "name": "Tricky: strings #1",
+  "inputs": {
+    "project": {
+      "type": "project"
+    }
+  },
+  "inputValues": {
+    "project": "/work/api"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "manual",
+      "title": "- dash start"
+    },
+    {
+      "id": "a",
+      "type": "askMono",
+      "question": "true",
+      "answers": [
+        "null",
+        "~",
+        "",
+        "12",
+        "-3",
+        "1.5",
+        "0x1F",
+        "0o17",
+        ".inf",
+        "-.inf",
+        ".nan",
+        "1e3",
+        "yes",
+        "no",
+        "on",
+        "off",
+        "Yes",
+        "09:00",
+        "2026-10-22",
+        "  lead",
+        "trail  ",
+        "tab\tin",
+        "colon: space",
+        "hash # tag",
+        "a#b",
+        "a: b",
+        "ends:",
+        "- item",
+        "-x",
+        "? q",
+        "?x",
+        "[flow]",
+        "{flow}",
+        "*alias",
+        "&anchor",
+        "!tag",
+        "|pipe",
+        ">fold",
+        "%pct",
+        "@at",
+        "`tick`",
+        "'single'",
+        "\"double\"",
+        "it's",
+        "say \"hi\" it's",
+        "say \"hi\"",
+        "---",
+        "--- x",
+        "...",
+        "a ... b",
+        "multi\nline",
+        "http://x/y?z=1&w=2",
+        "{{inputs.project}}",
+        "Ünïcödé 日本語 🎉",
+        "ctrl\u0001char",
+        "bell\u0007",
+        "esc\u001b[0m",
+        "nelx",
+        "nbsp x",
+        "ls ps x",
+        "delx",
+        "back\\slash",
+        "a\rb",
+        "a\r\nb"
+      ]
+    },
+    {
+      "id": "b",
+      "type": "if",
+      "condition": "{{a.answer}} == \"yes\"",
+      "question": "Is it: fine? # really"
+    },
+    {
+      "id": "c",
+      "type": "command",
+      "project": "{{inputs.project}}",
+      "command": "echo 'it''s' \"x\" && grep -E 'a|b' file # comment: x\n\tindented\n"
+    },
+    {
+      "id": "d",
+      "type": "report",
+      "template": "  Leading spaces\nSecond line   \n\n\nafter blank\n\n"
+    }
+  ],
+  "edges": [],
+  "enabled": false,
+  "createdAt": 0,
+  "description": "line1\nline2: with colon\n  indented\n"
+}

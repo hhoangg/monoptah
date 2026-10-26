@@ -254,6 +254,7 @@ impl super::Mono {
                 launch.completed = previous.completed;
                 launch.dismissed = previous.dismissed;
                 launch.each = previous.each;
+                launch.visible = previous.visible;
             }
         }
         self.documents.retain(|d| {
@@ -337,5 +338,28 @@ mod tests {
         mono.apply_work(Vec::new(), Vec::new()).unwrap();
         assert_eq!(mono.documents.len(), 1);
         assert_eq!(mono.documents[0].id, "native");
+    }
+    #[test]
+    fn refreshing_work_keeps_a_launch_visible_in_the_sidebar() {
+        let launch = |visible| super::super::Launch {
+            session_id: 7,
+            cwd: "/p".into(),
+            title: "T".into(),
+            harness: "claude".into(),
+            model: None,
+            origin_turn: 3,
+            notify_on_complete: false,
+            completed: false,
+            dismissed: false,
+            each: false,
+            visible,
+        };
+        let mut mono = super::super::Mono::default();
+        mono.launches.push(launch(true));
+        // The desktop reader knows nothing of the flag.
+        mono.apply_work(Vec::new(), vec![launch(false)]).unwrap();
+        assert_eq!(mono.launches.len(), 1);
+        assert!(mono.launches[0].visible);
+        assert_eq!(mono.launches[0].origin_turn, 3);
     }
 }

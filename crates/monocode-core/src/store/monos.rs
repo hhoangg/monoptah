@@ -224,6 +224,7 @@ impl Store {
                     completed: true,
                     dismissed: false,
                     each: false,
+                    visible: false,
                 });
             }
         }

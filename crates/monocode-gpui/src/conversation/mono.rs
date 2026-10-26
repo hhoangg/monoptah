@@ -24,6 +24,19 @@ pub(crate) struct QueueChanged {
     pub id: String,
     pub remove: bool,
 }
+/// How a turn a workflow run waits for ended.
+pub(crate) enum TurnEnd {
+    Completed,
+    /// Stopped by the user or the run.
+    Cancelled,
+    /// The turn ended in an error; the text is the conversation's status.
+    Failed(String),
+}
+pub(crate) struct WorkflowTurn {
+    pub end: TurnEnd,
+    /// The final assistant message of the turn.
+    pub reply: String,
+}
 impl EventEmitter<QueueChanged> for Conversation {}
 impl EventEmitter<Submitted> for Conversation {}
 impl Conversation {
@@ -259,6 +272,35 @@ impl Conversation {
     /// No turn is running, and none that was stopped is still finishing its writes.
     pub(crate) fn mono_settled(&self) -> bool {
         !self.busy && !self.stopping
+    }
+    /// Makes the conversation look like a stopped turn is still finishing.
+    #[cfg(test)]
+    pub(crate) fn hold_working_for_test(&mut self, on: bool) {
+        self.stopping = on;
+    }
+    /// Whether a turn is going, or a message sent from outside is waiting to start one.
+    pub(crate) fn workflow_working(&self) -> bool {
+        self.external_submission_pending() || self.stopping
+    }
+    /// How the last turn ended, or `None` while one is going. A workflow run asks this after it
+    /// sent a prompt, so it must not be asked before the prompt was taken.
+    pub(crate) fn workflow_turn(&self, cx: &App) -> Option<WorkflowTurn> {
+        if self.workflow_working() {
+            return None;
+        }
+        let reply = monocode_core::response::final_reply(self.transcript.read(cx).source_rows());
+        let end = if self.notification_was_cancelled() {
+            TurnEnd::Cancelled
+        } else if self.status == "Ready" {
+            TurnEnd::Completed
+        } else {
+            TurnEnd::Failed(self.status.clone())
+        };
+        Some(WorkflowTurn { end, reply })
+    }
+    /// The last message of the conversation's final turn, for a run reading a reply.
+    pub(crate) fn workflow_reply(&self, cx: &App) -> String {
+        monocode_core::response::final_reply(self.transcript.read(cx).source_rows())
     }
     pub(crate) fn mono_post(
         &mut self,

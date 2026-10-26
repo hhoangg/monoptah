@@ -27,7 +27,7 @@ pub struct Block {
     pub internal: bool,
 }
 
-/// Where a workflow node's session came from. Empty until workflows exist natively.
+/// Where a workflow node's session came from (set by the workflow runner).
 #[derive(Clone, Debug, Default)]
 pub struct Workflow {
     pub workflow_name: String,

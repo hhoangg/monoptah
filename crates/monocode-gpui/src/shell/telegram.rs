@@ -221,6 +221,10 @@ impl Shell {
         } else {
             locked(&self.store).ok()?.persisted_session_id(id).ok()?
         };
+        let workflow = self
+            .monos
+            .as_ref()
+            .and_then(|monos| monos.read(cx).workflow_context(&persisted));
         Some(SessionInfo {
             id: persisted,
             cwd: summary.cwd.clone(),
@@ -233,6 +237,7 @@ impl Shell {
                 .as_ref()
                 .is_some_and(|monos| monos.read(cx).is_mono_session(id)),
             ticket: self.session_tickets.get(&id).cloned(),
+            workflow,
             linked_number: summary.work_item.as_ref().and_then(github_number),
             ..Default::default()
         })
@@ -1137,6 +1142,58 @@ mod tests {
             set(&window, cx, work_item(kind, 42));
             assert_eq!(info(&window, cx, id).linked_number, expected, "{kind}");
         }
+    }
+
+    fn remember_workflow(window: &WindowHandle<Shell>, cx: &mut TestAppContext, id: i64) {
+        window
+            .update(cx, |shell, _, cx| {
+                let monos = shell.mono_manager();
+                monos.update(cx, |monos, _| {
+                    monos.remember_workflow_context(
+                        id.to_string(),
+                        monocode_core::telegram::forward::Workflow {
+                            workflow_name: "Triage".into(),
+                            node_title: "Fix".into(),
+                            item_label: Some("Crash on start".into()),
+                            item_id: Some("ABC-1".into()),
+                            round: Some(2),
+                        },
+                    )
+                })
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_session_a_workflow_runs_says_so_and_names_its_item(cx: &mut TestAppContext) {
+        let (window, id, wire, _controls) = armed(cx, connected(0));
+        assert!(info(&window, cx, id).workflow.is_none());
+        remember_workflow(&window, cx, id);
+        let known = info(&window, cx, id);
+        let workflow = known.workflow.as_ref().expect("the run's context");
+        assert_eq!(workflow.workflow_name, "Triage");
+        assert_eq!(workflow.node_title, "Fix");
+        // The item's id is the session's ticket, as with an inbox session.
+        assert_eq!(
+            monocode_core::telegram::forward::session_ticket_id(&known).as_deref(),
+            Some("ABC-1")
+        );
+        // And a question it asks arrives with the workflow line in its header.
+        ask(&window, cx, id, "q1");
+        let sent = wire.forwards();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0]
+                .header
+                .ends_with("\nWorkflow Triage \u{b7} Fix \u{b7} Crash on start \u{b7} round 2"),
+            "{}",
+            sent[0].header
+        );
+        assert!(
+            sent[0].topic_title.starts_with("[ABC-1] "),
+            "{}",
+            sent[0].topic_title
+        );
     }
 
     #[gpui::test]

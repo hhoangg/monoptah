@@ -1,0 +1,277 @@
+{
+  "id": "wf-fixture1",
+  "name": "Block scalars",
+  "inputs": {
+    "project": {
+      "type": "project"
+    }
+  },
+  "inputValues": {
+    "project": "/work/api"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "manual"
+    },
+    {
+      "id": "s0",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "one line",
+      "output": {}
+    },
+    {
+      "id": "s1",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "two\nlines",
+      "output": {}
+    },
+    {
+      "id": "s2",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "ends with newline\n",
+      "output": {}
+    },
+    {
+      "id": "s3",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "ends with two\n\n",
+      "output": {}
+    },
+    {
+      "id": "s4",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "ends with three\n\n\n",
+      "output": {}
+    },
+    {
+      "id": "s5",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "\nstarts with newline",
+      "output": {}
+    },
+    {
+      "id": "s6",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "\n\nstarts with two",
+      "output": {}
+    },
+    {
+      "id": "s7",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "  starts with spaces\nsecond",
+      "output": {}
+    },
+    {
+      "id": "s8",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "\n  newline then spaces\nx",
+      "output": {}
+    },
+    {
+      "id": "s9",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": " \n x\n",
+      "output": {}
+    },
+    {
+      "id": "s10",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "text\n \n",
+      "output": {}
+    },
+    {
+      "id": "s11",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "text\n   ",
+      "output": {}
+    },
+    {
+      "id": "s12",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "text\n\t",
+      "output": {}
+    },
+    {
+      "id": "s13",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "text   \nmore",
+      "output": {}
+    },
+    {
+      "id": "s14",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "a\n\n\nb\n\n\nc",
+      "output": {}
+    },
+    {
+      "id": "s15",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "a\n  b\n    c\n",
+      "output": {}
+    },
+    {
+      "id": "s16",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "\n",
+      "output": {}
+    },
+    {
+      "id": "s17",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "\n\n",
+      "output": {}
+    },
+    {
+      "id": "s18",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "- list\n- like\n",
+      "output": {}
+    },
+    {
+      "id": "s19",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "key: value\nother: v2\n",
+      "output": {}
+    },
+    {
+      "id": "s20",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "#comment\nline",
+      "output": {}
+    },
+    {
+      "id": "s21",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "line\n#comment",
+      "output": {}
+    },
+    {
+      "id": "s22",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "---\ndoc",
+      "output": {}
+    },
+    {
+      "id": "s23",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "text\n---\nmore",
+      "output": {}
+    },
+    {
+      "id": "s24",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "text\n...\nmore",
+      "output": {}
+    },
+    {
+      "id": "s25",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "%directive\nx",
+      "output": {}
+    },
+    {
+      "id": "s26",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "tab\there\nsecond\tline",
+      "output": {}
+    },
+    {
+      "id": "s27",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "ctrl\u0001\nsecond",
+      "output": {}
+    },
+    {
+      "id": "s28",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\ny z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z y z \n",
+      "output": {}
+    },
+    {
+      "id": "s29",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "unicode 日本語\nand more 🎉\n",
+      "output": {}
+    },
+    {
+      "id": "s30",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "cr\r\nlf",
+      "output": {}
+    },
+    {
+      "id": "s31",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "last line has trailing space \n",
+      "output": {}
+    }
+  ],
+  "edges": [],
+  "enabled": false,
+  "createdAt": 0
+}

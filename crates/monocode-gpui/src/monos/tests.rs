@@ -3,14 +3,14 @@ use gpui::{TestAppContext, WindowHandle};
 use monocode_core::store::Store;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, mpsc};
-struct Setup {
-    window: WindowHandle<Shell>,
-    manager: Entity<Monos>,
-    id: String,
-    project: String,
-    session: i64,
-    root: PathBuf,
-    store: Database,
+pub(super) struct Setup {
+    pub(super) window: WindowHandle<Shell>,
+    pub(super) manager: Entity<Monos>,
+    pub(super) id: String,
+    pub(super) project: String,
+    pub(super) session: i64,
+    pub(super) root: PathBuf,
+    pub(super) store: Database,
 }
 
 #[gpui::test]
@@ -307,7 +307,7 @@ fn detail_pages_slide_over_the_overview_and_back_without_recreating_content(
         );
     }
 }
-fn setup(cx: &mut TestAppContext) -> Setup {
+pub(super) fn setup(cx: &mut TestAppContext) -> Setup {
     let dir = std::env::temp_dir().join(format!("native-monos-{}", mono::new_id()));
     std::fs::create_dir_all(&dir).unwrap();
     let project = dir.to_string_lossy().to_string();
@@ -350,7 +350,7 @@ fn setup(cx: &mut TestAppContext) -> Setup {
         store,
     }
 }
-fn call(
+pub(super) fn call(
     s: &Setup,
     request: &str,
     action: &str,
@@ -359,7 +359,7 @@ fn call(
 ) -> mpsc::Receiver<Result<Value, String>> {
     call_from(s, s.session, request, action, input, cx)
 }
-fn call_from(
+pub(super) fn call_from(
     s: &Setup,
     session: i64,
     request: &str,
@@ -1655,10 +1655,13 @@ fn start(s: &Setup, request: &str, input: Value, cx: &mut TestAppContext) -> Res
         .try_recv()
         .unwrap()
 }
-fn session_count(s: &Setup) -> usize {
+pub(super) fn session_count(s: &Setup) -> usize {
     locked(&s.store).unwrap().sessions().unwrap().len()
 }
-fn groups_of(s: &Setup, cx: &mut TestAppContext) -> monocode_core::session_groups::Groups {
+pub(super) fn groups_of(
+    s: &Setup,
+    cx: &mut TestAppContext,
+) -> monocode_core::session_groups::Groups {
     cx.update(|cx| {
         s.manager
             .read(cx)
@@ -1669,7 +1672,7 @@ fn groups_of(s: &Setup, cx: &mut TestAppContext) -> monocode_core::session_group
             .mono_groups(&s.project)
     })
 }
-fn edit_mono(s: &Setup, cx: &mut TestAppContext, edit: impl FnOnce(&mut mono::Mono)) {
+pub(super) fn edit_mono(s: &Setup, cx: &mut TestAppContext, edit: impl FnOnce(&mut mono::Mono)) {
     cx.update(|cx| {
         s.manager.update(cx, |m, cx| {
             edit(m.roster.get_mut(&s.id).unwrap());
@@ -1702,7 +1705,7 @@ fn git_init(dir: &str) {
         .unwrap();
     assert!(out.status.success());
 }
-fn started_link(s: &Setup, child: i64) -> Option<i64> {
+pub(super) fn started_link(s: &Setup, child: i64) -> Option<i64> {
     locked(&s.store)
         .unwrap()
         .started_links()
@@ -2022,6 +2025,7 @@ fn start_rejects_a_parent_this_mono_did_not_start(cx: &mut TestAppContext) {
                 each: false,
                 completed: false,
                 dismissed: false,
+                visible: false,
             });
         })
     });
@@ -2121,6 +2125,7 @@ fn launch_of(session: i64, cwd: &str) -> mono::Launch {
         each: false,
         completed: false,
         dismissed: false,
+        visible: false,
     }
 }
 
@@ -2396,7 +2401,7 @@ fn the_habit_run_prompt_sends_session_reports_to_the_chat() {
     assert!(!prompt.contains("belongs to this habit"));
 }
 
-fn launches_of(s: &Setup, cx: &mut TestAppContext) -> Vec<mono::Launch> {
+pub(super) fn launches_of(s: &Setup, cx: &mut TestAppContext) -> Vec<mono::Launch> {
     cx.update(|cx| {
         s.manager
             .read(cx)
@@ -2785,7 +2790,7 @@ fn finish_run(s: &Setup, run: i64, cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.update(|cx| s.manager.read(cx).running.is_empty()));
 }
-fn chat_rows(s: &Setup) -> Vec<String> {
+pub(super) fn chat_rows(s: &Setup) -> Vec<String> {
     locked(&s.store)
         .unwrap()
         .load(s.session)
@@ -3597,4 +3602,111 @@ mod reset_flow {
         assert!(!busy);
         assert!(pending.is_empty() && posted, "{pending:?} posted={posted}");
     }
+}
+
+fn workflow_input(name: &str) -> Value {
+    json!({"workflow": {
+        "name": name,
+        "nodes": [{"id": "trigger", "type": "manual"}, {"id": "report", "type": "report"}],
+        "edges": [{"from": "trigger", "to": "report"}]
+    }})
+}
+
+fn saved_workflows(s: &Setup) -> Vec<monocode_core::mono::workflows::model::Workflow> {
+    monocode_core::mono::workflows::store::load_workflows(
+        &monocode_core::mono::workflows::store::MonoDir::new(&s.root, &s.id),
+    )
+    .unwrap()
+    .workflows
+}
+
+#[gpui::test]
+fn workflow_actions_work_from_the_mono_chat_and_signal_the_runner(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let signals = cx.update(|cx| s.manager.read(cx).workflow_signals.clone());
+    let ask = |request: &str, action: &str, input: Value, cx: &mut TestAppContext| {
+        call(&s, request, action, input, cx).try_recv().unwrap()
+    };
+    let listed = ask("list-0", "workflows.list", json!({}), cx).unwrap();
+    assert_eq!(listed, json!({"workflows": []}));
+    let added = ask("add-1", "workflows.add", workflow_input("Digest"), cx).unwrap();
+    let id = added["id"].as_str().unwrap().to_string();
+    assert_eq!(added["enabled"], false);
+    assert_eq!(added["issues"], json!([]));
+    // A retry with the same request id returns the same result and adds nothing.
+    let retry = ask("add-1", "workflows.add", workflow_input("Digest"), cx).unwrap();
+    assert_eq!(retry, added);
+    assert_eq!(saved_workflows(&s).len(), 1);
+    assert!(!saved_workflows(&s)[0].enabled);
+    // The guide and the field checks come through the same path.
+    let guide = ask("guide-1", "workflows.guide", json!({}), cx).unwrap();
+    assert!(guide["guide"].as_str().unwrap().contains("workflow"));
+    let refused = ask("bogus-1", "workflows.add", json!({"bogus": 1}), cx).unwrap_err();
+    assert_eq!(refused, "workflows.add does not take bogus");
+    let refused = ask("shape-1", "workflows.add", json!({"workflow": "x"}), cx).unwrap_err();
+    assert_eq!(refused, "workflow must be an object");
+    // run needs a resumed workflow, then only writes its request and wakes the runner.
+    let refused = ask("run-1", "workflows.run", json!({"id": id}), cx).unwrap_err();
+    assert_eq!(refused, "Resume the workflow before running it.");
+    assert!(!signals.take_check_now());
+    ask("resume-1", "workflows.resume", json!({"id": id}), cx).unwrap();
+    ask("run-2", "workflows.run", json!({"id": id}), cx).unwrap();
+    // The runner is woken, so the request is acted on at once and not on the next look: the
+    // run it asked for was claimed and is in the run history.
+    assert!(!saved_workflows(&s)[0].run_requested);
+    let runs = monocode_core::mono::workflows::store::load_runs(
+        &monocode_core::mono::workflows::store::MonoDir::new(&s.root, &s.id),
+        &id,
+    )
+    .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].trigger,
+        monocode_core::mono::workflows::model::RunTrigger::Manual
+    );
+    assert!(!signals.take_check_now(), "the look answered the request");
+    // stop and the running flag come from what the runner reports.
+    let refused = ask("stop-1", "workflows.stop", json!({"id": id}), cx).unwrap_err();
+    assert_eq!(refused, "That workflow is not running");
+    signals.set_running(&id, true);
+    let listed = ask("list-1", "workflows.list", json!({}), cx).unwrap();
+    assert_eq!(listed["workflows"][0]["running"], true);
+    ask("stop-2", "workflows.stop", json!({"id": id}), cx).unwrap();
+    // Taken at once as well (nothing real runs, so there is nothing to stop).
+    assert!(!saved_workflows(&s)[0].stop_requested);
+    assert!(!signals.take_check_now());
+    let refused = ask("remove-1", "workflows.remove", json!({"id": id}), cx).unwrap_err();
+    assert_eq!(refused, "Stop the workflow before removing it");
+    signals.set_running(&id, false);
+    ask("remove-2", "workflows.remove", json!({"id": id}), cx).unwrap();
+    assert!(saved_workflows(&s).is_empty());
+}
+
+#[gpui::test]
+fn a_habit_run_cannot_manage_workflows(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    for (action, input) in [
+        ("workflows.list", json!({})),
+        ("workflows.guide", json!({})),
+        ("workflows.add", workflow_input("From a habit")),
+    ] {
+        let result = call_from(&s, run, action, action, input, cx)
+            .try_recv()
+            .unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            "Only a Mono's own conversation can manage its workflows",
+            "{action}"
+        );
+    }
+    assert!(saved_workflows(&s).is_empty());
+    // A session that holds no capability at all gets no answer from this Mono.
+    let outsider = call_from(&s, run + 1000, "x", "workflows.list", json!({}), cx)
+        .try_recv()
+        .unwrap();
+    assert_eq!(
+        outsider.unwrap_err(),
+        "This Mono no longer owns an active app capability"
+    );
 }

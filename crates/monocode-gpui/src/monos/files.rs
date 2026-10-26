@@ -233,6 +233,7 @@ impl Monos {
                 for run in this.running.values().filter(|r| r.mono == id) {
                     run.view.update(cx, |v, cx| v.mono_stop(cx));
                 }
+                this.stop_workflows_of(&id, cx);
                 this.roster.monos.retain(|m| m.id != id);
                 if this.active.as_ref() == Some(&id) {
                     this.active = None;

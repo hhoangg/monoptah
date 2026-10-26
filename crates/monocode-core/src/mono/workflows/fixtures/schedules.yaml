@@ -1,0 +1,52 @@
+monoptahWorkflow: 1
+name: Schedules
+inputs:
+  project:
+    type: project
+nodes:
+  - id: t1
+    type: schedule
+    schedule:
+      kind: hourly
+      time: "09:00"
+      minute: 30
+  - id: t2
+    type: schedule
+    schedule:
+      kind: daily
+      time: "18:45"
+  - id: t3
+    type: schedule
+    schedule:
+      kind: weekly
+      time: "07:15"
+      dayOfWeek: 3
+  - id: t4
+    type: schedule
+    schedule:
+      kind: weekly
+      time: "07:15"
+      dayOfWeek: 0
+  - id: t5
+    type: schedule
+    schedule:
+      kind: interval
+      time: "08:00"
+      hours: 6
+      intervalFrom: 2026-10-22
+  - id: t6
+    type: schedule
+    schedule:
+      kind: interval
+      time: "00:00"
+      hours: 24
+  - id: t7
+    type: schedule
+    title: Weekdays
+    schedule:
+      kind: weekdays
+      time: "23:59"
+    ui:
+      x: 1
+      y: 2
+edges: []

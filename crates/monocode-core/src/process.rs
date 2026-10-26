@@ -1,24 +1,38 @@
 //! Child policy extracted from src-tauri/src/background_work.rs.
 use std::process::Command;
 
-/// Apply scheduling hints before exec so descendants inherit them.
-/// Best effort: a refused hint must not prevent a provider from launching.
-pub fn configure_child(command: &mut Command) {
+/// Give the child the ordinary process mask. A GUI executor's worker may block
+/// signals and exec preserves that mask; Tokio-based children then never receive
+/// SIGCHLD and their command sessions never finish.
+pub fn reset_signal_mask(command: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         // Only system calls here: the post-fork child must not allocate or lock.
         unsafe {
             command.pre_exec(|| {
-                // A GUI executor's worker may block signals. exec preserves
-                // that mask; Tokio-based provider children then never receive
-                // SIGCHLD and their command sessions never finish. Give the
-                // provider the ordinary process mask before it starts.
                 let mut signals = std::mem::zeroed();
                 libc::sigemptyset(&mut signals);
                 if libc::sigprocmask(libc::SIG_SETMASK, &signals, std::ptr::null_mut()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                Ok(())
+            });
+        }
+    }
+    let _ = command;
+}
+
+/// Apply scheduling hints before exec so descendants inherit them.
+/// Best effort: a refused hint must not prevent a provider from launching.
+pub fn configure_child(command: &mut Command) {
+    reset_signal_mask(command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Only system calls here: the post-fork child must not allocate or lock.
+        unsafe {
+            command.pre_exec(|| {
                 let priority = libc::getpriority(libc::PRIO_PROCESS, 0).max(10);
                 libc::setpriority(libc::PRIO_PROCESS, 0, priority);
                 #[cfg(target_os = "macos")]
@@ -198,6 +212,42 @@ mod tests {
         assert!(listed());
         drop(registration);
         assert!(!listed());
+    }
+    #[test]
+    fn reset_signal_mask_alone_clears_a_blocked_sigchld() {
+        const CHILD: &str = "MONOCODE_RESET_MASK_REGRESSION_CHILD";
+        unsafe {
+            let mut mask = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask);
+            if std::env::var_os(CHILD).is_some() {
+                assert_eq!(libc::sigismember(&mask, libc::SIGCHLD), 0);
+                return;
+            }
+            let mut blocked = std::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGCHLD);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()),
+                0
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "process::tests::reset_signal_mask_alone_clears_a_blocked_sigchld",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            reset_signal_mask(&mut command);
+            let result = command.output();
+            libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+            let output = result.unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
     }
     #[test]
     fn provider_child_does_not_inherit_executor_signal_mask() {

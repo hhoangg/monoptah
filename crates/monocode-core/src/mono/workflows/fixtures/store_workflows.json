@@ -1,0 +1,141 @@
+[
+  {
+    "id": "wf-abcd1234",
+    "name": "Nightly \"digest\"",
+    "description": "Every night é",
+    "inputs": {
+      "repo": {
+        "type": "project",
+        "description": "Where"
+      },
+      "limit": {
+        "type": "number"
+      }
+    },
+    "inputValues": {
+      "repo": "/code/app",
+      "limit": 2.5,
+      "dry": true
+    },
+    "nodes": [
+      {
+        "id": "trigger",
+        "ui": {
+          "x": 10,
+          "y": 20.5
+        },
+        "type": "schedule",
+        "schedule": {
+          "scheduleKind": "interval",
+          "time": "09:30",
+          "minute": 5,
+          "dayOfWeek": 2,
+          "intervalHours": 4,
+          "intervalFrom": "2026-01-01"
+        }
+      },
+      {
+        "id": "fetch",
+        "type": "command",
+        "project": "{{inputs.repo}}",
+        "command": "git log -n 5",
+        "cwd": "root",
+        "timeoutMinutes": 3
+      },
+      {
+        "id": "dev",
+        "type": "session",
+        "project": "{{inputs.repo}}",
+        "prompt": "Do it",
+        "checkout": "root",
+        "output": {
+          "pr": {
+            "type": "string",
+            "inReport": true
+          }
+        },
+        "harness": "claude",
+        "reuseSession": true
+      },
+      {
+        "id": "ask",
+        "type": "askMono",
+        "question": "ok?",
+        "answers": [
+          "yes",
+          "no"
+        ]
+      },
+      {
+        "id": "gate",
+        "type": "if",
+        "condition": "fetch.x == 1"
+      },
+      {
+        "id": "each",
+        "type": "forEach",
+        "in": "fetch.items",
+        "as": "item",
+        "maxParallel": 2
+      },
+      {
+        "id": "report",
+        "type": "report",
+        "template": "Done {{run.id}}"
+      }
+    ],
+    "edges": [
+      {
+        "from": "trigger",
+        "to": "fetch"
+      },
+      {
+        "from": "fetch",
+        "to": "gate"
+      },
+      {
+        "from": "gate",
+        "to": "dev",
+        "handle": "true"
+      },
+      {
+        "from": "dev",
+        "to": "report",
+        "loop": {
+          "maxRounds": 3,
+          "decide": "enough?"
+        }
+      }
+    ],
+    "enabled": true,
+    "createdAt": 1700000000000,
+    "nextRunAt": 1700003600000,
+    "runRequested": true,
+    "lastRunId": "r1",
+    "needsReview": true
+  },
+  3,
+  {
+    "id": "wf-strange01",
+    "name": "From a newer app",
+    "nodes": [
+      {
+        "id": "x",
+        "type": "teleport",
+        "beam": [
+          1,
+          2
+        ]
+      }
+    ],
+    "edges": [],
+    "futureField": {
+      "keep": true,
+      "n": 1,
+      "big": 1e+21,
+      "small": 1e-7
+    }
+  },
+  null,
+  "text"
+]

@@ -1,26 +1,42 @@
 //! Capability-checked app actions used by Mono provider subprocesses.
 use super::*;
+use monocode_core::mono::workflows::{
+    cli::{StoreHost, handle_value},
+    store::MonoDir,
+};
 use monocode_core::mono::{Document, Launch, bridge::Call, files, memory};
 use monocode_core::{session_groups::Groups, time::now_ms};
 use serde_json::{Value, json};
 use std::path::Path;
-enum Effect {
+pub(super) enum Effect {
     Card(Value),
     None,
     Start(Box<Started>),
     Groups(String, Groups),
 }
-struct Started {
-    summary: Session,
+pub(super) struct Started {
+    pub(super) summary: Session,
     settings: Settings,
     prompt: String,
     draft: bool,
     reveal: bool,
     parent: Option<i64>,
     folder: Option<Folder>,
+    /// Shown in the sidebar whatever the Mono's setting says (see `Launch::visible`).
+    visible: bool,
 }
+/// What differs between `sessions.start` and a workflow run starting a session.
+#[derive(Clone, Copy, Default)]
+pub(super) struct StartOptions {
+    /// A parent that does not qualify is dropped instead of refusing the start: a workflow's
+    /// nesting is decoration, the run goes on at the top level.
+    pub lenient_parent: bool,
+    /// Filed in a folder and shown in the sidebar whatever the Mono's setting says.
+    pub visible: bool,
+}
+pub(super) type StartWork = Box<dyn FnOnce(Database) -> Result<(Value, Effect), String> + Send>;
 /// Where a launch is filed: an existing folder, or a new one made for it.
-enum Folder {
+pub(super) enum Folder {
     Existing { id: String, name: String },
     New { id: String, name: String },
 }
@@ -248,63 +264,14 @@ impl Monos {
                             });
                         }
                         Effect::Start(started) => {
-                            let Started {
-                                summary,
-                                settings,
-                                prompt,
-                                draft,
-                                reveal,
-                                parent,
-                                folder,
-                            } = *started;
-                            let id = summary.id;
-                            let project = summary.cwd.clone();
-                            let caller = call.session;
-                            let origin = this
-                                .chats
-                                .values()
-                                .chain(this.running.values().map(|r| &r.view))
-                                .find(|v| v.read(cx).summary.id == caller)
-                                .map(|v| v.read(cx).mono_turn)
-                                .unwrap_or(0);
-                            let run_chat = this.run_chat(caller, &mono_id);
-                            let (origin_turn, each) =
-                                report_to(caller, origin, run_chat, &call.input);
-                            if let Some(mono) = this.roster.get_mut(&mono_id) {
-                                mono.launches.push(Launch {
-                                    session_id: id,
-                                    cwd: summary.cwd.clone(),
-                                    title: summary.title.clone(),
-                                    harness: summary.provider.clone(),
-                                    model: settings.model.clone(),
-                                    origin_turn,
-                                    notify_on_complete: flag(
-                                        &call.input,
-                                        "notifyOnComplete",
-                                        !draft,
-                                    ),
-                                    each,
-                                    completed: false,
-                                    dismissed: false,
-                                });
-                            }
-                            this.note_run_session(caller, id, true);
-                            let _ = this.owner.update(cx, |owner, cx| {
-                                owner.mono_install(summary, settings, prompt, draft, cx);
-                                if let Some(parent) = parent {
-                                    owner.mono_link_started(id, parent, cx);
-                                }
-                            });
-                            this.save(cx);
-                            match folder {
-                                Some(folder) => {
-                                    this.file_launch(&mono_id, &project, id, folder, cx)
-                                }
-                                None => this.group_launch(&mono_id, id, cx),
-                            }
-                            if reveal {
-                                this.open_workspace(id, window, cx);
-                            }
+                            this.apply_started(
+                                &mono_id,
+                                call.session,
+                                &call.input,
+                                *started,
+                                Some(window),
+                                cx,
+                            );
                         }
                     }
                     this.reload_files(&mono_id, cx);
@@ -316,6 +283,70 @@ impl Monos {
         })
         .detach();
     }
+    /// Installs a session `sessions.start` (or a workflow run) created: records the launch, opens
+    /// the conversation, links it under its parent and files it. `caller` is the session that asked
+    /// (a Mono chat or a habit run); `window` is only needed to reveal it.
+    pub(super) fn apply_started(
+        &mut self,
+        mono_id: &str,
+        caller: i64,
+        input: &Value,
+        started: Started,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let Started {
+            summary,
+            settings,
+            prompt,
+            draft,
+            reveal,
+            parent,
+            folder,
+            visible,
+        } = started;
+        let id = summary.id;
+        let project = summary.cwd.clone();
+        let origin = self
+            .chats
+            .values()
+            .chain(self.running.values().map(|r| &r.view))
+            .find(|v| v.read(cx).summary.id == caller)
+            .map(|v| v.read(cx).mono_turn)
+            .unwrap_or(0);
+        let run_chat = self.run_chat(caller, mono_id);
+        let (origin_turn, each) = report_to(caller, origin, run_chat, input);
+        if let Some(mono) = self.roster.get_mut(mono_id) {
+            mono.launches.push(Launch {
+                session_id: id,
+                cwd: summary.cwd.clone(),
+                title: summary.title.clone(),
+                harness: summary.provider.clone(),
+                model: settings.model.clone(),
+                origin_turn,
+                notify_on_complete: flag(input, "notifyOnComplete", !draft),
+                each,
+                completed: false,
+                dismissed: false,
+                visible,
+            });
+        }
+        self.note_run_session(caller, id, true);
+        let _ = self.owner.update(cx, |owner, cx| {
+            owner.mono_install(summary, settings, prompt, draft, cx);
+            if let Some(parent) = parent {
+                owner.mono_link_started(id, parent, cx);
+            }
+        });
+        self.save(cx);
+        match folder {
+            Some(folder) => self.file_launch(mono_id, &project, id, folder, cx),
+            None => self.group_launch(mono_id, id, cx),
+        }
+        if reveal && let Some(window) = window {
+            self.open_workspace(id, window, cx);
+        }
+    }
     pub(super) fn app_call(&mut self, call: Call, window: &mut Window, cx: &mut Context<Self>) {
         let mono = self
             .roster
@@ -325,20 +356,32 @@ impl Monos {
                     .get(&call.session)
                     .and_then(|r| self.roster.get(&r.mono))
             })
+            .or_else(|| {
+                self.workflow_live
+                    .asked_by(call.session)
+                    .and_then(|mono| self.roster.get(mono))
+            })
             .cloned();
+        // A habit run, or the hidden session of a workflow's question to the Mono.
+        let run_session = self.running.contains_key(&call.session)
+            || self.workflow_live.asked_by(call.session).is_some();
         let Some(mono) = mono else {
             let _ = call.reply.send(Err(
                 "This Mono no longer owns an active app capability".into()
             ));
             return;
         };
-        if call.action.starts_with("habits.")
-            && call.action != "habits.list"
-            && self.running.contains_key(&call.session)
-        {
+        if call.action.starts_with("habits.") && call.action != "habits.list" && run_session {
             let _ = call
                 .reply
                 .send(Err("A habit run cannot schedule more runs".into()));
+            return;
+        }
+        // Workflows belong to the Mono's own conversation, not to a habit run.
+        if call.action.starts_with("workflows.") && run_session {
+            let _ = call.reply.send(Err(
+                "Only a Mono's own conversation can manage its workflows".into(),
+            ));
             return;
         }
         if let Err(error) = mono::api::validate(&call.action, &call.input) {
@@ -420,7 +463,7 @@ impl Monos {
                 let view=self.owner.upgrade().and_then(|owner|owner.update(cx, |owner, cx| owner.mono_ensure_session(session, cx))).filter(|v|monocode_core::files::path_key(&v.read(cx).summary.cwd)==monocode_core::files::path_key(&project));
                 let Some(view)=view else{self.finish_call(call,Err("Session is outside the assigned project".into()),cx);return;};
                 if action=="sessions.send"||action=="sessions.draft"{if view.read(cx).busy||view.read(cx).mono_external_pending()||!view.read(cx).input.read(cx).content.trim().is_empty(){self.finish_call(call,Err("Session is busy or has an unsent draft".into()),cx);return;}match text(&input,"prompt",65536){Ok(prompt)=>{let sent=view.update(cx,|v,cx|v.mono_external_send(prompt,action=="sessions.draft",cx));if let Err(e)=sent{self.finish_call(call,Err(e),cx);return;}
-if flag(&input,"notifyOnComplete",false){if let Some(m)=self.roster.get_mut(&mono.id){let origin=source.map(|v|v.read(cx).mono_turn).unwrap_or(0);let (origin_turn,each)=report_to(call.session,origin,run_chat,&input);if let Some(launch)=m.launches.iter_mut().find(|l|l.session_id==session){launch.completed=false;launch.dismissed=false;launch.notify_on_complete=true;launch.origin_turn=origin_turn;launch.each=each;}else{let summary=&view.read(cx).summary;m.launches.push(Launch{session_id:session,cwd:summary.cwd.clone(),title:summary.title.clone(),harness:summary.provider.clone(),model:view.read(cx).mono_model(),origin_turn,notify_on_complete:true,each,completed:false,dismissed:false});}}self.save(cx);}
+if flag(&input,"notifyOnComplete",false){if let Some(m)=self.roster.get_mut(&mono.id){let origin=source.map(|v|v.read(cx).mono_turn).unwrap_or(0);let (origin_turn,each)=report_to(call.session,origin,run_chat,&input);if let Some(launch)=m.launches.iter_mut().find(|l|l.session_id==session){launch.completed=false;launch.dismissed=false;launch.notify_on_complete=true;launch.origin_turn=origin_turn;launch.each=each;}else{let summary=&view.read(cx).summary;m.launches.push(Launch{session_id:session,cwd:summary.cwd.clone(),title:summary.title.clone(),harness:summary.provider.clone(),model:view.read(cx).mono_model(),origin_turn,notify_on_complete:true,each,completed:false,dismissed:false,visible:false});}}self.save(cx);}
 if action=="sessions.send"{self.note_run_session(call.session,session,false);}Ok(json!({"accepted":true}))},Err(e)=>Err(e)}}else{
                     for m in &mut self.roster.monos{for launch in &mut m.launches{if launch.session_id==session{launch.dismissed=true;}}}self.save(cx);
                     if action=="sessions.stop"{view.update(cx,|v,cx|v.stop_if_busy(cx));}else{let delete=action=="sessions.delete";let owner=self.owner.clone();let handle=window.window_handle();let app:&mut App=cx;app.defer(move|cx|{let _=handle.update(cx,|_,window,cx|{let _=owner.update(cx,|owner,cx|owner.mono_remove(session,delete,window,cx));});});}Ok(json!({"accepted":true}))
@@ -483,6 +526,13 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                     };Ok((value,Effect::None))
                 },cx);return;
             }
+            workflow if workflow.starts_with("workflows.")=>{
+                // Probing the model catalog may start a CLI, so the whole handler runs off the UI
+                // thread. run/stop/resumeRun only write their request into the file.
+                let mut host=StoreHost::new(MonoDir::new(root,target.clone()),self.workflow_signals.clone()).with_probe(self.workflow_live.probe());
+                let name=action.clone();
+                self.call_work(call,target,move|_|{let value=handle_value(&name,&input,&mut host)?;Ok((value,Effect::None))},cx);return;
+            }
             _=>Err("Unknown action. Run app help to see supported actions".into()),
         };
         self.finish_call(call, result, cx);
@@ -496,12 +546,32 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         source: Option<Entity<Conversation>>,
         cx: &mut Context<Self>,
     ) {
-        let input = call.input.clone();
         let target = mono.id.clone();
-        let prompt = match text(&input, "prompt", 65536) {
-            Ok(t) => t,
-            Err(e) => return self.finish_call(call, Err(e), cx),
-        };
+        match self.prepare_start(
+            &mono,
+            project,
+            source,
+            &call.input,
+            StartOptions::default(),
+            cx,
+        ) {
+            Ok(work) => self.call_work(call, target, work, cx),
+            Err(error) => self.finish_call(call, Err(error), cx),
+        }
+    }
+    /// Everything a start decides on the UI thread; the returned work creates the session row off
+    /// it and ends in `Effect::Start`. Every check that can fail runs before the row exists.
+    pub(super) fn prepare_start(
+        &self,
+        mono: &mono::Mono,
+        project: String,
+        source: Option<Entity<Conversation>>,
+        input: &Value,
+        options: StartOptions,
+        cx: &App,
+    ) -> Result<StartWork, String> {
+        let input = input.clone();
+        let prompt = text(&input, "prompt", 65536)?;
         let provider = input
             .get("harness")
             .and_then(Value::as_str)
@@ -509,7 +579,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             .or_else(|| source.as_ref().map(|v| v.read(cx).summary.provider.clone()))
             .unwrap_or_else(|| "codex".into());
         if Kind::parse(&provider).is_none() {
-            return self.finish_call(call, Err("Unknown provider".into()), cx);
+            return Err("Unknown provider".into());
         }
         let same_provider = source
             .as_ref()
@@ -537,14 +607,12 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         if let Some(model) = input.get("model").and_then(Value::as_str) {
             settings.model = Some(model.into());
         }
+        if let Some(effort) = input.get("effort").and_then(Value::as_str) {
+            settings.effort = Some(effort.into());
+        }
         if let Some(values) = input.get("modelSettings") {
-            match serde_json::from_value(values.clone()) {
-                Ok(values) => settings.model_settings = values,
-                Err(_) => {
-                    let error = "modelSettings must be an object of strings".into();
-                    return self.finish_call(call, Err(error), cx);
-                }
-            }
+            settings.model_settings = serde_json::from_value(values.clone())
+                .map_err(|_| "modelSettings must be an object of strings".to_string())?;
         }
         if let Some(mode) = input.get("runtimeMode").and_then(Value::as_str) {
             settings.access = AccessMode::from_id(mode);
@@ -556,13 +624,12 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             None => None,
             Some(_) => match id(&input, "parentSessionId") {
                 Ok(parent) if mono.launches.iter().any(|l| l.session_id == parent) => Some(parent),
+                _ if options.lenient_parent => None,
                 Ok(_) => {
-                    let error = "parentSessionId must be a session this Mono started".into();
-                    return self.finish_call(call, Err(error), cx);
+                    return Err("parentSessionId must be a session this Mono started".into());
                 }
                 Err(_) => {
-                    let error = "parentSessionId must be a session ID (a positive number)".into();
-                    return self.finish_call(call, Err(error), cx);
+                    return Err("parentSessionId must be a session ID (a positive number)".into());
                 }
             },
         };
@@ -572,85 +639,118 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             .upgrade()
             .map(|o| o.read(cx).mono_groups(&project))
             .unwrap_or_default();
-        let folder = match folder_choice(&groups, &input) {
-            Ok(folder) => folder.filter(|_| mono.show_started_sessions_in_sidebar),
-            Err(e) => return self.finish_call(call, Err(e), cx),
-        };
+        // Only a launch that must show whatever the setting says is saved as visible; filing in a
+        // folder follows the setting too.
+        let filed_in_folder = options.visible || mono.show_started_sessions_in_sidebar;
+        let folder = folder_choice(&groups, &input)?.filter(|_| filed_in_folder);
+        let visible = options.visible;
         let filed = folder.as_ref().map(|f| {
             let (id, name) = f.entry();
             (id.to_owned(), name.to_owned())
         });
-        self.call_work(
-            call,
-            target,
-            move |store| {
-                let path = Path::new(&project);
-                let worktree = input.get("workspaceMode").and_then(Value::as_str) == Some("worktree");
-                if worktree && monocode_core::git::unborn(path) {
-                    return Err("This project has no commits yet; make an initial commit before using workspaceMode worktree".into());
-                }
-                let chosen = match input.get("worktreeCwd").and_then(Value::as_str) {
-                    Some(cwd) => {
-                        let snapshot = monocode_core::git::snapshot(path)?;
-                        let key = monocode_core::files::path_key(cwd);
-                        if !snapshot.worktrees.iter().any(|w| monocode_core::files::path_key(&w.path) == key) {
-                            return Err("Choose an existing worktree of the assigned project".into());
-                        }
-                        Some(cwd.to_owned())
+        Ok(Box::new(move |store| {
+            let path = Path::new(&project);
+            let worktree = input.get("workspaceMode").and_then(Value::as_str) == Some("worktree");
+            if worktree && monocode_core::git::unborn(path) {
+                return Err("This project has no commits yet; make an initial commit before using workspaceMode worktree".into());
+            }
+            let chosen = match input.get("worktreeCwd").and_then(Value::as_str) {
+                Some(cwd) => {
+                    let snapshot = monocode_core::git::snapshot(path)?;
+                    let key = monocode_core::files::path_key(cwd);
+                    if !snapshot
+                        .worktrees
+                        .iter()
+                        .any(|w| monocode_core::files::path_key(&w.path) == key)
+                    {
+                        return Err("Choose an existing worktree of the assigned project".into());
                     }
-                    None => None,
-                };
-                let mut db = locked(&store)?;
+                    Some(cwd.to_owned())
+                }
+                None => None,
+            };
+            let mut db = locked(&store)?;
+            let mut parent = parent;
+            if let Some(candidate) = parent {
+                let key = monocode_core::files::path_key(&project);
+                let known = db
+                    .sessions()?
+                    .iter()
+                    .any(|s| s.id == candidate && monocode_core::files::path_key(&s.cwd) == key);
+                let child = is_child_launch(&db.started_links()?, &launches, candidate);
+                if !known || child {
+                    if !options.lenient_parent {
+                        return Err(if !known {
+                                "Session was not found in this project"
+                            } else {
+                                "parentSessionId cannot be a session started under another one; a child of a child is not allowed"
+                            }.into());
+                    }
+                    parent = None;
+                }
+            }
+            // Always a chat: the app drives this session, whatever the surface preference.
+            let mut summary = db.create(&provider, &project)?;
+            let mut made = None;
+            let built = (|| {
+                if let Some(cwd) = chosen {
+                    settings.worktree_cwd = Some(cwd);
+                } else if worktree {
+                    let base = input
+                        .get("worktreeBase")
+                        .and_then(Value::as_str)
+                        .unwrap_or("HEAD");
+                    let tree = monocode_core::git::create_worktree(path, base, summary.id)?;
+                    settings.worktree_cwd = Some(tree.to_string_lossy().into());
+                    made = Some(tree);
+                }
+                summary.title = input
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&prompt)
+                    .chars()
+                    .take(160)
+                    .collect();
+                db.title(summary.id, &summary.title)?;
+                db.configure_agent(summary.id, &provider, &settings)?;
                 if let Some(parent) = parent {
-                    let key = monocode_core::files::path_key(&project);
-                    if !db.sessions()?.iter().any(|s| s.id == parent && monocode_core::files::path_key(&s.cwd) == key) {
-                        return Err("Session was not found in this project".into());
-                    }
-                    if is_child_launch(&db.started_links()?, &launches, parent) {
-                        return Err("parentSessionId cannot be a session started under another one; a child of a child is not allowed".into());
-                    }
+                    db.save_started_link(summary.id, parent)?;
                 }
-                // Always a chat: the app drives this session, whatever the surface preference.
-                let mut summary = db.create(&provider, &project)?;
-                let mut made = None;
-                let built = (|| {
-                    if let Some(cwd) = chosen {
-                        settings.worktree_cwd = Some(cwd);
-                    } else if worktree {
-                        let base = input.get("worktreeBase").and_then(Value::as_str).unwrap_or("HEAD");
-                        let tree = monocode_core::git::create_worktree(path, base, summary.id)?;
-                        settings.worktree_cwd = Some(tree.to_string_lossy().into());
-                        made = Some(tree);
-                    }
-                    summary.title = input.get("title").and_then(Value::as_str).unwrap_or(&prompt).chars().take(160).collect();
-                    db.title(summary.id, &summary.title)?;
-                    db.configure_agent(summary.id, &provider, &settings)?;
-                    if let Some(parent) = parent {
-                        db.save_started_link(summary.id, parent)?;
-                    }
-                    Ok::<_, String>(())
-                })();
-                if let Err(e) = built {
-                    // Nothing else refers to the row or its worktree yet.
-                    let _ = db.delete(summary.id);
-                    let e = match made.map(|tree| monocode_core::worktree_management::discard_new(&tree).map_err(|c| (tree, c))) {
-                        Some(Err((tree, cause))) => format!("{e} (the new worktree {} was left on disk: {cause})", tree.display()),
-                        _ => e,
-                    };
-                    return Err(e);
-                }
-                let mut result = json!({"sessionId":summary.id,"accepted":true,"project":project});
-                if let Some((id, name)) = filed {
-                    result["folderId"] = json!(id);
-                    result["folderName"] = json!(name);
-                }
-                Ok((
-                    result,
-                    Effect::Start(Box::new(Started { summary, settings, prompt, draft, reveal, parent, folder })),
-                ))
-            },
-            cx,
-        );
+                Ok::<_, String>(())
+            })();
+            if let Err(e) = built {
+                // Nothing else refers to the row or its worktree yet.
+                let _ = db.delete(summary.id);
+                let e = match made.map(|tree| {
+                    monocode_core::worktree_management::discard_new(&tree).map_err(|c| (tree, c))
+                }) {
+                    Some(Err((tree, cause))) => format!(
+                        "{e} (the new worktree {} was left on disk: {cause})",
+                        tree.display()
+                    ),
+                    _ => e,
+                };
+                return Err(e);
+            }
+            let mut result = json!({"sessionId":summary.id,"accepted":true,"project":project});
+            if let Some((id, name)) = filed {
+                result["folderId"] = json!(id);
+                result["folderName"] = json!(name);
+            }
+            Ok((
+                result,
+                Effect::Start(Box::new(Started {
+                    summary,
+                    settings,
+                    prompt,
+                    draft,
+                    reveal,
+                    parent,
+                    folder,
+                    visible,
+                })),
+            ))
+        }))
     }
     /// The Mono chat that gets a habit run's reports (0 before it has a chat),
     /// or `None` when the caller is not a habit run.

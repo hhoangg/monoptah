@@ -17,7 +17,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "memory.add"=>"fact topic until","memory.replace"=>"find fact topic until","memory.remove"=>"find topic",
         "habits.add"=>"name instructions schedule","habits.update"=>"id name instructions schedule enabled","habits.run"|"habits.remove"=>"id",
         "chat.card"=>"type repo number note sessionId options name instructions schedule",
-        _=>return Err("Unknown app action. Run app help".into()),
+        _=>super::workflows::cli::fields(action).ok_or("Unknown app action. Run app help")?,
     };
     for (key, value) in input.as_object().ok_or("Input must be an object")? {
         if !fields.split_whitespace().any(|f| f == key) {
@@ -77,6 +77,9 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "tags",
             "options",
             "parentSessionId",
+            // A workflow definition and its input values are objects.
+            "workflow",
+            "values",
         ]
         .contains(&key.as_str())
             && !value.is_string()
@@ -121,6 +124,88 @@ mod tests {
             &json!({"prompt":"x","project":"/code","draft":true})
         )
         .is_ok());
+    }
+    #[test]
+    fn workflows_actions_take_their_own_fields_and_objects() {
+        let actions = [
+            "list",
+            "get",
+            "add",
+            "validate",
+            "guide",
+            "update",
+            "setInputs",
+            "run",
+            "stop",
+            "pause",
+            "resume",
+            "resumeRun",
+            "remove",
+            "export",
+            "import",
+            "runs",
+        ];
+        for action in actions {
+            let action = format!("workflows.{action}");
+            assert!(validate(&action, &json!({})).is_ok(), "{action}");
+            assert_eq!(
+                validate(&action, &json!({"bogus": 1})).unwrap_err(),
+                format!("{action} does not take bogus")
+            );
+            assert!(
+                validate(&action, &json!({"project": "/p"})).is_ok(),
+                "{action}"
+            );
+            assert!(
+                validate(&action, &json!({"project": 5})).is_err(),
+                "{action}"
+            );
+        }
+        let ok = |action: &str, input| validate(action, &input);
+        assert!(ok(
+            "workflows.add",
+            json!({"workflow": {"name": "x", "nodes": []}})
+        )
+        .is_ok());
+        assert!(ok(
+            "workflows.add",
+            json!({"yaml": "a: 1", "values": {"p": "/x", "n": 2}})
+        )
+        .is_ok());
+        assert!(ok("workflows.validate", json!({"id": "wf-1", "workflow": {}})).is_ok());
+        assert!(ok(
+            "workflows.setInputs",
+            json!({"id": "wf-1", "values": {"n": 2}})
+        )
+        .is_ok());
+        assert!(ok(
+            "workflows.update",
+            json!({"id": "wf-1", "workflow": {"enabled": true}})
+        )
+        .is_ok());
+        assert!(ok("workflows.resumeRun", json!({"id": "wf-1", "runId": "r"})).is_ok());
+        assert_eq!(
+            ok("workflows.add", json!({"yaml": 5})).unwrap_err(),
+            "yaml must be text"
+        );
+        assert_eq!(
+            ok("workflows.resumeRun", json!({"id": "wf-1", "runId": 5})).unwrap_err(),
+            "runId must be text"
+        );
+        assert!(ok("workflows.runs", json!({"id": "wf-1", "limit": 3})).is_ok());
+        for bad in [json!("3"), json!(-1), json!(1.5)] {
+            assert_eq!(
+                ok("workflows.runs", json!({"id": "wf-1", "limit": bad})).unwrap_err(),
+                "limit must be a non-negative integer"
+            );
+        }
+        // The objects are only for workflows; other actions still want text.
+        assert!(ok("habits.add", json!({"values": {}})).is_err());
+        assert!(ok("notes.write", json!({"workflow": {}})).is_err());
+        assert_eq!(
+            ok("workflows.nope", json!({})).unwrap_err(),
+            "Unknown app action. Run app help"
+        );
     }
     #[test]
     fn start_fields_for_delivery_parent_and_folders() {

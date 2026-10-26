@@ -110,6 +110,9 @@ fn quit(cx: &mut App) {
     if notifications::updater::defer_quit(cx) {
         return;
     }
+    // Before the processes die, so workflow runs leave their files as they are (the next start
+    // interrupts them) instead of failing nodes whose commands were killed.
+    monos::begin_quit(cx);
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });
@@ -122,6 +125,7 @@ fn quit(cx: &mut App) {
 
 /// Quit, then relaunch the same app once this process has exited.
 fn restart(cx: &mut App) {
+    monos::begin_quit(cx);
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });

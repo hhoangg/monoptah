@@ -405,6 +405,69 @@ Settings > Inbox > Ticket scoring (runner radio, model field, API key field only
 
 **Phase 6b commit message:** `Native: Contributors page with GitHub and Ticket tabs`
 
+## Phase 7 - Mono workflows
+
+Reference survey with file:line for both apps: `.superpowers/sdd/2026-10-24-gpui-fork-port/phase7-survey.md` (git-ignored scratch; the facts below are the binding ones). Specs: `docs/superpowers/specs/2026-10-22-mono-workflows-design.md`, `docs/superpowers/specs/2026-10-23-workflow-run-graph-and-mono-authoring-design.md`. Two commits: 7a = core, runner and CLI (Tasks 7.1-7.9), 7b = UI (Tasks 7.10-7.13).
+
+**Phase rulings:**
+- Core lives in `crates/monocode-core/src/mono/workflows/` (model, parse, validate, template, condition, output, engine, report, yaml, schedule, models, guide, store, command, cli). The engine stays pure (`&WorkflowRun` in, new run out), exactly the TS contract.
+- File formats are shared with the Tauri app: `monos/<id>/workflows.json` (2 MiB cap, pretty JSON array + trailing newline, unreadable entries kept and written after readable ones) and `monos/<id>/workflow-runs/wf-xxxxxxxx.json` (4 MiB cap, 3.5 MiB budget, <= 20 runs newest first). JSON field names are the TS ones; session ids inside runs are strings (the persisted session id), so either app can read the other's runs. Fingerprints use the same stable key-sorted JSON as TS (`definitionFingerprint`).
+- Error and issue strings are copied verbatim from TS (the Mono and the guide read them).
+- JS regexes with lookaround (`COMMAND_ABSOLUTE_PATH`, the dev-null exclusion, word-boundary checks) are hand-written matchers; no `fancy-regex`. Each gets the TS test cases.
+- YAML: parse with `yaml-rust2` (YAML 1.2 core schema) through its event parser so aliases can be counted and capped at 20 (error mentioning "alias"), depth capped at 64, 512 KiB input cap before parsing; emit with a small hand-written emitter that writes the export shape deterministically (`time` always double-quoted, no line folding). If `yaml-rust2` cannot meet the core-schema rules (e.g. `09:00` must stay a string), report BLOCKED with the evidence instead of choosing another crate silently. Round-trip tests in both directions with fixtures exported by the TS code.
+- Not ported: the driver-window lease (`workflowDriver.ts`) and live-run registry (`workflowLiveRuns.ts`): the native app is one process. Startup sweep marks runs left `running` as interrupted.
+- Approvals use the native attention shelf (no chat relay); the 12 h approval wait and working-time-only node timeouts stay.
+- Ask-Mono decisions run in a hidden session per question (habit-style, full access, Mono context) that does not block habits (`active_run`).
+- Session nodes reuse the Mono `sessions.start` path from Phase 5 (full access, `notifyOnComplete: false`, a run folder named `<name> · YYYY-MM-DD HH:MM` capped at 100 chars, `nestUnder` via `parentSessionId`, worktree checkout).
+- Command nodes port `src-tauri/src/workflow_command.rs` (process group, early cancel, tails, grace) with `process::register` so quit kills them; Windows returns "Command nodes are not supported on Windows yet".
+- Schedules reuse `mono/habits.rs` `Schedule` including `interval` (Phase 5).
+- The CLI actions only answer from a Mono's own conversation, return within the bridge's 60 s window, and push work to the runner.
+- The UI builds a read-only run graph and a board editor on GPUI canvas/divs (no graph library): node cards (width 232), group frames for forEach, smooth-step orthogonal edges with arrowheads, the dashed loop edge with a rotated label, depth layout (`GAP_Y` 36, `GAP_X` 28), pan and zoom (0.3-1.5), drag, connect, reparent.
+
+### Task 7.1: Model, parse and validate
+`workflows/model.rs` (types, constants, ids, branch helpers, fingerprint), `parse.rs` (lenient node/edge/input parsing, `read_workflow_file` -> {workflows, unreadable}), `validate.rs` (`validate_workflow` -> issues with node ids). Tests: `workflow.test.ts` (5), `workflowParse.test.ts` (66).
+
+### Task 7.2: Templates, conditions and output contract
+`template.rs` (render with shell quoting, `template_vars`, `lookup`, `shell_template_problems`, `shell_dash_problems`), `condition.rs`, `output.rs`. Tests: 31 + 13 + 12.
+
+### Task 7.3: Engine
+`engine.rs` (`start_run`, `next_actions`, `apply_event`, `mark_interrupted`, `resume_run`, `run_scope`, `is_asking`, `looped_node_ids`). Tests: `workflowEngine.test.ts` (54).
+
+### Task 7.4: Report, schedule, models and guide
+`report.rs` (`compose_report`, `ask_mono_prompt`, `parse_mono_decision`), `schedule.rs` (`due_workflows`, `after_claim`), `models.rs` (`session_node_problem` over an injected catalog, `workflow_issues`), `guide.rs` (examples + `workflow_guide()`). Tests: 20 + 6 + 13 + 9 (every guide example validates).
+
+### Task 7.5: YAML export and import
+`yaml.rs` per the YAML ruling (`export_workflow`, `export_path_problem`, `preview_import`, `review_texts`, `review_of`, `input_value_problems`, `anchor_node`, `finish_import`). Tests: `workflowYaml.test.ts` (39) + TS-exported fixture round trips.
+
+### Task 7.6: Mono files and the workflow store
+`mono/files.rs` allow-list (`workflows.json`, `workflow-runs/<valid id>.json`, per-file caps, runs dir creation; port Tauri `mono.rs` tests :401-462) and `workflows/store.rs` (load/update with hash CAS up to 3 attempts, unreadable kept, runs load/update with the budget, clear). Tests: the store logic of `workflowStore.test.ts` (20) with temp dirs.
+
+### Task 7.7: Command runner
+`workflows/command.rs` port of `workflow_command.rs` with its 26 tests (`run_command`, `cancel`, `cancel_all`).
+
+### Task 7.8: CLI actions
+`workflows/cli.rs` `handle(action, input, host)` for the 16 actions with an in-memory host for tests; `mono/api.rs` field rules (`workflow`/`values`/`limit` not text), `bridge.rs` HELP lines (from `control_cli.rs:302-342`, native wording), `monos/host.rs` dispatch arm with the habit-run guard, `mono.rs` context workflows paragraph. Tests: `agentAppWorkflows.test.ts` (54) + validate/HELP tests.
+
+### Task 7.9: Runner and scheduling in GPUI
+`crates/monocode-gpui/src/monos/workflow_runner.rs`: live runs per workflow; executes engine actions (session start/send/re-ask once/output parse/cap 16,000 chars; command on the background executor; askMono hidden turn with 10 min timeout; report posted to the Mono chat), node timeouts on the 10 s clock counting working time, approvals via the attention shelf, persistence queue after every event ("Could not save the run history" on failure), stop (sessions, commands, report once), resume; scheduler integration (startup interrupted sweep, `due_workflows`/`after_claim`, `runRequested`/`stopRequested`/`resumeRunId` taken from the file, one run per workflow). Tests: the portable cases of `useMonoWorkflows.test.ts`, `workflowSessionStart.test.ts`, `capOutput`/`runFolderName`. Then `npm run native:check` -> 0 and commit 7a.
+Executed in two parts because of its size: 7.9a is the run executor (host seam, sessions, commands, askMono, approvals, persistence, stop, resume) and 7.9b is the scheduler integration (due runs, startup sweep, file requests, a check-now waker for `workflows.run`/`stop`, quit calling `command::cancel_all()` before `process::shutdown_all()`).
+
+**Phase 7a commit message:** `Native: Mono workflows engine, runner and app actions`
+
+### Task 7.10: Workflows tab, list, workflow, review and import pages
+`OverviewTab::Workflows` after Habits, routes, list rows with hover actions and notices, header actions (Ask Mono prefill "Help me build a workflow that ", Import, New, disabled at 20 with "At most 20 workflows"), empty state, workflow page (properties, inputs editor, recent runs, export via save dialog), review sections with `<U+XXXX>` escaping and fingerprint-checked approval, import page (paste or pick, live preview, inputs form, saved paused with needsReview). Tests: behaviour checks from `MonoWorkflows.test.ts`, `WorkflowPage.test.ts`, `WorkflowReviewPage.test.ts`, `ImportWorkflowPage.test.ts`.
+
+### Task 7.11: Board and run-graph models
+`board_model.rs` (pure port of `boardModel.ts`: layout, auto-place, `connection_kind`, `new_node`, `project_input_for`, `fit_groups`) and `run_graph_model.rs` (pure port of `runGraphModel.ts`). Tests: 44 + 27.
+
+### Task 7.12: Run page with the live graph
+Read-only graph canvas (node status colours, edge states, forEach lanes or single-item tabs with the remembered choice, round selector), details panel (rounds, decisions, error, outputs with Show more, Open session, command exit code and tails), Stop/Resume, "changed since this run started". Tests: from `RunGraph.test.ts`, `WorkflowRunPage.test.ts`.
+
+### Task 7.13: Board editor
+Editable canvas (drag, connect with `connection_kind`, reparent into/out of forEach, delete), node picker, node inspector (per-type fields, model picker, output fields, loop form), workflow settings, save/discard prompt, external-edit detection, issue badges, Save blocked for an enabled workflow with issues. Tests: from `WorkflowBoard.test.ts`, `NodeInspector.test.ts`. Then `npm run native:check` -> 0 and commit 7b.
+
+**Phase 7b commit message:** `Native: Mono workflows board, run graph and pages`
+
 ## Phases 4 to 7 (sketch; detailed plan written when each starts)
 
 - **Phase 4 - TUI surface:** per-provider surface preference (`monocode.providerSurface.v1`); `sessions.surface` read/write in `store.rs`/`store/shared.rs` (Tauri TUI rows stop showing as chat); `terminal.rs` spawn of program+args+env with exit code; a session-bound terminal pane opened from `open`/`activate_session`; Claude launch args (`--model`, `--permission-mode`, `--resume`/`--session-id`, `--settings` hooks), `agy` exception; `tui-hook` subcommand + spool watcher + `classify` with 5 s busy staleness into `busy_sessions`; app-driven sessions forced to chat; new-session provider prompt; automations follow the surface; close-on-clean-exit.

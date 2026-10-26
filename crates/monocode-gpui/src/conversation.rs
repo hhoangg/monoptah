@@ -44,6 +44,7 @@ use gpui::{
 pub(crate) use mobile::{Waiting as MobileWaiting, mobile_access_modes};
 pub(crate) use mono::QueueChanged as MonoQueueChanged;
 pub(crate) use mono::Submitted as MonoSubmitted;
+pub(crate) use mono::{TurnEnd, WorkflowTurn};
 use monocode_core::{
     agent::{AccessMode, Approval, Control, Decision, Settings},
     catalog::{self, Model},

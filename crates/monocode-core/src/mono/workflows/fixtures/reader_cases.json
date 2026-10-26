@@ -1,0 +1,1412 @@
+[
+ {
+  "yaml": "a: true\nb: True\nc: TRUE\nd: false\ne: False\nf: FALSE\ng: tRue\nh: yes\ni: on\nj: No\nk: y",
+  "value": {
+   "a": true,
+   "b": true,
+   "c": true,
+   "d": false,
+   "e": false,
+   "f": false,
+   "g": "tRue",
+   "h": "yes",
+   "i": "on",
+   "j": "No",
+   "k": "y"
+  }
+ },
+ {
+  "yaml": "a: null\nb: Null\nc: NULL\nd: ~\ne:\nf: nULL\ng: nil",
+  "value": {
+   "a": null,
+   "b": null,
+   "c": null,
+   "d": null,
+   "e": null,
+   "f": "nULL",
+   "g": "nil"
+  }
+ },
+ {
+  "yaml": "a: 0\nb: 12\nc: -12\nd: +12\ne: 007\nf: 0o17\ng: 0o8\nh: 0x1F\ni: 0xff\nj: 0XFF\nk: -0x1\nl: 0b11\nm: 1_000\nn: 12345678901234567890\no: 9007199254740993",
+  "value": {
+   "a": 0,
+   "b": 12,
+   "c": -12,
+   "d": 12,
+   "e": 7,
+   "f": 15,
+   "g": "0o8",
+   "h": 31,
+   "i": 255,
+   "j": "0XFF",
+   "k": "-0x1",
+   "l": "0b11",
+   "m": "1_000",
+   "n": 12345678901234567000,
+   "o": 9007199254740992
+  }
+ },
+ {
+  "yaml": "a: 1.5\nb: -1.5\nc: +1.5\nd: .5\ne: -.5\nf: 5.\ng: 1e3\nh: 1E3\ni: 1e-3\nj: 1.5e+3\nk: .5e2\nl: 5.e2\nm: 1e\nn: e5\no: 1.5.2\np: 1e400\nq: -1e400\nr: 1.7976931348623157e308\ns: 5e-324",
+  "value": {
+   "a": 1.5,
+   "b": -1.5,
+   "c": 1.5,
+   "d": 0.5,
+   "e": -0.5,
+   "f": 5,
+   "g": 1000,
+   "h": 1000,
+   "i": 0.001,
+   "j": 1500,
+   "k": 50,
+   "l": 500,
+   "m": "1e",
+   "n": "e5",
+   "o": "1.5.2",
+   "p": {
+    "$": "Infinity"
+   },
+   "q": {
+    "$": "-Infinity"
+   },
+   "r": 1.7976931348623157e+308,
+   "s": 5e-324
+  }
+ },
+ {
+  "yaml": "a: .inf\nb: -.inf\nc: +.inf\nd: .Inf\ne: .INF\nf: .nan\ng: .NaN\nh: .NAN\ni: .nAn\nj: inf\nk: Infinity\nl: NaN",
+  "value": {
+   "a": {
+    "$": "Infinity"
+   },
+   "b": {
+    "$": "-Infinity"
+   },
+   "c": {
+    "$": "Infinity"
+   },
+   "d": {
+    "$": "Infinity"
+   },
+   "e": {
+    "$": "Infinity"
+   },
+   "f": {
+    "$": "NaN"
+   },
+   "g": {
+    "$": "NaN"
+   },
+   "h": {
+    "$": "NaN"
+   },
+   "i": ".nAn",
+   "j": "inf",
+   "k": "Infinity",
+   "l": "NaN"
+  }
+ },
+ {
+  "yaml": "a: 09:00\nb: 2026-10-22\nc: 12:30:45\nd: 1:2\ne: 0900\nf: v1.2.3\ng: 1.2.3\nh: 0.5.\ni: -\nj: +\nk: --\nl: .\nm: ..",
+  "error": "Unexpected block-seq-ind on same line with key at line 9, column 4:"
+ },
+ {
+  "yaml": "a: \"true\"\nb: 'null'\nc: \"12\"\nd: '1.5'\ne: \"\"\nf: ''\ng: \"~\"",
+  "value": {
+   "a": "true",
+   "b": "null",
+   "c": "12",
+   "d": "1.5",
+   "e": "",
+   "f": "",
+   "g": "~"
+  }
+ },
+ {
+  "yaml": "a: !!str 12\nb: !!str true\nc: !!str\nd: !!int '5'\ne: !!int abc\nf: !!int 0x1f\ng: !!float 1.5\nh: !!float 1\ni: !!bool true\nj: !!bool yes\nk: !!null foo\nl: !!null ~\nm: !!null\nn: !foo 12\no: !!js/function 12\np: ! 12\nq: !!float .inf",
+  "value": {
+   "a": "12",
+   "b": "true",
+   "c": "",
+   "d": 5,
+   "e": "abc",
+   "f": 31,
+   "g": 1.5,
+   "h": "1",
+   "i": true,
+   "j": "yes",
+   "k": "foo",
+   "l": null,
+   "m": null,
+   "n": "12",
+   "o": "12",
+   "p": "12",
+   "q": {
+    "$": "Infinity"
+   }
+  }
+ },
+ {
+  "yaml": "a: !!seq [1, 2]\nb: !!map {c: 1}\nc: !!str [x]\nd: !custom {e: 1}",
+  "value": {
+   "a": [
+    1,
+    2
+   ],
+   "b": {
+    "c": 1
+   },
+   "c": [
+    "x"
+   ],
+   "d": {
+    "e": 1
+   }
+  }
+ },
+ {
+  "yaml": "name: !!js/function 'function(){}'",
+  "value": {
+   "name": "function(){}"
+  }
+ },
+ {
+  "yaml": "1: a\ntrue: b\n.5: c\n'x': d\n\"y\": e\nz w: f\n-k: g",
+  "value": {
+   "1": "a",
+   "true": "b",
+   "0.5": "c",
+   "x": "d",
+   "y": "e",
+   "z w": "f",
+   "-k": "g"
+  }
+ },
+ {
+  "yaml": "? a\n: 1\n? b\n: 2",
+  "value": {
+   "a": 1,
+   "b": 2
+  }
+ },
+ {
+  "yaml": "~: a\nb: 1",
+  "value": {
+   "": "a",
+   "b": 1
+  }
+ },
+ {
+  "yaml": ": a\nb: 1",
+  "value": {
+   "": "a",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "null: a\n~: b",
+  "error": "Map keys must be unique at line 2, column 1:"
+ },
+ {
+  "yaml": "1: a\n'1': b",
+  "value": {
+   "1": "b"
+  }
+ },
+ {
+  "yaml": "a: 1\na: 2",
+  "error": "Map keys must be unique at line 2, column 1:"
+ },
+ {
+  "yaml": "a: 1\n'a': 2",
+  "error": "Map keys must be unique at line 2, column 1:"
+ },
+ {
+  "yaml": "a: {b: 1, b: 2}",
+  "error": "Map keys must be unique at line 1, column 11:"
+ },
+ {
+  "yaml": "__proto__: {x: 1}\nconstructor: 2\ntoString: 3",
+  "value": {
+   "__proto__": {
+    "x": 1
+   },
+   "constructor": 2,
+   "toString": 3
+  }
+ },
+ {
+  "yaml": "<<: {a: 1}\nb: 2",
+  "value": {
+   "<<": {
+    "a": 1
+   },
+   "b": 2
+  }
+ },
+ {
+  "yaml": "a: &x 1\nb: *x\nc: [*x, *x]",
+  "value": {
+   "a": 1,
+   "b": 1,
+   "c": [
+    1,
+    1
+   ]
+  }
+ },
+ {
+  "yaml": "a: &x [1, 2]\nb: *x\nc: {d: *x}",
+  "value": {
+   "a": [
+    1,
+    2
+   ],
+   "b": [
+    1,
+    2
+   ],
+   "c": {
+    "d": [
+     1,
+     2
+    ]
+   }
+  }
+ },
+ {
+  "yaml": "&a b: &c d\ne: *a\nf: *c",
+  "value": {
+   "b": "d",
+   "e": "b",
+   "f": "d"
+  }
+ },
+ {
+  "yaml": "a: *x",
+  "error": "Unresolved alias (the anchor must be set before the alias): x"
+ },
+ {
+  "yaml": "a: &x [1]\nb: *y",
+  "error": "Unresolved alias (the anchor must be set before the alias): y"
+ },
+ {
+  "yaml": "a: &x 1\nb: &x 2\nc: *x",
+  "value": {
+   "a": 1,
+   "b": 2,
+   "c": 2
+  }
+ },
+ {
+  "yaml": "x: &a [1,2,3]\nl:\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a",
+  "value": {
+   "x": [
+    1,
+    2,
+    3
+   ],
+   "l": [
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2,
+     3
+    ]
+   ]
+  }
+ },
+ {
+  "yaml": "x: &a [1,2,3]\nl:\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a",
+  "error": "Excessive alias count indicates a resource exhaustion attack"
+ },
+ {
+  "yaml": "x: &a 1\nl:\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a",
+  "value": {
+   "x": 1,
+   "l": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ]
+  }
+ },
+ {
+  "yaml": "x: &a 1\nl:\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a",
+  "error": "Excessive alias count indicates a resource exhaustion attack"
+ },
+ {
+  "yaml": "x: &a {k: v}\nl:\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a",
+  "error": "Excessive alias count indicates a resource exhaustion attack"
+ },
+ {
+  "yaml": "x: &a []\nl:\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a",
+  "value": {
+   "x": [],
+   "l": [
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    []
+   ]
+  }
+ },
+ {
+  "yaml": "x: &a [1]\nb: &b [*a, *a, *a, *a, *a]\nl:\n  - *b\n  - *b",
+  "value": {
+   "x": [
+    1
+   ],
+   "b": [
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ]
+   ],
+   "l": [
+    [
+     [
+      1
+     ],
+     [
+      1
+     ],
+     [
+      1
+     ],
+     [
+      1
+     ],
+     [
+      1
+     ]
+    ],
+    [
+     [
+      1
+     ],
+     [
+      1
+     ],
+     [
+      1
+     ],
+     [
+      1
+     ],
+     [
+      1
+     ]
+    ]
+   ]
+  }
+ },
+ {
+  "yaml": "x: &a [1]\nb: &b [*a, *a, *a, *a, *a]\nl:\n  - *b\n  - *b\n  - *b",
+  "error": "Excessive alias count indicates a resource exhaustion attack"
+ },
+ {
+  "yaml": "x: &a [1]\ny: &b [2]\nl:\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *a\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b\n  - *b",
+  "value": {
+   "x": [
+    1
+   ],
+   "y": [
+    2
+   ],
+   "l": [
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [
+     2
+    ]
+   ]
+  }
+ },
+ {
+  "yaml": "a: &a [x]\nb: &b [*a, *a]\nc: &c [*b, *b]\nd: &d [*c, *c]\ne: [*d, *d]",
+  "error": "Excessive alias count indicates a resource exhaustion attack"
+ },
+ {
+  "yaml": "a: 1\n---\nb: 2",
+  "error": "Source contains multiple documents; please use YAML.parseAllDocuments() at line 2, column 1:"
+ },
+ {
+  "yaml": "---\na: 1\n...",
+  "value": {
+   "a": 1
+  }
+ },
+ {
+  "yaml": "--- a\n",
+  "value": "a"
+ },
+ {
+  "yaml": "--- |\n  text\n",
+  "value": "text\n"
+ },
+ {
+  "yaml": "# only a comment",
+  "value": null
+ },
+ {
+  "yaml": "",
+  "value": null
+ },
+ {
+  "yaml": "   \n\n",
+  "value": null
+ },
+ {
+  "yaml": "---\n",
+  "value": null
+ },
+ {
+  "yaml": "%YAML 1.2\n---\na: 1",
+  "value": {
+   "a": 1
+  }
+ },
+ {
+  "yaml": "a: 1 # comment\nb: 2 #c\n# full\nc: x#y",
+  "value": {
+   "a": 1,
+   "b": 2,
+   "c": "x#y"
+  }
+ },
+ {
+  "yaml": "just text",
+  "value": "just text"
+ },
+ {
+  "yaml": "12",
+  "value": 12
+ },
+ {
+  "yaml": "- a\n- b",
+  "value": [
+   "a",
+   "b"
+  ]
+ },
+ {
+  "yaml": "[1, 2, {a: b}]",
+  "value": [
+   1,
+   2,
+   {
+    "a": "b"
+   }
+  ]
+ },
+ {
+  "yaml": "{a: 1, b: [x, y], c: {d: e}}",
+  "value": {
+   "a": 1,
+   "b": [
+    "x",
+    "y"
+   ],
+   "c": {
+    "d": "e"
+   }
+  }
+ },
+ {
+  "yaml": "{a: , b}",
+  "value": {
+   "a": null,
+   "b": null
+  }
+ },
+ {
+  "yaml": "[a, , b]",
+  "error": "Unexpected , in flow sequence at line 1, column 5:"
+ },
+ {
+  "yaml": "[a: b, c]",
+  "value": [
+   {
+    "a": "b"
+   },
+   "c"
+  ]
+ },
+ {
+  "yaml": "{ a: 'x, y', b: \"p: q\" }",
+  "value": {
+   "a": "x, y",
+   "b": "p: q"
+  }
+ },
+ {
+  "yaml": "[1, 2,]",
+  "value": [
+   1,
+   2
+  ]
+ },
+ {
+  "yaml": "{a: 1,}",
+  "value": {
+   "a": 1
+  }
+ },
+ {
+  "yaml": "a: [unclosed",
+  "error": "Flow sequence in block collection must be sufficiently indented and end with a ] at line 1, column 13:"
+ },
+ {
+  "yaml": "a: {unclosed",
+  "error": "Flow map in block collection must be sufficiently indented and end with a } at line 1, column 13:"
+ },
+ {
+  "yaml": "name: [unclosed",
+  "error": "Flow sequence in block collection must be sufficiently indented and end with a ] at line 1, column 16:"
+ },
+ {
+  "yaml": "a: 'unclosed",
+  "error": "Missing closing 'quote at line 1, column 13:"
+ },
+ {
+  "yaml": "a: \"unclosed",
+  "error": "Missing closing \"quote at line 1, column 13:"
+ },
+ {
+  "yaml": "a:\n  - b\n  - c: d\n    e: f\n  -\n    - g",
+  "value": {
+   "a": [
+    "b",
+    {
+     "c": "d",
+     "e": "f"
+    },
+    [
+     "g"
+    ]
+   ]
+  }
+ },
+ {
+  "yaml": "a:\n- b\n- c",
+  "value": {
+   "a": [
+    "b",
+    "c"
+   ]
+  }
+ },
+ {
+  "yaml": "a:\n  b:\n    c:\n      d: 1",
+  "value": {
+   "a": {
+    "b": {
+     "c": {
+      "d": 1
+     }
+    }
+   }
+  }
+ },
+ {
+  "yaml": "-\n  a: 1\n-\n  b: 2",
+  "value": [
+   {
+    "a": 1
+   },
+   {
+    "b": 2
+   }
+  ]
+ },
+ {
+  "yaml": "a: b: c",
+  "error": "Nested mappings are not allowed in compact mappings at line 1, column 4:"
+ },
+ {
+  "yaml": "a: b\n\tc: d",
+  "error": "Tabs are not allowed as indentation at line 2, column 1:"
+ },
+ {
+  "yaml": "  a: 1\n  b: 2",
+  "value": {
+   "a": 1,
+   "b": 2
+  }
+ },
+ {
+  "yaml": "a: 1\n b: 2",
+  "error": "Nested mappings are not allowed in compact mappings at line 1, column 4:"
+ },
+ {
+  "yaml": "a:\n  b: 1\n c: 2",
+  "error": "All mapping items must start at the same column at line 3, column 1:"
+ },
+ {
+  "yaml": "- a\n b",
+  "value": [
+   "a b"
+  ]
+ },
+ {
+  "yaml": "a: |\n  one\n  two\nb: 1",
+  "value": {
+   "a": "one\ntwo\n",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: |-\n  one\n  two\n\nb: 1",
+  "value": {
+   "a": "one\ntwo",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: |+\n  one\n  two\n\nb: 1",
+  "value": {
+   "a": "one\ntwo\n\n",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: |\n  one\n\n  two\n\n\nb: 1",
+  "value": {
+   "a": "one\n\ntwo\n",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: >\n  one\n  two\n\n  three\n   more\n  last\nb: 1",
+  "value": {
+   "a": "one two\nthree\n more\nlast\n",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: >-\n  folded\n  text\nb: 1",
+  "value": {
+   "a": "folded text",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: >+\n  folded\n  text\n\nb: 1",
+  "value": {
+   "a": "folded text\n\n",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: |2\n    two extra\n  base\n",
+  "value": {
+   "a": "  two extra\nbase\n"
+  }
+ },
+ {
+  "yaml": "a: |1\n  one extra\n",
+  "value": {
+   "a": " one extra\n"
+  }
+ },
+ {
+  "yaml": "a: |\n\n  leading blank\n",
+  "value": {
+   "a": "\nleading blank\n"
+  }
+ },
+ {
+  "yaml": "a: |\n  text\n    indented\n  back\n",
+  "value": {
+   "a": "text\n  indented\nback\n"
+  }
+ },
+ {
+  "yaml": "a: |\n  # not a comment\n  - not a list\n  key: not a map\n",
+  "value": {
+   "a": "# not a comment\n- not a list\nkey: not a map\n"
+  }
+ },
+ {
+  "yaml": "a: |\n\ttab\n",
+  "error": "Block scalar values in collections must be indented at line 2, column 1:"
+ },
+ {
+  "yaml": "a: |\n  trailing   \n  spaces  \n",
+  "value": {
+   "a": "trailing   \nspaces  \n"
+  }
+ },
+ {
+  "yaml": "a: |-\n",
+  "value": {
+   "a": ""
+  }
+ },
+ {
+  "yaml": "a: |\nb: 1",
+  "value": {
+   "a": "",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "- |\n  x\n- >\n  y\n",
+  "value": [
+   "x\n",
+   "y\n"
+  ]
+ },
+ {
+  "yaml": "a: |  # comment\n  text\n",
+  "value": {
+   "a": "text\n"
+  }
+ },
+ {
+  "yaml": "a: first\n  second\n  third\nb: 1",
+  "value": {
+   "a": "first second third",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: first\n\n  third\nb: 1",
+  "value": {
+   "a": "first\nthird",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: 'one\n  two\n\n  three'\nb: 1",
+  "value": {
+   "a": "one two\nthree",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: \"one\n  two\n\n  three\"\nb: 1",
+  "value": {
+   "a": "one two\nthree",
+   "b": 1
+  }
+ },
+ {
+  "yaml": "a: \"one\\\n  two\"",
+  "value": {
+   "a": "onetwo"
+  }
+ },
+ {
+  "yaml": "a: \"trailing \\\n  next\"",
+  "value": {
+   "a": "trailing next"
+  }
+ },
+ {
+  "yaml": "a: \"x\\ty\\nz\"",
+  "value": {
+   "a": "x\ty\nz"
+  }
+ },
+ {
+  "yaml": "a: \"\\0 \\a \\b \\t \\n \\v \\f \\r \\e \\  \\\" \\/ \\\\ \\N \\_ \\L \\P \\x41 \\u00e9 \\U0001F600\"",
+  "value": {
+   "a": "\u0000 \u0007 \b \t \n \u000b \f \r \u001b   \" / \\        A é 😀"
+  }
+ },
+ {
+  "yaml": "a: \"\\q\"",
+  "error": "Invalid escape sequence \\q at line 1, column 5:"
+ },
+ {
+  "yaml": "a: \"\\x4\"",
+  "error": "Invalid escape sequence \\x4\" at line 1, column 5:"
+ },
+ {
+  "yaml": "a: 'it''s'",
+  "value": {
+   "a": "it's"
+  }
+ },
+ {
+  "yaml": "a: 'back\\slash'",
+  "value": {
+   "a": "back\\slash"
+  }
+ },
+ {
+  "yaml": "a: \"tab\there\"",
+  "value": {
+   "a": "tab\there"
+  }
+ },
+ {
+  "yaml": "a: \"nl\\nx\"",
+  "value": {
+   "a": "nl\nx"
+  }
+ },
+ {
+  "yaml": "a: \"\\u2028\\u2029\\u0085\"",
+  "value": {
+   "a": "  "
+  }
+ },
+ {
+  "yaml": "a: \"raw   raw   raw \"",
+  "value": {
+   "a": "raw   raw   raw "
+  }
+ },
+ {
+  "yaml": "a: 'raw   x'",
+  "value": {
+   "a": "raw   x"
+  }
+ },
+ {
+  "yaml": "a: plain   nbsp",
+  "value": {
+   "a": "plain   nbsp"
+  }
+ },
+ {
+  "yaml": "a: café 日本 🎉",
+  "value": {
+   "a": "café 日本 🎉"
+  }
+ },
+ {
+  "yaml": "a: \"🎉\"",
+  "value": {
+   "a": "🎉"
+  }
+ },
+ {
+  "yaml": "a: b: c",
+  "error": "Nested mappings are not allowed in compact mappings at line 1, column 4:"
+ },
+ {
+  "yaml": "a: - b",
+  "error": "Unexpected block-seq-ind on same line with key at line 1, column 4:"
+ },
+ {
+  "yaml": "a: -b",
+  "value": {
+   "a": "-b"
+  }
+ },
+ {
+  "yaml": "a: ?b",
+  "value": {
+   "a": "?b"
+  }
+ },
+ {
+  "yaml": "a: ? b",
+  "error": "Nested mappings are not allowed in compact mappings at line 1, column 4:"
+ },
+ {
+  "yaml": "a: @b",
+  "error": "Plain value cannot start with reserved character @ at line 1, column 4:"
+ },
+ {
+  "yaml": "a: `b",
+  "error": "Plain value cannot start with reserved character ` at line 1, column 4:"
+ },
+ {
+  "yaml": "a: %b",
+  "error": "Plain value cannot start with directive indicator character % at line 1, column 4:"
+ },
+ {
+  "yaml": "a: &b",
+  "value": {
+   "a": null
+  }
+ },
+ {
+  "yaml": "a: *b",
+  "error": "Unresolved alias (the anchor must be set before the alias): b"
+ },
+ {
+  "yaml": "a: !b",
+  "value": {
+   "a": ""
+  }
+ },
+ {
+  "yaml": "a: |b",
+  "error": "Block scalar header includes extra characters: |b at line 1, column 5:"
+ },
+ {
+  "yaml": "a: >b",
+  "error": "Block scalar header includes extra characters: >b at line 1, column 5:"
+ },
+ {
+  "yaml": "a: 'b",
+  "error": "Missing closing 'quote at line 1, column 6:"
+ },
+ {
+  "yaml": "a: b#c",
+  "value": {
+   "a": "b#c"
+  }
+ },
+ {
+  "yaml": "a: b #c",
+  "value": {
+   "a": "b"
+  }
+ },
+ {
+  "yaml": "a: b:c",
+  "value": {
+   "a": "b:c"
+  }
+ },
+ {
+  "yaml": "a: b: ",
+  "error": "Nested mappings are not allowed in compact mappings at line 1, column 4:"
+ },
+ {
+  "yaml": "a: http://x/y?z=1&w=2#frag",
+  "value": {
+   "a": "http://x/y?z=1&w=2#frag"
+  }
+ },
+ {
+  "yaml": "a: \"{{inputs.project}}\"",
+  "value": {
+   "a": "{{inputs.project}}"
+  }
+ },
+ {
+  "yaml": "a: x\n  # comment\n  y",
+  "error": "All mapping items must start at the same column at line 3, column 1:"
+ },
+ {
+  "yaml": "a: --- x",
+  "value": {
+   "a": "--- x"
+  }
+ },
+ {
+  "yaml": "a: ...",
+  "value": {
+   "a": "..."
+  }
+ },
+ {
+  "yaml": "a: [x]y",
+  "error": "Unexpected scalar at node end at line 1, column 7:"
+ },
+ {
+  "yaml": "a: ,b",
+  "error": "Plain value cannot start with flow indicator character , at line 1, column 4:"
+ },
+ {
+  "yaml": "a: ]",
+  "error": "Unexpected flow-seq-end token in YAML stream: \"]\" at line 1, column 4:"
+ },
+ {
+  "yaml": "a: 1\r\nb: |\r\n  x\r\n  y\r\nc: 2\r\n",
+  "value": {
+   "a": 1,
+   "b": "x\ny\n",
+   "c": 2
+  }
+ },
+ {
+  "yaml": "﻿a: 1",
+  "value": {
+   "a": 1
+  }
+ },
+ {
+  "yaml": "a: 1\n\n\nb: 2\n\n",
+  "value": {
+   "a": 1,
+   "b": 2
+  }
+ },
+ {
+  "yaml": "monoptahWorkflow: 1\nname: X\nnodes:\n  - { id: a, type: manual }\nedges:\n  - { from: a }\n",
+  "value": {
+   "monoptahWorkflow": 1,
+   "name": "X",
+   "nodes": [
+    {
+     "id": "a",
+     "type": "manual"
+    }
+   ],
+   "edges": [
+    {
+     "from": "a"
+    }
+   ]
+  }
+ },
+ {
+  "yaml": "monoptahWorkflow: 1\nname: X\nnodes:\n  - id: a\n    type: session\n",
+  "value": {
+   "monoptahWorkflow": 1,
+   "name": "X",
+   "nodes": [
+    {
+     "id": "a",
+     "type": "session"
+    }
+   ]
+  }
+ },
+ {
+  "yaml": "monoptahWorkflow: 1\nname: X\ninputs:\n  __proto__: { type: string }\n  ok: { type: string }\nnodes: []\n",
+  "value": {
+   "monoptahWorkflow": 1,
+   "name": "X",
+   "inputs": {
+    "__proto__": {
+     "type": "string"
+    },
+    "ok": {
+     "type": "string"
+    }
+   },
+   "nodes": []
+  }
+ },
+ {
+  "yaml": "monoptahWorkflow: 1\nname: !!js/function 'function(){}'\nnodes: []\n",
+  "value": {
+   "monoptahWorkflow": 1,
+   "name": "function(){}",
+   "nodes": []
+  }
+ }
+]

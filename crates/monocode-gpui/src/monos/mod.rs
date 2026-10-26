@@ -23,6 +23,8 @@ mod status;
 #[cfg(test)]
 mod tests;
 mod work;
+mod workflow_runner;
+mod workflow_schedule;
 use crate::{
     conversation::{Conversation, MonoSubmitted, SessionChanged},
     input::{self, Input},
@@ -55,6 +57,7 @@ pub(crate) struct Changed;
 pub(crate) struct TabOpened(pub String);
 pub(crate) struct ShowDetails(pub String);
 pub(crate) use notifications::{NotificationChanged, NotificationFinished};
+pub(crate) use workflow_schedule::begin_quit;
 #[derive(Clone, PartialEq)]
 pub(crate) struct OverviewChrome {
     active: Option<String>,
@@ -156,6 +159,15 @@ pub(crate) struct Monos {
     session_filter_anchor: AnchorSlot,
     app_results: HashMap<(i64, String), (String, Result<serde_json::Value, String>)>,
     app_pending: HashSet<(i64, String)>,
+    /// What the workflows.* actions and the workflow runner tell each other. The actions read
+    /// `is_running` and call `request_check_now`, which rings the waker `start_workflow_checks`
+    /// installed, so a `run`, `stop` or `resumeRun` request is acted on at once; the runner calls
+    /// `set_running` when a run starts and ends.
+    pub(crate) workflow_signals: std::sync::Arc<mono::workflows::cli::Signals>,
+    /// The live workflow runs, one per workflow.
+    workflows: workflow_runner::WorkflowRunner,
+    workflow_live: workflow_runner::Live,
+    workflow_checks: workflow_schedule::Checks,
 }
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
@@ -325,6 +337,7 @@ impl Monos {
             .unwrap_or_default();
         let manager = cx.entity();
         let details = cx.new(|cx| overview::Overview::new(manager, cx));
+        let signals = std::sync::Arc::<mono::workflows::cli::Signals>::default();
         let mut this = Self {
             #[cfg(all(target_os = "macos", not(test)))]
             status: None,
@@ -398,7 +411,13 @@ impl Monos {
             session_filter_anchor: AnchorSlot::default(),
             app_results: HashMap::new(),
             app_pending: HashSet::new(),
+            workflow_signals: signals.clone(),
+            workflows: workflow_runner::WorkflowRunner::new(signals),
+            workflow_live: workflow_runner::Live::new(),
+            workflow_checks: Default::default(),
         };
+        cx.set_global(workflow_schedule::QuitTarget(this.workflows.clone()));
+        this.start_workflow_checks(cx);
         if let Some(rx) = rx {
             this._bridge_task = Some(cx.spawn(async move |this, cx| {
                 while let Ok(call) = rx.recv().await {
@@ -445,7 +464,8 @@ impl Monos {
     pub(crate) fn hidden_session(&self, id: i64) -> bool {
         self.is_mono_session(id)
             || self.roster.monos.iter().any(|m| {
-                !m.show_started_sessions_in_sidebar && m.launches.iter().any(|l| l.session_id == id)
+                !m.show_started_sessions_in_sidebar
+                    && m.launches.iter().any(|l| l.session_id == id && !l.visible)
             })
     }
     pub(crate) fn set_preferences(
@@ -622,6 +642,15 @@ impl Monos {
         cx.notify();
     }
     fn save(&mut self, cx: &mut Context<Self>) {
+        self.save_reporting(cx);
+    }
+    /// `save`, and a receiver that gets the outcome of this write once it is on disk (writes go
+    /// one after another, so everything saved before it is on disk by then too).
+    fn save_reporting(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> async_channel::Receiver<Result<(), String>> {
+        let (written, outcome) = async_channel::bounded(1);
         let roster = self.roster.clone();
         let store = self.store.clone();
         let queued = roster
@@ -644,6 +673,7 @@ impl Monos {
                 roster.save(&db)
             });
             let result = work.await;
+            let _ = written.send(result.clone()).await;
             let _ = this.update(cx, |this, cx| match result {
                 Err(error) => {
                     this.error = Some(error);
@@ -658,6 +688,7 @@ impl Monos {
             });
         }));
         self.changed(cx);
+        outcome
     }
     fn ensure_chat(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.chats.contains_key(id) || !self.loading_chats.insert(id.into()) {
@@ -1610,6 +1641,7 @@ impl gpui::Render for Monos {
                     .children(
                         self.attention_views(&mono.id, cx)
                             .into_iter()
+                            .chain(self.workflow_attention_views(&mono.id, cx))
                             .map(|view| view.update(cx, |v, cx| v.mono_attention(window, cx))),
                     )
                     .when_some(self.chat(), |d, chat| {

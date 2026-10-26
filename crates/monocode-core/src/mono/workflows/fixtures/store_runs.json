@@ -1,0 +1,162 @@
+[
+  {
+    "id": "run-2",
+    "workflowId": "wf-abcd1234",
+    "definition": {
+      "id": "wf-abcd1234",
+      "name": "Daily",
+      "inputs": {},
+      "inputValues": {},
+      "nodes": [
+        {
+          "id": "trigger",
+          "type": "manual"
+        },
+        {
+          "id": "dev",
+          "type": "session",
+          "project": "/code/app",
+          "prompt": "Do {{trigger.x}}",
+          "checkout": "root",
+          "output": {
+            "pr_url": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "id": "report",
+          "type": "report"
+        }
+      ],
+      "edges": [
+        {
+          "from": "trigger",
+          "to": "dev"
+        },
+        {
+          "from": "dev",
+          "to": "report"
+        }
+      ],
+      "enabled": true,
+      "createdAt": 1
+    },
+    "status": "done",
+    "startedAt": 1700000100000,
+    "endedAt": 1700000200000,
+    "trigger": "manual",
+    "folderId": "f1",
+    "items": {
+      "each": [
+        "a",
+        {
+          "n": 1.5
+        }
+      ],
+      "each@r1": []
+    },
+    "nodes": [
+      {
+        "nodeId": "trigger",
+        "branch": "",
+        "status": "done",
+        "round": 1
+      },
+      {
+        "nodeId": "dev",
+        "branch": "",
+        "status": "done",
+        "round": 2,
+        "sessionId": "s2",
+        "output": {
+          "z_last": "1",
+          "pr_url": "https://x/1"
+        },
+        "decision": {
+          "value": "loop",
+          "reason": "again"
+        },
+        "startedAt": 5,
+        "endedAt": 9,
+        "reasked": true,
+        "history": [
+          {
+            "round": 1,
+            "status": "done",
+            "sessionId": "s1",
+            "decision": {
+              "value": "loop"
+            },
+            "startedAt": 1,
+            "endedAt": 2
+          }
+        ]
+      }
+    ],
+    "reportPostedAt": 1700000300000
+  },
+  {
+    "id": "run-1",
+    "workflowId": "wf-abcd1234",
+    "definition": {
+      "id": "wf-abcd1234",
+      "name": "Daily",
+      "inputs": {},
+      "inputValues": {},
+      "nodes": [
+        {
+          "id": "trigger",
+          "type": "manual"
+        },
+        {
+          "id": "dev",
+          "type": "session",
+          "project": "/code/app",
+          "prompt": "Do {{trigger.x}}",
+          "checkout": "root",
+          "output": {
+            "pr_url": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "id": "report",
+          "type": "report"
+        }
+      ],
+      "edges": [
+        {
+          "from": "trigger",
+          "to": "dev"
+        },
+        {
+          "from": "dev",
+          "to": "report"
+        }
+      ],
+      "enabled": true,
+      "createdAt": 1
+    },
+    "status": "failed",
+    "startedAt": 1700000000000,
+    "trigger": "schedule",
+    "items": {},
+    "nodes": [
+      {
+        "nodeId": "dev",
+        "branch": "",
+        "status": "failed",
+        "round": 1,
+        "error": "boom"
+      }
+    ],
+    "error": "boom"
+  },
+  {
+    "id": "run-odd",
+    "note": "from a newer app",
+    "big": 1e+21
+  }
+]

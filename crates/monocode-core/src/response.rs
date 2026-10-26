@@ -74,6 +74,24 @@ pub fn prose(rows: &[Row]) -> String {
         .collect::<Vec<_>>()
         .join("\n\n")
 }
+/// What the agent said last this turn: the final assistant message after the last user row, as
+/// written (no trimming). A workflow reads its `workflow-output` block from it. Empty when the
+/// turn said nothing.
+pub fn final_reply(rows: &[Row]) -> String {
+    let Some(end) = rows
+        .iter()
+        .rposition(|r| r.role == "user" || (r.role == "assistant" && !r.text.trim().is_empty()))
+        .filter(|&i| rows[i].role == "assistant")
+    else {
+        return String::new();
+    };
+    // A message arrives in pieces; the one that starts it has `first` set.
+    let mut start = end;
+    while start > 0 && !rows[start].first && rows[start - 1].role == "assistant" {
+        start -= 1;
+    }
+    rows[start..=end].iter().map(|r| r.text.as_str()).collect()
+}
 pub fn request(rows: &[Row]) -> String {
     rows.iter()
         .take_while(|r| r.role == "user")
@@ -234,6 +252,42 @@ pub fn strip_goal_sections(markdown: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(role: &str, text: &str, first: bool) -> Row {
+        Row {
+            role: role.into(),
+            text: text.into(),
+            first,
+            sent_at: None,
+        }
+    }
+    #[test]
+    fn the_final_reply_is_the_last_assistant_message_of_the_turn() {
+        let rows = vec![
+            row("user", "Go", true),
+            row("assistant", "First thoughts.", true),
+            row("tool", "{}", true),
+            row("assistant", "All ", true),
+            row("assistant", "done.", false),
+            row("assistant", "  ", false),
+        ];
+        assert_eq!(final_reply(&rows), "All done.");
+    }
+    #[test]
+    fn the_final_reply_stops_at_the_last_user_row_and_may_be_empty() {
+        let rows = vec![
+            row("user", "One", true),
+            row("assistant", "Old answer", true),
+            row("user", "Two", true),
+            row("tool", "{}", true),
+        ];
+        assert_eq!(final_reply(&rows), "");
+        assert_eq!(final_reply(&[]), "");
+        assert_eq!(
+            final_reply(&[row("assistant", "x", false), row("assistant", "y", false)]),
+            "xy"
+        );
+    }
     #[test]
     fn copied_prose_and_transfer_recaps_keep_message_boundaries() {
         let rows = vec![
