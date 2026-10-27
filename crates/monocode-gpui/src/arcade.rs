@@ -292,7 +292,7 @@ impl Render for Arcade {
                     .left(px((bubble.x * 7.).max(4.)))
                     .top(px((bubble.y * 7. - 24.).max(4.)))
                     .text_size(px(9.))
-                    .font_family(crate::markdown::MONO)
+                    .font_family(crate::fonts::mono())
                     .text_color(content(bubble.alpha * 0.9 * self.frame.dim))
                     .child(bubble.text.clone()),
             );
@@ -334,7 +334,7 @@ impl Render for Arcade {
                     .items_center()
                     .justify_between()
                     .text_size(px(11.))
-                    .font_family(crate::markdown::MONO)
+                    .font_family(crate::fonts::mono())
                     .child(format!(
                         "score {} {}",
                         self.frame.score,
@@ -359,7 +359,7 @@ impl Render for Arcade {
                 .opacity(0.)
                 .group_hover("empty-session-arcade", |s| s.opacity(1.))
                 .cursor_pointer()
-                .font_family(crate::markdown::MONO)
+                .font_family(crate::fonts::mono())
                 .text_size(px(11.))
                 .child(if index == 0 {
                     "[ take control · pac-man ]"

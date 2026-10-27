@@ -213,6 +213,36 @@ fn overlapping_turns_keep_exact_diffs_but_cannot_restore_shared_work() {
 }
 
 #[test]
+fn abandoned_turns_from_exited_processes_do_not_share_later_turns() {
+    let f = Fixture::new();
+    f.store.begin_turn("crashed", f.cwd(), "first").unwrap();
+    f.store.begin_turn("legacy", f.cwd(), "second").unwrap();
+    let crashed = f.store.session_dir("crashed");
+    let mut review = read_review(&crashed).unwrap().unwrap();
+    review
+        .active
+        .as_mut()
+        .unwrap()
+        .owner
+        .as_mut()
+        .unwrap()
+        .launch = "exited".into();
+    write_review(&crashed, &review).unwrap();
+    let legacy = f.store.session_dir("legacy");
+    let mut review = read_review(&legacy).unwrap().unwrap();
+    review.active.as_mut().unwrap().owner = None;
+    write_review(&legacy, &review).unwrap();
+
+    f.store.begin_turn("live", f.cwd(), "third").unwrap();
+    f.write("a.txt", "edited from the shell\n");
+    f.store.finish_turn("live", f.cwd(), "third").unwrap();
+    let status = f.store.status("live", f.cwd()).unwrap();
+    assert_eq!(status.files.len(), 1);
+    assert_eq!(status.files[0].relative, "a.txt");
+    assert!(status.files[0].undoable);
+}
+
+#[test]
 fn shared_turns_only_review_files_with_their_own_successful_edit_events() {
     let f = Fixture::new();
     f.store.begin_turn("reader", f.cwd(), "first").unwrap();

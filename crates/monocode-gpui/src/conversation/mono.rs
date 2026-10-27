@@ -10,7 +10,6 @@ pub(super) struct ChatState {
     pub(super) sending: Option<String>,
     pub(super) failed: Vec<(String, String)>,
     pub(super) external: Option<(String, bool)>,
-    pub(super) floating: std::collections::HashSet<gpui::WindowId>,
     /// ModelPicker with `hideSettings`: the model list opens on its own.
     pub(super) models: Option<(Entity<ModelList>, Vec<Subscription>)>,
     /// The setting pills' anchors, by `ComposerMenu::Setting` index.
@@ -40,10 +39,43 @@ pub(crate) struct WorkflowTurn {
 impl EventEmitter<QueueChanged> for Conversation {}
 impl EventEmitter<Submitted> for Conversation {}
 impl Conversation {
-    pub(crate) fn mono_floating_window(&mut self, window: &Window) {
-        self.mono_ui
-            .floating
-            .insert(window.window_handle().window_id());
+    /// App launches are saved before installing a view. Reuse the normal durable
+    /// draft/queue path instead of submitting an unrecorded seed prompt.
+    pub(crate) fn install_app_launch(
+        &mut self,
+        settings: Settings,
+        send: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.history_ready() {
+            self.defer_history_action(
+                move |this, cx| this.install_app_launch(settings, send, cx),
+                cx,
+            );
+            return;
+        }
+        self.install_transfer(settings, None, cx);
+        if send {
+            self.draft_action(true, cx);
+        }
+        cx.emit(SessionChanged);
+    }
+    pub(crate) fn save_app_draft(&mut self, prompt: String, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_text(prompt, cx));
+        self.save_message_draft(cx);
+    }
+    pub(crate) fn stop_app_session(&mut self, cx: &mut Context<Self>) {
+        if self.needs_history_restore() {
+            self.stop_if_busy(cx);
+            self.defer_history_action(|this, cx| this.stop_app_session(cx), cx);
+            return;
+        }
+        self.stop_if_busy(cx);
+        self.follow_ups.state.paused = true;
+        self.follow_ups.ready = false;
+        self.follow_ups.requested = None;
+        self.save_follow_ups(cx);
     }
     pub(crate) fn mono_quote(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.input.read(cx).is_composing() {
@@ -69,6 +101,7 @@ impl Conversation {
         if self.busy
             || self.stopping
             || self.mono_ui.external.is_some()
+            || self.has_saved_draft()
             || !self.input.read(cx).content.trim().is_empty()
         {
             return Err("Session is busy or has an unsent draft".into());
@@ -315,16 +348,20 @@ impl Conversation {
         if self.busy || self.stopping {
             return Err("Wait for the current turn before posting a report".into());
         }
-        let row = monocode_core::transcript::Row {
-            role: role.into(),
-            text,
-            first: true,
-            sent_at: Some(monocode_core::time::now_ms()),
-        };
+        let mut posted = monocode_core::transcript::Transcript::default();
+        posted.begin(role);
+        if role == "mono-card" {
+            // Card JSON is one metadata row, including large summaries.
+            posted.rows[0].text = text;
+        } else {
+            // Match the store's row boundaries so the next post starts after
+            // the complete report, even when it spans multiple display rows.
+            posted.append(&text);
+        }
         let at = self.transcript.read(cx).source_rows().len();
-        locked(&self.store)?.write_rows(self.summary.id, at, std::slice::from_ref(&row))?;
+        locked(&self.store)?.write_rows(self.summary.id, at, &posted.rows)?;
         self.transcript
-            .update(cx, |t, cx| t.patch(at, vec![row], cx));
+            .update(cx, |t, cx| t.patch(at, posted.rows, cx));
         self.summary.has_messages = true;
         cx.emit(SessionChanged);
         cx.notify();
@@ -1229,5 +1266,89 @@ impl Conversation {
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use monocode_core::{store::Store, transcript::Transcript};
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    #[gpui::test]
+    fn long_reports_preserve_card_and_follow_up_positions(cx: &mut TestAppContext) {
+        for report in [
+            "x".repeat(monocode_core::transcript::ROW_BYTES + 1),
+            "A finding\n".repeat(26),
+            "**Habit report**\n\n🙂 café 漢字\n\n".repeat(100),
+        ] {
+            let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+            let session = store.create("codex", "/project").unwrap();
+            let mut history = Transcript::default();
+            history.begin("user");
+            history.append("Earlier question");
+            history.begin("assistant");
+            history.append("Earlier reply");
+            store.write_rows(session.id, 0, &history.rows).unwrap();
+            let chat = cx.new(|cx| Conversation::new(session, Arc::new(Mutex::new(store)), cx));
+            chat.update(cx, |chat, cx| {
+                chat.loaded = true;
+                chat.transcript
+                    .update(cx, |view, cx| view.patch(0, history.rows.clone(), cx));
+                chat.mono_post("assistant", report.clone(), cx).unwrap();
+                let card_index = chat.mono_rows(cx).len();
+                let mut card = json!({
+                    "id":"report-card", "type":"document", "documentId":"report-document",
+                    "title":"Bug triage", "summary":"Detailed findings 🙂. ".repeat(200),
+                });
+                chat.mono_post("mono-card", card.to_string(), cx).unwrap();
+                card["title"] = json!("Updated bug triage");
+                chat.mono_patch_card(card_index, "report-card", card.clone(), cx)
+                    .unwrap();
+                chat.mono_post("assistant", "Another report".into(), cx)
+                    .unwrap();
+
+                let rows = chat.mono_rows(cx);
+                assert_eq!(&rows[..history.rows.len()], history.rows);
+                assert_eq!(
+                    rows[history.rows.len()..card_index]
+                        .iter()
+                        .map(|row| row.text.as_str())
+                        .collect::<String>(),
+                    report,
+                );
+                assert!(
+                    rows.iter()
+                        .filter(|row| row.role == "assistant")
+                        .all(|row| {
+                            row.text.len() <= monocode_core::transcript::ROW_BYTES
+                                && row.text.matches('\n').count() <= 12
+                        })
+                );
+                assert_eq!(rows.iter().filter(|row| row.role == "mono-card").count(), 1);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&rows[card_index].text).unwrap(),
+                    card,
+                );
+                assert_eq!(rows.last().unwrap().text, "Another report");
+                let mut reloaded = locked(&chat.store)
+                    .unwrap()
+                    .load(chat.summary.id)
+                    .unwrap()
+                    .rows;
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&reloaded[card_index].text).unwrap(),
+                    card,
+                );
+                // Restoring the card id can change JSON object field order.
+                reloaded[card_index].text = rows[card_index].text.clone();
+                assert_eq!(
+                    reloaded, rows,
+                    "reloading keeps the displayed rows and their message boundaries",
+                );
+            });
+        }
     }
 }

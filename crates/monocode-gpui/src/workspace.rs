@@ -110,6 +110,9 @@ pub(crate) struct Workspace {
     /// Independent file panes use negative IDs in the layout tree. Their
     /// originating session supplies project/worktree scope and Add to Chat.
     pub review_owners: HashMap<i64, i64>,
+    /// Monos dragged into a split, by their negative pane IDs. Each keeps the
+    /// Mono tab it came from, which it becomes again once it stands alone.
+    pub mono_panes: HashMap<i64, TitleTab>,
     /// Split trees of tabs with more than one pane, by tab key.
     pub layouts: HashMap<i64, PaneNode>,
     /// The pane each split tab returns to when it is activated.
@@ -317,6 +320,7 @@ impl Default for Workspace {
             changes_view: Default::default(),
             reviews: Default::default(),
             review_owners: Default::default(),
+            mono_panes: Default::default(),
             layouts: Default::default(),
             focused: Default::default(),
             docks: Default::default(),
@@ -446,6 +450,11 @@ impl Workspace {
                 && state.reviews.get(id).is_some_and(|r| !r.tabs.is_empty())
         });
         known.extend(state.review_owners.keys().copied());
+        let owners = &state.review_owners;
+        state.mono_panes.retain(|id, mono| {
+            *id < 0 && !owners.contains_key(id) && matches!(mono, TitleTab::Mono { .. })
+        });
+        known.extend(state.mono_panes.keys().copied());
         let mut seen = HashSet::new();
         let mut layouts = std::mem::take(&mut state.layouts);
         let mut focused = std::mem::take(&mut state.focused);
@@ -477,6 +486,7 @@ impl Workspace {
                 state.layouts.insert(key, layout);
             }
         }
+        state.settle_mono_panes();
         state.normalize_title_order();
         if state
             .desktop_project_preferences
@@ -567,6 +577,35 @@ impl Workspace {
     pub fn session_for_pane(&self, id: i64) -> i64 {
         self.review_owners.get(&id).copied().unwrap_or(id)
     }
+    /// File and Mono panes share the negative IDs below every session.
+    pub fn next_pane_id(&self) -> i64 {
+        self.review_owners
+            .keys()
+            .chain(self.mono_panes.keys())
+            .copied()
+            .min()
+            .unwrap_or(0)
+            .min(0)
+            - 1
+    }
+    pub fn mono_pane(&self, mono: &str) -> Option<i64> {
+        self.mono_panes.iter().find_map(|(pane, tab)| {
+            matches!(tab, TitleTab::Mono { id, .. } if id == mono).then_some(*pane)
+        })
+    }
+    /// The pane that scopes a tab to a project: its focus, unless that is a
+    /// Mono, which works across projects.
+    pub fn scope_pane(&self, tab: i64) -> i64 {
+        let focus = self.tab_focus(tab);
+        if !self.mono_panes.contains_key(&focus) {
+            return focus;
+        }
+        self.layout(tab)
+            .leaf_ids()
+            .into_iter()
+            .find(|id| !self.mono_panes.contains_key(id))
+            .unwrap_or(focus)
+    }
     /// Focus a session, opening it as its own tab unless a tab holds it.
     pub fn open(&mut self, id: i64) {
         match self.tab_of(id) {
@@ -648,10 +687,16 @@ impl Workspace {
         };
         let focus = self.focused.remove(&tab);
         self.layouts.remove(&tab);
-        let key = if layout.contains(tab) {
+        // A tab is keyed by a conversation when it holds one, never a Mono.
+        let key = if layout.contains(tab) && !self.mono_panes.contains_key(&tab) {
             tab
         } else {
-            layout.first_leaf()
+            let leaves = layout.leaf_ids();
+            leaves
+                .iter()
+                .copied()
+                .find(|id| !self.mono_panes.contains_key(id))
+                .unwrap_or(leaves[0])
         };
         self.tabs[ix] = key;
         if key != tab
@@ -769,6 +814,77 @@ impl Workspace {
         );
         self.focused.insert(key, focus);
         self.active = Some(focus);
+    }
+    /// A Mono tab dropped on a pane edge leaves the strip for the split.
+    pub fn place_mono(&mut self, mono: TitleTab, target: i64, edge: Edge) -> Option<i64> {
+        if !matches!(mono, TitleTab::Mono { .. }) || self.tab_of(target).is_none() {
+            return None;
+        }
+        let pane = self.next_pane_id();
+        self.title_order.retain(|entry| *entry != mono);
+        self.scope_focus.retain(|_, entry| *entry != mono);
+        self.mono_panes.insert(pane, mono);
+        self.place(pane, target, edge);
+        Some(pane)
+    }
+    /// The visible Mono becomes a split's first pane, its tab keeping its
+    /// slot, so a tab or pane can be dropped beside it.
+    pub fn mono_tab_pane(&mut self, mono: TitleTab) -> i64 {
+        let pane = self.next_pane_id();
+        self.tabs.push(pane);
+        for entry in self
+            .title_order
+            .iter_mut()
+            .chain(self.scope_focus.values_mut())
+        {
+            if *entry == mono {
+                *entry = TitleTab::Session(pane);
+            }
+        }
+        if !self.title_order.contains(&TitleTab::Session(pane)) {
+            self.title_order.push(TitleTab::Session(pane));
+        }
+        self.mono_panes.insert(pane, mono);
+        self.active = Some(pane);
+        pane
+    }
+    /// A Mono pane left alone in its tab becomes its Mono tab again, in the
+    /// same slot; one no tab holds is forgotten. Returns the Mono when it
+    /// had focus, for the caller to show.
+    pub fn settle_mono_panes(&mut self) -> Option<TitleTab> {
+        let mut focused = None;
+        let panes: Vec<_> = self.mono_panes.keys().copied().collect();
+        for pane in panes {
+            match self.tab_of(pane) {
+                Some(tab) if self.layout(tab).is_split() => continue,
+                Some(tab) => {
+                    let mono = self.mono_panes[&pane].clone();
+                    self.tabs.retain(|t| *t != tab);
+                    self.tab_workspaces.remove(&tab);
+                    self.layouts.remove(&tab);
+                    self.focused.remove(&tab);
+                    let present = self.title_order.contains(&mono);
+                    self.title_order
+                        .retain(|entry| !(present && *entry == TitleTab::Session(tab)));
+                    for entry in self
+                        .title_order
+                        .iter_mut()
+                        .chain(self.scope_focus.values_mut())
+                    {
+                        if *entry == TitleTab::Session(tab) {
+                            *entry = mono.clone();
+                        }
+                    }
+                    if self.active == Some(pane) {
+                        self.active = None;
+                        focused = Some(mono);
+                    }
+                }
+                None => {}
+            }
+            self.mono_panes.remove(&pane);
+        }
+        focused
     }
     /// A pane dragged onto the tab strip becomes its own tab at `to`.
     pub fn detach(&mut self, id: i64, to: usize) {
@@ -963,6 +1079,76 @@ mod tests {
             h.record(id);
         }
         assert_eq!(h.back.len(), 50);
+    }
+    fn mono(id: &str) -> TitleTab {
+        TitleTab::Mono {
+            id: id.into(),
+            project: "/work".into(),
+            worktree: "/work".into(),
+        }
+    }
+    #[test]
+    fn a_mono_joins_a_split_and_becomes_its_tab_again_when_alone() {
+        let mut s = Workspace::default();
+        s.open(1);
+        s.title_order.push(mono("m"));
+        s.open(2);
+        let pane = s.place_mono(mono("m"), 1, Edge::Right).unwrap();
+        assert!(pane < 0);
+        assert_eq!(s.layout(1).leaf_ids(), vec![1, pane]);
+        assert_eq!(s.active, Some(pane));
+        assert_eq!(s.scope_pane(1), 1, "a Mono never scopes its tab");
+        assert_eq!(
+            s.title_order,
+            vec![TitleTab::Session(1), TitleTab::Session(2)]
+        );
+        assert_eq!(s.mono_pane("m"), Some(pane));
+        assert_eq!(s.settle_mono_panes(), None);
+        // Restarting keeps the Mono in its split.
+        let saved = serde_json::to_string(&s).unwrap();
+        let restored = Workspace::restore(
+            Some(&saved),
+            &[(1, "/work".into()), (2, "/work".into())],
+            "/work",
+        );
+        assert_eq!(restored.layout(1).leaf_ids(), vec![1, pane]);
+        assert_eq!(restored.mono_pane("m"), Some(pane));
+        // Detached to the strip, it is the Mono tab again in the same slot.
+        s.detach(pane, 1);
+        assert_eq!(s.settle_mono_panes(), Some(mono("m")));
+        assert_eq!(
+            s.title_order,
+            vec![TitleTab::Session(1), mono("m"), TitleTab::Session(2)]
+        );
+        assert!(s.mono_panes.is_empty());
+        assert_eq!(s.tabs, vec![1, 2]);
+    }
+    #[test]
+    fn a_tab_dropped_on_the_visible_mono_splits_beside_it() {
+        let mut s = Workspace::default();
+        s.open(1);
+        s.title_order.push(mono("m"));
+        let pane = s.mono_tab_pane(mono("m"));
+        assert_eq!(
+            s.title_order,
+            vec![TitleTab::Session(1), TitleTab::Session(pane)]
+        );
+        s.place_tab(1, pane, Edge::Left);
+        assert_eq!(s.tabs, vec![1], "the conversation keys the tab");
+        assert_eq!(s.layout(1).leaf_ids(), vec![1, pane]);
+        assert_eq!(s.title_order, vec![TitleTab::Session(1)]);
+        assert_eq!(s.settle_mono_panes(), None);
+        // Closing the conversation's pane leaves the Mono on its own.
+        assert!(s.close_pane(1));
+        assert_eq!(s.settle_mono_panes(), Some(mono("m")));
+        assert_eq!(s.title_order, vec![mono("m")]);
+        assert!(s.tabs.is_empty());
+        // A closed tab forgets its Mono pane.
+        s.open(1);
+        s.place_mono(mono("m"), 1, Edge::Bottom);
+        s.close(1);
+        assert_eq!(s.settle_mono_panes(), None);
+        assert!(s.mono_panes.is_empty());
     }
     #[test]
     fn close_and_reopen_keep_session_identity() {

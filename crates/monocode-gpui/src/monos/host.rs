@@ -5,7 +5,7 @@ use monocode_core::mono::workflows::{
     store::MonoDir,
 };
 use monocode_core::mono::{Document, Launch, bridge::Call, files, memory};
-use monocode_core::{session_groups::Groups, time::now_ms};
+use monocode_core::{app_access as app, session_groups::Groups, time::now_ms};
 use serde_json::{Value, json};
 use std::path::Path;
 pub(super) enum Effect {
@@ -17,9 +17,10 @@ pub(super) enum Effect {
 pub(super) struct Started {
     pub(super) summary: Session,
     settings: Settings,
-    prompt: String,
     draft: bool,
     reveal: bool,
+    /// An explicit split beside a session (`placement` right or down), opened after install.
+    placement: Option<(i64, crate::pane_layout::Edge)>,
     parent: Option<i64>,
     folder: Option<Folder>,
     /// Shown in the sidebar whatever the Mono's setting says (see `Launch::visible`).
@@ -33,6 +34,31 @@ pub(super) struct StartOptions {
     pub lenient_parent: bool,
     /// Filed in a folder and shown in the sidebar whatever the Mono's setting says.
     pub visible: bool,
+    /// The model and effort were already checked against the workflow's own catalog, so the
+    /// provider's catalog is not read again.
+    pub catalog_checked: bool,
+}
+/// A model the caller vouches for, with no settings of its own.
+fn bare_model(id: &str) -> monocode_core::catalog::Model {
+    monocode_core::catalog::Model {
+        id: id.into(),
+        name: id.into(),
+        alias_target: None,
+        efforts: Vec::new(),
+        default_effort: None,
+        fast: false,
+        thinking: false,
+        default: false,
+        tiers: Vec::new(),
+        controls: Vec::new(),
+    }
+}
+/// What the caller of `prepare_start` contributes beyond the request input.
+pub(super) struct StartContext {
+    /// Names the saved first prompt, so a retry of the same request reuses it.
+    pub request: String,
+    pub placement: Option<(i64, crate::pane_layout::Edge)>,
+    pub options: StartOptions,
 }
 pub(super) type StartWork = Box<dyn FnOnce(Database) -> Result<(Value, Effect), String> + Send>;
 /// Where a launch is filed: an existing folder, or a new one made for it.
@@ -206,6 +232,34 @@ fn fingerprint(call: &Call) -> String {
     files::content_hash(&format!("{}:{}", call.action, call.input))
 }
 impl Monos {
+    fn app_caller(&self, call: &Call) -> Result<Mono, String> {
+        let mono = self
+            .roster
+            .of_session(call.session)
+            .or_else(|| {
+                self.running
+                    .get(&call.session)
+                    .and_then(|r| self.roster.get(&r.mono))
+            })
+            .or_else(|| {
+                self.workflow_live
+                    .asked_by(call.session)
+                    .and_then(|mono| self.roster.get(mono))
+            })
+            .cloned()
+            .ok_or("This Mono no longer owns an active app capability")?;
+        // A habit run, or the hidden session of a workflow's question to the Mono.
+        let run_session = self.running.contains_key(&call.session)
+            || self.workflow_live.asked_by(call.session).is_some();
+        if call.action.starts_with("habits.") && call.action != "habits.list" && run_session {
+            return Err("A habit run cannot schedule more runs".into());
+        }
+        // Workflows belong to the Mono's own conversation, not to a habit run.
+        if call.action.starts_with("workflows.") && run_session {
+            return Err("Only a Mono's own conversation can manage its workflows".into());
+        }
+        Ok(mono)
+    }
     fn finish_call(&mut self, call: Call, result: Result<Value, String>, cx: &mut Context<Self>) {
         let key = (call.session, call.request_id.clone());
         self.app_pending.remove(&key);
@@ -298,9 +352,9 @@ impl Monos {
         let Started {
             summary,
             settings,
-            prompt,
             draft,
             reveal,
+            placement,
             parent,
             folder,
             visible,
@@ -333,7 +387,7 @@ impl Monos {
         }
         self.note_run_session(caller, id, true);
         let _ = self.owner.update(cx, |owner, cx| {
-            owner.mono_install(summary, settings, prompt, draft, cx);
+            owner.mono_install_app(summary, settings, draft, cx);
             if let Some(parent) = parent {
                 owner.mono_link_started(id, parent, cx);
             }
@@ -343,66 +397,23 @@ impl Monos {
             Some(folder) => self.file_launch(mono_id, &project, id, folder, cx),
             None => self.group_launch(mono_id, id, cx),
         }
-        if reveal && let Some(window) = window {
-            self.open_workspace(id, window, cx);
+        if let Some(window) = window {
+            if placement.is_some() {
+                let _ = self.owner.update(cx, |owner, cx| {
+                    owner.app_place_launch(id, placement, true, window, cx)
+                });
+            } else if reveal {
+                self.open_workspace(id, window, cx);
+            }
         }
     }
-    pub(super) fn app_call(&mut self, call: Call, window: &mut Window, cx: &mut Context<Self>) {
-        let mono = self
-            .roster
-            .of_session(call.session)
-            .or_else(|| {
-                self.running
-                    .get(&call.session)
-                    .and_then(|r| self.roster.get(&r.mono))
-            })
-            .or_else(|| {
-                self.workflow_live
-                    .asked_by(call.session)
-                    .and_then(|mono| self.roster.get(mono))
-            })
-            .cloned();
-        // A habit run, or the hidden session of a workflow's question to the Mono.
-        let run_session = self.running.contains_key(&call.session)
-            || self.workflow_live.asked_by(call.session).is_some();
-        let Some(mono) = mono else {
-            let _ = call.reply.send(Err(
-                "This Mono no longer owns an active app capability".into()
-            ));
-            return;
-        };
-        if call.action.starts_with("habits.") && call.action != "habits.list" && run_session {
-            let _ = call
-                .reply
-                .send(Err("A habit run cannot schedule more runs".into()));
-            return;
-        }
-        // Workflows belong to the Mono's own conversation, not to a habit run.
-        if call.action.starts_with("workflows.") && run_session {
-            let _ = call.reply.send(Err(
-                "Only a Mono's own conversation can manage its workflows".into(),
-            ));
+    pub(super) fn app_call(&mut self, call: Call, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = self.app_caller(&call) {
+            let _ = call.reply.send(Err(error));
             return;
         }
         if let Err(error) = mono::api::validate(&call.action, &call.input) {
             let _ = call.reply.send(Err(error));
-            return;
-        }
-        let receipt_key = format!(
-            "mono-app-receipt:{}:{}",
-            call.session,
-            files::content_hash(&call.request_id)
-        );
-        let stored = locked(&self.store)
-            .ok()
-            .and_then(|db| db.setting(&receipt_key).ok().flatten())
-            .and_then(|s| serde_json::from_str::<(String, Result<Value, String>)>(&s).ok());
-        if let Some((hash, result)) = stored {
-            let _ = call.reply.send(if hash == fingerprint(&call) {
-                result
-            } else {
-                Err("Request ID was already used with different input".into())
-            });
             return;
         }
         let key = (call.session, call.request_id.clone());
@@ -414,12 +425,71 @@ impl Monos {
             });
             return;
         }
-        if !self.app_pending.insert(key) {
+        if !self.app_pending.insert(key.clone()) {
             let _ = call.reply.send(Err(
                 "Request is still running; retry with the same request ID".into(),
             ));
             return;
         }
+        let receipt_key = format!(
+            "mono-app-receipt:{}:{}",
+            call.session,
+            files::content_hash(&call.request_id)
+        );
+        let store = self.store.clone();
+        let lookup = cx.background_executor().spawn(async move {
+            locked(&store)?
+                .setting(&receipt_key)?
+                .map(|raw| {
+                    serde_json::from_str::<(String, Result<Value, String>)>(&raw)
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()
+        });
+        cx.spawn(async move |this, cx| {
+            let stored = lookup.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                // Capabilities may have been revoked while storage was busy.
+                let mono = match this.app_caller(&call) {
+                    Ok(mono) => mono,
+                    Err(error) => {
+                        this.app_pending.remove(&key);
+                        let _ = call.reply.send(Err(error));
+                        return;
+                    }
+                };
+                match stored {
+                    Ok(None) => {
+                        this.app_call_ready(call, mono, window, cx);
+                    }
+                    Ok(Some((hash, result))) => {
+                        this.app_pending.remove(&key);
+                        let _ = call.reply.send(if hash == fingerprint(&call) {
+                            result
+                        } else {
+                            Err("Request ID was already used with different input".into())
+                        });
+                    }
+                    Err(error) => {
+                        this.app_pending.remove(&key);
+                        // A failed read is not a missing receipt: replaying the
+                        // action could repeat a mutation that already committed.
+                        let _ = call
+                            .reply
+                            .send(Err(format!("Could not read app result: {error}")));
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+    fn app_call_ready(
+        &mut self,
+        call: Call,
+        mono: Mono,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !call.input.is_object() {
             self.finish_call(call, Err("Input must be a JSON object".into()), cx);
             return;
@@ -449,63 +519,371 @@ impl Monos {
             .get(&mono.id)
             .or_else(|| self.running.get(&call.session).map(|r| &r.view))
             .cloned();
-        let result=match action.as_str(){
-            "models.list"=>Ok(json!(Kind::ALL.into_iter().map(|kind|json!({"harness":kind.id(),"name":kind.label(),"models":self.chats.values().find(|v|{let v=v.read(cx);let profile=source.as_ref().filter(|s|s.read(cx).summary.provider==kind.id()).map(|s|s.read(cx).settings.account.clone()).unwrap_or_else(||crate::accounts::get(cx).map(|center|center.read(cx).selected(kind,&project)).unwrap_or_default());v.summary.provider==kind.id()&&v.settings.account.id==profile.id}).map(|v|v.read(cx).settings_models()).unwrap_or_default()})).collect::<Vec<_>>())),
-            "sessions.start"=>{
-                self.start_call(call,mono,project,source,cx);return;
+        let result = match action.as_str() {
+            "models.list" => {
+                let profiles = Kind::ALL
+                    .into_iter()
+                    .map(|kind| {
+                        let profile = source
+                            .as_ref()
+                            .filter(|s| s.read(cx).summary.provider == kind.id())
+                            .map(|s| s.read(cx).settings.account.clone())
+                            .unwrap_or_else(|| {
+                                crate::accounts::get(cx)
+                                    .map(|center| center.read(cx).selected(kind, &project))
+                                    .unwrap_or_default()
+                            });
+                        (kind, profile)
+                    })
+                    .collect();
+                self.call_work(
+                    call,
+                    target,
+                    move |_| Ok((app::models_catalog(profiles)?, Effect::None)),
+                    cx,
+                );
+                return;
             }
-            "sessions.list"|"sessions.read"=>{
-                self.call_work(call,target,move|store|{let db=locked(&store)?;let all=db.sessions()?;let sessions:Vec<_>=all.iter().filter(|s|!hidden.contains(&s.id)&&monocode_core::files::path_key(&s.cwd)==monocode_core::files::path_key(&project)).collect();
-                    let value=if action=="sessions.list"{json!(sessions.iter().map(|s|json!({"sessionId":s.id,"title":s.title,"harness":s.provider,"project":s.cwd,"archived":s.archived})).collect::<Vec<_>>())}else{let session=id(&input,"sessionId")?;if !sessions.iter().any(|s|s.id==session){return Err("Session is outside the assigned project".into());}let rows=db.load(session)?.rows;let end=input.get("before").and_then(Value::as_u64).unwrap_or(rows.len() as u64).min(rows.len() as u64) as usize;let limit=input.get("limit").and_then(Value::as_u64).unwrap_or(40).clamp(1,200) as usize;let start=end.saturating_sub(limit);let max=input.get("maxChars").and_then(Value::as_u64).unwrap_or(24000).clamp(100,200000) as usize;json!({"sessionId":session,"messages":rows[start..end].iter().map(|r|json!({"role":r.role,"text":monocode_core::response::limit(&r.text,max/limit.max(1))})).collect::<Vec<_>>(),"before":start,"hasMore":start>0})};Ok((value,Effect::None))},cx);return;
+            "sessions.start" => {
+                self.start_call(call, mono, project, source, cx);
+                return;
             }
-            "sessions.send"|"sessions.draft"|"sessions.stop"|"sessions.archive"|"sessions.delete"=>{
-                let session=match id(&input,"sessionId"){Ok(id)=>id,Err(e)=>{self.finish_call(call,Err(e),cx);return;}};
-                let view=self.owner.upgrade().and_then(|owner|owner.update(cx, |owner, cx| owner.mono_ensure_session(session, cx))).filter(|v|monocode_core::files::path_key(&v.read(cx).summary.cwd)==monocode_core::files::path_key(&project));
-                let Some(view)=view else{self.finish_call(call,Err("Session is outside the assigned project".into()),cx);return;};
-                if action=="sessions.send"||action=="sessions.draft"{if view.read(cx).busy||view.read(cx).mono_external_pending()||!view.read(cx).input.read(cx).content.trim().is_empty(){self.finish_call(call,Err("Session is busy or has an unsent draft".into()),cx);return;}match text(&input,"prompt",65536){Ok(prompt)=>{let sent=view.update(cx,|v,cx|v.mono_external_send(prompt,action=="sessions.draft",cx));if let Err(e)=sent{self.finish_call(call,Err(e),cx);return;}
-if flag(&input,"notifyOnComplete",false){if let Some(m)=self.roster.get_mut(&mono.id){let origin=source.map(|v|v.read(cx).mono_turn).unwrap_or(0);let (origin_turn,each)=report_to(call.session,origin,run_chat,&input);if let Some(launch)=m.launches.iter_mut().find(|l|l.session_id==session){launch.completed=false;launch.dismissed=false;launch.notify_on_complete=true;launch.origin_turn=origin_turn;launch.each=each;}else{let summary=&view.read(cx).summary;m.launches.push(Launch{session_id:session,cwd:summary.cwd.clone(),title:summary.title.clone(),harness:summary.provider.clone(),model:view.read(cx).mono_model(),origin_turn,notify_on_complete:true,each,completed:false,dismissed:false,visible:false});}}self.save(cx);}
-if action=="sessions.send"{self.note_run_session(call.session,session,false);}Ok(json!({"accepted":true}))},Err(e)=>Err(e)}}else{
-                    for m in &mut self.roster.monos{for launch in &mut m.launches{if launch.session_id==session{launch.dismissed=true;}}}self.save(cx);
-                    if action=="sessions.stop"{view.update(cx,|v,cx|v.stop_if_busy(cx));}else{let delete=action=="sessions.delete";let owner=self.owner.clone();let handle=window.window_handle();let app:&mut App=cx;app.defer(move|cx|{let _=handle.update(cx,|_,window,cx|{let _=owner.update(cx,|owner,cx|owner.mono_remove(session,delete,window,cx));});});}Ok(json!({"accepted":true}))
+            "sessions.list" | "sessions.read" => {
+                let views = self
+                    .owner
+                    .upgrade()
+                    .map(|owner| owner.read(cx).mono_session_views(cx))
+                    .unwrap_or_default();
+                self.call_work(call,target,move|store|{
+                    let db=locked(&store)?;let all=db.sessions()?;
+                    let sessions:Vec<_>=all.iter().filter(|s|!hidden.contains(&s.id)&&s.cwd==project).collect();
+                    let value=if action=="sessions.list" {
+                        let drafts=db.draft_sessions()?;let metadata=db.mobile_session_metadata()?;
+                        json!({"cwd":project,"sessions":sessions.iter().map(|s|json!({"id":s.id,"sessionId":s.id,"title":s.title,"harness":s.provider,"model":metadata.get(&s.id).and_then(|m|m.model.clone()),"busy":views.iter().any(|v|v.id==s.id&&v.busy),"hasDraft":drafts.contains(&s.id),"archived":s.archived})).collect::<Vec<_>>()})
+                    }else{
+                        let session=if let Some(id)=input["sessionId"].as_str(){db.resolve_session_id(id)?}else{id(&input,"sessionId")?};
+                        if !sessions.iter().any(|s|s.id==session){return Err("Session is outside the assigned project".into());}
+                        db.app_conversation(session,&input,views.iter().any(|v|v.id==session&&v.busy),db.draft_sessions()?.contains(&session))?
+                    };
+                    Ok((value,Effect::None))
+                },cx);
+                return;
+            }
+            "sessions.send" | "sessions.draft" | "sessions.stop" | "sessions.archive"
+            | "sessions.delete" => {
+                let session = match id(&input, "sessionId") {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.finish_call(call, Err(e), cx);
+                        return;
+                    }
+                };
+                let view = self
+                    .owner
+                    .upgrade()
+                    .and_then(|owner| {
+                        owner.update(cx, |owner, cx| owner.mono_ensure_session(session, cx))
+                    })
+                    .filter(|v| {
+                        monocode_core::files::path_key(&v.read(cx).summary.cwd)
+                            == monocode_core::files::path_key(&project)
+                    });
+                let Some(view) = view else {
+                    self.finish_call(
+                        call,
+                        Err("Session is outside the assigned project".into()),
+                        cx,
+                    );
+                    return;
+                };
+                if action == "sessions.send" || action == "sessions.draft" {
+                    if view.read(cx).busy
+                        || view.read(cx).mono_external_pending()
+                        || view.read(cx).has_saved_draft()
+                        || !view.read(cx).input.read(cx).content.trim().is_empty()
+                    {
+                        self.finish_call(
+                            call,
+                            Err("Session is busy or has an unsent draft".into()),
+                            cx,
+                        );
+                        return;
+                    }
+                    match text(&input, "prompt", 65536) {
+                        Ok(prompt) => {
+                            let sent = view.update(cx, |v, cx| {
+                                v.mono_external_send(prompt, action == "sessions.draft", cx)
+                            });
+                            if let Err(e) = sent {
+                                self.finish_call(call, Err(e), cx);
+                                return;
+                            }
+                            if flag(&input, "notifyOnComplete", false) {
+                                if let Some(m) = self.roster.get_mut(&mono.id) {
+                                    let origin = source.map(|v| v.read(cx).mono_turn).unwrap_or(0);
+                                    let (origin_turn, each) =
+                                        report_to(call.session, origin, run_chat, &input);
+                                    if let Some(launch) =
+                                        m.launches.iter_mut().find(|l| l.session_id == session)
+                                    {
+                                        launch.completed = false;
+                                        launch.dismissed = false;
+                                        launch.notify_on_complete = true;
+                                        launch.origin_turn = origin_turn;
+                                        launch.each = each;
+                                    } else {
+                                        let summary = &view.read(cx).summary;
+                                        m.launches.push(Launch {
+                                            session_id: session,
+                                            cwd: summary.cwd.clone(),
+                                            title: summary.title.clone(),
+                                            harness: summary.provider.clone(),
+                                            model: view.read(cx).mono_model(),
+                                            origin_turn,
+                                            notify_on_complete: true,
+                                            each,
+                                            completed: false,
+                                            dismissed: false,
+                                            visible: false,
+                                        });
+                                    }
+                                }
+                                self.save(cx);
+                            }
+                            if action == "sessions.send" {
+                                self.note_run_session(call.session, session, false);
+                            }
+                            Ok(json!({"accepted":true}))
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    for m in &mut self.roster.monos {
+                        for launch in &mut m.launches {
+                            if launch.session_id == session {
+                                launch.dismissed = true;
+                            }
+                        }
+                    }
+                    self.save(cx);
+                    if action == "sessions.stop" {
+                        view.update(cx, |v, cx| v.stop_if_busy(cx));
+                    } else {
+                        let delete = action == "sessions.delete";
+                        let owner = self.owner.clone();
+                        let handle = window.window_handle();
+                        let app: &mut App = cx;
+                        app.defer(move |cx| {
+                            let _ = handle.update(cx, |_, window, cx| {
+                                let _ = owner.update(cx, |owner, cx| {
+                                    owner.mono_remove(session, delete, window, cx)
+                                });
+                            });
+                        });
+                    }
+                    Ok(json!({"accepted":true}))
                 }
             }
-            "folders.list"=>Ok(json!(self.owner.upgrade().map(|o|o.read(cx).mono_groups(&project)).unwrap_or_default().folders)),
-            "folders.move"=>{
-                let session=match id(&input,"sessionId"){Ok(id)=>id,Err(e)=>{self.finish_call(call,Err(e),cx);return;}};
-                let allowed=self.owner.upgrade().and_then(|o|o.update(cx, |owner, cx| owner.mono_ensure_session(session, cx))).is_some_and(|v|v.read(cx).summary.cwd==project);
-                if !allowed{self.finish_call(call,Err("Session is outside this project".into()),cx);return;}
-                let mut groups=self.owner.upgrade().map(|o|o.read(cx).mono_groups(&project)).unwrap_or_default();
-                if let Some(name)=input.get("newFolderName").and_then(Value::as_str){if let Some(folder)=groups.create_folder(&[session],mono::new_id()){groups.rename_folder(&folder,name);}}
-                else if let Some(folder)=input.get("folderId").and_then(Value::as_str){if groups.folder(folder).is_none(){self.finish_call(call,Err("Folder not found".into()),cx);return;}groups.add_to_folder(folder,session);}else{groups.remove_sessions(&[session]);}
-                self.call_work(call,target,move|store|{locked(&store)?.save_groups(&project,&groups)?;Ok((json!({"moved":true}),Effect::Groups(project,groups)))},cx);return;
-            }
-            "artifacts.list"=>Ok(json!(mono.documents.iter().filter(|d|input.get("kind").and_then(Value::as_str).is_none_or(|k|k==d.kind)).skip(input.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize).take(input.get("limit").and_then(Value::as_u64).unwrap_or(50).min(200) as usize).collect::<Vec<_>>())),
-            "artifacts.read"=>input.get("id").and_then(Value::as_str).and_then(|id|mono.documents.iter().find(|d|d.id==id)).map(|d|json!(d)).ok_or("Document not found".into()),
-            "chat.card"=>{
-                let mut card=match mono::cards::parse(&input){Ok(c)=>c,Err(e)=>{self.finish_call(call,Err(e),cx);return;}};
-                card["id"]=json!(mono::new_id());
-                if card["type"]=="session"{
-                    let session=card["sessionId"].as_i64().unwrap();
-                    let view=self.owner.upgrade().and_then(|o|o.update(cx, |owner, cx| owner.mono_ensure_session(session, cx))).filter(|v|mono.works_on(&v.read(cx).summary.cwd));
-                    let Some(view)=view else{self.finish_call(call,Err("Session is outside assigned projects".into()),cx);return;};
-                    card["title"]=json!(view.read(cx).summary.title);card["state"]=json!(if view.read(cx).busy{"Working"}else{"Saved"});
+            "folders.list" => Ok(json!(
+                self.owner
+                    .upgrade()
+                    .map(|o| o.read(cx).mono_groups(&project))
+                    .unwrap_or_default()
+                    .folders
+            )),
+            "folders.move" => {
+                let session = match id(&input, "sessionId") {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.finish_call(call, Err(e), cx);
+                        return;
+                    }
+                };
+                let allowed = self
+                    .owner
+                    .upgrade()
+                    .and_then(|o| o.update(cx, |owner, cx| owner.mono_ensure_session(session, cx)))
+                    .is_some_and(|v| v.read(cx).summary.cwd == project);
+                if !allowed {
+                    self.finish_call(call, Err("Session is outside this project".into()), cx);
+                    return;
                 }
-                if card["type"]=="pr"{
-                    let cwd=mono.projects.first().cloned().unwrap_or_else(||std::env::var("HOME").unwrap_or_else(|_|".".into()));
-                    self.call_work(call,target,move|_|{let metadata=mono::cards::pull_request(&cwd,card["repo"].as_str(),card["number"].as_u64().unwrap())?;for key in ["title","state","url","isDraft","additions","deletions"]{card[key]=metadata[key].clone();}Ok((card.clone(),Effect::Card(card)))},cx);return;
+                let mut groups = self
+                    .owner
+                    .upgrade()
+                    .map(|o| o.read(cx).mono_groups(&project))
+                    .unwrap_or_default();
+                if let Some(name) = input.get("newFolderName").and_then(Value::as_str) {
+                    if let Some(folder) = groups.create_folder(&[session], mono::new_id()) {
+                        groups.rename_folder(&folder, name);
+                    }
+                } else if let Some(folder) = input.get("folderId").and_then(Value::as_str) {
+                    if groups.folder(folder).is_none() {
+                        self.finish_call(call, Err("Folder not found".into()), cx);
+                        return;
+                    }
+                    groups.add_to_folder(folder, session);
+                } else {
+                    groups.remove_sessions(&[session]);
                 }
-                self.hold_card(call.session,&mono.id,card.clone());self.save(cx);Ok(card)
+                self.call_work(
+                    call,
+                    target,
+                    move |store| {
+                        locked(&store)?.save_groups(&project, &groups)?;
+                        Ok((json!({"moved":true}), Effect::Groups(project, groups)))
+                    },
+                    cx,
+                );
+                return;
             }
-            "artifacts.write"=>{
-                let kind=input.get("kind").and_then(Value::as_str).unwrap_or("document");
-                if !["document","html","markdown"].contains(&kind){Err("Use document or html".into())}else{match text(&input,"title",512).and_then(|title|Ok((title,text(&input,"body",512*1024)?))){Err(e)=>Err(e),Ok((title,body))=>{
-                    let id=input.get("id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(mono::new_id);let now=now_ms();let document=Document{id:id.clone(),kind:kind.into(),title,summary:input.get("summary").and_then(Value::as_str).unwrap_or_default().chars().take(4000).collect(),body,created_at:mono.documents.iter().find(|d|d.id==id).map(|d|d.created_at).unwrap_or(now),updated_at:now};
-                    if let Some(m)=self.roster.get_mut(&mono.id){if let Some(old)=m.documents.iter_mut().find(|d|d.id==id){*old=document.clone();}else{m.documents.push(document.clone());}}
-                    self.documents.remove(&id);self.html_documents.remove(&id);self.hold_card(call.session,&mono.id,json!({"id":mono::new_id(),"type":"document","documentId":id,"title":document.title,"summary":document.summary}));self.save(cx);Ok(json!(document))
-                }}}
+            "artifacts.list" => Ok(json!(
+                mono.documents
+                    .iter()
+                    .filter(|d| input
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .is_none_or(|k| k == d.kind))
+                    .skip(input.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize)
+                    .take(
+                        input
+                            .get("limit")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(50)
+                            .min(200) as usize
+                    )
+                    .collect::<Vec<_>>()
+            )),
+            "artifacts.read" => input
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| mono.documents.iter().find(|d| d.id == id))
+                .map(|d| json!(d))
+                .ok_or("Document not found".into()),
+            "chat.card" => {
+                let mut card = match mono::cards::parse(&input) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.finish_call(call, Err(e), cx);
+                        return;
+                    }
+                };
+                card["id"] = json!(mono::new_id());
+                if card["type"] == "session" {
+                    let session = card["sessionId"].as_i64().unwrap();
+                    let view = self
+                        .owner
+                        .upgrade()
+                        .and_then(|o| {
+                            o.update(cx, |owner, cx| owner.mono_ensure_session(session, cx))
+                        })
+                        .filter(|v| mono.works_on(&v.read(cx).summary.cwd));
+                    let Some(view) = view else {
+                        self.finish_call(
+                            call,
+                            Err("Session is outside assigned projects".into()),
+                            cx,
+                        );
+                        return;
+                    };
+                    card["title"] = json!(view.read(cx).summary.title);
+                    card["state"] = json!(if view.read(cx).busy {
+                        "Working"
+                    } else {
+                        "Saved"
+                    });
+                }
+                if card["type"] == "pr" {
+                    let cwd =
+                        mono.projects.first().cloned().unwrap_or_else(|| {
+                            std::env::var("HOME").unwrap_or_else(|_| ".".into())
+                        });
+                    self.call_work(
+                        call,
+                        target,
+                        move |_| {
+                            let metadata = mono::cards::pull_request(
+                                &cwd,
+                                card["repo"].as_str(),
+                                card["number"].as_u64().unwrap(),
+                            )?;
+                            for key in
+                                ["title", "state", "url", "isDraft", "additions", "deletions"]
+                            {
+                                card[key] = metadata[key].clone();
+                            }
+                            Ok((card.clone(), Effect::Card(card)))
+                        },
+                        cx,
+                    );
+                    return;
+                }
+                self.hold_card(call.session, &mono.id, card.clone());
+                self.save(cx);
+                Ok(card)
             }
-            "soul.read"|"soul.update"|"memory.read"|"memory.search"|"memory.add"|"memory.replace"|"memory.remove"|"habits.list"|"habits.add"|"habits.update"|"habits.run"|"habits.remove"|"notes.list"|"notes.read"|"notes.write"|"worktrees.list"|"worktrees.create"=>{
-                let caller=call.session;let projects=mono.projects.clone();
+            "artifacts.write" => {
+                let kind = input
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("document");
+                if !["document", "html", "markdown"].contains(&kind) {
+                    Err("Use document or html".into())
+                } else {
+                    match text(&input, "title", 512)
+                        .and_then(|title| Ok((title, text(&input, "body", 512 * 1024)?)))
+                    {
+                        Err(e) => Err(e),
+                        Ok((title, body)) => {
+                            let id = input
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .unwrap_or_else(mono::new_id);
+                            let now = now_ms();
+                            let document = Document {
+                                id: id.clone(),
+                                kind: kind.into(),
+                                title,
+                                summary: input
+                                    .get("summary")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(4000)
+                                    .collect(),
+                                body,
+                                created_at: mono
+                                    .documents
+                                    .iter()
+                                    .find(|d| d.id == id)
+                                    .map(|d| d.created_at)
+                                    .unwrap_or(now),
+                                updated_at: now,
+                            };
+                            if let Some(m) = self.roster.get_mut(&mono.id) {
+                                if let Some(old) = m.documents.iter_mut().find(|d| d.id == id) {
+                                    *old = document.clone();
+                                } else {
+                                    m.documents.push(document.clone());
+                                }
+                            }
+                            self.documents.remove(&id);
+                            self.html_documents.remove(&id);
+                            self.hold_card(call.session,&mono.id,json!({"id":mono::new_id(),"type":"document","documentId":id,"title":document.title,"summary":document.summary}));
+                            self.save(cx);
+                            Ok(json!(document))
+                        }
+                    }
+                }
+            }
+            "soul.read" | "soul.update" | "memory.read" | "memory.search" | "memory.add"
+            | "memory.replace" | "memory.remove" | "habits.list" | "habits.add"
+            | "habits.update" | "habits.run" | "habits.remove" | "notes.list" | "notes.read"
+            | "notes.write" | "worktrees.list" | "worktrees.create" => {
+                let caller = call.session;
+                let request = call.request_id.clone();
+                let projects = mono.projects.clone();
                 self.call_work(call,target.clone(),move|store|{
                     let value=match action.as_str(){
                         "soul.read"=>json!(files::read(&root,&target,None,"SOUL.md")?),
@@ -519,21 +897,35 @@ if action=="sessions.send"{self.note_run_session(call.session,session,false);}Ok
 if let Some(instructions)=input.get("instructions").and_then(Value::as_str){if instructions.trim().is_empty()||instructions.len()>32000{return Err("Invalid habit instructions".into());}h.instructions=instructions.into();}
 if let Some(schedule)=input.get("schedule"){h.reschedule(habits::Schedule::from_cli(schedule)?,now_ms())?;}
 if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=enabled;if enabled{h.next_run_at=h.schedule.next(now_ms())?;}}}Ok(json!(h))})?},
-                        "notes.list"|"notes.read"|"notes.write"=>{let db=locked(&store)?;let notes=db.notes()?;let allowed=|n:&&monocode_core::response::Note|projects.iter().any(|p|monocode_core::files::path_key(p)==monocode_core::files::path_key(&n.source_cwd));match action.as_str(){"notes.list"=>json!(notes.iter().filter(allowed).skip(input.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize).take(input.get("limit").and_then(Value::as_u64).unwrap_or(50).min(200) as usize).collect::<Vec<_>>()),"notes.read"=>{let id=id(&input,"id")? as u64;json!(notes.iter().filter(allowed).find(|n|n.id==id).ok_or("Note not found in assigned projects")?)},_=>{let id=input.get("id").and_then(Value::as_u64).unwrap_or_else(now_ms);if notes.iter().any(|n|n.id==id&&!projects.iter().any(|p|p==&n.source_cwd)){return Err("Note is outside assigned projects".into());}let cwd=notes.iter().find(|n|n.id==id).map(|n|n.source_cwd.clone()).or_else(||projects.first().cloned()).ok_or("Assign a project before writing notes")?;let note=monocode_core::response::Note{id,title:text(&input,"title",512)?,body:text(&input,"body",256*1024)?,tags:input.get("tags").and_then(Value::as_array).map(|tags|tags.iter().filter_map(Value::as_str).map(str::to_owned).collect()).or_else(||notes.iter().find(|n|n.id==id).map(|n|n.tags.clone())).unwrap_or_default(),source_session:caller,source_cwd:cwd};db.save_note(&note)?;json!(note)}}},
+                        "notes.list"|"notes.read"|"notes.write"=>app::notes_action(&*locked(&store)?,caller,&request,&action,&input,&projects)?,
                         "worktrees.list"=>json!(monocode_core::git::snapshot(Path::new(&project))?.worktrees.iter().map(|w|json!({"path":w.path,"branch":w.branch,"head":w.head,"main":w.main})).collect::<Vec<_>>()),
                         "worktrees.create"=>{let branch=text(&input,"branch",240)?;let tree=monocode_core::git::create_project_worktree(Path::new(&project),&branch,input.get("base").and_then(Value::as_str),flag(&input,"existing",false))?;json!({"path":tree.path,"branch":tree.branch})},
                         _=>unreachable!(),
                     };Ok((value,Effect::None))
-                },cx);return;
+                },cx);
+                return;
             }
-            workflow if workflow.starts_with("workflows.")=>{
+            workflow if workflow.starts_with("workflows.") => {
                 // Probing the model catalog may start a CLI, so the whole handler runs off the UI
                 // thread. run/stop/resumeRun only write their request into the file.
-                let mut host=StoreHost::new(MonoDir::new(root,target.clone()),self.workflow_signals.clone()).with_probe(self.workflow_live.probe());
-                let name=action.clone();
-                self.call_work(call,target,move|_|{let value=handle_value(&name,&input,&mut host)?;Ok((value,Effect::None))},cx);return;
+                let mut host = StoreHost::new(
+                    MonoDir::new(root, target.clone()),
+                    self.workflow_signals.clone(),
+                )
+                .with_probe(self.workflow_live.probe());
+                let name = action.clone();
+                self.call_work(
+                    call,
+                    target,
+                    move |_| {
+                        let value = handle_value(&name, &input, &mut host)?;
+                        Ok((value, Effect::None))
+                    },
+                    cx,
+                );
+                return;
             }
-            _=>Err("Unknown action. Run app help to see supported actions".into()),
+            _ => Err("Unknown action. Run app help to see supported actions".into()),
         };
         self.finish_call(call, result, cx);
     }
@@ -547,14 +939,28 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         cx: &mut Context<Self>,
     ) {
         let target = mono.id.clone();
-        match self.prepare_start(
-            &mono,
-            project,
-            source,
-            &call.input,
-            StartOptions::default(),
-            cx,
-        ) {
+        let placement = self
+            .owner
+            .update(cx, |owner, cx| {
+                owner.app_placement(&call.input, call.session, &project, cx)
+            })
+            .map_err(|e| e.to_string())
+            .and_then(|placement| placement);
+        let prepared = placement.and_then(|placement| {
+            self.prepare_start(
+                &mono,
+                project,
+                source,
+                &call.input,
+                StartContext {
+                    request: call.request_id.clone(),
+                    placement,
+                    options: StartOptions::default(),
+                },
+                cx,
+            )
+        });
+        match prepared {
             Ok(work) => self.call_work(call, target, work, cx),
             Err(error) => self.finish_call(call, Err(error), cx),
         }
@@ -567,55 +973,40 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         project: String,
         source: Option<Entity<Conversation>>,
         input: &Value,
-        options: StartOptions,
+        context: StartContext,
         cx: &App,
     ) -> Result<StartWork, String> {
         let input = input.clone();
-        let prompt = text(&input, "prompt", 65536)?;
-        let provider = input
-            .get("harness")
-            .and_then(Value::as_str)
+        let StartContext {
+            request,
+            placement,
+            options,
+        } = context;
+        let prompt = app::prompt(&input)?;
+        let provider = input["harness"]
+            .as_str()
             .map(str::to_owned)
             .or_else(|| source.as_ref().map(|v| v.read(cx).summary.provider.clone()))
             .unwrap_or_else(|| "codex".into());
-        if Kind::parse(&provider).is_none() {
-            return Err("Unknown provider".into());
-        }
-        let same_provider = source
+        let kind = Kind::parse(&provider).ok_or("Unknown provider")?;
+        let source_provider = source
             .as_ref()
-            .is_some_and(|v| v.read(cx).summary.provider == provider);
+            .map(|v| v.read(cx).summary.provider.clone())
+            .unwrap_or_else(|| provider.clone());
         let mut settings = source
+            .as_ref()
             .map(|v| v.read(cx).settings.clone())
             .unwrap_or_default();
-        settings.mono = None;
-        settings.environment.clear();
-        settings.internal_message = false;
-        settings.turns.clear();
-        settings.attachments.clear();
-        settings.usage_limit = None;
-        if !same_provider {
+        if source
+            .as_ref()
+            .is_none_or(|v| v.read(cx).summary.cwd != project)
+        {
+            settings.worktree_cwd = None;
+        }
+        if source_provider != provider {
             settings.account = crate::accounts::get(cx)
-                .map(|center| center.read(cx).selected(Kind::from_id(&provider), &project))
+                .map(|center| center.read(cx).selected(kind, &project))
                 .unwrap_or_default();
-            settings.model = None;
-            settings.effort = None;
-            settings.model_settings.clear();
-            settings.fast = false;
-            settings.service_tier = None;
-            settings.thinking = None;
-        }
-        if let Some(model) = input.get("model").and_then(Value::as_str) {
-            settings.model = Some(model.into());
-        }
-        if let Some(effort) = input.get("effort").and_then(Value::as_str) {
-            settings.effort = Some(effort.into());
-        }
-        if let Some(values) = input.get("modelSettings") {
-            settings.model_settings = serde_json::from_value(values.clone())
-                .map_err(|_| "modelSettings must be an object of strings".to_string())?;
-        }
-        if let Some(mode) = input.get("runtimeMode").and_then(Value::as_str) {
-            settings.access = AccessMode::from_id(mode);
         }
         let launches = mono.launches.clone();
         let (draft, reveal) = (flag(&input, "draft", false), flag(&input, "reveal", false));
@@ -654,21 +1045,39 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             if worktree && monocode_core::git::unborn(path) {
                 return Err("This project has no commits yet; make an initial commit before using workspaceMode worktree".into());
             }
-            let chosen = match input.get("worktreeCwd").and_then(Value::as_str) {
-                Some(cwd) => {
-                    let snapshot = monocode_core::git::snapshot(path)?;
-                    let key = monocode_core::files::path_key(cwd);
-                    if !snapshot
-                        .worktrees
-                        .iter()
-                        .any(|w| monocode_core::files::path_key(&w.path) == key)
-                    {
-                        return Err("Choose an existing worktree of the assigned project".into());
-                    }
-                    Some(cwd.to_owned())
+            let mut settings = if options.catalog_checked {
+                // The workflow runner has already judged the model and effort against its own
+                // catalog (which may be unable to list them), so they are applied as given.
+                let model = input.get("model").and_then(Value::as_str).map(|m| {
+                    monocode_core::store::native_model(m, kind.id()).unwrap_or_else(|| m.into())
+                });
+                let known: Vec<_> = model.iter().map(|id| bare_model(id)).collect();
+                let mut bare = input.clone();
+                if let Some(fields) = bare.as_object_mut() {
+                    fields.remove("effort");
                 }
-                None => None,
+                let mut settings =
+                    app::launch_settings(&bare, &source_provider, settings, kind, &known)?;
+                if let Some(effort) = input.get("effort").and_then(Value::as_str) {
+                    settings.effort = Some(effort.into());
+                }
+                settings
+            } else {
+                // The catalog may start a CLI, so it is read here, off the UI thread.
+                let models = if input.get("model").is_some()
+                    || input.get("modelSettings").is_some()
+                    || input.get("effort").is_some()
+                {
+                    monocode_core::catalog::models_for(kind, &settings.account)?
+                } else {
+                    monocode_core::catalog::cached_models_for(kind, &settings.account)
+                        .unwrap_or_default()
+                };
+                app::launch_settings(&input, &source_provider, settings, kind, &models)?
             };
+            settings.revision = 0;
+            let title = app::optional_text(&input, "title", 160)?
+                .unwrap_or_else(|| prompt.chars().take(160).collect());
             let mut db = locked(&store)?;
             let mut parent = parent;
             if let Some(candidate) = parent {
@@ -693,26 +1102,20 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             let mut summary = db.create(&provider, &project)?;
             let mut made = None;
             let built = (|| {
-                if let Some(cwd) = chosen {
-                    settings.worktree_cwd = Some(cwd);
-                } else if worktree {
-                    let base = input
-                        .get("worktreeBase")
-                        .and_then(Value::as_str)
-                        .unwrap_or("HEAD");
-                    let tree = monocode_core::git::create_worktree(path, base, summary.id)?;
-                    settings.worktree_cwd = Some(tree.to_string_lossy().into());
-                    made = Some(tree);
+                monocode_core::app_access::launch_checkout(
+                    &input,
+                    &project,
+                    summary.id,
+                    &mut settings,
+                )?;
+                if worktree {
+                    made = settings.worktree_cwd.as_ref().map(std::path::PathBuf::from);
                 }
-                summary.title = input
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&prompt)
-                    .chars()
-                    .take(160)
-                    .collect();
+                summary.title = title;
                 db.title(summary.id, &summary.title)?;
                 db.configure_agent(summary.id, &provider, &settings)?;
+                db.prepare_app_prompt(summary.id, &request, &prompt)?;
+                summary.has_messages = true;
                 if let Some(parent) = parent {
                     db.save_started_link(summary.id, parent)?;
                 }
@@ -742,9 +1145,9 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                 Effect::Start(Box::new(Started {
                     summary,
                     settings,
-                    prompt,
                     draft,
                     reveal,
+                    placement,
                     parent,
                     folder,
                     visible,

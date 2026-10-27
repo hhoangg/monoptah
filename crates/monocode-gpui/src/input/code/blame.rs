@@ -300,7 +300,7 @@ impl Input {
                 .bg(crate::theme::pane_fill())
                 .border_1()
                 .border_color(crate::theme::content(0.14))
-                .font_family(crate::markdown::MONO)
+                .font_family(crate::fonts::mono())
                 .text_size(px(12.))
                 .text_color(crate::theme::content(1.))
                 .children(rows.into_iter().map(|(kind, text)| {

@@ -224,12 +224,15 @@ impl Conversation {
         cx.emit(SessionChanged);
         cx.notify();
     }
-    pub(crate) fn switch_usage_account(&mut self, profile: Profile, cx: &mut Context<Self>) {
+    /// Moves this conversation to another account in place. A limited
+    /// session resumes on the new account; an idle one just waits for the
+    /// next message there.
+    pub(crate) fn switch_account(&mut self, profile: Profile, cx: &mut Context<Self>) {
         if self.editing_last_turn.pending() {
             return;
         }
         if self.needs_history_restore() {
-            self.defer_history_action(move |this, cx| this.switch_usage_account(profile, cx), cx);
+            self.defer_history_action(move |this, cx| this.switch_account(profile, cx), cx);
             return;
         }
         if self.busy
@@ -239,10 +242,11 @@ impl Conversation {
         {
             return;
         }
-        let Some(limit) = self.account_recovery_limit(cx) else {
-            return;
-        };
-        self.settings.usage_limit = Some(limit);
+        let limit = self.account_recovery_limit(cx);
+        let limited = limit.is_some();
+        if limited {
+            self.settings.usage_limit = limit;
+        }
         self.attach_account(cx);
         let from = self.settings.account.clone();
         let thread = self.summary.provider_id.clone();
@@ -262,7 +266,7 @@ impl Conversation {
             let _ = this.update(cx, |this, cx| {
                 this.account_switching = false;
                 if this.busy
-                    || this.settings.usage_limit.is_none()
+                    || (limited && this.settings.usage_limit.is_none())
                     || this.settings.account.id != old
                     || this.summary.provider_id != expected
                     || crate::accounts::get(cx)
@@ -275,6 +279,7 @@ impl Conversation {
                         this.settings.pending_provider_switch =
                             Some(monocode_core::agent::ProviderSwitch {
                                 from: this.summary.provider.clone(),
+                                model_label: this.model_label().to_string(),
                                 cwd: this.execution_cwd().to_owned(),
                                 model: this.model.clone(),
                                 model_settings: this.settings.model_settings.clone(),
@@ -282,7 +287,7 @@ impl Conversation {
                                 fast: this.settings.fast,
                                 service_tier: this.settings.service_tier.clone(),
                                 thinking: this.settings.thinking,
-                                skip_outgoing_recap: true,
+                                skip_outgoing_recap: limited,
                                 account: this.settings.account.clone(),
                                 provider_id: this.summary.provider_id.clone(),
                             });
@@ -315,7 +320,12 @@ impl Conversation {
                 this.catalog.clear();
                 this.refresh_catalog(cx);
                 this.save_settings(cx);
-                this.resume_usage(cx);
+                if limited {
+                    this.resume_usage(cx);
+                } else {
+                    cx.emit(SessionChanged);
+                    cx.notify();
+                }
             });
         })
         .detach();

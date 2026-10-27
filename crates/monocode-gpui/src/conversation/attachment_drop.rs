@@ -15,6 +15,9 @@ impl Conversation {
         }
         div()
             .id(id)
+            .key_context("Session")
+            .relative()
+            .child(self.completion.read(cx).container_probe())
             .on_drag_move::<ExternalPaths>(cx.listener(
                 |this, event: &gpui::DragMoveEvent<ExternalPaths>, _, cx| {
                     this.set_file_drag(event.bounds.contains(&event.event.position), cx);

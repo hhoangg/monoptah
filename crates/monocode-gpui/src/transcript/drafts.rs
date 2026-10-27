@@ -54,7 +54,7 @@ impl TranscriptView {
             let index = self
                 .rows
                 .iter()
-                .position(|row| row.key.0 >= draft.at)
+                .position(|row| row.key.0 >= self.base + draft.at)
                 .unwrap_or(self.rows.len());
             self.rows.insert(
                 index,

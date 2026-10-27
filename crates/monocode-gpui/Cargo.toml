@@ -48,6 +48,9 @@ tree-sitter-ruby = "0.23"
 # Settings → Mobile draws the pairing code from the module matrix.
 qrcode = { version = "0.14", default-features = false }
 
+[build-dependencies]
+embed-resource = "3"
+
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false, features = ["test-support"] }
 

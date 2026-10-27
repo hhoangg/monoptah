@@ -113,7 +113,7 @@ pub(crate) enum SettingsEvent {
     CheckHarnessUpdates,
     ManageInboxProvider(String),
     Changed(Box<Preferences>),
-    /// The Appearance page's New layout switch.
+    /// The Appearance page's Layout picker: true for Focused, false for Classic.
     NewLayout(bool),
     NewLayoutBoxy(bool),
     Section(Section),
@@ -311,7 +311,7 @@ impl SettingsView {
                 cx.notify();
             }),
             cx.subscribe(&search, |this, _, _: &input::Submitted, cx| {
-                let results = model::search(&this.search_query);
+                let results = model::search(&this.search_query, cx.compositor_name());
                 if let Some(result) = results.get(this.search_active).cloned() {
                     this.go(result, cx);
                 }
@@ -584,7 +584,7 @@ impl SettingsView {
     /// The breadcrumb, Restore defaults and search: in the inset title bar,
     /// or the page's own 40px header row in the classic layout.
     pub(crate) fn header(&mut self, in_title_bar: bool, cx: &mut Context<Self>) -> AnyElement {
-        let results = model::search(&self.search_query);
+        let results = model::search(&self.search_query, cx.compositor_name());
         let open = !self.search_query.trim().is_empty();
         let weak = cx.weak_entity();
         div()
@@ -596,7 +596,7 @@ impl SettingsView {
             .flex()
             .items_center()
             .child(
-                div()
+                crate::shell::titlebar_drag_area()
                     .min_w_0()
                     .flex_1()
                     .flex()
@@ -707,7 +707,8 @@ impl SettingsView {
                                 if this.search_query.trim().is_empty() {
                                     return;
                                 }
-                                let count = model::search(&this.search_query).len();
+                                let count =
+                                    model::search(&this.search_query, cx.compositor_name()).len();
                                 match event.keystroke.key.as_str() {
                                     "down" => {
                                         this.search_active =

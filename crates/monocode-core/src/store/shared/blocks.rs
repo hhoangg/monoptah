@@ -166,7 +166,11 @@ fn project_content(block: &Value) -> Result<Vec<Row>, String> {
         });
         t.append(text);
     }
-    t.rows[0].sent_at = block["sentAt"].as_u64().or(block["startedAt"].as_u64());
+    // Desktop habit reports record only when their run happened.
+    t.rows[0].sent_at = block["sentAt"]
+        .as_u64()
+        .or(block["startedAt"].as_u64())
+        .or(block["monoHabit"]["at"].as_u64());
     Ok(t.rows)
 }
 fn metadata_row(role: &str, value: &Value) -> Row {

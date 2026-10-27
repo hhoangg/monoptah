@@ -864,7 +864,7 @@ impl GithubView {
                         .gap(px(2.))
                         .text_size(px(12.))
                         .text_color(content(0.5))
-                        .font_family(crate::markdown::MONO)
+                        .font_family(crate::fonts::mono())
                         .when(row.identities.is_empty(), |d| {
                             d.child("No commit identities")
                         })

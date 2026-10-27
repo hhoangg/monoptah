@@ -19,7 +19,7 @@ fn first_text(node: &Option<Node>) -> &str {
 }
 
 #[gpui::test]
-fn native_button_preserves_state_across_frames_and_reset_restarts_it(cx: &mut TestAppContext) {
+fn native_button_preserves_state_across_frames(cx: &mut TestAppContext) {
     let window = cx.update(|cx| {
         cx.open_window(Default::default(), |_, cx| {
             cx.new(|cx| {
@@ -54,36 +54,6 @@ fn native_button_preserves_state_across_frames_and_reset_restarts_it(cx: &mut Te
             })
             .unwrap();
     }
-    let source = visual.debug_bounds("visual-source").unwrap();
-    visual.simulate_click(source.center(), Default::default());
-    visual.run_until_parked();
-    assert!(visual.debug_bounds("visual-button-root/1").is_none());
-    window
-        .update(visual, |view, _, _| assert!(view.show_source))
-        .unwrap();
-    let copy = visual.debug_bounds("visual-copy").unwrap();
-    visual.simulate_click(copy.center(), Default::default());
-    visual.run_until_parked();
-    let source_text = window
-        .update(visual, |view, _, _| view.document.source.clone())
-        .unwrap();
-    assert_eq!(
-        visual.read_from_clipboard().unwrap().text(),
-        Some(source_text),
-        "The compact copy action must preserve the complete original program"
-    );
-    let source = visual.debug_bounds("visual-source").unwrap();
-    visual.simulate_click(source.center(), Default::default());
-    visual.run_until_parked();
-    window
-        .update(visual, |view, _, _| assert_eq!(first_text(&view.tree), "2"))
-        .unwrap();
-    let reset = visual.debug_bounds("visual-reset").unwrap();
-    visual.simulate_click(reset.center(), Default::default());
-    visual.run_until_parked();
-    window
-        .update(visual, |view, _, _| assert_eq!(first_text(&view.tree), "0"))
-        .unwrap();
 }
 
 #[gpui::test]
@@ -183,7 +153,7 @@ fn slider_drag_rebinds_callbacks_after_each_native_update(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn failed_handler_is_contained_and_reset_recovers(cx: &mut TestAppContext) {
+fn failed_handler_is_contained(cx: &mut TestAppContext) {
     let window = cx.update(|cx| {
         cx.open_window(Default::default(), |_, cx| {
             cx.new(|cx| {
@@ -212,12 +182,6 @@ fn failed_handler_is_contained_and_reset_recovers(cx: &mut TestAppContext) {
             assert!(view.error.as_deref().unwrap().contains("Expected failure"));
             assert_eq!(first_text(&view.tree), "Still here");
         })
-        .unwrap();
-    let reset = visual.debug_bounds("visual-reset").unwrap();
-    visual.simulate_click(reset.center(), Default::default());
-    visual.run_until_parked();
-    window
-        .update(visual, |view, _, _| assert!(view.error.is_none()))
         .unwrap();
 }
 
@@ -421,7 +385,7 @@ fn tall_visual_uses_full_height_and_wheel_scrolls_the_conversation(cx: &mut Test
 }
 
 #[gpui::test]
-fn source_and_reset_emit_row_remeasure_events(cx: &mut TestAppContext) {
+fn width_changes_emit_row_remeasure_events(cx: &mut TestAppContext) {
     let window = cx.update(|cx| {
         cx.open_window(Default::default(), |_, cx| {
             cx.new(|cx| VisualView::new(document("return () => visual.text('Ready');"), cx))
@@ -439,21 +403,11 @@ fn source_and_reset_emit_row_remeasure_events(cx: &mut TestAppContext) {
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     visual.run_until_parked();
     count.set(0);
-    for selector in ["visual-source", "visual-reset"] {
-        let bounds = visual.debug_bounds(selector).unwrap();
-        visual.simulate_click(bounds.center(), Default::default());
-        visual.run_until_parked();
-    }
-    assert_eq!(
-        count.get(),
-        2,
-        "Every row-height-affecting action must notify the transcript"
-    );
     visual.simulate_window_resize(window.into(), size(px(300.), px(700.)));
     visual.refresh().unwrap();
     visual.run_until_parked();
     assert!(
-        count.get() > 2,
+        count.get() > 0,
         "Responsive width changes must also remeasure the transcript row"
     );
 }

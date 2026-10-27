@@ -24,6 +24,7 @@ pub(crate) fn row_text(row: &MarkdownRow) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         Part::Math(text) => text.clone(),
+        Part::Visual { caption, .. } => caption.clone(),
         Part::Rule => String::new(),
     }
 }

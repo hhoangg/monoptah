@@ -677,7 +677,7 @@ impl DiffView {
             return width;
         }
         let mut font = window.text_style().font();
-        font.family = crate::markdown::MONO.into();
+        font.family = crate::fonts::mono().into();
         let run = gpui::TextRun {
             len: 10,
             font,
@@ -1100,7 +1100,7 @@ impl DiffView {
                         .min_w_0()
                         .truncate()
                         .px_3()
-                        .font_family(crate::markdown::MONO)
+                        .font_family(crate::fonts::mono())
                         .text_size(px(11.))
                         .text_color(content(0.5))
                         .child(text),
@@ -1282,7 +1282,7 @@ impl DiffView {
                                     .pl_3()
                                     .pr_6()
                                     .whitespace_nowrap()
-                                    .font_family(crate::markdown::MONO)
+                                    .font_family(crate::fonts::mono())
                                     .text_size(px(CODE_SIZE))
                                     .text_color(content(0.92))
                                     .child(StyledText::new(text).with_highlights(styles)),
@@ -1521,7 +1521,7 @@ impl Render for DiffView {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .font_family(crate::markdown::MONO)
+                                    .font_family(crate::fonts::mono())
                                     .text_size(px(11.))
                                     .text_color(content(0.55))
                                     .child(location),

@@ -622,7 +622,7 @@ impl ResourceMonitor {
                     .child(
                         div()
                             .truncate()
-                            .font_family(crate::markdown::MONO)
+                            .font_family(crate::fonts::mono())
                             .text_size(px(11.))
                             .text_color(content(0.65))
                             .child(process.command.clone()),

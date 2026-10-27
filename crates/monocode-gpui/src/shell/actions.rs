@@ -451,10 +451,24 @@ impl Shell {
                                 .text_size(px(12.))
                                 .child(
                                     div()
-                                        .text_size(px(14.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(content(1.))
-                                        .child(title),
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1p5()
+                                        .child(
+                                            div()
+                                                .text_size(px(14.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(content(1.))
+                                                .child(title),
+                                        )
+                                        .when(!editing, |d| {
+                                            d.child(
+                                                div()
+                                                    .line_height(px(18.))
+                                                    .text_color(content(0.6))
+                                                    .child("Save a project command to run with one click."),
+                                            )
+                                        }),
                                 )
                                 .child(
                                     div()

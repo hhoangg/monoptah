@@ -206,7 +206,7 @@ impl Monos {
                     .bg(content(0.05))
                     .px_2()
                     .py(px(6.))
-                    .font_family(crate::markdown::MONO)
+                    .font_family(crate::fonts::mono())
                     .text_size(px(11.))
                     .line_height(px(16.))
                     .text_color(content(0.75))

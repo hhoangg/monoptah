@@ -119,16 +119,18 @@ impl Conversation {
         let store = self.store.clone();
         let mono = self.settings.mono.is_some();
         let work = cx.background_executor().spawn(async move {
-            let (history, turns) = {
+            let (history, turns, before) = {
                 let store = locked(&store)?;
                 (
                     store.load(id)?,
                     store.agent_settings(id)?.unwrap_or_default().turns,
+                    store.history_before(id)?,
                 )
             };
             Ok::<_, String>((
                 crate::transcript::PreparedHistory::new(history.rows, mono),
                 turns,
+                before,
             ))
         });
         cx.spawn(async move |this, cx| {
@@ -136,13 +138,16 @@ impl Conversation {
             let _ = this.update(cx, |this, cx| {
                 this.loading = false;
                 match result {
-                    Ok((history, turns)) => {
+                    Ok((history, turns, before)) => {
                         this.settings.turns = turns.clone();
+                        let pager = this.history_pager();
                         this.transcript.update(cx, |view, cx| {
-                            view.turns = turns;
+                            view.set_turns(turns);
                             view.restore_prepared_history(history, cx);
+                            view.set_history_pager(before, Some(pager));
                         });
                         this.history_unloaded = false;
+                        this.sync_review(cx);
                         this.status = "Ready".into();
                         if let Some((row, query)) = this.pending_search.take() {
                             this.reveal_search(row, query, cx);

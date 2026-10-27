@@ -311,6 +311,9 @@ impl Render for LinkedActivity {
                     ),
             );
         }
+        // Solid inverse ink: the translucent pane fill washed out on the light button.
+        let mut ink = shell_fill();
+        ink.a = 1.;
         body = body.child(
             div()
                 .px(px(12.))
@@ -320,17 +323,22 @@ impl Render for LinkedActivity {
                 .flex()
                 .gap(px(6.))
                 .text_size(px(11.))
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .child(
                     div()
                         .id("linked-activity-agent")
                         .role(Role::Button)
                         .cursor_pointer()
                         .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .rounded(px(6.))
                         .px(px(8.))
                         .py(px(4.))
                         .bg(content(1.))
-                        .text_color(pane_fill())
+                        .text_color(ink)
+                        .hover(move |s| s.bg(content(0.85)).text_color(ink))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(LinkedActivityEvent::Acknowledge(session));
                             cx.emit(LinkedActivityEvent::AddToChat(session, prompt.clone()));
@@ -343,10 +351,14 @@ impl Render for LinkedActivity {
                         .role(Role::Button)
                         .cursor_pointer()
                         .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .rounded(px(6.))
                         .px(px(8.))
                         .py(px(4.))
                         .bg(content(0.1))
+                        .hover(|s| s.bg(content(0.15)))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(LinkedActivityEvent::Acknowledge(session));
                             if discussion {

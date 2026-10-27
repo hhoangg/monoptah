@@ -67,7 +67,7 @@ fn icon_action_ink(
 fn action_icon(name: &'static str, ink: Hsla) -> gpui::Svg {
     icon(name, 14.).text_color(ink)
 }
-fn relative_time(iso: &str) -> String {
+pub(crate) fn relative_time(iso: &str) -> String {
     if model::timestamp_ms(iso) == 0 {
         return String::new();
     }
@@ -807,7 +807,7 @@ impl Inbox {
             .child(
                 div()
                     .w_full()
-                    .px(px(32.))
+                    .px(px(12.))
                     .pt(px(20.))
                     .pb(px(if is_pr { 0. } else { 20. }))
                     .flex()
@@ -1843,7 +1843,7 @@ impl Inbox {
     }
 
     fn summary_body_width(&self) -> Pixels {
-        (self.summary_width.get().min(px(1024.)) - px(64.)).max(px(1.))
+        (self.summary_width.get().min(px(1024.)) - px(24.)).max(px(1.))
     }
 
     fn summary_view(&self, item: &Item, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2075,7 +2075,7 @@ impl Inbox {
         div()
             .id(("inbox-summary-row", ix))
             .w_full()
-            .px(px(32.))
+            .px(px(12.))
             .child(body)
             .into_any_element()
     }
@@ -2100,7 +2100,7 @@ impl Inbox {
     }
 
     fn checks_view(&self, cx: &mut Context<Self>) -> AnyElement {
-        div().id("inbox-checks-scroll").min_h_0().flex_1().overflow_y_scroll().px(px(32.)).py(px(20.))
+        div().id("inbox-checks-scroll").min_h_0().flex_1().overflow_y_scroll().px(px(12.)).py(px(20.))
             .when(self.extra_loading, |d| d.child(message("Loading checks…")))
             .when_some(self.extra_error.clone(), |d, text| d.child(error(text)))
             .when_some(self.checks.clone(), |d, checks| {

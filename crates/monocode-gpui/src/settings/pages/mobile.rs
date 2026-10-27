@@ -23,6 +23,8 @@ use std::{
 /// Tailwind's amber-500 and emerald-500.
 const AMBER: u32 = 0xf59e0b;
 const EMERALD: u32 = 0x10b981;
+/// The public TestFlight invite for the iPhone beta.
+const TESTFLIGHT_URL: &str = "https://testflight.apple.com/join/xdwX38bB";
 /// How long Pair phone waits for the desktop to listen and make a code.
 const PAIRING_WAIT: Duration = Duration::from_secs(15);
 /// PairPhoneDialog.tsx's LINEUP: mascots fanning out from the middle,
@@ -422,9 +424,25 @@ impl SettingsView {
                     .child(paragraph(
                         "Check on projects and conversations from the Monoptah mobile app. Your phone connects straight to this desktop.",
                     ))
-                    .child(paragraph(
-                        "The iPhone app currently requires a TestFlight invitation.",
-                    )),
+                    .child(
+                        paragraph("The iPhone app is in beta on TestFlight.")
+                            .flex()
+                            .flex_wrap()
+                            .gap_x_1()
+                            .child(
+                                div()
+                                    .id("mobile-testflight")
+                                    .debug_selector(|| "mobile-testflight".into())
+                                    .role(Role::Link)
+                                    .aria_label("Get the iPhone app on TestFlight")
+                                    .text_color(content(0.7))
+                                    .underline()
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(content(1.)))
+                                    .child("Get the iPhone app")
+                                    .on_click(|_, _, cx| cx.open_url(TESTFLIGHT_URL)),
+                            ),
+                    ),
             )
             .child(
                 secondary_button("pair-phone", "Pair phone", false, !can_pair)

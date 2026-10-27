@@ -46,6 +46,13 @@ impl Attachment {
         }
     }
 
+    /// Everything a chip's size depends on. Embedded image data is skipped:
+    /// it can be large, and chips have a fixed size.
+    pub(super) fn hash_layout(&self, state: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        (&self.name, &self.path, &self.mime, self.image).hash(state);
+    }
+
     pub(super) fn from_paths(paths: &[PathBuf]) -> Arc<[Self]> {
         let value = monocode_core::transcript::attachments::from_paths(paths);
         value

@@ -3698,6 +3698,7 @@ dependencies = [
  "base64 0.22.1",
  "block2 0.6.2",
  "chrono",
+ "embed-resource",
  "gpui-pre",
  "gpui-pre-apple",
  "gpui-pre-platform",

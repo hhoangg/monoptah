@@ -1,13 +1,12 @@
 //! Session visuals are a bounded native component tree, with no browser surface.
 use crate::theme::{accent_color, content};
 use gpui::{
-    AnyElement, Bounds, ClipboardItem, Context, Div, EventEmitter, FontWeight, Hsla, IntoElement,
-    MouseButton, PathBuilder, Pixels, Point, Render, Role, SharedString, Stateful, Window, canvas,
-    div, fill, point, prelude::*, px, relative, size,
+    AnyElement, Bounds, Context, Div, EventEmitter, FontWeight, Hsla, IntoElement, MouseButton,
+    PathBuilder, Pixels, Point, Render, Role, SharedString, Stateful, Window, canvas, div, fill,
+    point, prelude::*, px, relative, size,
 };
 use monocode_core::visual::{
-    Camera, ChartKind, Node, SceneObject, Series, Shape, TextSize, ThemeColor, VisualDocument,
-    VisualRuntime,
+    Camera, Node, SceneObject, Shape, TextSize, ThemeColor, VisualDocument, VisualRuntime,
 };
 use serde_json::{Value, json};
 use std::{
@@ -16,8 +15,9 @@ use std::{
     rc::Rc,
 };
 
+mod charts;
+mod dither;
 mod scene;
-mod source;
 #[cfg(test)]
 mod tests;
 
@@ -28,8 +28,6 @@ pub(crate) struct VisualView {
     runtime: Option<VisualRuntime>,
     tree: Option<Node>,
     error: Option<String>,
-    show_source: bool,
-    source: Option<gpui::Entity<source::SourceView>>,
     width: Rc<Cell<f32>>,
     tracks: HashMap<String, Rc<Cell<Option<Bounds<Pixels>>>>>,
     slider_drag: Option<SliderDrag>,
@@ -39,6 +37,10 @@ pub(crate) struct VisualView {
     active: HashSet<String>,
     revision: u64,
     scene_cache: HashMap<String, Rc<RefCell<Option<SceneCache>>>>,
+    /// Placed in an answer's prose: no title bar, its caption underneath.
+    inline: Option<String>,
+    /// When the visual first appeared, for its charts' entrances.
+    motion: dither::Motion,
 }
 impl EventEmitter<VisualChanged> for VisualView {}
 struct SliderDrag {
@@ -65,18 +67,43 @@ fn color(token: &ThemeColor) -> Hsla {
     // Semantic hues need darker variants when the interface uses dark ink.
     let light_surface = content(1.).l < 0.5;
     let hue = |dark, light| gpui::rgb(if light_surface { light } else { dark }).into();
+    // Series 1 is the user's accent. A later series of the same hue would be
+    // indistinguishable, so it takes the first spare hue that differs.
+    let series = |dark, light| {
+        let accent = accent_color();
+        let near = |c: Hsla| {
+            let d = (c.h - accent.h).abs();
+            accent.s > 0.25 && d.min(1. - d) < 30. / 360.
+        };
+        let own: Hsla = hue(dark, light);
+        if !near(own) {
+            return own;
+        }
+        [
+            (0x2dd4bf, 0x0d7f73),
+            (0xe2c541, 0x8a6d00),
+            (0xfc5855, 0xd01d21),
+        ]
+        .into_iter()
+        .map(|(dark, light)| hue(dark, light))
+        .find(|c| !near(*c))
+        .unwrap_or(own)
+    };
     match token {
         ThemeColor::Ink => content(1.),
         ThemeColor::Muted => content(0.6),
         ThemeColor::Faint => content(0.2),
         ThemeColor::Accent | ThemeColor::Series1 => accent_color(),
-        ThemeColor::Positive | ThemeColor::Series2 => hue(0x45b98b, 0x18734f),
-        ThemeColor::Negative => hue(0xe76f73, 0xb9313d),
-        ThemeColor::Warning => hue(0xd69b3a, 0x845c0e),
-        ThemeColor::Series3 => hue(0xb58ae8, 0x7952aa),
-        ThemeColor::Series4 => hue(0xe8ab51, 0x8a5a12),
-        ThemeColor::Series5 => hue(0xe5789b, 0xaa3f67),
-        ThemeColor::Series6 => hue(0x5bbdc5, 0x24747d),
+        // Series hues, tuned separately for dark and light surfaces.
+        // Semantic colours keep their meaning even when close to the accent.
+        ThemeColor::Positive => hue(0x4fd57f, 0x0a924b),
+        ThemeColor::Negative => hue(0xfc5855, 0xd01d21),
+        ThemeColor::Warning => hue(0xfea247, 0xd96700),
+        ThemeColor::Series2 => series(0x4fd57f, 0x0a924b),
+        ThemeColor::Series3 => series(0xb77df8, 0x863ad2),
+        ThemeColor::Series4 => series(0xfea247, 0xd96700),
+        ThemeColor::Series5 => series(0xfa78b2, 0xd12c80),
+        ThemeColor::Series6 => series(0x3faff3, 0x0077d7),
     }
 }
 fn control(id: impl Into<SharedString>) -> Stateful<Div> {
@@ -130,59 +157,6 @@ fn tab_button(id: impl Into<SharedString>, selected: bool) -> Stateful<Div> {
         })
 }
 
-fn action_button(
-    id: &'static str,
-    label: &'static str,
-    glyph: &'static str,
-    active: bool,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .role(Role::Button)
-        .aria_label(label)
-        .focusable()
-        .tab_stop(true)
-        .group("visual-action")
-        .size(px(24.))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .cursor_pointer()
-        .when(active, |d| d.bg(content(0.06)))
-        .hover(|s| s.bg(content(0.08)))
-        .focus(|s| s.bg(content(0.1)))
-        .tooltip(move |_, cx| cx.new(|_| ActionTooltip(label)).into())
-        .child(
-            crate::theme::icon(glyph, 14.)
-                .text_color(if active {
-                    accent_color()
-                } else {
-                    content(0.55)
-                })
-                .group_hover("visual-action", |s| s.text_color(content(1.))),
-        )
-}
-
-struct ActionTooltip(&'static str);
-impl Render for ActionTooltip {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let mut background = crate::theme::shell_fill();
-        background.a = 1.;
-        div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(background)
-            .border_1()
-            .border_color(content(0.12))
-            .text_size(px(11.))
-            .line_height(px(16.))
-            .text_color(content(0.85))
-            .child(self.0)
-    }
-}
 fn activated(event: &gpui::KeyDownEvent) -> bool {
     matches!(event.keystroke.key.as_str(), "enter" | "space" | " ")
 }
@@ -194,8 +168,6 @@ impl VisualView {
             runtime: None,
             tree: None,
             error: None,
-            show_source: false,
-            source: None,
             width: Rc::new(Cell::new(640.)),
             tracks: HashMap::new(),
             slider_drag: None,
@@ -205,9 +177,18 @@ impl VisualView {
             active: HashSet::new(),
             revision: 0,
             scene_cache: HashMap::new(),
+            inline: None,
+            motion: dither::Motion(std::time::Instant::now()),
         };
         this.initialize();
         this
+    }
+    /// Draws the visual inside an answer, captioned, or back in its own row.
+    pub(crate) fn set_inline(&mut self, caption: Option<String>, cx: &mut Context<Self>) {
+        if self.inline != caption {
+            self.inline = caption;
+            self.changed(cx);
+        }
     }
     fn initialize(&mut self) {
         self.revision = self.revision.wrapping_add(1);
@@ -275,15 +256,6 @@ impl VisualView {
         }
         self.changed(cx);
     }
-    fn reset(&mut self, cx: &mut Context<Self>) {
-        self.slider_drag = None;
-        self.scene_drag = None;
-        self.orbits.clear();
-        self.inputs.clear();
-        self.scene_cache.clear();
-        self.initialize();
-        self.changed(cx);
-    }
     fn slide(&mut self, x: Pixels, cx: &mut Context<Self>) {
         let Some(drag) = &self.slider_drag else {
             return;
@@ -304,8 +276,17 @@ impl VisualView {
         match node {
             Node::Column { children, gap }
             | Node::Row { children, gap }
-            | Node::Grid { children, gap, .. } => {
+            | Node::Grid { children, gap, .. }
+            | Node::Card { children, gap } => {
                 let mut layout = div().w_full().min_w_0().gap(px(*gap));
+                if matches!(node, Node::Card { .. }) {
+                    layout = layout
+                        .p_4()
+                        .rounded_xl()
+                        .bg(content(0.03))
+                        .border_1()
+                        .border_color(content(0.08));
+                }
                 if let Node::Grid { columns, .. } = node {
                     let responsive =
                         ((*columns).min((self.width.get() / 180.).floor().max(1.) as usize)).max(1);
@@ -358,32 +339,77 @@ impl VisualView {
                 value,
                 detail,
                 color: token,
-            } => div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .min_w_0()
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(content(0.6))
-                        .child(label.clone()),
-                )
-                .child(
-                    div()
-                        .text_size(px(28.))
-                        .line_height(px(34.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(color(token))
-                        .child(value.clone()),
-                )
-                .children(detail.iter().map(|d| {
-                    div()
-                        .text_size(px(12.))
-                        .text_color(content(0.6))
-                        .child(d.clone())
-                }))
-                .into_any_element(),
+                delta,
+                trend,
+                lower_is_better,
+            } => {
+                let (delta, detail) = match (delta, detail) {
+                    (Some(delta), detail) => (Some(delta.clone()), detail.clone()),
+                    (None, Some(detail)) => match charts::split_delta(detail) {
+                        Some((delta, rest)) => (
+                            Some(delta.to_owned()),
+                            (!rest.is_empty()).then(|| rest.to_owned()),
+                        ),
+                        None => (None, Some(detail.clone())),
+                    },
+                    (None, None) => (None, None),
+                };
+                let tint = if matches!(
+                    token,
+                    ThemeColor::Ink | ThemeColor::Muted | ThemeColor::Faint
+                ) {
+                    accent_color()
+                } else {
+                    color(token)
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(content(0.6))
+                            .truncate()
+                            .child(label.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(30.))
+                            .line_height(px(38.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_features(crate::right_panel::tabular())
+                            .text_color(color(token))
+                            .child(value.clone()),
+                    )
+                    .when(delta.is_some() || detail.is_some(), |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_x_2()
+                                .children(
+                                    delta.as_deref().map(|d| charts::delta(d, *lower_is_better)),
+                                )
+                                .children(detail.map(|detail| {
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(content(0.55))
+                                        .child(detail)
+                                })),
+                        )
+                    })
+                    .when(trend.len() > 1, |d| {
+                        d.child(
+                            div()
+                                .pt_2()
+                                .child(charts::trend(trend.clone(), tint, self.motion)),
+                        )
+                    })
+                    .into_any_element()
+            }
             Node::Table { columns, rows } => {
                 let mut table = div()
                     .id(SharedString::from(format!("visual-table-{key}")))
@@ -702,31 +728,22 @@ impl VisualView {
                     slot.input
                         .update(cx, |input, cx| input.set_text(value.clone(), cx));
                 }
+                // The placeholder says what to type; the label stays for
+                // assistive technology only.
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
+                    .id(SharedString::from(format!("visual-input-{key}")))
+                    .debug_selector({
+                        let key = key.clone();
+                        move || format!("visual-input-{key}")
+                    })
+                    .aria_label(label.clone())
                     .min_w_0()
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(content(0.6))
-                            .child(label.clone()),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("visual-input-{key}")))
-                            .debug_selector({
-                                let key = key.clone();
-                                move || format!("visual-input-{key}")
-                            })
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(content(0.14))
-                            .child(slot.input.clone()),
-                    )
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(content(0.14))
+                    .child(slot.input.clone())
                     .into_any_element()
             }
             Node::Select {
@@ -735,7 +752,15 @@ impl VisualView {
                 selected,
                 handler,
             } => {
-                let mut choices = div().flex().flex_wrap().gap_1();
+                // The options name themselves; the label stays for assistive
+                // technology only.
+                let mut choices = div()
+                    .id(SharedString::from(format!("visual-select-{key}")))
+                    .role(Role::Group)
+                    .aria_label(label.clone())
+                    .flex()
+                    .flex_wrap()
+                    .gap_1();
                 for (i, option) in options.iter().enumerate() {
                     let handler = handler.clone();
                     let keyboard = handler.clone();
@@ -763,25 +788,75 @@ impl VisualView {
                             })),
                     );
                 }
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(content(0.6))
-                            .child(label.clone()),
-                    )
-                    .child(choices)
-                    .into_any_element()
+                choices.into_any_element()
             }
             Node::Chart {
                 chart_type,
                 series,
                 labels,
                 height,
-            } => chart(*chart_type, series.clone(), labels.clone(), *height),
+            } => charts::chart(
+                *chart_type,
+                series.clone(),
+                labels.clone(),
+                *height,
+                self.motion,
+                format!("visual-chart-{key}").into(),
+            ),
+            Node::Gauge {
+                label,
+                value,
+                min,
+                max,
+                unit,
+                color: token,
+            } => charts::gauge(
+                label.clone(),
+                *value,
+                *min,
+                *max,
+                unit.clone(),
+                *token,
+                self.motion,
+            ),
+            Node::Donut {
+                slices,
+                label,
+                value,
+            } => charts::donut(
+                slices.clone(),
+                label.clone(),
+                value.clone(),
+                self.motion,
+                format!("visual-donut-{key}").into(),
+            ),
+            Node::Heatmap {
+                values,
+                rows,
+                columns,
+                color: token,
+            } => charts::heatmap(
+                values.clone(),
+                rows.clone(),
+                columns.clone(),
+                *token,
+                self.motion,
+                format!("visual-heatmap-{key}").into(),
+            ),
+            Node::Progress {
+                label,
+                value,
+                max,
+                detail,
+                color: token,
+            } => charts::progress(
+                label.clone(),
+                *value,
+                *max,
+                detail.clone(),
+                *token,
+                self.motion,
+            ),
             Node::Canvas {
                 width,
                 height,
@@ -980,24 +1055,23 @@ impl Render for VisualView {
         let width = self.width.clone();
         let entity = cx.entity().downgrade();
         self.active.clear();
-        let body = if self.show_source {
-            self.source
-                .get_or_insert_with(|| {
-                    cx.new(|cx| source::SourceView::new(self.document.source.clone(), cx))
-                })
-                .clone()
-                .into_any_element()
-        } else if let Some(tree) = tree {
+        let body = if let Some(tree) = tree {
             self.node(&tree, "root".into(), cx)
         } else {
             div().into_any_element()
         };
-        if !self.show_source {
-            self.inputs.retain(|key, _| self.active.contains(key));
-            self.tracks.retain(|key, _| self.active.contains(key));
-            self.orbits.retain(|key, _| self.active.contains(key));
-            self.scene_cache.retain(|key, _| self.active.contains(key));
-        }
+        self.inputs.retain(|key, _| self.active.contains(key));
+        self.tracks.retain(|key, _| self.active.contains(key));
+        self.orbits.retain(|key, _| self.active.contains(key));
+        self.scene_cache.retain(|key, _| self.active.contains(key));
+        let inline = self.inline.clone();
+        // A visual in its own row is titled; placed in prose, it is captioned.
+        let header = inline.is_none().then(|| {
+            div()
+                .min_w_0()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title)
+        });
         div()
             .id("native-session-visual")
             .debug_selector(|| "native-session-visual".into())
@@ -1025,74 +1099,7 @@ impl Render for VisualView {
                 .w_full()
                 .h(px(1.)),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(80.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(
-                        action_button(
-                            "visual-source",
-                            if self.show_source {
-                                "Show visual"
-                            } else {
-                                "Show source"
-                            },
-                            if self.show_source { "eye" } else { "code" },
-                            self.show_source,
-                        )
-                        .debug_selector(|| "visual-source".into())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_source = !this.show_source;
-                            this.changed(cx);
-                        }))
-                        .on_key_down(cx.listener(|this, event, _, cx| {
-                            if activated(event) {
-                                this.show_source = !this.show_source;
-                                this.changed(cx);
-                                cx.stop_propagation();
-                            }
-                        })),
-                    )
-                    .when(self.show_source, |d| {
-                        d.child(
-                            action_button("visual-copy", "Copy source", "copy", false)
-                                .debug_selector(|| "visual-copy".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        this.document.source.clone(),
-                                    ))
-                                }))
-                                .on_key_down(cx.listener(|this, event, _, cx| {
-                                    if activated(event) {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            this.document.source.clone(),
-                                        ));
-                                        cx.stop_propagation();
-                                    }
-                                })),
-                        )
-                    })
-                    .child(
-                        action_button("visual-reset", "Reset visual", "rotate-ccw", false)
-                            .debug_selector(|| "visual-reset".into())
-                            .on_click(cx.listener(|this, _, _, cx| this.reset(cx)))
-                            .on_key_down(cx.listener(|this, event, _, cx| {
-                                if activated(event) {
-                                    this.reset(cx);
-                                    cx.stop_propagation();
-                                }
-                            })),
-                    ),
-            )
+            .children(header)
             .children(self.error.iter().map(|error| {
                 div()
                     .px_3()
@@ -1113,6 +1120,12 @@ impl Render for VisualView {
                     .flex_shrink_0()
                     .child(body),
             )
+            .children(inline.as_ref().filter(|c| !c.is_empty()).map(|caption| {
+                div()
+                    .text_size(px(12.))
+                    .text_color(content(0.5))
+                    .child(caption.clone())
+            }))
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 if !event.dragging() {
                     this.slider_drag = None;
@@ -1160,7 +1173,8 @@ fn node_at<'a>(mut node: &'a Node, key: &str) -> Option<&'a Node> {
         node = match node {
             Node::Column { children, .. }
             | Node::Row { children, .. }
-            | Node::Grid { children, .. } => children.get(index)?,
+            | Node::Grid { children, .. }
+            | Node::Card { children, .. } => children.get(index)?,
             _ => return None,
         };
     }
@@ -1346,167 +1360,5 @@ fn drawing(width: f32, height: f32, shapes: Vec<Shape>) -> AnyElement {
             )
             .size_full(),
         )
-        .into_any_element()
-}
-
-fn chart(kind: ChartKind, series: Vec<Series>, labels: Vec<String>, height: f32) -> AnyElement {
-    let legend = div()
-        .flex()
-        .flex_wrap()
-        .gap_3()
-        .children(series.iter().map(|s| {
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .text_size(px(11.))
-                .text_color(content(0.6))
-                .child(div().size(px(7.)).rounded_full().bg(color(&s.color)))
-                .child(s.label.clone())
-        }));
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(
-            canvas(
-                |_, _, _| {},
-                move |bounds, _, window, cx| {
-                    let mut low = 0f64;
-                    let mut high = 0f64;
-                    let count = series
-                        .iter()
-                        .map(|s| s.values.len())
-                        .max()
-                        .unwrap_or(0)
-                        .max(labels.len())
-                        .max(1);
-                    for value in series.iter().flat_map(|s| &s.values) {
-                        low = low.min(*value);
-                        high = high.max(*value);
-                    }
-                    if (high - low).abs() < f64::EPSILON {
-                        high = low + 1.;
-                    }
-                    let w = (bounds.size.width.as_f32() - 52.).max(1.);
-                    let h = (bounds.size.height.as_f32() - 30.).max(1.);
-                    let origin = bounds.origin + point(px(44.), px(4.));
-                    let y = |v: f64| ((high - v) / (high - low)) as f32 * h;
-                    window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                        for i in 0..=4 {
-                            let value = low + (high - low) * i as f64 / 4.;
-                            let yy = y(value);
-                            paint_path(
-                                &[[0., yy], [w, yy]],
-                                origin,
-                                1.,
-                                1.,
-                                false,
-                                content(0.07),
-                                window,
-                            );
-                            paint_label(
-                                format_number(value),
-                                bounds.origin + point(px(0.), px(yy - 3.)),
-                                &ThemeColor::Muted,
-                                10.,
-                                window,
-                                cx,
-                            );
-                        }
-                        for (index, s) in series.iter().enumerate() {
-                            let points = s
-                                .values
-                                .iter()
-                                .enumerate()
-                                .map(|(i, v)| {
-                                    let x = if matches!(kind, ChartKind::Bar) {
-                                        (i as f32 + 0.5) * w / count as f32
-                                    } else {
-                                        if count <= 1 {
-                                            w / 2.
-                                        } else {
-                                            i as f32 * w / (count - 1) as f32
-                                        }
-                                    };
-                                    [x, y(*v)]
-                                })
-                                .collect::<Vec<_>>();
-                            if matches!(kind, ChartKind::Bar) {
-                                let group = w / count as f32;
-                                let bar = group * 0.75 / series.len().max(1) as f32;
-                                for (p, value) in points.iter().zip(&s.values) {
-                                    let xx = p[0] - group * 0.375 + index as f32 * bar;
-                                    let yy = y(*value).min(y(0.));
-                                    window.paint_quad(fill(
-                                        Bounds::new(
-                                            origin + point(px(xx), px(yy)),
-                                            size(
-                                                px((bar - 2.).max(1.)),
-                                                px((y(*value) - y(0.)).abs().max(1.)),
-                                            ),
-                                        ),
-                                        color(&s.color),
-                                    ));
-                                }
-                            } else {
-                                if matches!(kind, ChartKind::Area) && !points.is_empty() {
-                                    let mut area = points.clone();
-                                    area.push([points.last().unwrap()[0], y(0.)]);
-                                    area.push([points[0][0], y(0.)]);
-                                    let mut tint = color(&s.color);
-                                    tint.a = 0.14;
-                                    paint_path(&area, origin, 1., 0., true, tint, window);
-                                }
-                                paint_path(&points, origin, 1., 2., false, color(&s.color), window);
-                                if points.len() <= 32 {
-                                    for p in &points {
-                                        window.paint_quad(
-                                            fill(
-                                                Bounds::new(
-                                                    origin + point(px(p[0] - 2.5), px(p[1] - 2.5)),
-                                                    size(px(5.), px(5.)),
-                                                ),
-                                                color(&s.color),
-                                            )
-                                            .corner_radii(px(3.)),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        let stride = (count as f32 / (w / 70.).max(1.)).ceil() as usize;
-                        for (i, label) in labels.iter().enumerate().step_by(stride.max(1)) {
-                            let x = if matches!(kind, ChartKind::Bar) {
-                                (i as f32 + 0.5) * w / count as f32
-                            } else {
-                                if count <= 1 {
-                                    w / 2.
-                                } else {
-                                    i as f32 * w / (count - 1) as f32
-                                }
-                            };
-                            let label = if label.chars().count() > 14 {
-                                format!("{}…", label.chars().take(13).collect::<String>())
-                            } else {
-                                label.clone()
-                            };
-                            paint_label(
-                                label,
-                                origin + point(px((x - 12.).max(0.)), px(h + 8.)),
-                                &ThemeColor::Muted,
-                                10.,
-                                window,
-                                cx,
-                            );
-                        }
-                    });
-                },
-            )
-            .w_full()
-            .h(px(height)),
-        )
-        .child(legend)
         .into_any_element()
 }

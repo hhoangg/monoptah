@@ -175,7 +175,7 @@ impl InboxDocument {
                         .into_any_element(),
                     Some(Err(_)) => div()
                         .text_size(px(14.))
-                        .text_color(gpui::rgb(0x38bdf8))
+                        .text_color(crate::theme::accent_color())
                         .child(label.clone())
                         .into_any_element(),
                     None => div()

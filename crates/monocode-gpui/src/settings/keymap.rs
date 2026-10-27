@@ -70,6 +70,7 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
         "workspace::VisitBack" => "Tab: Back",
         "workspace::VisitForward" => "Tab: Forward",
         "workspace::CloseTab" => "Pane: Close",
+        "workspace::ArchiveSession" => "Session: Archive",
         "workspace::PreviousSession" => "Session: Previous",
         "workspace::NextSession" => "Session: Next",
         "workspace::PreviousSessionInTab" => "Session: Previous in Current Tab",

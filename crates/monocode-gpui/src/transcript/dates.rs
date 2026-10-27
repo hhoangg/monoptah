@@ -84,6 +84,24 @@ pub(crate) fn previous_send(source: &[Row], start: usize) -> Option<u64> {
         .and_then(|(_, row)| row.sent_at)
 }
 
+/// A reply posted without a prompt, such as a habit report, on a later day
+/// than the message before it. It continues the turn but opens its own day.
+pub(super) fn opens_later_day(source: &[Row], start: usize) -> bool {
+    let row = &source[start];
+    let Some(day) = row.sent_at.and_then(local_day) else {
+        return false;
+    };
+    row.role == "assistant"
+        && row.first
+        && source[..start]
+            .iter()
+            .rev()
+            .filter(|r| r.first)
+            .find_map(|r| r.sent_at)
+            .and_then(local_day)
+            .is_some_and(|previous| previous != day)
+}
+
 pub(crate) fn mono_opens_stretch(source: &[Row], start: usize) -> bool {
     opens_stretch(source[start].sent_at, previous_send(source, start))
 }
@@ -114,7 +132,9 @@ impl TranscriptView {
                 .rposition(|r| r.is_prompt())
                 .map_or(0, |ix| ix + 1);
             if start != turn {
-                return None;
+                return opens_later_day(&self.source, start)
+                    .then_some(row.sent_at)
+                    .flatten();
             }
             let prompt = self.prompt_start(turn);
             if self.source[prompt..turn].iter().any(|r| r.role == "user") {
@@ -155,6 +175,55 @@ mod tests {
             .with_ymd_and_hms(2026, 10, day, hour, minute, 0)
             .unwrap()
             .timestamp_millis() as u64
+    }
+
+    #[gpui::test]
+    fn habit_reports_on_later_days_get_their_own_day_inside_one_turn(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = cx.new(|_| {
+            let mut view = TranscriptView::new();
+            view.mono_mode("cat", 0xe86b5f, "MonoCat");
+            view
+        });
+        view.update(cx, |view, cx| {
+            let row = |role: &str, text: &str, sent_at| Row {
+                role: role.into(),
+                text: text.into(),
+                first: true,
+                sent_at,
+            };
+            view.patch(
+                0,
+                vec![
+                    row("user", "Check performance", Some(at(16, 7, 39))),
+                    row("assistant", "Undated reply", None),
+                    row("assistant", "Habit report one", Some(at(17, 9, 0))),
+                    row("assistant", "Same-day follow-up", Some(at(17, 9, 1))),
+                    row("assistant", "Habit report two", Some(at(19, 9, 0))),
+                    row("assistant", "Habit report three", Some(at(21, 9, 1))),
+                ],
+                cx,
+            );
+            assert_eq!(view.mono_stamp(0), Some(at(16, 7, 39)));
+            assert_eq!(
+                view.mono_stamp(1),
+                None,
+                "the reply shares its prompt's day"
+            );
+            assert_eq!(view.mono_stamp(2), Some(at(17, 9, 0)));
+            assert_eq!(view.mono_stamp(3), None, "same-day runs stack");
+            assert_eq!(view.mono_stamp(4), Some(at(19, 9, 0)));
+            assert_eq!(view.mono_stamp(5), Some(at(21, 9, 1)));
+            // The Mono signs each later day again, under that day's badge.
+            let headers: Vec<_> = view
+                .rows
+                .iter()
+                .filter(|r| matches!(r.body, Body::WorkLine { .. }))
+                .map(|r| (view.messages[r.message].start, r.first))
+                .collect();
+            assert_eq!(headers, [(1, true), (2, true), (4, true), (5, true)]);
+        });
     }
 
     #[test]

@@ -18,11 +18,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
+          # Like release.yml: AppKit draws its controls (traffic lights, menus)
+          # for the SDK the app links against, and only the newest Apple
+          # silicon images ship a current one, so Intel cross-compiles there.
+          - os: macos-latest
             target: aarch64-apple-darwin
             arch: aarch64
             kind: macos
-          - os: macos-15-intel
+          - os: macos-latest
             target: x86_64-apple-darwin
             arch: x86_64
             kind: macos
@@ -54,6 +57,7 @@ jobs:
         with:
           workspaces: crates/monocode-gpui
           key: native-release-${{ matrix.target }}
+          cache-on-failure: true
       - name: Configure native channel and version
         shell: bash
         run: |
@@ -111,8 +115,40 @@ jobs:
       - run: node --test scripts/native-release.test.mjs scripts/package-native.test.mjs
       - name: Test native update backend
         run: cargo test --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-core --profile native-dev app_update
+      - name: Reclaim Mac updater-test build space
+        if: runner.os == 'macOS'
+        run: |
+          df -h .
+          cargo clean --manifest-path crates/monocode-gpui/Cargo.toml --profile native-dev
+          df -h .
+      - name: Require a current macOS SDK
+        if: runner.os == 'macOS'
+        run: |
+          sdk=$(xcrun --sdk macosx --show-sdk-version)
+          echo "macOS SDK $sdk"
+          if (( ${sdk%%.*} < 26 )); then
+            echo "macOS SDK $sdk would draw pre-macOS 26 window controls" >&2
+            exit 1
+          fi
+          # Xcode 26 ships the Metal compiler GPUI's shaders need separately.
+          if ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun metal --version
+          fi
+      - name: Install Rosetta to run the Intel build while packaging
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: /usr/sbin/softwareupdate --install-rosetta --agree-to-license || arch -x86_64 /usr/bin/true
       - name: Build optimized native app
         run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --target ${{ matrix.target }} --release
+      - name: Use TCP for Mac notarization
+        if: runner.os == 'macOS'
+        run: |
+          # Mac runners can drop HTTP/3 connections to Apple's ticket service.
+          # Scope this workaround to the disposable runners; preserve
+          # notarization, ticket validation and Gatekeeper checks.
+          # https://github.com/actions/runner-images/issues/14924
+          echo 'block return out quick proto udp from any to any port 443' | sudo pfctl -f -
+          sudo pfctl -E
       - name: Package native app
         shell: bash
         env:

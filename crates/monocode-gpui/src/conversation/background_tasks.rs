@@ -53,6 +53,9 @@ impl Conversation {
         let card_width = (width.unwrap_or_default() - inset * 2.).max(px(0.));
         let row_width = (card_width - px(22.)).max(px(0.));
         let count = tasks.len();
+        // A lone task folds into the header: its title takes the subtitle's
+        // place and its clock sits at the end, so the card stays one row.
+        let single = (count == 1).then(|| &tasks[0]);
         let collapsible = count > 1;
         let collapsed = collapsible && self.background.collapsed;
         let title = if count == 1 {
@@ -101,7 +104,9 @@ impl Conversation {
                     .min_w_0()
                     .truncate()
                     .text_color(content(0.35))
-                    .child(if collapsed {
+                    .child(if let Some(task) = single {
+                        task.description.clone()
+                    } else if collapsed {
                         tasks
                             .iter()
                             .map(|task| task.description.as_str())
@@ -111,6 +116,7 @@ impl Conversation {
                         format!("{agent} continues when they finish")
                     }),
             )
+            .when_some(single, |d, task| d.child(live_clock(task)))
             .when(collapsible, |d| {
                 d.child(
                     div()
@@ -144,7 +150,7 @@ impl Conversation {
             .role(Role::Group)
             .aria_label("Background tasks")
             .child(header)
-            .when(!collapsed, |d| d.child(rows));
+            .when(!collapsed && single.is_none(), |d| d.child(rows));
         composer_shelf::shelf("background-tasks")
             .px(inset)
             .child(self.background.motion.card(card, card_width, window))
@@ -153,7 +159,6 @@ impl Conversation {
 }
 
 fn background_row(task: &BackgroundTask) -> gpui::Stateful<gpui::Div> {
-    let started_at = task.started_at;
     div()
         .id(SharedString::from(format!("background-{}", task.id)))
         .debug_selector({
@@ -196,50 +201,56 @@ fn background_row(task: &BackgroundTask) -> gpui::Stateful<gpui::Div> {
                     d.child(
                         div()
                             .truncate()
-                            .font_family(crate::markdown::MONO)
+                            .font_family(crate::fonts::mono())
                             .text_size(px(11.))
                             .text_color(content(0.4))
                             .child(format!("$ {}", first_line(&command))),
                     )
                 }),
         )
-        .child(crate::pulse::looping(
-            SharedString::from(format!("background-clock-{}", task.id)),
-            std::time::Duration::from_millis(2_000),
-            crate::pulse::Rate::Low,
-            move |phase| {
-                let ms = monocode_core::time::now_ms().saturating_sub(started_at);
-                // A slow breath: the dot swells and its halo fades out.
-                let breath = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
-                let live: gpui::Hsla = gpui::rgb(LIVE).into();
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(content(0.45))
-                            .child(elapsed(ms)),
-                    )
-                    .child(
-                        div()
-                            .size(px(12.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(live.opacity(0.25 * (1. - breath)))
-                            .child(
-                                div()
-                                    .size(px(6.))
-                                    .rounded_full()
-                                    .bg(live.opacity(0.65 + 0.35 * breath)),
-                            ),
-                    )
-            },
-        ))
+        .child(live_clock(task))
+}
+
+/// Elapsed time beside a breathing green dot.
+fn live_clock(task: &BackgroundTask) -> impl IntoElement {
+    let started_at = task.started_at;
+    crate::pulse::looping(
+        SharedString::from(format!("background-clock-{}", task.id)),
+        std::time::Duration::from_millis(2_000),
+        crate::pulse::Rate::Low,
+        move |phase| {
+            let ms = monocode_core::time::now_ms().saturating_sub(started_at);
+            // A slow breath: the dot swells and its halo fades out.
+            let breath = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+            let live: gpui::Hsla = gpui::rgb(LIVE).into();
+            div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(content(0.45))
+                        .child(elapsed(ms)),
+                )
+                .child(
+                    div()
+                        .size(px(12.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(live.opacity(0.25 * (1. - breath)))
+                        .child(
+                            div()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(live.opacity(0.65 + 0.35 * breath)),
+                        ),
+                )
+        },
+    )
 }
 
 fn first_line(command: &str) -> &str {
@@ -329,6 +340,29 @@ mod tests {
             .unwrap();
         visual.refresh().unwrap();
         assert!(visual.debug_bounds("background-tasks-header").is_none());
+    }
+
+    #[gpui::test]
+    fn a_lone_task_folds_into_the_header(cx: &mut TestAppContext) {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let summary = store.create("claude", "/tmp").unwrap();
+        let window = cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+                    view.loaded = true;
+                    view.summary.has_messages = true;
+                    view.set_background(vec![task("dev", false)], cx);
+                    view
+                })
+            })
+            .unwrap()
+        });
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("background-tasks-header").is_some());
+        assert!(visual.debug_bounds("background-task-dev").is_none());
     }
 
     #[test]

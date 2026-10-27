@@ -95,6 +95,10 @@ impl SessionReview {
     pub(crate) fn shown(&self) -> bool {
         !self.busy && (self.error.is_some() || !self.files.is_empty())
     }
+    #[cfg(test)]
+    pub(crate) fn set_files(&mut self, files: Vec<CheckpointFile>, cx: &mut Context<Self>) {
+        self.publish(Ok(CheckpointStatus { files }), cx);
+    }
     /// Reread the recorded turn, as after a turn, Git change or reload.
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         if !self.valid() || self.busy {
@@ -386,7 +390,7 @@ impl Render for SessionReview {
                         .min_w_0()
                         .flex_1()
                         .truncate()
-                        .font_family(crate::markdown::MONO)
+                        .font_family(crate::fonts::mono())
                         .text_size(px(12.))
                         .child(file.relative.clone()),
                 )

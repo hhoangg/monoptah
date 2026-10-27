@@ -2,7 +2,10 @@
 use serde::{Deserialize, Serialize};
 mod presentation;
 pub mod tasks;
-pub use presentation::{CommandStep, ToolPresentation};
+pub use presentation::{visual_tool, CommandStep, ToolPresentation, VisualStep};
+
+/// The app's own step while a conversation carries over from another model.
+pub const HANDOFF: &str = "providerHandoff";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +44,13 @@ impl ToolCall {
     pub fn is_compaction(&self) -> bool {
         self.name == "contextCompaction"
     }
+    pub fn is_handoff(&self) -> bool {
+        self.name == HANDOFF
+    }
+    /// Session milestones read as a status line rather than a tool step.
+    pub fn is_milestone(&self) -> bool {
+        self.is_compaction() || self.is_handoff()
+    }
     pub fn append_output(&mut self, delta: &str) {
         self.output.push_str(delta);
         self.bound_output();
@@ -55,6 +65,10 @@ impl ToolCall {
             }
             self.output = format!("… earlier output omitted …\n{}", &self.output[at..]);
         }
+    }
+    /// One of Monocode's own visual tools, under any provider's naming.
+    pub fn visual_step(&self) -> Option<VisualStep> {
+        visual_tool(&self.name)
     }
     pub fn summary(&self) -> (String, String) {
         match self.panel() {

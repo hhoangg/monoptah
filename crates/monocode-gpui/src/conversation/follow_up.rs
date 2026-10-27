@@ -27,7 +27,7 @@ impl Conversation {
             || monocode_core::composer::consume_command(&self.input.read(cx).content, "draft")
                 .is_some()
     }
-    fn message(
+    pub(super) fn message(
         &mut self,
         text: String,
         attachments: Vec<std::path::PathBuf>,
@@ -352,39 +352,43 @@ impl Conversation {
             }
             self.follow_ups.sending = Some(message.id.clone());
             let message_id = message.id.clone();
-            // A queued message carries its own one-shot intent; the user's next
-            // composer selection must not change a message already in the queue.
-            let previous = (
-                self.settings.plan,
-                self.settings.operator,
-                self.settings.orchestrator,
-            );
-            self.settings.plan = message.mode.as_deref() == Some("plan");
-            self.settings.operator = message.mode.as_deref() == Some("operator");
-            self.settings.orchestrator = message.mode.as_deref() == Some("orchestrator");
-            self.planning_orchestration = self.settings.orchestrator;
-            self.orchestration_plan = None;
-            self.orchestration_error = None;
-            let composer_attachments = std::mem::take(&mut self.attachments);
-            self.settings.attachments = message.attachments;
-            self.settings.mono_message_id = Some(message.id);
-            let previous_prepared = self.settings.prepared_prompt.take();
-            self.settings.prepared_prompt = message.prepared_prompt;
-            self.launch_prompt(message.text, cx);
+            self.settings.mono_message_id = Some(message.id.clone());
+            self.launch_message(message, cx);
+            self.settings.mono_message_id = None;
             if !self.busy {
                 self.fail_follow_up(&message_id, self.status.clone(), cx);
             }
-            self.settings.prepared_prompt = previous_prepared;
-            self.attachments = composer_attachments;
-            self.settings.attachments.clear();
-            self.settings.mono_message_id = None;
-            (
-                self.settings.plan,
-                self.settings.operator,
-                self.settings.orchestrator,
-            ) = previous;
         }
         cx.notify();
+    }
+    /// Starts `message` with its own one-shot mode, attachments and prompt.
+    /// The user's next composer selection must not change a message already
+    /// queued, and the message must not take the composer's.
+    pub(super) fn launch_message(&mut self, message: Message, cx: &mut Context<Self>) {
+        let previous = (
+            self.settings.plan,
+            self.settings.operator,
+            self.settings.orchestrator,
+        );
+        self.settings.plan = message.mode.as_deref() == Some("plan");
+        self.settings.operator = message.mode.as_deref() == Some("operator");
+        self.settings.orchestrator = message.mode.as_deref() == Some("orchestrator");
+        self.planning_orchestration = self.settings.orchestrator;
+        self.orchestration_plan = None;
+        self.orchestration_error = None;
+        let composer_attachments = std::mem::take(&mut self.attachments);
+        self.settings.attachments = message.attachments;
+        let previous_prepared = self.settings.prepared_prompt.take();
+        self.settings.prepared_prompt = message.prepared_prompt;
+        self.launch_prompt(message.text, cx);
+        self.settings.prepared_prompt = previous_prepared;
+        self.attachments = composer_attachments;
+        self.settings.attachments.clear();
+        (
+            self.settings.plan,
+            self.settings.operator,
+            self.settings.orchestrator,
+        ) = previous;
     }
     fn resume_queue(&mut self, cx: &mut Context<Self>) {
         if self.stopping {

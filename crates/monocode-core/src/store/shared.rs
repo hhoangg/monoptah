@@ -3,8 +3,11 @@
 mod accounts;
 pub(super) mod blocks;
 mod edit;
+mod settings;
 #[cfg(test)]
 mod tests;
+mod window;
+pub use window::{HistoryPage, PAGE_TURNS};
 
 use super::{Reminder, Session, Store};
 use crate::surface::Surface;
@@ -26,8 +29,10 @@ pub(super) struct Shared {
     columns: HashSet<String>,
     ids: RefCell<HashMap<i64, String>>,
     extras: RefCell<BTreeMap<String, String>>,
-    extras_path: Option<PathBuf>,
+    extras_db: Option<Connection>,
     snapshots: RefCell<HashMap<i64, HistoryRevision>>,
+    /// The first block sequence of each indexed Mono's row numbering.
+    windows: RefCell<HashMap<i64, i64>>,
     queues: RefCell<HashMap<i64, String>>,
     account_source: RefCell<Option<crate::accounts::Book>>,
     preferences: std::sync::Arc<crate::desktop_preferences::DesktopPreferences>,
@@ -134,29 +139,6 @@ pub(super) fn has_table(conn: &Connection, table: &str) -> Result<bool, String> 
         |r| r.get(0),
     ))
 }
-fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
-    let temporary = path.with_extension(format!("{}.tmp", crate::mono::new_id()));
-    let result = (|| {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary).map_err(|e| e.to_string())?;
-        file.write_all(encode(value)?.as_bytes())
-            .map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        std::fs::rename(&temporary, path).map_err(|e| e.to_string())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result
-}
-
 /// Turn keys are row offsets, including invisible document/card metadata rows.
 /// Never substitute the session's current model for missing historical provenance.
 pub(super) fn project_turns(
@@ -285,17 +267,7 @@ impl Store {
                 ));
             }
         }
-        let extras_path = (!memory).then(|| {
-            path.with_file_name(format!(
-                "{}.gpui.json",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ))
-        });
-        let extras = match extras_path.as_ref().map(std::fs::read_to_string) {
-            Some(Ok(raw)) => parse(&raw)?,
-            Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
-            _ => BTreeMap::new(),
-        };
+        let (extras, extras_db) = settings::open(path, read_only)?;
         let store = Self {
             conn,
             path: path.into(),
@@ -303,8 +275,9 @@ impl Store {
                 columns,
                 ids: RefCell::new(HashMap::new()),
                 extras: RefCell::new(extras),
-                extras_path,
+                extras_db,
                 snapshots: RefCell::new(HashMap::new()),
+                windows: RefCell::new(HashMap::new()),
                 queues: RefCell::new(HashMap::new()),
                 account_source: RefCell::new(None),
                 preferences: preferences.unwrap_or_else(|| {
@@ -469,11 +442,7 @@ impl Store {
             .and_then(|v| v.split_once(':'))
         {
             if let Ok(id) = id.parse::<i64>() {
-                if self
-                    .shared_blocks(id)?
-                    .iter()
-                    .any(|b| b["appRequestId"].as_str() == Some(message))
-                {
+                if self.shared_delivered(id, message)? {
                     return Ok(Some("1".into()));
                 }
             }
@@ -490,12 +459,22 @@ impl Store {
     pub(super) fn shared_save_setting(&self, key: &str, value: &str) -> Result<(), String> {
         self.shared_writable()?;
         let shared = self.shared.as_ref().unwrap();
-        let mut next = shared.extras.borrow().clone();
-        next.insert(key.into(), value.into());
-        if let Some(path) = &shared.extras_path {
-            atomic_json(path, &next)?;
+        if shared
+            .extras
+            .borrow()
+            .get(key)
+            .is_some_and(|old| old == value)
+        {
+            return Ok(());
         }
-        *shared.extras.borrow_mut() = next;
+        if let Some(conn) = &shared.extras_db {
+            sql(conn.execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            ))?;
+        }
+        // Publish only committed values. A failed save must remain retryable.
+        shared.extras.borrow_mut().insert(key.into(), value.into());
         Ok(())
     }
     pub(super) fn shared_sessions(&self) -> Result<Vec<Session>, String> {
@@ -606,6 +585,24 @@ impl Store {
         cwd: &str,
         surface: Surface,
     ) -> Result<Session, String> {
+        self.shared_create_surface(provider, cwd, &crate::accounts::request_id(), surface)
+            .map(|(session, _)| session)
+    }
+    pub(super) fn shared_create_named(
+        &self,
+        provider: &str,
+        cwd: &str,
+        original: &str,
+    ) -> Result<(Session, bool), String> {
+        self.shared_create_surface(provider, cwd, original, Surface::Chat)
+    }
+    fn shared_create_surface(
+        &self,
+        provider: &str,
+        cwd: &str,
+        original: &str,
+        surface: Surface,
+    ) -> Result<(Session, bool), String> {
         self.shared_writable()?;
         let surface = if self.shared_surface_supported() {
             surface
@@ -615,7 +612,25 @@ impl Store {
         let label = crate::provider::Kind::parse(provider)
             .ok_or_else(|| format!("Unknown provider: {provider}"))?
             .label();
-        let original = crate::accounts::request_id();
+        let id = self.shared_register(original)?;
+        let exists: bool = sql(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+            [original],
+            |row| row.get(0),
+        ))?;
+        if exists {
+            let existing = self
+                .shared_sessions()?
+                .into_iter()
+                .find(|s| s.id == id)
+                .ok_or("The session created by this request was removed")?;
+            if existing.provider != provider
+                || crate::files::path_key(&existing.cwd) != crate::files::path_key(cwd)
+            {
+                return Err("Request ID was already used for another session".into());
+            }
+            return Ok((existing, false));
+        }
         let now = crate::time::now_ms().min(i64::MAX as u64) as i64;
         let title = format!("New {label} session");
         let tui = surface.is_tui().then(|| surface.id());
@@ -631,19 +646,22 @@ impl Store {
                     .into_iter()
                     .chain(tui.as_ref().map(|id| id as &dyn rusqlite::ToSql)),
             )))?;
-        Ok(Session {
-            id: self.shared_register(&original)?,
-            title,
-            provider: provider.into(),
-            cwd: cwd.into(),
-            provider_id: None,
-            has_messages: false,
-            updated_at: now as u64,
-            archived: false,
-            pinned: false,
-            work_item: None,
-            surface,
-        })
+        Ok((
+            Session {
+                id,
+                title,
+                provider: provider.into(),
+                cwd: cwd.into(),
+                provider_id: None,
+                has_messages: false,
+                updated_at: now as u64,
+                archived: false,
+                pinned: false,
+                work_item: None,
+                surface,
+            },
+            true,
+        ))
     }
     pub(super) fn shared_agent(&self, id: i64) -> Result<Option<Settings>, String> {
         let fields = ["harness", "model", "model_settings", "runtime_mode"]
@@ -745,7 +763,21 @@ impl Store {
         settings.account.id = account.unwrap_or_else(|| crate::accounts::DEFAULT.into());
         // Desktop blocks are authoritative. Native-only legacy metadata remains
         // available, but cannot override a saved desktop turn's identity/time.
-        for (turn, source) in project_turns(&self.shared_blocks(id)?)? {
+        let blocks = self.shared_blocks(id)?;
+        settings.operator_enabled |= blocks.iter().any(|block| {
+            block["role"] == "user"
+                && block["draft"] != true
+                && block["internal"] != true
+                && (block["monocode"] == true
+                    || ["mono", "monocode"].into_iter().any(|command| {
+                        crate::composer::consume_command(
+                            block["text"].as_str().unwrap_or_default(),
+                            command,
+                        )
+                        .is_some()
+                    }))
+        });
+        for (turn, source) in project_turns(&blocks)? {
             let info = settings.turns.entry(turn).or_default();
             if !source.provider.is_empty() {
                 info.provider = source.provider;
@@ -969,23 +1001,12 @@ impl Store {
             window: window.filter(|w| *w > 0).map(|w| w as u64),
         }))
     }
+    /// The blocks whose rows this store numbers: an indexed Mono's window, or
+    /// the whole history of one stored as a blob.
     pub(super) fn shared_blocks(&self, id: i64) -> Result<Vec<Value>, String> {
         let original = self.persisted_session_id(id)?;
-        if has_table(&self.conn, "mono_transcripts")?
-            && sql(self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM mono_transcripts WHERE session_id=?1)",
-                [&original],
-                |r| r.get::<_, bool>(0),
-            ))?
-        {
-            let mut query = sql(self
-                .conn
-                .prepare("SELECT block_json FROM mono_blocks WHERE session_id=?1 ORDER BY seq"))?;
-            let mut result = Vec::new();
-            for row in sql(query.query_map([&original], |r| r.get::<_, String>(0)))? {
-                result.push(parse(&sql(row)?)?);
-            }
-            Ok(result)
+        if let Some(from) = self.shared_window(id, &original)? {
+            self.shared_indexed_blocks(&original, from, i64::MAX)
         } else {
             let raw: String = sql(self.conn.query_row(
                 "SELECT blocks_json FROM sessions WHERE id=?1",
@@ -997,21 +1018,15 @@ impl Store {
     }
     pub(super) fn shared_load(&self, id: i64) -> Result<Transcript, String> {
         let original = self.persisted_session_id(id)?;
-        if has_table(&self.conn, "mono_transcripts")?
-            && sql(self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM mono_transcripts WHERE session_id=?1)",
-                [&original],
-                |row| row.get::<_, bool>(0),
-            ))?
-        {
+        if let Some(from) = self.shared_window(id, &original)? {
             // Project one source block at a time. A long Mono must not retain
             // a second complete JSON history alongside its display rows.
             // The scalar count and the rows share one SQLite read snapshot.
             let mut query = sql(self.conn.prepare(
-                "SELECT block_json,(SELECT count(*) FROM mono_blocks WHERE session_id=?1)
-                 FROM mono_blocks WHERE session_id=?1 ORDER BY seq",
+                "SELECT block_json,(SELECT count(*) FROM mono_blocks WHERE session_id=?1 AND seq>=?2)
+                 FROM mono_blocks WHERE session_id=?1 AND seq>=?2 ORDER BY seq",
             ))?;
-            let mut records = sql(query.query([&original]))?;
+            let mut records = sql(query.query(params![original, from]))?;
             let mut rows = Vec::new();
             let mut digest = HistoryRevision::start(0);
             let mut first = true;
@@ -1050,40 +1065,53 @@ impl Store {
             return Ok(());
         }
         let original = self.persisted_session_id(id)?;
-        let indexed = has_table(&self.conn, "mono_transcripts")?
-            && sql(self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM mono_transcripts WHERE session_id=?1)",
+        let (has_user, draft) = if let Some(from) = self.shared_window(id, &original)? {
+            self.shared_store_indexed_blocks(&original, from, blocks)?;
+            // Blocks before the window count too, and were never read.
+            sql(self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mono_blocks WHERE session_id=?1 AND is_user=1),
+                 EXISTS(SELECT 1 FROM mono_blocks WHERE session_id=?1 AND is_user=1 AND is_draft=1)",
                 [&original],
-                |r| r.get::<_, bool>(0),
-            ))?;
-        if indexed {
-            self.shared_store_indexed_blocks(&original, blocks)?;
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            ))?
         } else {
             self.shared_patch(id, &[("blocks_json", json!(encode(&blocks)?))])?;
-        }
+            (
+                blocks.iter().any(|b| b["role"] == "user"),
+                blocks
+                    .iter()
+                    .any(|b| b["role"] == "user" && b["draft"] == true),
+            )
+        };
         self.shared_patch(
             id,
             &[
-                (
-                    "has_user_message",
-                    json!(blocks.iter().any(|b| b["role"] == "user")),
-                ),
-                (
-                    "is_draft",
-                    json!(blocks
-                        .iter()
-                        .any(|b| b["role"] == "user" && b["draft"] == true)),
-                ),
+                ("has_user_message", json!(has_user)),
+                ("is_draft", json!(draft)),
             ],
         )
     }
-    fn shared_store_indexed_blocks(&self, original: &str, blocks: &[Value]) -> Result<(), String> {
+    /// Replace the window's blocks, from sequence `from` on. Earlier blocks are
+    /// outside every row index this store handed out, so they stay untouched.
+    fn shared_store_indexed_blocks(
+        &self,
+        original: &str,
+        from: i64,
+        blocks: &[Value],
+    ) -> Result<(), String> {
         let mut query = sql(self.conn.prepare(
-            "SELECT seq,block_id,block_json FROM mono_blocks WHERE session_id=?1 ORDER BY seq",
+            "SELECT seq,block_id,block_json FROM mono_blocks WHERE session_id=?1 AND seq>=?2 ORDER BY seq",
         ))?;
         let mut old = HashMap::new();
-        let mut max_seq = 0;
-        for row in sql(query.query_map([original], |r| {
+        // New blocks always land inside the window, after everything stored.
+        let first = from.max(1);
+        let mut max_seq = sql(self.conn.query_row(
+            "SELECT coalesce(max(seq),0) FROM mono_blocks WHERE session_id=?1",
+            [original],
+            |row| row.get::<_, i64>(0),
+        ))?
+        .max(first - 1);
+        for row in sql(query.query_map(params![original, from], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -1091,7 +1119,6 @@ impl Store {
             ))
         }))? {
             let (seq, id, raw) = sql(row)?;
-            max_seq = max_seq.max(seq);
             old.insert(id, (seq, parse::<Value>(&raw)?));
         }
         let retained: HashSet<_> = blocks.iter().filter_map(|b| b["id"].as_str()).collect();
@@ -1114,14 +1141,16 @@ impl Store {
         if resequence {
             // An explicit insertion/reorder changes turn positions. Payloads
             // and block identities survive, in one enclosing transaction.
-            sql(self
-                .conn
-                .execute("DELETE FROM mono_turns WHERE session_id=?1", [original]))?;
-            sql(self
-                .conn
-                .execute("DELETE FROM mono_blocks WHERE session_id=?1", [original]))?;
+            sql(self.conn.execute(
+                "DELETE FROM mono_turns WHERE session_id=?1 AND seq>=?2",
+                params![original, from],
+            ))?;
+            sql(self.conn.execute(
+                "DELETE FROM mono_blocks WHERE session_id=?1 AND seq>=?2",
+                params![original, from],
+            ))?;
             old.clear();
-            max_seq = 0;
+            max_seq = first - 1;
         } else {
             for (id, (seq, _)) in &old {
                 if !retained.contains(id.as_str()) {
@@ -1600,7 +1629,7 @@ impl Store {
                 if cancel.load(Ordering::Acquire) {
                     return Ok((Vec::new(), false));
                 }
-                let rows = blocks::project(&self.shared_blocks(summary.id)?)?;
+                let rows = blocks::project(&self.shared_all_blocks(summary.id)?)?;
                 let mut ix = 0;
                 while ix < rows.len() {
                     if cancel.load(Ordering::Acquire) {

@@ -36,11 +36,46 @@ impl Conversation {
         let deny_id = approval.id.clone();
         let session_id = approval.id.clone();
         let allow_id = approval.id.clone();
+        let actions = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                approval_button("approval-deny", "Deny")
+                    .text_color(content(0.5))
+                    .hover(|s| s.bg(content(0.08)).text_color(content(0.9)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.decide_notification_request(&deny_id, Decision::Deny, cx);
+                    })),
+            )
+            .when(approval.can_remember, |d| {
+                d.child(
+                    approval_button("approval-session", "Allow for this session")
+                        .bg(content(0.06))
+                        .hover(|s| s.bg(content(0.1)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.decide_notification_request(&session_id, Decision::Session, cx);
+                        })),
+                )
+            })
+            .child(
+                approval_button("approval-allow", "Allow once")
+                    .bg(content(1.))
+                    .text_color(ink)
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .hover(move |s| s.bg(content(0.85)).text_color(ink))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.decide_notification_request(&allow_id, Decision::Allow, cx);
+                    })),
+            );
+        // The question and its answers share one row; any detail follows below.
         let card = composer_shelf::card("approval-request", self.classic_layout)
             .role(Role::Group)
             .aria_label(approval.title.clone())
             .child(
                 div()
+                    .debug_selector(|| "approval-header".into())
                     .min_h(px(32.))
                     .flex()
                     .items_center()
@@ -53,7 +88,8 @@ impl Conversation {
                             .py_1()
                             .text_color(content(0.75))
                             .child(approval.title.clone()),
-                    ),
+                    )
+                    .child(actions),
             )
             .when(!approval.detail.is_empty(), |card| {
                 card.child(
@@ -66,54 +102,13 @@ impl Conversation {
                         .py_1()
                         .max_h(px(180.))
                         .overflow_y_scroll()
-                        .font_family(crate::markdown::MONO)
+                        .font_family(crate::fonts::mono())
                         .text_size(px(12.))
                         .line_height(px(18.))
                         .text_color(content(0.75))
                         .child(approval.detail.clone()),
                 )
-            })
-            .child(
-                div()
-                    .py_1()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_end()
-                    .gap(px(6.))
-                    .child(
-                        approval_button("approval-deny", "Deny")
-                            .text_color(content(0.5))
-                            .hover(|s| s.bg(content(0.08)).text_color(content(0.9)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.decide_notification_request(&deny_id, Decision::Deny, cx);
-                            })),
-                    )
-                    .when(approval.can_remember, |d| {
-                        d.child(
-                            approval_button("approval-session", "Allow for this session")
-                                .bg(content(0.06))
-                                .hover(|s| s.bg(content(0.1)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.decide_notification_request(
-                                        &session_id,
-                                        Decision::Session,
-                                        cx,
-                                    );
-                                })),
-                        )
-                    })
-                    .child(
-                        approval_button("approval-allow", "Allow once")
-                            .bg(content(1.))
-                            .text_color(ink)
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .hover(move |s| s.bg(content(0.85)).text_color(ink))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.decide_notification_request(&allow_id, Decision::Allow, cx);
-                            })),
-                    ),
-            );
+            });
         let card_width = (width.unwrap_or_default() - px(16.)).max(px(0.));
         composer_shelf::shelf("approval-shelf")
             .debug_selector(|| "approval-shelf".into())
@@ -271,6 +266,14 @@ mod tests {
             .unwrap();
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.refresh().unwrap();
+        let header = visual.debug_bounds("approval-header").unwrap();
+        for button in ["approval-deny", "approval-session", "approval-allow"] {
+            let bounds = visual.debug_bounds(button).unwrap();
+            assert!(
+                bounds.top() >= header.top() && bounds.bottom() <= header.bottom(),
+                "{button} shares the title row"
+            );
+        }
         for (button, id) in [
             ("approval-allow", "once"),
             ("approval-session", "session"),

@@ -220,7 +220,7 @@ fn the_prompt_and_help_describe_each_delivery_and_habit_reporting() {
         "\"each\" delivers",
         "habit run",
         "report to the Mono's chat",
-        "draft:true with notifyOnComplete:true still records a launch that reports",
+        "draft:true with notifyOnComplete:true is refused",
         "sessions.start notifyOnComplete defaults to true",
         "sessions.send notifyOnComplete defaults to false",
     ] {

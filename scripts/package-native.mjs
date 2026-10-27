@@ -8,6 +8,7 @@ import {
   readdir,
   writeFile,
   chmod,
+  lstat,
 } from "node:fs/promises";
 import { join, resolve, dirname, basename } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -36,9 +37,45 @@ function run(command, args, options = {}) {
     ...options,
   });
   if (result.error) throw result.error;
-  if (result.status !== 0)
-    throw new Error(`${command} failed (${result.status})`);
+  if (result.status !== 0) {
+    const error = new Error(`${command} failed (${result.status})`);
+    error.status = result.status;
+    throw error;
+  }
   return result;
+}
+
+// stapler's EX_NOHOST (68) can indicate a ticket-service/network failure.
+// Retry it boundedly; every other status still stops packaging immediately.
+export async function runStapler(
+  action,
+  file,
+  { wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {},
+) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      run("xcrun", ["stapler", action, file]);
+      return;
+    } catch (error) {
+      if (error.status !== 68 || attempt === 5) throw error;
+      const delay = attempt * 10_000;
+      console.warn(
+        `Apple ticket service unavailable during ${action}; retrying in ${delay / 1000}s (${attempt}/5)`,
+      );
+      await wait(delay);
+    }
+  }
+}
+
+// Count apparent bytes, including sparse files, without following the
+// Applications shortcut or any other symlinks outside the staging tree.
+async function logicalBytes(path) {
+  const info = await lstat(path);
+  if (!info.isDirectory()) return info.size;
+  const children = await Promise.all(
+    (await readdir(path)).map((name) => logicalBytes(join(path, name))),
+  );
+  return info.size + children.reduce((sum, size) => sum + size, 0);
 }
 async function notices(directory) {
   await mkdir(directory, { recursive: true });
@@ -170,8 +207,8 @@ export async function packageNative({
           `Apple did not accept ${basename(file)} for notarization`,
         );
       if (staple) {
-        run("xcrun", ["stapler", "staple", staple]);
-        run("xcrun", ["stapler", "validate", staple]);
+        await runStapler("staple", staple);
+        await runStapler("validate", staple);
       }
     };
     const zip = join(work, "notarize.zip");
@@ -192,6 +229,8 @@ export async function packageNative({
     run("ditto", [app, join(imageRoot, "Monoptah Native.app")]);
     run("ln", ["-s", "/Applications", join(imageRoot, "Applications")]);
     const dmg = add(`MonocodeNative_${version}_${name}.dmg`);
+    const imageSizeMiB =
+      Math.ceil((await logicalBytes(imageRoot)) / 1048576) + 64;
     run("hdiutil", [
       "create",
       "-volname",
@@ -201,6 +240,10 @@ export async function packageNative({
       "-ov",
       "-format",
       "UDZO",
+      "-fs",
+      "HFS+",
+      "-size",
+      `${imageSizeMiB}m`,
       dmg,
     ]);
     run("codesign", [

@@ -60,15 +60,12 @@ impl Conversation {
         let work = cx.background_executor().spawn(async move {
             // Persist the fallback before generation so a fast response cannot
             // race its initial write, and never overwrite a saved manual name.
-            if !locked(&store)
+            let titled = locked(&store)
                 .and_then(|s| s.replace_title(id, &placeholder, &expected))
-                .unwrap_or(false)
-            {
-                return None;
-            }
+                .unwrap_or(false);
             // GPUI unit tests use synthetic conversations. Live-provider checks
             // are opt-in; the core runner is tested with isolated CLI fixtures.
-            if cfg!(test) {
+            let generated = if !titled || cfg!(test) {
                 None
             } else {
                 monocode_core::session_title::generate_for(
@@ -78,19 +75,55 @@ impl Conversation {
                     account,
                     flag,
                 )
-            }
+            };
+            // Tauri's resolveLinkedWorkItem: a pasted issue or PR links the
+            // session even when a manual name kept the title. Tests never shell
+            // out to `gh`, so they only see pasted URLs.
+            let linked = if cfg!(test) {
+                monocode_core::session_groups::parse_github_work_item(&message)
+            } else {
+                monocode_core::session_groups::resolve_work_item(
+                    &message,
+                    Path::new(&cwd),
+                    generated.as_ref().and_then(|g| g.work_item.as_ref()),
+                )
+            };
+            (generated, linked)
         });
         cx.spawn(async move |this, cx| {
-            let generated = work.await;
+            let (generated, linked) = work.await;
             let _ = this.update(cx, |this, cx| {
                 if !cancel.load(Ordering::Relaxed)
                     && let Some(generated) = generated
                 {
                     this.apply_generated_title(&seed, generated.title, cx);
                 }
+                if let Some(item) = linked {
+                    this.link_first_work_item(item, cx);
+                }
             });
         })
         .detach();
+    }
+    /// Links only an unlinked session: a manual or inbox link always wins.
+    fn link_first_work_item(
+        &mut self,
+        item: monocode_core::session_groups::WorkItem,
+        cx: &mut Context<Self>,
+    ) {
+        if self.summary.work_item.is_some() {
+            return;
+        }
+        self.summary.work_item = Some(item.clone());
+        let store = self.store.clone();
+        let id = self.summary.id;
+        cx.background_executor()
+            .spawn(async move {
+                let _ = locked(&store).and_then(|s| s.set_work_item(id, Some(&item)));
+            })
+            .detach();
+        cx.emit(SessionChanged);
+        cx.notify();
     }
     pub(super) fn apply_generated_title(
         &mut self,
@@ -170,5 +203,50 @@ mod tests {
             assert_eq!(v.summary.title, "My session name");
         });
         assert!(locked(&store).unwrap().load(id).unwrap().rows.is_empty());
+    }
+    #[gpui::test]
+    fn first_prompts_link_a_pasted_pull_request_without_replacing_a_link(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let prompt = "hey lets review this pr\n\nhttps://github.com/acme/app/pull/1142 its for the native one";
+        let fresh = |cx: &mut gpui::TestAppContext| {
+            let mut summary = locked(&store).unwrap().create("codex", "/tmp").unwrap();
+            summary.title = "New Codex session".into();
+            locked(&store)
+                .unwrap()
+                .title(summary.id, &summary.title)
+                .unwrap();
+            cx.new(|cx| Conversation::new(summary, store.clone(), cx))
+        };
+
+        let view = fresh(cx);
+        view.update(cx, |v, cx| v.generate_title(prompt, cx));
+        cx.run_until_parked();
+        let id = view.read_with(cx, |v, _| v.summary.id);
+        let linked = view
+            .read_with(cx, |v, _| v.summary.work_item.clone())
+            .unwrap();
+        assert_eq!((linked.kind.as_str(), linked.number), ("pr", 1142));
+        assert_eq!(linked.url, "https://github.com/acme/app/pull/1142");
+        let saved = locked(&store).unwrap().sessions().unwrap();
+        let saved = saved.into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(saved.work_item, Some(linked));
+
+        let view = fresh(cx);
+        let manual = monocode_core::session_groups::parse_github_work_item(
+            "https://github.com/a/b/issues/7",
+        );
+        view.update(cx, |v, cx| {
+            v.summary.work_item = manual.clone();
+            v.generate_title(prompt, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.summary.work_item.clone()),
+            manual
+        );
     }
 }

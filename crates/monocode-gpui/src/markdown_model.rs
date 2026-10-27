@@ -1,6 +1,6 @@
 //! Native Markdown model for AgentMarkdown's Streamdown elements.
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use std::{iter::Peekable, sync::Arc};
+use std::{iter::Peekable, ops::Range, sync::Arc};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct InlineStyle {
@@ -58,12 +58,19 @@ pub(crate) enum Block {
     Math {
         tex: String,
     },
+    /// `![caption](visual:id)` on its own line: a published visual placed
+    /// in the prose.
+    Visual {
+        id: String,
+        caption: String,
+    },
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TopBlock {
+    range: Range<usize>,
     pub block: Block,
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct BlockTree {
     pub blocks: Vec<Arc<TopBlock>>,
 }
@@ -71,22 +78,184 @@ pub(crate) struct BlockTree {
 pub(crate) struct MarkdownParser {
     source: String,
     tree: BlockTree,
+    display: Vec<(Arc<TopBlock>, BlockTree)>,
+    full_display: Option<DisplayCache>,
+    display_full: bool,
+    display_dirty: bool,
+    full_only: bool,
+    #[cfg(test)]
+    parsed_bytes: usize,
 }
 impl MarkdownParser {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn set_text(&mut self, text: &str) {
-        if self.source != text {
-            self.source = text.into();
-            self.tree = parse_full(text);
+        if self.source == text {
+            return;
         }
+        let append = text.starts_with(&self.source);
+        self.display_dirty = true;
+        // The display mender treats raw HTML as prose and can observe fence
+        // markers that the canonical parser hides inside HTML. Preserve that
+        // whole-source context instead of repairing those blocks separately.
+        self.display_full = if append {
+            self.display_full || text[self.source.len()..].contains(['<', '`'])
+        } else {
+            text.contains(['<', '`'])
+        };
+        // Reference definitions can change links anywhere in the document.
+        // Check the new bytes (including a split `]:`) and use a full parse
+        // for that uncommon case, including definitions inside containers.
+        self.full_only = if append {
+            self.full_only
+                || text.as_bytes()[self.source.len().saturating_sub(1)..]
+                    .windows(2)
+                    .any(|pair| pair == b"]:")
+        } else {
+            text.contains("]:")
+        };
+        let mut boundary = 0;
+        if append && !self.full_only && self.tree.blocks.len() > 2 {
+            // Keep two trailing blocks reparsable: an append can turn a
+            // paragraph into a table/heading or merge it into a loose list.
+            let n = self.tree.blocks.len();
+            boundary = self.tree.blocks[n - 2].range.start;
+            let previous = self.tree.blocks[n - 3].range.start;
+            let between = &text[previous..boundary];
+            if matches!(
+                self.tree.blocks[n - 3].block,
+                Block::List { .. } | Block::BlockQuote { .. }
+            ) && between[between.trim_end().len()..].matches('\n').count() < 2
+            {
+                boundary = previous;
+            }
+            boundary = text[..boundary].rfind('\n').map_or(0, |at| at + 1);
+        }
+        self.source
+            .truncate(if append { self.source.len() } else { 0 });
+        self.source.push_str(&text[self.source.len()..]);
+        #[cfg(test)]
+        {
+            self.parsed_bytes += text.len() - boundary;
+        }
+        self.tree.blocks.retain(|block| block.range.end <= boundary);
+        self.tree
+            .blocks
+            .extend(parse_at(&text[boundary..], boundary, false).blocks);
+        // Display repairs flush at blank lines, not Markdown block borders.
+        // Adjacent blocks may therefore share one synthetic closer.
+        self.display_full |= self.tree.blocks.windows(2).any(|pair| {
+            let between = &text[pair[0].range.start..pair[1].range.start];
+            between[between.trim_end().len()..].matches('\n').count() < 2
+        });
+        self.display.truncate(
+            self.tree
+                .blocks
+                .iter()
+                .zip(&self.display)
+                .take_while(|(block, (old, _))| Arc::ptr_eq(block, old))
+                .count(),
+        );
     }
     pub fn tree(&self) -> &BlockTree {
         &self.tree
     }
-    pub fn display_tree(&self) -> BlockTree {
-        parse_full(&mend_stream(&self.source))
+    pub fn display_tree(&mut self) -> BlockTree {
+        if self.full_only || self.display_full {
+            if !self.display_dirty {
+                return self
+                    .full_display
+                    .as_ref()
+                    .map_or_else(|| self.tree.clone(), |display| display.tree.clone());
+            }
+            self.display_dirty = false;
+            self.display = Vec::new();
+            let repaired = mend_stream(&self.source);
+            if repaired == self.source {
+                self.full_display = None;
+                return self.tree.clone();
+            }
+            let display = self.full_display.get_or_insert_with(|| DisplayCache {
+                source: self.source.clone(),
+                tree: self.tree.clone(),
+            });
+            display.set_text(repaired);
+            // Unrepaired prefix blocks share canonical storage, including on
+            // the next commit when its closing marker has finally arrived.
+            for (display, canonical) in display.tree.blocks.iter_mut().zip(&self.tree.blocks) {
+                if !Arc::ptr_eq(display, canonical) && display == canonical {
+                    *display = canonical.clone();
+                }
+            }
+            return display.tree.clone();
+        }
+        self.full_display = None;
+        for (index, block) in self.tree.blocks.iter().enumerate().skip(self.display.len()) {
+            let end = self
+                .tree
+                .blocks
+                .get(index + 1)
+                .map_or(self.source.len(), |next| next.range.start);
+            let source = &self.source[block.range.start..end];
+            let repaired = mend_stream(source);
+            let display = if repaired == source {
+                BlockTree {
+                    blocks: vec![block.clone()],
+                }
+            } else {
+                parse_full(&repaired)
+            };
+            self.display.push((block.clone(), display));
+        }
+        BlockTree {
+            blocks: self
+                .display
+                .iter()
+                .flat_map(|(_, tree)| tree.blocks.iter().cloned())
+                .collect(),
+        }
+    }
+    pub fn finish_display(&mut self) {
+        self.display = Vec::new();
+        self.full_display = None;
+        self.display_dirty = true;
+    }
+}
+
+/// Synthetic closing markers may change at the tail of a display repair.
+/// Keep the prefix before that edit and preserve whole-source fence context.
+#[derive(Default)]
+struct DisplayCache {
+    source: String,
+    tree: BlockTree,
+}
+impl DisplayCache {
+    fn set_text(&mut self, text: String) {
+        if self.source == text {
+            return;
+        }
+        let common = self
+            .source
+            .bytes()
+            .zip(text.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let prefix = self
+            .tree
+            .blocks
+            .partition_point(|block| block.range.end <= common);
+        let boundary = if text.contains("]:") || self.source.contains("]:") || prefix < 3 {
+            0
+        } else {
+            let at = self.tree.blocks[prefix - 3].range.start;
+            text[..at].rfind('\n').map_or(0, |at| at + 1)
+        };
+        self.tree.blocks.retain(|block| block.range.end <= boundary);
+        self.tree
+            .blocks
+            .extend(parse_at(&text[boundary..], boundary, false).blocks);
+        self.source = text;
     }
 }
 
@@ -272,29 +441,47 @@ pub(crate) fn parse_full_hard_breaks(text: &str) -> BlockTree {
 }
 
 fn parse_with_breaks(text: &str, hard_breaks: bool) -> BlockTree {
-    let mut events = Parser::new_ext(
+    parse_at(text, 0, hard_breaks)
+}
+
+fn parse_at(text: &str, base: usize, hard_breaks: bool) -> BlockTree {
+    let parser = Parser::new_ext(
         text,
         Options::ENABLE_TABLES
             | Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TASKLISTS
             | Options::ENABLE_MATH,
-    )
-    .map(|event| {
-        if hard_breaks && matches!(event, Event::SoftBreak) {
+    );
+    let mut tree = BlockTree::default();
+    let mut pending = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (event, range) in parser.into_offset_iter() {
+        if pending.is_empty() {
+            start = range.start;
+        }
+        match &event {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        pending.push(if hard_breaks && matches!(event, Event::SoftBreak) {
             Event::HardBreak
         } else {
             event
+        });
+        if depth == 0 {
+            let mut events = std::mem::take(&mut pending).into_iter().peekable();
+            tree.blocks
+                .extend(blocks(&mut events, None, 0).into_iter().map(|block| {
+                    Arc::new(TopBlock {
+                        range: base + start..base + range.end,
+                        block,
+                    })
+                }));
         }
-    })
-    .collect::<Vec<_>>()
-    .into_iter()
-    .peekable();
-    BlockTree {
-        blocks: blocks(&mut events, None, 0)
-            .into_iter()
-            .map(|block| Arc::new(TopBlock { block }))
-            .collect(),
     }
+    tree
 }
 fn blocks(events: &mut Events<'_>, until: Option<TagEnd>, depth: usize) -> Vec<Block> {
     let mut out = Vec::new();
@@ -302,9 +489,15 @@ fn blocks(events: &mut Events<'_>, until: Option<TagEnd>, depth: usize) -> Vec<B
         match event {
             Event::End(end) if until == Some(end) => break,
             Event::Start(tag) if depth < 32 => match tag {
-                Tag::Paragraph => out.push(Block::Paragraph {
-                    runs: inlines(events, TagEnd::Paragraph),
-                }),
+                Tag::Paragraph => {
+                    if let Some(visual) = placed_visual(events) {
+                        out.push(visual);
+                        continue;
+                    }
+                    out.push(Block::Paragraph {
+                        runs: inlines(events, TagEnd::Paragraph),
+                    })
+                }
                 Tag::Heading { level, .. } => {
                     let number = match level {
                         HeadingLevel::H1 => 1,
@@ -455,6 +648,39 @@ fn blocks(events: &mut Events<'_>, until: Option<TagEnd>, depth: usize) -> Vec<B
     }
     out
 }
+/// A paragraph that is only a `visual:` image places that visual. Consumes
+/// the paragraph when it matches; leaves the events untouched otherwise.
+fn placed_visual(events: &mut Events<'_>) -> Option<Block> {
+    let id = match events.peek()? {
+        Event::Start(Tag::Image { dest_url, .. }) => dest_url
+            .strip_prefix("visual:")
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 96
+                    && id
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+            })?
+            .to_owned(),
+        _ => return None,
+    };
+    events.next();
+    let mut caption = String::new();
+    for event in events.by_ref() {
+        match event {
+            Event::End(TagEnd::Image) => break,
+            Event::Text(text) | Event::Code(text) => caption.push_str(&text),
+            _ => {}
+        }
+    }
+    // Anything after the image on the same line stays prose.
+    let rest = inlines(events, TagEnd::Paragraph);
+    let rest: String = rest.iter().map(|r| r.text.as_str()).collect();
+    if !rest.trim().is_empty() {
+        caption = format!("{caption} {}", rest.trim()).trim().to_owned();
+    }
+    Some(Block::Visual { id, caption })
+}
 fn inlines(events: &mut Events<'_>, end: TagEnd) -> Vec<InlineRun> {
     let mut out = Vec::new();
     while let Some(event) = events.next() {
@@ -533,3 +759,7 @@ mod note_break_tests {
         assert_eq!(code, "one\ntwo\n");
     }
 }
+
+#[cfg(test)]
+#[path = "markdown_model/streaming_tests.rs"]
+mod streaming_tests;

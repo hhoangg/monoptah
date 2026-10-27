@@ -4,7 +4,11 @@ use gpui::{
     AnyElement, App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId,
     InspectorElementId, IntoElement, LayoutId, Pixels, Style, Window, size,
 };
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 /// Measure the expanded child at the current width before interpolating height.
 /// Estimates or heights from an earlier width cause a snap when motion finishes.
@@ -83,6 +87,70 @@ impl Element for Disclosure {
 }
 
 pub(crate) const WORD_FADE: Duration = Duration::from_millis(320);
+struct FadeGroup {
+    words: Range<usize>,
+    born: Instant,
+    duration: Duration,
+    opacity: f32,
+}
+
+/// Only the short, still-fading suffix needs timing data. Words committed
+/// together share a timestamp and one easing calculation per frame.
+#[derive(Default)]
+pub(crate) struct WordFades {
+    groups: VecDeque<FadeGroup>,
+    words: usize,
+}
+impl WordFades {
+    pub fn advance(&mut self, now: Instant) {
+        self.groups
+            .retain(|group| now.duration_since(group.born) < group.duration);
+        for group in &mut self.groups {
+            group.opacity = bezier(
+                now.duration_since(group.born).as_secs_f32() / group.duration.as_secs_f32(),
+                0.,
+                0.,
+                0.58,
+                1.,
+            );
+        }
+    }
+    fn append(&mut self, count: usize, now: Instant, duration: Duration, animate: bool) {
+        self.advance(now);
+        if count < self.words {
+            self.groups.retain(|group| group.words.start < count);
+            if let Some(group) = self.groups.back_mut() {
+                group.words.end = group.words.end.min(count);
+            }
+        } else if animate && count > self.words {
+            self.groups.push_back(FadeGroup {
+                words: self.words..count,
+                born: now,
+                duration,
+                opacity: 0.,
+            });
+        }
+        self.words = count;
+    }
+    pub fn opacity(&self, word: usize) -> f32 {
+        self.groups
+            .get(self.groups.partition_point(|group| group.words.end <= word))
+            .filter(|group| group.words.contains(&word))
+            .map_or(1., |group| group.opacity)
+    }
+    pub fn intersects(&self, words: Range<usize>) -> bool {
+        words.start < words.end
+            && self
+                .groups
+                .iter()
+                .any(|group| group.words.start < words.end && group.words.end > words.start)
+    }
+    fn active(&self, now: Instant) -> bool {
+        self.groups
+            .iter()
+            .any(|group| now.duration_since(group.born) < group.duration)
+    }
+}
 pub(crate) struct PacedText {
     target: String,
     shown: usize,
@@ -90,7 +158,9 @@ pub(crate) struct PacedText {
     last: Instant,
     burst: Instant,
     animate: bool,
-    pub births: Vec<Instant>,
+    gap_ms: f64,
+    skip_fade: bool,
+    pub fades: WordFades,
 }
 impl PacedText {
     pub fn new(text: &str, animate: bool, now: Instant) -> Self {
@@ -101,7 +171,9 @@ impl PacedText {
             last: now,
             burst: now,
             animate,
-            births: Vec::new(),
+            gap_ms: 160.,
+            skip_fade: false,
+            fades: WordFades::default(),
         }
     }
     pub fn update(&mut self, text: &str, now: Instant) {
@@ -111,9 +183,13 @@ impl PacedText {
         if !text.starts_with(&self.target) {
             self.shown = 0;
             self.position = 0.;
-            self.births.clear();
+            self.fades = WordFades::default();
+            self.target.clear();
+        } else {
+            self.gap_ms = self.gap_ms * 0.7
+                + (now.duration_since(self.burst).as_secs_f64() * 1000.).min(1000.) * 0.3;
         }
-        self.target = text.into();
+        self.target.push_str(&text[self.target.len()..]);
         self.burst = now;
         if !self.animate {
             self.shown = text.len();
@@ -161,28 +237,23 @@ impl PacedText {
         false
     }
     pub fn words(&mut self, count: usize, now: Instant) {
-        let born = if self.animate { now } else { now - WORD_FADE };
-        self.births.resize(count, born);
+        self.fades.append(
+            count,
+            now,
+            Duration::from_secs_f64((self.gap_ms * 0.003).clamp(0.12, WORD_FADE.as_secs_f64())),
+            self.animate && !self.skip_fade,
+        );
+        self.skip_fade = false;
     }
     pub fn active(&self, now: Instant) -> bool {
-        self.behind()
-            || self
-                .births
-                .last()
-                .is_some_and(|born| now.duration_since(*born) < WORD_FADE)
+        self.behind() || self.fades.active(now)
     }
-    pub fn settle(&mut self, now: Instant) {
+    pub fn settle(&mut self, _now: Instant) {
         self.shown = self.target.len();
         self.position = self.shown as f64;
-        self.births.fill(now - WORD_FADE);
+        self.fades.groups = VecDeque::new();
+        self.skip_fade = true;
     }
-}
-pub(crate) fn word_opacity(born: Option<&Instant>, now: Instant) -> f32 {
-    born.map_or(1., |born| {
-        let t = (now.duration_since(*born).as_secs_f32() / WORD_FADE.as_secs_f32()).clamp(0., 1.);
-        // CSS ease-out (0,0,.58,1), rather than a linear opacity ramp.
-        bezier(t, 0., 0., 0.58, 1.)
-    })
 }
 pub(crate) fn bezier(t: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
     if t <= 0. {
@@ -317,6 +388,47 @@ impl Motion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fade_state_tracks_active_groups_instead_of_all_words() {
+        let now = Instant::now();
+        let mut fades = WordFades::default();
+        for n in 1..=500 {
+            fades.append(
+                n * 200,
+                now + Duration::from_millis(n as u64 * 33),
+                WORD_FADE,
+                true,
+            );
+            assert!(fades.groups.len() <= 10);
+        }
+        assert_eq!(fades.words, 100_000);
+        assert_eq!(fades.opacity(0), 1.);
+        let end = now + Duration::from_secs(18);
+        fades.advance(end);
+        assert!(fades.groups.is_empty());
+        fades.append(100_002, end, WORD_FADE, true);
+        assert_eq!(fades.groups.len(), 1);
+        assert_eq!(fades.groups[0].words, 100_000..100_002);
+    }
+
+    #[test]
+    fn settling_never_replays_old_words_and_cadence_is_bounded() {
+        let now = Instant::now();
+        let mut text = PacedText::new("one two", true, now);
+        text.words(2, now);
+        text.settle(now);
+        text.words(2, now);
+        assert!(text.fades.groups.is_empty());
+        text.update("one two three", now + Duration::from_millis(20));
+        text.words(3, now + Duration::from_millis(20));
+        assert_eq!(text.fades.groups[0].words, 2..3);
+        let duration = text.fades.groups[0].duration;
+        assert!((Duration::from_millis(120)..=WORD_FADE).contains(&duration));
+        text.update("one two three four", now + Duration::from_secs(2));
+        text.words(4, now + Duration::from_secs(2));
+        assert_eq!(text.fades.groups[0].duration, WORD_FADE);
+    }
     #[test]
     fn phase_matches_react_height_fade_and_chevron_timings_in_both_directions() {
         let start = Instant::now();

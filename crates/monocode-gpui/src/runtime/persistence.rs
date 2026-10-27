@@ -3,7 +3,9 @@
 use super::*;
 use std::time::Instant;
 
-const SHARED_SAVE_INTERVAL: Duration = Duration::from_millis(250);
+// Match the desktop's routine-save window. Accepted messages and settled turns
+// still commit immediately, independently of this streaming debounce.
+const SHARED_SAVE_INTERVAL: Duration = Duration::from_millis(650);
 
 pub(super) struct PendingSave {
     from: Option<usize>,
@@ -144,6 +146,8 @@ mod tests {
             pending.changed(transcript.append(text));
         }
         assert!(!pending.due(false, now + Duration::from_millis(200)));
+        assert!(!pending.due(false, now + Duration::from_millis(600)));
+        assert!(pending.due(true, now + Duration::from_millis(200)));
         assert!(pending.due(false, now + SHARED_SAVE_INTERVAL));
         assert!(
             locked(&store).unwrap().load(id).unwrap().rows[1]

@@ -298,27 +298,6 @@ fn the_support_probe_reads_the_database(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_apps_own_quick_compose_is_a_chat_whatever_the_preference(cx: &mut TestAppContext) {
-    let (window, _, _) = window(cx);
-    let before = window
-        .update(cx, |shell, _, cx| {
-            all_terminal(shell);
-            let before = known(shell);
-            shell.create_chat(Kind::Codex, cx);
-            before
-        })
-        .unwrap();
-    cx.run_until_parked();
-    window
-        .update(cx, |shell, _, _| {
-            let ids = since(shell, &before);
-            assert_eq!(ids.len(), 1);
-            assert_chat(shell, ids[0]);
-        })
-        .unwrap();
-}
-
-#[gpui::test]
 fn a_handoff_or_second_opinion_is_a_chat_whatever_the_preference(cx: &mut TestAppContext) {
     use crate::response_actions::Transfer;
     use monocode_core::response::{Target, TransferKind};

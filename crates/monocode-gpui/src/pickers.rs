@@ -255,6 +255,8 @@ pub(crate) struct ModelList {
     missing: Vec<Kind>,
     switch_allowed: bool,
     hidden: Vec<String>,
+    /// QuickModelSelector.tsx: providers as tabs above the search and list.
+    quick: bool,
     tab: ModelTab,
     highlighted: usize,
     search: Entity<input::Input>,
@@ -296,6 +298,7 @@ impl ModelList {
             missing: Vec::new(),
             switch_allowed: true,
             hidden: Vec::new(),
+            quick: false,
             tab: cx
                 .try_global::<crate::settings::Preferences>()
                 .and_then(|prefs| prefs.model_picker_tab.as_deref())
@@ -334,6 +337,61 @@ impl ModelList {
         }
         self.hidden = hidden;
         self
+    }
+    /// The quick composer's inline selector: providers in a row of tabs,
+    /// a favorite star on every model, and no hover-to-switch.
+    pub(crate) fn quick(mut self, cx: &mut Context<Self>) -> Self {
+        self.quick = true;
+        self.search.update(cx, |search, cx| {
+            search.set_placeholder("Search models…", cx)
+        });
+        self
+    }
+    /// Follow a pick made through this list, keeping it open.
+    pub(crate) fn set_current(
+        &mut self,
+        kind: Kind,
+        model: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.provider = kind;
+        self.current = model;
+        cx.notify();
+    }
+    /// The live catalog entry behind a choice, once discovery has run.
+    pub(crate) fn catalog_model(&self, kind: Kind, id: Option<&str>) -> Option<&Model> {
+        let models = &self.catalogs.iter().find(|(k, _)| *k == kind)?.1;
+        match id {
+            Some(id) => models.iter().find(|m| m.id == id),
+            None => models.iter().find(|m| m.default).or(models.first()),
+        }
+    }
+    fn favorite(&self, kind: Kind, id: Option<&str>, cx: &gpui::App) -> bool {
+        cx.try_global::<crate::settings::Preferences>()
+            .is_some_and(|prefs| {
+                prefs
+                    .favorite_models
+                    .iter()
+                    .any(|c| c.provider == kind.id() && c.model.as_deref() == id)
+            })
+    }
+    fn toggle_favorite(&mut self, kind: Kind, id: Option<String>, cx: &mut Context<Self>) {
+        if !cx.has_global::<crate::settings::Preferences>() {
+            return;
+        }
+        cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
+            let before = prefs.favorite_models.len();
+            prefs
+                .favorite_models
+                .retain(|c| !(c.provider == kind.id() && c.model == id));
+            if prefs.favorite_models.len() == before {
+                prefs.favorite_models.push(crate::settings::ModelChoice {
+                    provider: kind.id().into(),
+                    model: id,
+                });
+            }
+        });
+        cx.notify();
     }
     pub(crate) fn allow_provider_switch(mut self, allowed: bool) -> Self {
         self.switch_allowed = allowed;
@@ -664,7 +722,7 @@ impl ModelList {
             })
             // Hovering an unselected provider selects it, as in the rail.
             .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
-                if *hovered {
+                if *hovered && !this.quick {
                     this.select_tab(tab, window, cx);
                 }
             }))
@@ -674,6 +732,9 @@ impl ModelList {
 }
 impl Render for ModelList {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.quick {
+            return self.render_quick(cx);
+        }
         let entries = self.entries(cx);
         let kind = match self.tab {
             ModelTab::Harness(kind) => Some(kind),
@@ -884,6 +945,235 @@ impl Render for ModelList {
                             }),
                     ),
             )
+            .into_any_element()
+    }
+}
+impl ModelList {
+    fn render_quick(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let entries = self.entries(cx);
+        let kind = match self.tab {
+            ModelTab::Harness(kind) => Some(kind),
+            _ => None,
+        };
+        let loading = kind.is_some_and(|kind| self.loading.contains(&kind));
+        let query = !self.query(cx).is_empty();
+        let empty = entries.is_empty().then(|| {
+            if query {
+                "No matching models"
+            } else if kind.is_none() {
+                "No favorite models"
+            } else if loading {
+                "Loading models…"
+            } else {
+                "No models"
+            }
+        });
+        let favorites = kind.is_none();
+        let rows: Vec<AnyElement> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(ix, entry)| {
+                let highlighted = self.highlighted == ix;
+                let current = entry.kind == self.provider && entry.id == self.current;
+                let starred = self.favorite(entry.kind, entry.id.as_deref(), cx);
+                let (star_kind, star_id) = (entry.kind, entry.id.clone());
+                div()
+                    .id(("quick-model", ix))
+                    .group("quick-model-row")
+                    .flex_shrink_0()
+                    .h(px(32.))
+                    .rounded(px(8.))
+                    .flex()
+                    .items_center()
+                    .when(highlighted, |d| d.bg(content(0.1)))
+                    .when(!highlighted, |d| d.hover(|s| s.bg(content(0.06))))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.highlighted = ix;
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .id(("quick-model-option", ix))
+                            .role(Role::ListBoxOption)
+                            .aria_label(entry.name.clone())
+                            .aria_selected(current)
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(13.))
+                            .text_color(content(1.))
+                            .when(!entry.enabled, |d| d.opacity(0.35))
+                            .when(entry.enabled, |d| d.cursor_pointer())
+                            .when(favorites, |d| d.child(provider_icon(entry.kind.id(), 14.)))
+                            .child(div().min_w_0().truncate().child(entry.name.clone()))
+                            .when(current, |d| {
+                                d.child(icon("check-2", 14.).ml_auto().text_color(accent_color()))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, cx))),
+                    )
+                    .child(
+                        div()
+                            .id(("quick-model-star", ix))
+                            .role(Role::Button)
+                            .aria_label(format!(
+                                "{} {} {} favorites",
+                                if starred { "Remove" } else { "Add" },
+                                entry.name,
+                                if starred { "from" } else { "to" }
+                            ))
+                            .group("quick-model-star")
+                            .cursor_pointer()
+                            .size(px(32.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                icon(if starred { "star-filled" } else { "star" }, 14.)
+                                    .text_color(content(0.35))
+                                    .group_hover("quick-model-star", |s| s.text_color(content(1.))),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_favorite(star_kind, star_id.clone(), cx)
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let tabs: Vec<ModelTab> = std::iter::once(ModelTab::Favorites)
+            .chain(
+                Kind::ALL
+                    .into_iter()
+                    .filter(|kind| {
+                        *kind == self.provider
+                            || (!self.hidden.iter().any(|id| id == kind.id())
+                                && !self.missing.contains(kind))
+                    })
+                    .map(ModelTab::Harness),
+            )
+            .collect();
+        div()
+            .id("quick-model-selector")
+            .role(Role::Group)
+            .aria_label("Model selector")
+            .w_full()
+            .flex()
+            .flex_col()
+            .capture_action(cx.listener(|this, _: &input::Up, _, cx| {
+                this.step(-1, cx);
+                cx.stop_propagation();
+            }))
+            .capture_action(cx.listener(|this, _: &input::Down, _, cx| {
+                this.step(1, cx);
+                cx.stop_propagation();
+            }))
+            .capture_action(cx.listener(|this, _: &input::Submit, _, cx| {
+                this.pick(this.highlighted, cx);
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .id("quick-model-providers")
+                    .role(Role::TabList)
+                    .aria_label("Providers")
+                    .h(px(44.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .border_b_1()
+                    .border_color(content(0.08))
+                    .children(tabs.into_iter().map(|tab| {
+                        let selected = self.tab == tab;
+                        let id: SharedString = match tab {
+                            ModelTab::Favorites => "quick-tab-favorites".into(),
+                            ModelTab::Harness(kind) => format!("quick-tab-{}", kind.id()).into(),
+                        };
+                        let label = match tab {
+                            ModelTab::Favorites => "Favorites",
+                            ModelTab::Harness(kind) => kind.label(),
+                        };
+                        div()
+                            .id(id.clone())
+                            .role(Role::Tab)
+                            .aria_label(label)
+                            .aria_selected(selected)
+                            .group(id.clone())
+                            .cursor_pointer()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(32.))
+                            .rounded(px(8.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(selected, |d| d.bg(content(0.1)))
+                            .when(!selected, |d| {
+                                d.opacity(0.4).hover(|s| s.opacity(1.).bg(content(0.06)))
+                            })
+                            .child(match tab {
+                                ModelTab::Favorites => {
+                                    icon(if selected { "star-filled" } else { "star" }, 16.)
+                                        .text_color(content(1.))
+                                        .into_any_element()
+                                }
+                                ModelTab::Harness(kind) => {
+                                    provider_icon(kind.id(), 16.).into_any_element()
+                                }
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_tab(tab, window, cx)
+                            }))
+                    })),
+            )
+            .child(
+                div()
+                    .h(px(40.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(content(0.08))
+                    .text_size(px(13.))
+                    .text_color(content(1.))
+                    .child(icon("search", 14.).text_color(content(0.4)))
+                    .child(div().flex_1().min_w_0().child(self.search.clone())),
+            )
+            .child(
+                div()
+                    .id("quick-model-list")
+                    .role(Role::ListBox)
+                    .aria_label("Models")
+                    .h(px(240.))
+                    .flex_shrink_0()
+                    .overflow_y_scroll()
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .when_some(empty, |d, text| {
+                        d.child(
+                            div()
+                                .px_2()
+                                .py_6()
+                                .flex()
+                                .justify_center()
+                                .text_size(px(12.))
+                                .text_color(content(0.45))
+                                .child(text),
+                        )
+                    })
+                    .children(rows),
+            )
+            .into_any_element()
     }
 }
 
@@ -1018,7 +1308,7 @@ impl ProjectPicker {
     }
 }
 /// `prettyParent`: the folder holding a project, with the home folder as `~`.
-fn pretty_parent(path: &str) -> String {
+pub(crate) fn pretty_parent(path: &str) -> String {
     let parent = std::path::Path::new(path)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())

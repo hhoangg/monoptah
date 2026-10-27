@@ -6,7 +6,7 @@ use super::{
     StartedSession, WorkflowHost,
 };
 use crate::conversation::{TurnEnd, WorkflowTurn};
-use crate::monos::host::{Effect, StartOptions};
+use crate::monos::host::{Effect, StartContext, StartOptions};
 use crate::monos::*;
 use async_channel::{Receiver, Sender, bounded};
 use gpui::AsyncApp;
@@ -356,9 +356,15 @@ impl Monos {
         let options = StartOptions {
             lenient_parent: true,
             visible: true,
+            catalog_checked: true,
+        };
+        let context = StartContext {
+            request: mono::new_id(),
+            placement: None,
+            options,
         };
         let work =
-            self.prepare_start(&mono, req.project.clone(), Some(chat), &input, options, cx)?;
+            self.prepare_start(&mono, req.project.clone(), Some(chat), &input, context, cx)?;
         // The catalog check may start a CLI, so it runs with the rest off the UI thread.
         let check = (harness.is_some() || req.model.is_some() || req.effort.is_some()).then(|| {
             Node::new(

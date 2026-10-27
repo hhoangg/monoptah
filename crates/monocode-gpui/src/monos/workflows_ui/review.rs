@@ -143,7 +143,7 @@ fn verbatim(text: &str) -> Div {
         .bg(content(0.05))
         .px_2p5()
         .py_2()
-        .font_family(crate::markdown::MONO)
+        .font_family(crate::fonts::mono())
         .text_size(px(11.))
         .line_height(px(16.))
         .text_color(content(0.75))

@@ -55,9 +55,14 @@ macOS is the primary verified preview target. Remaining verification includes
 accessibility, IME and scroll profiling, crash/recovery testing and actual
 packaged upgrades.
 
-Linux and Windows GUI builds and interaction have not been verified. In
-particular, HTML panels currently use a text fallback, native notification
-delivery is unavailable, and media hosting still needs platform support.
+On October 25, a Linux ARM64 source build was launched and exercised in an
+Ubuntu 24.04 Noodle VM using Rust 1.98 and a VM-specific graphics workaround.
+This covered launch and basic UI interaction, not live provider requests or
+installation/upgrades of the downloadable Linux x64 packages. Windows GUI
+execution remains unverified.
+
+On Linux and Windows, HTML panels currently use a text fallback, native
+notification delivery is unavailable, and media hosting still needs platform support.
 Windows close-to-tray behavior also needs implementation/verification.
 Desktop webview preferences (theme, projects, model defaults, and related
 settings) are read from the installed app on Linux as well as macOS. The Windows

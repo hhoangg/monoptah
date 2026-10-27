@@ -656,6 +656,19 @@ impl Terminal {
         self.foreground = label;
         cx.emit(TerminalEvent::Changed);
     }
+    /// Hangs up the job holding the terminal, leaving the shell at its prompt.
+    pub(crate) fn stop_foreground(&mut self, cx: &mut Context<Self>) {
+        #[cfg(unix)]
+        if self.master_fd >= 0 && !self.exited {
+            let pgrp = unsafe { libc::tcgetpgrp(self.master_fd) };
+            if pgrp > 1 && pgrp != self.shell_pid as i32 {
+                unsafe {
+                    libc::kill(-pgrp, libc::SIGHUP);
+                }
+            }
+        }
+        self.set_foreground(None, cx);
+    }
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
         if let Some(sender) = &self.sender {
             let _ = sender.send(Msg::Input(bytes.into()));
@@ -748,6 +761,18 @@ impl Terminal {
     }
 
     /// The cell under a window position, and which half of it.
+    /// The zero-based viewport line and column under a pointer.
+    fn viewport_cell(&self, position: gpui::Point<gpui::Pixels>) -> (usize, usize) {
+        let Some(g) = self.geometry.get() else {
+            return (0, 0);
+        };
+        let x = ((position.x - g.origin.x) / g.cell.width).max(0.);
+        let y = ((position.y - g.origin.y) / g.cell.height).max(0.);
+        (
+            (y as usize).min(self.size.lines.saturating_sub(1)),
+            (x as usize).min(self.size.columns.saturating_sub(1)),
+        )
+    }
     fn grid_point(&self, position: gpui::Point<gpui::Pixels>) -> Option<(GridPoint, Side)> {
         let g = self.geometry.get()?;
         let x = ((position.x - g.origin.x) / g.cell.width).max(0.);
@@ -882,8 +907,13 @@ impl Terminal {
             return;
         }
         let mode = *self.term.lock().mode();
+        // A program tracking the mouse gets the wheel itself.
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            let (line, column) = self.viewport_cell(event.position);
+            let report = wheel_report(lines > 0, line, column, mode);
+            self.write(report.repeat(lines.unsigned_abs() as usize));
         // A full-screen program scrolls itself; the shell scrolls history.
-        if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
             let key: &[u8] = match (lines > 0, mode.contains(TermMode::APP_CURSOR)) {
                 (true, true) => b"\x1bOA",
                 (true, false) => b"\x1b[A",
@@ -1322,7 +1352,7 @@ fn cell_rect(
 }
 
 fn mono_font() -> Font {
-    gpui::font(crate::markdown::MONO)
+    gpui::font(crate::fonts::mono())
 }
 fn selection_fill() -> Hsla {
     crate::theme::text_selection()
@@ -1739,11 +1769,34 @@ fn is_shell_name(name: &str) -> bool {
     )
 }
 
+/// One wheel notch as a mouse report, SGR when asked for, else the legacy
+/// X10 encoding (which cannot address past column or line 223).
+fn wheel_report(up: bool, line: usize, column: usize, mode: TermMode) -> Vec<u8> {
+    let button = if up { 64 } else { 65 };
+    if mode.contains(TermMode::SGR_MOUSE) {
+        format!("\x1b[<{button};{};{}M", column + 1, line + 1).into_bytes()
+    } else {
+        let cell = |n: usize| (n.min(222) + 33) as u8;
+        vec![0x1b, b'[', b'M', button + 32, cell(column), cell(line)]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alacritty_terminal::index::Line;
     use gpui::{AppContext, Modifiers};
+
+    #[test]
+    fn wheel_reports_match_the_requested_encoding() {
+        let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(wheel_report(true, 4, 9, sgr), b"\x1b[<64;10;5M");
+        assert_eq!(wheel_report(false, 0, 0, sgr), b"\x1b[<65;1;1M");
+        assert_eq!(
+            wheel_report(true, 4, 9, TermMode::MOUSE_REPORT_CLICK),
+            [0x1b, b'[', b'M', 96, 42, 37]
+        );
+    }
 
     fn key(spec: &str) -> Keystroke {
         Keystroke::parse(spec).unwrap()

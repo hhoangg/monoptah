@@ -129,7 +129,8 @@ fn validate_event(node: &Node, id: &str, value: &serde_json::Value) -> Option<Re
     let accepted = match node {
         Node::Column { children, .. }
         | Node::Row { children, .. }
-        | Node::Grid { children, .. } => {
+        | Node::Grid { children, .. }
+        | Node::Card { children, .. } => {
             return children
                 .iter()
                 .find_map(|child| validate_event(child, id, value));
@@ -190,7 +191,8 @@ fn collect_probes(node: &Node, probes: &mut Vec<(String, serde_json::Value)>) {
     match node {
         Node::Column { children, .. }
         | Node::Row { children, .. }
-        | Node::Grid { children, .. } => {
+        | Node::Grid { children, .. }
+        | Node::Card { children, .. } => {
             for child in children {
                 collect_probes(child, probes);
             }

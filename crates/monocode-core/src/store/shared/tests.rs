@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+fn desktop_operator_access_restores_only_from_submitted_user_messages() {
+    for (block, enabled) in [
+        (
+            json!({"role":"user", "text":"Start a session", "monocode":true}),
+            true,
+        ),
+        (json!({"role":"user", "text":"/mono Start a session"}), true),
+        (
+            json!({"role":"user", "text":"/monocode Start a session"}),
+            true,
+        ),
+        (
+            json!({"role":"user", "text":"Start a session", "monocode":true, "draft":true}),
+            false,
+        ),
+        (
+            json!({"role":"user", "text":"Start a session", "monocode":true, "internal":true}),
+            false,
+        ),
+        (
+            json!({"role":"assistant", "text":"/mono Start a session", "monocode":true}),
+            false,
+        ),
+        (json!({"role":"user", "text":"Start a session"}), false),
+    ] {
+        let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+        let (id, _) = saved(&store, json!([block]));
+        assert_eq!(
+            store.agent_settings(id).unwrap().unwrap().operator_enabled,
+            enabled
+        );
+    }
+}
+
+#[test]
+fn saved_turn_metrics_reload_with_the_same_revision() {
+    // Without exact float parsing these reload one ULP away, and the next
+    // save reports the conversation as changed in another window.
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let id = store.create("codex", "/project").unwrap().id;
+    let blocks = [95.12525746447635, 99.55200675204587, 98.15813953488373]
+        .map(|percent| {
+            json!({"id":percent.to_string(),"role":"assistant","text":"Done",
+            "turnMetrics":{"cacheHitPercent":percent}})
+        })
+        .to_vec();
+    store.shared_store_blocks(id, &blocks).unwrap();
+    assert!(HistoryRevision::of(&blocks).matches(&store.shared_blocks(id).unwrap()));
+}
+
+#[test]
 fn streamed_indexed_mono_load_preserves_projection_and_revision_guards() {
     let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
     let legacy = include_str!("../../../../../src-tauri/src/mono_transcript.rs");
@@ -50,6 +101,150 @@ fn streamed_indexed_mono_load_preserves_projection_and_revision_guards() {
             .unwrap_err();
         assert!(error.contains("changed in another window"), "{error}");
     }
+}
+
+fn indexed_mono(store: &mut Store, turns: usize) -> (i64, String, Vec<Value>) {
+    let legacy = include_str!("../../../../../src-tauri/src/mono_transcript.rs");
+    let schema = legacy
+        .split("CREATE TABLE IF NOT EXISTS mono_transcripts (")
+        .nth(1)
+        .unwrap()
+        .split("\",")
+        .next()
+        .unwrap();
+    store
+        .conn
+        .execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS mono_transcripts ({schema}"
+        ))
+        .unwrap();
+    let blocks = (0..turns)
+        .flat_map(|turn| {
+            [
+                json!({"id":format!("prompt-{turn}"),"role":"user","text":format!("Question {turn}"),
+                       "sentAt":turn,"startedAt":turn,"durationMs":5,
+                       "turnModel":{"harness":"codex","id":"codex:model","name":"Model"}}),
+                json!({"id":format!("answer-{turn}"),"role":"assistant","text":format!("Answer {turn}")}),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let id = store.create("codex", "/project").unwrap().id;
+    let original = store.persisted_session_id(id).unwrap();
+    store
+        .conn
+        .execute("INSERT INTO mono_transcripts VALUES(?1)", [&original])
+        .unwrap();
+    store.shared_store_blocks(id, &blocks).unwrap();
+    // As a newly opened store would: no window or revision chosen yet.
+    store.shared.as_ref().unwrap().windows.borrow_mut().clear();
+    store
+        .shared
+        .as_ref()
+        .unwrap()
+        .snapshots
+        .borrow_mut()
+        .clear();
+    (id, original, blocks)
+}
+
+#[test]
+fn desktop_habit_reports_are_dated_by_their_run() {
+    let rows = blocks::project(&[
+        json!({"id":"habit","role":"assistant","text":"Report","monoHabit":{"at":1792224228054u64,"id":"h"}}),
+        json!({"id":"sent","role":"assistant","text":"Reply","sentAt":5,"monoHabit":{"at":9}}),
+    ])
+    .unwrap();
+    assert_eq!(rows[0].sent_at, Some(1792224228054));
+    assert_eq!(rows[1].sent_at, Some(5), "an explicit send time wins");
+}
+
+#[test]
+fn a_long_indexed_mono_opens_on_its_newest_turns_and_pages_older_ones() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let (id, _, blocks) = indexed_mono(&mut store, 25);
+
+    let window = store.load(id).unwrap();
+    assert_eq!(window.rows, blocks::project(&blocks[30..]).unwrap());
+    assert_eq!(window.rows[0].text, "Question 15");
+    let turns = store.agent_settings(id).unwrap().unwrap().turns;
+    assert!(turns.contains_key(&1), "receipts count from the window");
+    assert_eq!(turns[&1].started_at, Some(15));
+
+    let before = store.history_before(id).unwrap().unwrap();
+    let page = store.load_before(id, before, false).unwrap();
+    assert_eq!(page.rows, blocks::project(&blocks[10..30]).unwrap());
+    assert_eq!(page.turns[&1].started_at, Some(5));
+    let last = store.load_before(id, page.before.unwrap(), false).unwrap();
+    assert_eq!(last.rows, blocks::project(&blocks[..10]).unwrap());
+    assert_eq!(last.before, None);
+    let all = store.load_before(id, before, true).unwrap();
+    assert_eq!(all.rows, blocks::project(&blocks[..30]).unwrap());
+    assert_eq!(all.before, None);
+
+    // The window stays put once rows are numbered from it.
+    let mut grown = Transcript {
+        rows: window.rows.clone(),
+    };
+    let from = grown.begin("user");
+    grown.append("Continue");
+    store.write_rows(id, from, &grown.rows[from..]).unwrap();
+    assert_eq!(store.load(id).unwrap().rows, grown.rows);
+    assert_eq!(store.history_before(id).unwrap(), Some(before));
+}
+
+#[test]
+fn window_saves_never_rewrite_or_drop_turns_before_it() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let (id, original, blocks) = indexed_mono(&mut store, 25);
+    let older = |store: &Store| {
+        let mut query = store
+            .conn
+            .prepare("SELECT seq,block_json FROM mono_blocks WHERE session_id=?1 AND block_id GLOB '*-[0-9]' ORDER BY seq")
+            .unwrap();
+        query
+            .query_map([&original], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let before = older(&store);
+    assert_eq!(before.len(), 20, "turns 0-9 sit before the window");
+
+    // Rewriting the window's first message re-sequences the window only.
+    let mut window = store.load(id).unwrap();
+    window.rows[0].text = "Edited question".into();
+    store.write_rows(id, 0, &window.rows[..1]).unwrap();
+    let mut inserted = store.shared_blocks(id).unwrap();
+    inserted.insert(
+        1,
+        json!({"id":"inserted","role":"assistant","text":"Inserted"}),
+    );
+    store.shared_store_blocks(id, &inserted).unwrap();
+
+    assert_eq!(older(&store), before);
+    assert_eq!(store.shared_all_blocks(id).unwrap()[..30], blocks[..30]);
+    assert_eq!(store.shared_blocks(id).unwrap(), inserted);
+    assert_eq!(
+        store.shared_blocks(id).unwrap()[0]["text"],
+        "Edited question"
+    );
+    let turns: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM mono_turns WHERE session_id=?1",
+            [&original],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(turns, 25);
+    // A store opened after the insertion still sees all 25 turns in order.
+    store.shared.as_ref().unwrap().windows.borrow_mut().clear();
+    let page = store
+        .load_before(id, store.history_before(id).unwrap().unwrap(), true)
+        .unwrap();
+    assert_eq!(page.rows, blocks::project(&blocks[..30]).unwrap());
 }
 
 #[test]

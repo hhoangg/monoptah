@@ -12,6 +12,8 @@ use std::time::Duration;
 #[cfg(all(test, unix))]
 mod follow_up_tests;
 mod handoff;
+#[cfg(all(test, unix))]
+mod handoff_tests;
 mod persistence;
 pub(crate) mod remote;
 mod visual_discovery;
@@ -164,6 +166,7 @@ fn run_turn_using(
         transcript = locked(&store)?.load(summary.id)?;
         history_loaded = true;
         turn_start = transcript.rows.len();
+        settings.operator_enabled |= settings.operator;
         let mut persisted = settings.clone();
         persisted.handoff = None;
         // These modes belong to this turn, not the next composer draft.
@@ -307,6 +310,51 @@ fn run_turn_using(
             )?;
         }
         if let Some(source) = settings.pending_provider_switch.take() {
+            // The turn's first step: the outgoing model's recap can take a while.
+            let mut transfer = monocode_core::tool::ToolCall::new(
+                "provider-handoff",
+                monocode_core::tool::HANDOFF,
+            );
+            let from = if source.model_label.is_empty() {
+                Kind::from_id(&source.from).label()
+            } else {
+                source.model_label.as_str()
+            };
+            transfer.input = serde_json::json!({ "from": from }).to_string();
+            let transfer_row = transcript.begin("tool");
+            transcript.rows[transfer_row].text =
+                serde_json::to_string(&transfer).map_err(|e| e.to_string())?;
+            pending.changed(transfer_row);
+            publish(
+                &tx,
+                &cancel,
+                Update {
+                    worktree_cwd: None,
+                    commands: None,
+                    provider_turn_id: None,
+                    turn_ready: false,
+                    follow_up_delivered: Vec::new(),
+                    follow_up_errors: Vec::new(),
+                    delivered: None,
+                    start: transfer_row,
+                    rows: transcript.rows[transfer_row..].to_vec(),
+                    provider_id: None,
+                    model: None,
+                    config_model: None,
+                    config_settings: None,
+                    context: None,
+                    metrics: None,
+                    usage_limit: None,
+                    background: None,
+                    approvals: Vec::new(),
+                    approvals_resolved: Vec::new(),
+                    questions: Vec::new(),
+                    questions_resolved: Vec::new(),
+                    handoff: None,
+                    status: "Preparing handoff…".into(),
+                    finished: false,
+                },
+            )?;
             let root = locked(&store)?.data_dir().map(std::path::Path::to_path_buf);
             let prepared = handoff::prepare(
                 summary.id,
@@ -317,6 +365,14 @@ fn run_turn_using(
                 root,
                 cancel.clone(),
             );
+            transfer.state = if cancel.load(Ordering::Relaxed) {
+                monocode_core::tool::ToolState::Cancelled
+            } else {
+                monocode_core::tool::ToolState::Completed
+            };
+            transcript.rows[transfer_row].text =
+                serde_json::to_string(&transfer).map_err(|e| e.to_string())?;
+            pending.changed(transfer_row);
             settings.handoff = Some(prepared.clone());
             prepared_handoff = Some(prepared.clone());
             provider_id = None;
@@ -339,8 +395,8 @@ fn run_turn_using(
                     follow_up_delivered: Vec::new(),
                     follow_up_errors: Vec::new(),
                     delivered: None,
-                    start: transcript.rows.len(),
-                    rows: Vec::new(),
+                    start: transfer_row,
+                    rows: transcript.rows[transfer_row..].to_vec(),
                     provider_id: None,
                     model: None,
                     config_model: None,
@@ -475,7 +531,7 @@ fn run_turn_using(
                 monocode_core::orchestration::INSTRUCTIONS
             );
         }
-        if !raw_native_command && settings.operator {
+        if !raw_native_command && settings.operator_enabled {
             let cli = std::env::current_exe().map_err(|e| e.to_string())?;
             prompt = format!(
                 "You have Monoptah app access for this project. Use the CLI: {} app ACTION --json JSON. Supported actions: models.list {{}}, sessions.list {{}}, sessions.read {{sessionId}}, sessions.start {{prompt,harness?,model?,title?,draft?,reveal?}}, sessions.send/draft {{sessionId,prompt}}, sessions.stop {{sessionId}}, folders.list {{}}, folders.move {{sessionId,folderId?,newFolderName?}}, notes.list {{}}, notes.read {{id}}, notes.write {{id?,title,body}}, worktrees.list {{}}. Scope is this thread's project. App credentials are in the environment; never print them. Respect the user’s request and selected access policy.\n\n{prompt}",
@@ -1014,7 +1070,7 @@ fn run_turn_using(
 }
 
 /// checkpointEdits.ts's sessionEditPaths: files named by successful edit tools.
-fn edited_paths(rows: &[Row]) -> Vec<String> {
+pub(crate) fn edited_paths(rows: &[Row]) -> Vec<String> {
     let mut paths = Vec::new();
     for row in rows.iter().filter(|r| r.role == "tool") {
         let Ok(tool) = serde_json::from_str::<monocode_core::tool::ToolCall>(&row.text) else {
@@ -1023,14 +1079,34 @@ fn edited_paths(rows: &[Row]) -> Vec<String> {
         if tool.state != monocode_core::tool::ToolState::Completed {
             continue;
         }
-        let (action, path) = tool.summary();
+        let shown = tool.presentation();
         if matches!(
-            action.as_str(),
+            shown.action.as_str(),
             "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
-        ) && !path.is_empty()
-            && !paths.contains(&path)
-        {
-            paths.push(path);
+        ) {
+            let input = serde_json::from_str::<serde_json::Value>(&tool.input).unwrap_or_default();
+            let many = input["paths"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|path| path.as_str());
+            let desktop = tool.display.as_ref().unwrap_or(&input["__desktop"]);
+            let desktop_paths = desktop["paths"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|path| path.as_str());
+            for path in shown
+                .file_path
+                .as_deref()
+                .into_iter()
+                .chain(many)
+                .chain(desktop_paths)
+            {
+                if !path.is_empty() && !paths.iter().any(|p| p == path) {
+                    paths.push(path.to_owned());
+                }
+            }
         }
     }
     paths
@@ -1044,4 +1120,60 @@ fn shlex_quote(text: &str) -> String {
             .replace('$', "\\$")
             .replace('`', "\\`")
     )
+}
+
+#[cfg(test)]
+mod edited_paths_tests {
+    use super::*;
+    use monocode_core::tool::{ToolCall, ToolState};
+    use serde_json::json;
+
+    #[test]
+    fn successful_edits_keep_real_paths_across_the_whole_session() {
+        let row = |name: &str, state, input: serde_json::Value| {
+            let mut tool = ToolCall::new("tool", name);
+            tool.state = state;
+            tool.input = input.to_string();
+            Row {
+                role: "tool".into(),
+                text: serde_json::to_string(&tool).unwrap(),
+                first: true,
+                sent_at: None,
+            }
+        };
+        let rows = vec![
+            row(
+                "Edit",
+                ToolState::Completed,
+                json!({"file_path":"/repo/a.rs", "cwd":"/repo"}),
+            ),
+            row(
+                "Read",
+                ToolState::Completed,
+                json!({"file_path":"/repo/read.rs"}),
+            ),
+            row(
+                "Write",
+                ToolState::Failed,
+                json!({"file_path":"/repo/failed.rs"}),
+            ),
+            row(
+                "Edit",
+                ToolState::Running,
+                json!({"file_path":"/repo/running.rs"}),
+            ),
+            Row {
+                role: "user".into(),
+                text: "A plain question".into(),
+                first: true,
+                sent_at: None,
+            },
+            row(
+                "fileChange",
+                ToolState::Completed,
+                json!({"path":"/repo/a.rs", "paths":["/repo/a.rs", "relative.rs"]}),
+            ),
+        ];
+        assert_eq!(edited_paths(&rows), ["/repo/a.rs", "relative.rs"]);
+    }
 }

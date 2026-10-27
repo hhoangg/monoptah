@@ -1133,6 +1133,12 @@ impl Input {
         }
         false
     }
+    pub(super) fn code_max_scroll_y(&self) -> Pixels {
+        let height = self.bounds.map_or(px(0.), |b| b.size.height);
+        self.code
+            .as_ref()
+            .map_or(px(0.), |code| (px(code.total()) - height).max(px(0.)))
+    }
     pub(super) fn code_scrollbar_up(&mut self) {
         if let Some(code) = &mut self.code {
             code.drag_offset = None;
@@ -1417,7 +1423,7 @@ fn plain_line(
             px(font_size),
             &[TextRun {
                 len: text.len(),
-                font: gpui::font(crate::markdown::MONO),
+                font: gpui::font(crate::fonts::mono()),
                 color,
                 background_color: None,
                 underline: None,
@@ -1438,7 +1444,7 @@ fn token_line(
 ) -> WrappedLine {
     let base = TextRun {
         len: 0,
-        font: gpui::font(crate::markdown::MONO),
+        font: gpui::font(crate::fonts::mono()),
         color: crate::theme::content(1.),
         background_color: None,
         underline: None,
@@ -1487,7 +1493,7 @@ fn shape(i: &Input, row: usize, width: Option<Pixels>, w: &mut Window) -> Wrappe
     };
     let base = TextRun {
         len: text.len(),
-        font: gpui::font(crate::markdown::MONO),
+        font: gpui::font(crate::fonts::mono()),
         color: crate::theme::content(1.),
         background_color: None,
         underline: None,
@@ -1687,7 +1693,7 @@ impl Element for CodeElement {
                     px(i.font_size),
                     &[TextRun {
                         len: 1,
-                        font: gpui::font(crate::markdown::MONO),
+                        font: gpui::font(crate::fonts::mono()),
                         color: crate::theme::content(1.),
                         background_color: None,
                         underline: None,
@@ -1851,6 +1857,7 @@ impl Element for CodeElement {
         w: &mut Window,
         cx: &mut App,
     ) {
+        paint_drag_listener(&self.input, w, cx);
         let i = self.input.read(cx);
         let code = i.code.as_ref().unwrap();
         let lh = i.line_height();
@@ -1988,7 +1995,7 @@ impl Element for CodeElement {
                             } else {
                                 "⌄".len()
                             },
-                            font: gpui::font(crate::markdown::MONO),
+                            font: gpui::font(crate::fonts::mono()),
                             color: crate::theme::content(0.45),
                             background_color: None,
                             underline: None,
@@ -2016,7 +2023,7 @@ impl Element for CodeElement {
                     px(11.),
                     &[TextRun {
                         len,
-                        font: gpui::font(crate::markdown::MONO),
+                        font: gpui::font(crate::fonts::mono()),
                         color: crate::theme::content(0.3),
                         background_color: None,
                         underline: None,
@@ -2348,6 +2355,61 @@ mod tests {
                 assert!(i.scroll_y > px(3500.), "drag ended at {:?}", i.scroll_y);
                 assert!(i.code.as_ref().unwrap().drag_offset.is_none());
                 assert!(!i.selecting);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn drag_selection_keeps_scrolling_past_the_viewport_edge(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            bind(cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(400.), px(240.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(Input::editor),
+            )
+            .unwrap()
+        });
+        window
+            .update(cx, |input, w, cx| {
+                w.focus(&input.focus, cx);
+                input.set_text((0..1_000).map(|n| format!("line {n}\n")).collect(), cx);
+                input.move_to(0, cx);
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let bounds = window.update(visual, |i, _, _| i.bounds.unwrap()).unwrap();
+        let start = bounds.origin + point(px(4.), px(10.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        let anchor = window.update(visual, |i, _, _| i.cursor()).unwrap();
+        // Leave the editor and hold still: the selection must keep growing.
+        let below = point(start.x, bounds.bottom() + px(40.));
+        visual.simulate_mouse_move(below, MouseButton::Left, Default::default());
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        visual.run_until_parked();
+        let (scrolled, row) = window
+            .update(visual, |i, _, _| {
+                assert!(i.autoscroll.is_some());
+                (i.scroll_y, i.code.as_ref().unwrap().row(i.selection.end))
+            })
+            .unwrap();
+        assert!(scrolled > bounds.size.height, "scrolled {scrolled:?}");
+        assert!(row > 20, "selected to row {row}");
+        visual.simulate_mouse_up(below, MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |i, _, _| {
+                assert!(!i.selecting);
+                assert!(i.autoscroll.is_none());
+                assert_eq!(i.selection.start, anchor);
+                assert_eq!(i.scroll_y, scrolled);
             })
             .unwrap();
     }

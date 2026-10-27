@@ -1032,7 +1032,7 @@ impl Shell {
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .font_family(crate::markdown::MONO)
+                                .font_family(crate::fonts::mono())
                                 .text_size(px(10.))
                                 .child(label),
                         )
@@ -1108,7 +1108,10 @@ mod tests {
                 assert_eq!(shell.terminals[&project].len(), 1);
                 let panel = shell.right_panel.clone().unwrap();
                 assert_eq!(panel.read(cx).tab(), RightTab::Terminal);
-                assert_eq!(panel.read(cx).tabs().last(), Some(&RightTab::Terminal));
+                assert_eq!(
+                    panel.read(cx).tabs(),
+                    [RightTab::Files, RightTab::Terminal, RightTab::Graph]
+                );
             })
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
@@ -1121,7 +1124,16 @@ mod tests {
         assert!(visual.debug_bounds("footer-terminal").is_none());
         window
             .update(cx, |shell, window, cx| {
+                // Closing the last tab hides the panel and keeps the shell.
+                let project = shell.workspace.project.clone();
+                let terminal = shell.terminals[&project][0].clone();
+                shell.close_terminal(0, window, cx);
+                assert!(!shell.workspace.right_panel_open);
+                assert_eq!(shell.terminals[&project], [terminal]);
+                assert_eq!(shell.workspace.docks[&project].terminals.len(), 1);
                 // The footer button closes the panel it opened.
+                shell.toggle_terminal(window, cx);
+                assert!(shell.workspace.right_panel_open);
                 shell.toggle_terminal(window, cx);
                 assert!(!shell.workspace.right_panel_open);
                 // Turned off, the tab goes and the dock is back.

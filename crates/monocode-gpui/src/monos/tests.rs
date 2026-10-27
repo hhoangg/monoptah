@@ -535,15 +535,54 @@ fn overview_activity_returns_to_its_previous_tab_and_uses_the_shared_reveal(
 #[gpui::test]
 fn floating_chat_opens_after_releasing_the_manager_and_shares_the_runtime(cx: &mut TestAppContext) {
     let s = setup(cx);
-    cx.update(|cx| s.manager.update(cx, |m, cx| m.open_floating(cx)));
+    cx.update(|cx| {
+        s.manager
+            .update(cx, |m, cx| m.open_floating(s.id.clone(), cx))
+    });
     cx.run_until_parked();
-    cx.update(|cx| s.manager.update(cx, |m, cx| m.open_floating(cx)));
+    cx.update(|cx| {
+        s.manager
+            .update(cx, |m, cx| m.open_floating(s.id.clone(), cx))
+    });
     cx.run_until_parked();
     cx.update(|cx| {
         let manager = s.manager.read(cx);
         assert_eq!(manager.floating.len(), 1);
         assert_eq!(manager.chats.len(), 1);
         assert!(manager.chats.contains_key(&s.id));
+        // The panel owns the chat; the workspace draws a placeholder rather
+        // than the same transcript in a second window.
+        assert!(manager.floating_shows(&s.id, cx));
+    });
+    cx.update(|cx| {
+        s.manager
+            .update(cx, |m, cx| m.hide_floating(&s.id.clone(), cx))
+    });
+    cx.run_until_parked();
+    cx.update(|cx| assert!(!s.manager.read(cx).floating_shows(&s.id, cx)));
+}
+
+#[gpui::test]
+fn floating_chat_leaves_the_workspace_selection_alone(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let other = cx.update(|cx| {
+        s.manager.update(cx, |m, cx| {
+            let before = m.active.clone();
+            let id = m.create_floating(Vec::new(), cx);
+            assert_eq!(
+                m.active, before,
+                "a panel's new Mono stays out of the workspace"
+            );
+            m.open_floating(id.clone(), cx);
+            assert_eq!(m.active, before);
+            id
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let manager = s.manager.read(cx);
+        assert!(manager.floating_shows(&other, cx));
+        assert!(!manager.floating_shows(&s.id, cx));
     });
 }
 
@@ -628,6 +667,86 @@ fn identity_and_context_editors_survive_switches_and_save_to_their_own_files(
     });
 }
 #[gpui::test]
+fn app_receipt_lookup_does_not_wait_for_storage_on_the_ui_thread(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let store = s.store.clone();
+    let (held, acquired) = mpsc::sync_channel(0);
+    let (release, released) = mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = store.lock().unwrap();
+        held.send(()).unwrap();
+        // A regression must fail rather than hang the whole test suite.
+        released.recv_timeout(Duration::from_secs(2)).is_ok()
+    });
+    acquired.recv().unwrap();
+    let (reply, response) = mpsc::channel();
+    let call = mono::bridge::Call {
+        session: s.session,
+        request_id: "contended-lookup".into(),
+        action: "sessions.list".into(),
+        input: json!({}),
+        reply,
+    };
+    s.window
+        .update(cx, |_, window, cx| {
+            s.manager
+                .update(cx, |manager, cx| manager.app_call(call, window, cx));
+        })
+        .unwrap();
+    assert!(response.try_recv().is_err());
+    let _ = release.send(());
+    assert!(
+        holder.join().unwrap(),
+        "app request blocked the UI waiting for the store"
+    );
+    cx.run_until_parked();
+    assert!(response.try_recv().unwrap().is_ok());
+}
+
+#[gpui::test]
+fn durable_app_receipts_survive_cache_eviction_and_invalid_receipts_do_not_repeat_mutations(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let input = json!({"name":"Digest","instructions":"Summarize changes","schedule":{"kind":"daily","time":"09:00"}});
+    let first = call(&s, "durable-habit", "habits.add", input.clone(), cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+    s.manager.update(cx, |m, _| m.app_results.clear());
+    let retry = call(&s, "durable-habit", "habits.add", input, cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, retry);
+    assert_eq!(habits::load(&s.root, &s.id).unwrap().len(), 1);
+    assert!(
+        call(
+            &s,
+            "durable-habit",
+            "habits.add",
+            json!({"name":"different"}),
+            cx
+        )
+        .try_recv()
+        .unwrap()
+        .is_err()
+    );
+    let key = format!(
+        "mono-app-receipt:{}:{}",
+        s.session,
+        mono::files::content_hash("corrupt-habit")
+    );
+    locked(&s.store)
+        .unwrap()
+        .save_setting(&key, "invalid receipt")
+        .unwrap();
+    let error = call(&s, "corrupt-habit", "habits.add", json!({"name":"Another","instructions":"Summarize changes","schedule":{"kind":"daily","time":"09:00"}}), cx).try_recv().unwrap().unwrap_err();
+    assert!(error.contains("Could not read app result"));
+    assert_eq!(habits::load(&s.root, &s.id).unwrap().len(), 1);
+}
+
+#[gpui::test]
 fn app_actions_are_project_scoped_and_mutation_retries_are_idempotent(cx: &mut TestAppContext) {
     let s = setup(cx);
     assert!(
@@ -666,10 +785,104 @@ fn app_actions_are_project_scoped_and_mutation_retries_are_idempotent(cx: &mut T
         assert_eq!(m.roster.get(&s.id).unwrap().launches.len(), 1);
         let owner = m.owner.upgrade().unwrap();
         let view = owner.read(cx).mono_session_entity(child).unwrap();
-        assert_eq!(view.read(cx).input.read(cx).content, "Review the project");
+        assert!(view.read(cx).has_saved_draft());
+        assert_eq!(
+            locked(&s.store)
+                .unwrap()
+                .follow_ups(child)
+                .unwrap()
+                .draft
+                .unwrap()
+                .text,
+            "Review the project"
+        );
         assert!(!view.read(cx).busy);
         assert!(m.hidden_session(child));
     });
+}
+#[gpui::test]
+fn sidebar_hidden_launches_still_list_in_the_mono_panel_after_a_restart(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let started = call(
+        &s,
+        "hidden-launch",
+        "sessions.start",
+        json!({"project":s.project,"prompt":"Review quietly","title":"Quiet review","draft":true}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap();
+    let child = started["sessionId"].as_i64().unwrap();
+    let owner = cx.update(|cx| s.manager.read(cx).owner.upgrade().unwrap());
+    cx.update(|cx| {
+        assert!(s.manager.read(cx).hidden_session(child));
+        owner.update(cx, |shell, _| shell.mono_forget_session(child));
+        assert!(
+            !owner
+                .read(cx)
+                .mono_session_views(cx)
+                .iter()
+                .any(|v| v.id == child)
+        );
+    });
+    s.manager.update(cx, |m, cx| m.configure_chat(&s.id, cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let views = owner.read(cx).mono_session_views(cx);
+        let view = views
+            .iter()
+            .find(|v| v.id == child)
+            .expect("the launch lists again");
+        assert!(view.title.contains("Quiet review"), "{}", view.title);
+        assert!(
+            owner
+                .update(cx, |shell, cx| shell.mono_ensure_session(child, cx))
+                .is_some()
+        );
+        assert!(s.manager.read(cx).hidden_session(child));
+    });
+}
+#[gpui::test]
+fn mono_app_launch_visibility_can_be_toggled_and_survives_roster_reload(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let started = call(
+        &s,
+        "visibility-draft",
+        "sessions.start",
+        json!({"project":s.project,"prompt":"Review quietly","draft":true}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap();
+    let child = started["sessionId"].as_i64().unwrap();
+    cx.update(|cx| assert!(s.manager.read(cx).hidden_session(child)));
+    s.manager
+        .update(cx, |m, cx| m.sidebar_preferences(&s.id, true, true, cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(!s.manager.read(cx).hidden_session(child));
+        assert!(s.manager.read(cx).is_mono_session(s.session));
+    });
+    assert!(
+        mono::Roster::load(&locked(&s.store).unwrap())
+            .unwrap()
+            .get(&s.id)
+            .unwrap()
+            .show_started_sessions_in_sidebar
+    );
+    s.manager
+        .update(cx, |m, cx| m.sidebar_preferences(&s.id, false, false, cx));
+    cx.run_until_parked();
+    cx.update(|cx| assert!(s.manager.read(cx).hidden_session(child)));
+    assert!(
+        !mono::Roster::load(&locked(&s.store).unwrap())
+            .unwrap()
+            .get(&s.id)
+            .unwrap()
+            .show_started_sessions_in_sidebar
+    );
 }
 #[gpui::test]
 fn queued_messages_are_saved_before_dispatch_and_do_not_run_while_blocked(cx: &mut TestAppContext) {
@@ -2452,8 +2665,10 @@ fn run_sessions(s: &Setup, run: i64, cx: &mut TestAppContext) -> Vec<i64> {
     })
     .unwrap_or_default()
 }
+/// A launch that reports back needs a submitted prompt (an unsent draft cannot notify). Tests that
+/// start one hold a `NoClis` so no provider runs.
 fn notifying(extra: Value) -> Value {
-    let mut input = json!({"prompt":"Review","draft":true,"notifyOnComplete":true});
+    let mut input = json!({"prompt":"Review","notifyOnComplete":true});
     for (key, value) in extra.as_object().unwrap() {
         input[key] = value.clone();
     }
@@ -2462,6 +2677,7 @@ fn notifying(extra: Value) -> Value {
 
 #[gpui::test]
 fn a_chat_launch_reports_under_its_turn_as_a_group_unless_asked_for_each(cx: &mut TestAppContext) {
+    let _clis = crate::shell::surface_tests::NoClis::new();
     let s = setup(cx);
     for (request, extra) in [
         ("plain", json!({})),
@@ -2494,6 +2710,7 @@ fn a_chat_launch_reports_under_its_turn_as_a_group_unless_asked_for_each(cx: &mu
 
 #[gpui::test]
 fn a_habit_runs_sessions_report_each_to_the_chat_and_the_run_notes_them(cx: &mut TestAppContext) {
+    let _clis = crate::shell::surface_tests::NoClis::new();
     let s = setup(cx);
     let run = fake_run(&s, cx);
     for (request, extra) in [
@@ -2577,7 +2794,9 @@ fn a_run_timeout_stops_the_run_but_not_the_sessions_it_started(cx: &mut TestAppC
 fn a_run_ends_without_waiting_for_the_sessions_it_started(cx: &mut TestAppContext) {
     let s = setup(cx);
     let run = fake_run(&s, cx);
-    let mut input = notifying(json!({}));
+    // Unsent drafts start no provider; an unsent draft cannot ask to be monitored, so the
+    // launches are marked as monitored afterwards.
+    let mut input = json!({"prompt":"Review","draft":true});
     input["project"] = json!(s.project);
     call_from(&s, run, "one", "sessions.start", input.clone(), cx)
         .try_recv()
@@ -2588,7 +2807,26 @@ fn a_run_ends_without_waiting_for_the_sessions_it_started(cx: &mut TestAppContex
         .try_recv()
         .unwrap()
         .unwrap();
-    // Both are pending (draft sessions never stop with messages) yet the run is done.
+    edit_mono(&s, cx, |m| {
+        for launch in &mut m.launches {
+            launch.notify_on_complete = true;
+        }
+    });
+    // Both are still running (held busy, so no provider starts) yet the run is done.
+    for launch in launches_of(&s, cx) {
+        cx.update(|cx| {
+            let view = s
+                .manager
+                .read(cx)
+                .owner
+                .upgrade()
+                .unwrap()
+                .read(cx)
+                .mono_session_entity(launch.session_id)
+                .unwrap();
+            view.update(cx, |v, _| v.busy = true);
+        });
+    }
     cx.update(|cx| s.manager.update(cx, |m, cx| m.habit_changed(run, cx)));
     cx.run_until_parked();
     assert!(cx.update(|cx| s.manager.read(cx).running.is_empty()));
@@ -3057,6 +3295,7 @@ fn every_follow_up_is_counted_but_only_created_sessions_are_started(cx: &mut Tes
 
 #[gpui::test]
 fn a_session_the_run_started_is_created_and_reported_with_it(cx: &mut TestAppContext) {
+    let _clis = crate::shell::surface_tests::NoClis::new();
     let s = setup(cx);
     let run = fake_run(&s, cx);
     let mut input = notifying(json!({}));
@@ -3709,4 +3948,67 @@ fn a_habit_run_cannot_manage_workflows(cx: &mut TestAppContext) {
         outsider.unwrap_err(),
         "This Mono no longer owns an active app capability"
     );
+}
+
+#[gpui::test]
+fn habits_and_documents_search_like_sessions(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let habit = |id: &str, name: &str| {
+        let mut h = Habit::new(
+            name.into(),
+            "Do the work.".into(),
+            habits::Schedule::default(),
+            monocode_core::time::now_ms(),
+        )
+        .unwrap();
+        h.id = id.into();
+        h
+    };
+    let document = |id: &str, title: &str| mono::Document {
+        id: id.into(),
+        kind: "markdown".into(),
+        title: title.into(),
+        summary: String::new(),
+        body: String::new(),
+        created_at: 1,
+        updated_at: 1,
+    };
+    s.window
+        .update(cx, |_, _, cx| {
+            s.manager.update(cx, |m, cx| {
+                m.settings = None;
+                m.overview_tab = OverviewTab::Habits;
+                m.habits = vec![
+                    habit("digest", "Morning digest"),
+                    habit("report", "Weekly report"),
+                ];
+                let documents = &mut m.roster.get_mut(&s.id).unwrap().documents;
+                documents.push(document("plan", "Launch plan"));
+                documents.push(document("summary", "Release summary"));
+                cx.notify();
+            });
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    let search = |visual: &mut gpui::VisualTestContext, key: &str, text: &str| {
+        s.manager.update(visual, |m, cx| {
+            m.fields[key].update(cx, |f, cx| f.set_text(text.into(), cx));
+        });
+        visual.run_until_parked();
+    };
+    assert!(visual.debug_bounds("mono-habit-report").is_some());
+    search(visual, "mono-habit-search", "DIGEST");
+    assert!(visual.debug_bounds("mono-habit-digest").is_some());
+    assert!(visual.debug_bounds("mono-habit-report").is_none());
+
+    s.manager.update(visual, |m, cx| {
+        m.select_overview(OverviewTab::Documents, cx)
+    });
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("mono-document-plan").is_some());
+    search(visual, "mono-document-search", "release");
+    assert!(visual.debug_bounds("mono-document-plan").is_none());
+    assert!(visual.debug_bounds("mono-document-summary").is_some());
 }

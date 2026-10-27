@@ -41,8 +41,18 @@ pub fn configure_child(command: &mut Command) {
             });
         }
     }
+    // A GUI-subsystem parent gives every console child (git, gh) its own
+    // visible console window unless asked not to.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     let _ = command;
 }
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -61,7 +71,7 @@ pub fn isolate(command: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000 | 0x0000_0200);
+        command.creation_flags(CREATE_NO_WINDOW | 0x0000_0200);
     }
 }
 
@@ -76,7 +86,7 @@ pub fn terminate(child: &mut std::process::Child) {
         let mut kill = Command::new("taskkill");
         kill.args(["/PID", &child.id().to_string(), "/T", "/F"]);
         use std::os::windows::process::CommandExt;
-        kill.creation_flags(0x0800_0000);
+        kill.creation_flags(CREATE_NO_WINDOW);
         let _ = kill.status();
     }
     let _ = child.kill();
@@ -185,7 +195,7 @@ pub fn shutdown_all() {
             let mut c = Command::new("taskkill");
             c.args(["/PID", &pid.to_string(), "/T", "/F"]);
             use std::os::windows::process::CommandExt;
-            c.creation_flags(0x0800_0000);
+            c.creation_flags(CREATE_NO_WINDOW);
             let _ = c.status();
         }
     }
@@ -284,5 +294,22 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout)
             );
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn background_children_keep_piped_output_and_exit_status() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", "(echo stdout)&(echo stderr 1>&2)&exit /b 7"]);
+        configure_child(&mut command);
+
+        let output = command.output().expect("background command should run");
+        assert_eq!(output.status.code(), Some(7));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("stdout"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("stderr"));
     }
 }

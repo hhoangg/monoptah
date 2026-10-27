@@ -53,7 +53,11 @@ impl Store {
             return Err("This provider does not support editing the last turn".into());
         }
         let blocks = self.shared_blocks(id)?;
-        if blocks.iter().any(|b| b["role"] == "handoff") {
+        if self
+            .shared_all_blocks(id)?
+            .iter()
+            .any(|b| b["role"] == "handoff")
+        {
             return Err("Editing a turn across a provider handoff is unavailable".into());
         }
         let rows = blocks::project(&blocks)?;

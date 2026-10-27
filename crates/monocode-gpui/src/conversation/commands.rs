@@ -8,7 +8,7 @@ impl Conversation {
     /// Returns true when this input belongs to a local command, including failures.
     /// A rejected command keeps its draft and attachments intact.
     pub(super) fn handle_local_command(&mut self, cx: &mut Context<Self>) -> bool {
-        let text = self.input.read(cx).content.trim();
+        let text = self.input.read(cx).content.trim().to_owned();
         if text.eq_ignore_ascii_case("/mcp") {
             if self.input.read(cx).is_composing() {
                 return true;
@@ -17,7 +17,10 @@ impl Conversation {
                 .update(cx, |completion, cx| completion.open_mcp(cx));
             return true;
         }
-        if let Some(question) = monocode_core::composer::consume_command(text, "btw") {
+        if self.git_action_command(&text, cx) {
+            return true;
+        }
+        if let Some(question) = monocode_core::composer::consume_command(&text, "btw") {
             let question = question.trim().to_owned();
             self.open_btw(question, false, cx);
             return true;

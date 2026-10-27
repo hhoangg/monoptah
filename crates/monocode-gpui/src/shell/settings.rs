@@ -171,6 +171,13 @@ impl Shell {
                         .update(cx, |notice, cx| notice.check_now(hidden, cx));
                 }
                 SettingsEvent::Changed(prefs) => {
+                    #[cfg(target_os = "linux")]
+                    if this.workspace.preferences.wayland_window_decorations
+                        != prefs.wayland_window_decorations
+                        && let Some(decorations) = prefs.wayland_decorations(cx.compositor_name())
+                    {
+                        window.request_decorations(decorations);
+                    }
                     this.workspace.preferences = *prefs.clone();
                     this.apply_preferences(cx);
                     this.persist(cx);

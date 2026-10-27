@@ -163,7 +163,7 @@ impl Conversation {
                         if let Some((history, turns)) = history {
                             this.settings.turns = turns.clone();
                             this.transcript.update(cx, |view, cx| {
-                                view.turns = turns;
+                                view.set_turns(turns);
                                 view.install_prepared_history(history, cx);
                             });
                         }

@@ -90,6 +90,15 @@ pub struct Series {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Slice {
+    pub label: String,
+    pub value: f64,
+    #[serde(default)]
+    pub color: ThemeColor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Node {
     Column {
@@ -105,6 +114,11 @@ pub enum Node {
         columns: usize,
         gap: f32,
     },
+    /// A raised panel around its children, laid out as a column.
+    Card {
+        children: Vec<Node>,
+        gap: f32,
+    },
     Text {
         text: String,
         size: TextSize,
@@ -115,6 +129,15 @@ pub enum Node {
         value: String,
         detail: Option<String>,
         color: ThemeColor,
+        /// A signed change such as "+12.4%", drawn with an arrow.
+        #[serde(default)]
+        delta: Option<String>,
+        /// A sparkline under the value.
+        #[serde(default)]
+        trend: Vec<f64>,
+        /// A falling value is good news, as for latency or error rates.
+        #[serde(default)]
+        lower_is_better: bool,
     },
     Table {
         columns: Vec<String>,
@@ -125,6 +148,32 @@ pub enum Node {
         series: Vec<Series>,
         labels: Vec<String>,
         height: f32,
+    },
+    Gauge {
+        label: String,
+        value: f64,
+        min: f64,
+        max: f64,
+        unit: Option<String>,
+        color: ThemeColor,
+    },
+    Donut {
+        slices: Vec<Slice>,
+        label: Option<String>,
+        value: Option<String>,
+    },
+    Heatmap {
+        values: Vec<Vec<f64>>,
+        rows: Vec<String>,
+        columns: Vec<String>,
+        color: ThemeColor,
+    },
+    Progress {
+        label: String,
+        value: f64,
+        max: f64,
+        detail: Option<String>,
+        color: ThemeColor,
     },
     Button {
         label: String,
@@ -269,7 +318,9 @@ impl Node {
             return Err("Visual tree exceeds 512 nodes or 16 levels".into());
         }
         match self {
-            Self::Column { children, gap } | Self::Row { children, gap } => {
+            Self::Column { children, gap }
+            | Self::Row { children, gap }
+            | Self::Card { children, gap } => {
                 bounded(*gap as f64, 0., 48., "layout gap")?;
                 children
                     .iter()
@@ -293,6 +344,8 @@ impl Node {
                 label,
                 value,
                 detail,
+                delta,
+                trend,
                 ..
             } => {
                 budget.text(label, 256)?;
@@ -300,6 +353,87 @@ impl Node {
                 if let Some(detail) = detail {
                     budget.text(detail, 2048)?;
                 }
+                if let Some(delta) = delta {
+                    budget.text(delta, 64)?;
+                }
+                points(trend, budget)?;
+            }
+            Self::Gauge {
+                label,
+                value,
+                min,
+                max,
+                unit,
+                ..
+            } => {
+                budget.text(label, 256)?;
+                if let Some(unit) = unit {
+                    budget.text(unit, 32)?;
+                }
+                bounded(*min, -1e12, 1e12, "gauge min")?;
+                bounded(*max, -1e12, 1e12, "gauge max")?;
+                if min >= max {
+                    return Err("Gauge max must exceed min".into());
+                }
+                bounded(*value, -1e12, 1e12, "gauge value")?;
+            }
+            Self::Donut {
+                slices,
+                label,
+                value,
+            } => {
+                if slices.is_empty() || slices.len() > 12 {
+                    return Err("Donuts need 1–12 slices".into());
+                }
+                for slice in slices {
+                    budget.text(&slice.label, 256)?;
+                    bounded(slice.value, 0., 1e12, "slice value")?;
+                }
+                if slices.iter().all(|s| s.value <= 0.) {
+                    return Err("A donut needs at least one positive slice".into());
+                }
+                for text in [label, value].into_iter().flatten() {
+                    budget.text(text, 128)?;
+                }
+            }
+            Self::Heatmap {
+                values,
+                rows,
+                columns,
+                ..
+            } => {
+                let width = values.first().map_or(0, Vec::len);
+                if values.is_empty() || values.len() > 32 || width == 0 || width > 128 {
+                    return Err("Heatmaps need 1–32 rows of 1–128 values".into());
+                }
+                if values.iter().any(|row| row.len() != width) {
+                    return Err("Heatmap rows must have equal lengths".into());
+                }
+                if (!rows.is_empty() && rows.len() != values.len())
+                    || (!columns.is_empty() && columns.len() != width)
+                {
+                    return Err("Heatmap labels must match its rows and columns".into());
+                }
+                for label in rows.iter().chain(columns) {
+                    budget.text(label, 64)?;
+                }
+                for row in values {
+                    points(row, budget)?;
+                }
+            }
+            Self::Progress {
+                label,
+                value,
+                max,
+                detail,
+                ..
+            } => {
+                budget.text(label, 256)?;
+                if let Some(detail) = detail {
+                    budget.text(detail, 256)?;
+                }
+                bounded(*max, 1e-9, 1e12, "progress max")?;
+                bounded(*value, 0., *max, "progress value")?;
             }
             Self::Table { columns, rows } => {
                 if columns.is_empty() || columns.len() > 24 || rows.len() > 250 {
@@ -458,6 +592,21 @@ impl Node {
         }
         Ok(())
     }
+}
+
+/// Data points count against the shared vertex budget.
+fn points(values: &[f64], budget: &mut Budget) -> Result<(), String> {
+    if values.len() > 512 {
+        return Err("A data row may hold at most 512 values".into());
+    }
+    budget.vertices += values.len();
+    if budget.vertices > 32_768 {
+        return Err("Visual data point budget exceeded".into());
+    }
+    for value in values {
+        bounded(*value, -1e12, 1e12, "data value")?;
+    }
+    Ok(())
 }
 
 #[derive(Default)]

@@ -12,10 +12,13 @@ return () => {
     visual.text("Throughput explorer", { size: "title" }),
     visual.text("Explore a sample week with native charts and controls.", { color: "muted" }),
     visual.grid([
-      visual.stat("Total", values.reduce((sum, value) => sum + value, 0), { detail: "requests this week" }),
-      visual.stat("Peak", Math.max(...values), { detail: "requests per day", color: "accent" }),
-      visual.stat("Change", "+24%", { detail: "versus the previous week", color: "positive" }),
-    ], { columns: 3, gap: 20 }),
+      visual.card([visual.stat("Total", values.reduce((sum, value) => sum + value, 0), {
+        delta: "+24%", detail: "versus the previous week", trend: values })]),
+      visual.card([visual.gauge("Peak load", Math.round(Math.max(...values) / 2), { unit: "%" })]),
+      visual.card([visual.donut([
+        { label: "Search", value: 48 }, { label: "Checkout", value: 27 }, { label: "Accounts", value: 16 },
+      ], { label: "Requests" })]),
+    ], { columns: 3, gap: 16 }),
     visual.tabs(["Bars", "Trend", "Area"], state.metric, value => { state.metric = value; }),
     visual.chart(["bar", "line", "area"][state.metric], series, { labels, height: 240 }),
     visual.slider("Scenario multiplier", state.scale, 0.5, 2, value => { state.scale = value; }, { step: 0.1 }),

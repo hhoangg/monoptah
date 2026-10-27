@@ -496,7 +496,7 @@ impl SettingsView {
                                         content(0.15)
                                     })
                                     .px(px(6.))
-                                    .font_family(crate::markdown::MONO)
+                                    .font_family(crate::fonts::mono())
                                     .text_size(px(11.))
                                     .text_color(content(if disabled {
                                         0.35
@@ -543,7 +543,7 @@ impl SettingsView {
                             .w(px(112.))
                             .flex_shrink_0()
                             .truncate()
-                            .font_family(crate::markdown::MONO)
+                            .font_family(crate::fonts::mono())
                             .text_size(px(11.))
                             .text_color(content(0.4))
                             .child(row.when),

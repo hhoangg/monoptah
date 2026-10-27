@@ -133,6 +133,7 @@ impl AssetSource for Assets {
    "undo"=>include_bytes!("../assets/hugeicons/undo.svg"),
    "cloud-upload"=>include_bytes!("../assets/hugeicons/cloud-upload.svg"),
    "git-merge"=>include_bytes!("../assets/hugeicons/git-merge.svg"),
+   "git-commit"=>include_bytes!("../assets/hugeicons/git-commit.svg"),
    "git-pull-request-draft"=>include_bytes!("../assets/hugeicons/git-pull-request-draft.svg"),
    "git-pull-request-closed"=>include_bytes!("../assets/hugeicons/git-pull-request-closed.svg"),
    "git-pull-request"=>include_bytes!("../assets/hugeicons/git-pull-request.svg"),
@@ -217,6 +218,14 @@ fn icon_body(path: &str) -> Option<&'static str> {
         // ContextMeter's empty 14px ring (radius 6, stroke 2) on a 24 grid.
         "context-ring" => "<circle cx='12' cy='12' r='10.29' stroke-width='3.43'/>",
         "window" => "<rect x='3' y='4' width='18' height='16' rx='3'/><path d='M3 9h18'/>",
+        // lucide's Maximize2, Shield and Pencil, as in QuickComposer.tsx.
+        "maximize-2" => "<path d='M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7'/>",
+        "shield" => {
+            "<path d='M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z'/>"
+        }
+        "pencil" => {
+            "<path d='M21.17 6.81a1 1 0 0 0-3.98-3.98L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5zM15 5l4 4'/>"
+        }
         "copy" => {
             "<path d='M14 4H6a2 2 0 0 0-2 2v8'/><rect x='8' y='8' width='12' height='12' rx='2'/>"
         }

@@ -32,6 +32,8 @@ mod git_cache;
 mod git_graph;
 mod git_picker;
 mod git_status;
+#[cfg(target_os = "macos")]
+mod hang_watchdog;
 mod history;
 mod image_lightbox;
 mod image_memory;
@@ -386,6 +388,13 @@ fn main() {
         db.title(s.id, "Native visuals · Controls, charts and 3D")
             .unwrap();
         db.write_rows(s.id, 0, &fixtures::visuals().rows).unwrap();
+        let s = db
+            .create("claude", &cwd)
+            .expect("create visual story fixture");
+        db.title(s.id, "Native visuals · Charts inside an answer")
+            .unwrap();
+        db.write_rows(s.id, 0, &fixtures::visual_story().rows)
+            .unwrap();
     }
     let mut sessions = db.sessions().expect("read native sessions");
     if sessions.is_empty() {
@@ -415,6 +424,8 @@ fn main() {
             image_memory::init(cx);
             #[cfg(target_os = "macos")]
             memory_log::start(cx);
+            #[cfg(target_os = "macos")]
+            hang_watchdog::start(database.with_file_name("gpui-hangs"), cx);
             input::bind(cx);
             image_lightbox::bind(cx);
             composer_completion::bind(cx);
@@ -424,6 +435,7 @@ fn main() {
             explorer::bind(cx);
             history::bind(cx);
             diff_view::bind(cx);
+            fonts::init(cx);
             terminal::bind(cx);
             // Kept so the app menu shows its Cmd+Q hint. The window's key
             // monitor takes the key press first (shell/quit_gate.rs), so this
@@ -446,6 +458,12 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(820.), px(520.))),
+                    window_decorations: workspace
+                        .preferences
+                        .wayland_decorations(cx.compositor_name()),
+                    // Linux desktops match this to the .desktop file's
+                    // StartupWMClass to show the app icon.
+                    app_id: Some(monocode_core::brand::NATIVE_APP_ID.into()),
                     window_background: if cfg!(target_os = "macos") {
                         WindowBackgroundAppearance::Blurred
                     } else {

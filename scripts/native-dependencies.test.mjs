@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-const buildScript = new URL("../crates/monocode-gpui/build.rs", import.meta.url);
+const guard = new URL("../crates/monocode-gpui/dependency_guard.rs", import.meta.url);
 // The first Cargo build on a fresh Windows runner can exceed one minute.
 const cargoTimeout = process.platform === "win32" ? 180_000 : 60_000;
 
@@ -15,7 +15,13 @@ async function fixture(t) {
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(join(root, "src"));
   await writeFile(join(root, "src/lib.rs"), "");
-  await copyFile(buildScript, join(root, "build.rs"));
+  // The real build script also embeds the Windows icon, which needs a
+  // registry dependency this offline fixture can't fetch.
+  await copyFile(guard, join(root, "dependency_guard.rs"));
+  await writeFile(
+    join(root, "build.rs"),
+    "mod dependency_guard;\nfn main() {\n    dependency_guard::check(std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\")));\n}\n",
+  );
   const manifest = `[package]
 name = "dependency-guard-fixture"
 version = "0.0.0"

@@ -550,6 +550,20 @@ pub(crate) fn paint_glass(
     };
     window.paint_quad(quad.corner_radii(corners));
 }
+/// A whole popover surface painted directly, for cards drawn inside a
+/// canvas such as chart readouts: shadow, glass (or the light theme's opaque
+/// card) and the 10% border, at the popover's radius.
+pub(crate) fn paint_surface(bounds: Bounds<Pixels>, window: &mut Window) {
+    let corners = Corners::all(px(RADIUS));
+    window.paint_drop_shadows(bounds, corners, &shadow());
+    paint_glass(bounds, corners, tint(), window);
+    window.paint_quad(
+        gpui::fill(bounds, gpui::transparent_black())
+            .corner_radii(corners)
+            .border_widths(px(1.))
+            .border_color(content(0.1)),
+    );
+}
 /// The default popover glass tint.
 pub(crate) fn glass_tint() -> Hsla {
     tint()

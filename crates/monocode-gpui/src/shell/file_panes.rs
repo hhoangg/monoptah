@@ -56,14 +56,7 @@ impl Shell {
             return Some(id);
         }
         let review = self.reviews.remove(&id)?;
-        let pane = self
-            .workspace
-            .review_owners
-            .keys()
-            .copied()
-            .min()
-            .unwrap_or(0)
-            - 1;
+        let pane = self.workspace.next_pane_id();
         self.workspace.review_owners.insert(pane, id);
         self.workspace.reviews.remove(&id);
         self.reviews.insert(pane, review.clone());

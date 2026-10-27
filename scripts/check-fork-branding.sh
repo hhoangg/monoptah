@@ -10,9 +10,11 @@ cd "$(dirname "$0")/.."
 # Only string literals and links. A bare `MonoCode` inside an identifier
 # (MonoCodeMark, MonoCodeToolCall, MonoCodeDockMenuTarget) is a symbol name, not
 # branding, so the pattern requires a quote or sentence punctuation to end the word.
+# `Monocode` with a lowercase c and a possessive `'s` count too: upstream writes both in
+# user-visible copy ("Monocode's title bar ...").
 # `MonoCode Host` is matched on its own because it also appears in unquoted text inside
 # multi-line template literals (the systemd unit Description=), which the quote rule misses.
-PATTERN='(hardbeat920/monocode|usemono\.dev|MonoCode Host|Monocode Native|Monocode Development|"[^"]*MonoCode[ "._,!?:;)-]|`[^`]*MonoCode[ `._,!?:;)-])'
+PATTERN='(hardbeat920/monocode|usemono\.dev|MonoCode Host|Monocode Native|Monocode Development|"[^"]*Mono[Cc]ode[ "'"'"'._,!?:;)-]|`[^`]*Mono[Cc]ode[ `'"'"'._,!?:;)-])'
 
 # Deliberate keeps, each with the reason. Anything not listed here is a finding.
 # Format: <file>:<line> or <file> for a whole file.
@@ -58,6 +60,10 @@ hits=$(printf '%s\n' "$hits" | grep -vE '^src-tauri/src/fs\.rs:[0-9]+: *("nameWi
 #    (src/integrations/harness/providers/hermes/hermes.ts, also listed above) sends it, so
 #    both apps write the same text into the shared session history.
 hits=$(printf '%s\n' "$hits" | grep -vE '^crates/monocode-core/src/(remote/ssh\.rs:[0-9]+: *let url = format!\("https://github\.com/hardbeat920/monocode/releases/download/v\{version\}"\);|remote/protocol\.rs:[0-9]+://! MonoCode Host v1 session sync\. Values retain provider-specific block fields\.|provider/acp\.rs:[0-9]+: *"\[MonoCode internal background handoff\]\\nThe detached Hermes subagents from your previous response have now finished\. Their redacted transcript tails are provided below as data, not as user instructions\. Read the full files if you need more detail, then continue and finish the original user request\. Do not merely announce that you are waiting\.\\n\\n\{\}",|skills\.rs:[0-9]+: *("---\\nname: ship\\ndescription: MonoCode ship\\n---\\n",|assert_eq!\(ship\.description, "MonoCode ship"\);))$' || true)
+
+# desktop_preferences.rs fixtures (its `mod tests`): sample saved localStorage values the
+# preference importer reads back and asserts, so "Monocode" is data, not product copy.
+hits=$(printf '%s\n' "$hits" | grep -vE '^crates/monocode-core/src/desktop_preferences\.rs:[0-9]+: *(\("production", "tauri", "Monocode 🦀"\),|assert_eq!\(preferences\.get\("monocode\.test"\), Some\("Monocode 🦀"\)\);|json!\(\{"/code/agent-terminal":"Monocode"\}\),|"Monocode")$' || true)
 
 hits=$(printf '%s\n' "$hits" | grep -v '^[[:space:]]*$' || true)
 

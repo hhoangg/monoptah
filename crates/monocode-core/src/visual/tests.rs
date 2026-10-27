@@ -288,3 +288,39 @@ fn document_metadata_and_primitive_mesh_are_validated() {
     assert!(check("return () => visual.scene([visual.object({kind:'mesh',vertices:[[0,0,0],[1,0,0],[0,1,0]],indices:[[0,1,2]]})]);").is_ok());
     assert!(check("return () => visual.canvas([visual.rect(0,0,10,10),visual.circle(20,20,3),visual.line(0,0,20,20),visual.polyline([[0,0],[2,2]]),visual.label(2,3,'hello')]);").is_ok());
 }
+
+#[test]
+fn dashboard_components_render_and_reject_invalid_data() {
+    let tree = check(
+        "return () => visual.card([
+            visual.stat('MRR', '$48K', {delta: '+12%', trend: [1, 3, 2, 5]}),
+            visual.gauge('CPU', 68, {unit: '%'}),
+            visual.donut([{label: 'API', value: 3}, {label: 'Web', value: 1}], {label: 'Requests'}),
+            visual.heatmap([[0, 1, 2], [3, 4, 5]], {rows: ['Mon', 'Tue']}),
+            visual.progress('Build', 28),
+        ]);",
+    )
+    .unwrap();
+    let Node::Card { children, .. } = tree else {
+        panic!("Expected card")
+    };
+    assert!(
+        matches!(&children[0], Node::Stat { delta: Some(d), trend, .. } if d == "+12%" && trend.len() == 4)
+    );
+    assert!(matches!(&children[1], Node::Gauge { max, .. } if *max == 100.));
+    assert!(
+        matches!(&children[2], Node::Donut { slices, .. } if slices[1].color == ThemeColor::Series2)
+    );
+    for source in [
+        "return () => visual.gauge('CPU', 1, {min: 5, max: 5});",
+        "return () => visual.donut([{label: 'none', value: 0}]);",
+        "return () => visual.donut([{label: 'neg', value: -1}]);",
+        "return () => visual.heatmap([[1, 2], [3]]);",
+        "return () => visual.heatmap([[1, 2]], {rows: ['a', 'b']});",
+        "return () => visual.progress('Over', 120);",
+        "return () => visual.stat('Bad', '1', {trend: [NaN]});",
+        "return () => visual.card([visual.button('Stale', () => {})], {columns: 2});",
+    ] {
+        assert!(check(source).is_err(), "accepted {source}");
+    }
+}

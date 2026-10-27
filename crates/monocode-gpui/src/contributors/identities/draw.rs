@@ -118,7 +118,7 @@ fn mono_key(text: String, alpha: f32) -> Div {
     div()
         .min_w_0()
         .truncate()
-        .font_family(crate::markdown::MONO)
+        .font_family(crate::fonts::mono())
         .text_size(px(12.))
         .line_height(px(16.))
         .text_color(content(alpha))
@@ -266,7 +266,7 @@ impl IdentitiesView {
                     .text_size(px(11.))
                     .text_color(content(0.5))
                     .child(SAVED_TO)
-                    .child(div().font_family(crate::markdown::MONO).child(SAVED_PATH))
+                    .child(div().font_family(crate::fonts::mono()).child(SAVED_PATH))
                     .child(SAVED_REST),
             )
             .into_any_element()
@@ -646,7 +646,7 @@ impl IdentitiesView {
             )
             .child(
                 div()
-                    .font_family(crate::markdown::MONO)
+                    .font_family(crate::fonts::mono())
                     .text_size(px(11.))
                     .text_color(content(0.65))
                     .child(keys),

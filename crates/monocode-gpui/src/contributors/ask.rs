@@ -402,7 +402,7 @@ impl AskDialog {
 
     fn code(text: &'static str) -> gpui::Div {
         div()
-            .font_family(crate::markdown::MONO)
+            .font_family(crate::fonts::mono())
             .text_size(px(11.))
             .child(text)
     }

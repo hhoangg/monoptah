@@ -1,4 +1,5 @@
 //! Session storage. Desktop launches use Monocode's existing schema directly.
+mod app_access;
 mod managed_sessions;
 mod monocode_import;
 mod monos;
@@ -20,6 +21,7 @@ pub use edit::EditSnapshot;
 pub use monocode_import::native_model;
 pub use monocode_import::{monocode_database, ImportReport};
 use rusqlite::{params, Connection};
+pub use shared::{HistoryPage, PAGE_TURNS};
 pub use side_threads::DesktopSideThread;
 use std::path::Path;
 
@@ -598,24 +600,31 @@ impl Store {
                 .ok_or_else(|| format!("Unknown provider: {provider}"))?
                 .label()
         );
+        // A caller that already opened a transaction (an app launch reserving its
+        // session) owns the commit; otherwise the row and its surface land together.
         let tx = self
             .conn
-            .unchecked_transaction()
+            .is_autocommit()
+            .then(|| self.conn.unchecked_transaction())
+            .transpose()
             .map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO native_sessions(title,provider,cwd,updated_at) VALUES(?1,?2,?3,?4)",
-            params![title, provider, cwd, updated_at.min(i64::MAX as u64) as i64],
-        )
-        .map_err(|e| e.to_string())?;
-        let id = tx.last_insert_rowid();
+        self.conn
+            .execute(
+                "INSERT INTO native_sessions(title,provider,cwd,updated_at) VALUES(?1,?2,?3,?4)",
+                params![title, provider, cwd, updated_at.min(i64::MAX as u64) as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        let id = self.conn.last_insert_rowid();
         if surface.is_tui() {
-            tx.execute(
+            self.conn.execute(
                     "INSERT INTO native_settings(key,value) VALUES(?1,json_object('surface',?2)) ON CONFLICT(key) DO UPDATE SET value=json_set(CASE WHEN json_valid(value) THEN value ELSE '{}' END,'$.surface',?2)",
                 params![format!("agent:{id}"), surface.id()],
             )
             .map_err(|e| e.to_string())?;
         }
-        tx.commit().map_err(|e| e.to_string())?;
+        if let Some(tx) = tx {
+            tx.commit().map_err(|e| e.to_string())?;
+        }
         Ok(Session {
             id,
             title,
@@ -818,6 +827,21 @@ impl Store {
         } else {
             result
         }
+    }
+    /// The cursor for the turns before `load`'s rows, when a Mono's history
+    /// is paged rather than loaded whole.
+    pub fn history_before(&self, session: i64) -> Result<Option<i64>, String> {
+        if self.shared.is_none() || self.remote_session(session)?.is_some() {
+            return Ok(None);
+        }
+        self.shared_history_before(session)
+    }
+    /// The page of turns before `before`, or with `all` every older turn.
+    pub fn load_before(&self, session: i64, before: i64, all: bool) -> Result<HistoryPage, String> {
+        if self.shared.is_none() {
+            return Ok(HistoryPage::default());
+        }
+        self.shared_load_before(session, before, all)
     }
     pub fn load(&self, session: i64) -> Result<Transcript, String> {
         if let Some(remote) = self.remote_session(session)? {

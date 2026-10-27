@@ -1,6 +1,6 @@
 //! Compact semantic tool captions with clickable file targets.
 use super::{TranscriptView, tasks};
-use crate::{markdown, theme::*};
+use crate::theme::*;
 use gpui::{AnyElement, Context, Div, Role, div, prelude::*, px, rgb};
 use monocode_core::tool::{CommandStep, ToolCall, ToolState};
 
@@ -66,7 +66,7 @@ impl TranscriptView {
             return panel;
         }
         let identity = scope.map_or_else(|| start.to_string(), |scope| format!("{start}:{scope}"));
-        if tool.is_compaction() {
+        if tool.is_milestone() {
             let running = tool.state == ToolState::Running;
             let failed = tool.state == ToolState::Failed;
             let label = tool.summary().0;
@@ -121,6 +121,7 @@ impl TranscriptView {
                 .into_any_element();
         }
         let shown = tool.presentation_in(self.file_link_base.as_deref());
+        let visual = tool.visual_step().is_some();
         let failed = matches!(tool.state, ToolState::Failed | ToolState::Cancelled);
         let is_search =
             matches!(shown.action.as_str(), "Find" | "Search") && !shown.target.is_empty();
@@ -227,7 +228,8 @@ impl TranscriptView {
             .py_1()
             .line_height(px(20.))
             // React's activity rows are always bare: no status glyph, only
-            // a failure stays marked.
+            // a failure stays marked. Monocode's own tools carry its logo.
+            .when(visual, |d| d.child(crate::activity::glyph("monocode", 14.)))
             .when(shown.action != "Run", |d| {
                 d.child(
                     div()
@@ -249,8 +251,11 @@ impl TranscriptView {
                         .flex()
                         .items_center()
                         .gap_1()
-                        // A chain's description is prose; only its chips are code.
-                        .when(!chain, |d| d.font_family(markdown::MONO).text_size(px(12.)))
+                        // A chain's description is prose; only its chips are
+                        // code. A chart's title is prose too.
+                        .when(!chain && !visual, |d| {
+                            d.font_family(crate::fonts::mono()).text_size(px(12.))
+                        })
                         .text_color(if failed {
                             rgb(0xff6467).into()
                         } else {
@@ -346,7 +351,7 @@ impl TranscriptView {
                                             })
                                             .max_w(px(200.))
                                             .flex_shrink(1.)
-                                            .font_family(markdown::MONO)
+                                            .font_family(crate::fonts::mono())
                                             .text_size(px(12.))
                                             .gap_1()
                                             .px_1p5()
@@ -392,7 +397,7 @@ impl TranscriptView {
                                                 format!("tool-step-more-{start}")
                                             })
                                             .flex_shrink_0()
-                                            .font_family(markdown::MONO)
+                                            .font_family(crate::fonts::mono())
                                             .text_size(px(12.))
                                             .bg(content(0.))
                                             .border_color(content(0.12))
@@ -462,7 +467,7 @@ impl TranscriptView {
                         .pb_2()
                         .flex()
                         .flex_col()
-                        .font_family(markdown::MONO)
+                        .font_family(crate::fonts::mono())
                         .text_size(px(12.))
                         .line_height(px(20.))
                         .children(steps.into_iter().enumerate().map(
@@ -514,7 +519,7 @@ impl TranscriptView {
                     div()
                         .min_w_0()
                         .pb_2()
-                        .font_family(markdown::MONO)
+                        .font_family(crate::fonts::mono())
                         .text_size(px(12.))
                         .line_height(px(20.))
                         .text_color(rgb(0xf87171))
@@ -826,6 +831,67 @@ mod tests {
                     .iter()
                     .any(|r| matches!(r.body, Body::Reasoning | Body::Phase { .. }))
             );
+        });
+    }
+
+    #[gpui::test]
+    fn a_settled_lone_step_keeps_its_loader_until_the_next_one_arrives(cx: &mut TestAppContext) {
+        let view = cx.new(|_| TranscriptView::new());
+        let row = |role: &str, text: String| Row {
+            role: role.into(),
+            text,
+            first: true,
+            sent_at: None,
+        };
+        let step = |id: &str, state: ToolState| {
+            let mut call = ToolCall::new(id, "Bash");
+            call.input = r#"{"command":"ls"}"#.into();
+            call.state = state;
+            row("tool", serde_json::to_string(&call).unwrap())
+        };
+        let lone = |view: &TranscriptView| {
+            view.rows.iter().find_map(|r| match &r.body {
+                Body::Tool {
+                    group: None, live, ..
+                } => Some(*live),
+                _ => None,
+            })
+        };
+        view.update(cx, |view, cx| {
+            // Inspect the handoff state without waiting for paced prose, and
+            // keep the work expanded so the settled tool row remains visible.
+            view.smooth_reveal = false;
+            view.work_folds.insert(1, true);
+            view.streaming(true, cx);
+            view.patch(
+                0,
+                vec![
+                    row("user", "List files".into()),
+                    step("first", ToolState::Completed),
+                ],
+                cx,
+            );
+            assert_eq!(lone(view), Some(true), "settled but still the live end");
+
+            view.patch(2, vec![step("second", ToolState::Running)], cx);
+            assert!(
+                view.rows
+                    .iter()
+                    .any(|r| matches!(r.body, Body::Phase { .. })),
+                "the second step hands the loader to its group header"
+            );
+
+            view.patch(1, vec![step("first", ToolState::Completed)], cx);
+            view.patch(2, vec![row("assistant", String::new())], cx);
+            assert_eq!(lone(view), Some(true), "an empty answer keeps the wait");
+
+            view.patch(2, vec![row("assistant", "Done".into())], cx);
+            assert_eq!(lone(view), Some(false), "an answer after it ends the wait");
+
+            cx.set_reduce_motion(true);
+            view.work_folds.insert(1, false);
+            view.rebuild(1, cx);
+            assert_eq!(lone(view), None, "collapsed work hides the settled step");
         });
     }
 }

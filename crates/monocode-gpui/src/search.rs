@@ -480,7 +480,7 @@ fn empty_state() -> AnyElement {
         .into_any_element()
 }
 impl Render for SearchView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows: Vec<_> = self
             .hits
             .iter()
@@ -618,7 +618,12 @@ impl Render for SearchView {
                     .border_b_1()
                     .border_color(stroke)
                     .pl(px(self.original_header.unwrap_or(12.)))
-                    .pr_3()
+                    .pr(px(12.
+                        + if self.original_header.is_some() {
+                            crate::shell::client_controls_width(window)
+                        } else {
+                            0.
+                        }))
                     .flex()
                     .items_center()
                     .gap_2()

@@ -78,6 +78,7 @@ impl Shell {
         settings.plan = false;
         settings.orchestrator = false;
         settings.operator = false;
+        settings.operator_enabled = false;
         settings.handoff = None;
         settings.turns.clear();
         settings.environment.clear();

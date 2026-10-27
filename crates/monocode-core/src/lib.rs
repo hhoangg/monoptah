@@ -1,6 +1,7 @@
 //! UI-independent services shared by the native migration and Tauri.
 pub mod accounts;
 pub mod agent;
+pub mod app_access;
 pub mod app_update;
 pub mod attachment;
 pub mod automations;
@@ -40,6 +41,7 @@ pub mod transcript;
 pub mod tui_hook;
 pub mod tui_launch;
 pub mod usage;
+pub mod user_links;
 pub mod visual;
 pub mod visual_bridge;
 

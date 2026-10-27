@@ -171,11 +171,14 @@ impl Shell {
         let summaries = summaries.into_values().collect();
         let live = conversations
             .iter()
-            .filter(|s| s.read(cx).history_loaded())
+            // A paged Mono's saved search covers turns not loaded yet.
+            .filter(|s| {
+                s.read(cx).history_loaded() && s.read(cx).transcript.read(cx).history_complete()
+            })
             .map(|s| {
                 (
                     s.read(cx).summary.id,
-                    Arc::new(s.read(cx).transcript.read(cx).source_rows().to_vec()),
+                    Arc::new(s.read(cx).transcript.read(cx).history_rows().to_vec()),
                 )
             })
             .collect();
@@ -326,8 +329,12 @@ impl Shell {
             .map(|m| m.read(cx).search_conversations())
             .unwrap_or_default();
         for view in views {
+            let transcript = view.read(cx).transcript.read(cx);
+            if !transcript.history_complete() {
+                continue;
+            }
+            let rows = Arc::new(transcript.history_rows().to_vec());
             let summary = view.read(cx).summary.clone();
-            let rows = Arc::new(view.read(cx).transcript.read(cx).source_rows().to_vec());
             search
                 .view
                 .update(cx, |v, cx| v.update_session(summary, rows, cx));
@@ -341,8 +348,12 @@ impl Shell {
             return;
         };
         let session = session.read(cx);
+        let transcript = session.transcript.read(cx);
+        if !transcript.history_complete() {
+            return;
+        }
         let summary = session.summary.clone();
-        let rows = Arc::new(session.transcript.read(cx).source_rows().to_vec());
+        let rows = Arc::new(transcript.history_rows().to_vec());
         search
             .view
             .update(cx, |v, cx| v.update_session(summary, rows, cx));

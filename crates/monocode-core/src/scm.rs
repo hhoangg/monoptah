@@ -397,6 +397,14 @@ pub fn pr_status(cwd: &Path) -> Result<Option<Pr>, String> {
     Ok(pr_status_for(&expand_home(cwd)))
 }
 
+/// The working copy's GitHub `owner/name`, via `gh` (Tauri's git_github_repo).
+pub fn github_repo(cwd: &Path) -> Result<String, String> {
+    if remote_workspace::is_remote(cwd) {
+        return Err("GitHub repository lookup is local only".into());
+    }
+    github_repo_for(&expand_home(cwd))
+}
+
 /// Create a GitHub pull request with `gh` and return its URL.
 pub fn pr_create(
     cwd: &Path,

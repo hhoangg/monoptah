@@ -282,82 +282,124 @@ impl Updater {
         .detach();
     }
 }
+/// What the updater offers right now, for Settings' About button.
+pub(crate) enum Action {
+    Check,
+    Install(String),
+    Busy(String),
+}
+pub(crate) fn action(entity: &Entity<Updater>, cx: &App) -> Action {
+    let state = entity.read(cx);
+    match state.phase {
+        Phase::Available => Action::Install(state.pending_version()),
+        Phase::Checking => Action::Busy("Checking…".into()),
+        Phase::Downloading | Phase::Installing => Action::Busy(state.progress_label()),
+        Phase::Disabled | Phase::Idle | Phase::Current => Action::Check,
+    }
+}
+/// A line for Settings' About description: the last check's outcome, if any.
+pub(crate) fn status(entity: &Entity<Updater>, cx: &App) -> Option<String> {
+    let state = entity.read(cx);
+    match state.phase {
+        Phase::Current => Some("You’re on the latest version.".into()),
+        Phase::Checking => None,
+        _ => state.message.clone(),
+    }
+}
+pub(crate) fn install(entity: &Entity<Updater>, cx: &mut App) {
+    entity.update(cx, |updater, cx| updater.install(cx));
+}
+impl Updater {
+    fn pending_version(&self) -> String {
+        self.pending
+            .as_ref()
+            .map(|u| u.version.to_string())
+            .unwrap_or_default()
+    }
+    fn progress_label(&self) -> String {
+        match self.phase {
+            Phase::Installing => "Installing…".into(),
+            _ => self
+                .progress
+                .map(|p| format!("Downloading {p}%"))
+                .unwrap_or_else(|| "Downloading…".into()),
+        }
+    }
+}
+/// The sidebar's update card, shown while an update is available or installing.
 pub(crate) fn row(entity: Entity<Updater>, cx: &App) -> gpui::AnyElement {
     let action = entity.clone();
     let state = entity.read(cx);
-    let label = match state.phase {
-        Phase::Available => format!(
-            "Update to {}",
-            state
-                .pending
-                .as_ref()
-                .map(|u| u.version.to_string())
-                .unwrap_or_default()
-        ),
-        Phase::Downloading => state
-            .progress
-            .map(|p| format!("Downloading {p}%"))
-            .unwrap_or_else(|| "Downloading…".into()),
-        Phase::Installing => "Installing update…".into(),
-        Phase::Checking => "Checking for updates…".into(),
-        Phase::Current => "You’re on the latest version".into(),
-        Phase::Idle => "Check for updates in Settings".into(),
-        Phase::Disabled => state.message.clone().unwrap_or_default(),
-    };
     let available = state.phase == Phase::Available;
-    let mut view = div()
+    let title = if available {
+        "Update available".to_string()
+    } else {
+        state.progress_label()
+    };
+    let detail = if available || state.busy() {
+        format!("v{}", state.pending_version())
+    } else {
+        format!("v{}", version())
+    };
+    let mut button = div()
+        .id("install-native-update")
+        .role(Role::Button)
+        .rounded(px(8.))
+        .px_2()
+        .py(px(6.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .bg(content(0.06))
+        .child(
+            icon(
+                if state.busy() {
+                    "loader"
+                } else {
+                    "arrow-down-circle"
+                },
+                16.,
+            )
+            .text_color(content(if available { 0.9 } else { 0.5 })),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(12.))
+                        .line_height(px(16.))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(content(0.9))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(11.))
+                        .line_height(px(14.))
+                        .text_color(content(0.45))
+                        .child(detail),
+                ),
+        );
+    if available {
+        button = button
+            .aria_label("Install the available Monoptah Native update")
+            .cursor_pointer()
+            .hover(|s| s.bg(content(0.1)))
+            .on_click(move |_, _, cx| action.update(cx, |updater, cx| updater.install(cx)));
+    }
+    div()
         .id("native-app-update")
         .role(Role::Status)
         .w_full()
         .min_w_0()
-        .flex()
-        .flex_col()
-        .gap_1();
-    let mut button = div()
-        .id("install-native-update")
-        .rounded(px(8.))
-        .px_2()
-        .py_2()
-        .flex()
-        .items_center()
-        .gap_2()
-        .text_size(px(12.))
-        .child(icon(
-            if state.busy() {
-                "loader"
-            } else {
-                "circle-arrow-down"
-            },
-            16.,
-        ))
-        .child(div().flex_1().min_w_0().truncate().child(label))
-        .child(
-            div()
-                .text_size(px(11.))
-                .text_color(content(0.4))
-                .child(format!("v{}", version())),
-        );
-    if available {
-        button = button
-            .role(Role::Button)
-            .aria_label("Install the available Monoptah Native update")
-            .cursor_pointer()
-            .bg(content(0.08))
-            .hover(|s| s.bg(content(0.12)))
-            .on_click(move |_, _, cx| action.update(cx, |updater, cx| updater.install(cx)));
-    }
-    view = view.child(button);
-    if state.phase != Phase::Disabled
-        && let Some(error) = &state.message
-    {
-        view = view.child(
-            div()
-                .text_size(px(11.))
-                .text_color(content(0.6))
-                .child(error.clone()),
-        );
-    }
-    view.into_any_element()
+        .child(button)
+        .into_any_element()
 }
 
 #[cfg(test)]

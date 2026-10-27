@@ -264,7 +264,7 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "terminal-in-panel",
         Section::General,
         "Terminal in side panel",
-        "terminal dock right panel tab shell new layout",
+        "terminal dock right panel tab shell focused layout",
     ),
     (
         "file-tabs",
@@ -289,6 +289,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         Section::Appearance,
         "Theme",
         "dark light system appearance mode",
+    ),
+    (
+        "wayland-window-decorations",
+        Section::Appearance,
+        "Wayland window decorations",
+        "wayland linux compositor title bar titlebar border decorations minimize maximize close",
     ),
     (
         "workspace-theme",
@@ -336,8 +342,8 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
     (
         "inset-layout",
         Section::Appearance,
-        "New layout",
-        "classic preview sidebar navigation tabs inset workspace card rounded floating linear frame",
+        "Layout",
+        "classic focused new preview sidebar navigation tabs inset workspace card rounded floating linear frame",
     ),
     (
         "interface-scale",
@@ -548,13 +554,16 @@ fn score(needle: &str, label: &str, keywords: &str) -> Option<f32> {
 }
 
 /// searchSettings: individual settings first, then whole sections.
-pub(crate) fn search(query: &str) -> Vec<SearchResult> {
+pub(crate) fn search(query: &str, compositor: &str) -> Vec<SearchResult> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return Vec::new();
     }
     let mut scored: Vec<(f32, SearchResult)> = Vec::new();
     for &(id, section, label, keywords) in INDEX {
+        if id == "wayland-window-decorations" && compositor != "Wayland" {
+            continue;
+        }
         if let Some(s) = score(&needle, label, keywords) {
             scored.push((
                 s,
@@ -590,17 +599,40 @@ pub(crate) fn search(query: &str) -> Vec<SearchResult> {
 mod tests {
     use super::*;
     #[test]
+    fn wayland_decorations_are_searchable_only_on_wayland() {
+        for query in ["Wayland", "window decorations", "compositor", "title bar"] {
+            let results = search(query, "Wayland");
+            let result = results
+                .iter()
+                .find(|r| r.setting == Some("wayland-window-decorations"))
+                .unwrap();
+            assert_eq!(result.section, Section::Appearance);
+            for compositor in ["X11", "Headless", ""] {
+                assert!(
+                    search(query, compositor)
+                        .iter()
+                        .all(|r| r.setting != Some("wayland-window-decorations"))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rows_win_their_own_name_and_shared_appearance_rows_are_searchable() {
-        let results = search("theme");
+        let results = search("theme", "Wayland");
         assert_eq!(results[0].setting, Some("theme"));
         assert_eq!(results[1].setting, Some("workspace-theme"));
-        assert!(search("hue").iter().any(|r| r.setting == Some("hue")));
         assert!(
-            search("workspace theme")
+            search("hue", "Wayland")
+                .iter()
+                .any(|r| r.setting == Some("hue"))
+        );
+        assert!(
+            search("workspace theme", "Wayland")
                 .iter()
                 .any(|r| r.setting == Some("workspace-theme"))
         );
-        let clickup = search("clickup");
+        let clickup = search("clickup", "Wayland");
         assert!(
             clickup
                 .iter()
@@ -608,7 +640,7 @@ mod tests {
             "{clickup:?}"
         );
         assert!(
-            search("spaces")
+            search("spaces", "Wayland")
                 .iter()
                 .any(|r| r.setting == Some("clickup"))
         );
@@ -618,13 +650,13 @@ mod tests {
         );
         for query in ["session surface", "terminal", "tui"] {
             assert!(
-                search(query).iter().any(
+                search(query, "Wayland").iter().any(
                     |r| r.section == Section::Providers && r.setting == Some("session-surface")
                 ),
                 "{query}"
             );
         }
-        let pages = search("archive");
+        let pages = search("archive", "Wayland");
         assert!(
             pages
                 .iter()

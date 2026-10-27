@@ -76,13 +76,11 @@ impl RightTab {
         }
     }
     /// loadRightPanelTabOrder: unique known tabs, the missing ones appended.
+    /// Changes has no tab; the title bar's diff stat opens it.
     pub(crate) fn normalize(order: &[RightTab]) -> Vec<RightTab> {
         let mut out = Vec::new();
-        for tab in order
-            .iter()
-            .chain(&[Self::Files, Self::Changes, Self::Graph])
-        {
-            if *tab != Self::Terminal && !out.contains(tab) {
+        for tab in order.iter().chain(&[Self::Files, Self::Graph]) {
+            if !matches!(tab, Self::Terminal | Self::Changes) && !out.contains(tab) {
                 out.push(*tab);
             }
         }
@@ -232,8 +230,8 @@ struct TabDrag {
     active: bool,
 }
 
-/// The title-bar strip observes the panel so selection, drag motion, and git
-/// updates repaint independently of the cached pane and session tabs.
+/// The title-bar strip observes the panel so selection and drag motion
+/// repaint independently of the cached pane and session tabs.
 pub(crate) struct ProjectTabs {
     panel: WeakEntity<RightPanel>,
     _subscription: Subscription,
@@ -249,7 +247,6 @@ impl Render for ProjectTabs {
 
 pub(crate) struct RightPanel {
     pub tabs: Entity<ProjectTabs>,
-    pub git: Entity<ProjectGit>,
     pub explorer: Entity<Explorer>,
     pub changes: Entity<Changes>,
     pub history: Entity<History>,
@@ -299,7 +296,6 @@ impl RightPanel {
         });
         Self {
             tabs,
-            git,
             focus: cx.focus_handle(),
             explorer,
             changes,
@@ -321,11 +317,12 @@ impl RightPanel {
     pub(crate) fn tab(&self) -> RightTab {
         self.tab
     }
-    /// The tabs in strip order: the saved three, then Terminal when enabled.
+    /// The tabs in strip order: the saved two, with Terminal between them
+    /// when enabled.
     pub(crate) fn tabs(&self) -> Vec<RightTab> {
         let mut tabs = self.order.clone();
         if self.terminal_tab {
-            tabs.push(RightTab::Terminal);
+            tabs.insert(1.min(tabs.len()), RightTab::Terminal);
         }
         tabs
     }
@@ -420,6 +417,7 @@ impl RightPanel {
         });
     }
     fn move_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let tabs = self.tabs();
         let Some(drag) = &mut self.drag else {
             return;
         };
@@ -433,13 +431,14 @@ impl RightPanel {
         }
         drag.active = true;
         // Swap with a neighbour once the dragged tab's centre crosses its centre.
-        // Terminal stays last, outside the reorderable tabs.
-        let Some(from) = self.order.iter().position(|t| *t == drag.tab) else {
+        // Terminal holds its slot, outside the reorderable tabs.
+        let Some(from) = tabs.iter().position(|t| *t == drag.tab) else {
             return;
         };
-        let bounds: Vec<Option<Bounds<Pixels>>> = self.tab_bounds[..self.order.len()]
+        let bounds: Vec<Option<Bounds<Pixels>>> = tabs
             .iter()
-            .map(|slot| slot.get())
+            .zip(&self.tab_bounds)
+            .map(|(tab, slot)| slot.get().filter(|_| *tab != RightTab::Terminal))
             .collect();
         if let Some(Some(own)) = bounds.get(from) {
             let centre = own.center().x + drag.offset;
@@ -467,7 +466,13 @@ impl RightPanel {
                 } else {
                     other.left() - own.left()
                 };
-                self.order.swap(from, to);
+                let (a, b) = (
+                    self.order.iter().position(|t| *t == tabs[from]),
+                    self.order.iter().position(|t| *t == tabs[to]),
+                );
+                if let (Some(a), Some(b)) = (a, b) {
+                    self.order.swap(a, b);
+                }
                 drag.origin += shift;
                 drag.offset -= shift;
             }
@@ -485,7 +490,6 @@ impl RightPanel {
     }
 
     fn tab_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let changes = self.git.read(cx).has_changes();
         let progress = self
             .reveal
             .as_ref()
@@ -530,7 +534,7 @@ impl RightPanel {
                                 .max_width(tab_label_width(self.tab_width, count)),
                             path,
                             active,
-                            tab == RightTab::Changes && changes && !active,
+                            false,
                             unfolded,
                             window,
                         )
@@ -635,7 +639,11 @@ mod tests {
     fn tab_order_keeps_known_tabs_once() {
         assert_eq!(
             RightTab::normalize(&[RightTab::Graph, RightTab::Graph]),
-            [RightTab::Graph, RightTab::Files, RightTab::Changes]
+            [RightTab::Graph, RightTab::Files]
+        );
+        assert_eq!(
+            RightTab::normalize(&[RightTab::Changes, RightTab::Graph]),
+            [RightTab::Graph, RightTab::Files]
         );
         assert_eq!(format_integer(1234567), "1,234,567");
         assert_eq!(format_integer(12), "12");

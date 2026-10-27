@@ -709,7 +709,7 @@ impl FormulaSidebar {
                 .bg(content(0.03))
                 .px(px(10.))
                 .py(px(8.))
-                .font_family(crate::markdown::MONO)
+                .font_family(crate::fonts::mono())
                 .text_size(px(11.5))
                 .line_height(px(17.))
                 .text_color(content(1.))
@@ -743,7 +743,7 @@ impl FormulaSidebar {
                 .flex()
                 .flex_wrap()
                 .gap(px(4.))
-                .font_family(crate::markdown::MONO)
+                .font_family(crate::fonts::mono())
                 .text_size(px(11.))
                 .children(globs.iter().map(|glob| {
                     div()

@@ -28,7 +28,7 @@ impl Render for DraggedIdentity {
             .bg(floating_fill())
             .px_2()
             .py_1()
-            .font_family(crate::markdown::MONO)
+            .font_family(crate::fonts::mono())
             .text_size(px(12.))
             .line_height(px(16.))
             .text_color(content(1.))

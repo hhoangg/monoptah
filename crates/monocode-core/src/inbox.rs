@@ -1146,6 +1146,42 @@ impl Service {
 pub(super) fn run_git(root: &Path, args: &[&str]) -> Result<String, String> {
     run_command("git", root, args, true)
 }
+/// githubWorkItem: one GitHub issue or pull request a message links to,
+/// looked up with `gh` from `cwd` (any folder, when the session's is gone).
+pub fn github_work_item(cwd: &Path, repo: &str, kind: &str, number: i64) -> Result<Item, String> {
+    let mut item: Item = convert(github::git_github_work_item_for(
+        &gh_root(cwd),
+        repo,
+        kind,
+        number,
+    )?)?;
+    item.provider = "github".into();
+    Ok(item)
+}
+/// githubWorkItemDetails for [`github_work_item`]'s item.
+pub fn github_work_item_details(
+    cwd: &Path,
+    repo: &str,
+    kind: &str,
+    number: i64,
+) -> Result<Details, String> {
+    convert(github::git_github_work_item_details_for(
+        &gh_root(cwd),
+        repo,
+        kind,
+        number,
+    )?)
+}
+fn gh_root(cwd: &Path) -> PathBuf {
+    let cwd = crate::scm::expand_home(cwd);
+    if cwd.is_dir() {
+        cwd
+    } else {
+        crate::scm::shell::dirs_home()
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+    }
+}
 pub(super) fn run_gh(root: &Path, args: &[&str], allow_empty: bool) -> Result<String, String> {
     run_command("gh", root, args, allow_empty)
 }

@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn the_search_finds_ticket_scoring_in_inbox() {
         for query in ["ticket scoring", "leaderboard", "anthropic", "haiku"] {
-            let results = crate::settings::model::search(query);
+            let results = crate::settings::model::search(query, "Wayland");
             assert!(
                 results
                     .iter()

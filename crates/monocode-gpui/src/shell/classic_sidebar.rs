@@ -276,22 +276,6 @@ impl Shell {
         {
             self.classic_worktree_picker = None;
         }
-        let (slide_x, slide_opacity) = match self.space_slide {
-            Some((direction, start)) => {
-                let t = start.elapsed().as_secs_f32() / 0.44;
-                if t >= 1. {
-                    self.space_slide = None;
-                    (0., 1.)
-                } else {
-                    let eased = crate::reveal::bezier(t, 0.4, 0., 0.2, 1.);
-                    (
-                        direction * self.workspace.sidebar_width * (1. - eased),
-                        eased,
-                    )
-                }
-            }
-            None => (0., 1.),
-        };
         let sessions = self.classic_sidebar_tab == ClassicSidebarTab::Sessions;
         let live_agents = if self.workspace.project_rail_open {
             None
@@ -333,8 +317,6 @@ impl Shell {
                     .child(
                         div()
                             .relative()
-                            .left(px(slide_x))
-                            .opacity(slide_opacity)
                             .h_full()
                             .pl_3()
                             .pr_1p5()
@@ -384,8 +366,6 @@ impl Shell {
                 div().flex_1().min_h_0().overflow_hidden().child(
                     div()
                         .relative()
-                        .left(px(slide_x))
-                        .opacity(slide_opacity)
                         .size_full()
                         .min_h_0()
                         .flex()

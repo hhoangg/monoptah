@@ -54,7 +54,7 @@ Section "Monocode Native"
   WriteRegStr HKCU "Software\Monocode Native" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MonocodeNative" "DisplayName" "Monocode Native"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MonocodeNative" "DisplayVersion" "@VERSION@"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MonocodeNative" "UninstallString" '$"$INSTDIR\Uninstall.exe$"'
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\MonocodeNative" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   CreateShortcut "$SMPROGRAMS\Monocode Native.lnk" "$INSTDIR\monocode-gpui.exe"
   CreateShortcut "$DESKTOP\Monocode Native.lnk" "$INSTDIR\monocode-gpui.exe"
   Delete "$INSTDIR\monocode-gpui.previous.exe"
@@ -71,12 +71,12 @@ SectionEnd
 Function .onInstFailed
   StrCmp $UpdatePID "" failed_done
   IfFileExists "$INSTDIR\monocode-gpui.exe" 0 failed_done
-  Exec '$"$INSTDIR\monocode-gpui.exe$"'
+  Exec '"$INSTDIR\monocode-gpui.exe"'
   failed_done:
 FunctionEnd
 Function .onInstSuccess
   StrCmp $UpdatePID "" done
-  Exec '$"$INSTDIR\monocode-gpui.exe$"'
+  Exec '"$INSTDIR\monocode-gpui.exe"'
   done:
 FunctionEnd
 Section "Uninstall"

@@ -480,7 +480,7 @@ impl History {
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .font_family(crate::markdown::MONO)
+                                    .font_family(crate::fonts::mono())
                                     .text_color(content(0.3))
                                     .child(commit.short_sha.clone()),
                             ),

@@ -6,8 +6,9 @@
 //! frame per spinner, and at 30Hz or less instead of the display's 120Hz. A
 //! lease ends when its view was notified but did not paint a loop again, so
 //! a closed, scrolled-away or hidden spinner stops costing anything, and the
-//! clock parks once no lease is left. While no window is active the clock
-//! slows every loop down further.
+//! clock parks once no lease is left. While no window is visible the clock
+//! slows every loop down further; a visible window behind another app's keeps
+//! the full pace, since its loops are still on screen.
 use gpui::{
     AnyElement, App, Element, ElementId, EntityId, Global, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, Pixels, Window,
@@ -18,7 +19,7 @@ use std::{
 };
 
 const TICK: Duration = Duration::from_millis(33);
-/// An inactive app's loops tick this many times slower.
+/// A hidden app's loops tick this many times slower.
 const BACKGROUND_STRIDE: u64 = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,10 +41,12 @@ impl Rate {
     }
 }
 
+type FrameCallback = Box<dyn FnOnce(&mut App)>;
 struct Lease {
     rate: Rate,
     /// Painted a loop since the clock last notified it.
     painted: bool,
+    on_tick: Option<FrameCallback>,
 }
 
 #[derive(Default)]
@@ -59,6 +62,26 @@ impl Global for Clock {}
 /// or painting a loop, every time the loop is drawn. Returns false, and
 /// leases nothing, under reduced motion: draw the loop's resting frame.
 pub(crate) fn request(rate: Rate, window: &Window, cx: &mut App) -> bool {
+    request_inner(rate, window, cx, None)
+}
+
+/// Stream presentation uses the same coalesced 30Hz wakeup as decorative
+/// loops, advancing its state before notifying rather than spawning a timer.
+pub(crate) fn request_frame(
+    rate: Rate,
+    window: &Window,
+    cx: &mut App,
+    on_tick: impl FnOnce(&mut App) + 'static,
+) -> bool {
+    request_inner(rate, window, cx, Some(Box::new(on_tick)))
+}
+
+fn request_inner(
+    rate: Rate,
+    window: &Window,
+    cx: &mut App,
+    mut on_tick: Option<FrameCallback>,
+) -> bool {
     if cx.reduce_motion() {
         return false;
     }
@@ -69,13 +92,17 @@ pub(crate) fn request(rate: Rate, window: &Window, cx: &mut App) -> bool {
         .entry(view)
         .and_modify(|lease| {
             lease.painted = true;
+            if on_tick.is_some() {
+                lease.on_tick = on_tick.take();
+            }
             if lease.rate.stride() > rate.stride() {
                 lease.rate = rate;
             }
         })
-        .or_insert(Lease {
+        .or_insert_with(|| Lease {
             rate,
             painted: true,
+            on_tick,
         });
     if !clock.running {
         clock.running = true;
@@ -114,7 +141,7 @@ pub(crate) fn running(cx: &App) -> bool {
 }
 
 fn tick(cx: &mut App) -> bool {
-    let background = !app_active(cx);
+    let background = !app_visible(cx);
     let clock = cx.global_mut::<Clock>();
     clock.tick = clock.tick.wrapping_add(1);
     let tick = clock.tick;
@@ -128,23 +155,28 @@ fn tick(cx: &mut App) -> bool {
             return false;
         }
         lease.painted = false;
-        due.push(*view);
+        due.push((*view, lease.on_tick.take()));
         true
     });
     if clock.leases.is_empty() {
         clock.running = false;
         return false;
     }
-    for view in due {
-        cx.notify(view);
+    for (view, callback) in due {
+        if let Some(callback) = callback {
+            callback(cx);
+        } else {
+            cx.notify(view);
+        }
     }
     true
 }
 
-fn app_active(cx: &mut App) -> bool {
+/// Whether any window is on screen: an inactive window can still be in view.
+fn app_visible(cx: &mut App) -> bool {
     cx.windows().into_iter().any(|window| {
         window
-            .update(cx, |_, window, _| window.is_window_active())
+            .update(cx, |_, window, _| window.is_visible())
             .unwrap_or(false)
     })
 }
@@ -262,9 +294,7 @@ mod tests {
         });
         cx.run_until_parked();
         let first = renders.get();
-        // A test window is never active, so the clock runs at its background pace.
-        cx.executor()
-            .advance_clock(TICK * BACKGROUND_STRIDE as u32 * 2);
+        cx.executor().advance_clock(TICK * 2);
         cx.run_until_parked();
         assert!(renders.get() > first, "a leased view repaints on ticks");
 
@@ -289,6 +319,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_visible_window_keeps_full_pace_and_a_hidden_one_slows(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(false));
+        let renders = Rc::new(Cell::new(0));
+        let (_view, cx) = cx.add_window_view(|_, _| Spinner {
+            spinning: true,
+            renders: renders.clone(),
+        });
+        cx.run_until_parked();
+        // A test window is visible but never active, like one behind another app.
+        let start = renders.get();
+        cx.executor().advance_clock(TICK * BACKGROUND_STRIDE as u32);
+        cx.run_until_parked();
+        assert_eq!(renders.get() - start, BACKGROUND_STRIDE as usize);
+
+        cx.simulate_visibility_change(gpui::WindowVisibility::Hidden);
+        cx.run_until_parked();
+        let hidden = renders.get();
+        cx.executor()
+            .advance_clock(TICK * BACKGROUND_STRIDE as u32 * 2);
+        cx.run_until_parked();
+        assert!(
+            renders.get() - hidden <= 2,
+            "a hidden app's loops slow down"
+        );
+    }
+
+    #[gpui::test]
     fn reduced_motion_leases_nothing(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let renders = Rc::new(Cell::new(0));
@@ -302,5 +359,54 @@ mod tests {
             .advance_clock(TICK * BACKGROUND_STRIDE as u32 * 3);
         cx.run_until_parked();
         assert_eq!(renders.get(), first);
+    }
+
+    #[gpui::test]
+    fn stream_callbacks_share_the_clock_and_release_their_lease(cx: &mut TestAppContext) {
+        struct Stream {
+            active: bool,
+            ticks: Rc<Cell<usize>>,
+        }
+        impl Render for Stream {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let active = self.active;
+                let view = cx.entity().downgrade();
+                div().size_4().child(gpui::canvas(
+                    move |_, window, cx| {
+                        if active {
+                            request_frame(Rate::Smooth, window, cx, move |cx| {
+                                let _ = view.update(cx, |stream, cx| {
+                                    if stream.active {
+                                        stream.ticks.set(stream.ticks.get() + 1);
+                                        cx.notify();
+                                    }
+                                });
+                            });
+                        }
+                    },
+                    |_, _, _, _| {},
+                ))
+            }
+        }
+        cx.update(|cx| cx.set_reduce_motion(false));
+        let ticks = Rc::new(Cell::new(0));
+        let (view, cx) = cx.add_window_view(|_, _| Stream {
+            active: true,
+            ticks: ticks.clone(),
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(TICK);
+        cx.run_until_parked();
+        assert_eq!(ticks.get(), 1);
+        view.update(cx, |stream, cx| {
+            stream.active = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(TICK * BACKGROUND_STRIDE as u32 * 3);
+        cx.run_until_parked();
+        assert_eq!(ticks.get(), 1);
+        cx.update(|_, cx| assert!(!running(cx)));
     }
 }

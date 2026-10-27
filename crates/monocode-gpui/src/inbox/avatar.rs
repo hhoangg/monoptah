@@ -21,7 +21,7 @@ impl Asset for Avatar {
     }
 }
 
-pub(super) fn image(
+pub(crate) fn image(
     provider: &str,
     name: &str,
     url: &str,

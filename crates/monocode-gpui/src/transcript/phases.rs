@@ -86,9 +86,9 @@ pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
                 at = end;
                 continue;
             }
-            // Keep compaction visible as its own step instead of burying it in
-            // an unrelated group of reads, commands or private reasoning.
-            let compaction = call.is_compaction();
+            // Keep compaction and handoffs visible as their own step instead of
+            // burying them in an unrelated group of reads, commands or reasoning.
+            let compaction = call.is_milestone();
             if compaction {
                 flush(at, &mut members, &mut calls, &mut result);
             }
@@ -103,6 +103,9 @@ pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
             if compaction {
                 flush(end, &mut members, &mut calls, &mut result);
             }
+        } else if role == "visual" {
+            // A visual published mid-work belongs to that work; it must not
+            // split the group around the call that published it.
         } else {
             // React's first assistant message replaces the initial private think.
             if role == "assistant" && leading && calls.is_empty() {

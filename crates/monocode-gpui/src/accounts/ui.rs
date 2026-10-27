@@ -737,7 +737,7 @@ impl Accounts {
                     .text_size(px(10.))
                     .line_height(px(16.))
                     .text_color(content(0.4))
-                    .child("Each conversation stays pinned to the account that started it."),
+                    .child("Choosing an account moves the current conversation to it."),
             )
             .child(rows)
             .when(accounts::supports_profiles(kind), |d| {

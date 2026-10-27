@@ -35,15 +35,35 @@ return () => visual.column([
   visual.button('Add', () => { state.count += 1; })
 ], {gap: 12});
 
+Answers that tell a story: publish one small visual per idea (a single chart,
+a stat row, a gauge) rather than one dashboard holding everything. Each
+visual_show returns an embed line such as ![Deploys per week](visual:deploys).
+Write your final reply as prose and put each embed line on its own line
+directly after the sentence it supports, so text and visuals alternate. The
+title becomes the caption; do not restate what the visual already shows.
+Visuals you never place appear above your reply. Choose short, readable ids.
+
 Native components:
 visual.column(children,{gap?}), row(children,{gap?}), grid(children,{columns?,gap?})
-visual.text(text,{size?,color?}), stat(label,value,{detail?,color?})
+visual.card(children,{gap?}) groups a chart or stats on a raised panel.
+visual.text(text,{size?,color?})
+visual.stat(label,value,{detail?,delta?,trend?,better?,color?}): delta is a signed
+change such as '+12.4%'; trend is an array of numbers drawn as a sparkline;
+better:'lower' colors a falling delta as good (latency, errors, cost).
 visual.table(columns,rows)
 visual.chart('bar'|'line'|'area',[{label,values,color?}],{labels?,height?})
+A single-series bar chart labels its latest bar; give each series its own color.
+visual.gauge(label,value,{min?,max?,unit?,color?}) for a reading against a range.
+visual.donut([{label,value,color?}],{label?,value?}) for parts of a whole;
+label and value are written in the middle (default: the total).
+visual.heatmap(rows,{rows?,columns?,color?}): rows is an array of equal-length
+number arrays, such as weekdays by weeks; labels are optional.
+visual.progress(label,value,{max?,detail?,color?})
 visual.button(label,onClick,{disabled?}), toggle(label,value,onChange)
 visual.slider(label,value,min,max,onChange,{step?}), tabs(labels,selected,onChange)
 visual.input(label,value,onChange,{placeholder?}), select(label,options,selectedIndex,onChange)
 Input handlers receive a string (up to 4096 bytes); select handlers receive an index.
+Select and input labels are not shown: make options and placeholders self-explanatory.
 visual.canvas(shapes,{width?,height?})
 Canvas shapes: visual.rect(x,y,w,h,{color?}), circle(x,y,r,{color?}),
 line(x1,y1,x2,y2,{color?,width?}), polyline([[x,y],...],{color?,width?}),
@@ -512,7 +532,28 @@ fn publish_with_environment(
             .unwrap_or("Visual publication failed")
             .into());
     }
+    let mut response = response;
+    response["embed"] = json!(embed(&wire.document));
+    response["placement"] = json!(
+        "Put the embed line on its own line in your final reply, where this visual belongs. Do not describe or restate the visual around it."
+    );
     Ok(response)
+}
+
+/// The Markdown line that places a published visual in an answer's prose.
+fn embed(document: &VisualDocument) -> String {
+    let caption: String = document
+        .title
+        .chars()
+        .map(|c| {
+            if matches!(c, '[' | ']' | '\n' | '\r') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    format!("![{}](visual:{})", caption.trim(), document.id)
 }
 
 fn current_environment() -> HashMap<String, String> {
@@ -673,7 +714,7 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({"name":"visual_docs","description":"Read the native visual SDK reference, examples and styling rules when preparing an inline visual. Does not publish.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
         json!({"name":"visual_check","description":"Validate a native visual program and representative controls without publishing. Returns its component tree. Read visual_docs for the SDK reference.","inputSchema":{"type":"object","properties":properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
-        json!({"name":"visual_show","description":"Publish an interactive native visual into the current conversation and save it with the transcript. Read visual_docs for the SDK reference; validate with visual_check before publishing.","inputSchema":{"type":"object","properties":show_properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
+        json!({"name":"visual_show","description":"Publish a native visual for your reply. Returns an embed line: put it on its own line in your final reply where the visual belongs, between the sentences it supports. Read visual_docs first; validate with visual_check.","inputSchema":{"type":"object","properties":show_properties,"required":["source"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
     ]
 }
 

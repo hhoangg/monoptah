@@ -86,6 +86,49 @@ pub(super) fn present(call: &ToolCall, fallback_cwd: Option<&str>) -> ToolPresen
             steps: Vec::new(),
         };
     }
+    if call.is_handoff() {
+        let input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
+        let from = input["from"].as_str().unwrap_or("the previous model");
+        return ToolPresentation {
+            action: match call.state {
+                ToolState::Running => format!("Transferring from {from}"),
+                ToolState::Completed => format!("Transferred from {from}"),
+                ToolState::Failed => format!("Transfer from {from} failed"),
+                ToolState::Cancelled => format!("Transfer from {from} cancelled"),
+            },
+            target: String::new(),
+            file_path: None,
+            start_line: None,
+            command: None,
+            description: None,
+            steps: Vec::new(),
+        };
+    }
+    if let Some(step) = visual_tool(&call.name) {
+        let running = call.state == ToolState::Running;
+        let input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
+        let title = string(&input, &["title"]).unwrap_or_else(|| "a chart".into());
+        let (action, target) = match step {
+            VisualStep::Docs => (
+                if running { "Planning" } else { "Planned" },
+                "a chart".into(),
+            ),
+            VisualStep::Check => (
+                if running { "Checking" } else { "Checked" },
+                "a chart".into(),
+            ),
+            VisualStep::Show => (if running { "Drawing" } else { "Drew" }, title),
+        };
+        return ToolPresentation {
+            action: action.into(),
+            target,
+            file_path: None,
+            start_line: None,
+            command: None,
+            description: None,
+            steps: Vec::new(),
+        };
+    }
     let mut input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
     normalize_inputs(&mut input, 0);
     let desktop = call.display.as_ref().unwrap_or(&input["__desktop"]);
@@ -273,6 +316,34 @@ pub(super) fn present(call: &ToolCall, fallback_cwd: Option<&str>) -> ToolPresen
     shown.target = shown.target.lines().next().unwrap_or("").into();
     shown
 }
+/// A step of Monocode's own visual tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisualStep {
+    Docs,
+    Check,
+    Show,
+}
+
+/// Recognizes Monocode's visual tools however a provider names an MCP tool:
+/// `visual_show`, `monocode_visual:visual_show`,
+/// `mcp__monocode_visual__visual_show` or `monocode_visual.visual_show`.
+pub fn visual_tool(name: &str) -> Option<VisualStep> {
+    let (server, tool) = name
+        .rsplit_once("__")
+        .or_else(|| name.rsplit_once(':'))
+        .or_else(|| name.rsplit_once('.'))
+        .unwrap_or(("", name));
+    if !server.is_empty() && !server.contains("monocode_visual") {
+        return None;
+    }
+    match tool {
+        "visual_docs" => Some(VisualStep::Docs),
+        "visual_check" => Some(VisualStep::Check),
+        "visual_show" => Some(VisualStep::Show),
+        _ => None,
+    }
+}
+
 fn location(value: &Value) -> Option<&Value> {
     let locations = value.get("locations").or_else(|| value.get("location"))?;
     locations
@@ -890,5 +961,32 @@ mod tests {
         let shown = call("Bash", json!({"command":"cd src && cat a.rs"})).presentation();
         assert_eq!(shown.action, "Read");
         assert!(shown.steps.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod visual_tests {
+    use super::*;
+
+    #[test]
+    fn visual_tools_read_as_chart_steps_under_every_provider_name() {
+        for name in [
+            "visual_show",
+            "monocode_visual:visual_show",
+            "mcp__monocode_visual__visual_show",
+            "monocode_visual.visual_show",
+        ] {
+            assert_eq!(visual_tool(name), Some(VisualStep::Show), "{name}");
+        }
+        assert_eq!(visual_tool("other_server:visual_show"), None);
+        assert_eq!(visual_tool("visual_publish"), None);
+        let mut call = ToolCall::new("1", "monocode_visual:visual_show");
+        call.input = r#"{"title":"Stars per week","source":"return () => null"}"#.into();
+        call.state = ToolState::Completed;
+        let shown = call.presentation();
+        assert_eq!(
+            (shown.action.as_str(), shown.target.as_str()),
+            ("Drew", "Stars per week")
+        );
     }
 }

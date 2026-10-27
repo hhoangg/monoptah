@@ -1145,7 +1145,8 @@ impl Shell {
         )
     }
 
-    /// SessionCard's linked issue or PR; Cmd/Ctrl-click and click both open it.
+    /// SessionCard's linked issue or PR, opened on GitHub. Hover underlines
+    /// it as a link; with no number shown, the line runs under the icon.
     pub(super) fn work_item_badge(
         &self,
         id: i64,
@@ -1180,11 +1181,26 @@ impl Shell {
                     .text_color(rgb(ACCENT)),
                 )
                 .when(!compact, |d| d.child(format!("#{}", item.number)))
+                .cursor_pointer()
+                .when(compact, |d| {
+                    d.border_b_1()
+                        .border_color(gpui::transparent_black())
+                        .hover(|s| s.border_color(rgb(ACCENT)))
+                })
+                .when(!compact, |d| d.hover(|s| s.underline()))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |_, _, _, cx| {
+                .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(MouseButton::Middle, {
+                    let url = url.clone();
+                    move |_, _, cx| {
+                        cx.stop_propagation();
+                        cx.open_url(&url);
+                    }
+                })
+                .on_click(move |_, _, cx| {
                     cx.stop_propagation();
                     cx.open_url(&url);
-                }))
+                })
                 .into_any(),
         )
     }

@@ -222,6 +222,7 @@ impl Store {
                     .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
             },
             shared: pending.as_ref().is_some_and(|turn| turn.shared),
+            owner: Some(TurnOwner::current()),
             error: None,
             dismissed: BTreeSet::new(),
             edited: pending
@@ -449,8 +450,13 @@ impl Store {
             }
             if let Some(review) = read_review(&entry.path())? {
                 let other = review_comparison_path(Path::new(&review.cwd));
-                if review.active.is_some() && (root.starts_with(&other) || other.starts_with(&root))
-                {
+                // A turn whose process exited never finishes; it must not
+                // mark this checkout's later turns as shared.
+                let running = review
+                    .active
+                    .as_ref()
+                    .is_some_and(|turn| turn.owner.as_ref().is_some_and(TurnOwner::running));
+                if running && (root.starts_with(&other) || other.starts_with(&root)) {
                     active.push((entry.path(), review));
                 }
             }
@@ -697,6 +703,10 @@ struct RecordedTurn {
     after: Option<String>,
     head: Option<String>,
     shared: bool,
+    /// The process recording the active turn. Older recordings have none and
+    /// count as abandoned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<TurnOwner>,
     error: Option<String>,
     #[serde(default)]
     dismissed: BTreeSet<String>,
@@ -704,6 +714,50 @@ struct RecordedTurn {
     /// Older shared snapshots have no attribution evidence and stay out of the card.
     #[serde(default)]
     edited: BTreeSet<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TurnOwner {
+    pid: u32,
+    /// Tells this launch apart from an earlier process that had the same pid.
+    launch: String,
+}
+
+impl TurnOwner {
+    fn current() -> Self {
+        Self {
+            pid: std::process::id(),
+            launch: launch_id().to_owned(),
+        }
+    }
+
+    fn running(&self) -> bool {
+        if self.pid == std::process::id() {
+            return self.launch == launch_id();
+        }
+        process_running(self.pid)
+    }
+}
+
+fn launch_id() -> &'static str {
+    static LAUNCH: OnceLock<String> = OnceLock::new();
+    LAUNCH.get_or_init(new_turn_id)
+}
+
+#[cfg(unix)]
+fn process_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // Signal 0 only checks that the process exists.
+    let found = unsafe { libc::kill(pid, 0) } == 0;
+    found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Without a cheap check, another process's turn stays shared.
+#[cfg(not(unix))]
+fn process_running(_pid: u32) -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]

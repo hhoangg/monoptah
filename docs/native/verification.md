@@ -1,7 +1,8 @@
 # Native verification
 
 Status recorded on October 22, 2026, on macOS Apple Silicon. These are local
-results, not a release certification. See [preview limitations](parity.md) for
+results, not a release certification. Later dated sections supplement this
+snapshot. See [preview limitations](parity.md) for
 remaining runtime and platform work.
 
 ## Recorded results
@@ -67,6 +68,22 @@ personal storage. To run that read-only check explicitly:
 ```sh
 cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --profile native-dev installed_desktop_dir_reads -- --ignored
 ```
+
+## Preview 1 candidate — October 25, 2026
+
+The [native CI run for `b106d32b`](https://github.com/hardbeat920/monocode/actions/runs/40185511105)
+passed. It checked core on macOS, Linux and Windows, and formatting, strict
+Clippy, tests and a GUI build on macOS. The same revision passed all 657 GPUI
+tests locally, with 11 ignored, plus formatting and strict Clippy. Local fixture
+tests required access to loopback networking, file watching and process sampling.
+
+A Linux ARM64 source build was launched and exercised in an Ubuntu 24.04 Noodle
+VM. Rust 1.98 avoided a compiler failure with Rust 1.99.1, and a VM-specific
+shared-memory workaround with software OpenGL enabled rendering. This was a
+launch/UI smoke test, not live provider or packaged Linux x64 upgrade coverage.
+
+Packaged preview-to-preview updates, Windows GUI execution, and macOS
+completion/approval alerts, sounds and Dock badges still need runtime testing.
 
 ## Local checks
 

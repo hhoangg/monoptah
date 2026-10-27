@@ -41,11 +41,11 @@ impl Render for LayoutNotice {
             return div().into_any_element();
         }
         super::surface::glass_frame()
-            .id("new-layout-notice").role(Role::Status).aria_label("Try the new layout")
+            .id("new-layout-notice").role(Role::Status).aria_label("Try the Focused layout")
             .child(div().relative().p(px(12.))
-            .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Try the new layout"))
+            .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Try the Focused layout"))
             .child(div().mt(px(4.)).text_size(px(12.)).line_height(px(19.5)).text_color(content(0.6))
-                .child("A redesigned sidebar, project switcher and workspace tabs. Switch back anytime in Settings → Appearance → Layout."))
+                .child("A project switcher, workspace tabs and a right panel. Switch back to Classic anytime in Settings → Appearance → Layout."))
             .child(div().mt(px(12.)).flex().justify_end().gap(px(8.))
                 .child(div().id("new-layout-not-now").role(Role::Button).aria_label("Not now").cursor_pointer()
                     .rounded(px(6.)).px(px(10.)).py(px(6.)).text_size(px(12.)).text_color(content(0.6))
