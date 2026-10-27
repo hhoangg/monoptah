@@ -190,7 +190,7 @@ impl Monos {
             .absolute()
             .inset_0()
             .occlude()
-            .bg(pane_fill())
+            .bg(floating_fill())
             .flex()
             .flex_col()
             .child(header)
