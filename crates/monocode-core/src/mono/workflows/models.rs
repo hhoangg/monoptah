@@ -265,6 +265,39 @@ fn resolve<'a>(catalog: &'a ModelCatalog, harness: &str, value: &str) -> Option<
         .map(Resolved::Found)
 }
 
+/// The id a session node stores for the model a native picker chose (`native` is the id the
+/// CLI is started with; None is the harness's own default). It is spelled as the React app
+/// spells it (`claude:sonnet-5`, `claude:opus-4-6`) whenever that turns back into `native`, so
+/// the workflow reads the same in both apps, else `<harness>:<native>`. A harness with a bundled
+/// default stores `<harness>:default`; the others store no model.
+pub fn stored_model_id(kind: Kind, native: Option<&str>) -> Option<String> {
+    let harness = kind.id();
+    let Some(native) = native.filter(|n| !n.is_empty()) else {
+        return ["pi", "omp", "hermes"]
+            .contains(&harness)
+            .then(|| format!("{harness}:default"));
+    };
+    // React's `claudeCatalogId`: the id with only the `claude-` prefix taken off.
+    let react = (harness == "claude")
+        .then(|| native.strip_prefix("claude-"))
+        .flatten()
+        .map(|name| format!("claude:{name}"));
+    Some(match react {
+        Some(react) if native_model(&react, harness).as_deref() == Some(native) => react,
+        _ => format!("{harness}:{native}"),
+    })
+}
+
+/// The effort levels the catalog offers for a stored model id (empty: the model has no effort
+/// setting); None when the catalog cannot say (not probed, no list, or no such model).
+pub fn model_efforts(catalog: &ModelCatalog, harness: &str, stored: &str) -> Option<Vec<String>> {
+    match resolve(catalog, harness, stored)? {
+        Resolved::Found(model) => Some(model.efforts.clone()),
+        Resolved::NoEfforts => Some(Vec::new()),
+        Resolved::Unjudged => None,
+    }
+}
+
 /// The message for what is wrong with the harness, model and effort a session node names, if
 /// anything. It applies the rules `sessions.start` applies when the node runs, so what is flagged
 /// is what would fail there. A node that sets nothing runs with the Mono's own model and is fine.
@@ -388,6 +421,7 @@ mod tests {
                         model("claude-sonnet-5", &[]),
                         model("claude-sonnet-4-6", &[]),
                         model("claude-opus-5", &["low", "high"]),
+                        model("claude-opus-5-5", &[]),
                     ],
                 ),
                 Kind::Grok => (
@@ -417,6 +451,85 @@ mod tests {
         WorkflowIssue {
             node_id: Some("hi".into()),
             message,
+        }
+    }
+
+    mod stored_ids {
+        use super::*;
+
+        #[test]
+        fn a_claude_model_is_stored_the_way_the_react_app_spells_it() {
+            assert_eq!(
+                stored_model_id(Kind::Claude, Some("claude-sonnet-5")).as_deref(),
+                Some("claude:sonnet-5")
+            );
+            assert_eq!(
+                stored_model_id(Kind::Claude, Some("claude-opus-4-6")).as_deref(),
+                Some("claude:opus-4-6")
+            );
+            assert_eq!(
+                stored_model_id(Kind::Claude, Some("claude-opus-5-5")).as_deref(),
+                Some("claude:opus-5-5")
+            );
+            assert_eq!(
+                stored_model_id(Kind::Claude, Some("claude-haiku-4-5")).as_deref(),
+                Some("claude:haiku-4-5")
+            );
+        }
+
+        #[test]
+        fn another_harness_keeps_the_id_the_cli_uses_behind_its_prefix() {
+            assert_eq!(
+                stored_model_id(Kind::Grok, Some("grok-4.6")).as_deref(),
+                Some("grok:grok-4.6")
+            );
+            assert_eq!(
+                stored_model_id(Kind::Claude, Some("opus")).as_deref(),
+                Some("claude:opus")
+            );
+        }
+
+        #[test]
+        fn what_is_stored_is_found_again_in_the_catalog() {
+            for (kind, native) in [
+                (Kind::Claude, "claude-sonnet-5"),
+                (Kind::Claude, "claude-sonnet-4-6"),
+                (Kind::Claude, "claude-opus-5-5"),
+                (Kind::Claude, "claude-opus-5"),
+                (Kind::Grok, "grok-4.6"),
+            ] {
+                let stored = stored_model_id(kind, Some(native)).unwrap();
+                assert!(
+                    model_efforts(&catalog(true), kind.id(), &stored).is_some(),
+                    "{stored}"
+                );
+                assert_eq!(native_model(&stored, kind.id()).as_deref(), Some(native));
+            }
+        }
+
+        #[test]
+        fn the_default_model_of_a_harness_that_has_one_is_stored_as_default() {
+            assert_eq!(
+                stored_model_id(Kind::Pi, None).as_deref(),
+                Some("pi:default")
+            );
+            assert_eq!(stored_model_id(Kind::Claude, None), None);
+        }
+
+        #[test]
+        fn efforts_come_from_the_catalog_entry_of_the_stored_model() {
+            let c = catalog(true);
+            assert_eq!(
+                model_efforts(&c, "claude", "claude:opus-5"),
+                Some(vec!["low".to_string(), "high".to_string()])
+            );
+            assert_eq!(model_efforts(&c, "claude", "claude:sonnet-5"), Some(vec![]));
+            assert_eq!(model_efforts(&c, "claude", "claude:nope-9"), None);
+            assert_eq!(model_efforts(&c, "codex", "codex:x"), None);
+            assert_eq!(
+                model_efforts(&ModelCatalog::unprobed(), "claude", "claude:opus-5"),
+                None
+            );
         }
     }
 

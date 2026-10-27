@@ -1,5 +1,11 @@
 //! Mono workflows: a graph of session, command, Ask Mono, If, For each and Report nodes.
 //! The definition, lenient parsing and validation are pure; files and running come later.
+pub mod board_edit;
+#[cfg(test)]
+mod board_edit_tests;
+pub mod board_model;
+#[cfg(test)]
+mod board_model_tests;
 pub mod cli;
 #[cfg(test)]
 mod cli_tests;
@@ -19,6 +25,9 @@ pub mod parse;
 pub mod report;
 #[cfg(test)]
 mod report_tests;
+pub mod run_graph_model;
+#[cfg(test)]
+mod run_graph_model_tests;
 pub mod schedule;
 pub mod session_context;
 pub mod store;
@@ -30,6 +39,8 @@ mod tests;
 pub mod tick;
 #[cfg(test)]
 mod tick_tests;
+#[cfg(test)]
+mod ui_fixtures;
 pub mod validate;
 pub mod yaml;
 mod yaml_emit;

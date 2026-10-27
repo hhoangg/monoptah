@@ -1273,3 +1273,45 @@ fn a_key_is_explicit_after_1024_utf16_units_not_characters() {
     assert!(!emoji(512).starts_with("? "));
     assert!(emoji(513).starts_with("? "));
 }
+
+// --- visible: the review shows what runs (WorkflowReviewSections.visible) ---------------------
+
+#[test]
+fn visible_marks_bidi_zero_width_and_joiner_characters() {
+    assert_eq!(visible("echo a\u{202e}b"), "echo a<U+202E>b");
+    assert_eq!(
+        visible("echo safe \u{202e}# rm -rf ~\u{200b}\u{2066}"),
+        "echo safe <U+202E># rm -rf ~<U+200B><U+2066>"
+    );
+    assert_eq!(
+        visible("Do it\u{feff} now\u{2060}"),
+        "Do it<U+FEFF> now<U+2060>"
+    );
+}
+
+#[test]
+fn visible_marks_tag_characters_with_their_full_code_point_and_the_other_format_marks() {
+    assert_eq!(
+        visible("echo a\u{E0041}b\u{200e}\u{200f}\u{061c}\u{00ad} c"),
+        "echo a<U+E0041>b<U+200E><U+200F><U+061C><U+00AD> c"
+    );
+}
+
+#[test]
+fn visible_keeps_line_breaks_and_tabs_but_marks_a_lone_carriage_return_and_controls() {
+    assert_eq!(
+        visible("c\rd\r\ne\u{0007}\u{2028}\u{2029}"),
+        "c<U+000D>d\r\ne<U+0007><U+2028><U+2029>"
+    );
+    assert_eq!(visible("a\tb\nc\r\nd"), "a\tb\nc\r\nd");
+    // A carriage return at the very end has no line feed after it.
+    assert_eq!(visible("end\r"), "end<U+000D>");
+    assert_eq!(visible("\u{7f}\u{0085}"), "<U+007F><U+0085>");
+}
+
+#[test]
+fn visible_leaves_ordinary_text_alone() {
+    let text = "Fix what broke in {{inputs.area}}. \u{1f600} caf\u{e9} \u{4e2d}\u{6587} {x}";
+    assert_eq!(visible(text), text);
+    assert_eq!(visible(""), "");
+}

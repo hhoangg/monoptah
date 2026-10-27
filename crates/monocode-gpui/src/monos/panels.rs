@@ -1,3 +1,4 @@
+use super::workflows_ui::ReviewIntent;
 use super::*;
 use crate::{
     pickers::{ModelList, ModelPicked},
@@ -10,6 +11,7 @@ use monocode_core::project_appearance::{MASCOTS, ProjectAppearance};
 pub(super) enum OverviewTab {
     Sessions,
     Habits,
+    Workflows,
     Documents,
     Changes,
     Activity,
@@ -27,6 +29,12 @@ pub(super) enum Route {
     Document(String),
     Habit(String),
     NewHabit,
+    Workflow(String),
+    WorkflowRun(String, String),
+    WorkflowBoard(String),
+    WorkflowReview(String, ReviewIntent),
+    NewWorkflow,
+    ImportWorkflow,
 }
 impl Route {
     pub(super) fn key(&self) -> String {
@@ -36,6 +44,12 @@ impl Route {
             Self::Document(id) => format!("document:{id}"),
             Self::Habit(id) => format!("habit:{id}"),
             Self::NewHabit => "new-habit".into(),
+            Self::Workflow(id) => format!("workflow:{id}"),
+            Self::WorkflowRun(id, run) => format!("workflow-run:{id}:{run}"),
+            Self::WorkflowBoard(id) => format!("workflow-board:{id}"),
+            Self::WorkflowReview(id, intent) => format!("workflow-review:{id}:{intent:?}"),
+            Self::NewWorkflow => "new-workflow".into(),
+            Self::ImportWorkflow => "import-workflow".into(),
         }
     }
 }
@@ -169,7 +183,7 @@ fn card() -> Div {
         .flex_col()
 }
 /// monoPanelParts' EmptyState: an icon over a short, centred note.
-fn empty_state(glyph: &'static str, message: &str) -> AnyElement {
+pub(super) fn empty_state(glyph: &'static str, message: &str) -> AnyElement {
     div()
         .size_full()
         .flex()
@@ -756,6 +770,13 @@ impl Monos {
             .into_any_element()
     }
     pub(super) fn select_overview(&mut self, tab: OverviewTab, cx: &mut Context<Self>) {
+        // What a refused action said goes with the tab or page it was shown on.
+        if self.overview_tab == OverviewTab::Workflows && tab != OverviewTab::Workflows {
+            self.wf_leave_tab();
+        }
+        if self.route.is_some() {
+            self.wf_leave_page();
+        }
         if tab != OverviewTab::Changes {
             self.pause_changes(cx);
         }
@@ -854,6 +875,12 @@ impl Monos {
             ),
             (OverviewTab::Habits, "Habits", "clock", self.habits.len()),
             (
+                OverviewTab::Workflows,
+                "Workflows",
+                "git-branch",
+                self.workflow_count().unwrap_or(0),
+            ),
+            (
                 OverviewTab::Changes,
                 "Changes",
                 "file-diff",
@@ -884,6 +911,7 @@ impl Monos {
                     OverviewTab::Sessions => "mono-overview-Sessions",
                     OverviewTab::Documents => "mono-overview-Documents",
                     OverviewTab::Habits => "mono-overview-Habits",
+                    OverviewTab::Workflows => "mono-overview-Workflows",
                     OverviewTab::Changes => "mono-overview-Changes",
                     OverviewTab::Activity => unreachable!(),
                 };
@@ -909,6 +937,9 @@ impl Monos {
                             cx.notify();
                         })),
                 )
+            })
+            .when(self.overview_tab == OverviewTab::Workflows, |d| {
+                d.children(self.workflow_header_actions(cx))
             })
             .child(
                 icon_button("mono-activity", "Show activity", "list-bullet")
@@ -942,6 +973,7 @@ impl Monos {
         let body = match self.overview_tab {
             OverviewTab::Sessions => self.session_list(mono, cx),
             OverviewTab::Habits => self.habits_list(mono, cx),
+            OverviewTab::Workflows => self.workflows_list(mono, cx),
             OverviewTab::Documents => self.document_list(mono, cx),
             OverviewTab::Changes => self.changes_list(mono, cx),
             OverviewTab::Activity => self.activity_view(mono, cx),
@@ -1165,7 +1197,8 @@ impl Monos {
                 icon_button("mono-page-back", "Back", "chevron-left")
                     .debug_selector(|| "mono-page-back".into())
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.route = None;
+                        // A session opened from a workflow run goes back to that run.
+                        this.route = this.wf_session_back();
                         cx.notify();
                     })),
             )
@@ -1297,6 +1330,13 @@ impl Monos {
             }
             Route::Habit(id) => self.habit_page(mono, Some(&id), window, cx),
             Route::NewHabit => self.habit_page(mono, None, window, cx),
+            Route::Workflow(id) => self.workflow_page(mono, &id, window, cx),
+            Route::WorkflowReview(id, intent) => self.workflow_review_page(&id, intent, cx),
+            Route::ImportWorkflow => self.import_workflow_page(mono, cx),
+            Route::WorkflowRun(id, run) => self.workflow_run_page(mono, &id, &run, window, cx),
+            route @ (Route::NewWorkflow | Route::WorkflowBoard(_)) => {
+                self.workflow_board_page(mono, &route, window, cx)
+            }
         }
     }
     fn activity_view(&mut self, mono: &Mono, cx: &mut Context<Self>) -> AnyElement {

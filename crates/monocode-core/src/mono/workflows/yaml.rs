@@ -598,6 +598,42 @@ pub fn preview_import(text: &str, catalog: &ModelCatalog) -> Result<ImportPrevie
     })
 }
 
+// --- review text ---------------------------------------------------------------------------
+
+/// The text with the characters that change how it reads or what it looks like, without
+/// showing, made visible as `<U+XXXX>`: every format character (bidirectional controls,
+/// zero-width characters, tag characters, soft hyphens), the line and paragraph separators, a
+/// carriage return that is not half of a line break, and the other control characters. What is
+/// reviewed is then what runs. Port of `visible()` in `WorkflowReviewSections.tsx`: a character
+/// outside the BMP is one marker with its full number.
+pub fn visible(text: &str) -> String {
+    static FORMAT: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^\p{Cf}$").expect("a valid pattern"));
+    let hidden = |c: char, next: Option<char>| {
+        if c.is_ascii() {
+            return match c {
+                '\r' => next != Some('\n'),
+                '\n' | '\t' => false,
+                _ => c.is_control(),
+            };
+        }
+        c == '\u{2028}'
+            || c == '\u{2029}'
+            || c.is_control()
+            || FORMAT.is_match(c.encode_utf8(&mut [0; 4]))
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if hidden(c, chars.peek().copied()) {
+            out.push_str(&format!("<U+{:04X}>", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // --- values and finishing ------------------------------------------------------------------
 
 /// What is wrong with one input's value, if anything.

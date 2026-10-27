@@ -1008,6 +1008,17 @@ impl WorkflowRunner {
         self.live.borrow().contains_key(workflow_id)
     }
 
+    /// Reads the workflow's run while the runner has it, without copying it out.
+    pub(crate) fn with_run<R>(
+        &self,
+        workflow_id: &str,
+        read: impl FnOnce(&WorkflowRun) -> R,
+    ) -> Option<R> {
+        let exec = self.live.borrow().get(workflow_id).cloned()?;
+        let state = exec.state.borrow();
+        Some(read(&state.run))
+    }
+
     /// The runs going, as `(workflow id, run id)`.
     pub(crate) fn running(&self) -> Vec<(String, String)> {
         self.live

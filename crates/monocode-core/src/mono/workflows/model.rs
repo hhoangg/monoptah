@@ -442,7 +442,7 @@ lenient_deserialize!(Node, parse::parse_node);
 lenient_deserialize!(Edge, parse::parse_edge);
 
 /// `value` as JSON with object keys sorted, like the React app's `stableJson`.
-fn stable_json(value: &Value) -> String {
+pub(crate) fn stable_json(value: &Value) -> String {
     match value {
         Value::Array(items) => {
             let items: Vec<String> = items.iter().map(stable_json).collect();

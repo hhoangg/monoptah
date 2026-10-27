@@ -25,6 +25,7 @@ mod tests;
 mod work;
 mod workflow_runner;
 mod workflow_schedule;
+mod workflows_ui;
 use crate::{
     conversation::{Conversation, MonoSubmitted, SessionChanged},
     input::{self, Input},
@@ -63,7 +64,7 @@ pub(crate) struct OverviewChrome {
     active: Option<String>,
     tab: OverviewTab,
     routed: bool,
-    counts: (usize, usize, usize, usize),
+    counts: (usize, usize, usize, usize, usize),
 }
 struct RunningHabit {
     mono: String,
@@ -168,11 +169,17 @@ pub(crate) struct Monos {
     workflows: workflow_runner::WorkflowRunner,
     workflow_live: workflow_runner::Live,
     workflow_checks: workflow_schedule::Checks,
+    /// The Workflows tab and its pages.
+    wf: workflows_ui::WorkflowsUi,
 }
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
 impl EventEmitter<ShowDetails> for Monos {}
 impl Monos {
+    #[cfg(test)]
+    pub(crate) fn observation_count(&self) -> usize {
+        self.observations.len()
+    }
     pub(crate) fn resource_sessions(
         &self,
         cx: &App,
@@ -415,6 +422,7 @@ impl Monos {
             workflows: workflow_runner::WorkflowRunner::new(signals),
             workflow_live: workflow_runner::Live::new(),
             workflow_checks: Default::default(),
+            wf: Default::default(),
         };
         cx.set_global(workflow_schedule::QuitTarget(this.workflows.clone()));
         this.start_workflow_checks(cx);
@@ -490,11 +498,12 @@ impl Monos {
         cx.notify();
     }
     pub(crate) fn overview_chrome(&self) -> OverviewChrome {
-        let counts = self.current().map_or((0, 0, 0, 0), |mono| {
+        let counts = self.current().map_or((0, 0, 0, 0, 0), |mono| {
             (
                 mono.launches.len(),
                 mono.documents.len(),
                 self.habits.len(),
+                self.workflow_count().unwrap_or(0),
                 self.project_changes.count(&mono.id),
             )
         });
@@ -855,6 +864,7 @@ impl Monos {
                         crate::transcript::MonoResponseAction::Activity(turn) => {
                             this.activity_turn = Some(*turn);
                             this.show_overview(cx);
+                            this.wf_leave_page();
                             this.route = None;
                             this.overview_tab = OverviewTab::Activity;
                             cx.notify();
@@ -1088,6 +1098,9 @@ impl Monos {
         if self.active.as_deref() != Some(id) {
             self.save_open_file(cx);
             self.pause_changes(cx);
+            // What a page of the old Mono kept (notices, a board, a run's way back) stays there.
+            self.wf_leave_tab();
+            self.wf_leave_page();
             self.route = None;
             self.details.update(cx, |details, cx| details.reset(cx));
             self.fields.retain(|k, _| k.starts_with("file:"));
@@ -1183,6 +1196,10 @@ impl Monos {
                         Ok((files, habits)) => {
                             this.files = Some(files);
                             this.habits = habits;
+                            // The app's own workflows.* actions save through here too.
+                            if this.workflows_requested(&id) {
+                                this.refresh_workflows(cx);
+                            }
                         }
                         Err(error) => this.error = Some(error),
                     }

@@ -58,6 +58,7 @@ impl Monos {
             return false;
         };
         self.settings = None;
+        self.wf_leave_page();
         self.route = None;
         self.open(&mono, window, cx);
         true

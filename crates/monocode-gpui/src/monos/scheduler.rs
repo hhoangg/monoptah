@@ -12,7 +12,7 @@ pub(super) struct HabitUi {
     expanded: HashSet<(String, u64)>,
 }
 
-fn duration(ms: u64) -> String {
+pub(super) fn duration(ms: u64) -> String {
     let seconds = (ms.saturating_add(500) / 1000).max(1);
     if seconds < 60 {
         format!("{seconds}s")
@@ -22,7 +22,7 @@ fn duration(ms: u64) -> String {
         format!("{}m {}s", seconds / 60, seconds % 60)
     }
 }
-fn when(at: u64, now: u64) -> String {
+pub(super) fn when(at: u64, now: u64) -> String {
     let Some(at) = chrono::DateTime::from_timestamp_millis(at as i64) else {
         return String::new();
     };
@@ -140,7 +140,7 @@ fn property(label: &'static str, value: impl IntoElement) -> gpui::Div {
         )
 }
 /// Fixed controls must never be compressed by a large, scrollable draft.
-fn habit_field(field: Entity<Input>) -> gpui::Div {
+pub(super) fn habit_field(field: Entity<Input>) -> gpui::Div {
     div()
         .px_2()
         .py_1()
@@ -152,7 +152,7 @@ fn habit_field(field: Entity<Input>) -> gpui::Div {
         .overflow_hidden()
         .child(field)
 }
-fn habit_icon_button(
+pub(super) fn habit_icon_button(
     id: SharedString,
     label: &'static str,
     glyph: &'static str,
