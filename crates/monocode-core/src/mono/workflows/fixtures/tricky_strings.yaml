@@ -1,0 +1,103 @@
+monoptahWorkflow: 1
+name: "Tricky: strings #1"
+description: |
+  line1
+  line2: with colon
+    indented
+inputs:
+  project:
+    type: project
+nodes:
+  - id: start
+    type: manual
+    title: "- dash start"
+  - id: a
+    type: askMono
+    question: "true"
+    answers:
+      - "null"
+      - "~"
+      - ""
+      - "12"
+      - "-3"
+      - "1.5"
+      - "0x1F"
+      - "0o17"
+      - ".inf"
+      - "-.inf"
+      - ".nan"
+      - "1e3"
+      - yes
+      - no
+      - on
+      - off
+      - Yes
+      - 09:00
+      - 2026-10-22
+      - "  lead"
+      - "trail  "
+      - tab	in
+      - "colon: space"
+      - "hash # tag"
+      - a#b
+      - "a: b"
+      - "ends:"
+      - "- item"
+      - -x
+      - "? q"
+      - ?x
+      - "[flow]"
+      - "{flow}"
+      - "*alias"
+      - "&anchor"
+      - "!tag"
+      - "|pipe"
+      - ">fold"
+      - "%pct"
+      - "@at"
+      - "`tick`"
+      - "'single'"
+      - '"double"'
+      - it's
+      - say "hi" it's
+      - say "hi"
+      - ---
+      - --- x
+      - ...
+      - a ... b
+      - |-
+        multi
+        line
+      - http://x/y?z=1&w=2
+      - "{{inputs.project}}"
+      - Ünïcödé 日本語 🎉
+      - "ctrl\x01char"
+      - "bell\a"
+      - "esc\e[0m"
+      - "nelx"
+      - nbsp x
+      - ls ps x
+      - "delx"
+      - back\slash
+      - "a\rb"
+      - "a\r\nb"
+  - id: b
+    type: if
+    condition: '{{a.answer}} == "yes"'
+    question: "Is it: fine? # really"
+  - id: c
+    type: command
+    project: "{{inputs.project}}"
+    command: |
+      echo 'it''s' "x" && grep -E 'a|b' file # comment: x
+      	indented
+  - id: d
+    type: report
+    template: |2+
+        Leading spaces
+      Second line   
+
+
+      after blank
+
+edges: []

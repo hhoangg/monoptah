@@ -6,8 +6,14 @@ Type `/operator` at the start of a composer message to enable Monoptah access in
 
 ## CLI actions
 
+Sessions started by an ordinary Operator remain visible in project history.
+Monos use the same project actions, with their **Show started sessions** setting
+controlling whether their launches appear in the user's history. This is
+independent of navigation: `reveal` defaults to `false`, so a background launch
+can stay visible in history without switching the user's current conversation.
+
 - `models.list` shows available providers, models, settings, and permission modes.
-- `sessions.start` opens a tab in the current project with a prompt. Set `placement: "right"` or `placement: "down"` to split the calling session's pane instead; `besideSessionId` selects another visible session pane in the project. Reuse the returned session ID as the next `besideSessionId` to build nested layouts. By default it submits the prompt; set `draft: true` to save it unsent without starting an agent turn. It accepts a provider, model, effort or other model settings, permission mode, and current checkout or new worktree choice. Set `worktreeCwd` to a path from `worktrees.list` for a specific existing checkout. Use `worktrees.create` to create a worktree on a named new or existing local branch, then pass its path as `worktreeCwd`. Omit `runtimeMode` to inherit the calling session's permission mode, or set it explicitly to override. It returns the new session ID as soon as the pane and prompt are accepted, so the agent can move it into a folder immediately.
+- `sessions.start` creates a session in the current project with a prompt. Set `reveal: true` to open its tab, or `placement: "right"` / `placement: "down"` to split the calling session's pane; `besideSessionId` selects another visible session pane in the project. Reuse the returned session ID as the next `besideSessionId` to build nested layouts. By default it submits the prompt; set `draft: true` to save it unsent without starting an agent turn. It accepts a provider, model, effort or other model settings, permission mode, and current checkout or new worktree choice. Set `worktreeCwd` to a path from `worktrees.list` for a specific existing checkout. Use `worktrees.create` to create a worktree on a named new or existing local branch, then pass its path as `worktreeCwd`. Omit `runtimeMode` to inherit the calling session's permission mode, or set it explicitly to override. It returns the new session ID as soon as the pane and prompt are accepted, so the agent can move it into a folder immediately.
 - `sessions.start` and `sessions.send` accept `completionDelivery: "group" | "each"` (default `"group"`). With `"each"`, the session's completion report reaches the calling Mono as soon as that session stops, without waiting for the Mono's turn or sibling sessions, as a new turn once the Mono is idle (several may queue while it is busy). Habit runs always use `"each"`: sessions a habit run starts report to the Mono's chat, not to the run, and the report still arrives after the run has ended. The field is ignored when the launch is not monitored (a draft, or `notifyOnComplete: false`).
 - `sessions.start` accepts `parentSessionId` from a Mono or its habit runs. The new session is nested under that parent in the sidebar and its ID becomes `app-<parentSessionId>-<requestId>`. The parent must be a session that Mono (or its habit runs) started in the same project during the current app run; the record is kept in memory and lost on restart. Nesting is one level deep, so a child cannot be a parent. IDs over 255 characters are rejected, so use a short request ID. The completion report still goes to the Mono, and the child gets no app access.
 - `sessions.start` accepts `folderName` (up to 100 characters) and `folderId` to file the new session in a folder. An existing `folderId` wins and the folder is never renamed. An unknown `folderId` with a `folderName` creates a new folder; an unknown `folderId` alone fails with "Folder was not found in this project". A `folderName` alone always creates a new folder, even if one with that name exists. New folders use the Mono's color, and the result includes `folderId` and `folderName`. Without these fields the session goes in the Mono's default folder when **Group in a folder** is on for that Mono.
@@ -28,6 +34,12 @@ Type `/operator` at the start of a composer message to enable Monoptah access in
 - Command steps run shell commands in a project on macOS and Linux; on Windows they are not supported yet and fail when reached.
 - When a Mono successfully stops, archives or deletes a session it is monitoring, its pending completion report for that session is dismissed, including any queued report. The Mono confirms the action in its current reply. Reports for other sessions and other Monos are kept. Rejected launches or follow-ups return a CLI error without a later completion report.
 - `notes.list` returns titles and short previews; `notes.read` returns one full note by ID.
+- `notes.list` accepts `limit` and `offset`. `notes.write` creates a note from its
+  `body`, with optional title and tags; pass an existing note `id` to update just
+  its title, body or tags while preserving the other fields.
+
+Retry an uncertain mutation with the same request ID and identical input.
+Unknown fields and invalid options produce errors instead of being ignored.
 
 ## Orchestration workers
 

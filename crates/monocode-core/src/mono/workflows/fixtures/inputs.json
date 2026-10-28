@@ -1,0 +1,63 @@
+{
+  "id": "wf-fixture1",
+  "name": "Inputs",
+  "inputs": {
+    "project": {
+      "type": "project",
+      "description": "The repo"
+    },
+    "count": {
+      "type": "number"
+    },
+    "dry": {
+      "type": "boolean",
+      "description": "true or false: yes/no"
+    },
+    "label": {
+      "type": "string",
+      "description": "# not a comment: really"
+    },
+    "true": {
+      "type": "string"
+    },
+    "null": {
+      "type": "string"
+    },
+    "Null": {
+      "type": "string"
+    },
+    "FALSE": {
+      "type": "boolean"
+    },
+    "yes": {
+      "type": "string"
+    },
+    "on": {
+      "type": "string"
+    },
+    "_x": {
+      "type": "string"
+    },
+    "n1": {
+      "type": "string"
+    }
+  },
+  "inputValues": {
+    "project": "/p",
+    "count": 3,
+    "dry": true,
+    "label": "x",
+    "true": "a",
+    "null": "b"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "manual"
+    }
+  ],
+  "edges": [],
+  "enabled": false,
+  "createdAt": 0,
+  "description": "Every input type"
+}

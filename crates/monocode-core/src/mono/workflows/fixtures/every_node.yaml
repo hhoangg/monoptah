@@ -1,0 +1,79 @@
+monoptahWorkflow: 1
+name: Every node type
+inputs:
+  project:
+    type: project
+nodes:
+  - id: start
+    type: manual
+    title: Start
+  - id: ask
+    type: askMono
+    question: Ship it?
+    answers:
+      - yes
+      - no
+    ui:
+      x: 10
+      y: 20
+  - id: gate
+    type: if
+    decide: mono
+    question: Is it safe?
+  - id: gate2
+    type: if
+    condition: '{{ask.answer}} == "yes"'
+  - id: build
+    type: command
+    project: "{{inputs.project}}"
+    cwd:
+      worktreeOf: work
+    timeoutMinutes: 5
+    command: npm test
+  - id: rootcmd
+    type: command
+    project: "{{inputs.project}}"
+    cwd: root
+    command: npm run lint && echo $HOME
+  - id: work
+    type: session
+    project: "{{inputs.project}}"
+    harness: claude
+    model: claude:opus-5
+    effort: high
+    checkout: newWorktree
+    nestUnder: work
+    reuseSession: false
+    timeoutMinutes: 30
+    prompt: Do it
+    output:
+      a:
+        type: number
+        inReport: true
+        description: A number
+      b:
+        type: boolean
+      c:
+        type: object
+        inReport: false
+  - id: loop
+    type: forEach
+    in: "{{work.a}}"
+    ui:
+      x: -16.5
+      y: 1e+21
+  - id: report
+    type: report
+    template: "Done: {{work.a}}"
+edges:
+  - from: gate
+    to: build
+    handle: "true"
+  - from: gate
+    to: report
+    handle: "false"
+  - from: work
+    to: gate2
+    loop:
+      maxRounds: 2.5
+      decide: "{{work.a}} > 3"

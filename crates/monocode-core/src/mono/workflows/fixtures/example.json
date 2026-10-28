@@ -1,0 +1,133 @@
+{
+  "id": "wf-abcd1234",
+  "name": "ClickUp -> Dev -> Review",
+  "description": "Pull my ClickUp tickets, implement each, review up to 3 rounds.",
+  "inputs": {
+    "project": {
+      "type": "project"
+    },
+    "clickupList": {
+      "type": "string",
+      "description": "ClickUp list to pull from"
+    }
+  },
+  "inputValues": {
+    "project": "/Users/x/repo",
+    "clickupList": "Sprint"
+  },
+  "nodes": [
+    {
+      "id": "trigger",
+      "type": "schedule",
+      "schedule": {
+        "scheduleKind": "weekdays",
+        "time": "09:00",
+        "minute": 0,
+        "dayOfWeek": 1
+      },
+      "ui": {
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": "fetch",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "model": "claude:sonnet-5",
+      "checkout": "root",
+      "prompt": "List open tickets assigned to me in {{inputs.clickupList}}.",
+      "output": {
+        "tickets": {
+          "type": "list"
+        }
+      },
+      "ui": {
+        "x": 240,
+        "y": 0
+      }
+    },
+    {
+      "id": "each",
+      "type": "forEach",
+      "in": "{{fetch.tickets}}",
+      "as": "item",
+      "maxParallel": 3
+    },
+    {
+      "id": "dev",
+      "type": "session",
+      "parent": "each",
+      "project": "{{inputs.project}}",
+      "model": "claude:sonnet-5",
+      "checkout": "newWorktree",
+      "prompt": "Implement {{item.title}} ({{item.url}}) and open a PR.\n{{#if review}}Fix these review issues: {{review.issues}}{{/if}}\n",
+      "output": {
+        "pr_url": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string",
+          "inReport": false
+        }
+      }
+    },
+    {
+      "id": "review",
+      "type": "session",
+      "parent": "each",
+      "project": "{{inputs.project}}",
+      "model": "claude:opus-5",
+      "checkout": {
+        "worktreeOf": "dev"
+      },
+      "nestUnder": "dev",
+      "prompt": "Review {{dev.pr_url}}. List blocking issues only.",
+      "output": {
+        "verdict": {
+          "type": "string"
+        },
+        "issues": {
+          "type": "list"
+        }
+      }
+    },
+    {
+      "id": "report",
+      "type": "report"
+    }
+  ],
+  "edges": [
+    {
+      "from": "trigger",
+      "to": "fetch"
+    },
+    {
+      "from": "fetch",
+      "to": "each"
+    },
+    {
+      "from": "dev",
+      "to": "review"
+    },
+    {
+      "from": "each",
+      "to": "report"
+    },
+    {
+      "from": "review",
+      "to": "dev",
+      "loop": {
+        "maxRounds": 3,
+        "decide": "mono"
+      }
+    }
+  ],
+  "enabled": true,
+  "createdAt": 1700000000000,
+  "nextRunAt": 1700000100000,
+  "runRequested": true,
+  "lastRunId": "run-1",
+  "importedFrom": "somewhere.yaml",
+  "needsReview": true
+}

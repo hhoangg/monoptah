@@ -1,0 +1,49 @@
+{
+  "id": "wf-fixture1",
+  "name": "Long lines",
+  "inputs": {
+    "project": {
+      "type": "project"
+    }
+  },
+  "inputValues": {
+    "project": "/work/api"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "type": "manual"
+    },
+    {
+      "id": "long",
+      "type": "session",
+      "project": "{{inputs.project}}",
+      "checkout": "root",
+      "prompt": "Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. Read the ticket and write a careful, complete implementation with tests, then open a PR. ",
+      "output": {}
+    },
+    {
+      "id": "q",
+      "type": "askMono",
+      "question": "A question that is long enough that a folding emitter would wrap it onto several lines: words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words ",
+      "answers": [
+        "short",
+        "an answer that is also very long and would need folding an answer that is also very long and would need folding an answer that is also very long and would need folding an answer that is also very long and would need folding an answer that is also very long and would need folding end"
+      ]
+    },
+    {
+      "id": "cmd",
+      "type": "command",
+      "project": "{{inputs.project}}",
+      "command": "npm run build -- --flag-one --flag-two --flag-three --flag-four --flag-five --flag-six --flag-seven --flag-eight --flag-nine"
+    },
+    {
+      "id": "dq",
+      "type": "report",
+      "template": "x\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nctrl\u0001 yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+    }
+  ],
+  "edges": [],
+  "enabled": false,
+  "createdAt": 0
+}

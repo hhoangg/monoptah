@@ -1,0 +1,95 @@
+{
+  "id": "wf-fixture1",
+  "name": "Schedules",
+  "inputs": {
+    "project": {
+      "type": "project"
+    }
+  },
+  "inputValues": {
+    "project": "/work/api"
+  },
+  "nodes": [
+    {
+      "id": "t1",
+      "type": "schedule",
+      "schedule": {
+        "scheduleKind": "hourly",
+        "time": "09:00",
+        "minute": 30,
+        "dayOfWeek": 1
+      }
+    },
+    {
+      "id": "t2",
+      "type": "schedule",
+      "schedule": {
+        "scheduleKind": "daily",
+        "time": "18:45",
+        "minute": 0,
+        "dayOfWeek": 1
+      }
+    },
+    {
+      "id": "t3",
+      "type": "schedule",
+      "schedule": {
+        "scheduleKind": "weekly",
+        "time": "07:15",
+        "minute": 0,
+        "dayOfWeek": 3
+      }
+    },
+    {
+      "id": "t4",
+      "type": "schedule",
+      "schedule": {
+        "scheduleKind": "weekly",
+        "time": "07:15",
+        "minute": 0,
+        "dayOfWeek": 0
+      }
+    },
+    {
+      "id": "t5",
+      "type": "schedule",
+      "schedule": {
+        "scheduleKind": "interval",
+        "time": "08:00",
+        "minute": 0,
+        "dayOfWeek": 1,
+        "intervalHours": 6,
+        "intervalFrom": "2026-10-22"
+      }
+    },
+    {
+      "id": "t6",
+      "type": "schedule",
+      "schedule": {
+        "scheduleKind": "interval",
+        "time": "00:00",
+        "minute": 0,
+        "dayOfWeek": 1,
+        "intervalHours": 24
+      }
+    },
+    {
+      "id": "t7",
+      "type": "schedule",
+      "title": "Weekdays",
+      "schedule": {
+        "scheduleKind": "weekdays",
+        "time": "23:59",
+        "minute": 0,
+        "dayOfWeek": 1
+      },
+      "ui": {
+        "x": 1,
+        "y": 2
+      }
+    }
+  ],
+  "edges": [],
+  "enabled": false,
+  "createdAt": 0
+}
