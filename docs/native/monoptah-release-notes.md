@@ -1,6 +1,10 @@
-# Monoptah Native 0.34.0
+# Monoptah Native 0.34.1
 
-This is the first Monoptah Native release: an experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
+A bug-fix release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
+
+## Changes since 0.34.0
+
+- Typing Vietnamese in terminals and TUI sessions now gives the right text. Input methods such as GoTiengViet replace typed letters with the accented text ("tôi đang gõ tiếng việt" used to come out as "tai aang via tia via"). The terminal now takes typed text from macOS's text input, so GoTiengViet, the built-in Vietnamese Telex input source and other input methods work. Option-as-Meta and special keys behave as before.
 
 ## What it is
 
