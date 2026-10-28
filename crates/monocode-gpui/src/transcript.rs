@@ -5696,15 +5696,13 @@ pub(crate) fn floating_surface() -> impl IntoElement {
         |_, _, _| {},
         |bounds, _, window, _| {
             let radius = bounds.size.height / 2.;
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             window.paint_quad(
                 gpui::fill(bounds, content(0.04))
                     .corner_radii(radius)
-                    .border_color(gpui_apple::metal_renderer::backdrop_blur_marker(
-                        12. * window.scale_factor(),
-                    )),
+                    .border_color(gpui::backdrop_blur_marker(12. * window.scale_factor())),
             );
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             window.paint_quad(gpui::fill(bounds, rgb(CHAT)).corner_radii(radius));
         },
     )

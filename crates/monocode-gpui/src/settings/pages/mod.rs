@@ -15,6 +15,7 @@ mod ticket_scoring;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
+pub(crate) use appearance::{ACCENTS, swatch};
 pub(super) use connections::ConnectionsState;
 pub(crate) use keybindings::command_shortcut;
 pub(super) use mobile::MobileState;

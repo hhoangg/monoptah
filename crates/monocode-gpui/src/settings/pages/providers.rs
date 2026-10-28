@@ -296,13 +296,7 @@ impl SettingsView {
                         if models.len() == 1 { "model" } else { "models" }
                     )
                 })
-                .unwrap_or_else(|| {
-                    format!(
-                        "Install {} and sign in with {}.",
-                        kind.label(),
-                        kind.login_hint()
-                    )
-                });
+                .unwrap_or_else(|| kind.unavailable_hint());
             let description = if self.ctx.no_terminal_sessions {
                 format!("{description} {NO_TERMINAL_HINT}")
             } else {

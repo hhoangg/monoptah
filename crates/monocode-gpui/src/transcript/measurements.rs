@@ -11,6 +11,7 @@ struct LayoutStyle {
 
 #[derive(Default)]
 pub(super) struct Measurements {
+    diagram_generation: u64,
     style: Option<LayoutStyle>,
     viewport: gpui::Size<Pixels>,
     rows: HashMap<usize, Pixels>,
@@ -146,6 +147,19 @@ impl TranscriptView {
     }
 
     pub(super) fn begin_measurements(&mut self, window: &Window, cx: &Context<Self>) {
+        let generation = markdown::mermaid::generation(cx);
+        if self.measurements.diagram_generation != generation {
+            self.measurements.diagram_generation = generation;
+            self.measurements.retained.retain(|_, entry| {
+                !matches!(&entry.row.body, Body::Markdown(md) if matches!(md.part, markdown::Part::Mermaid { .. }))
+            });
+            for (ix, row) in self.rows.iter().enumerate() {
+                if matches!(&row.body, Body::Markdown(md) if matches!(md.part, markdown::Part::Mermaid { .. }))
+                {
+                    self.list.remeasure_items(ix..ix + 1);
+                }
+            }
+        }
         let style = LayoutStyle {
             text: window.text_style(),
             rem: window.rem_size(),

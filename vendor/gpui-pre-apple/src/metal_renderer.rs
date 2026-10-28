@@ -2026,11 +2026,10 @@ fn build_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
-// Monocode: frosted popovers. A quad marked with this border colour (and no
-// border width) asks the renderer to blur the backdrop beneath it first.
-const BACKDROP_MARKER_HUE: f32 = 0.707_106_77;
-const BACKDROP_MARKER_SATURATION: f32 = 0.577_215_7;
-const BACKDROP_MAX_SIGMA: f32 = 4096.;
+// Monocode: frosted popovers. The marker lives in gpui so every renderer
+// that frosts agrees on it.
+pub use gpui::backdrop_blur_marker;
+use gpui::backdrop_blur_sigma as backdrop_sigma;
 const EDGE_FADE_BEGIN: f32 = 0.271828;
 const EDGE_FADE_END: f32 = 0.314159;
 const HORIZONTAL_FADE_BEGIN: f32 = 0.161803;
@@ -2183,28 +2182,6 @@ fn copy_fade_region(
         metal::MTLOrigin { x: 0, y: 0, z: 0 },
     );
     blit.end_encoding();
-}
-
-/// The border colour that marks a quad as frosted glass: before drawing it,
-/// the renderer blurs what is already drawn behind it by `sigma` device
-/// pixels, like CSS `backdrop-filter: blur()`. Its background then tints the
-/// glass. Give the quad no border width.
-pub fn backdrop_blur_marker(sigma: f32) -> Hsla {
-    Hsla {
-        h: BACKDROP_MARKER_HUE,
-        s: BACKDROP_MARKER_SATURATION,
-        l: (sigma / BACKDROP_MAX_SIGMA).clamp(0., 1.),
-        a: 0.,
-    }
-}
-
-fn backdrop_sigma(quad: &Quad) -> Option<f32> {
-    let color = quad.border_color;
-    (color.h == BACKDROP_MARKER_HUE
-        && color.s == BACKDROP_MARKER_SATURATION
-        && color.a == 0.
-        && color.l > 0.)
-        .then_some(color.l * BACKDROP_MAX_SIGMA)
 }
 
 #[repr(C)]

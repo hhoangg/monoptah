@@ -95,11 +95,7 @@ impl Shell {
                 titlebar: None,
                 is_resizable: false,
                 is_minimizable: false,
-                window_background: if cfg!(target_os = "macos") {
-                    gpui::WindowBackgroundAppearance::Blurred
-                } else {
-                    gpui::WindowBackgroundAppearance::Opaque
-                },
+                window_background: crate::theme::window_backdrop(true),
                 app_id: Some("com.monoptah.native.quick-composer".into()),
                 ..Default::default()
             },

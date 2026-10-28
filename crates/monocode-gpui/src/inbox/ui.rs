@@ -250,7 +250,7 @@ fn item_kind_label(item: &Item) -> &'static str {
     }
 }
 /// The space, plus the list for ClickUp (the list name travels in `project_name`).
-fn source_label(item: &Item, tracker: bool) -> String {
+fn source_label(item: &Item, tracker: bool, project_label: impl FnOnce() -> String) -> String {
     if tracker {
         let space = if item.team_name.is_empty() {
             &item.repo
@@ -269,7 +269,7 @@ fn source_label(item: &Item, tracker: bool) -> String {
         }
     }
     if item.repo.is_empty() {
-        project_name(std::path::Path::new(&item.project_path))
+        project_label()
     } else {
         item.repo.clone()
     }
@@ -400,10 +400,16 @@ enum CommentStyle {
 }
 
 impl Inbox {
+    fn project_label(&self, path: &str) -> String {
+        self.appearances.get(path).map_or_else(
+            || project_name(std::path::Path::new(path)),
+            |appearance| appearance.label(path),
+        )
+    }
     fn project_mark(&self, path: &str, side: f32) -> AnyElement {
         crate::project_settings::project_icon(
             &self.appearances.get(path).cloned().unwrap_or_default(),
-            &project_name(std::path::Path::new(path)),
+            path,
             side,
         )
     }
@@ -576,7 +582,8 @@ impl Inbox {
                 let related_label = running::related_threads_label(sessions, running);
                 let tracker = model::is_tracker(&item.provider);
                 let kind = item_kind_label(&item);
-                let source = source_label(&item, tracker);
+                let source =
+                    source_label(&item, tracker, || self.project_label(&item.project_path));
                 let attention = attention_label(&item.attention_reason);
                 div()
                     .id(SharedString::from(format!("inbox-item-{key}")))
@@ -1020,7 +1027,7 @@ impl Inbox {
                                 d.child(
                                     icon_action(
                                         "inbox-choose-project",
-                                        &project_name(&self.start_project),
+                                        &self.project_label(&self.start_project.to_string_lossy()),
                                         "folder",
                                     )
                                     .relative()
@@ -2289,7 +2296,7 @@ impl Inbox {
                 rows.push(
                     menu_row(
                         format!("inbox-project-filter-{ix}"),
-                        project_name(project),
+                        self.project_label(&key),
                         !f.hidden_projects.contains(&key),
                     )
                     .child(self.project_mark(&key, 12.))
@@ -2640,7 +2647,7 @@ impl Inbox {
             let path = project.clone();
             menu_row(
                 format!("inbox-start-project-{ix}"),
-                project_name(project),
+                self.project_label(&project.to_string_lossy()),
                 *project == self.start_project,
             )
             .child(self.project_mark(&project.to_string_lossy(), 14.))
@@ -3044,6 +3051,87 @@ mod tests {
         window.update(cx, |_, _, cx| cx.notify()).unwrap();
         cx.refresh().unwrap();
         cx.run_until_parked();
+    }
+    #[gpui::test]
+    fn the_inbox_opens_scoped_to_its_project_and_labels_projects_by_appearance(
+        cx: &mut TestAppContext,
+    ) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, _| {
+                    let home = PathBuf::from("/work/home");
+                    let other = PathBuf::from("/work/other");
+                    assert_eq!(
+                        super::super::other_projects(&[home.clone(), other.clone()], &home),
+                        vec!["/work/other".to_string()]
+                    );
+                    assert_eq!(inbox.project_label("/work/other"), "other");
+                    inbox.appearances.insert(
+                        "/work/other".into(),
+                        monocode_core::project_appearance::ProjectAppearance {
+                            name: "Other app".into(),
+                            ..Default::default()
+                        },
+                    );
+                    assert_eq!(inbox.project_label("/work/other"), "Other app");
+                });
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn switching_projects_drops_the_previous_projects_selection_and_detail(
+        cx: &mut TestAppContext,
+    ) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    let (a, b) = (PathBuf::from("/work/a"), PathBuf::from("/work/b"));
+                    let item = |number, project: &PathBuf| Item {
+                        provider: "github".into(),
+                        kind: "pr".into(),
+                        state: "open".into(),
+                        repo: format!("acme/app-{number}"),
+                        number,
+                        project_path: project.to_string_lossy().into_owned(),
+                        ..Default::default()
+                    };
+                    // Keep the list fetch queued instead of reaching real providers.
+                    inbox.loading = true;
+                    inbox.snapshot.items = vec![item(1, &a), item(2, &b)];
+                    inbox.set_context(vec![a.clone(), b.clone()], a.clone(), cx);
+                    inbox.selected = Some(item(1, &a).key());
+                    inbox.details = Some(Details {
+                        body: "From project A".into(),
+                        ..Default::default()
+                    });
+                    inbox.detail_loading = true;
+                    let request = inbox.detail_generation;
+                    let scope = inbox.fetch_scope();
+
+                    inbox.set_context(vec![a.clone(), b.clone()], b.clone(), cx);
+
+                    assert_eq!(inbox.selected, None);
+                    assert!(inbox.details.is_none() && inbox.thread.is_none());
+                    assert!(inbox.document.is_none() && inbox.comments.is_empty());
+                    assert!(!inbox.detail_loading);
+                    assert_ne!(
+                        inbox.detail_generation, request,
+                        "project A's detail request must be discarded"
+                    );
+                    assert_ne!(inbox.fetch_scope(), scope, "a fetch made for A is stale");
+                    assert_eq!(
+                        inbox
+                            .visible_items(cx)
+                            .iter()
+                            .map(Item::key)
+                            .collect::<Vec<_>>(),
+                        vec![item(2, &b).key()]
+                    );
+                });
+            })
+            .unwrap();
     }
     #[gpui::test]
     fn long_discussion_materializes_only_viewport_comments_and_reply_focus_reaches_composer(
@@ -3610,12 +3698,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(item_kind_label(&task), "Task");
-        assert_eq!(source_label(&task, true), "Eng / Sprint 4");
+        assert_eq!(
+            source_label(&task, true, || unreachable!()),
+            "Eng / Sprint 4"
+        );
         let no_list = Item {
             project_name: String::new(),
             ..task.clone()
         };
-        assert_eq!(source_label(&no_list, true), "Eng");
+        assert_eq!(source_label(&no_list, true, || unreachable!()), "Eng");
         let jira = Item {
             provider: "jira".into(),
             kind: "issue".into(),
@@ -3624,7 +3715,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(item_kind_label(&jira), "Issue");
-        assert_eq!(source_label(&jira, true), "PRJ");
+        assert_eq!(source_label(&jira, true, || unreachable!()), "PRJ");
     }
     #[test]
     fn clickup_has_its_own_mark_and_needs_only_a_token() {

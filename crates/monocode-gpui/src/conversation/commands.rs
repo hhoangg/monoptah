@@ -132,8 +132,7 @@ impl Conversation {
             let cancelled = cancel.clone();
             let result = (|| {
                 locked(&store)?.write_rows(session, compact_start, &[compact_row.clone()])?;
-                let binary = provider::resolve(kind)
-                    .ok_or_else(|| format!("{} CLI not found.", kind.label()))?;
+                let binary = provider::resolve(kind).ok_or_else(|| kind.unavailable_hint())?;
                 let request = Request {
                     kind,
                     binary,

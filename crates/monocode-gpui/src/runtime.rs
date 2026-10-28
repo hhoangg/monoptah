@@ -419,8 +419,8 @@ fn run_turn_using(
             .ok_or_else(|| format!("Unknown provider: {}", summary.provider))?;
         let binary = resolve_binary(kind).ok_or_else(|| {
             format!(
-                "{} CLI not found. Install it and sign in, or set MONOCODE_{}_BINARY.",
-                kind.label(),
+                "{} Set MONOCODE_{}_BINARY to choose a different path.",
+                kind.unavailable_hint(),
                 kind.id().to_uppercase()
             )
         })?;

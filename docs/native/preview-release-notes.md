@@ -1,4 +1,20 @@
-This is the first experimental Monoptah Native preview, built with Rust + GPUI. React/Tauri remains the production app.
+# Monoptah Native 0.16.0-preview.8
+
+This experimental Monoptah Native preview is built with Rust + GPUI. React/Tauri remains the production app.
+
+## Changes since preview 7
+
+- Native charts and dashboard components can appear inline in assistant replies.
+- Mono tabs can join session splits as panes. The terminal panel hides when its last terminal closes, and the sidebar adjusts as the surrounding layout changes.
+- New `/stage` and `/commit` commands handle session Git actions, with compact summaries of Git turns.
+- GitHub issue and pull request links in prompts appear as chips with hover cards and can be linked to the session.
+- The Inbox opens scoped to the active project, uses configured project names, and clears stale selection and detail requests when switching projects.
+- Window size, fullscreen and maximized state survive relaunches. Wayland users gain a decoration setting, window controls, title-bar dragging and edge resizing.
+- Expanded user messages keep a consistent bubble width. Windows and Linux builds resolve a real monospace font and show the app icon.
+- Idle conversations switch accounts in place, stored floating-point values reload accurately, and composer autocorrect is off by default.
+- Missing-provider hints name the runtime actually needed, including the Antigravity ACP server.
+
+## Installation and testing
 
 Choose the download for your platform: macOS Apple Silicon or Intel, Windows x64, or Linux x64 (AppImage, Debian/Ubuntu `.deb`, or Fedora/Enterprise Linux `.rpm`). Install it alongside your existing Monoptah application.
 
@@ -6,7 +22,7 @@ Choose the download for your platform: macOS Apple Silicon or Intel, Windows x64
 
 **Data:** this preview uses your existing Monoptah database and saves changes there. Back up your Monoptah data with the app closed before testing. Native preferences are stored separately. Avoid editing the same conversations in both apps at once.
 
-**Updates:** the sidebar is configured to show the next native preview and offer download, verification, installation, and restart. Settings → General also offers Check for updates. The first packaged upgrade will be tested with a subsequent preview; if updating fails, download the new installer manually. Linux `.deb`/`.rpm` installs use the system authentication prompt (`pkexec`) to install the downloaded package. Cancelling authentication leaves the current version installed. Native previews receive native preview updates; production Tauri releases use their own feed.
+**Updates:** use Settings → General → About to check for updates and install the next native preview. Packaged upgrades still need runtime testing; if updating fails, download the new installer manually. Linux `.deb`/`.rpm` installs use the system authentication prompt (`pkexec`) to install the downloaded package. Cancelling authentication leaves the current version installed. Native previews receive native preview updates; production Tauri releases use their own feed.
 
 The initial installation requires a download. macOS completion/approval notifications, sounds, and Dock badges still need testing in the distributed app.
 

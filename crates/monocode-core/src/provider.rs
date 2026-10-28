@@ -1305,13 +1305,7 @@ pub fn run_text(mut request: Request, cancel: Arc<AtomicBool>) -> Result<String,
 }
 
 pub(crate) fn catalog_for(kind: Kind, account: crate::accounts::Profile) -> Result<Value, String> {
-    let binary = resolve(kind).ok_or_else(|| {
-        format!(
-            "{} CLI not installed. Sign in with {}.",
-            kind.label(),
-            kind.login_hint()
-        )
-    })?;
+    let binary = resolve(kind).ok_or_else(|| kind.unavailable_hint())?;
     let cwd = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)

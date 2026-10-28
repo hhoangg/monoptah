@@ -59,6 +59,7 @@ mod project_background;
 mod project_search;
 mod project_settings;
 mod project_tabs;
+mod project_theme;
 mod pulse;
 mod questions;
 mod quick_composer;
@@ -88,13 +89,11 @@ mod transcript;
 mod tui_session;
 mod usage_footer;
 mod visuals;
+mod window_state;
 mod workspace;
 mod worktree_switcher;
 
-use gpui::{
-    App, Bounds, KeyBinding, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
-    WindowOptions, actions, point, prelude::*, px, size,
-};
+use gpui::{App, KeyBinding, TitlebarOptions, WindowOptions, actions, point, prelude::*, px, size};
 use monocode_core::{store::Store, transcript::Transcript};
 use std::{
     path::PathBuf,
@@ -453,10 +452,10 @@ fn main() {
                 }
             })
             .detach();
-            let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
+            let bounds = workspace.window.bounds(cx);
             cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(bounds),
                     window_min_size: Some(size(px(820.), px(520.))),
                     window_decorations: workspace
                         .preferences
@@ -464,17 +463,15 @@ fn main() {
                     // Linux desktops match this to the .desktop file's
                     // StartupWMClass to show the app icon.
                     app_id: Some(monocode_core::brand::NATIVE_APP_ID.into()),
-                    window_background: if cfg!(target_os = "macos") {
-                        WindowBackgroundAppearance::Blurred
-                    } else {
-                        WindowBackgroundAppearance::Opaque
-                    },
+                    window_background: theme::window_backdrop(true),
                     // GPUI owns the custom chrome. AppKit must not reinterpret
                     // its controls as native titlebar double-click/drag gestures.
                     app_owns_titlebar_drag: cfg!(target_os = "macos"),
                     titlebar: Some(TitlebarOptions {
                         title: Some(monocode_core::brand::NATIVE_PRODUCT.into()),
-                        appears_transparent: cfg!(target_os = "macos"),
+                        // Windows also drops its caption: the app's drag areas
+                        // hit-test as the caption and the frame still resizes.
+                        appears_transparent: cfg!(any(target_os = "macos", target_os = "windows")),
                         traffic_light_position: if cfg!(target_os = "macos") {
                             // Original macOS chrome: 12 pt left inset, with
                             // 14 pt native buttons centered in the 40 pt bar.
@@ -521,7 +518,7 @@ fn main() {
 mod native_tests {
     use super::*;
     use crate::{input, transcript::TranscriptView};
-    use gpui::{Context, Entity, Render, StyleRefinement, Window, div};
+    use gpui::{Bounds, Context, Entity, Render, StyleRefinement, Window, WindowBounds, div};
     use gpui::{EntityInputHandler, ListOffset, TestAppContext, point};
     use monocode_core::transcript::Row;
     struct Surface {

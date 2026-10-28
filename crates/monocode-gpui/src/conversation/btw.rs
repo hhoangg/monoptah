@@ -711,7 +711,7 @@ impl Btw {
                     }
                     settings.account.root = store.data_dir().map(std::path::Path::to_path_buf);
                 }
-                let binary = provider::resolve(provider).ok_or_else(|| format!("{} CLI not found.", provider.label()))?;
+                let binary = provider::resolve(provider).ok_or_else(|| provider.unavailable_hint())?;
                 provider::run(Request { kind:provider, binary, cwd:cwd.into(), prompt, provider_id:None, model, settings }, cancel.clone(), |events| {
                     for event in events {
                         match event {

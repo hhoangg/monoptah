@@ -3401,12 +3401,12 @@ mod composer_motion_tests {
                                             <= 2.
                                 })
                                 .expect("the composer paints React's content-3% surface");
-                            #[cfg(target_os = "macos")]
+                            #[cfg(any(target_os = "macos", target_os = "windows"))]
                             assert_eq!(
                                 surface.border_color,
-                                gpui_apple::metal_renderer::backdrop_blur_marker(24. * scale)
+                                gpui::backdrop_blur_marker(24. * scale)
                             );
-                            #[cfg(not(target_os = "macos"))]
+                            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                             let _ = surface;
                             assert!(window.painted_quads().iter().any(|quad| {
                                 quad.border_color == content(0.2)
@@ -3683,15 +3683,13 @@ fn composer_surface(radius: f32) -> impl IntoElement {
         |_, _, _| {},
         move |bounds, _, window, _| {
             let surface = gpui::fill(bounds, fill).corner_radii(px(radius - 1.));
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             let surface = if blur > 0. {
-                surface.border_color(gpui_apple::metal_renderer::backdrop_blur_marker(
-                    blur * window.scale_factor(),
-                ))
+                surface.border_color(gpui::backdrop_blur_marker(blur * window.scale_factor()))
             } else {
                 surface
             };
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let _ = blur;
             window.paint_quad(surface);
         },

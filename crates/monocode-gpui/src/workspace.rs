@@ -69,6 +69,7 @@ pub(crate) struct ProjectRailGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Workspace {
+    pub window: crate::window_state::WindowState,
     pub tabs: Vec<i64>,
     pub title_order: Vec<TitleTab>,
     pub scope_focus: HashMap<String, TitleTab>,
@@ -293,6 +294,7 @@ impl TerminalDock {
 impl Default for Workspace {
     fn default() -> Self {
         Self {
+            window: Default::default(),
             tabs: Vec::new(),
             title_order: Vec::new(),
             scope_focus: HashMap::new(),
