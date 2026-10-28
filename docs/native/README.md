@@ -62,7 +62,7 @@ produce a standalone executable
 under `crates/monocode-gpui/target/release/`. `CARGO_TARGET_DIR` and
 `CARGO_BUILD_TARGET` can change these output paths.
 
-The **Monocode Native Preview** GitHub Actions workflow runs checks and build
+The **Monoptah Native Preview** GitHub Actions workflow runs checks and build
 verification.
 
 ## Data and configuration

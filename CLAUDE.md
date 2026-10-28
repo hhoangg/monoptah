@@ -95,3 +95,35 @@ and expires: if the job fails at the tap checkout, the likely cause is an expire
 The updater private key lives at `~/.config/monoptah/updater.key` and is **not** in this
 repo. Losing it means no further updates can be published to installed apps — they only
 trust that one key, so a replacement key would strand them.
+
+### Releasing the native app
+
+Monoptah Native (GPUI, macOS arm64 only, ad-hoc signed, not notarized) releases separately
+from the Tauri app. Edit `docs/native/monoptah-release-notes.md` (its first line must be
+`# Monoptah Native X.Y.Z`), commit it, then push the tag `native-vX.Y.Z` (plain `X.Y.Z`, no
+pre-release form). `.github/workflows/native-release-monoptah.yml` builds, signs with the same
+`TAURI_SIGNING_PRIVATE_KEY`, and publishes:
+
+- Release `native-vX.Y.Z` (never "latest": Tauri's updater reads `releases/latest`) with
+  `MonoptahNative_X.Y.Z_aarch64.app.tar.gz` and `.sig` for the in-app updater, plus the
+  `.zip` and `.zip.sha256` the cask pins.
+- `latest.json` on the rolling pre-release `native-latest`, the feed compiled into the app.
+  It is never replaced by an older version.
+
+A re-run of the same tag after a partial failure reuses the published assets and never
+replaces them; the signed files and feed are also kept as a workflow artifact.
+
+The `homebrew` job only bumps `Casks/monoptah-native.rb` in the tap, it does not create it:
+add that file (modelled on `Casks/monoptah.rb`) before the first release, or the job fails.
+It runs when `HOMEBREW_TAP_TOKEN` is set. While it is unset, bump the cask by hand with
+`scripts/update-homebrew-cask.sh` and the sha from the `MonoptahNative_<version>_aarch64.zip.sha256`
+asset. The fork scripts are `scripts/package-native-monoptah.mjs` and
+`scripts/native-release-monoptah.mjs`.
+
+Two things to keep true after merging from upstream or changing repo settings:
+
+- Upstream's `native-release.yml` is gated with `if: github.repository == 'hardbeat920/monocode'`
+  on each job. Any job upstream adds there runs ungated on this fork (and fails without Apple
+  and R2 secrets), so give it the same `if:`.
+- The rolling feed is replaced with `gh release upload --clobber`. Do not enable GitHub
+  immutable releases for this repository, or the feed can never be updated.

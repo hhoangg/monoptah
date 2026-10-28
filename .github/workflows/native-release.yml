@@ -14,6 +14,9 @@ concurrency:
 jobs:
   build:
     name: Native preview (${{ matrix.target }})
+    # Fork-local: upstream's release needs Apple, R2 and updater secrets this fork
+    # does not have. The fork releases through native-release-monoptah.yml.
+    if: github.repository == 'hardbeat920/monocode'
     strategy:
       fail-fast: false
       matrix:
@@ -179,6 +182,9 @@ jobs:
 
   rpm:
     name: Native preview (Enterprise Linux rpm)
+    # Fork-local: upstream's release needs Apple, R2 and updater secrets this fork
+    # does not have. The fork releases through native-release-monoptah.yml.
+    if: github.repository == 'hardbeat920/monocode'
     runs-on: ubuntu-latest
     container: almalinux:10
     env:
@@ -223,6 +229,9 @@ jobs:
 
   publish:
     name: Publish native preview and its update feed
+    # Fork-local: upstream's release needs Apple, R2 and updater secrets this fork
+    # does not have. The fork releases through native-release-monoptah.yml.
+    if: github.repository == 'hardbeat920/monocode'
     needs: [build, rpm]
     runs-on: macos-latest
     permissions:

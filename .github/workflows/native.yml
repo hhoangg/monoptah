@@ -1,4 +1,4 @@
-name: Monocode Native Preview
+name: Monoptah Native Preview
 
 on:
   push:
@@ -16,6 +16,7 @@ on:
       - 'package.json'
       - '.github/workflows/native.yml'
       - '.github/workflows/native-release.yml'
+      - '.github/workflows/native-release-monoptah.yml'
 
 permissions:
   contents: read
@@ -50,7 +51,7 @@ jobs:
       - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --profile native-dev
 
   desktop:
-    name: Monocode Native (macOS)
+    name: Monoptah Native (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

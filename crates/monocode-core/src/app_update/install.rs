@@ -164,6 +164,32 @@ fn extract_app(package: &Path, directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Fork-local. A Developer ID build, or an update that is not ad-hoc signed, must
+/// pass Gatekeeper; only an ad-hoc app replacing another ad-hoc app skips it, so a
+/// Developer ID build never accepts an ad-hoc update.
+#[cfg(any(target_os = "macos", test))]
+fn requires_gatekeeper_approval(running_adhoc: bool, downloaded_adhoc: bool) -> bool {
+    !(running_adhoc && downloaded_adhoc)
+}
+
+/// Fork-local. Reads `codesign -dv` output (written to stderr) for the
+/// `Signature=adhoc` line. Anything else, including an unreadable signature, is
+/// not ad-hoc, which keeps the Gatekeeper assessment in force.
+#[cfg(any(target_os = "macos", test))]
+fn output_reports_adhoc(output: &str) -> bool {
+    output.lines().any(|line| line.trim() == "Signature=adhoc")
+}
+
+#[cfg(target_os = "macos")]
+fn is_adhoc_signed(app: &Path) -> bool {
+    Command::new("/usr/bin/codesign")
+        .arg("-dv")
+        .arg(app)
+        .output()
+        .map(|o| o.status.success() && output_reports_adhoc(&String::from_utf8_lossy(&o.stderr)))
+        .unwrap_or(false)
+}
+
 #[cfg(target_os = "macos")]
 fn install_mac(update: &Update, package: &Path, target: &Path) -> Result<Installed, String> {
     let parent = target.parent().ok_or("Cannot locate the app directory")?;
@@ -199,12 +225,18 @@ fn install_mac(update: &Update, package: &Path, target: &Path) -> Result<Install
             .arg(&prepared),
         "The downloaded app signature is invalid",
     )?;
-    success(
-        Command::new("/usr/sbin/spctl")
-            .args(["--assess", "--type", "execute"])
-            .arg(&prepared),
-        "macOS did not approve the downloaded app",
-    )?;
+    // Fork-local: Monoptah Native releases are ad-hoc signed and not notarized, so
+    // Gatekeeper can never approve them. The assessment is skipped only when both the
+    // running app and the downloaded app are ad-hoc signed; the feed and package
+    // signatures, bundle identity and `codesign --verify` above still apply.
+    if requires_gatekeeper_approval(is_adhoc_signed(target), is_adhoc_signed(&prepared)) {
+        success(
+            Command::new("/usr/sbin/spctl")
+                .args(["--assess", "--type", "execute"])
+                .arg(&prepared),
+            "macOS did not approve the downloaded app",
+        )?;
+    }
     if authorize {
         // Pass paths as quoted shell data, then quote the complete command as
         // an AppleScript string. Never interpolate an unescaped app path.
@@ -283,6 +315,23 @@ mod tests {
         archive(&package, "Monoptah Native.app/escape", true);
         assert!(extract_app(&package, &stage).is_err());
         assert!(!temp.path().join("outside").exists());
+    }
+    #[test]
+    fn only_an_adhoc_app_replacing_an_adhoc_app_skips_gatekeeper() {
+        assert!(!requires_gatekeeper_approval(true, true));
+        assert!(requires_gatekeeper_approval(false, true));
+        assert!(requires_gatekeeper_approval(true, false));
+        assert!(requires_gatekeeper_approval(false, false));
+    }
+    #[test]
+    fn adhoc_signatures_are_recognised_from_codesign_output() {
+        let adhoc = "Executable=/Applications/Monoptah Native.app/Contents/MacOS/monocode-gpui\nIdentifier=com.monoptah.native\nCodeDirectory v=20400 size=1 flags=0x2(adhoc) hashes=1+3 location=embedded\nSignature=adhoc\nTeamIdentifier=not set\n";
+        assert!(output_reports_adhoc(adhoc));
+        let developer_id = "Identifier=com.monoptah.native\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Example (TEAM)\nTeamIdentifier=TEAM\n";
+        assert!(!output_reports_adhoc(developer_id));
+        assert!(!output_reports_adhoc(""));
+        assert!(!output_reports_adhoc("code object is not signed at all\n"));
+        assert!(!output_reports_adhoc("Authority=Signature=adhoc\n"));
     }
     #[test]
     fn failed_swap_restores_the_previous_executable() {
