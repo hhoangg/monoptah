@@ -21,6 +21,26 @@ case "$native_data_mode" in
   *) echo "Unknown data mode: $native_data_mode" >&2; exit 1 ;;
 esac
 native_bundle="$native_target/Monoptah Native.app"
+native_bundle_name="Monoptah Native"
+native_bundle_id="com.monoptah.native"
+if [ "$native_profile" != release ]; then
+  # Dev builds live in one fixed bundle with its own name and identifier, so the
+  # Dock, Spotlight and Launch Services never confuse it with the installed app.
+  native_bundle_name="Monoptah Native Dev"
+  native_bundle_id="com.monoptah.native.dev"
+  native_dev_dir="${MONOCODE_DEV_APP_DIR:-${HOME:?HOME is not set}/Applications}"
+  native_final_bundle="$native_dev_dir/$native_bundle_name.app"
+  case "$native_final_bundle" in
+    /*/"Monoptah Native Dev.app") ;;
+    *) echo "Refusing unsafe dev bundle path: $native_final_bundle" >&2; exit 1 ;;
+  esac
+  # Build and sign beside the final path; the old bundle stays until the swap.
+  native_bundle="$native_dev_dir/.$native_bundle_name.app.next"
+  case "$native_bundle" in
+    /*/".Monoptah Native Dev.app.next") ;;
+    *) echo "Refusing unsafe dev staging path: $native_bundle" >&2; exit 1 ;;
+  esac
+fi
 native_binary="$native_target/monocode-gpui"
 if [ ! -f "$native_binary" ]; then
   echo "Missing native executable: $native_binary" >&2
@@ -28,6 +48,12 @@ if [ ! -f "$native_binary" ]; then
   exit 1
 fi
 
+if [ "$native_profile" != release ]; then
+  mkdir -p "$native_dev_dir"
+  native_staging="$native_bundle"
+  trap 'rm -rf "$native_staging"' EXIT
+  rm -rf "$native_bundle"
+fi
 mkdir -p "$native_bundle/Contents/MacOS" "$native_bundle/Contents/Resources"
 # Replace the inode atomically so macOS does not reuse an older signature cache.
 cp "$native_binary" "$native_bundle/Contents/MacOS/monocode-gpui.next"
@@ -60,9 +86,9 @@ cat > "$native_bundle/Contents/Info.plist" <<PLIST
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>$native_executable</string>
 <key>MonocodeDataMode</key><string>$native_data_mode</string>
-<key>CFBundleIdentifier</key><string>com.monoptah.native</string>
-<key>CFBundleName</key><string>Monoptah Native</string>
-<key>CFBundleDisplayName</key><string>Monoptah Native</string>
+<key>CFBundleIdentifier</key><string>$native_bundle_id</string>
+<key>CFBundleName</key><string>$native_bundle_name</string>
+<key>CFBundleDisplayName</key><string>$native_bundle_name</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$native_short_version</string>
 <key>CFBundleVersion</key><string>$native_build_version</string>
@@ -79,5 +105,14 @@ if [ "$native_identity" = - ]; then
 else
   codesign --force --sign "$native_identity" --options runtime --timestamp \
     --entitlements src-tauri/Entitlements.plist "$native_bundle"
+fi
+if [ "$native_profile" != release ]; then
+  codesign --verify --deep --strict "$native_bundle"
+  rm -rf "$native_final_bundle"
+  mv "$native_bundle" "$native_final_bundle"
+  # Older versions wrote the dev bundle into the cargo target directory.
+  rm -rf "$native_target/Monoptah Native.app"
+  codesign --verify --deep --strict "$native_final_bundle"
+  native_bundle="$native_final_bundle"
 fi
 printf 'App: %s\n' "$native_bundle"

@@ -87,6 +87,47 @@ pub(crate) fn secondary_button(
     })
 }
 
+/// A 14px checkbox, like the ones in the delete dialogs. The caller adds
+/// `on_click` when it is enabled.
+pub(crate) fn checkbox(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    checked: bool,
+    disabled: bool,
+) -> Stateful<Div> {
+    let id = id.into();
+    let selector = id.to_string();
+    div()
+        .id(id)
+        .debug_selector(move || selector.clone())
+        .role(Role::CheckBox)
+        .aria_label(label.into())
+        .aria_toggled(if checked {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
+        .mt(px(2.))
+        .size(px(14.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .border_1()
+        .border_color(if checked {
+            accent_color()
+        } else {
+            content(0.3)
+        })
+        .when(checked, |d| {
+            d.bg(accent_color())
+                .child(icon("check", 10.).text_color(gpui::white()))
+        })
+        .when(disabled, |d| d.opacity(0.4))
+        .when(!disabled, |d| d.cursor_pointer())
+}
+
 fn button_base(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
     let label = label.into();
     div()
@@ -801,6 +842,7 @@ impl SettingsView {
             cx,
             |this, value, cx| {
                 this.selected_project = value;
+                this.selected_trees.clear();
                 this.refresh(cx);
             },
         )

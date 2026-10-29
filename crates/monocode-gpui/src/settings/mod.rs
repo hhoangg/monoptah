@@ -1,6 +1,7 @@
 //! Port of src/features/settings/ui/SettingsView.tsx and
 //! src/app/shell/SettingsRail.tsx: the Settings pages, their rail and the
 //! breadcrumb, search and actions the inset layout puts in its title bar.
+mod bulk_delete;
 mod data;
 mod keymap;
 #[cfg(test)]
@@ -234,6 +235,8 @@ pub(crate) struct SettingsView {
     recorder_focus: FocusHandle,
     recording_error: Option<String>,
     management: Option<management::Editor>,
+    /// Worktree paths ticked for bulk delete on the Worktrees page.
+    selected_trees: std::collections::HashSet<String>,
     management_generation: u64,
     binary_anchors: RefCell<HashMap<monocode_core::provider::Kind, AnchorSlot>>,
     mcp_show_all: bool,
@@ -370,6 +373,7 @@ impl SettingsView {
             recorder_focus: cx.focus_handle(),
             recording_error: None,
             management: None,
+            selected_trees: Default::default(),
             management_generation: 0,
             binary_anchors: RefCell::default(),
             mcp_show_all: false,
@@ -429,6 +433,7 @@ impl SettingsView {
                 this.skill_documents.clear();
                 this.discovery = data;
                 this.discovery_loading = false;
+                this.prune_selected_trees();
                 if this.section == Section::Mcp {
                     this.refresh_mcp_health(cx);
                 }
@@ -461,11 +466,12 @@ impl SettingsView {
         }
     }
     pub(crate) fn select_section(&mut self, section: Section, cx: &mut Context<Self>) {
-        if self.section != section {
+        if self.section != section && !self.delete_in_flight() {
             if let Some(center) = crate::accounts::get(cx) {
                 center.update(cx, |center, _| center.hide_emails());
             }
             self.management = None;
+            self.selected_trees.clear();
             self.management_generation += 1;
             self.leave_mobile(cx);
             self.leave_connections(cx);

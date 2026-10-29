@@ -1,8 +1,8 @@
 use crate::{
     settings::{
-        SettingsView,
+        SettingsView, bulk_delete,
         management::Target,
-        widgets::{note, secondary_button},
+        widgets::{checkbox, note, secondary_button},
     },
     theme::*,
 };
@@ -58,9 +58,76 @@ impl SettingsView {
             );
         } else {
             let trees = self.discovery.worktrees.trees.clone();
+            let selectable = bulk_delete::selectable_paths(&trees);
+            let busy = self.management.as_ref().is_some_and(|e| e.busy);
+            let chosen = trees
+                .iter()
+                .filter(|t| self.selected_trees.contains(&t.tree.path))
+                .cloned()
+                .collect::<Vec<_>>();
+            let all = !selectable.is_empty() && chosen.len() == selectable.len();
             page.push(
                 div()
                     .mt_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        checkbox(
+                            "select-all-trees",
+                            if all {
+                                "Clear selection"
+                            } else {
+                                "Select all worktrees"
+                            },
+                            all,
+                            busy || selectable.is_empty(),
+                        )
+                        .mt_0()
+                        .when(!(busy || selectable.is_empty()), |d| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                bulk_delete::toggle_all(&mut this.selected_trees, &selectable);
+                                cx.notify();
+                            }))
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("selected-trees-count")
+                            .flex_1()
+                            .text_size(px(12.))
+                            .text_color(content(0.55))
+                            .child(if chosen.is_empty() {
+                                "Select worktrees to delete several at once.".to_owned()
+                            } else {
+                                format!("{} selected", chosen.len())
+                            }),
+                    )
+                    .child(
+                        secondary_button(
+                            "delete-selected-trees",
+                            "Delete selected",
+                            true,
+                            busy || chosen.is_empty(),
+                        )
+                        .debug_selector(|| "delete-selected-trees".into())
+                        .child(icon("trash", 14.))
+                        .child("Delete selected")
+                        .when(!(busy || chosen.is_empty()), |d| {
+                            d.on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_management(
+                                    Target::DeleteTrees(chosen.clone()),
+                                    window,
+                                    cx,
+                                );
+                            }))
+                        }),
+                    )
+                    .into_any_element(),
+            );
+            page.push(
+                div()
+                    .mt_2()
                     .rounded_xl()
                     .border_1()
                     .border_color(content(0.1))
@@ -85,7 +152,9 @@ impl SettingsView {
                         } else {
                             "Status unavailable"
                         };
-                        let blocked = tree.locked || t.branch.is_none();
+                        let blocked = !bulk_delete::selectable(&tree);
+                        let ticked = self.selected_trees.contains(&t.path);
+                        let tick_path = t.path.clone();
                         div()
                             .p_4()
                             .flex()
@@ -93,6 +162,20 @@ impl SettingsView {
                             .gap_3()
                             .border_b_1()
                             .border_color(content(0.1))
+                            .child(
+                                checkbox(
+                                    SharedString::from(format!("select-tree-{ix}")),
+                                    format!("Select {}", t.branch.as_deref().unwrap_or("worktree")),
+                                    ticked,
+                                    blocked || busy,
+                                )
+                                .when(!(blocked || busy), |d| {
+                                    d.on_click(cx.listener(move |this, _, _, cx| {
+                                        bulk_delete::toggle(&mut this.selected_trees, &tick_path);
+                                        cx.notify();
+                                    }))
+                                }),
+                            )
                             .child(icon("folder-tree", 16.))
                             .child(
                                 div()

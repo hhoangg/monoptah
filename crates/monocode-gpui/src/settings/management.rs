@@ -10,6 +10,7 @@ pub(super) enum Target {
     Skill,
     Worktree,
     DeleteTree(data::Tree),
+    DeleteTrees(Vec<data::Tree>),
     ResetMono(super::MonoSetting),
 }
 pub(super) struct Editor {
@@ -21,6 +22,7 @@ pub(super) struct Editor {
     pub base: String,
     pub existing: bool,
     pub delete_sessions: bool,
+    pub bulk: Option<bulk_delete::BulkDelete>,
     pub busy: bool,
     pub error: Option<String>,
     pub editing: bool,
@@ -79,7 +81,7 @@ impl SettingsView {
         let previous = window.focused(cx);
         if matches!(
             target,
-            Target::Cli(_) | Target::DeleteTree(_) | Target::ResetMono(_)
+            Target::Cli(_) | Target::DeleteTree(_) | Target::DeleteTrees(_) | Target::ResetMono(_)
         ) {
             window.focus(&self.focus, cx);
         } else {
@@ -113,6 +115,7 @@ impl SettingsView {
             base: "HEAD".into(),
             existing: false,
             delete_sessions: false,
+            bulk: None,
             busy: false,
             error: None,
             editing: false,
@@ -179,11 +182,89 @@ impl SettingsView {
         .detach();
         cx.notify();
     }
+    /// True while a worktree delete is running, so Settings must stay open to
+    /// receive its result.
+    pub(crate) fn delete_in_flight(&self) -> bool {
+        self.management.as_ref().is_some_and(|e| {
+            e.busy && matches!(e.target, Target::DeleteTree(_) | Target::DeleteTrees(_))
+        })
+    }
+    /// Starts deleting `path` as the Delete button would, for tests in other modules.
+    #[cfg(test)]
+    pub(crate) fn start_delete_for_test(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tree = data::Tree {
+            tree: monocode_core::git::Worktree {
+                path: path.into(),
+                branch: Some("topic".into()),
+                ..Default::default()
+            },
+            locked: false,
+            dirty: Some(false),
+            unpushed: 0,
+        };
+        self.open_management(Target::DeleteTree(tree), window, cx);
+        self.submit_management(cx);
+    }
+    /// Whether a finished action belongs to the form that is open. Worktree
+    /// deletes carry their path and must match the one in flight; every other
+    /// action has no path.
+    fn accepts_result(&self, path: Option<&str>) -> bool {
+        let Some(editor) = &self.management else {
+            return false;
+        };
+        match &editor.target {
+            Target::DeleteTree(tree) => editor.busy && path == Some(tree.tree.path.as_str()),
+            Target::DeleteTrees(_) => editor
+                .bulk
+                .as_ref()
+                .and_then(|b| b.current())
+                .is_some_and(|item| path == Some(item.path.as_str())),
+            _ => path.is_none(),
+        }
+    }
+    pub(super) fn management_title(&self) -> String {
+        let Some(editor) = &self.management else {
+            return String::new();
+        };
+        match &editor.target {
+            Target::Cli(kind) => format!("{} CLI details", kind.label()),
+            Target::Mcp => "Add MCP server".into(),
+            Target::Worktree => "Create worktree".into(),
+            Target::DeleteTree(_) => "Delete worktree?".into(),
+            Target::DeleteTrees(trees) => match &editor.bulk {
+                Some(bulk) if bulk.finished() && !bulk.failures().is_empty() => {
+                    bulk_delete::result_title(bulk.deleted().len(), bulk.total())
+                }
+                _ => format!("Delete {} worktrees?", trees.len()),
+            },
+            Target::ResetMono(mono) => format!("Reset {} to its defaults?", mono.name),
+            Target::Skill => String::new(),
+        }
+    }
+    /// `path` is the worktree a delete result is about; results of other
+    /// actions pass `None`. A result that does not match the open form is ignored.
     pub(crate) fn management_finished(
         &mut self,
         result: Result<(), String>,
+        path: Option<&str>,
         cx: &mut Context<Self>,
     ) {
+        if !self.accepts_result(path) {
+            return;
+        }
+        if self
+            .management
+            .as_ref()
+            .is_some_and(|e| e.bulk.as_ref().is_some_and(|b| b.running()))
+        {
+            self.bulk_delete_finished(result, cx);
+            return;
+        }
         if let Some(editor) = &mut self.management {
             editor.busy = false;
             match result {
@@ -203,6 +284,55 @@ impl SettingsView {
                 Err(e) => editor.error = Some(e),
             }
         }
+        cx.notify();
+    }
+    /// Drops ticked worktrees that are no longer in the list or can't be deleted.
+    pub(super) fn prune_selected_trees(&mut self) {
+        let paths = bulk_delete::selectable_paths(&self.discovery.worktrees.trees);
+        bulk_delete::prune(&mut self.selected_trees, &paths);
+    }
+    /// Result of one worktree in a bulk delete. Each one goes through the same
+    /// `RemoveWorktree` event as a single delete; this decides what comes next.
+    fn bulk_delete_finished(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.management else {
+            return;
+        };
+        let Some(bulk) = &mut editor.bulk else {
+            return;
+        };
+        let Some(done) = bulk.current().cloned() else {
+            return;
+        };
+        let ok = result.is_ok();
+        let next = bulk.record(result);
+        if ok {
+            self.selected_trees.remove(&done.path);
+            if monocode_core::files::is_equal_or_inside(&self.selected_project, &done.path) {
+                self.selected_project = self.discovery.worktrees.main.clone();
+            }
+        }
+        let cwd = self.selected_project.clone();
+        let Some(editor) = &mut self.management else {
+            return;
+        };
+        if let Some(next) = next {
+            cx.emit(SettingsEvent::RemoveWorktree {
+                cwd,
+                path: next.path,
+                delete_sessions: editor.delete_sessions,
+            });
+            cx.notify();
+            return;
+        }
+        editor.busy = false;
+        if editor
+            .bulk
+            .as_ref()
+            .is_some_and(|b| b.failures().is_empty())
+        {
+            self.management = None;
+        }
+        self.refresh(cx);
         cx.notify();
     }
     pub(super) fn submit_management(&mut self, cx: &mut Context<Self>) {
@@ -231,6 +361,22 @@ impl SettingsView {
         editor.error = None;
         if let Target::ResetMono(mono) = target {
             cx.emit(SettingsEvent::ResetMono(mono.id));
+            cx.notify();
+            return;
+        }
+        if let Target::DeleteTrees(trees) = target {
+            let mut bulk =
+                bulk_delete::BulkDelete::new(trees.iter().map(bulk_delete::item).collect());
+            let first = bulk.start();
+            editor.bulk = Some(bulk);
+            match first {
+                Some(first) => cx.emit(SettingsEvent::RemoveWorktree {
+                    cwd,
+                    path: first.path,
+                    delete_sessions: editor.delete_sessions,
+                }),
+                None => editor.busy = false,
+            }
             cx.notify();
             return;
         }
@@ -264,7 +410,7 @@ impl SettingsView {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 if this.management_generation == generation {
-                    this.management_finished(result, cx);
+                    this.management_finished(result, None, cx);
                 }
             });
         })
@@ -287,6 +433,16 @@ impl SettingsView {
         let existing = e.existing;
         let base = e.base.clone();
         let deleting = e.delete_sessions;
+        let bulk = e.bulk.as_ref().map(|b| {
+            (
+                b.running(),
+                b.finished(),
+                b.position(),
+                b.total(),
+                b.deleted().len(),
+                b.failures().to_vec(),
+            )
+        });
         let editing = e.editing;
         let inspection = e.inspection.clone();
         let mut rows = Vec::new();
@@ -560,6 +716,131 @@ impl SettingsView {
                     self.discovery.worktrees.default_root.display()
                 )));
             }
+            Target::DeleteTrees(trees) => {
+                let count = trees
+                    .iter()
+                    .map(|tree| {
+                        self.ctx
+                            .sessions
+                            .iter()
+                            .filter(|(_, p, _)| {
+                                monocode_core::files::is_equal_or_inside(p, &tree.tree.path)
+                            })
+                            .count()
+                    })
+                    .sum::<usize>();
+                let (dirty, unknown) = bulk_delete::split_dirty(trees);
+                let unpushed = trees.iter().map(|t| t.unpushed).sum::<usize>();
+                if let Some((running, finished, position, total, deleted, failures)) = &bulk {
+                    if *running {
+                        rows.push(
+                            div()
+                                .id("bulk-delete-progress")
+                                .role(Role::Status)
+                                .text_size(px(12.))
+                                .child(format!("Deleting {position} of {total}"))
+                                .into_any_element(),
+                        );
+                    } else if *finished {
+                        rows.push(
+                            div()
+                                .id("bulk-delete-summary")
+                                .role(Role::Alert)
+                                .text_size(px(12.))
+                                .text_color(gpui::rgb(0xf87171))
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(format!(
+                                    "Deleted {deleted} of {total}. {} could not be deleted and stay selected:",
+                                    failures.len()
+                                ))
+                                .children(failures.iter().map(|f| {
+                                    format!("{} ({}): {}", f.item.label, f.item.path, f.error)
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                } else {
+                    rows.push(note(format!(
+                        "This permanently deletes {} working copies and everything inside them.",
+                        trees.len()
+                    )));
+                    let mut consequences = div()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(content(0.1))
+                        .bg(content(0.05))
+                        .p_3()
+                        .text_size(px(12.))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(trees.iter().map(|t| t.tree.path.clone()));
+                    if count > 0 {
+                        consequences = consequences.child(format!(
+                            "{count} sessions using these worktrees are {}",
+                            if deleting {
+                                "permanently deleted."
+                            } else {
+                                "kept. Select a branch or worktree to continue them."
+                            }
+                        ));
+                    }
+                    if !dirty.is_empty() {
+                        consequences = consequences.child(
+                            div().text_color(gpui::rgb(0xfbbf24)).child(format!(
+                                "All uncommitted and untracked changes are discarded in: {}.",
+                                dirty.join(", ")
+                            )),
+                        );
+                    }
+                    if !unknown.is_empty() {
+                        consequences = consequences.child(
+                            div().text_color(gpui::rgb(0xfbbf24)).child(format!(
+                                "Status unknown (changes may be discarded): {}.",
+                                unknown.join(", ")
+                            )),
+                        );
+                    }
+                    consequences = consequences.child("Their branches and commits are kept.");
+                    if unpushed > 0 {
+                        consequences = consequences.child(format!(
+                            "{unpushed} unpublished commits stay on the branches."
+                        ));
+                    }
+                    rows.push(consequences.into_any_element());
+                    if count > 0 {
+                        rows.push(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_center()
+                                .gap_3()
+                                .p_3()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(content(0.1))
+                                .text_size(px(12.5))
+                                .child("Also delete associated sessions")
+                                .child(self.toggle(
+                                    "delete-worktree-sessions",
+                                    "Also delete associated sessions",
+                                    deleting,
+                                    busy,
+                                    cx,
+                                    |this, on, cx| {
+                                        if let Some(e) = &mut this.management {
+                                            e.delete_sessions = on;
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
             Target::DeleteTree(tree) => {
                 let count = self
                     .ctx
@@ -743,26 +1024,44 @@ impl SettingsView {
                     "Delete worktree"
                 }
             }
+            Target::DeleteTrees(_) => "",
         };
+        let label = match &target {
+            Target::DeleteTrees(trees) if busy => format!("Deleting {} worktrees…", trees.len()),
+            Target::DeleteTrees(trees) if deleting => {
+                format!("Delete {} worktrees and sessions", trees.len())
+            }
+            Target::DeleteTrees(trees) => format!("Delete {} worktrees", trees.len()),
+            _ => label.to_owned(),
+        };
+        let bulk_done = bulk.as_ref().is_some_and(|b| b.1 && !b.0);
         actions = actions
             .child(
                 crate::modal::disabled(
-                    crate::modal::ghost_button("cancel-management", "Cancel"),
+                    crate::modal::ghost_button(
+                        "cancel-management",
+                        if bulk_done { "Close" } else { "Cancel" },
+                    ),
                     busy,
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.close_management(window, cx))),
             )
-            .child(
-                crate::modal::disabled(
-                    if matches!(target, Target::DeleteTree(_) | Target::ResetMono(_)) {
-                        crate::modal::danger_button("submit-management", label)
-                    } else {
-                        crate::modal::primary_button("submit-management", label)
-                    },
-                    busy,
+            .when(!bulk_done, |actions| {
+                actions.child(
+                    crate::modal::disabled(
+                        if matches!(
+                            target,
+                            Target::DeleteTree(_) | Target::DeleteTrees(_) | Target::ResetMono(_)
+                        ) {
+                            crate::modal::danger_button("submit-management", label)
+                        } else {
+                            crate::modal::primary_button("submit-management", label)
+                        },
+                        busy,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.submit_management(cx))),
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.submit_management(cx))),
-            );
+            });
         rows.push(actions.into_any_element());
         div()
             .flex()
@@ -780,14 +1079,7 @@ impl SettingsView {
         if matches!(target, Target::Skill) {
             return None;
         }
-        let title = match target {
-            Target::Cli(kind) => format!("{} CLI details", kind.label()),
-            Target::Mcp => "Add MCP server".into(),
-            Target::Worktree => "Create worktree".into(),
-            Target::DeleteTree(_) => "Delete worktree?".into(),
-            Target::ResetMono(ref mono) => format!("Reset {} to its defaults?", mono.name),
-            _ => String::new(),
-        };
+        let title = self.management_title();
         let form = self.management_form(cx);
         if let Target::Cli(kind) = target {
             let slot = self

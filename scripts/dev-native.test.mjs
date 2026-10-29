@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
-import { parseDevArgs, startDev } from "./dev-native.mjs";
+import { devAppPath, parseDevArgs, startDev } from "./dev-native.mjs";
 
 test("forwards app options and rejects the retired runner flags", () => {
   assert.deepEqual(parseDevArgs([]), { args: [] });
@@ -159,12 +159,12 @@ test("macOS bundles automatically and preserves the selected data mode for Finde
     [["--monocode-data", "--dev-data", "--cwd", "--monocode-data"], "dev-data"],
   ]) {
     await t.test(`${mode}: ${JSON.stringify(args)}`, async (t) => {
-      const f = await fixture(t, {}, { platform: "darwin", args });
+      const f = await fixture(t, { MONOCODE_DEV_APP_DIR: "/tmp/dev-apps" }, { platform: "darwin", args });
       await f.until((events) => f.starts(events) === 1);
       const packaged = f.calls.find((call) => call.command === "bash");
       assert.deepEqual(packaged.args, ["scripts/bundle-native-macos.sh", "native-dev", join(f.root, "custom-target"), "0.15.0", mode]);
       const app = f.calls.find((call) => !["cargo", "bash"].includes(call.command));
-      assert.equal(app.command, join(f.root, "custom-target/native-dev/Monoptah Native.app/Contents/MacOS/monocode-gpui"));
+      assert.equal(app.command, "/tmp/dev-apps/Monoptah Native Dev.app/Contents/MacOS/monocode-gpui");
       assert.deepEqual(app.args, args);
       const events = await f.events();
       assert.ok(events.indexOf("built") < events.indexOf("package"));
@@ -198,4 +198,9 @@ test("closing during compilation terminates Cargo and never launches an app", { 
   await f.dev.close();
   assert.equal(f.starts(await f.events()), 0);
   assert.ok(f.calls.every((call) => call.command === "cargo"));
+});
+
+test("the dev bundle path is fixed and overridable", () => {
+  assert.equal(devAppPath({ HOME: "/Users/a" }), "/Users/a/Applications/Monoptah Native Dev.app");
+  assert.equal(devAppPath({ HOME: "/Users/a", MONOCODE_DEV_APP_DIR: "/x" }), "/x/Monoptah Native Dev.app");
 });
