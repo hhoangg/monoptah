@@ -3005,8 +3005,24 @@ impl Shell {
         });
     }
     /// newTerminalCwd: the focused session's worktree, else its folder, else
-    /// the project.
+    /// the project. In a Mono chat, see the rule below.
     fn terminal_cwd(&self, cx: &App) -> String {
+        // A Mono chat has no focused session: `workspace.active` is only the
+        // last session used. A Mono working on the project in view roots the
+        // shell in its working copy (so a focused worktree is respected);
+        // otherwise at its first local project, the dock still being this
+        // project's. Without either, the working copy.
+        if let Some(mono) = self.monos.as_ref().and_then(|m| m.read(cx).current()) {
+            if mono.works_on(&self.workspace.project) {
+                return self.working_copy().to_owned();
+            }
+            return mono
+                .projects
+                .iter()
+                .find(|p| !p.starts_with("remote://"))
+                .cloned()
+                .unwrap_or_else(|| self.working_copy().to_owned());
+        }
         self.workspace
             .active
             .and_then(|id| self.sessions.get(&id))
@@ -12879,6 +12895,179 @@ mod tests {
                 assert_eq!(dock.active, 2);
             })
             .unwrap();
+    }
+    #[gpui::test]
+    fn a_mono_chat_shows_its_terminal_dock_rooted_at_its_project(cx: &mut TestAppContext) {
+        let (window, _, b) = window(cx);
+        cx.update(|cx| {
+            bind_keys(cx);
+            crate::terminal::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(b, w, cx);
+                shell.mono_manager().update(cx, |m, cx| {
+                    m.create(vec!["/work/mono-project".into()], w, cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, w, cx| {
+                shell
+                    .mono_manager()
+                    .update(cx, |m, cx| m.dismiss_settings(w, cx));
+                assert!(shell.mono_active(cx));
+                shell.focus_active(w, cx);
+            })
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let before = window
+            .update(cx, |shell, _, _| shell.mono_bounds.get().unwrap())
+            .unwrap();
+        assert!(cx.debug_bounds("terminal-dock").is_none());
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(&format!("{modifier}-`"));
+        cx.run_until_parked();
+        let project = window
+            .update(cx, |shell, _, cx| {
+                let project = shell.workspace.project.clone();
+                assert!(shell.mono_active(cx));
+                assert_eq!(shell.terminals[&project].len(), 1);
+                let dock = &shell.workspace.docks[&project];
+                assert!(dock.open);
+                assert_eq!(dock.terminals, ["/work/mono-project"]);
+                assert_ne!(shell.working_copy(), "/work/mono-project");
+                project
+            })
+            .unwrap();
+        assert!(
+            cx.debug_bounds("terminal-dock").is_some(),
+            "the dock must be drawn in the Mono view"
+        );
+        let after = window
+            .update(cx, |shell, _, _| shell.mono_bounds.get().unwrap())
+            .unwrap();
+        assert!(
+            after.size.width < before.size.width || after.size.height < before.size.height,
+            "the Mono shrinks for the dock: {before:?} -> {after:?}"
+        );
+        // Another press adds exactly one more shell.
+        cx.simulate_keystrokes(&format!("{modifier}-`"));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(shell.terminals[&project].len(), 2);
+                assert_eq!(shell.workspace.docks[&project].terminals.len(), 2);
+            })
+            .unwrap();
+        // The toggle hides and shows it, keeping the shells.
+        window
+            .update(cx, |shell, w, cx| {
+                assert_eq!(shell.dock_focused(w, cx), Some(1));
+                shell.toggle_terminal(w, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("terminal-dock").is_none());
+        window
+            .update(cx, |shell, w, cx| {
+                assert_eq!(shell.dock_focused(w, cx), None);
+                let chat = shell.mono_manager().read(cx).chat().unwrap();
+                let input = chat.read(cx).input.focus_handle(cx);
+                assert!(input.is_focused(w), "focus returns to the Mono input");
+                shell.toggle_terminal(w, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("terminal-dock").is_some());
+        // Back in a session the same dock is drawn, with no extra shells.
+        window
+            .update(cx, |shell, w, cx| {
+                shell.mono_manager().update(cx, |m, cx| m.close(cx));
+                shell.open(b, w, cx);
+                assert!(!shell.mono_active(cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("terminal-dock").is_some());
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(shell.terminals[&project].len(), 2);
+                assert_eq!(shell.workspace.docks[&project].terminals.len(), 2);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn a_mono_roots_terminals_at_the_project_being_worked_on(cx: &mut TestAppContext) {
+        let (window, a, _) = window(cx);
+        // The last session used lives elsewhere than the project in view.
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(a, w, cx);
+                assert_eq!(shell.terminal_cwd(cx), "/work/another-project");
+                shell.workspace.project = "/work/monocode".into();
+                assert_eq!(shell.workspace.active, Some(a));
+            })
+            .unwrap();
+        let mut cases: Vec<(Vec<&str>, Option<&str>, &str)> = vec![
+            // No project of its own: the project in view, never the stale session.
+            (vec![], None, "/work/monocode"),
+            // Works on the project in view: its working copy, not the first project.
+            (
+                vec!["/work/other", "/work/monocode"],
+                None,
+                "/work/monocode",
+            ),
+            // ... which follows the focused worktree.
+            (
+                vec!["/work/monocode"],
+                Some("/work/monocode-feature"),
+                "/work/monocode-feature",
+            ),
+            // Does not work on it: its own first project.
+            (vec!["/work/other", "/work/third"], None, "/work/other"),
+            // A remote project never becomes the cwd of a local shell.
+            (vec!["remote://host/project"], None, "/work/monocode"),
+            (
+                vec!["remote://host/project", "/work/other"],
+                None,
+                "/work/other",
+            ),
+        ];
+        for (projects, worktree, want) in cases.drain(..) {
+            window
+                .update(cx, |shell, w, cx| {
+                    shell.worktree_focus.clear();
+                    if let Some(path) = worktree {
+                        shell.worktree_focus.insert(
+                            "/work/monocode".into(),
+                            crate::worktree_switcher::WorktreeFocus {
+                                path: path.into(),
+                                branch: Some("feature".into()),
+                            },
+                        );
+                    }
+                    let projects = projects.iter().map(|p| p.to_string()).collect();
+                    shell
+                        .mono_manager()
+                        .update(cx, |m, cx| m.create(projects, w, cx));
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |shell, _, cx| {
+                    assert!(shell.mono_active(cx));
+                    assert_eq!(shell.terminal_cwd(cx), want);
+                })
+                .unwrap();
+        }
     }
     #[gpui::test]
     fn terminal_new_in_home_refuses_remote_projects(cx: &mut TestAppContext) {

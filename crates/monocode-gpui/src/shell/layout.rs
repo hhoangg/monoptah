@@ -760,7 +760,7 @@ impl Shell {
                             {
                                 let session = monos.read(cx).active_notification_session(cx);
                                 let linked = session.and_then(|id| self.linked_notice(id, cx));
-                                div()
+                                let body = div()
                                     .relative()
                                     .size_full()
                                     .child(self.mono_bounds.layout_probe())
@@ -775,7 +775,10 @@ impl Shell {
                                             .max_w_full()
                                             .child(notice)
                                     }))
-                                    .into_any_element()
+                                    .into_any_element();
+                                // The terminal dock is shared by the project, so
+                                // a Mono chat shows it like a session does.
+                                self.with_dock(body, window, cx)
                             } else {
                                 let body = self.workspace_body(window, cx);
                                 self.with_dock(body, window, cx)
