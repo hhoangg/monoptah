@@ -104,7 +104,7 @@ export async function startDev({
             log("App packaging failed. Fix the error, then type r to retry.");
             continue;
           }
-          executable = join(target, "native-dev", "Monoptah Native.app", "Contents", "MacOS", "monocode-gpui");
+          executable = join(target, "native-dev", "Monoptah Native Dev.app", "Contents", "MacOS", "monocode-gpui");
         }
         if (builtRevision !== revision) continue;
         await stopApp();

@@ -20,7 +20,16 @@ case "$native_data_mode" in
   dev-data|monocode-data) ;;
   *) echo "Unknown data mode: $native_data_mode" >&2; exit 1 ;;
 esac
-native_bundle="$native_target/Monoptah Native.app"
+# A development bundle must not share a name or bundle id with the installed app,
+# or the Dock, Cmd-Tab and `open` treat the two as the same application.
+if [ "$native_profile" = release ]; then
+  native_name="Monoptah Native"
+  native_bundle_id="com.monoptah.native"
+else
+  native_name="Monoptah Native Dev"
+  native_bundle_id="com.monoptah.native.dev"
+fi
+native_bundle="$native_target/$native_name.app"
 native_binary="$native_target/monocode-gpui"
 if [ ! -f "$native_binary" ]; then
   echo "Missing native executable: $native_binary" >&2
@@ -60,9 +69,9 @@ cat > "$native_bundle/Contents/Info.plist" <<PLIST
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>$native_executable</string>
 <key>MonocodeDataMode</key><string>$native_data_mode</string>
-<key>CFBundleIdentifier</key><string>com.monoptah.native</string>
-<key>CFBundleName</key><string>Monoptah Native</string>
-<key>CFBundleDisplayName</key><string>Monoptah Native</string>
+<key>CFBundleIdentifier</key><string>$native_bundle_id</string>
+<key>CFBundleName</key><string>$native_name</string>
+<key>CFBundleDisplayName</key><string>$native_name</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$native_short_version</string>
 <key>CFBundleVersion</key><string>$native_build_version</string>
