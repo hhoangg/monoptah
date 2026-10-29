@@ -309,7 +309,16 @@ pub(crate) fn rail_branch(last: bool, branch: bool) -> impl IntoElement {
 /// The same rail for a step whose content sits `offset` lower, as the
 /// sidebar's `.orchestration-tree-step` does with its 2px padding.
 pub(crate) fn rail_branch_at(last: bool, branch: bool, offset: f32) -> impl IntoElement {
-    let color = crate::theme::rail_color();
+    rail_branch_tinted(last, branch, offset, None)
+}
+/// `rail_branch_at` drawn in `tint` instead of the default rail color.
+pub(crate) fn rail_branch_tinted(
+    last: bool,
+    branch: bool,
+    offset: f32,
+    tint: Option<gpui::Hsla>,
+) -> gpui::Div {
+    let color = tint.unwrap_or_else(crate::theme::rail_color);
     gpui::div()
         .absolute()
         .top_0()
