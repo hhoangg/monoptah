@@ -1,10 +1,18 @@
-# Monoptah Native 0.34.1
+# Monoptah Native 0.34.2
 
-A bug-fix release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
+A release of the experimental Rust + GPUI app for macOS on Apple silicon, merged with the upstream native 0.16.0-preview.9 work. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.34.0
+## Changes since 0.34.1
 
-- Typing Vietnamese in terminals and TUI sessions now gives the right text. Input methods such as GoTiengViet replace typed letters with the accented text ("tôi đang gõ tiếng việt" used to come out as "tai aang via tia via"). The terminal now takes typed text from macOS's text input, so GoTiengViet, the built-in Vietnamese Telex input source and other input methods work. Option-as-Meta and special keys behave as before.
+- Archiving a session now archives the sessions it started too, so they no longer break out into separate top-level rows. Restoring the parent brings back the children that were archived with it, and a session you archived on its own stays archived. Archiving a child alone still archives only that child. This applies to the context menu, multi-select, the keyboard shortcut and Monos. The app `sessions.archive` action follows the same rules; it is refused when the calling session was started by the session being archived.
+- Faster startup and fewer full-window redraws during animations, with GPU memory released when the app goes quiet.
+- Mermaid diagrams render natively in Markdown and resize with the panel.
+- Cmd/Ctrl+Enter sends a mid-turn message the opposite way from your usual follow-up preference (steer or queue).
+- Composer file mentions show file icons and insert short names. Terminal links open on click.
+- The workspace picker includes All checkouts, while selecting a project folder keeps that folder as the session scope.
+- Pasted images are stored per conversation and removed with that conversation; shared legacy attachments are kept.
+- Plain-link prompts wrap inside their bubbles, and the Edit GitHub link dialog keeps its Update button inside the dialog.
+- Disabling mobile access or shutting down cancels pending mobile startup.
 
 ## What it is
 
