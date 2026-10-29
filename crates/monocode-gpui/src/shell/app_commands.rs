@@ -16,7 +16,8 @@ enum Effect {
     None,
     Start(Box<(Session, Settings, bool, bool, Placement)>),
     Groups(String, monocode_core::session_groups::Groups),
-    Archive(i64),
+    /// The sessions an archive covered, those the store saved, and why it stopped.
+    Archive(Vec<i64>, Vec<i64>, Option<String>),
 }
 impl Shell {
     pub(super) fn init_app_bridge(&mut self, cx: &mut Context<Self>) {
@@ -91,7 +92,8 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let result = result.map(|(value, effect)| {
+                let result = result.and_then(|(value, effect)| {
+                    let mut failure = None;
                     match effect {
                         Effect::None => (),
                         Effect::Start(start) => {
@@ -111,22 +113,23 @@ impl Shell {
                         Effect::Groups(project, groups) => {
                             this.groups.insert(project, groups);
                         }
-                        Effect::Archive(id) => {
-                            if let Some(summary) = this.session_summaries.get_mut(&id) {
-                                summary.archived = true;
-                            }
-                            if let Some(view) = this.sessions.get(&id) {
-                                view.update(cx, |v, _| v.summary.archived = true);
-                            }
-                            this.refresh_session_mark(id, cx);
-                            if this.workspace.tab_of(id).is_some() {
-                                this.close_pane(id, window, cx);
-                            }
+                        Effect::Archive(family, written, error) => {
+                            this.finish_archive(
+                                &family,
+                                &written,
+                                error.is_none(),
+                                true,
+                                window,
+                                cx,
+                            );
+                            failure = error;
                         }
                     }
                     this.invalidate_chrome(cx);
                     cx.notify();
-                    value
+                    failure.map_or(Ok(value), |error| {
+                        Err(format!("Could not update archive: {error}"))
+                    })
                 });
                 this.finish_app_call(call, result, cx);
             });
@@ -236,6 +239,45 @@ impl Shell {
         })
         .detach();
         let _ = window;
+    }
+    /// What `sessions.archive` covers: the target and the sessions it started
+    /// that this app call may manage. A call from inside that group is refused,
+    /// since archiving would stop and close the caller mid-call.
+    fn app_archive_family(
+        &self,
+        id: i64,
+        caller: i64,
+        project: &str,
+        cx: &App,
+    ) -> Result<Vec<i64>, String> {
+        if self.archiving.contains(&id) {
+            return Err("Session is already being archived".into());
+        }
+        let mut up = caller;
+        for _ in 0..self.started_by.len() {
+            let Some(&by) = self.started_by.get(&up) else {
+                break;
+            };
+            if by == id {
+                return Err(
+                    "This session was started by the session being archived; archiving would stop it".into(),
+                );
+            }
+            up = by;
+        }
+        let mut family = self.archive_family(id, true, cx);
+        family.retain(|&member| {
+            member == id
+                || (self.session_summaries.get(&member).is_some_and(|s| {
+                    monocode_core::files::path_key(&s.cwd)
+                        == monocode_core::files::path_key(project)
+                }) && !self.orchestration_worker(member)
+                    && !self
+                        .monos
+                        .as_ref()
+                        .is_some_and(|m| m.read(cx).is_mono_session(member)))
+        });
+        Ok(family)
     }
     fn app_target(
         &self,
@@ -482,14 +524,26 @@ impl Shell {
                             }));
                             return;
                         } else if action == "sessions.archive" {
+                            let ids = match self.app_archive_family(id, call.session, &project, cx)
+                            {
+                                Ok(ids) => ids,
+                                Err(e) => {
+                                    self.finish_app_call(call, Err(e), cx);
+                                    return;
+                                }
+                            };
                             view.update(cx, |v, cx| v.stop_app_session(cx));
+                            self.archiving.extend(ids.iter().copied());
                             self.app_background(
                                 call,
                                 move |store| {
-                                    locked(&store)?.set_archived(id, true)?;
+                                    let (written, error) =
+                                        archive_family::write_until_failure(&ids, |id| {
+                                            locked(&store)?.set_archived(id, true)
+                                        });
                                     Ok((
                                         json!({"sessionId":id,"archived":true}),
-                                        Effect::Archive(id),
+                                        Effect::Archive(ids, written, error),
                                     ))
                                 },
                                 cx,
