@@ -230,7 +230,9 @@ impl Shell {
                             let result = reset.await;
                             let _ = this.update(cx, |this, cx| {
                                 if let Some(settings) = &this.settings {
-                                    settings.update(cx, |s, cx| s.management_finished(result, cx));
+                                    settings.update(cx, |s, cx| {
+                                        s.management_finished(result, None, cx)
+                                    });
                                 }
                                 this.sync_settings(cx);
                             });
@@ -291,6 +293,12 @@ impl Shell {
         }
     }
     pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A running worktree delete reports back to this view, so keep it alive.
+        if let Some(view) = &self.settings
+            && view.read(cx).delete_in_flight()
+        {
+            return;
+        }
         self.settings = None;
         self.settings_events = None;
         self.settings_overlay_watch = None;
@@ -432,9 +440,14 @@ impl Shell {
         })
         .detach();
     }
-    fn finish_worktree_action(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+    fn finish_worktree_action(
+        &mut self,
+        path: &str,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(view) = &self.settings {
-            view.update(cx, |v, cx| v.management_finished(result, cx));
+            view.update(cx, |v, cx| v.management_finished(result, Some(path), cx));
         }
         self.sync_git(cx);
         self.sync_settings(cx);
@@ -457,6 +470,7 @@ impl Shell {
             .any(|t| is_equal_or_inside(&t.read(cx).cwd, &path))
         {
             self.finish_worktree_action(
+                &path,
                 Err("Close the terminals using this worktree first.".into()),
                 cx,
             );
@@ -473,6 +487,7 @@ impl Shell {
             .any(|id| self.sessions.get(id).is_some_and(|v| v.read(cx).busy))
         {
             self.finish_worktree_action(
+                &path,
                 Err("Stop the running sessions using this worktree first.".into()),
                 cx,
             );
@@ -485,13 +500,13 @@ impl Shell {
         });
         cx.spawn(async move|this,cx|{
             let result=work.await;
-            if let Err(e)=result {let _=this.update(cx,|this,cx|this.finish_worktree_action(Err(e),cx));return;}
+            if let Err(e)=result {let _=this.update(cx,|this,cx|this.finish_worktree_action(&path,Err(e),cx));return;}
             let pending=match this.update_in(cx,|this,window,cx| {
                 // Recheck before deleting any conversations after the preflight worker.
                 if this.terminals.values().flatten().any(|t|is_equal_or_inside(&t.read(cx).cwd,&path))||ids.iter().any(|id|this.sessions.get(id).is_some_and(|s|s.read(cx).busy)) {return Err("This worktree is now in use. Close its terminals and stop its sessions first.".to_owned());}
                 if delete_sessions {for id in &ids{this.delete_session(*id,window,cx);}}
                 Ok((this.group_writes.take(),this.store.clone()))
-            }) {Ok(Ok(v))=>v,Ok(Err(e))=>{let _=this.update(cx,|this,cx|this.finish_worktree_action(Err(e),cx));return;},Err(_)=>return};
+            }) {Ok(Ok(v))=>v,Ok(Err(e))=>{let _=this.update(cx,|this,cx|this.finish_worktree_action(&path,Err(e),cx));return;},Err(_)=>return};
             if let Some(task)=pending.0 {task.await;}
             let worker_cwd=cwd.clone();let worker_path=path.clone();let store=pending.1;
             let work=cx.background_executor().spawn(async move{
@@ -501,7 +516,7 @@ impl Shell {
                 monocode_core::worktree_management::remove(Path::new(&main.path),Path::new(&worker_path))?;
                 locked(&store)?.detach_worktree(&worker_path,&main.path)
             });let result=work.await;
-            let _=this.update(cx,|this,cx|{let result=result.map(|detached|{for(summary,settings)in detached{this.session_summaries.insert(summary.id, summary.clone());this.session_worktrees.insert(summary.id,settings.worktree_cwd.clone());if let Some(view)=this.sessions.get(&summary.id){view.update(cx,|v,cx|v.worktree_deleted(summary,settings,cx));}}this.worktree_focus.retain(|_,focus|!is_equal_or_inside(&focus.path,&path));});this.finish_worktree_action(result,cx);});
+            let _=this.update(cx,|this,cx|{let result=result.map(|detached|{for(summary,settings)in detached{this.session_summaries.insert(summary.id, summary.clone());this.session_worktrees.insert(summary.id,settings.worktree_cwd.clone());if let Some(view)=this.sessions.get(&summary.id){view.update(cx,|v,cx|v.worktree_deleted(summary,settings,cx));}}this.worktree_focus.retain(|_,focus|!is_equal_or_inside(&focus.path,&path));});this.finish_worktree_action(&path,result,cx);});
         }).detach();
         let _ = window;
     }
@@ -588,6 +603,31 @@ mod tests {
                     "Escape only dismisses the pairing dialog"
                 );
                 assert!(shell.mobile.invite.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_running_worktree_delete_keeps_settings_open_until_it_reports(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_settings(Section::Worktrees, w, cx)
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, w, cx| {
+                let view = shell.settings.clone().unwrap();
+                view.update(cx, |v, cx| v.start_delete_for_test("/wt/a", w, cx));
+                shell.close_settings(w, cx);
+                assert!(shell.settings.is_some(), "blocked while deleting");
+                shell.select_settings(Section::Archive, cx);
+                assert_eq!(view.read(cx).section, Section::Worktrees);
+                shell.finish_worktree_action("/wt/a", Ok(()), cx);
+                shell.close_settings(w, cx);
+                assert!(shell.settings.is_none(), "closes once the delete is done");
             })
             .unwrap();
     }

@@ -37,7 +37,9 @@ Type `r` then Enter in the terminal to rebuild and restart. The current app stay
 open until the new build succeeds. Ctrl+C stops the app and runner. There is no
 hot reload or automatic rebuild on save.
 
-On macOS, the command packages and launches `Monoptah Native.app`. Other
+On macOS, the command packages and launches `~/Applications/Monoptah Native Dev.app`
+(one fixed dev bundle with its own identifier, separate from the installed app).
+All worktrees share that app, so run only one `native:dev` session at a time. Other
 platforms launch the executable directly.
 
 ## Build

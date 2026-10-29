@@ -1,9 +1,15 @@
 import { spawn } from "node:child_process";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const workspace = fileURLToPath(new URL("../", import.meta.url));
+
+// The one dev bundle; scripts/bundle-native-macos.sh uses the same default.
+export function devAppPath(env = process.env) {
+  return join(env.MONOCODE_DEV_APP_DIR || join(env.HOME || homedir(), "Applications"), "Monoptah Native Dev.app");
+}
 
 function track(child) {
   // Attach immediately: short-lived processes can exit before a caller awaits them.
@@ -104,7 +110,7 @@ export async function startDev({
             log("App packaging failed. Fix the error, then type r to retry.");
             continue;
           }
-          executable = join(target, "native-dev", "Monoptah Native Dev.app", "Contents", "MacOS", "monocode-gpui");
+          executable = join(devAppPath(buildEnv), "Contents", "MacOS", "monocode-gpui");
         }
         if (builtRevision !== revision) continue;
         await stopApp();

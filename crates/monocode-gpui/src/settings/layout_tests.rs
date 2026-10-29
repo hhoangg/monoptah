@@ -273,3 +273,350 @@ fn the_surface_control_gives_way_to_a_hint_when_terminals_cannot_be_stored(
             .is_some()
     );
 }
+
+fn tree(path: &str, branch: Option<&str>, locked: bool) -> data::Tree {
+    data::Tree {
+        tree: monocode_core::git::Worktree {
+            path: path.into(),
+            branch: branch.map(Into::into),
+            ..Default::default()
+        },
+        locked,
+        dirty: Some(false),
+        unpushed: 0,
+    }
+}
+
+fn worktree_window(cx: &mut TestAppContext) -> WindowHandle<SettingsView> {
+    let window = window(Section::Worktrees, cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.selected_project = "/repo".into();
+            view.discovery.worktrees.main = "/repo".into();
+            view.discovery.worktrees.trees = vec![
+                tree("/wt/a", Some("a"), false),
+                tree("/wt/locked", Some("locked"), true),
+                tree("/wt/detached", None, false),
+                tree("/wt/b", Some("b"), false),
+            ];
+            cx.notify();
+        })
+        .unwrap();
+    window
+}
+
+#[gpui::test]
+fn worktrees_select_all_skips_locked_and_detached_trees(cx: &mut TestAppContext) {
+    let window = worktree_window(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    let click_select_all = |visual: &mut VisualTestContext| {
+        let bounds = visual.debug_bounds("select-all-trees").unwrap();
+        visual.simulate_click(bounds.center(), Default::default());
+    };
+    click_select_all(visual);
+    window
+        .update(visual, |view, _, _| {
+            let mut got = view.selected_trees.iter().cloned().collect::<Vec<_>>();
+            got.sort();
+            assert_eq!(got, ["/wt/a", "/wt/b"]);
+        })
+        .unwrap();
+    // Blocked rows ignore clicks.
+    let locked = visual.debug_bounds("select-tree-1").unwrap();
+    visual.simulate_click(locked.center(), Default::default());
+    // A selected row can be cleared on its own.
+    let a = visual.debug_bounds("select-tree-0").unwrap();
+    visual.simulate_click(a.center(), Default::default());
+    window
+        .update(visual, |view, _, _| {
+            assert_eq!(view.selected_trees.len(), 1);
+            assert!(view.selected_trees.contains("/wt/b"));
+        })
+        .unwrap();
+    click_select_all(visual);
+    click_select_all(visual);
+    window
+        .update(visual, |view, _, _| assert!(view.selected_trees.is_empty()))
+        .unwrap();
+}
+
+#[gpui::test]
+fn selection_follows_the_discovered_worktrees(cx: &mut TestAppContext) {
+    let window = worktree_window(cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.selected_trees = ["/wt/a", "/wt/b", "/wt/gone"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            view.discovery
+                .worktrees
+                .trees
+                .retain(|t| t.tree.path != "/wt/b");
+            view.prune_selected_trees();
+            assert_eq!(view.selected_trees.len(), 1);
+            assert!(view.selected_trees.contains("/wt/a"));
+            view.select_section(Section::Archive, cx);
+            assert!(view.selected_trees.is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn bulk_delete_runs_one_remove_event_at_a_time_and_keeps_failures_selected(
+    cx: &mut TestAppContext,
+) {
+    let window = worktree_window(cx);
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    let view = window.root(visual).unwrap();
+    let log = events.clone();
+    visual.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &SettingsEvent, _| {
+            if let SettingsEvent::RemoveWorktree {
+                cwd,
+                path,
+                delete_sessions,
+            } = event
+            {
+                log.borrow_mut()
+                    .push((cwd.clone(), path.clone(), *delete_sessions));
+            }
+        })
+        .detach();
+    });
+    window
+        .update(visual, |view, _, cx| {
+            view.selected_trees = ["/wt/a", "/wt/b"].iter().map(|s| s.to_string()).collect();
+            cx.notify();
+        })
+        .unwrap();
+    visual.run_until_parked();
+    let button = visual.debug_bounds("delete-selected-trees").unwrap();
+    visual.simulate_click(button.center(), Default::default());
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("settings-management-dialog").is_some());
+    window
+        .update(visual, |view, _, cx| view.submit_management(cx))
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(events.borrow().len(), 1);
+    assert_eq!(events.borrow()[0], ("/repo".into(), "/wt/a".into(), false));
+    // Busy: a second submit does not start another delete.
+    window
+        .update(visual, |view, _, cx| view.submit_management(cx))
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(events.borrow().len(), 1);
+    // The first fails; the run continues with the second.
+    window
+        .update(visual, |view, _, cx| {
+            view.management_finished(Err("in use".into()), Some("/wt/a"), cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(events.borrow().len(), 2);
+    assert_eq!(events.borrow()[1].1, "/wt/b");
+    window
+        .update(visual, |view, _, cx| {
+            view.management_finished(Ok(()), Some("/wt/b"), cx)
+        })
+        .unwrap();
+    // Checked before the refresh lands: the test folders don't exist on disk.
+    window
+        .update(visual, |view, _, _| {
+            let editor = view.management.as_ref().expect("summary stays open");
+            assert!(!editor.busy);
+            assert_eq!(editor.bulk.as_ref().unwrap().failures().len(), 1);
+            assert!(view.selected_trees.contains("/wt/a"));
+            assert!(!view.selected_trees.contains("/wt/b"));
+        })
+        .unwrap();
+    assert!(visual.debug_bounds("settings-management-dialog").is_some());
+    assert_eq!(events.borrow().len(), 2);
+}
+
+#[gpui::test]
+fn bulk_delete_resets_the_project_and_closes_when_everything_succeeds(cx: &mut TestAppContext) {
+    let window = worktree_window(cx);
+    window
+        .update(cx, |view, window, cx| {
+            view.selected_project = "/wt/a/sub".into();
+            view.selected_trees = ["/wt/a"].iter().map(|s| s.to_string()).collect();
+            let chosen = vec![view.discovery.worktrees.trees[0].clone()];
+            view.open_management(management::Target::DeleteTrees(chosen), window, cx);
+            view.submit_management(cx);
+            view.management_finished(Ok(()), Some("/wt/a"), cx);
+            assert_eq!(view.selected_project, "/repo");
+            assert!(view.management.is_none());
+            assert!(view.selected_trees.is_empty());
+        })
+        .unwrap();
+}
+
+fn record_removals(
+    window: WindowHandle<SettingsView>,
+    visual: &mut VisualTestContext,
+) -> std::rc::Rc<std::cell::RefCell<Vec<String>>> {
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let log = events.clone();
+    let view = window.root(visual).unwrap();
+    visual.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &SettingsEvent, _| {
+            if let SettingsEvent::RemoveWorktree { path, .. } = event {
+                log.borrow_mut().push(path.clone());
+            }
+        })
+        .detach();
+    });
+    events
+}
+
+#[gpui::test]
+fn bulk_delete_ignores_results_for_another_worktree(cx: &mut TestAppContext) {
+    let window = worktree_window(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    let events = record_removals(window, visual);
+    window
+        .update(visual, |view, window, cx| {
+            let chosen = vec![
+                view.discovery.worktrees.trees[0].clone(),
+                view.discovery.worktrees.trees[3].clone(),
+            ];
+            view.selected_trees = ["/wt/a", "/wt/b"].iter().map(|s| s.to_string()).collect();
+            view.open_management(management::Target::DeleteTrees(chosen), window, cx);
+            view.submit_management(cx);
+            // A stale result, a result for an item that is still queued, and one
+            // with no path at all must not move the run on.
+            view.management_finished(Ok(()), Some("/wt/old"), cx);
+            view.management_finished(Ok(()), Some("/wt/b"), cx);
+            view.management_finished(Ok(()), None, cx);
+            let editor = view.management.as_ref().unwrap();
+            assert!(editor.busy);
+            let bulk = editor.bulk.as_ref().unwrap();
+            assert_eq!(bulk.current().unwrap().path, "/wt/a");
+            assert!(bulk.deleted().is_empty());
+            assert_eq!(view.selected_trees.len(), 2);
+        })
+        .unwrap();
+    assert_eq!(*events.borrow(), ["/wt/a"]);
+    window
+        .update(visual, |view, _, cx| {
+            view.management_finished(Ok(()), Some("/wt/a"), cx)
+        })
+        .unwrap();
+    assert_eq!(*events.borrow(), ["/wt/a", "/wt/b"]);
+}
+
+#[gpui::test]
+fn single_delete_ignores_results_for_another_worktree(cx: &mut TestAppContext) {
+    let window = worktree_window(cx);
+    window
+        .update(cx, |view, window, cx| {
+            let tree = view.discovery.worktrees.trees[0].clone();
+            view.open_management(management::Target::DeleteTree(tree), window, cx);
+            // Not submitted yet: a result can't close the dialog.
+            view.management_finished(Ok(()), Some("/wt/a"), cx);
+            assert!(view.management.is_some());
+            view.submit_management(cx);
+            view.management_finished(Ok(()), Some("/wt/b"), cx);
+            view.management_finished(Err("late".into()), None, cx);
+            let editor = view.management.as_ref().unwrap();
+            assert!(editor.busy && editor.error.is_none());
+            view.management_finished(Ok(()), Some("/wt/a"), cx);
+            assert!(view.management.is_none());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn results_without_a_path_still_finish_other_forms(cx: &mut TestAppContext) {
+    let window = worktree_window(cx);
+    window
+        .update(cx, |view, window, cx| {
+            view.open_management(management::Target::Mcp, window, cx);
+            view.management_finished(Err("bad".into()), None, cx);
+            assert_eq!(
+                view.management.as_ref().unwrap().error.as_deref(),
+                Some("bad")
+            );
+            view.management_finished(Ok(()), None, cx);
+            assert!(view.management.is_none());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_running_delete_blocks_leaving_the_section(cx: &mut TestAppContext) {
+    let window = worktree_window(cx);
+    window
+        .update(cx, |view, window, cx| {
+            assert!(!view.delete_in_flight());
+            let tree = view.discovery.worktrees.trees[0].clone();
+            view.open_management(management::Target::DeleteTree(tree), window, cx);
+            assert!(!view.delete_in_flight(), "open but not started");
+            view.submit_management(cx);
+            assert!(view.delete_in_flight());
+            view.select_section(Section::Archive, cx);
+            assert_eq!(view.section, Section::Worktrees);
+            assert!(view.management.is_some());
+            view.management_finished(Ok(()), Some("/wt/a"), cx);
+            assert!(!view.delete_in_flight());
+            view.select_section(Section::Archive, cx);
+            assert_eq!(view.section, Section::Archive);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_dialog_title_reports_a_finished_run_with_failures(cx: &mut TestAppContext) {
+    let window = worktree_window(cx);
+    window
+        .update(cx, |view, window, cx| {
+            let chosen = vec![
+                view.discovery.worktrees.trees[0].clone(),
+                view.discovery.worktrees.trees[3].clone(),
+            ];
+            view.open_management(management::Target::DeleteTrees(chosen), window, cx);
+            assert_eq!(view.management_title(), "Delete 2 worktrees?");
+            view.submit_management(cx);
+            assert_eq!(view.management_title(), "Delete 2 worktrees?");
+            view.management_finished(Ok(()), Some("/wt/a"), cx);
+            view.management_finished(Err("in use".into()), Some("/wt/b"), cx);
+            assert_eq!(view.management_title(), "1 of 2 worktrees deleted");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn switching_project_in_the_picker_clears_the_selection(cx: &mut TestAppContext) {
+    let window = worktree_window(cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.ctx.projects = vec![
+                ("/repo".into(), "repo".into()),
+                ("/other".into(), "other".into()),
+            ];
+            view.selected_trees = ["/wt/a"].iter().map(|s| s.to_string()).collect();
+            cx.notify();
+        })
+        .unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    let trigger = visual
+        .debug_bounds("settings-select-settings-project")
+        .unwrap();
+    visual.simulate_click(trigger.center(), Default::default());
+    visual.run_until_parked();
+    let option = visual
+        .debug_bounds("settings-option-settings-project-1")
+        .unwrap();
+    visual.simulate_click(option.center(), Default::default());
+    window
+        .update(visual, |view, _, _| {
+            assert_eq!(view.selected_project, "/other");
+            assert!(view.selected_trees.is_empty());
+        })
+        .unwrap();
+}
