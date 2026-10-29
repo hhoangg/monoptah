@@ -1755,7 +1755,12 @@ impl Shell {
             .into_any_element()
     }
 
-    fn open_link_dialog(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_link_dialog(
+        &mut self,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.close_preview(cx);
         let initial = self.session_metadata(id, cx).summary.work_item.clone();
         let input = cx.new(|cx| {

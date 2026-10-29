@@ -11,6 +11,9 @@ mod classic_surfaces;
 mod contributors;
 #[cfg(test)]
 mod contributors_tests;
+mod escape;
+#[cfg(test)]
+mod escape_tests;
 mod file_panes;
 mod idle_agents;
 #[cfg(test)]
@@ -8700,6 +8703,9 @@ impl Render for Shell {
                 if this.cancel_classic_sidebar_tab(cx) {
                     return;
                 }
+                if this.dismiss_overlay(window, cx) {
+                    return;
+                }
                 if this.remote_project_picker.is_some() {
                     this.close_remote_project(window, cx);
                     return;
@@ -8773,11 +8779,9 @@ impl Render for Shell {
                         return;
                     }
                 }
-                // `Session: Stop` when no menu is open to close.
-                if this.menu.is_none()
-                    && let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id))
-                {
-                    view.update(cx, |v, cx| v.stop_if_busy(cx));
+                // `Session: Stop` on the conversation in view, when nothing is left to close.
+                if let Some(target) = this.escape_stop_target(cx) {
+                    this.stop_escape_target(target, window, cx);
                 }
                 this.close_menu(cx);
                 this.tab_drag = None;

@@ -8,6 +8,20 @@ impl Accounts {
             .as_ref()
             .is_some_and(|s| s.surface == Surface::Settings)
     }
+    #[cfg(test)]
+    pub(crate) fn open_modal_signin_for_test(&mut self, cx: &mut Context<Self>) {
+        self.signin = Some(SignIn {
+            kind: Kind::Codex,
+            profile: Profile::default(),
+            action: AuthAction::SignIn,
+            surface: Surface::Settings,
+            cancel: Arc::new(AtomicBool::new(false)),
+            complete: false,
+            error: None,
+            adding: None,
+        });
+        cx.notify();
+    }
     pub(crate) fn has_footer_auth(&self, kind: Kind, id: &str) -> bool {
         self.footer_signin(kind, id).is_some()
     }

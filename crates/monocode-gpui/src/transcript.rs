@@ -623,6 +623,25 @@ pub(crate) struct TranscriptView {
     rebuild_passes: usize,
 }
 impl TranscriptView {
+    /// Escape: drop a text selection or its menu. True when there was one.
+    pub(crate) fn dismiss_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.selection.active() {
+            return false;
+        }
+        self.selection.clear();
+        cx.notify();
+        true
+    }
+    #[cfg(test)]
+    pub(crate) fn select_for_test(&mut self) {
+        self.selection.mark_for_test();
+    }
+    #[cfg(test)]
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection.active()
+    }
+}
+impl TranscriptView {
     pub(crate) fn side_question(&mut self) {
         self.side_question = true;
     }

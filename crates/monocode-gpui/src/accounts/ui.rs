@@ -1086,6 +1086,14 @@ impl Render for Accounts {
 }
 
 impl Accounts {
+    /// Escape on the provider sign-in dialog: cancel it. False when none is open.
+    pub(crate) fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.has_modal_auth() {
+            return false;
+        }
+        self.close_auth(window, cx);
+        true
+    }
     fn close_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(signin) = self.signin.take() {
             signin.cancel.store(true, Ordering::Relaxed);

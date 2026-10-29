@@ -331,7 +331,7 @@ impl Shell {
         let summary = self.session_metadata(id, cx).summary;
         provider_cleanup::files_kind(summary).filter(|_| !summary.cwd.starts_with("remote://"))
     }
-    fn open_delete_dialog(
+    pub(super) fn open_delete_dialog(
         &mut self,
         ids: Vec<i64>,
         worktrees: Vec<(i64, String)>,

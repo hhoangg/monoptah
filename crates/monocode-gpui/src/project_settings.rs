@@ -619,6 +619,14 @@ impl BackgroundDialog {
     pub(crate) fn popup_region(&self) -> AnchorSlot {
         self.effect_region.clone()
     }
+    /// Escape: the open effect list first, then the dialog itself.
+    pub(crate) fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.effect_open {
+            self.close_effect(window, cx);
+        } else {
+            cx.emit(Event::Close);
+        }
+    }
     fn close_effect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.effect_open = false;
         window.focus(&self.effect_trigger_focus, cx);
@@ -1049,7 +1057,7 @@ impl Render for BackgroundDialog {
             .child(self.bounds.layout_probe())
             .on_key_down(cx.listener(|this,event:&gpui::KeyDownEvent,window,cx| {
                 if event.keystroke.key=="escape" {
-                    if this.effect_open {this.close_effect(window,cx);} else {cx.emit(Event::Close);}
+                    this.dismiss(window,cx);
                     window.prevent_default();cx.stop_propagation();
                 }
             }))

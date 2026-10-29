@@ -1122,6 +1122,9 @@ impl FileEditor {
                 .update(cx, |i, cx| i.set_search_matches(Vec::new(), cx));
             window.focus(&self.input.focus_handle(cx), cx);
             cx.notify();
+        } else if self.selection.active() {
+            self.selection.dismiss();
+            cx.notify();
         } else {
             cx.propagate();
         }
