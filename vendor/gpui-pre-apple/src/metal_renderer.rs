@@ -72,6 +72,11 @@ const SCRATCH_IDLE: Duration = Duration::from_secs(2);
 
 static SCRATCH_BYTES: AtomicU64 = AtomicU64::new(0);
 static INSTANCE_BUFFER_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_INSTANCE_BUFFER_SIZE as u64);
+/// Bumped to make each renderer give back its spare GPU memory on its next
+/// frame.
+static TRIM_GENERATION: AtomicU64 = AtomicU64::new(0);
+static RENDERERS: AtomicU64 = AtomicU64::new(0);
+static DRAWABLE_PIXELS: AtomicU64 = AtomicU64::new(0);
 
 /// GPU memory, for diagnostics.
 #[derive(Clone, Copy, Debug, Default)]
@@ -82,6 +87,14 @@ pub struct GpuMemory {
     pub instance_buffer: u64,
     /// Effect textures the renderers keep between frames.
     pub scratch: u64,
+    /// Live renderers, one per open window.
+    pub renderers: u64,
+    /// Drawable pixels summed over windows; each window keeps a path texture
+    /// and up to three drawables of this size at 4 bytes a pixel.
+    pub drawable_pixels: u64,
+    pub atlas: crate::metal_atlas::AtlasMemory,
+    /// How many times [`trim`] ran.
+    pub trims: u64,
 }
 
 pub fn gpu_memory() -> GpuMemory {
@@ -90,7 +103,17 @@ pub fn gpu_memory() -> GpuMemory {
             .map_or(0, |device| device.current_allocated_size()),
         instance_buffer: INSTANCE_BUFFER_BYTES.load(Ordering::Relaxed),
         scratch: SCRATCH_BYTES.load(Ordering::Relaxed),
+        renderers: RENDERERS.load(Ordering::Relaxed),
+        drawable_pixels: DRAWABLE_PIXELS.load(Ordering::Relaxed),
+        atlas: crate::metal_atlas::atlas_memory(),
+        trims: TRIM_GENERATION.load(Ordering::Relaxed),
     }
+}
+
+/// Ask every renderer to drop its instance buffers back to the default size on
+/// its next frame. Effect and path textures already go once unused.
+pub fn trim() {
+    TRIM_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
@@ -180,6 +203,13 @@ impl InstanceBufferPool {
     }
 }
 
+impl Drop for MetalRenderer {
+    fn drop(&mut self) {
+        RENDERERS.fetch_sub(1, Ordering::Relaxed);
+        DRAWABLE_PIXELS.fetch_sub(self.drawable_pixels, Ordering::Relaxed);
+    }
+}
+
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
@@ -218,7 +248,12 @@ pub struct MetalRenderer {
     core_video_texture_cache: CFRetained<CVMetalTextureCache>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    /// Paths need a window-sized texture; it is made by the first frame that
+    /// draws one and dropped once none has for a while.
+    paths_used: Option<Instant>,
+    trim_generation: u64,
     path_sample_count: u32,
+    drawable_pixels: u64,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -267,7 +302,9 @@ impl MetalRenderer {
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
-        layer.set_maximum_drawable_count(3);
+        // Each drawable is a full window of pixels; a third one costs as much
+        // as the path texture and only helps a frame that misses its deadline.
+        layer.set_maximum_drawable_count(2);
         // Monocode: backdrop blur copies already drawn pixels out of the
         // drawable, so it must stay readable in every build, not only for
         // visual tests and UI automation screenshots.
@@ -502,6 +539,7 @@ impl MetalRenderer {
             CFRetained::from_raw(ptr::NonNull::new(cache).expect("CoreVideo returned a null cache"))
         };
 
+        RENDERERS.fetch_add(1, Ordering::Relaxed);
         Self {
             device,
             layer,
@@ -535,7 +573,10 @@ impl MetalRenderer {
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            paths_used: None,
+            trim_generation: 0,
             path_sample_count: PATH_SAMPLE_COUNT,
+            drawable_pixels: 0,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         }
@@ -567,10 +608,24 @@ impl MetalRenderer {
         if let Some(layer) = &self.layer {
             layer.set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
         }
-        self.update_path_intermediate_textures(size);
+        let pixels = (size.width.0.max(0) as u64) * (size.height.0.max(0) as u64);
+        DRAWABLE_PIXELS.fetch_sub(self.drawable_pixels, Ordering::Relaxed);
+        DRAWABLE_PIXELS.fetch_add(pixels, Ordering::Relaxed);
+        self.drawable_pixels = pixels;
     }
 
+    /// Make the path textures for a frame of `size` that draws paths.
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+        self.paths_used = Some(Instant::now());
+        if self
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| {
+                texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+            })
+        {
+            return;
+        }
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
@@ -685,6 +740,9 @@ impl MetalRenderer {
                 scene.surfaces.len(),
             )
         })?;
+        if !scene.paths.is_empty() {
+            self.update_path_intermediate_textures(viewport_size);
+        }
         let command_buffer = self.draw_primitives_to_texture(
             scene,
             &instance_bindings,
@@ -694,6 +752,13 @@ impl MetalRenderer {
         )?;
 
         let used = writer.used();
+        let trim_generation = TRIM_GENERATION.load(Ordering::Relaxed);
+        if self.trim_generation != trim_generation {
+            self.trim_generation = trim_generation;
+            self.instance_buffer_pool
+                .lock()
+                .reset(DEFAULT_INSTANCE_BUFFER_SIZE);
+        }
         self.instance_buffer_pool.lock().note_frame(used);
         self.release_idle_scratch();
 
@@ -858,10 +923,16 @@ impl MetalRenderer {
             self.background_blur_used.pop();
             self.background_blurs.pop();
         }
-        self.background_blurs.truncate(self.background_blur_used.len());
+        self.background_blurs
+            .truncate(self.background_blur_used.len());
         if self.backdrop_used.as_ref().is_none_or(idle) {
             self.backdrop_scratch = None;
             self.backdrop_used = None;
+        }
+        if self.paths_used.as_ref().is_none_or(idle) {
+            self.path_intermediate_texture = None;
+            self.path_intermediate_msaa_texture = None;
+            self.paths_used = None;
         }
         let bytes = self
             .edge_fade_scratch
@@ -869,7 +940,11 @@ impl MetalRenderer {
             .chain(&self.background_blurs)
             .chain(&self.backdrop_scratch)
             .map(|(a, b)| texture_bytes(a) + texture_bytes(b))
-            .sum::<u64>();
+            .sum::<u64>()
+            + self
+                .path_intermediate_texture
+                .as_ref()
+                .map_or(0, |texture| texture_bytes(texture));
         // Several windows share the total; the last frame's renderer reports.
         SCRATCH_BYTES.store(bytes, Ordering::Relaxed);
     }
@@ -2352,7 +2427,11 @@ struct InstanceBufferWriter {
 
 impl InstanceBufferWriter {
     fn used(&self) -> usize {
-        self.filled.iter().map(|(_, written)| *written).sum::<usize>() + self.offset
+        self.filled
+            .iter()
+            .map(|(_, written)| *written)
+            .sum::<usize>()
+            + self.offset
     }
 
     fn new(

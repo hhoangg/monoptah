@@ -45,6 +45,17 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+/// Animates the transcript on the first display frame at or after `due`.
+fn motion_frame(view: gpui::WeakEntity<TranscriptView>, due: Option<Instant>, window: &Window) {
+    window.on_next_frame(move |window, cx| {
+        if due.is_some_and(|due| Instant::now() < due) {
+            motion_frame(view, due, window);
+        } else {
+            let _ = view.update(cx, |this, cx| this.animate_frame(cx));
+        }
+    });
+}
+
 /// Where a launched session stands, for its card in the chat.
 #[derive(Clone, PartialEq)]
 pub(crate) struct LaunchView {
@@ -232,6 +243,9 @@ struct Follow {
 }
 /// Units are px per 60fps frame, as in useBottomChatMotion.ts.
 const SPRING_FRAME: f32 = 1000. / 60.;
+/// Row motion redraws the whole transcript, so it runs at no more than 60fps
+/// even on 120Hz displays; the slack keeps a 60Hz display at its full rate.
+const MOTION_FRAME: std::time::Duration = std::time::Duration::from_millis(15);
 /// Mono replies can appear together; keep their glide below 1080px/second.
 const CHAT_FOLLOW_MAX_SPEED: f32 = 18.;
 /// Steady frames only measure the tail. A large reveal measures its full
@@ -575,6 +589,7 @@ pub(crate) struct TranscriptView {
     motions: HashMap<(usize, usize), Motion>,
     reflow: crate::reflow_motion::ReflowMotion,
     frame_scheduled: bool,
+    last_motion_frame: Option<Instant>,
     visible: bool,
     viewport: Bounds<Pixels>,
     anchor_turn: Option<usize>,
@@ -2384,6 +2399,7 @@ impl TranscriptView {
             motions: HashMap::new(),
             reflow: Default::default(),
             frame_scheduled: false,
+            last_motion_frame: None,
             visible: true,
             viewport: Bounds::default(),
             anchor_turn: None,
@@ -2510,8 +2526,10 @@ impl TranscriptView {
                         .await;
                     let keep = this
                         .update(cx, |this, cx| {
-                            if this.streaming {
-                                cx.notify();
+                            // The working time redraws the whole transcript;
+                            // skip it while the tab or the app is out of view.
+                            if this.streaming && this.visible && crate::pulse::app_active(cx) {
+                                cx.notify_paint();
                             }
                             this.streaming
                         })
@@ -2917,6 +2935,11 @@ impl TranscriptView {
         self.rebuild(start, cx);
     }
     fn rebuild(&mut self, start: usize, cx: &mut Context<Self>) {
+        self.rebuild_rows(start, cx);
+        cx.notify();
+    }
+    /// `rebuild` for a caller that notifies itself.
+    fn rebuild_rows(&mut self, start: usize, cx: &mut Context<Self>) {
         #[cfg(test)]
         {
             self.rebuild_passes += 1;
@@ -3830,7 +3853,6 @@ impl TranscriptView {
             });
         }
         self.prune_reveals(now);
-        cx.notify();
     }
     fn prune_reveals(&mut self, now: Instant) {
         let latest = self
@@ -4062,10 +4084,8 @@ impl TranscriptView {
             || self.chat_animating();
         if smooth {
             self.frame_scheduled = true;
-            let view = cx.entity().downgrade();
-            window.on_next_frame(move |_, cx| {
-                let _ = view.update(cx, |this, cx| this.animate_frame(cx));
-            });
+            let due = self.last_motion_frame.map(|at| at + MOTION_FRAME);
+            motion_frame(cx.entity().downgrade(), due, window);
         } else if self.stream_animating(now) {
             // Stream presentation keeps the shared 30Hz budget. Pure fade
             // frames reuse the parsed blocks, prepared text and measured rows.
@@ -4077,6 +4097,7 @@ impl TranscriptView {
         }
     }
     fn animate_frame(&mut self, cx: &mut Context<Self>) {
+        self.last_motion_frame = Some(Instant::now());
         self.frame_scheduled = false;
         // A frame queued before switching tabs must not invalidate the hidden
         // transcript's retained layout or advance its presentation animations.
@@ -4084,6 +4105,9 @@ impl TranscriptView {
             return;
         }
         let mut changed_phases = HashSet::new();
+        // Revealing words keeps every size but the revealed rows', which
+        // measure again by their content; anything else here resizes rows.
+        let mut resized = self.agent_panels.animating() || !self.motions.is_empty();
         for start in self.agent_panels.animate() {
             for (ix, row) in self.rows.iter().enumerate() {
                 if row.key.0 == start {
@@ -4100,7 +4124,7 @@ impl TranscriptView {
             }
         }
         if let Some(start) = changed {
-            self.rebuild(start, cx);
+            self.rebuild_rows(start, cx);
         }
         let mut removed = Vec::new();
         let offset = self.list.logical_scroll_top();
@@ -4151,7 +4175,12 @@ impl TranscriptView {
         self.list
             .remeasure_items(self.footer_ix()..self.footer_ix() + 1);
         self.index_messages();
-        cx.notify();
+        resized |= self.agent_panels.animating() || !self.motions.is_empty();
+        if resized {
+            cx.notify();
+        } else {
+            cx.notify_paint();
+        }
     }
     fn highlight(&mut self, fence: &Arc<Fence>, cx: &mut Context<Self>) {
         if self.highlights.contains_key(&fence.key) || self.highlighting.contains(&fence.key) {

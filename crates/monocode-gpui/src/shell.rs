@@ -667,8 +667,10 @@ pub(crate) struct Shell {
     /// The live agents card's spinners, apart from the sidebar rows' marks.
     live_marks: HashMap<i64, Entity<SessionMark>>,
     live_agents_expanded: bool,
-    /// Repaints the live agents card's elapsed times once a second.
+    /// Repaints the live agents card when one of its elapsed times changes.
     live_tick: Option<gpui::Task<()>>,
+    /// Milliseconds until the next elapsed label in the live agents card changes.
+    live_next_change: u64,
     busy_sessions: HashSet<i64>,
     notification_state: notifications::State,
     quick: crate::quick_composer::Controller,
@@ -1056,6 +1058,7 @@ impl Shell {
             live_marks: HashMap::new(),
             live_agents_expanded: false,
             live_tick: None,
+            live_next_change: 1000,
             busy_sessions: HashSet::new(),
             notification_state,
             quick: Default::default(),
@@ -3376,7 +3379,9 @@ impl Shell {
                     self.terminals
                         .get(&project)
                         .and_then(|t| t.get(dock.active))
-                        .cloned(),
+                        // The grid shapes every line; redraw it only when the
+                        // terminal itself changes.
+                        .map(|t| t.clone().cached(StyleRefinement::default().size_full())),
                 ),
             );
         let sash = div()
@@ -3548,10 +3553,12 @@ impl Shell {
         let preferred = self.provider_surface(kind);
         let worktree = target.and_then(|id| {
             let path = self.session_working_copy(id, cx);
-            (path != cwd).then(|| crate::worktree_switcher::WorktreeFocus {
-                path: path.into(),
-                branch: self.worktree_focus.get(&cwd).and_then(|f| f.branch.clone()),
-            })
+            (monocode_core::files::path_key(path) != monocode_core::files::path_key(&cwd)).then(
+                || crate::worktree_switcher::WorktreeFocus {
+                    path: path.into(),
+                    branch: self.worktree_focus.get(&cwd).and_then(|f| f.branch.clone()),
+                },
+            )
         });
         let worktree_cwd = worktree.as_ref().map(|f| f.path.clone());
         let work = cx.background_executor().spawn(async move {
@@ -4514,6 +4521,10 @@ impl Shell {
         let store = self.store.clone();
         let cwd = self.workspace.project.clone();
         let focus = self.worktree_focus.get(&cwd).cloned();
+        // The project folder as a selected checkout is not a separate worktree.
+        let copy = focus.clone().filter(|f| {
+            monocode_core::files::path_key(&f.path) != monocode_core::files::path_key(&cwd)
+        });
         let blank_key = format!("{cwd}\0{}", focus.as_ref().map_or("", |f| f.path.as_str()));
         if only_if_empty && !self.pending_project_blanks.insert(blank_key.clone()) {
             return;
@@ -4534,7 +4545,7 @@ impl Shell {
         let effort = crate::conversation::preferred_effort(kind.id(), cx);
         let work = cx.background_executor().spawn({
             let cwd = cwd.clone();
-            let worktree_cwd = focus.as_ref().map(|f| f.path.clone());
+            let worktree_cwd = copy.as_ref().map(|f| f.path.clone());
             async move {
                 let store = locked(&store)?;
                 let summary = store.create_with_surface(kind.id(), &cwd, preferred)?;
@@ -4594,7 +4605,7 @@ impl Shell {
                         if let Some(view) = this.sessions.get(&id) {
                             view.update(cx, |view, cx| view.seed_new_settings(settings, cx));
                         }
-                        this.seed_worktree(id, focus.as_ref(), cx);
+                        this.seed_worktree(id, copy.as_ref(), cx);
                         // A pending blank belongs to the copy that requested it;
                         // navigation to another copy must never redirect that request.
                         if this.workspace.project != cwd

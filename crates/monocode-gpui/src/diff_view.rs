@@ -1539,7 +1539,7 @@ impl Render for DiffView {
                             .rounded_lg()
                             .border_1()
                             .border_color(content(0.1))
-                            .bg(rgb(crate::right_panel::BACKGROUND_BASE).opacity(0.7))
+                            .bg(crate::theme::background_base().opacity(0.7))
                             .px(px(10.))
                             .py_2()
                             .text_size(px(13.))
@@ -1574,12 +1574,12 @@ impl Render for DiffView {
                                     .bg(content(1.))
                                     .text_size(px(12.))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(crate::right_panel::BACKGROUND_BASE))
+                                    .text_color(crate::theme::background_base())
                                     .when(!can_add, |d| d.opacity(0.4))
                                     .when(can_add, |d| d.hover(|s| s.opacity(0.8)))
                                     .child(
                                         icon("comment-add", 14.)
-                                            .text_color(rgb(crate::right_panel::BACKGROUND_BASE)),
+                                            .text_color(crate::theme::background_base()),
                                     )
                                     .child("Add to chat")
                                     .when(can_add, |d| {
