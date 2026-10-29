@@ -1,18 +1,14 @@
-# Monoptah Native 0.34.2
+# Monoptah Native 0.34.3
 
 A release of the experimental Rust + GPUI app for macOS on Apple silicon, merged with the upstream native 0.16.0-preview.9 work. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.34.1
+## Changes since 0.34.2
 
-- Archiving a session now archives the sessions it started too, so they no longer break out into separate top-level rows. Restoring the parent brings back the children that were archived with it, and a session you archived on its own stays archived. Archiving a child alone still archives only that child. This applies to the context menu, multi-select, the keyboard shortcut and Monos. The app `sessions.archive` action follows the same rules; it is refused when the calling session was started by the session being archived.
-- Faster startup and fewer full-window redraws during animations, with GPU memory released when the app goes quiet.
-- Mermaid diagrams render natively in Markdown and resize with the panel.
-- Cmd/Ctrl+Enter sends a mid-turn message the opposite way from your usual follow-up preference (steer or queue).
-- Composer file mentions show file icons and insert short names. Terminal links open on click.
-- The workspace picker includes All checkouts, while selecting a project folder keeps that folder as the session scope.
-- Pasted images are stored per conversation and removed with that conversation; shared legacy attachments are kept.
-- Plain-link prompts wrap inside their bubbles, and the Edit GitHub link dialog keeps its Update button inside the dialog.
-- Disabling mobile access or shutting down cancels pending mobile startup.
+- Settings > Worktrees can delete several worktrees at once: tick the rows (or select all), then choose Delete selected. The confirmation lists which worktrees have uncommitted changes or an unknown status. They are deleted one by one, a failure does not stop the rest, and the ones that failed stay selected with the reason shown. Settings stays open while a delete is running.
+- A folder's color now tints its icon, its chevron and the line joining it to its sessions, so the color is visible while the folder is open.
+- Escape now does one thing: it closes the topmost dialog or overlay, and only when nothing is open does it stop the turn of the conversation you are looking at. It no longer stops the sidebar-selected session from a Mono chat, from Settings or from a dialog, and it targets the focused pane in a split.
+- Terminal: New in Home (Cmd+Alt+J, Ctrl+Alt+J elsewhere) opens a terminal at your home directory. It is also in the app menu, the command palette and the Keybindings page. Cmd+` still opens one in the project folder.
+- Cmd+` and Cmd+J now work in a Mono chat. The terminal dock is shown there and opens in the project the Mono works on, instead of silently creating hidden terminals in the last session's folder. Hidden terminals saved by earlier versions may appear once in that project's dock; close them there.
 
 ## What it is
 
