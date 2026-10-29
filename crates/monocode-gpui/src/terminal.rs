@@ -20,18 +20,19 @@ use alacritty_terminal::{
     vte::ansi::{Color as AnsiColor, CursorShape, CursorStyle as TermCursorStyle, NamedColor, Rgb},
 };
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Element, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, KeyBinding,
-    KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, ScrollDelta,
-    ScrollWheelEvent, ShapedLine, SharedString, Size, StrikethroughStyle, Style, Task, TextAlign,
-    TextRun, UnderlineStyle, Window, actions, div, point, prelude::*, px, rgb, size,
+    App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight,
+    GlobalElementId, Hsla, InputHandler, InspectorElementId, KeyBinding, KeyDownEvent, Keystroke,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, ScrollDelta, ScrollWheelEvent,
+    ShapedLine, SharedString, Size, StrikethroughStyle, Style, Task, TextAlign, TextRun,
+    UTF16Selection, UnderlineStyle, Window, actions, div, point, prelude::*, px, rgb, size,
 };
 use std::{
     borrow::Cow,
     cell::Cell,
     collections::HashMap,
     ffi::OsString,
-    ops::RangeInclusive,
+    ops::{Range, RangeInclusive},
     path::Path,
     rc::Rc,
     sync::Arc,
@@ -132,6 +133,15 @@ struct Link {
     uri: String,
 }
 
+/// Text an input method is composing. It lives only here until the method
+/// commits it: the PTY never sees marked text.
+#[derive(Clone, Debug, PartialEq)]
+struct Marked {
+    text: String,
+    /// The caret or selection inside `text`, in UTF-16 units.
+    selected: Range<usize>,
+}
+
 pub(crate) struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
     sender: Option<EventLoopSender>,
@@ -170,6 +180,11 @@ pub(crate) struct Terminal {
     pub(crate) visible: bool,
     /// Has the keyboard (tracked from the first draw); a relaunch hands it on.
     focused: bool,
+    /// Text the input method is composing, shown at the cursor.
+    marked: Option<Marked>,
+    /// Every byte `write` was asked to send, since a test PTY has no reader.
+    #[cfg(test)]
+    sent: std::cell::RefCell<Vec<u8>>,
     _focus_watch: Vec<gpui::Subscription>,
     _events: Task<()>,
     /// The dock's foreground poll; a launched program has no shell to watch.
@@ -554,6 +569,9 @@ impl Terminal {
             pressed_link: None,
             visible: true,
             focused: false,
+            marked: None,
+            #[cfg(test)]
+            sent: Default::default(),
             _focus_watch: Vec::new(),
             _events: events,
             _poll: poll,
@@ -693,8 +711,11 @@ impl Terminal {
         self.set_foreground(None, cx);
     }
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+        let bytes = bytes.into();
+        #[cfg(test)]
+        self.sent.borrow_mut().extend_from_slice(&bytes);
         if let Some(sender) = &self.sender {
-            let _ = sender.send(Msg::Input(bytes.into()));
+            let _ = sender.send(Msg::Input(bytes));
         }
     }
     /// Typing returns a scrolled-back view to the prompt.
@@ -736,6 +757,10 @@ impl Terminal {
         }
     }
 
+    /// Special keys and shortcuts. Typed text is left unhandled so the platform
+    /// delivers it through the input handler: an input method that rewrites the
+    /// text (Vietnamese, Telex, kana) sends a key whose code names a different
+    /// letter than the characters it commits.
     fn key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let mode = *self.term.lock().mode();
         if let Some(bytes) = key_bytes(&event.keystroke, mode) {
@@ -1059,6 +1084,8 @@ impl Render for Terminal {
                 }),
                 cx.on_blur(&focus, window, |this, _, cx| {
                     this.focused = false;
+                    // The input method drops its composition with focus.
+                    this.marked = None;
                     cx.notify();
                 }),
             ];
@@ -1101,6 +1128,264 @@ impl Render for Terminal {
     }
 }
 
+/// Text from the platform's input system: typed characters, and what an input
+/// method commits. The document it edits is only the marked text: the PTY owns
+/// everything already sent, so nothing before the cursor can be revised.
+impl EntityInputHandler for Terminal {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let marked = self.marked.as_ref()?;
+        let (text, adjusted) = utf16_slice(&marked.text, range);
+        *adjusted_range = Some(adjusted);
+        Some(text)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self
+                .marked
+                .as_ref()
+                .map_or(0..0, |marked| marked.selected.clone()),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked
+            .as_ref()
+            .map(|marked| 0..marked.text.encode_utf16().count())
+    }
+
+    /// The method accepted its composition as it stands.
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(marked) = self.marked.take() {
+            self.commit(&marked.text, cx);
+        }
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Committed text replaces the composition (and nothing else: the
+        // range is in terms of the marked text, which is dropped here).
+        self.marked = None;
+        self.commit(text, cx);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = (!new_text.is_empty()).then(|| {
+            let len = new_text.encode_utf16().count();
+            let selected = new_selected_range
+                .map_or(len..len, |range| range.start.min(len)..range.end.min(len));
+            Marked {
+                text: new_text.to_owned(),
+                selected,
+            }
+        });
+        cx.notify();
+    }
+
+    /// The cursor cell, so the candidate window opens where the text goes.
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: Bounds<gpui::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<gpui::Pixels>> {
+        let geometry = self.geometry.get()?;
+        let at = {
+            let term = self.term.lock();
+            point_to_viewport(term.grid().display_offset(), term.grid().cursor.point)?
+        };
+        Some(cell_rect(
+            geometry.origin,
+            geometry.cell,
+            at.line,
+            at.column.0,
+            at.column.0 + 1,
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: gpui::Point<gpui::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl Terminal {
+    /// Sends text the platform finished composing to the program.
+    fn commit(&mut self, text: &str, cx: &mut Context<Self>) {
+        if !text.is_empty() {
+            self.input(text.as_bytes().to_vec(), cx);
+        }
+    }
+}
+
+/// The part of `text` inside `range` (UTF-16 units), widened to whole
+/// characters, and the range it actually covers.
+fn utf16_slice(text: &str, range: Range<usize>) -> (String, Range<usize>) {
+    let mut out = String::new();
+    let mut covered: Option<Range<usize>> = None;
+    let mut at = 0;
+    for c in text.chars() {
+        let end = at + c.len_utf16();
+        if end > range.start && at < range.end {
+            out.push(c);
+            covered = Some(covered.map_or(at..end, |covered| covered.start..end));
+        }
+        at = end;
+    }
+    let covered = covered.unwrap_or_else(|| {
+        let edge = range.start.min(at);
+        edge..edge
+    });
+    (out, covered)
+}
+
+/// `ElementInputHandler` for the terminal, except that a held key keeps
+/// repeating. The default hands repeats to macOS, whose press-and-hold accent
+/// menu swallows them for letters, which a shell or editor must not lose.
+struct TerminalInputHandler(ElementInputHandler<Terminal>);
+impl InputHandler for TerminalInputHandler {
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        self.0
+            .selected_text_range(ignore_disabled_input, window, cx)
+    }
+    fn marked_text_range(&mut self, window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+        self.0.marked_text_range(window, cx)
+    }
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String> {
+        self.0
+            .text_for_range(range_utf16, adjusted_range, window, cx)
+    }
+    fn replace_text_in_range(
+        &mut self,
+        replacement_range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0
+            .replace_text_in_range(replacement_range, text, window, cx)
+    }
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0
+            .replace_and_mark_text_in_range(range_utf16, new_text, new_selected_range, window, cx)
+    }
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut App) {
+        self.0.unmark_text(window, cx)
+    }
+    fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut App) {
+        self.0.paste(item, window, cx)
+    }
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<gpui::Pixels>> {
+        self.0.bounds_for_range(range_utf16, window, cx)
+    }
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        self.0.character_index_for_point(point, window, cx)
+    }
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.set_selected_text_range(range_utf16, window, cx)
+    }
+    fn element_bounds(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<gpui::Pixels>> {
+        self.0.element_bounds(window, cx)
+    }
+    fn text_length_utf16(&mut self, window: &mut Window, cx: &mut App) -> Option<usize> {
+        self.0.text_length_utf16(window, cx)
+    }
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        false
+    }
+    fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.0.accepts_text_input(window, cx)
+    }
+    fn text_input_editable_range(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Range<usize>> {
+        self.0.text_input_editable_range(window, cx)
+    }
+    /// Raw keys must reach the program: with a Japanese, Korean or Chinese
+    /// source active, `true` would send printable keys (including Option-letter,
+    /// the Meta key) to the input method before `key_down` sees them.
+    fn prefers_ime_for_printable_keys(&mut self, _: &mut Window, _: &mut App) -> bool {
+        false
+    }
+    fn text_input_configuration(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::TextInputConfiguration {
+        self.0.text_input_configuration(window, cx)
+    }
+}
+
 /// One shaped run at a column, or a filled cell span.
 struct Painted {
     lines: Vec<(gpui::Point<gpui::Pixels>, ShapedLine)>,
@@ -1109,6 +1394,15 @@ struct Painted {
     line_height: gpui::Pixels,
     /// Set while the pointer is over a link, for the pointing hand.
     link_hitbox: Option<gpui::Hitbox>,
+    /// The input method's composition, drawn underlined at the cursor.
+    marked: Option<MarkedPaint>,
+}
+
+struct MarkedPaint {
+    backdrop: Bounds<gpui::Pixels>,
+    fill: Hsla,
+    origin: gpui::Point<gpui::Pixels>,
+    line: ShapedLine,
 }
 
 struct Grid {
@@ -1177,11 +1471,12 @@ impl Element for Grid {
             (((bounds.size.width - px(PADDING * 2.)) / cell_width).floor() as usize).max(2);
         let lines = (((bounds.size.height - px(PADDING)) / line_height).floor() as usize).max(1);
         let cell = size(cell_width, line_height);
-        let (term, link) = self.terminal.update(cx, |t, _| {
+        let (term, link, marked_text) = self.terminal.update(cx, |t, _| {
             t.resize(columns, lines, cell);
             t.geometry.set(Some(Geometry { origin, cell }));
             let link = t.hover.and_then(|position| t.link_at(position));
-            (t.term.clone(), link)
+            let marked = t.marked.as_ref().map(|m| m.text.clone());
+            (t.term.clone(), link, marked)
         });
 
         let term = term.lock();
@@ -1189,6 +1484,9 @@ impl Element for Grid {
         let colors = content.colors;
         let offset = content.display_offset;
         let selection = content.selection;
+        let default_fg = color(AnsiColor::Named(NamedColor::Foreground), colors, true);
+        // The program's OSC 11 background, else the chat fill.
+        let default_bg = color(AnsiColor::Named(NamedColor::Background), colors, true);
         let mut rows: Vec<Vec<Painting>> = vec![Vec::new(); lines];
         for indexed in content.display_iter {
             let cell = indexed.cell;
@@ -1250,6 +1548,7 @@ impl Element for Grid {
             cursor: None,
             line_height,
             link_hitbox: link.map(|_| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)),
+            marked: None,
         };
         for (line, cells) in rows.iter().enumerate() {
             let y = origin.y + line_height * line as f32;
@@ -1360,6 +1659,34 @@ impl Element for Grid {
             }
             painted.cursor = Some((bounds, fill, hollow));
         }
+        if let Some(text) = marked_text.filter(|text| !text.is_empty())
+            && let Some(at) = point_to_viewport(offset, cursor_point)
+            && at.line < lines
+        {
+            let origin = point(
+                origin.x + cell_width * at.column.0 as f32,
+                origin.y + line_height * at.line as f32,
+            );
+            let run = TextRun {
+                len: text.len(),
+                font: base.clone(),
+                color: default_fg,
+                background_color: None,
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(default_fg),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            };
+            let line = text_system.shape_line(SharedString::from(text), font_size, &[run], None);
+            painted.marked = Some(MarkedPaint {
+                backdrop: Bounds::new(origin, size(line.width.max(cell_width), line_height)),
+                fill: default_bg,
+                origin,
+                line,
+            });
+        }
         painted
     }
     fn paint(
@@ -1389,6 +1716,12 @@ impl Element for Grid {
         if let Some(hitbox) = &painted.link_hitbox {
             window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
         }
+        let focus = self.terminal.read(cx).focus.clone();
+        window.handle_input(
+            &focus,
+            TerminalInputHandler(ElementInputHandler::new(bounds, self.terminal.clone())),
+            cx,
+        );
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             for (rect, fill) in &painted.rects {
                 window.paint_quad(gpui::fill(*rect, *fill));
@@ -1409,6 +1742,17 @@ impl Element for Grid {
                 } else {
                     window.paint_quad(gpui::fill(rect, fill));
                 }
+            }
+            if let Some(marked) = &painted.marked {
+                window.paint_quad(gpui::fill(marked.backdrop, marked.fill));
+                let _ = marked.line.paint(
+                    marked.origin,
+                    painted.line_height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             }
         });
     }
@@ -1570,7 +1914,8 @@ fn color(value: AnsiColor, colors: &Colors, foreground: bool) -> Hsla {
     }
 }
 
-/// Bytes a keystroke sends, or None to leave it to the app's bindings.
+/// Bytes a keystroke sends, or None to leave it to the app's bindings or, for
+/// plain typed text, to the input handler (see `Terminal::key_down`).
 /// Includes terminalKeys.ts's macOS editing shortcuts.
 pub(crate) fn key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
     let m = &keystroke.modifiers;
@@ -1694,11 +2039,7 @@ pub(crate) fn key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
             return meta(text.as_bytes());
         }
     }
-    let text = keystroke.key_char.as_deref().or(match key {
-        "space" => Some(" "),
-        _ => None,
-    })?;
-    Some(text.as_bytes().to_vec())
+    None
 }
 
 /// Signal the program and its process group; escalate off the calling thread.
@@ -2046,12 +2387,245 @@ mod tests {
         // App shortcuts stay with the app.
         assert_eq!(bytes("cmd-j"), None);
         assert_eq!(bytes("cmd-shift-d"), None);
-        let typed = Keystroke {
-            modifiers: Modifiers::default(),
-            key: "a".into(),
-            key_char: Some("a".into()),
+    }
+
+    fn typed(key: &str, key_char: &str, modifiers: Modifiers) -> Keystroke {
+        Keystroke {
+            modifiers,
+            key: key.into(),
+            key_char: Some(key_char.into()),
+        }
+    }
+
+    #[test]
+    fn typed_text_is_left_to_the_input_handler() {
+        let none = Modifiers::default();
+        let shift = Modifiers::shift();
+        for keystroke in [
+            typed("a", "a", none),
+            typed("a", "A", shift),
+            typed("space", " ", none),
+            typed("1", "!", shift),
+            // An input method rewrote the text: the key code says A, the
+            // characters say otherwise.
+            typed("a", "ô", none),
+            typed("a", "đ", none),
+            typed("a", "ếng", none),
+        ] {
+            assert_eq!(
+                key_bytes(&keystroke, TermMode::empty()),
+                None,
+                "{keystroke:?}"
+            );
+        }
+        // Keys that are not text keep their bytes, whatever key_char says.
+        assert_eq!(
+            key_bytes(&typed("enter", "\n", none), TermMode::empty()),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            key_bytes(&typed("tab", "\t", none), TermMode::empty()),
+            Some(b"\t".to_vec())
+        );
+        assert_eq!(
+            key_bytes(&typed("b", "\u{222b}", Modifiers::alt()), TermMode::empty()),
+            Some(b"\x1bb".to_vec())
+        );
+    }
+
+    fn terminal_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Terminal>, &mut gpui::VisualTestContext) {
+        let (terminal, cx) = cx.add_window_view(|_, cx| Terminal::new("/tmp".into(), cx));
+        terminal.update_in(cx, |terminal, window, cx| window.focus(&terminal.focus, cx));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        (terminal, cx)
+    }
+    fn sent(terminal: &Entity<Terminal>, cx: &gpui::VisualTestContext) -> Vec<u8> {
+        terminal.read_with(cx, |terminal, _| terminal.sent.borrow().clone())
+    }
+    fn press(
+        terminal: &Entity<Terminal>,
+        cx: &mut gpui::VisualTestContext,
+        keystroke: Keystroke,
+    ) -> Vec<u8> {
+        terminal.read_with(cx, |terminal, _| terminal.sent.borrow_mut().clear());
+        terminal.update(cx, |terminal, cx| {
+            terminal.key_down(
+                &KeyDownEvent {
+                    keystroke,
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                cx,
+            )
+        });
+        sent(terminal, cx)
+    }
+
+    #[gpui::test]
+    fn key_down_writes_special_keys_but_not_typed_text(cx: &mut gpui::TestAppContext) {
+        let (terminal, cx) = terminal_window(cx);
+        let none = Modifiers::default();
+        // Typed text reaches the PTY only through the input handler.
+        for keystroke in [
+            typed("a", "a", none),
+            typed("space", " ", none),
+            typed("a", "ô", none),
+        ] {
+            assert_eq!(press(&terminal, cx, keystroke), b"", "typed text");
+        }
+        // Everything else writes what it always did.
+        let ctrl = Modifiers::control();
+        let alt = Modifiers::alt();
+        let cases: [(Keystroke, &[u8]); 7] = [
+            (typed("c", "c", ctrl), b"\x03"),
+            (typed("b", "\u{222b}", alt), b"\x1bb"),
+            (key("up"), b"\x1b[A"),
+            (typed("enter", "\n", none), b"\r"),
+            (key("backspace"), b"\x7f"),
+            (typed("tab", "\t", none), b"\t"),
+            (key("alt-left"), b"\x1bb"),
+        ];
+        for (keystroke, expected) in cases {
+            assert_eq!(
+                press(&terminal, cx, keystroke.clone()),
+                expected,
+                "{keystroke:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn committed_text_is_written_as_utf8_once(cx: &mut gpui::TestAppContext) {
+        let (terminal, cx) = terminal_window(cx);
+        for text in ["ô", "đ", "ếng", "日本語"] {
+            terminal.update_in(cx, |terminal, window, cx| {
+                terminal.sent.borrow_mut().clear();
+                terminal.replace_text_in_range(None, text, window, cx);
+            });
+            assert_eq!(sent(&terminal, cx), text.as_bytes(), "{text}");
+        }
+    }
+
+    #[gpui::test]
+    fn marked_text_stays_out_of_the_pty_until_committed(cx: &mut gpui::TestAppContext) {
+        let (terminal, cx) = terminal_window(cx);
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.replace_and_mark_text_in_range(None, "ê", Some(1..1), window, cx);
+            assert_eq!(terminal.marked_text_range(window, cx), Some(0..1));
+            terminal.replace_and_mark_text_in_range(None, "ếng", None, window, cx);
+            assert_eq!(terminal.marked_text_range(window, cx), Some(0..3));
+            let mut adjusted = None;
+            assert_eq!(
+                terminal
+                    .text_for_range(1..3, &mut adjusted, window, cx)
+                    .as_deref(),
+                Some("ng")
+            );
+            assert_eq!(adjusted, Some(1..3));
+            assert_eq!(
+                terminal
+                    .selected_text_range(false, window, cx)
+                    .map(|selection| selection.range),
+                Some(3..3)
+            );
+        });
+        assert_eq!(sent(&terminal, cx), b"", "composing writes nothing");
+
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.replace_text_in_range(None, "ếng", window, cx);
+            assert_eq!(terminal.marked_text_range(window, cx), None);
+        });
+        assert_eq!(sent(&terminal, cx), "ếng".as_bytes(), "committed once");
+
+        // A cancelled composition (empty marked text) writes nothing.
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.sent.borrow_mut().clear();
+            terminal.replace_and_mark_text_in_range(None, "x", None, window, cx);
+            terminal.replace_and_mark_text_in_range(None, "", None, window, cx);
+            assert_eq!(terminal.marked_text_range(window, cx), None);
+            terminal.unmark_text(window, cx);
+        });
+        assert_eq!(sent(&terminal, cx), b"");
+    }
+
+    #[gpui::test]
+    fn unmarking_commits_the_composition_once(cx: &mut gpui::TestAppContext) {
+        let (terminal, cx) = terminal_window(cx);
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.replace_and_mark_text_in_range(None, "ô", None, window, cx);
+            terminal.unmark_text(window, cx);
+            terminal.unmark_text(window, cx);
+            assert_eq!(terminal.marked_text_range(window, cx), None);
+        });
+        assert_eq!(sent(&terminal, cx), "ô".as_bytes());
+    }
+
+    #[gpui::test]
+    fn the_candidate_window_opens_at_the_cursor(cx: &mut gpui::TestAppContext) {
+        let (terminal, cx) = terminal_window(cx);
+        let at = |terminal: &Entity<Terminal>, cx: &mut gpui::VisualTestContext| {
+            terminal.update_in(cx, |terminal, window, cx| {
+                terminal.bounds_for_range(0..0, Bounds::default(), window, cx)
+            })
         };
-        assert_eq!(key_bytes(&typed, TermMode::empty()), Some(b"a".to_vec()));
+        let first = at(&terminal, cx).expect("cursor bounds after the first paint");
+        terminal.update(cx, |terminal, cx| terminal.fake_output("ab", cx));
+        let moved = at(&terminal, cx).unwrap();
+        assert_eq!(moved.size, first.size);
+        assert_eq!(moved.origin.y, first.origin.y);
+        assert_eq!(moved.origin.x, first.origin.x + first.size.width * 2.);
+    }
+
+    #[gpui::test]
+    fn typing_through_the_window_reaches_the_pty_exactly_once(cx: &mut gpui::TestAppContext) {
+        let (terminal, cx) = terminal_window(cx);
+        cx.simulate_input("abc");
+        assert_eq!(sent(&terminal, cx), b"abc");
+
+        // The input method posts the replacement as a key whose code is A and
+        // whose characters are the real text.
+        terminal.read_with(cx, |terminal, _| terminal.sent.borrow_mut().clear());
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(typed("a", "ô", Modifiers::default()), cx)
+        });
+        assert_eq!(sent(&terminal, cx), "ô".as_bytes());
+
+        // Space and enter are keys with a key_char: each is written once.
+        terminal.read_with(cx, |terminal, _| terminal.sent.borrow_mut().clear());
+        cx.simulate_keystrokes("space enter backspace tab ctrl-c");
+        assert_eq!(sent(&terminal, cx), b" \r\x7f\t\x03");
+
+        // macOS with GoTiengViet: the key event says "a" (from the key code)
+        // and the real text "ô" arrives afterwards as insertText. The key
+        // event must write nothing, or the output would be "aô".
+        terminal.read_with(cx, |terminal, _| terminal.sent.borrow_mut().clear());
+        assert_eq!(
+            press(&terminal, cx, typed("a", "a", Modifiers::default())),
+            b"",
+            "key_down leaves typed text to the input handler"
+        );
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.replace_text_in_range(None, "ô", window, cx)
+        });
+        assert_eq!(sent(&terminal, cx), "ô".as_bytes());
+    }
+
+    #[gpui::test]
+    fn the_input_handler_keeps_raw_keys_for_the_program(cx: &mut gpui::TestAppContext) {
+        let (terminal, cx) = terminal_window(cx);
+        let mut handler =
+            TerminalInputHandler(ElementInputHandler::new(Bounds::default(), terminal));
+        cx.update(|window, cx| {
+            // Option-letter is Meta: an input method must not see it first.
+            assert!(!handler.prefers_ime_for_printable_keys(window, cx));
+            // Held keys repeat instead of opening the accent menu.
+            assert!(!handler.apple_press_and_hold_enabled());
+            assert!(handler.accepts_text_input(window, cx));
+        });
     }
 
     #[test]
