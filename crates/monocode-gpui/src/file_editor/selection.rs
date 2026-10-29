@@ -27,6 +27,10 @@ pub(super) struct Selection {
     surface: AnchorSlot,
 }
 impl Selection {
+    /// A quote popup or pending selection that Escape would clear.
+    pub(super) fn active(&self) -> bool {
+        self.target.is_some() || self.pending
+    }
     pub(super) fn dismiss(&mut self) {
         self.target = None;
         self.pending = false;

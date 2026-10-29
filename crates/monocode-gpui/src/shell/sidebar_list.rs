@@ -1,4 +1,5 @@
 //! Only construct and lay out sidebar cards near the viewport.
+use super::session_groups::{folder_accent, folder_tints};
 use super::*;
 use gpui::{ListAlignment, ListState, list};
 use monocode_core::session_groups::Entry;
@@ -19,6 +20,8 @@ enum Row {
     Session(i64),
     GroupedSession {
         id: i64,
+        /// The folder the member sits in, for its connector color.
+        folder: Option<String>,
         first: bool,
         last: bool,
     },
@@ -322,6 +325,10 @@ impl Shell {
             }
             rows.push(Row::Group(entry.clone()));
             if !collapsed || !self.query.is_empty() {
+                let folder = match entry {
+                    Entry::Folder { id, .. } => Some(id.clone()),
+                    _ => None,
+                };
                 let members: Vec<_> = members
                     .iter()
                     .copied()
@@ -333,6 +340,7 @@ impl Shell {
                         .enumerate()
                         .map(|(ix, id)| Row::GroupedSession {
                             id: *id,
+                            folder: folder.clone(),
                             first: ix == 0,
                             last: ix + 1 == members.len(),
                         }),
@@ -478,76 +486,83 @@ impl Shell {
             return div().into_any();
         };
         self.sidebar_list.visible_rows.borrow_mut().push(ix);
-        let content = match row {
-            Row::Navigation => return self.sidebar_navigation(cx),
-            Row::Monos => {
-                return self
-                    .monos
-                    .clone()
-                    .map(|monos| {
-                        monos.update(cx, |monos, cx| {
-                            monos.rail(Some(self.workspace.project.clone()), cx)
+        let content =
+            match row {
+                Row::Navigation => return self.sidebar_navigation(cx),
+                Row::Monos => {
+                    return self
+                        .monos
+                        .clone()
+                        .map(|monos| {
+                            monos.update(cx, |monos, cx| {
+                                monos.rail(Some(self.workspace.project.clone()), cx)
+                            })
                         })
-                    })
-                    .unwrap_or_else(|| div().into_any());
-            }
-            Row::Pinned => section_label("Pinned").into_any(),
-            Row::Folders => section_label("Folders").into_any(),
-            Row::Group(entry) => {
-                if let Entry::Folder { id, .. } = &entry
-                    && let Some(anchor) = self.folder_bounds.get(id)
-                {
-                    self.sidebar_list.track_anchor(anchor.clone());
+                        .unwrap_or_else(|| div().into_any());
                 }
-                self.sidebar_group_header(&entry, cx)
-            }
-            Row::Gap => return div().h(px(12.)).into_any(),
-            Row::Heading { label, first } => section_label(label)
-                .when(!first, |d| d.mt_3())
-                .when(first, |d| d.child(self.sidebar_filter_button(cx)))
-                .into_any(),
-            Row::Session(id) => self.session_card(id, cx),
-            Row::GroupedSession { id, first, last } => {
-                return div()
+                Row::Pinned => section_label("Pinned").into_any(),
+                Row::Folders => section_label("Folders").into_any(),
+                Row::Group(entry) => {
+                    if let Entry::Folder { id, .. } = &entry
+                        && let Some(anchor) = self.folder_bounds.get(id)
+                    {
+                        self.sidebar_list.track_anchor(anchor.clone());
+                    }
+                    self.sidebar_group_header(&entry, cx)
+                }
+                Row::Gap => return div().h(px(12.)).into_any(),
+                Row::Heading { label, first } => section_label(label)
+                    .when(!first, |d| d.mt_3())
+                    .when(first, |d| d.child(self.sidebar_filter_button(cx)))
+                    .into_any(),
+                Row::Session(id) => self.session_card(id, cx),
+                Row::GroupedSession {
+                    id,
+                    folder,
+                    first,
+                    last,
+                } => {
+                    let tint = folder
+                        .as_ref()
+                        .and_then(|id| self.project_groups().folder(id).and_then(folder_accent))
+                        .and_then(|color| folder_tints(Some(color)).connector);
+                    return div()
+                        .px_2()
+                        .child(div().ml(px(10.)).when(first, |d| d.pt_1()).child(
+                            rails::step_tinted(last, tint, self.nested_session_card(id, cx)),
+                        ))
+                        .into_any();
+                }
+                Row::ClassicGroupMember {
+                    entry,
+                    id,
+                    first,
+                    last,
+                } => {
+                    return div()
+                        .px(px(6.))
+                        .child(self.classic_group_member(&entry, id, first, last, cx))
+                        .into_any();
+                }
+                Row::ClassicFolderNew(id) => {
+                    return div()
+                        .px(px(6.))
+                        .child(self.classic_folder_new_session(&id, cx))
+                        .into_any();
+                }
+                Row::ClassicGap(height) => return div().h(px(height as f32)).into_any(),
+                Row::Empty => div()
                     .px_2()
-                    .child(
-                        div()
-                            .ml(px(10.))
-                            .when(first, |d| d.pt_1())
-                            .child(rails::step(last, self.nested_session_card(id, cx))),
-                    )
-                    .into_any();
-            }
-            Row::ClassicGroupMember {
-                entry,
-                id,
-                first,
-                last,
-            } => {
-                return div()
-                    .px(px(6.))
-                    .child(self.classic_group_member(&entry, id, first, last, cx))
-                    .into_any();
-            }
-            Row::ClassicFolderNew(id) => {
-                return div()
-                    .px(px(6.))
-                    .child(self.classic_folder_new_session(&id, cx))
-                    .into_any();
-            }
-            Row::ClassicGap(height) => return div().h(px(height as f32)).into_any(),
-            Row::Empty => div()
-                .px_2()
-                .py_2()
-                .text_size(px(12.))
-                .text_color(rgb(MUTED))
-                .child(if self.query.is_empty() {
-                    "No sessions yet"
-                } else {
-                    "No matching sessions"
-                })
-                .into_any(),
-        };
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child(if self.query.is_empty() {
+                        "No sessions yet"
+                    } else {
+                        "No matching sessions"
+                    })
+                    .into_any(),
+            };
         div()
             .when(self.workspace.classic_layout, |d| d.px(px(6.)))
             .when(!self.workspace.classic_layout, |d| d.px_2().pb_px())

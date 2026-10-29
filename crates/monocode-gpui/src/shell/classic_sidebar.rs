@@ -610,13 +610,14 @@ impl Shell {
                             .text_color(content(0.5)),
                     )
                     .child(self.classic_session_search.clone())
-                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                        if event.keystroke.key == "escape" {
-                            if !this.classic_session_search.read(cx).content.is_empty() {
-                                this.classic_session_search
-                                    .update(cx, |input, cx| input.set_text(String::new(), cx));
-                            }
-                            cx.stop_propagation();
+                    // The Workspace binding shadows key listeners: Escape clears
+                    // the query here, and with nothing typed moves on.
+                    .on_action(cx.listener(|this, _: &DismissMenu, _, cx| {
+                        if this.classic_session_search.read(cx).content.is_empty() {
+                            cx.propagate();
+                        } else {
+                            this.classic_session_search
+                                .update(cx, |input, cx| input.set_text(String::new(), cx));
                         }
                     })),
             )

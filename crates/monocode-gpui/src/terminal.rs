@@ -2125,6 +2125,11 @@ fn default_title(cwd: &str) -> String {
 fn home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
+/// The home directory as a terminal cwd, or `~` (which `working_dir` expands)
+/// when the platform reports none.
+pub(crate) fn home_cwd() -> String {
+    home().map_or_else(|| "~".into(), |h| h.to_string_lossy().into_owned())
+}
 fn working_dir(cwd: &str) -> std::path::PathBuf {
     let path = match cwd.strip_prefix("~") {
         Some(rest) => home().map_or_else(|| cwd.into(), |h| h.join(rest.trim_start_matches('/'))),

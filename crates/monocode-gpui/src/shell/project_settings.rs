@@ -178,6 +178,23 @@ impl Shell {
         });
         cx.notify();
     }
+    /// Escape on the open project dialog: its inner list first, then the dialog.
+    pub(super) fn dismiss_background_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self
+            .background_dialog
+            .as_ref()
+            .map(|open| open.view.clone())
+        {
+            Some(ProjectDialog::Background(view)) => view.update(cx, |v, cx| v.dismiss(window, cx)),
+            Some(ProjectDialog::Theme(view)) => view.update(cx, |_, cx| cx.emit(Event::Close)),
+            None => return false,
+        }
+        true
+    }
     fn close_background_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.background_dialog = None;
         self.focus_workspace(window, cx);

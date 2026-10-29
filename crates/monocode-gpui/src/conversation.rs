@@ -2613,6 +2613,46 @@ impl Conversation {
             .collect()
     }
     /// `Session: Stop` on Escape: cancels a running turn.
+    /// What a stop would change, for tests that Escape left a session alone.
+    #[cfg(test)]
+    pub(crate) fn escape_probe(&self) -> (bool, String, bool, bool, bool) {
+        (
+            self.busy,
+            self.status.clone(),
+            self.follow_ups.state.paused,
+            self.notification_cancelled,
+            self.stopping,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&mut self, status: &str) {
+        self.busy = false;
+        self.status = status.into();
+    }
+    /// Escape closes this conversation's own transient surfaces before it
+    /// stops the turn. True when it closed one.
+    pub(crate) fn dismiss_transient(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.transcript.update(cx, |t, cx| t.dismiss_selection(cx)) {
+            return true;
+        }
+        if self.response_menu.is_some() {
+            self.close_response_menu(cx);
+            return true;
+        }
+        if self.git_picker.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        if self.menu.is_some() {
+            self.close_menu(window, cx);
+            return true;
+        }
+        false
+    }
     pub(crate) fn stop_if_busy(&mut self, cx: &mut Context<Self>) {
         if self.cancel_edit_last_turn(cx) {
             return;

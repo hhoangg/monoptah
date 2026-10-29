@@ -11,6 +11,9 @@ mod classic_surfaces;
 mod contributors;
 #[cfg(test)]
 mod contributors_tests;
+mod escape;
+#[cfg(test)]
+mod escape_tests;
 mod file_panes;
 mod idle_agents;
 #[cfg(test)]
@@ -131,6 +134,7 @@ actions!(
         FocusPaneDown,
         ToggleTerminal,
         NewTerminal,
+        NewTerminalHome,
         ToggleLayout,
         ToggleWorkspaceStyle,
         OpenSettings,
@@ -251,6 +255,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-d"), SplitRight, context),
         KeyBinding::new(&format!("{modifier}-j"), ToggleTerminal, context),
         KeyBinding::new(&format!("{modifier}-`"), NewTerminal, context),
+        KeyBinding::new(&format!("{modifier}-alt-j"), NewTerminalHome, context),
         // Switch between the original two-sidebar layout and the new layout.
         KeyBinding::new(&format!("{modifier}-shift-l"), ToggleLayout, context),
         // Switch the Focused layout between its rounded and boxy workspace.
@@ -3000,8 +3005,24 @@ impl Shell {
         });
     }
     /// newTerminalCwd: the focused session's worktree, else its folder, else
-    /// the project.
+    /// the project. In a Mono chat, see the rule below.
     fn terminal_cwd(&self, cx: &App) -> String {
+        // A Mono chat has no focused session: `workspace.active` is only the
+        // last session used. A Mono working on the project in view roots the
+        // shell in its working copy (so a focused worktree is respected);
+        // otherwise at its first local project, the dock still being this
+        // project's. Without either, the working copy.
+        if let Some(mono) = self.monos.as_ref().and_then(|m| m.read(cx).current()) {
+            if mono.works_on(&self.workspace.project) {
+                return self.working_copy().to_owned();
+            }
+            return mono
+                .projects
+                .iter()
+                .find(|p| !p.starts_with("remote://"))
+                .cloned()
+                .unwrap_or_else(|| self.working_copy().to_owned());
+        }
         self.workspace
             .active
             .and_then(|id| self.sessions.get(&id))
@@ -3075,6 +3096,15 @@ impl Shell {
     /// Terminal: New (cmd-`): another terminal in the project's dock, which
     /// opens if it was hidden.
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = self.terminal_cwd(cx);
+        self.new_terminal_at(cwd, window, cx);
+    }
+    /// Terminal: New in Home: the same as `new_terminal`, rooted at the user's
+    /// home directory instead of the project.
+    fn new_terminal_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_terminal_at(crate::terminal::home_cwd(), window, cx);
+    }
+    fn new_terminal_at(&mut self, cwd: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.project.starts_with("remote://") {
             self.error = Some("Terminals are not available on remote projects.".into());
             cx.notify();
@@ -3084,7 +3114,6 @@ impl Shell {
             return;
         }
         let project = self.workspace.project.clone();
-        let cwd = self.terminal_cwd(cx);
         let was_open = self
             .workspace
             .docks
@@ -8700,6 +8729,9 @@ impl Render for Shell {
                 if this.cancel_classic_sidebar_tab(cx) {
                     return;
                 }
+                if this.dismiss_overlay(window, cx) {
+                    return;
+                }
                 if this.remote_project_picker.is_some() {
                     this.close_remote_project(window, cx);
                     return;
@@ -8773,11 +8805,9 @@ impl Render for Shell {
                         return;
                     }
                 }
-                // `Session: Stop` when no menu is open to close.
-                if this.menu.is_none()
-                    && let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id))
-                {
-                    view.update(cx, |v, cx| v.stop_if_busy(cx));
+                // `Session: Stop` on the conversation in view, when nothing is left to close.
+                if let Some(target) = this.escape_stop_target(cx) {
+                    this.stop_escape_target(target, window, cx);
                 }
                 this.close_menu(cx);
                 this.tab_drag = None;
@@ -8833,6 +8863,9 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &NewTerminal, window, cx| this.new_terminal(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &NewTerminalHome, window, cx| {
+                this.new_terminal_home(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleLayout, _, cx| this.toggle_layout(cx)))
             .on_action(
                 cx.listener(|this, _: &ToggleWorkspaceStyle, _, cx| {
@@ -12796,6 +12829,301 @@ mod tests {
             })
             .unwrap();
         assert!(cx.debug_bounds("terminal-dock").is_none());
+    }
+    #[gpui::test]
+    fn terminal_new_in_home_opens_at_home_and_new_terminal_keeps_the_project(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, b) = window(cx);
+        cx.update(|cx| {
+            bind_keys(cx);
+            crate::terminal::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(b, w, cx);
+                shell.focus_active(w, cx);
+            })
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let home = crate::terminal::home_cwd();
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(&format!("{modifier}-alt-j"));
+        cx.run_until_parked();
+        let project = window
+            .update(cx, |shell, w, cx| {
+                let project = shell.workspace.project.clone();
+                let dock = &shell.workspace.docks[&project];
+                assert_eq!(dock.terminals, [home.clone()]);
+                assert_ne!(home, project);
+                assert!(dock.open);
+                assert_eq!(shell.terminals[&project].len(), 1);
+                assert_eq!(shell.terminals[&project][0].read(cx).cwd, home);
+                assert_eq!(shell.dock_focused(w, cx), Some(0));
+                project
+            })
+            .unwrap();
+        // Terminal: New still roots at the project and joins the same dock.
+        window
+            .update(cx, |shell, w, cx| shell.new_terminal(w, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let dock = &shell.workspace.docks[&project];
+                assert_eq!(dock.terminals, [home.clone(), project.clone()]);
+                assert_eq!(dock.active, 1);
+            })
+            .unwrap();
+        // The action is also reachable by dispatch, as the menu and palette do.
+        window
+            .update(cx, |_, w, cx| {
+                w.dispatch_action(Box::new(NewTerminalHome), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let dock = &shell.workspace.docks[&project];
+                assert_eq!(dock.terminals, [home.clone(), project.clone(), home]);
+                assert_eq!(dock.active, 2);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn a_mono_chat_shows_its_terminal_dock_rooted_at_its_project(cx: &mut TestAppContext) {
+        let (window, _, b) = window(cx);
+        cx.update(|cx| {
+            bind_keys(cx);
+            crate::terminal::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(b, w, cx);
+                shell.mono_manager().update(cx, |m, cx| {
+                    m.create(vec!["/work/mono-project".into()], w, cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, w, cx| {
+                shell
+                    .mono_manager()
+                    .update(cx, |m, cx| m.dismiss_settings(w, cx));
+                assert!(shell.mono_active(cx));
+                shell.focus_active(w, cx);
+            })
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let before = window
+            .update(cx, |shell, _, _| shell.mono_bounds.get().unwrap())
+            .unwrap();
+        assert!(cx.debug_bounds("terminal-dock").is_none());
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(&format!("{modifier}-`"));
+        cx.run_until_parked();
+        let project = window
+            .update(cx, |shell, _, cx| {
+                let project = shell.workspace.project.clone();
+                assert!(shell.mono_active(cx));
+                assert_eq!(shell.terminals[&project].len(), 1);
+                let dock = &shell.workspace.docks[&project];
+                assert!(dock.open);
+                assert_eq!(dock.terminals, ["/work/mono-project"]);
+                assert_ne!(shell.working_copy(), "/work/mono-project");
+                project
+            })
+            .unwrap();
+        assert!(
+            cx.debug_bounds("terminal-dock").is_some(),
+            "the dock must be drawn in the Mono view"
+        );
+        let after = window
+            .update(cx, |shell, _, _| shell.mono_bounds.get().unwrap())
+            .unwrap();
+        assert!(
+            after.size.width < before.size.width || after.size.height < before.size.height,
+            "the Mono shrinks for the dock: {before:?} -> {after:?}"
+        );
+        // Another press adds exactly one more shell.
+        cx.simulate_keystrokes(&format!("{modifier}-`"));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(shell.terminals[&project].len(), 2);
+                assert_eq!(shell.workspace.docks[&project].terminals.len(), 2);
+            })
+            .unwrap();
+        // The toggle hides and shows it, keeping the shells.
+        window
+            .update(cx, |shell, w, cx| {
+                assert_eq!(shell.dock_focused(w, cx), Some(1));
+                shell.toggle_terminal(w, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("terminal-dock").is_none());
+        window
+            .update(cx, |shell, w, cx| {
+                assert_eq!(shell.dock_focused(w, cx), None);
+                let chat = shell.mono_manager().read(cx).chat().unwrap();
+                let input = chat.read(cx).input.focus_handle(cx);
+                assert!(input.is_focused(w), "focus returns to the Mono input");
+                shell.toggle_terminal(w, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("terminal-dock").is_some());
+        // Back in a session the same dock is drawn, with no extra shells.
+        window
+            .update(cx, |shell, w, cx| {
+                shell.mono_manager().update(cx, |m, cx| m.close(cx));
+                shell.open(b, w, cx);
+                assert!(!shell.mono_active(cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("terminal-dock").is_some());
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(shell.terminals[&project].len(), 2);
+                assert_eq!(shell.workspace.docks[&project].terminals.len(), 2);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn a_mono_roots_terminals_at_the_project_being_worked_on(cx: &mut TestAppContext) {
+        let (window, a, _) = window(cx);
+        // The last session used lives elsewhere than the project in view.
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(a, w, cx);
+                assert_eq!(shell.terminal_cwd(cx), "/work/another-project");
+                shell.workspace.project = "/work/monocode".into();
+                assert_eq!(shell.workspace.active, Some(a));
+            })
+            .unwrap();
+        let mut cases: Vec<(Vec<&str>, Option<&str>, &str)> = vec![
+            // No project of its own: the project in view, never the stale session.
+            (vec![], None, "/work/monocode"),
+            // Works on the project in view: its working copy, not the first project.
+            (
+                vec!["/work/other", "/work/monocode"],
+                None,
+                "/work/monocode",
+            ),
+            // ... which follows the focused worktree.
+            (
+                vec!["/work/monocode"],
+                Some("/work/monocode-feature"),
+                "/work/monocode-feature",
+            ),
+            // Does not work on it: its own first project.
+            (vec!["/work/other", "/work/third"], None, "/work/other"),
+            // A remote project never becomes the cwd of a local shell.
+            (vec!["remote://host/project"], None, "/work/monocode"),
+            (
+                vec!["remote://host/project", "/work/other"],
+                None,
+                "/work/other",
+            ),
+        ];
+        for (projects, worktree, want) in cases.drain(..) {
+            window
+                .update(cx, |shell, w, cx| {
+                    shell.worktree_focus.clear();
+                    if let Some(path) = worktree {
+                        shell.worktree_focus.insert(
+                            "/work/monocode".into(),
+                            crate::worktree_switcher::WorktreeFocus {
+                                path: path.into(),
+                                branch: Some("feature".into()),
+                            },
+                        );
+                    }
+                    let projects = projects.iter().map(|p| p.to_string()).collect();
+                    shell
+                        .mono_manager()
+                        .update(cx, |m, cx| m.create(projects, w, cx));
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |shell, _, cx| {
+                    assert!(shell.mono_active(cx));
+                    assert_eq!(shell.terminal_cwd(cx), want);
+                })
+                .unwrap();
+        }
+    }
+    #[gpui::test]
+    fn terminal_new_in_home_refuses_remote_projects(cx: &mut TestAppContext) {
+        let (window, _, b) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(b, w, cx);
+                let local =
+                    std::mem::replace(&mut shell.workspace.project, "remote://host/project".into());
+                shell.new_terminal_home(w, cx);
+                assert_eq!(
+                    shell.error.as_deref(),
+                    Some("Terminals are not available on remote projects.")
+                );
+                assert!(
+                    shell
+                        .workspace
+                        .docks
+                        .get(&shell.workspace.project)
+                        .is_none()
+                );
+                assert!(shell.terminals.is_empty());
+                shell.workspace.project = local;
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn terminal_new_in_home_is_in_the_app_menu(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::app_menu::MenuReady);
+            crate::app_menu::install(&crate::settings::Preferences::default(), cx);
+            let menus = cx.get_menus().unwrap();
+            let file = menus
+                .iter()
+                .find(|m| {
+                    m.items.iter().any(|i| {
+                        matches!(i, gpui::OwnedMenuItem::Action { name, .. } if name == "New Terminal")
+                    })
+                })
+                .expect("the menu with New Terminal");
+            let names: Vec<_> = file
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    gpui::OwnedMenuItem::Action { name, action, .. } => {
+                        Some((name.as_str(), action.name()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let at = names.iter().position(|(n, _)| *n == "New Terminal").unwrap();
+            assert_eq!(
+                names[at + 1],
+                ("New Terminal in Home", "workspace::NewTerminalHome")
+            );
+        });
     }
     #[gpui::test]
     fn closing_the_last_review_tab_removes_the_pane(cx: &mut TestAppContext) {

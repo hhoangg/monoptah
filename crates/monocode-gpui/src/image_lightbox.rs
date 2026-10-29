@@ -159,7 +159,7 @@ impl ImageLightbox {
         }
     }
 
-    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(restore) = self.restore.take() {
             window.focus(&restore, cx);
         }

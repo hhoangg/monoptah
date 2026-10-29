@@ -19,6 +19,7 @@ pub(crate) enum Command {
     Sidebar,
     Panel,
     Terminal,
+    TerminalHome,
     Layout,
     WorkspaceStyle,
     Plan,
@@ -33,6 +34,7 @@ const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Sidebar, "Toggle sidebar", "⌘B"),
     (Command::Panel, "Toggle files and changes", "⌘⇧B"),
     (Command::Terminal, "Toggle terminal", "⌘J"),
+    (Command::TerminalHome, "New terminal in home", "⌘⌥J"),
     (Command::Layout, "Switch workspace layout", "⌘⇧L"),
     (
         Command::WorkspaceStyle,
@@ -303,5 +305,21 @@ impl Render for QuickOpen {
                     .text_color(content(0.35))
                     .child("↑ ↓ navigate    ↵ open    Esc close    > commands"),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_palette_lists_terminal_in_home_after_toggle_terminal() {
+        let at = COMMANDS
+            .iter()
+            .position(|(c, _, _)| matches!(c, Command::Terminal))
+            .unwrap();
+        let (command, label, _) = COMMANDS[at + 1];
+        assert!(matches!(command, Command::TerminalHome));
+        assert_eq!(label, "New terminal in home");
     }
 }

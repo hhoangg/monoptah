@@ -277,6 +277,12 @@ pub(crate) const BINDINGS: &[Binding] = &[
         fixed: false,
     },
     Binding {
+        command: "Terminal: New in Home",
+        keys: "⌘⌥J",
+        when: "Always",
+        fixed: false,
+    },
+    Binding {
         command: "Terminal: New Tab",
         keys: "⌘⇧`",
         when: "Always",
@@ -667,4 +673,19 @@ fn default_shortcuts(row: &Binding) -> Vec<String> {
         .into_iter()
         .filter_map(|s| gpui::Keystroke::parse(&s).ok().map(|s| s.unparse()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_new_in_home_is_listed_once_with_its_default() {
+        let rows: Vec<_> = BINDINGS
+            .iter()
+            .filter(|b| b.command == "Terminal: New in Home")
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].keys, "⌘⌥J");
+    }
 }

@@ -71,6 +71,18 @@ impl Selection {
         let state = self.0.borrow();
         state.drag.is_some() || state.menu.is_some() || state.anchor != state.head
     }
+    #[cfg(test)]
+    pub(super) fn mark_for_test(&self) {
+        let mut state = self.0.borrow_mut();
+        state.anchor = Some(Position {
+            row: (0, 0),
+            byte: 0,
+        });
+        state.head = Some(Position {
+            row: (0, 0),
+            byte: 3,
+        });
+    }
     pub(super) fn clear(&self) {
         let mut state = self.0.borrow_mut();
         state.anchor = None;

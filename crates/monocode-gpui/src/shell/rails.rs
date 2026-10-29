@@ -65,11 +65,19 @@ pub(crate) enum Rail {
 /// `.zen-phase-step.orchestration-tree-step`: a step branching off the
 /// transcript's tool rail, its row 2px lower inside the step's padding.
 pub(super) fn step(last: bool, child: impl IntoElement) -> gpui::Div {
+    step_tinted(last, None, child)
+}
+/// `step` whose rail is drawn in `tint` (a colored folder's connector).
+pub(super) fn step_tinted(
+    last: bool,
+    tint: Option<gpui::Hsla>,
+    child: impl IntoElement,
+) -> gpui::Div {
     div()
         .relative()
         .pl(px(20.))
         .py(px(2.))
-        .child(crate::activity::rail_branch_at(last, true, 2.))
+        .child(crate::activity::rail_branch_tinted(last, true, 2., tint))
         .child(child)
 }
 

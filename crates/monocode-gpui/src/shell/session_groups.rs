@@ -51,6 +51,41 @@ fn folder_color(ix: usize) -> Option<gpui::Hsla> {
         .get(ix)
         .map(|&(h, s, l)| gpui::hsla(h / 360., s, l, 1.))
 }
+/// Alpha of a colored folder's connector: the folder hue as a subtle guide,
+/// close to how faint the default rail looks.
+const FOLDER_CONNECTOR_ALPHA: f32 = 0.35;
+
+/// A folder's saved color: a custom hex wins over the palette index.
+pub(super) fn folder_accent(folder: &monocode_core::session_groups::Folder) -> Option<gpui::Hsla> {
+    folder
+        .custom_color
+        .as_deref()
+        .and_then(|color| color.strip_prefix('#'))
+        .and_then(|color| u32::from_str_radix(color, 16).ok())
+        .map(|color| rgb(color).into())
+        .or_else(|| folder.color_index.and_then(folder_color))
+}
+
+/// Where a folder's color shows beyond its row fill. `None` keeps the
+/// default look of that part.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct FolderTints {
+    pub(super) icon: Option<gpui::Hsla>,
+    pub(super) chevron: Option<gpui::Hsla>,
+    pub(super) connector: Option<gpui::Hsla>,
+}
+
+pub(super) fn folder_tints(color: Option<gpui::Hsla>) -> FolderTints {
+    FolderTints {
+        icon: color,
+        chevron: color,
+        connector: color.map(|color| gpui::Hsla {
+            a: FOLDER_CONNECTOR_ALPHA,
+            ..color
+        }),
+    }
+}
+
 /// Sidebar.tsx's REMINDERS_COLOR, amber-500.
 const REMINDERS_COLOR: u32 = 0xf59e0b;
 
@@ -1236,13 +1271,7 @@ impl Shell {
                     format!("folder:{id}"),
                     folder.name.clone(),
                     "folder",
-                    folder
-                        .custom_color
-                        .as_deref()
-                        .and_then(|color| color.strip_prefix('#'))
-                        .and_then(|color| u32::from_str_radix(color, 16).ok())
-                        .map(|color| rgb(color).into())
-                        .or_else(|| folder.color_index.and_then(folder_color)),
+                    folder_accent(folder),
                     folder.collapsed,
                     sessions,
                 )
@@ -1297,9 +1326,10 @@ impl Shell {
                     .as_ref()
                     .is_some_and(|drag| drag.active && drag.over.as_ref() == Some(id))
         });
+        let tints = folder_tints(color);
         let mark = |side| {
             let glyph = icon(glyph, side);
-            match color {
+            match tints.icon {
                 Some(color) => glyph.text_color(color),
                 None => glyph,
             }
@@ -1340,27 +1370,43 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .opacity(0.7)
+                    // A chosen color shows at full strength; only the default
+                    // gray glyph is dimmed.
+                    .when(tints.icon.is_none(), |d| d.opacity(0.7))
                     .child(
                         div()
+                            .debug_selector({
+                                let key = key.to_string();
+                                move || format!("folder-icon-{key}")
+                            })
                             .when(expanded, |d| d.invisible())
                             .group_hover(group.clone(), |s| s.invisible())
                             .child(mark(16.)),
                     )
                     .child(
                         div()
+                            .debug_selector({
+                                let key = key.to_string();
+                                move || format!("folder-chevron-{key}")
+                            })
                             .absolute()
                             .invisible()
                             .when(expanded, |d| d.visible())
                             .group_hover(group.clone(), |s| s.visible())
-                            .child(icon(
-                                if expanded {
-                                    "chevron-down"
-                                } else {
-                                    "chevron-right"
-                                },
-                                16.,
-                            )),
+                            .child({
+                                let chevron = icon(
+                                    if expanded {
+                                        "chevron-down"
+                                    } else {
+                                        "chevron-right"
+                                    },
+                                    16.,
+                                );
+                                match tints.chevron {
+                                    Some(color) => chevron.text_color(color),
+                                    None => chevron,
+                                }
+                            }),
                     )
                     .relative(),
             )
@@ -1709,7 +1755,12 @@ impl Shell {
             .into_any_element()
     }
 
-    fn open_link_dialog(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_link_dialog(
+        &mut self,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.close_preview(cx);
         let initial = self.session_metadata(id, cx).summary.work_item.clone();
         let input = cx.new(|cx| {
@@ -2532,6 +2583,122 @@ mod tests {
             })
             .unwrap();
     }
+    #[test]
+    fn folder_tints_follow_the_folder_color_and_leave_uncolored_folders_alone() {
+        let none = folder_tints(None);
+        assert!(none.icon.is_none() && none.chevron.is_none() && none.connector.is_none());
+        let red = gpui::hsla(0., 0.8, 0.5, 1.);
+        let tints = folder_tints(Some(red));
+        assert_eq!(tints.icon, Some(red));
+        assert_eq!(tints.chevron, Some(red));
+        let connector = tints.connector.unwrap();
+        assert_eq!(
+            (connector.h, connector.s, connector.l),
+            (red.h, red.s, red.l)
+        );
+        assert_eq!(connector.a, FOLDER_CONNECTOR_ALPHA);
+    }
+
+    #[test]
+    fn folder_accent_reads_custom_hex_before_the_palette_index() {
+        let mut folder = monocode_core::session_groups::Folder {
+            color_index: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(folder_accent(&folder), folder_color(3));
+        folder.custom_color = Some("#ff0000".into());
+        assert_eq!(folder_accent(&folder), Some(rgb(0xff0000).into()));
+        folder.custom_color = None;
+        folder.color_index = None;
+        assert_eq!(folder_accent(&folder), None);
+    }
+
+    #[gpui::test]
+    fn folder_color_reaches_the_icon_chevron_and_connector(cx: &mut TestAppContext) {
+        let (window, a, b) = setup(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let folder = |id: &str, session, color_index, custom_color: Option<&str>| {
+                    monocode_core::session_groups::Folder {
+                        id: id.into(),
+                        name: id.into(),
+                        session_ids: vec![session],
+                        color_index,
+                        custom_color: custom_color.map(str::to_string),
+                        ..Default::default()
+                    }
+                };
+                shell.groups.insert(
+                    shell.workspace.project.clone(),
+                    Groups {
+                        folders: vec![
+                            folder("tinted", a, Some(3), None),
+                            folder("plain", b, None, None),
+                        ],
+                        ..Default::default()
+                    },
+                );
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        for folder in ["tinted", "plain"] {
+            for part in ["icon", "chevron"] {
+                let selector: &'static str =
+                    Box::leak(format!("folder-{part}-folder:{folder}").into_boxed_str());
+                assert!(
+                    visual.debug_bounds(selector).is_some(),
+                    "{selector} is rendered"
+                );
+            }
+        }
+        let spine = |visual: &mut VisualTestContext, folder: &str, member: i64| {
+            let header = visual
+                .debug_bounds(Box::leak(
+                    format!("session-group-folder:{folder}").into_boxed_str(),
+                ))
+                .unwrap();
+            let row = visual
+                .debug_bounds(Box::leak(
+                    format!("sidebar-session-{member}").into_boxed_str(),
+                ))
+                .unwrap();
+            window
+                .update(visual, |_, window, _| {
+                    let scale = window.scale_factor();
+                    window
+                        .painted_quads()
+                        .iter()
+                        .filter(|quad| {
+                            (quad.bounds.left().0 - f32::from(header.left() + px(16.)) * scale)
+                                .abs()
+                                < 1.
+                                && (quad.bounds.size.width.0 - scale).abs() < 0.1
+                                && quad.bounds.top().0 > f32::from(header.bottom()) * scale
+                                && quad.bounds.top().0 < f32::from(row.bottom()) * scale
+                        })
+                        .filter_map(|quad| quad.background.as_solid())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap()
+        };
+        let tinted = folder_tints(folder_color(3)).connector.unwrap();
+        assert!(
+            spine(visual, "tinted", a).contains(&tinted),
+            "a colored folder draws its connector in the folder color"
+        );
+        assert!(
+            spine(visual, "plain", b).contains(&crate::theme::rail_color()),
+            "an uncolored folder keeps the default rail"
+        );
+        assert!(
+            !spine(visual, "plain", b).contains(&tinted),
+            "the color does not leak to other folders"
+        );
+    }
+
     #[gpui::test]
     fn folder_headers_reorder_and_the_color_menu_updates_the_saved_folder(cx: &mut TestAppContext) {
         let (window, a, b) = setup(cx);

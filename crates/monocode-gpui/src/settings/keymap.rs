@@ -84,6 +84,7 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
         "workspace::FocusPaneUp" => "Pane: Focus Up",
         "workspace::FocusPaneDown" => "Pane: Focus Down",
         "workspace::NewTerminal" => "Terminal: New",
+        "workspace::NewTerminalHome" => "Terminal: New in Home",
         "workspace::ToggleTerminal" => "Terminal: Toggle Dock",
         "file_editor::ToggleGitBlame" => "Editor: Toggle Git Blame",
         "file_editor::Find" => "Editor: Find",
@@ -94,4 +95,15 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
         "workspace::Reload" => "View: Reload",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_new_in_home_has_a_keybinding_label() {
+        let binding = KeyBinding::new("cmd-alt-j", crate::shell::NewTerminalHome, None);
+        assert_eq!(command(&binding), Some("Terminal: New in Home"));
+    }
 }
