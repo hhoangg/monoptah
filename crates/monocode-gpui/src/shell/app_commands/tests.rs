@@ -401,6 +401,121 @@ fn operator_archive_delete_and_folder_actions_settle_after_persistence(cx: &mut 
 }
 
 #[gpui::test]
+fn archiving_a_session_over_the_app_api_archives_the_sessions_it_started(cx: &mut TestAppContext) {
+    let (window, _, caller) = setup(cx);
+    let child = launch(window, caller, "child", json!({}), cx);
+    let grandchild = launch(window, caller, "grandchild", json!({}), cx);
+    let sibling = launch(window, caller, "sibling", json!({}), cx);
+    window
+        .update(cx, |shell, _, _| {
+            shell.started_by.insert(grandchild, child);
+        })
+        .unwrap();
+    call(
+        window,
+        caller,
+        "archive-tree",
+        "sessions.archive",
+        json!({"sessionId":child}),
+        cx,
+    )
+    .unwrap();
+    window
+        .update(cx, |shell, _, _| {
+            assert!(shell.session_summaries[&child].archived);
+            assert!(shell.session_summaries[&grandchild].archived);
+            assert!(!shell.session_summaries[&sibling].archived);
+            let db = locked(&shell.store).unwrap();
+            let rows = db.sessions().unwrap();
+            assert!(rows.iter().find(|s| s.id == grandchild).unwrap().archived);
+            assert!(!rows.iter().find(|s| s.id == sibling).unwrap().archived);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_session_cannot_archive_the_session_that_started_it(cx: &mut TestAppContext) {
+    let (window, _, caller) = setup(cx);
+    let parent = launch(window, caller, "parent", json!({}), cx);
+    // The caller sits below `parent`, as when a launched session starts its own work.
+    let nested = launch(window, caller, "nested", json!({}), cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.started_by.extend([(nested, parent)]);
+            shell.sessions[&nested].update(cx, |v, cx| {
+                let settings = Settings {
+                    operator_enabled: true,
+                    ..Default::default()
+                };
+                v.install_transfer(settings, None, cx);
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let caller = nested;
+    let error = call(
+        window,
+        caller,
+        "archive-up",
+        "sessions.archive",
+        json!({"sessionId":parent}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(error.contains("started by"), "{error}");
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(!shell.session_summaries[&parent].archived);
+            assert!(!shell.session_metadata(caller, cx).summary.archived);
+            assert!(shell.archiving.is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn archiving_over_the_app_api_leaves_workers_and_monos_alone(cx: &mut TestAppContext) {
+    let (window, _, caller) = setup(cx);
+    let parent = launch(window, caller, "parent", json!({}), cx);
+    let child = launch(window, caller, "child", json!({}), cx);
+    let worker = launch(window, caller, "worker", json!({}), cx);
+    window
+        .update(cx, |shell, _, _| {
+            shell.started_by.extend([(child, parent), (worker, parent)]);
+            shell.orchestration_summaries.insert(
+                caller,
+                monocode_core::orchestration::Summary {
+                    live: false,
+                    tasks: vec![monocode_core::orchestration::SummaryTask {
+                        session: Some(worker),
+                        title: "Write the tests".into(),
+                        provider: "codex".into(),
+                        model: None,
+                        status: "completed".into(),
+                    }],
+                },
+            );
+        })
+        .unwrap();
+    call(
+        window,
+        caller,
+        "archive-parent",
+        "sessions.archive",
+        json!({"sessionId":parent}),
+        cx,
+    )
+    .unwrap();
+    window
+        .update(cx, |shell, _, _| {
+            assert!(shell.session_summaries[&parent].archived);
+            assert!(shell.session_summaries[&child].archived);
+            assert!(!shell.session_summaries[&worker].archived);
+            assert!(shell.archiving.is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn operator_retries_use_durable_receipts_and_reject_changed_input(cx: &mut TestAppContext) {
     let (window, _, caller) = setup(cx);
     let child = launch(window, caller, "repeat", json!({}), cx);

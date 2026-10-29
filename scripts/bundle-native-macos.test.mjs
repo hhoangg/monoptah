@@ -45,12 +45,15 @@ test("Finder launches use development data for dev bundles and installed data fo
       });
       assert.ifError(packaged.error);
       assert.equal(packaged.status, 0, packaged.stdout + packaged.stderr);
-      const bundle = join(output, "Monoptah Native.app/Contents");
+      // Only the development bundle is told apart from the installed app.
+      const name = profile === "release" ? "Monoptah Native" : "Monoptah Native Dev";
+      const id = profile === "release" ? "com.monoptah.native" : "com.monoptah.native.dev";
+      const bundle = join(output, `${name}.app/Contents`);
       const plist = await readFile(join(bundle, "Info.plist"), "utf8");
       assert.ok(plist.includes(`<key>MonocodeDataMode</key><string>${mode}</string>`));
-      assert.ok(plist.includes("<key>CFBundleIdentifier</key><string>com.monoptah.native</string>"));
-      assert.ok(plist.includes("<key>CFBundleName</key><string>Monoptah Native</string>"));
-      assert.ok(plist.includes("<key>CFBundleDisplayName</key><string>Monoptah Native</string>"));
+      assert.ok(plist.includes(`<key>CFBundleIdentifier</key><string>${id}</string>`));
+      assert.ok(plist.includes(`<key>CFBundleName</key><string>${name}</string>`));
+      assert.ok(plist.includes(`<key>CFBundleDisplayName</key><string>${name}</string>`));
       // macOS rejects menu bar items from a process that exec'd after launch.
       assert.ok(plist.includes("<key>CFBundleExecutable</key><string>monocode-gpui</string>"));
       await assert.rejects(access(join(bundle, "MacOS/monocode-launcher")));

@@ -2,6 +2,7 @@ mod accounts;
 mod actions;
 mod app_commands;
 mod app_views;
+mod archive_family;
 mod automation_runs;
 mod classic_sidebar;
 #[cfg(test)]
@@ -676,6 +677,9 @@ pub(crate) struct Shell {
     quick: crate::quick_composer::Controller,
     unseen_finished: HashSet<i64>,
     archiving: HashSet<i64>,
+    /// Sessions archived together with the session that started them, so
+    /// restoring that session restores them and not the ones archived earlier.
+    archived_with: HashMap<i64, Vec<i64>>,
     archive_shortcut_held: bool,
     /// Editors offered by a project's "Open in editor"; `None` while scanning.
     external_editors: Option<Vec<monocode_core::external_editor::ExternalEditor>>,
@@ -1064,6 +1068,7 @@ impl Shell {
             quick: Default::default(),
             unseen_finished: HashSet::new(),
             archiving: HashSet::new(),
+            archived_with: HashMap::new(),
             archive_shortcut_held: false,
             external_editors: None,
             groups: sidebar_metadata.groups,
@@ -1538,45 +1543,28 @@ impl Shell {
         }
     }
     fn toggle_archive(&mut self, id: i64, cx: &mut Context<Self>) {
-        if !self.archiving.insert(id) {
+        if self.archiving.contains(&id) {
             return;
         }
         self.close_preview(cx);
         let archived = !self.session_metadata(id, cx).summary.archived;
+        let ids = self.archive_family(id, archived, cx);
+        self.archiving.extend(ids.iter().copied());
         let store = self.store.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { locked(&store)?.set_archived(id, archived) });
+        let family = ids.clone();
+        let work = cx.background_executor().spawn(async move {
+            archive_family::write_until_failure(&family, |id| {
+                locked(&store)?.set_archived(id, archived)
+            })
+        });
         cx.spawn(async move |this, cx| {
-            let result = work.await;
+            let (written, error) = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.archiving.remove(&id);
-                match result {
-                    Ok(()) => {
-                        if let Some(summary) = this.session_summaries.get_mut(&id) {
-                            summary.archived = archived;
-                        }
-                        if let Some(view) = this.sessions.get(&id) {
-                            view.update(cx, |session, cx| {
-                                session.summary.archived = archived;
-                                if archived {
-                                    session.stop_if_busy(cx);
-                                }
-                            });
-                        }
-                        this.refresh_session_mark(id, cx);
-                        if archived && this.workspace.tab_of(id).is_some() {
-                            this.close_pane(id, window, cx);
-                        } else {
-                            this.invalidate_chrome(cx);
-                            cx.notify();
-                        }
-                    }
-                    Err(error) => {
-                        this.error = Some(format!("Could not update archive: {error}"));
-                        this.invalidate_chrome(cx);
-                        cx.notify();
-                    }
+                this.finish_archive(&ids, &written, error.is_none(), archived, window, cx);
+                if let Some(error) = error {
+                    this.error = Some(format!("Could not update archive: {error}"));
+                    this.invalidate_chrome(cx);
+                    cx.notify();
                 }
             });
         })
