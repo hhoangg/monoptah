@@ -134,6 +134,7 @@ actions!(
         FocusPaneDown,
         ToggleTerminal,
         NewTerminal,
+        NewTerminalHome,
         ToggleLayout,
         ToggleWorkspaceStyle,
         OpenSettings,
@@ -254,6 +255,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-d"), SplitRight, context),
         KeyBinding::new(&format!("{modifier}-j"), ToggleTerminal, context),
         KeyBinding::new(&format!("{modifier}-`"), NewTerminal, context),
+        KeyBinding::new(&format!("{modifier}-alt-j"), NewTerminalHome, context),
         // Switch between the original two-sidebar layout and the new layout.
         KeyBinding::new(&format!("{modifier}-shift-l"), ToggleLayout, context),
         // Switch the Focused layout between its rounded and boxy workspace.
@@ -3078,6 +3080,15 @@ impl Shell {
     /// Terminal: New (cmd-`): another terminal in the project's dock, which
     /// opens if it was hidden.
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = self.terminal_cwd(cx);
+        self.new_terminal_at(cwd, window, cx);
+    }
+    /// Terminal: New in Home: the same as `new_terminal`, rooted at the user's
+    /// home directory instead of the project.
+    fn new_terminal_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_terminal_at(crate::terminal::home_cwd(), window, cx);
+    }
+    fn new_terminal_at(&mut self, cwd: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.project.starts_with("remote://") {
             self.error = Some("Terminals are not available on remote projects.".into());
             cx.notify();
@@ -3087,7 +3098,6 @@ impl Shell {
             return;
         }
         let project = self.workspace.project.clone();
-        let cwd = self.terminal_cwd(cx);
         let was_open = self
             .workspace
             .docks
@@ -8837,6 +8847,9 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &NewTerminal, window, cx| this.new_terminal(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &NewTerminalHome, window, cx| {
+                this.new_terminal_home(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleLayout, _, cx| this.toggle_layout(cx)))
             .on_action(
                 cx.listener(|this, _: &ToggleWorkspaceStyle, _, cx| {
@@ -12800,6 +12813,128 @@ mod tests {
             })
             .unwrap();
         assert!(cx.debug_bounds("terminal-dock").is_none());
+    }
+    #[gpui::test]
+    fn terminal_new_in_home_opens_at_home_and_new_terminal_keeps_the_project(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, b) = window(cx);
+        cx.update(|cx| {
+            bind_keys(cx);
+            crate::terminal::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(b, w, cx);
+                shell.focus_active(w, cx);
+            })
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let home = crate::terminal::home_cwd();
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(&format!("{modifier}-alt-j"));
+        cx.run_until_parked();
+        let project = window
+            .update(cx, |shell, w, cx| {
+                let project = shell.workspace.project.clone();
+                let dock = &shell.workspace.docks[&project];
+                assert_eq!(dock.terminals, [home.clone()]);
+                assert_ne!(home, project);
+                assert!(dock.open);
+                assert_eq!(shell.terminals[&project].len(), 1);
+                assert_eq!(shell.terminals[&project][0].read(cx).cwd, home);
+                assert_eq!(shell.dock_focused(w, cx), Some(0));
+                project
+            })
+            .unwrap();
+        // Terminal: New still roots at the project and joins the same dock.
+        window
+            .update(cx, |shell, w, cx| shell.new_terminal(w, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let dock = &shell.workspace.docks[&project];
+                assert_eq!(dock.terminals, [home.clone(), project.clone()]);
+                assert_eq!(dock.active, 1);
+            })
+            .unwrap();
+        // The action is also reachable by dispatch, as the menu and palette do.
+        window
+            .update(cx, |_, w, cx| {
+                w.dispatch_action(Box::new(NewTerminalHome), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let dock = &shell.workspace.docks[&project];
+                assert_eq!(dock.terminals, [home.clone(), project.clone(), home]);
+                assert_eq!(dock.active, 2);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn terminal_new_in_home_refuses_remote_projects(cx: &mut TestAppContext) {
+        let (window, _, b) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(b, w, cx);
+                let local =
+                    std::mem::replace(&mut shell.workspace.project, "remote://host/project".into());
+                shell.new_terminal_home(w, cx);
+                assert_eq!(
+                    shell.error.as_deref(),
+                    Some("Terminals are not available on remote projects.")
+                );
+                assert!(
+                    shell
+                        .workspace
+                        .docks
+                        .get(&shell.workspace.project)
+                        .is_none()
+                );
+                assert!(shell.terminals.is_empty());
+                shell.workspace.project = local;
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn terminal_new_in_home_is_in_the_app_menu(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::app_menu::MenuReady);
+            crate::app_menu::install(&crate::settings::Preferences::default(), cx);
+            let menus = cx.get_menus().unwrap();
+            let file = menus
+                .iter()
+                .find(|m| {
+                    m.items.iter().any(|i| {
+                        matches!(i, gpui::OwnedMenuItem::Action { name, .. } if name == "New Terminal")
+                    })
+                })
+                .expect("the menu with New Terminal");
+            let names: Vec<_> = file
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    gpui::OwnedMenuItem::Action { name, action, .. } => {
+                        Some((name.as_str(), action.name()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let at = names.iter().position(|(n, _)| *n == "New Terminal").unwrap();
+            assert_eq!(
+                names[at + 1],
+                ("New Terminal in Home", "workspace::NewTerminalHome")
+            );
+        });
     }
     #[gpui::test]
     fn closing_the_last_review_tab_removes_the_pane(cx: &mut TestAppContext) {

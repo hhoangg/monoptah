@@ -35,7 +35,7 @@ pub(crate) fn bind(cx: &mut App) {
 }
 
 /// Set once the first window has presented a frame.
-struct MenuReady;
+pub(crate) struct MenuReady;
 impl gpui::Global for MenuReady {}
 
 /// Installs the menu bar, called after the first frame is on screen. Setting
@@ -79,6 +79,7 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
             MenuItem::action("New Tab", NewCodex),
             MenuItem::action("New Claude Tab", NewClaude),
             MenuItem::action("New Terminal", NewTerminal),
+            MenuItem::action("New Terminal in Home", NewTerminalHome),
             MenuItem::action("Split Pane Right", SplitRight),
             MenuItem::action("Split Pane Down", SplitDown),
             MenuItem::action("Close Pane", CloseTab),
