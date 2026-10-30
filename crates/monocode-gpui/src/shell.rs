@@ -12865,7 +12865,7 @@ mod tests {
             .update(cx, |shell, w, cx| {
                 let project = shell.workspace.project.clone();
                 let dock = &shell.workspace.docks[&project];
-                assert_eq!(dock.terminals, [home.clone()]);
+                assert_eq!(dock.terminals, std::slice::from_ref(&home));
                 assert_ne!(home, project);
                 assert!(dock.open);
                 assert_eq!(shell.terminals[&project].len(), 1);
@@ -13087,13 +13087,7 @@ mod tests {
                     shell.error.as_deref(),
                     Some("Terminals are not available on remote projects.")
                 );
-                assert!(
-                    shell
-                        .workspace
-                        .docks
-                        .get(&shell.workspace.project)
-                        .is_none()
-                );
+                assert!(!shell.workspace.docks.contains_key(&shell.workspace.project));
                 assert!(shell.terminals.is_empty());
                 shell.workspace.project = local;
             })
