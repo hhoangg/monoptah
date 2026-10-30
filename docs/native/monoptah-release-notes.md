@@ -1,14 +1,15 @@
-# Monoptah Native 0.34.3
+# Monoptah Native 0.35.0
 
-A release of the experimental Rust + GPUI app for macOS on Apple silicon, merged with the upstream native 0.16.0-preview.9 work. The React/Tauri app, Monoptah, remains the production app.
+A release of the experimental Rust + GPUI app for macOS on Apple silicon, merged with the upstream native 0.16.0-preview.10 work. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.34.2
+## Changes since 0.34.3
 
-- Settings > Worktrees can delete several worktrees at once: tick the rows (or select all), then choose Delete selected. The confirmation lists which worktrees have uncommitted changes or an unknown status. They are deleted one by one, a failure does not stop the rest, and the ones that failed stay selected with the reason shown. Settings stays open while a delete is running.
-- A folder's color now tints its icon, its chevron and the line joining it to its sessions, so the color is visible while the folder is open.
-- Escape now does one thing: it closes the topmost dialog or overlay, and only when nothing is open does it stop the turn of the conversation you are looking at. It no longer stops the sidebar-selected session from a Mono chat, from Settings or from a dialog, and it targets the focused pane in a split.
-- Terminal: New in Home (Cmd+Alt+J, Ctrl+Alt+J elsewhere) opens a terminal at your home directory. It is also in the app menu, the command palette and the Keybindings page. Cmd+` still opens one in the project folder.
-- Cmd+` and Cmd+J now work in a Mono chat. The terminal dock is shown there and opens in the project the Mono works on, instead of silently creating hidden terminals in the last session's folder. Hidden terminals saved by earlier versions may appear once in that project's dock; close them there.
+- Merged upstream native 0.16.0-preview.10. A new Overview tab in a Mono shows its current activity, a contribution calendar, merged pull requests, lines changed and upcoming habits. The session list is now called Sub-agents, with cards showing model, provider, checkout and state.
+- Heartbeats: an idle Mono reviews recent work, sessions left unattended, notes and inbox items in its projects and suggests up to two follow-ups. On by default after 30 minutes of quiet; the Mono's settings offer an off switch and 15-minute, 30-minute, 1-hour and 2-hour intervals. Quiet checks leave no chat report, and a heartbeat that started sessions keeps its history.
+- /visualize and native visual documents: visuals published in a Mono chat also appear in Documents. New HTML artifacts are no longer accepted; use a Markdown document or visual_show.
+- Monos open every reply with a short sentence and hand longer work to background sessions. Launched sessions stay in the background unless split into the workspace explicitly.
+- New opt-in setting in Settings > Providers: Identify as Monoptah to Claude (experimental).
+- Hermes Agent receives the reasoning effort selected in the model picker, slash commands have distinct icons, and a transcript crash while messages merge during animation is fixed.
 
 ## What it is
 
