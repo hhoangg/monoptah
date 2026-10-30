@@ -472,6 +472,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "pretooluse settings.json block command notification",
     ),
     (
+        "claude-entrypoint",
+        Section::Providers,
+        "Identify as Monoptah to Claude",
+        "entrypoint sdk-cli label usage limit 5-hour window rate experimental",
+    ),
+    (
         "idle-agents",
         Section::Providers,
         "Keep idle agents ready",

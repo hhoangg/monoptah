@@ -305,3 +305,28 @@ fn the_prompt_and_help_describe_workflows() {
         assert!(bridge::HELP.contains(needle), "help lacks {needle}");
     }
 }
+
+#[test]
+fn context_shows_how_to_delegate_without_running_help() {
+    let mono = Mono {
+        projects: vec!["/repo".into()],
+        ..Default::default()
+    };
+    let text = context(
+        &mono,
+        &files::AgentFiles {
+            id: mono.id.clone(),
+            dir: String::new(),
+            soul: Some(DEFAULT_SOUL.into()),
+            soul_hash: String::new(),
+            memory: String::new(),
+            memory_hash: String::new(),
+            memory_path: String::new(),
+            topics: Vec::new(),
+        },
+        std::path::Path::new("/Applications/Monoptah.app/monocode"),
+    );
+    assert!(text.contains(
+        r#"/Applications/Monoptah.app/monocode app sessions.start --json '{"project":"<assigned path>","title":"<short title>","prompt":"<complete instructions>","notifyOnComplete":true}'"#
+    ));
+}

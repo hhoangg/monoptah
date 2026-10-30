@@ -12358,8 +12358,7 @@ mod tests {
     }
     #[gpui::test]
     fn a_split_pane_slides_in_from_its_edge_then_settles(cx: &mut TestAppContext) {
-        let (window, _, b) = window(cx);
-        cx.update(bind_keys);
+        let (window, new, b) = same_project_window(cx);
         window
             .update(cx, |shell, w, cx| {
                 shell.open(b, w, cx);
@@ -12368,15 +12367,21 @@ mod tests {
             .unwrap();
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-d");
         window
-            .update(cx, |shell, _, _| {
+            .update(cx, |shell, _, cx| {
+                // Freeze before the first paint: keyboard simulation can draw
+                // enough slow frames for the animation to finish on CI. The
+                // shortcut itself is covered by the split-and-drag test above.
+                let before = shell.active_leaves();
+                shell.workspace.split(new, SplitDir::Right);
+                shell.begin_pane_motion(before, cx);
                 shell
                     .pane_motion
                     .as_ref()
                     .unwrap()
                     .slide
                     .freeze_elapsed(std::time::Duration::from_millis(16));
+                cx.notify();
             })
             .unwrap();
         cx.run_until_parked();
@@ -12860,7 +12865,7 @@ mod tests {
             .update(cx, |shell, w, cx| {
                 let project = shell.workspace.project.clone();
                 let dock = &shell.workspace.docks[&project];
-                assert_eq!(dock.terminals, [home.clone()]);
+                assert_eq!(dock.terminals, std::slice::from_ref(&home));
                 assert_ne!(home, project);
                 assert!(dock.open);
                 assert_eq!(shell.terminals[&project].len(), 1);
@@ -13082,13 +13087,7 @@ mod tests {
                     shell.error.as_deref(),
                     Some("Terminals are not available on remote projects.")
                 );
-                assert!(
-                    shell
-                        .workspace
-                        .docks
-                        .get(&shell.workspace.project)
-                        .is_none()
-                );
+                assert!(!shell.workspace.docks.contains_key(&shell.workspace.project));
                 assert!(shell.terminals.is_empty());
                 shell.workspace.project = local;
             })

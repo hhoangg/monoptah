@@ -126,7 +126,11 @@ fn env_lists_the_exact_pairs_that_apply_sets_and_removes() {
         let (set, remove) = profile.env(kind).unwrap();
         let mut command = Command::new("provider");
         profile.apply(kind, &mut command).unwrap();
-        let applied: HashMap<_, _> = command.get_envs().collect();
+        // The entrypoint label is a global opt-in other tests flip; it is not part of env.
+        let applied: HashMap<_, _> = command
+            .get_envs()
+            .filter(|(key, _)| *key != OsStr::new("CLAUDE_CODE_ENTRYPOINT"))
+            .collect();
         assert_eq!(applied.len(), set.len() + remove.len());
         for (key, value) in &set {
             assert_eq!(applied[OsStr::new(key)], Some(value.as_os_str()));
@@ -307,5 +311,22 @@ for line in sys.stdin:
         )
         .unwrap();
         assert!(profile.identity(Kind::Codex).is_none());
+    }
+}
+
+#[test]
+fn claude_entrypoint_label_is_opt_in_for_every_profile() {
+    let root = tempfile::tempdir().unwrap();
+    let label = |on: bool, profile: &Profile| {
+        set_claude_entrypoint(on);
+        let mut command = Command::new("provider");
+        command.env("CLAUDE_CODE_ENTRYPOINT", "sdk-cli");
+        profile.apply(Kind::Claude, &mut command).unwrap();
+        let env: HashMap<_, _> = command.get_envs().collect();
+        env[std::ffi::OsStr::new("CLAUDE_CODE_ENTRYPOINT")].map(|v| v.to_owned())
+    };
+    for profile in [Profile::default(), Profile::new("work-1", root.path())] {
+        assert_eq!(label(true, &profile), Some("monocode".into()));
+        assert_eq!(label(false, &profile), Some("sdk-cli".into()));
     }
 }

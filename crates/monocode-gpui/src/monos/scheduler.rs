@@ -1,7 +1,122 @@
 use super::panels::{button, empty_state, matches_query, search_bar};
 use super::*;
 use monocode_core::mono::habits::{Run, Schedule};
+use monocode_core::mono::heartbeat;
 use monocode_core::time::now_ms;
+
+enum Claimed {
+    Habit(Box<Habit>),
+    Heartbeat(String),
+}
+/// What a worker needs to decide whether a Mono's heartbeat is due.
+struct HeartbeatCandidate {
+    mono: Mono,
+    /// The Mono's own chat, habit runs and other app-hidden sessions.
+    skip: HashSet<i64>,
+}
+/// The user's inbox across the Mono's projects. Fetched without holding the
+/// database: providers are network calls.
+fn fetch_inbox(store: &Database, mono: &Mono) -> Vec<monocode_core::inbox::Item> {
+    let Some(cwd) = mono.projects.first() else {
+        return Vec::new();
+    };
+    let Some((data_dir, state)) = locked(store).ok().and_then(|db| {
+        Some((
+            db.data_dir()?.to_path_buf(),
+            monocode_core::inbox::ViewState::load(&db),
+        ))
+    }) else {
+        return Vec::new();
+    };
+    let service = monocode_core::inbox::Service {
+        data_dir,
+        cwd: cwd.into(),
+    };
+    let projects: Vec<std::path::PathBuf> = mono.projects.iter().map(Into::into).collect();
+    service.list(&projects, &state).items
+}
+/// Runs on a worker. Advances the cursor whenever a heartbeat is due, even when
+/// nothing changed, so a quiet Mono costs no model call.
+fn prepare_heartbeat(
+    store: &Database,
+    root: &std::path::Path,
+    beat: &HeartbeatCandidate,
+    now: u64,
+    inbox: fn(&Database, &Mono) -> Vec<monocode_core::inbox::Item>,
+) -> Result<Option<String>, String> {
+    let mono = &beat.mono;
+    let state = heartbeat::load(root, &mono.id)?;
+    if state.last_run_at == 0 {
+        // Enabling heartbeats or a first launch is not inactivity.
+        heartbeat::update(root, &mono.id, |s| s.last_run_at = now)?;
+        return Ok(None);
+    }
+    let (rows, sessions, notes) = {
+        let db = locked(store)?;
+        let chat = mono
+            .session_id
+            .map(|id| db.mono_session(id))
+            .transpose()?
+            .flatten();
+        let activity = chat.as_ref().map_or(0, |s| s.updated_at);
+        if !heartbeat::due(mono.heartbeat_minutes, &state, activity, now) {
+            return Ok(None);
+        }
+        let rows = chat
+            .map(|s| db.load(s.id))
+            .transpose()?
+            .map(|t| t.rows)
+            .unwrap_or_default();
+        if activity > state.last_run_at {
+            heartbeat::update(root, &mono.id, |s| s.quiet_streak = 0)?;
+        }
+        let all = db.sessions()?;
+        let since = state.last_run_at;
+        let mut sessions = Vec::new();
+        for s in heartbeat::idle_sessions(
+            &all,
+            &mono.projects,
+            |id| beat.skip.contains(&id),
+            since,
+            now,
+        )
+        .into_iter()
+        .take(5)
+        {
+            let (user, agent) = heartbeat::last_exchange(&db.load(s.id)?.rows);
+            sessions.push(heartbeat::SessionLead {
+                id: s.id,
+                title: s.title.clone(),
+                idle_ms: now.saturating_sub(s.updated_at),
+                user,
+                agent,
+            });
+        }
+        let notes = heartbeat::changed_notes(&db.list_notes()?, &mono.projects, since, now);
+        (rows, sessions, notes)
+    };
+    let since = state.last_run_at;
+    heartbeat::update(root, &mono.id, |s| s.last_run_at = now)?;
+    let inbox = heartbeat::changed_inbox(&inbox(store, mono), &mono.projects, since, now);
+    let files = mono::load_files(root, mono)?;
+    let standing = files
+        .soul
+        .as_deref()
+        .and_then(heartbeat::standing_instructions);
+    let digest = heartbeat::digest(sessions, notes, inbox);
+    if digest.is_empty() && standing.is_none() {
+        return Ok(None);
+    }
+    let brief = heartbeat::brief(&rows);
+    Ok(Some(heartbeat::message(
+        standing.as_deref(),
+        &digest,
+        &state.recent,
+        &brief,
+        since,
+        now,
+    )))
+}
 
 #[derive(Default)]
 pub(super) struct HabitUi {
@@ -201,7 +316,7 @@ impl Monos {
         views
     }
 
-    fn habit_running_since(&self, habit: &Habit) -> Option<u64> {
+    pub(super) fn habit_running_since(&self, habit: &Habit) -> Option<u64> {
         self.running
             .values()
             .find(|r| r.habit == habit.id && self.active.as_deref() == Some(r.mono.as_str()))
@@ -262,8 +377,7 @@ impl Monos {
         let id = h.id.clone();
         let since = self.habit_running_since(h);
         let subtitle = habit_subtitle(h, since, self.habit_busy(h), now_ms());
-        div()
-            .id(SharedString::from(format!("mono-habit-{id}")))
+        super::panels::outlined(div().id(SharedString::from(format!("mono-habit-{id}"))))
             .debug_selector({
                 let id = id.clone();
                 move || format!("mono-habit-{id}")
@@ -272,10 +386,8 @@ impl Monos {
             .w_full()
             .min_w_0()
             .flex_shrink_0()
-            .rounded_md()
             .flex()
             .items_center()
-            .hover(|s| s.bg(content(0.05)))
             .child(
                 div()
                     .id(SharedString::from(format!("mono-habit-open-{id}")))
@@ -286,7 +398,7 @@ impl Monos {
                     .flex()
                     .items_center()
                     .gap_2p5()
-                    .px_2()
+                    .px(px(10.))
                     .py_2()
                     .child(
                         div()
@@ -1265,6 +1377,41 @@ impl Monos {
         })
         .detach();
     }
+    /// Monos whose chat is idle with nothing queued; habits run first.
+    fn heartbeat_candidates(&self, cx: &App) -> Vec<HeartbeatCandidate> {
+        let mut skip: HashSet<i64> = self.roster.hidden_sessions.iter().copied().collect();
+        for m in &self.roster.monos {
+            skip.extend(m.session_id);
+            skip.extend(m.habit_sessions.iter().copied());
+        }
+        self.roster
+            .monos
+            .iter()
+            .filter(|m| m.heartbeat_minutes > 0 && m.session_id.is_some() && m.outbox.is_empty())
+            .filter(|m| !self.chats.get(&m.id).is_some_and(|v| v.read(cx).busy))
+            .filter(|m| !self.inflight.contains_key(&m.id))
+            .map(|m| HeartbeatCandidate {
+                mono: m.clone(),
+                skip: skip.clone(),
+            })
+            .collect()
+    }
+    /// A quiet heartbeat leaves nothing behind: no hidden session, no history.
+    fn discard_quiet_heartbeat(&mut self, mono: &str, session: i64, cx: &mut Context<Self>) {
+        if let Some(m) = self.roster.get_mut(mono) {
+            m.habit_sessions.retain(|&s| s != session);
+        }
+        self.roster.hidden_sessions.retain(|&s| s != session);
+        self.save(cx);
+        let store = self.store.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Ok(mut db) = locked(&store) {
+                    let _ = db.delete(session);
+                }
+            })
+            .detach();
+    }
     pub(super) fn tick(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.check_habits(cx);
         cx.notify();
@@ -1321,6 +1468,8 @@ impl Monos {
         self.scheduling = true;
         let root = self.root.clone();
         let ids: Vec<_> = self.roster.monos.iter().map(|m| m.id.clone()).collect();
+        let beats = self.heartbeat_candidates(cx);
+        let store = self.store.clone();
         let work = cx.background_executor().spawn(async move {
             for id in ids {
                 let claimed = habits::update(&root, &id, |all| {
@@ -1354,7 +1503,12 @@ impl Monos {
                     Ok(None)
                 })?;
                 if let Some(h) = claimed {
-                    return Ok::<_, String>(Some((id, h)));
+                    return Ok::<_, String>(Some((id, Claimed::Habit(Box::new(h)))));
+                }
+            }
+            for beat in beats {
+                if let Some(text) = prepare_heartbeat(&store, &root, &beat, now, fetch_inbox)? {
+                    return Ok(Some((beat.mono.id.clone(), Claimed::Heartbeat(text))));
                 }
             }
             Ok(None)
@@ -1364,7 +1518,8 @@ impl Monos {
             let _ = this.update(cx, |this, cx| {
                 this.scheduling = false;
                 match result {
-                    Ok(Some((id, habit))) => this.start_habit(&id, habit, cx),
+                    Ok(Some((id, Claimed::Habit(habit)))) => this.start_habit(&id, *habit, cx),
+                    Ok(Some((id, Claimed::Heartbeat(text)))) => this.start_heartbeat(&id, text, cx),
                     Ok(None) => (),
                     Err(e) => {
                         this.error = Some(e);
@@ -1376,12 +1531,36 @@ impl Monos {
         .detach();
     }
     fn start_habit(&mut self, id: &str, habit: Habit, cx: &mut Context<Self>) {
+        let text = habit_prompt(&habit.name, &habit.instructions);
+        self.start_run(id, habit.id, habit.name, text, false, cx);
+    }
+    pub(super) fn start_heartbeat(&mut self, id: &str, text: String, cx: &mut Context<Self>) {
+        self.start_run(
+            id,
+            heartbeat::RUN_ID.into(),
+            "Heartbeat".into(),
+            text,
+            true,
+            cx,
+        );
+    }
+    /// Habits and heartbeats run alike: a hidden side session that reports
+    /// back into the Mono's chat only when it has something to say.
+    fn start_run(
+        &mut self,
+        id: &str,
+        run_id: String,
+        name: String,
+        text: String,
+        triage: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.active_run = Some(-1);
         let Some(mono) = self.roster.get(id).cloned() else {
             return;
         };
         self.ensure_chat(id, cx);
-        let inherited = self
+        let mut inherited = self
             .chats
             .get(id)
             .map(|v| v.read(cx).settings.clone())
@@ -1398,9 +1577,27 @@ impl Monos {
             let cwd = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             // Always a chat: the app drives this session, whatever the surface preference.
             let mut s = db.create(&provider, &cwd)?;
-            s.title = format!("{} · {}", mono.label(), habit.name);
+            s.title = format!("{} · {}", mono.label(), name);
             db.title(s.id, &s.title)?;
-            Ok::<_, String>((s, mono, inherited, habit))
+            drop(db);
+            if triage && inherited.usage_limit.is_none() {
+                // The catalog is cached for a few minutes; a miss keeps the Mono's model.
+                let models = Kind::parse(&provider)
+                    .and_then(|kind| {
+                        monocode_core::catalog::models_for(kind, &inherited.account).ok()
+                    })
+                    .unwrap_or_default();
+                if let Some((model, effort)) =
+                    heartbeat::model(&provider, inherited.model.as_deref(), &models)
+                {
+                    inherited.model = Some(model);
+                    inherited.effort = effort;
+                    inherited.model_settings.clear();
+                    inherited.fast = false;
+                    inherited.service_tier = None;
+                }
+            }
+            Ok::<_, String>((s, mono, inherited))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -1410,7 +1607,7 @@ impl Monos {
                         this.active_run = None;
                         this.error = Some(e);
                     }
-                    Ok((summary, mono, mut settings, habit)) => {
+                    Ok((summary, mono, mut settings)) => {
                         let session = summary.id;
                         let view = cx.new(|cx| Conversation::new(summary, this.store.clone(), cx));
                         let root = this.root.clone();
@@ -1419,7 +1616,9 @@ impl Monos {
                             .as_ref()
                             .map(|b| b.environment(session))
                             .unwrap_or_default();
-                        settings.access = AccessMode::FullAccess;
+                        if !triage {
+                            settings.access = AccessMode::FullAccess;
+                        }
                         settings.internal_message = true;
                         settings.mono = None;
                         settings.environment.clear();
@@ -1436,7 +1635,7 @@ impl Monos {
                             session,
                             RunningHabit {
                                 mono: target.clone(),
-                                habit: habit.id.clone(),
+                                habit: run_id,
                                 view: view.clone(),
                                 started: now_ms(),
                                 launched: now_ms(),
@@ -1457,7 +1656,7 @@ impl Monos {
                         let message = Message {
                             sent_at: Some(monocode_core::time::now_ms()),
                             id: mono::new_id(),
-                            text: habit_prompt(&habit.name, &habit.instructions),
+                            text,
                             internal: true,
                             error: None,
                             attachments: Vec::new(),
@@ -1518,7 +1717,7 @@ impl Monos {
         let remaining = run.sessions.iter().filter(|s| !stopped.contains(s)).count();
         let report = ok
             .then(|| {
-                habits::report(&monocode_core::response::prose(
+                habits::report(&monocode_core::response::final_prose(
                     run.view.read(cx).mono_rows(cx),
                 ))
             })
@@ -1542,18 +1741,41 @@ impl Monos {
             report: stored,
             error,
         };
-        self.file_work(
-            id.clone(),
-            move || {
-                habits::update(&root, &id, |all| {
-                    if let Some(h) = all.iter_mut().find(|h| h.id == habit) {
-                        h.finish(result.clone())?;
-                    }
-                    Ok(())
-                })
-            },
-            cx,
-        );
+        let beat = habit == heartbeat::RUN_ID;
+        if beat {
+            let remembered = report.clone();
+            let quiet = ok && report.is_none();
+            self.file_work(
+                id.clone(),
+                move || {
+                    heartbeat::update(&root, &id, |state| {
+                        if let Some(report) = &remembered {
+                            state.remember(report);
+                            state.quiet_streak = 0;
+                        } else if quiet {
+                            state.quiet_streak = state.quiet_streak.saturating_add(1);
+                        }
+                    })
+                },
+                cx,
+            );
+            if ok && report.is_none() && run.cards.is_empty() && run.created.is_empty() {
+                self.discard_quiet_heartbeat(&run.mono, session, cx);
+            }
+        } else {
+            self.file_work(
+                id.clone(),
+                move || {
+                    habits::update(&root, &id, |all| {
+                        if let Some(h) = all.iter_mut().find(|h| h.id == habit) {
+                            h.finish(result.clone())?;
+                        }
+                        Ok(())
+                    })
+                },
+                cx,
+            );
+        }
         if let Some(post) = habit_stop::post_text(
             report.as_deref(),
             run.stop,
@@ -1563,8 +1785,11 @@ impl Monos {
             &stuck,
         ) {
             if let Some(m) = self.roster.get_mut(&run.mono) {
-                m.pending_reports
-                    .push(format!("**Habit report**\n\n{post}"));
+                m.pending_reports.push(if beat {
+                    post
+                } else {
+                    format!("**Habit report**\n\n{post}")
+                });
                 for card in &run.cards {
                     m.pending_reports.push(format!("mono-card:{card}"));
                 }
@@ -1597,6 +1822,59 @@ pub(super) fn run_post(report: Option<&str>, started: usize) -> Option<String> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn heartbeat_seeds_waits_for_quiet_then_raises_a_left_session_once() {
+        let dir = std::env::temp_dir().join(format!("mono-heartbeat-{}", mono::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.to_string_lossy().to_string();
+        let store: Database = std::sync::Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(&dir.join("native.sqlite")).unwrap(),
+        ));
+        let root = dir.join("monos");
+        let (chat, left) = {
+            let mut db = locked(&store).unwrap();
+            let chat = db.create("codex", &project).unwrap();
+            let left = db.create("codex", &project).unwrap();
+            db.title(left.id, "Hermes effort").unwrap();
+            let mut t = monocode_core::transcript::Transcript::default();
+            t.begin("user");
+            t.append("lets do option B");
+            t.begin("assistant");
+            t.append("Plan ready. Want me to start?");
+            db.write_rows(left.id, 0, &t.rows).unwrap();
+            (chat.id, left.id)
+        };
+        let beat = HeartbeatCandidate {
+            mono: Mono {
+                session_id: Some(chat),
+                projects: vec![project.clone()],
+                ..Default::default()
+            },
+            skip: HashSet::from([chat]),
+        };
+        let no_inbox: fn(&Database, &Mono) -> Vec<monocode_core::inbox::Item> = |_, _| Vec::new();
+        let t = now_ms();
+        let min = 60_000;
+        let prepare = |at| prepare_heartbeat(&store, &root, &beat, at, no_inbox).unwrap();
+        assert_eq!(prepare(t), None, "the first sight only seeds the cursor");
+        assert_eq!(prepare(t + 10 * min), None, "not quiet for long enough");
+        let text =
+            prepare(t + 2 * heartbeat::IDLE_MS).expect("a left session is worth a heartbeat");
+        assert!(text.contains(&format!("\"Hermes effort\" (sessionId {left})")));
+        assert!(text.contains("lets do option B"));
+        assert!(text.contains("Want me to start?"));
+        assert_eq!(
+            prepare(t + 2 * heartbeat::IDLE_MS + 31 * min),
+            None,
+            "nothing new and no standing instructions costs no model call"
+        );
+        assert_eq!(
+            heartbeat::load(&root, &beat.mono.id).unwrap().last_run_at,
+            t + 2 * heartbeat::IDLE_MS + 31 * min
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn habits_list_groups_today_with_running_first_and_paused_last() {

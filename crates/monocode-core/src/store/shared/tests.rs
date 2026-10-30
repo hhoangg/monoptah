@@ -1478,3 +1478,20 @@ fn database_without_the_surface_column_creates_chat_only() {
     assert_eq!(listed(&store, session.id).surface, Surface::Chat);
     assert!(store.set_terminal_conversation(session.id, "c").is_err());
 }
+
+#[test]
+fn a_steer_with_an_earlier_turns_start_still_joins_the_running_turn() {
+    // Saved by a receipt keyed to the wrong row: the steer carried a start
+    // from before it was sent, and reopening split it from its turn.
+    let turns = project_turns(&[
+        json!({"id":"old","role":"user","text":"merge it","sentAt":500,"startedAt":500}),
+        json!({"id":"done","role":"assistant","text":"Merged"}),
+        json!({"id":"first","role":"user","text":"windows fails","sentAt":1_000_000,"startedAt":1_000_000}),
+        json!({"id":"work","role":"assistant","text":"Checking"}),
+        json!({"id":"steer","role":"user","text":"is it the pr","sentAt":1_017_000,"startedAt":500}),
+        json!({"id":"answer","role":"assistant","text":"Shared test code"}),
+    ])
+    .unwrap();
+    assert_eq!(turns[&5].joined_turn, Some(3));
+    assert_eq!(turns[&5].started_at, None);
+}
