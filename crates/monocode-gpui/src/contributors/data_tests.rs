@@ -4,7 +4,7 @@
 //! repository, the network or the user's files.
 use super::{
     backend::Backend,
-    data::{Clock, Snapshot, Status, SyncState},
+    data::{Clock, Snapshot, Status, SyncState, origin_note_text},
     github::GithubView,
     jobs::SyncJobs,
 };
@@ -12,6 +12,7 @@ use chrono::{DateTime, Local, TimeZone};
 use gpui::{AppContext as _, Context, Entity, TestAppContext};
 use monocode_core::contributors::{
     ContributorsBranches, GitIdentity, GitUser, RawCommit, RawData, RawFile,
+    fetch::FetchOutcome,
     jobs::{JobState, LoadResponse, SyncEvent},
     model::{
         config::{DEFAULT_CONFIG, serialize_config},
@@ -50,6 +51,7 @@ pub(super) enum Call {
         from: String,
         to: String,
     },
+    Fetch(Option<String>),
     Start(StartCall),
     Cancel,
     Clear,
@@ -85,6 +87,7 @@ pub(super) struct State {
     pub(super) load: Script<Result<LoadResponse, String>>,
     pub(super) estimate: Script<Result<Estimate, String>>,
     pub(super) write: Script<Result<(), String>>,
+    pub(super) fetch: Script<Result<FetchOutcome, String>>,
     pub(super) start: Script<Result<(), String>>,
     pub(super) clear: Script<Result<(), String>>,
     pub(super) cancel: Script<Result<(), String>>,
@@ -118,6 +121,7 @@ impl Fake {
             load: Script::new(load_ok(synced("h1"))),
             estimate: Script::new(Ok(ESTIMATE)),
             write: Script::new(Ok(())),
+            fetch: Script::new(Ok(FetchOutcome::Skipped)),
             start: Script::new(Ok(())),
             clear: Script::new(Ok(())),
             cancel: Script::new(Ok(())),
@@ -239,6 +243,12 @@ impl Backend for Fake {
                 to: to.into(),
             });
             s.estimate.next()
+        })
+    }
+    fn fetch_origin(&self, _: &str, branch: Option<&str>) -> Result<FetchOutcome, String> {
+        self.with(|s| {
+            s.calls.push(Call::Fetch(branch.map(String::from)));
+            s.fetch.next()
         })
     }
     fn start(&self, cwd: &str, call: &StartCall) -> Result<(), String> {
@@ -497,6 +507,23 @@ impl Rig {
     /// Stops answering backend calls until the test releases them.
     fn hold(&self, cx: &mut TestAppContext) {
         self.view.update(cx, |view, _| view.hold_backend_calls());
+    }
+
+    /// Holds every answer, the fetch of origin included.
+    fn hold_fetch(&self, cx: &mut TestAppContext) {
+        self.view.update(cx, |view, _| view.hold_fetch_answers());
+    }
+
+    fn running(&self, cx: &mut TestAppContext) -> usize {
+        self.view.read_with(cx, |view, _| view.running)
+    }
+
+    fn fetches(&self) -> Vec<Call> {
+        self.fake
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::Fetch(_)))
+            .collect()
     }
 
     fn release(&self, cx: &mut TestAppContext, label: &str) {
@@ -2218,4 +2245,399 @@ fn all_time_matches_the_job_of_its_own_window_so_progress_shows(cx: &mut TestApp
     // A job of another window of the same project is not this page's job.
     rig.emit(cx, rig.event(|e| e.state = JobState::Running));
     assert_eq!(rig.snap(cx).job.unwrap().state, JobState::Queued);
+}
+
+// ---- fetching origin ------------------------------------------------------
+
+fn script_fetch(rig_fake: &Fake, answers: Vec<Result<FetchOutcome, String>>) {
+    rig_fake.with(|s| s.fetch.once = answers.into());
+}
+
+#[gpui::test]
+fn refresh_asks_origin_once_for_the_picked_branch_or_for_none(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    assert!(rig.fetches().is_empty(), "opening the page never fetches");
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    assert_eq!(rig.fetches(), [Call::Fetch(None)]);
+    rig.act(cx, |view, cx| view.set_branch(Some("dev".into()), cx));
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    assert_eq!(
+        rig.fetches(),
+        [Call::Fetch(None), Call::Fetch(Some("dev".into()))]
+    );
+    // The branch a pick-less request follows is the same as no pick.
+    rig.act(cx, |view, cx| view.set_branch(Some("main".into()), cx));
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    assert_eq!(rig.fetches().last(), Some(&Call::Fetch(None)));
+    assert_eq!(rig.running(cx), 0);
+}
+
+#[gpui::test]
+fn no_automatic_path_asks_origin(cx: &mut TestAppContext) {
+    let fake = Fake::new();
+    fake.set_load(moved("new2"));
+    let mut gh = moved("new2");
+    gh.gh_state = Some("partial".into());
+    let rig = Rig::with(cx, fake, start_of_tests(), false);
+    // The open itself topped the period up: a job, and still no fetch.
+    assert_eq!(rig.fake.starts().len(), 1);
+    rig.act(cx, |view, cx| view.refresh(false, cx));
+    rig.set_clock(local(2026, 10, 15, 10, 5));
+    rig.resume(cx);
+    rig.act(cx, |view, cx| view.set_kind(PeriodKind::Month, cx));
+    rig.act(cx, |view, cx| view.go_previous(cx));
+    rig.act(cx, |view, cx| view.set_branch(Some("dev".into()), cx));
+    rig.act(cx, |view, cx| view.set_kind(PeriodKind::All, cx));
+    rig.emit(cx, rig.event(|e| e.state = JobState::Done));
+    rig.fake.set_load(gh);
+    rig.act(cx, |view, cx| view.retry_github(cx));
+    // Midnight.
+    rig.set_clock(local(2026, 10, 16, 0, 1));
+    cx.executor().advance_clock(Duration::from_secs(36_000));
+    cx.run_until_parked();
+    let backend: Arc<dyn Backend> = rig.fake.clone();
+    rig.act(cx, |view, cx| view.set_backend(backend, cx));
+    assert!(rig.fetches().is_empty(), "{:?}", rig.fake.calls());
+}
+
+#[gpui::test]
+fn a_remote_project_never_asks_origin(cx: &mut TestAppContext) {
+    let fake = Fake::new();
+    let clock: Clock = Rc::new(start_of_tests);
+    let jobs = cx.new(SyncJobs::new);
+    let view = cx.new({
+        let jobs = jobs.clone();
+        move |cx| GithubView::new("remote://box/work/app".into(), jobs, clock, cx)
+    });
+    let backend: Arc<dyn Backend> = fake.clone();
+    view.update(cx, |view, cx| view.set_backend(backend, cx));
+    view.update(cx, |view, cx| {
+        view.refresh(true, cx);
+        view.start_sync(cx);
+    });
+    cx.run_until_parked();
+    assert!(fake.calls().is_empty());
+    assert_eq!(view.read_with(cx, |view, _| view.running), 0);
+}
+
+#[gpui::test]
+fn a_moved_tracking_ref_reads_again_and_tops_the_period_up(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    rig.hold_fetch(cx);
+    let loads = rig.fake.loads().len();
+    script_fetch(&rig.fake, vec![Ok(FetchOutcome::Fetched { moved: true })]);
+    rig.fake.with(|s| {
+        s.load.once.push_back(Ok(synced("h1")));
+        s.load.once.push_back(Ok(moved("h2")));
+    });
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    // The refresh itself never waits for the network.
+    assert_eq!(rig.fake.loads().len(), loads + 1);
+    rig.release_all(cx);
+    assert_eq!(rig.fake.loads().len(), loads + 2);
+    let starts = rig.fake.starts();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        (starts[0].mode, starts[0].old_head.as_deref()),
+        ("topup", Some("old1"))
+    );
+    assert_eq!(rig.running(cx), 0);
+}
+
+#[gpui::test]
+fn a_tracking_ref_that_did_not_move_reads_nothing_more(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    rig.hold_fetch(cx);
+    let loads = rig.fake.loads().len();
+    script_fetch(&rig.fake, vec![Ok(FetchOutcome::Fetched { moved: false })]);
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    rig.release_all(cx);
+    assert_eq!(rig.fake.loads().len(), loads + 1);
+    assert!(rig.fake.starts().is_empty());
+}
+
+#[gpui::test]
+fn all_time_reads_its_first_commit_again_when_the_ref_moved(cx: &mut TestAppContext) {
+    let fake = Fake::new();
+    fake.with(|s| s.saved_range = Some("all".into()));
+    let rig = Rig::with(cx, fake, start_of_tests(), false);
+    rig.hold_fetch(cx);
+    script_fetch(&rig.fake, vec![Ok(FetchOutcome::Fetched { moved: true })]);
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    let firsts = rig.fake.count(|c| matches!(c, Call::First(_)));
+    rig.release_all(cx);
+    assert_eq!(rig.fake.count(|c| matches!(c, Call::First(_))), firsts + 1);
+}
+
+#[gpui::test]
+fn a_failed_fetch_keeps_the_data_and_shows_a_note_with_the_time(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    script_fetch(
+        &rig.fake,
+        vec![Ok(FetchOutcome::Failed(
+            "fatal: unable to access 'https://user:secret@host/r.git'".into(),
+        ))],
+    );
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    let snap = rig.snap(cx);
+    assert_eq!(
+        snap.origin_note.as_deref(),
+        Some("Data as of 09:55, could not reach origin")
+    );
+    assert_eq!(snap.status, Status::Ready);
+    assert!(snap.error.is_none() && snap.model.is_some());
+    assert!(!snap.fetching);
+    assert_eq!(rig.running(cx), 0);
+    // The next success clears it.
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    assert!(rig.snap(cx).origin_note.is_none());
+}
+
+#[gpui::test]
+fn an_error_of_the_call_is_a_failed_fetch_too(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    script_fetch(&rig.fake, vec![Err("Not a git repository".into())]);
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    let snap = rig.snap(cx);
+    assert!(snap.origin_note.is_some());
+    assert!(snap.error.is_none());
+}
+
+#[gpui::test]
+fn the_note_belongs_to_the_branch_that_failed(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    script_fetch(&rig.fake, vec![Ok(FetchOutcome::Failed("x".into()))]);
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    assert!(rig.snap(cx).origin_note.is_some());
+    rig.act(cx, |view, cx| view.set_branch(Some("dev".into()), cx));
+    assert!(rig.snap(cx).origin_note.is_none());
+    // A good fetch of another branch must not wipe main's note.
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    assert!(rig.snap(cx).origin_note.is_none());
+    rig.act(cx, |view, cx| view.set_branch(Some("main".into()), cx));
+    assert!(rig.snap(cx).origin_note.is_some());
+    // Without a time of the last sync the note still says it.
+    rig.fake.set_load(unsynced());
+    rig.act(cx, |view, cx| view.refresh(false, cx));
+    rig.act(cx, |view, cx| view.set_kind(PeriodKind::Month, cx));
+    assert_eq!(
+        rig.snap(cx).origin_note.as_deref(),
+        Some("Could not reach origin")
+    );
+}
+
+#[gpui::test]
+fn skipped_and_cancelled_fetches_clear_the_note(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    for outcome in [FetchOutcome::Skipped, FetchOutcome::Cancelled] {
+        script_fetch(
+            &rig.fake,
+            vec![Ok(FetchOutcome::Failed("x".into())), Ok(outcome.clone())],
+        );
+        rig.act(cx, |view, cx| view.refresh(true, cx));
+        assert!(rig.snap(cx).origin_note.is_some());
+        rig.act(cx, |view, cx| view.refresh(true, cx));
+        assert!(rig.snap(cx).origin_note.is_none(), "{outcome:?}");
+    }
+}
+
+#[gpui::test]
+fn a_second_refresh_joins_the_fetch_and_the_spinner_stops_on_every_outcome(
+    cx: &mut TestAppContext,
+) {
+    let outcomes: Vec<Result<FetchOutcome, String>> = vec![
+        Ok(FetchOutcome::Fetched { moved: false }),
+        Ok(FetchOutcome::Fetched { moved: true }),
+        Ok(FetchOutcome::Skipped),
+        Ok(FetchOutcome::Busy),
+        Ok(FetchOutcome::Cancelled),
+        Ok(FetchOutcome::Failed("x".into())),
+        Err("boom".into()),
+    ];
+    for outcome in outcomes {
+        let rig = Rig::new(cx);
+        rig.hold_fetch(cx);
+        script_fetch(&rig.fake, vec![outcome.clone()]);
+        rig.act(cx, |view, cx| view.refresh(true, cx));
+        rig.act(cx, |view, cx| view.refresh(true, cx));
+        assert_eq!(rig.fetches().len(), 1, "{outcome:?}");
+        assert!(rig.snap(cx).fetching && rig.snap(cx).refreshing);
+        rig.release_all(cx);
+        let snap = rig.snap(cx);
+        assert!(!snap.fetching && !snap.refreshing, "{outcome:?}");
+        assert_eq!(rig.running(cx), 0, "{outcome:?}");
+    }
+}
+
+#[gpui::test]
+fn sync_waits_for_the_fetch_and_then_starts_a_full_job(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    rig.hold_fetch(cx);
+    rig.act(cx, |view, cx| view.start_sync(cx));
+    assert!(rig.fake.starts().is_empty());
+    assert!(rig.snap(cx).fetching);
+    // A press while it runs joins it.
+    rig.act(cx, |view, cx| view.start_sync(cx));
+    assert_eq!(rig.fetches().len(), 1);
+    rig.release(cx, "fetch");
+    let starts = rig.fake.starts();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].mode, "full");
+    let calls = rig.fake.calls();
+    let at = |pred: fn(&Call) -> bool| calls.iter().position(pred).unwrap();
+    assert!(at(|c| matches!(c, Call::Fetch(_))) < at(|c| matches!(c, Call::Start(_))));
+}
+
+#[gpui::test]
+fn sync_starts_on_what_is_there_after_a_failed_fetch(cx: &mut TestAppContext) {
+    for outcome in [
+        Ok(FetchOutcome::Failed("x".into())),
+        Err("boom".into()),
+        Ok(FetchOutcome::Skipped),
+        Ok(FetchOutcome::Busy),
+        Ok(FetchOutcome::Fetched { moved: false }),
+    ] {
+        let rig = Rig::new(cx);
+        script_fetch(&rig.fake, vec![outcome.clone()]);
+        rig.act(cx, |view, cx| view.start_sync(cx));
+        assert_eq!(rig.fake.starts().len(), 1, "{outcome:?}");
+    }
+}
+
+#[gpui::test]
+fn sync_does_not_start_after_a_cancel_or_when_the_period_changed(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    rig.hold_fetch(cx);
+    script_fetch(&rig.fake, vec![Ok(FetchOutcome::Cancelled)]);
+    rig.act(cx, |view, cx| view.start_sync(cx));
+    rig.release_all(cx);
+    assert!(rig.fake.starts().is_empty());
+
+    let rig = Rig::new(cx);
+    rig.hold_fetch(cx);
+    rig.act(cx, |view, cx| view.start_sync(cx));
+    rig.act(cx, |view, cx| view.set_kind(PeriodKind::Month, cx));
+    rig.release_all(cx);
+    assert!(rig.fake.starts().is_empty());
+}
+
+#[gpui::test]
+fn cancel_reaches_the_core_while_only_a_fetch_runs(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    rig.hold_fetch(cx);
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    let snap = rig.snap(cx);
+    assert!(snap.fetching && snap.job.is_none());
+    rig.act(cx, |view, cx| view.cancel_sync(cx));
+    assert_eq!(rig.fake.count(|c| matches!(c, Call::Cancel)), 1);
+}
+
+#[gpui::test]
+fn retry_github_does_not_fetch(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    rig.act(cx, |view, cx| view.retry_github(cx));
+    assert!(rig.fetches().is_empty());
+    assert_eq!(rig.fake.starts()[0].mode, "github");
+}
+
+#[test]
+fn the_origin_note_names_the_time_of_the_sync() {
+    use super::data::OriginIssue::{Gone, Unreachable};
+    let now = local(2026, 10, 15, 10, 0);
+    let at = |t: DateTime<Local>| Some(t.timestamp());
+    assert_eq!(
+        origin_note_text(Unreachable, at(local(2026, 10, 15, 8, 5)), &now),
+        "Data as of 08:05, could not reach origin"
+    );
+    assert_eq!(
+        origin_note_text(Unreachable, at(local(2026, 10, 3, 14, 30)), &now),
+        "Data as of Oct 3, 14:30, could not reach origin"
+    );
+    assert_eq!(
+        origin_note_text(Unreachable, None, &now),
+        "Could not reach origin"
+    );
+    assert_eq!(
+        origin_note_text(Gone, at(local(2026, 10, 15, 14, 30)), &now),
+        "Data as of 14:30, origin no longer has this branch"
+    );
+    assert_eq!(
+        origin_note_text(Gone, None, &now),
+        "Origin no longer has this branch"
+    );
+}
+
+#[gpui::test]
+fn a_branch_origin_dropped_shows_its_own_note_and_keeps_the_data(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    script_fetch(&rig.fake, vec![Ok(FetchOutcome::Gone)]);
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    let snap = rig.snap(cx);
+    assert_eq!(
+        snap.origin_note.as_deref(),
+        Some("Data as of 09:55, origin no longer has this branch")
+    );
+    assert!(snap.error.is_none() && snap.model.is_some());
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    assert!(rig.snap(cx).origin_note.is_none());
+}
+
+#[gpui::test]
+fn a_busy_fetch_leaves_the_note_as_it_was(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    script_fetch(
+        &rig.fake,
+        vec![Ok(FetchOutcome::Failed("x".into())), Ok(FetchOutcome::Busy)],
+    );
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    rig.act(cx, |view, cx| view.refresh(true, cx));
+    assert!(rig.snap(cx).origin_note.is_some());
+}
+
+#[gpui::test]
+fn sync_of_a_covered_period_whose_branch_moved_leaves_the_work_to_the_top_up(
+    cx: &mut TestAppContext,
+) {
+    let rig = Rig::new(cx);
+    rig.hold_fetch(cx);
+    script_fetch(&rig.fake, vec![Ok(FetchOutcome::Fetched { moved: true })]);
+    rig.fake.with(|s| s.load.once.push_back(Ok(moved("h2"))));
+    let loads = rig.fake.loads().len();
+    rig.act(cx, |view, cx| view.start_sync(cx));
+    rig.release_all(cx);
+    // The reload happened, and the incremental sync is the top-up, not Full.
+    assert_eq!(rig.fake.loads().len(), loads + 1);
+    let modes: Vec<&str> = rig.fake.starts().iter().map(|c| c.mode).collect();
+    assert_eq!(modes, ["topup"]);
+}
+
+#[gpui::test]
+fn sync_of_a_covered_period_whose_branch_did_not_move_still_syncs(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    script_fetch(&rig.fake, vec![Ok(FetchOutcome::Fetched { moved: false })]);
+    rig.act(cx, |view, cx| view.start_sync(cx));
+    let modes: Vec<&str> = rig.fake.starts().iter().map(|c| c.mode).collect();
+    assert_eq!(modes, ["full"]);
+}
+
+#[gpui::test]
+fn sync_of_an_unsynced_period_syncs_even_when_the_branch_moved(cx: &mut TestAppContext) {
+    let fake = Fake::new();
+    fake.set_load(unsynced());
+    let rig = Rig::with(cx, fake, start_of_tests(), false);
+    script_fetch(&rig.fake, vec![Ok(FetchOutcome::Fetched { moved: true })]);
+    rig.act(cx, |view, cx| view.start_sync(cx));
+    let modes: Vec<&str> = rig.fake.starts().iter().map(|c| c.mode).collect();
+    assert_eq!(modes, ["full"]);
+}
+
+#[gpui::test]
+fn cancel_while_the_fetch_runs_stops_the_waiting_sync(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    rig.hold_fetch(cx);
+    rig.act(cx, |view, cx| view.start_sync(cx));
+    rig.act(cx, |view, cx| view.cancel_sync(cx));
+    // The fetch finished before it saw the cancel.
+    rig.release_all(cx);
+    assert!(rig.fake.starts().is_empty());
 }

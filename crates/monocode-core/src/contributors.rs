@@ -13,6 +13,7 @@ pub mod api;
 pub mod assessor;
 pub mod clickup_tickets;
 pub mod db;
+pub mod fetch;
 pub mod gh;
 pub mod jobs;
 pub mod model;
@@ -198,6 +199,8 @@ pub struct RawData {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContributorsBranches {
+    /// The branch a request without a pick reads: the default branch of
+    /// `origin` when the repository has one, else the checked-out branch.
     pub current: String,
     pub branches: Vec<String>,
 }
@@ -352,27 +355,76 @@ fn repo_root(cwd: &Path) -> Result<PathBuf, String> {
 }
 
 fn current_branch(root: &Path) -> String {
-    git(root, ["symbolic-ref", "--short", "-q", "HEAD"])
-        .map(|s| s.trim().to_string())
+    // Not `--short`: a tag with the branch's name makes that print `heads/main`.
+    git(root, ["symbolic-ref", "-q", "HEAD"])
         .ok()
+        .and_then(|s| s.trim().strip_prefix("refs/heads/").map(str::to_string))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "HEAD".to_string())
 }
 
-/// Returns the branch name to report and the commit sha it points to.
-fn resolve_branch(root: &Path, branch: Option<&str>) -> Result<(String, String), String> {
-    let name = match branch.map(str::trim).filter(|b| !b.is_empty()) {
+/// The default branch of `origin`, read from the local remote-tracking refs
+/// only (no network). `refs/remotes/origin/HEAD` names it; when that is missing
+/// or stale, `main` and then `master` stand in. The tracking ref must exist, so
+/// a name is never returned that cannot be read.
+fn origin_default_branch(root: &Path) -> Option<String> {
+    const PREFIX: &str = "refs/remotes/origin/";
+    let exists = |name: &str| pr_heads::remote_branch_tip(root, name).is_some();
+    let named = git(root, ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+        .ok()
+        .and_then(|out| out.trim().strip_prefix(PREFIX).map(str::to_string))
+        .filter(|name| name != "HEAD" && exists(name));
+    named.or_else(|| {
+        ["main", "master"]
+            .into_iter()
+            .find(|name| exists(name))
+            .map(str::to_string)
+    })
+}
+
+/// The branch a request without a pick reads. Following the origin default
+/// means the page shows what landed there whatever is checked out; a
+/// repository without an origin keeps following its checkout.
+fn default_branch(root: &Path) -> String {
+    origin_default_branch(root).unwrap_or_else(|| current_branch(root))
+}
+
+/// The branch name a request reads: the pick, else the default.
+fn target_branch(root: &Path, branch: Option<&str>) -> Result<String, String> {
+    match branch.map(str::trim).filter(|b| !b.is_empty()) {
         Some(b) => {
             if b.starts_with('-') {
                 return Err(format!("Unknown branch: {b}"));
             }
-            b.to_string()
+            Ok(b.to_string())
         }
-        None => current_branch(root),
+        None => Ok(default_branch(root)),
+    }
+}
+
+/// Returns the branch name to report and the commit sha it points to. The
+/// remote-tracking ref wins over the local branch of the same name, so what
+/// landed on `origin` is what is read; local refs are never changed. `HEAD` is
+/// never looked up on the remote (`refs/remotes/origin/HEAD` is a symref).
+fn resolve_branch(root: &Path, branch: Option<&str>) -> Result<(String, String), String> {
+    let name = target_branch(root, branch)?;
+    let tracked = (name != "HEAD")
+        .then(|| pr_heads::remote_branch_tip(root, &name))
+        .flatten();
+    if let Some(head) = tracked {
+        return Ok((name, head));
+    }
+    // A branch wins over a tag of the same name; the bare name still finds
+    // tags, shas and `HEAD`.
+    let verify = |spec: String| git(root, ["rev-parse", "--verify", "--quiet", spec.as_str()]);
+    let local = (name != "HEAD")
+        .then(|| verify(format!("refs/heads/{name}^{{commit}}")).ok())
+        .flatten();
+    let head = match local {
+        Some(head) => head,
+        None => verify(format!("{name}^{{commit}}"))
+            .map_err(|_| format!("Unknown branch or no commits yet: {name}"))?,
     };
-    let spec = format!("{name}^{{commit}}");
-    let head = git(root, ["rev-parse", "--verify", "--quiet", spec.as_str()])
-        .map_err(|_| format!("Unknown branch or no commits yet: {name}"))?;
     let head = head.trim().to_string();
     if head.is_empty() {
         return Err(format!("Unknown branch or no commits yet: {name}"));
@@ -2110,10 +2162,10 @@ pub(crate) fn write_config(cwd: &Path, content: &str) -> Result<(), String> {
 
 pub(crate) fn list_branches(cwd: &Path) -> Result<ContributorsBranches, String> {
     let root = repo_root(cwd)?;
-    let current = current_branch(&root);
+    let current = default_branch(&root);
     let listed = git(
         &root,
-        ["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        ["for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads"],
     )?;
     let mut branches: Vec<String> = listed
         .lines()
@@ -2121,9 +2173,14 @@ pub(crate) fn list_branches(cwd: &Path) -> Result<ContributorsBranches, String> 
         .filter(|b| !b.is_empty())
         .map(str::to_string)
         .collect();
-    if let Some(index) = branches.iter().position(|b| *b == current) {
-        let name = branches.remove(index);
-        branches.insert(0, name);
+    match branches.iter().position(|b| *b == current) {
+        Some(index) => {
+            let name = branches.remove(index);
+            branches.insert(0, name);
+        }
+        // The origin default may have no local branch; "HEAD" is not a branch.
+        None if current != "HEAD" => branches.insert(0, current.clone()),
+        None => {}
     }
     Ok(ContributorsBranches { current, branches })
 }
@@ -2225,6 +2282,12 @@ pub(super) mod tests {
                 "2026-01-01T00:00:00+0000",
             );
             repo
+        }
+
+        /// Takes over a repository made some other way (a clone); it is removed
+        /// when this value is dropped.
+        pub(super) fn adopt(dir: PathBuf) -> Self {
+            Self { dir }
         }
 
         pub(super) fn path(&self) -> &Path {

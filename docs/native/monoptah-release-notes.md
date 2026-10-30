@@ -8,6 +8,7 @@ A release of the experimental Rust + GPUI app for macOS on Apple silicon. The Re
 - On the workflow board a Switch card has one output port per case plus `default`. The inspector edits the value, the question, who decides, and the list of cases; renaming or removing a case keeps its connected edge in step.
 - Workflow validation checks Switch nodes: cases must be non-blank and unique, `default` is reserved, and every out-edge needs a case or `default` handle, with at most one edge per handle. `workflows.guide` documents the node.
 - Existing workflows with If nodes load and save unchanged.
+- Contributors: Refresh and Sync on the GitHub tab now fetch the default branch from `origin` and read `refs/remotes/origin/<branch>`, so commits that landed on the remote show up without a manual `git pull`. With no branch selected the page follows the default branch of `origin`, and unpushed commits are not counted. Fetching never changes the working tree or local branches. If `origin` cannot be reached, the stored data stays and the page says how old it is. Repositories without `origin` keep reading the local branch.
 
 ## What it is
 
