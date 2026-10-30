@@ -20,7 +20,7 @@ pub(super) fn type_glyph(ty: NodeType) -> &'static str {
         NodeType::Session => "message-multiple",
         NodeType::Command => "terminal",
         NodeType::AskMono => "circle-help",
-        NodeType::If => "git-branch",
+        NodeType::If | NodeType::Switch => "git-branch",
         NodeType::ForEach => "refresh-cw",
         NodeType::Report => "paper-plane",
     }

@@ -35,7 +35,7 @@ pub(in crate::monos) enum GraphEvent {
     /// dropped on `target`, at `at` in the window.
     Connect {
         source: String,
-        handle: Option<&'static str>,
+        handle: Option<String>,
         target: String,
         at: gpui::Point<Pixels>,
     },
@@ -48,7 +48,7 @@ pub(in crate::monos) enum GraphEvent {
 }
 
 /// Whether a connection from a node (by the If handle, if any) to another may be made.
-pub(in crate::monos) type Connector = Rc<dyn Fn(&str, Option<&'static str>, &str) -> bool>;
+pub(in crate::monos) type Connector = Rc<dyn Fn(&str, Option<&str>, &str) -> bool>;
 
 /// A card being dragged: which, where the pointer went down, and where the card was.
 struct NodeDrag {
@@ -162,7 +162,7 @@ impl GraphCanvas {
     pub(in crate::monos) fn may_connect(
         &self,
         source: &str,
-        handle: Option<&'static str>,
+        handle: Option<&str>,
         target: &str,
     ) -> bool {
         self.connector
@@ -372,8 +372,8 @@ impl GraphCanvas {
         let to = self.view.to_graph(self.local(event.position));
         let scene = self.scene.clone();
         let hover = self.connection.as_ref().and_then(|c| {
-            let handle = match c.kind {
-                HandleKind::Out(handle) => handle,
+            let handle = match &c.kind {
+                HandleKind::Out(handle) => handle.as_deref(),
                 _ => None,
             };
             drop_target(to, &scene.nodes, &c.source, self.view.zoom)

@@ -5,7 +5,7 @@
 //! f32 pixels with the same numbers as the React board.
 use super::model::{
     new_workflow_id, stable_json, Checkout, Cwd, Decide, Edge, Handle, InputType, InputValue,
-    LoopSpec, Node, NodeId, NodeKind, Ui, Workflow, WorkflowInput,
+    LoopSpec, Node, NodeId, NodeKind, Ui, Workflow, WorkflowInput, SWITCH_DEFAULT,
 };
 use super::ordered::OrderedMap;
 use super::run_graph_model::{RunEdgeState, RunNodeState};
@@ -32,7 +32,8 @@ pub const GROUP_SLACK: f32 = 44.0;
 /// The height of a For each with nothing in it yet.
 pub const EMPTY_GROUP_H: f32 = GROUP_HEADER + NODE_H + GROUP_PAD + GROUP_SLACK;
 
-/// Handle ids: the two outs of an If node ("true", "false"), and the side handles a loop edge uses.
+/// Handle ids: the two outs of an If node ("true", "false"), the outs of a Switch (each case,
+/// and `SWITCH_DEFAULT`), and the side handles a loop edge uses.
 pub const LOOP_OUT: &str = "loop-out";
 pub const LOOP_IN: &str = "loop-in";
 
@@ -135,8 +136,8 @@ pub enum EdgeKind {
     Loop,
 }
 
-/// An edge on the canvas. `source_handle` is "true"/"false" on an If out edge and `LOOP_OUT` on
-/// a loop edge (whose `target_handle` is `LOOP_IN`). `run` is set only in the run graph, and
+/// An edge on the canvas. `source_handle` is "true"/"false" on an If out edge, a case or
+/// "default" on a Switch out edge, and `LOOP_OUT` on a loop edge (whose `target_handle` is `LOOP_IN`). `run` is set only in the run graph, and
 /// `compact` only on the edges of lanes drawn side by side.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlowEdge {
@@ -144,7 +145,7 @@ pub struct FlowEdge {
     pub kind: EdgeKind,
     pub source: NodeId,
     pub target: NodeId,
-    pub source_handle: Option<&'static str>,
+    pub source_handle: Option<String>,
     pub target_handle: Option<&'static str>,
     pub loop_spec: Option<LoopSpec>,
     pub compact: bool,
@@ -167,18 +168,20 @@ pub enum NodeType {
     Command,
     AskMono,
     If,
+    Switch,
     ForEach,
     Report,
 }
 
 impl NodeType {
-    pub const ALL: [NodeType; 8] = [
+    pub const ALL: [NodeType; 9] = [
         Self::Schedule,
         Self::Manual,
         Self::Session,
         Self::Command,
         Self::AskMono,
         Self::If,
+        Self::Switch,
         Self::ForEach,
         Self::Report,
     ];
@@ -192,6 +195,7 @@ impl NodeType {
             Self::Command => "command",
             Self::AskMono => "askMono",
             Self::If => "if",
+            Self::Switch => "switch",
             Self::ForEach => "forEach",
             Self::Report => "report",
         }
@@ -205,6 +209,7 @@ impl NodeType {
             NodeKind::Command { .. } => Self::Command,
             NodeKind::AskMono { .. } => Self::AskMono,
             NodeKind::If { .. } => Self::If,
+            NodeKind::Switch { .. } => Self::Switch,
             NodeKind::ForEach { .. } => Self::ForEach,
             NodeKind::Report { .. } => Self::Report,
         }
@@ -218,17 +223,24 @@ impl NodeType {
             Self::Command => "command",
             Self::AskMono => "ask",
             Self::If => "check",
+            Self::Switch => "route",
             Self::ForEach => "each",
             Self::Report => "report",
         }
     }
 }
 
-/// The name of an If handle as it is written on an edge and in an edge id.
-pub fn handle_name(handle: Handle) -> &'static str {
-    match handle {
-        Handle::True => "true",
-        Handle::False => "false",
+/// The out handles a node draws: "true" and "false" for an If; the cases and then "default" for
+/// a Switch; none for any other node.
+pub fn out_handles(node: &Node) -> Vec<String> {
+    match &node.kind {
+        NodeKind::If { .. } => vec!["true".into(), "false".into()],
+        NodeKind::Switch { cases, .. } => cases
+            .iter()
+            .cloned()
+            .chain(std::iter::once(SWITCH_DEFAULT.to_string()))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -431,9 +443,9 @@ pub fn auto_place(w: &Workflow, parent: Option<&str>) -> Point {
 
 // --- the workflow as a flow --------------------------------------------------------------------
 
-fn edge_id(from: &str, to: &str, handle: Option<Handle>, looped: bool) -> String {
+fn edge_id(from: &str, to: &str, handle: Option<&Handle>, looped: bool) -> String {
     let handle = handle
-        .map(|h| format!(".{}", handle_name(h)))
+        .map(|h| format!(".{}", h.as_str()))
         .unwrap_or_default();
     format!("{from}{handle}->{to}{}", if looped { "~loop" } else { "" })
 }
@@ -444,7 +456,7 @@ pub fn make_edge(
     handle: Option<Handle>,
     loop_spec: Option<LoopSpec>,
 ) -> FlowEdge {
-    let id = edge_id(from, to, handle, loop_spec.is_some());
+    let id = edge_id(from, to, handle.as_ref(), loop_spec.is_some());
     let looped = loop_spec.is_some();
     FlowEdge {
         id,
@@ -456,9 +468,9 @@ pub fn make_edge(
         source: from.to_string(),
         target: to.to_string(),
         source_handle: if looped {
-            Some(LOOP_OUT)
+            Some(LOOP_OUT.to_string())
         } else {
-            handle.map(handle_name)
+            handle.map(|h| h.as_str().to_string())
         },
         target_handle: looped.then_some(LOOP_IN),
         loop_spec,
@@ -502,7 +514,7 @@ pub fn to_flow(w: &Workflow) -> Flow {
         .edges
         .iter()
         .map(|e| {
-            let mut edge = make_edge(&e.from, &e.to, e.handle, e.loop_spec.clone());
+            let mut edge = make_edge(&e.from, &e.to, e.handle.clone(), e.loop_spec.clone());
             let mut id = edge.id.clone();
             let mut n = 2;
             while seen.contains(&id) {
@@ -555,11 +567,11 @@ pub fn from_flow(base: &Workflow, nodes: &[FlowNode], edges: &[FlowEdge]) -> Wor
     let out_edges = edges
         .iter()
         .map(|e| {
-            let handle = match e.source_handle {
-                Some("true") => Some(Handle::True),
-                Some("false") => Some(Handle::False),
-                _ => None,
-            };
+            let handle = e
+                .source_handle
+                .as_deref()
+                .filter(|h| !h.is_empty())
+                .map(Handle::named);
             Edge {
                 from: e.source.clone(),
                 to: e.target.clone(),
@@ -606,7 +618,7 @@ pub enum ConnectionKind {
 /// What dragging a connection from `from` to `to` makes. A loop is a connection back to an
 /// ancestor in the same branch, allowed from a session, command or Ask Mono node that has no
 /// loop yet; anything else that would break the graph's rules is invalid. `handle` is the If
-/// handle the connection leaves from; an If node may send both to one node.
+/// or Switch handle the connection leaves from; either may send two handles to one node.
 pub fn connection_kind(
     w: &Workflow,
     from: &str,
@@ -616,6 +628,12 @@ pub fn connection_kind(
     let (Some(a), Some(b)) = (w.node(from), w.node(to)) else {
         return ConnectionKind::Invalid;
     };
+    // A Switch has an out handle for each case and for the default, and no other.
+    if let (NodeKind::Switch { cases, .. }, Some(h)) = (&a.kind, &handle) {
+        if h.as_str() != SWITCH_DEFAULT && !cases.iter().any(|c| c == h.as_str()) {
+            return ConnectionKind::Invalid;
+        }
+    }
     if from == to || b.is_trigger() || matches!(a.kind, NodeKind::Report { .. }) {
         return ConnectionKind::Invalid;
     }
@@ -705,6 +723,12 @@ pub fn new_node(ty: NodeType, w: &Workflow) -> Node {
         },
         NodeType::If => NodeKind::If {
             condition: None,
+            decide: Some(Decide::Mono),
+            question: None,
+        },
+        NodeType::Switch => NodeKind::Switch {
+            value: None,
+            cases: vec!["a".into(), "b".into()],
             decide: Some(Decide::Mono),
             question: None,
         },

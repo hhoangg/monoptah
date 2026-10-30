@@ -628,7 +628,7 @@ pub fn default_run_view(run: &WorkflowRun) -> RunView {
 
 // --- edges ------------------------------------------------------------------------------------
 
-fn edge_state(def: &Edge, branch: &str, by_key: &ByKey) -> RunEdgeState {
+fn edge_state(def: &Edge, branch: &str, by_key: &ByKey, branching: bool) -> RunEdgeState {
     let Some(source) = by_key.get(&node_run_key(&def.from, branch)).copied() else {
         return RunEdgeState::Idle;
     };
@@ -654,9 +654,9 @@ fn edge_state(def: &Edge, branch: &str, by_key: &ByKey) -> RunEdgeState {
     if source.status != NodeStatus::Done {
         return RunEdgeState::Idle;
     }
-    if let Some(handle) = def.handle {
-        let want = super::board_model::handle_name(handle);
-        if source.decision.as_ref().map(|d| d.value.as_str()) != Some(want) {
+    // Only the handles of an If or Switch pick a side; a stray one elsewhere is ignored.
+    if let Some(handle) = def.handle.as_ref().filter(|_| branching) {
+        if source.decision.as_ref().map(|d| d.value.as_str()) != Some(handle.as_str()) {
             return RunEdgeState::Idle;
         }
     }
@@ -905,11 +905,17 @@ pub fn run_graph(run: &WorkflowRun, view: RunView, groups: &[GroupView], now: u6
         .collect();
     let scope = |id: &str| parent_of.get(id).copied().flatten();
     let mut edges: Vec<FlowEdge> = Vec::new();
+    let branching = |id: &str| {
+        run.definition
+            .nodes
+            .iter()
+            .any(|n| n.id == id && matches!(n.kind, NodeKind::If { .. } | NodeKind::Switch { .. }))
+    };
     for (flow, def) in base.edges.iter().zip(&run.definition.edges) {
         let (from, to) = (scope(&def.from), scope(&def.to));
         if from.is_none() && to.is_none() {
             let mut edge = flow.clone();
-            edge.run = Some(edge_state(def, "", &by_key));
+            edge.run = Some(edge_state(def, "", &by_key, branching(&def.from)));
             edges.push(edge);
         } else if from.is_some() && from == to {
             for lane in lanes.get(from.unwrap_or_default()).into_iter().flatten() {
@@ -917,7 +923,7 @@ pub fn run_graph(run: &WorkflowRun, view: RunView, groups: &[GroupView], now: u6
                 edge.id = format!("{}@{}", flow.id, lane.branch);
                 edge.source = format!("{}@{}", def.from, lane.branch);
                 edge.target = format!("{}@{}", def.to, lane.branch);
-                edge.run = Some(edge_state(def, &lane.branch, &by_key));
+                edge.run = Some(edge_state(def, &lane.branch, &by_key, branching(&def.from)));
                 edge.compact = compact;
                 edges.push(edge);
             }

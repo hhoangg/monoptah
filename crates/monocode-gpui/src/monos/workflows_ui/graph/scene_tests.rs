@@ -1,5 +1,6 @@
 //! The scene the canvas draws: nodes at their place on the canvas and edges routed from handle
 //! to handle, built from the pure board and run models.
+use super::cards::{port_label, port_label_width};
 use super::geometry::{Rect, Seg};
 use super::scene::*;
 use monocode_core::mono::workflows::{
@@ -43,6 +44,75 @@ fn first_and_last(edge: &RoutedEdge) -> (Point, Point) {
         other => panic!("{other:?}"),
     };
     (start, end)
+}
+
+#[test]
+fn the_outs_of_a_switch_leave_in_order_by_case_then_default() {
+    let w = workflow(
+        json!([
+            {"id": "route", "type": "switch", "value": "{{a.kind}}", "cases": ["bug", "feature"]},
+            session("one"), session("two"), session("three"),
+        ]),
+        json!([
+            {"from": "route", "to": "one", "handle": "bug"},
+            {"from": "route", "to": "two", "handle": "feature"},
+            {"from": "route", "to": "three", "handle": "default"},
+        ]),
+    );
+    let scene = scene_of(&w);
+    let rect = node(&scene, "route").rect;
+    let start = |target: &str| {
+        let edge = scene
+            .edges
+            .iter()
+            .find(|e| e.id.ends_with(&format!("->{target}")))
+            .unwrap();
+        first_and_last(edge).0.x - rect.x
+    };
+    let (bug, feature, default) = (start("one"), start("two"), start("three"));
+    assert!(
+        bug < feature && feature < default,
+        "{bug} {feature} {default}"
+    );
+    for (got, index) in [(bug, 0), (feature, 1), (default, 2)] {
+        assert!((got - NODE_W * out_at(index, 3)).abs() < 0.01, "{got}");
+    }
+}
+
+#[test]
+fn out_at_keeps_the_places_of_an_if_and_spreads_more_outs_evenly() {
+    assert_eq!(out_at(0, 1), 0.5);
+    assert_eq!((out_at(0, 2), out_at(1, 2)), (TRUE_AT, FALSE_AT));
+    let five: Vec<f32> = (0..5).map(|i| out_at(i, 5)).collect();
+    assert!(five.windows(2).all(|p| p[1] > p[0]));
+    assert!(five[0] > 0. && five[4] < 1.);
+    let gaps: Vec<f32> = five.windows(2).map(|p| p[1] - p[0]).collect();
+    assert!(gaps.iter().all(|g| (g - gaps[0]).abs() < 0.001));
+}
+
+#[test]
+fn a_port_label_is_cut_to_fit_under_its_out() {
+    assert_eq!(port_label("bug", 40.), "bug");
+    let cut = port_label("a very long case name", 40.);
+    assert!(
+        cut.chars().count() <= 6 && cut.ends_with('\u{2026}'),
+        "{cut}"
+    );
+    // The room per label shrinks as outs are added.
+    assert!(port_label_width(NODE_W, 0, 6) < port_label_width(NODE_W, 0, 3));
+    // A label never reaches the next out, and the last one stays inside the card.
+    for count in [2, 3, 6] {
+        for index in 0..count {
+            let start = NODE_W * out_at(index, count) + 9.;
+            let end = start + port_label_width(NODE_W, index, count);
+            let limit = if index + 1 < count {
+                NODE_W * out_at(index + 1, count)
+            } else {
+                NODE_W
+            };
+            assert!(end <= limit + 0.01, "{index}/{count}: {end} > {limit}");
+        }
+    }
 }
 
 #[test]

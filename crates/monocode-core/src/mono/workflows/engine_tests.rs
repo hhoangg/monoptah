@@ -2031,3 +2031,295 @@ fn an_unknown_loop_edge_target_or_cross_parent_loop_is_ignored() {
     let run = begin(&w);
     assert_eq!(session_node_ids(&next_actions(&run)), vec!["a".to_string()]);
 }
+
+// ---------------------------------------------------------------------------------------------
+// switch
+// ---------------------------------------------------------------------------------------------
+
+/// trigger -> triage -> route (switch on `triage.kind`) -> fix | plan | other -> report.
+fn switch_workflow(route: Value) -> Workflow {
+    let mut route_node = json!({"id": "route", "type": "switch", "cases": ["bug", "feature"]});
+    for (k, x) in route.as_object().unwrap() {
+        route_node[k] = x.clone();
+    }
+    def(
+        vec![
+            trigger(),
+            session("triage", json!({"output": {"kind": {"type": "string"}}})),
+            n(route_node),
+            plain("fix"),
+            plain("plan"),
+            plain("other"),
+            report(),
+        ],
+        vec![
+            e("trigger", "triage"),
+            e("triage", "route"),
+            eh("route", "fix", "bug"),
+            eh("route", "plan", "feature"),
+            eh("route", "other", "default"),
+            e("fix", "report"),
+            e("plan", "report"),
+            e("other", "report"),
+        ],
+    )
+}
+
+fn decision_of(run: &WorkflowRun, id: &str) -> Option<String> {
+    node_of(run, id, "")
+        .decision
+        .as_ref()
+        .map(|d| d.value.clone())
+}
+
+#[test]
+fn switch_value_that_matches_a_case_takes_only_that_branch() {
+    let w = switch_workflow(json!({"value": "{{triage.kind}}"}));
+    let run = complete(&begin(&w), "triage", json!({"kind": "feature"}));
+    assert_eq!(status_of(&run, "route", ""), Some(NodeStatus::Done));
+    assert_eq!(decision_of(&run, "route").as_deref(), Some("feature"));
+    assert_eq!(status_of(&run, "fix", ""), Some(NodeStatus::Skipped));
+    assert_eq!(status_of(&run, "other", ""), Some(NodeStatus::Skipped));
+    assert_eq!(
+        session_node_ids(&next_actions(&run)),
+        vec!["plan".to_string()]
+    );
+}
+
+#[test]
+fn switch_value_with_no_matching_case_takes_default() {
+    let w = switch_workflow(json!({"value": "{{triage.kind}}"}));
+    for kind in ["chore", "", "Bug"] {
+        let run = complete(&begin(&w), "triage", json!({ "kind": kind }));
+        assert_eq!(
+            decision_of(&run, "route").as_deref(),
+            Some("default"),
+            "{kind:?}"
+        );
+        assert_eq!(status_of(&run, "fix", ""), Some(NodeStatus::Skipped));
+        assert_eq!(status_of(&run, "plan", ""), Some(NodeStatus::Skipped));
+        assert_eq!(
+            session_node_ids(&next_actions(&run)),
+            vec!["other".to_string()]
+        );
+    }
+}
+
+#[test]
+fn switch_decided_by_the_mono_asks_cases_and_default() {
+    let w = switch_workflow(json!({"decide": "mono", "question": "What is {{inputs.project}}?"}));
+    let mut run = complete(&begin(&w), "triage", json!({"kind": "x"}));
+    match next_actions(&run).as_slice() {
+        [EngineAction::AskMono {
+            purpose,
+            question,
+            answers,
+            ..
+        }] => {
+            assert_eq!(*purpose, AskPurpose::Switch);
+            assert_eq!(question, "What is /work/repo?");
+            assert_eq!(
+                answers,
+                &vec![
+                    "bug".to_string(),
+                    "feature".to_string(),
+                    "default".to_string()
+                ]
+            );
+        }
+        other => panic!("expected one askMono, got {other:?}"),
+    }
+    run = started(&run, "route");
+    assert_eq!(next_actions(&run), vec![]);
+    run = decided_on(&run, "route", "bug", "", Some("looks like one"));
+    assert_eq!(
+        node_of(&run, "route", "").decision,
+        Some(Decision {
+            value: "bug".into(),
+            reason: Some("looks like one".into())
+        })
+    );
+    assert_eq!(status_of(&run, "plan", ""), Some(NodeStatus::Skipped));
+    assert_eq!(
+        session_node_ids(&next_actions(&run)),
+        vec!["fix".to_string()]
+    );
+    // `default` is a valid answer too.
+    let run = complete(&begin(&w), "triage", json!({}));
+    let run = decided(&started(&run, "route"), "route", "default");
+    assert_eq!(
+        session_node_ids(&next_actions(&run)),
+        vec!["other".to_string()]
+    );
+}
+
+#[test]
+fn switch_asks_a_default_question_that_names_the_node() {
+    let w = switch_workflow(json!({"decide": "mono"}));
+    let run = complete(&begin(&w), "triage", json!({}));
+    match next_actions(&run).as_slice() {
+        [EngineAction::AskMono { question, .. }] => assert_eq!(
+            question,
+            "Which case of \"route\" applies? Answer with one of: bug, feature, default."
+        ),
+        other => panic!("expected one askMono, got {other:?}"),
+    }
+}
+
+#[test]
+fn switch_rejects_an_answer_that_is_not_a_case() {
+    let w = switch_workflow(json!({"decide": "mono"}));
+    let run = complete(&begin(&w), "triage", json!({}));
+    let run = decided(&started(&run, "route"), "route", "maybe");
+    assert_eq!(status_of(&run, "route", ""), Some(NodeStatus::Failed));
+    assert_eq!(
+        node_of(&run, "route", "").error.as_deref(),
+        Some("Invalid decision \"maybe\" (expected one of the cases or default)")
+    );
+    assert_eq!(decision_of(&run, "route"), None);
+}
+
+#[test]
+fn switch_in_a_loop_is_decided_again_each_round() {
+    let w = def(
+        vec![
+            trigger(),
+            session("dev", json!({"output": {"kind": {"type": "string"}}})),
+            n(
+                json!({"id": "route", "type": "switch", "value": "{{dev.kind}}",
+                "cases": ["bug", "feature"]}),
+            ),
+            plain("fix"),
+            plain("plan"),
+            plain("other"),
+            plain("review"),
+            report(),
+        ],
+        vec![
+            e("trigger", "dev"),
+            e("dev", "route"),
+            eh("route", "fix", "bug"),
+            eh("route", "plan", "feature"),
+            eh("route", "other", "default"),
+            e("fix", "review"),
+            e("plan", "review"),
+            e("other", "review"),
+            e("review", "report"),
+            lp("review", "dev", 3, "mono"),
+        ],
+    );
+    let mut run = complete(&begin(&w), "dev", json!({"kind": "bug"}));
+    assert_eq!(
+        session_node_ids(&next_actions(&run)),
+        vec!["fix".to_string()]
+    );
+    run = complete(&run, "fix", json!({}));
+    run = complete(&run, "review", json!({}));
+    run = decided(&run, "review", "loop");
+    // The decision is cleared for the new round and taken again from the new output.
+    assert_eq!(decision_of(&run, "route"), None);
+    run = complete(&run, "dev", json!({"kind": "feature"}));
+    assert_eq!(decision_of(&run, "route").as_deref(), Some("feature"));
+    assert_eq!(status_of(&run, "fix", ""), Some(NodeStatus::Skipped));
+    assert_eq!(
+        session_node_ids(&next_actions(&run)),
+        vec!["plan".to_string()]
+    );
+    run = complete(&run, "plan", json!({}));
+    run = complete(&run, "review", json!({}));
+    run = decided(&run, "review", "loop");
+    run = complete(&run, "dev", json!({"kind": "something else"}));
+    assert_eq!(decision_of(&run, "route").as_deref(), Some("default"));
+    assert_eq!(
+        session_node_ids(&next_actions(&run)),
+        vec!["other".to_string()]
+    );
+}
+
+#[test]
+fn a_join_after_a_switch_runs_once_when_only_one_of_its_case_branches_is_live() {
+    let w = def(
+        vec![
+            trigger(),
+            session("triage", json!({"output": {"kind": {"type": "string"}}})),
+            n(
+                json!({"id": "route", "type": "switch", "value": "{{triage.kind}}",
+                "cases": ["bug", "feature"]}),
+            ),
+            plain("fix"),
+            plain("plan"),
+            plain("join"),
+            report(),
+        ],
+        vec![
+            e("trigger", "triage"),
+            e("triage", "route"),
+            eh("route", "fix", "bug"),
+            eh("route", "plan", "feature"),
+            e("fix", "join"),
+            e("plan", "join"),
+            e("join", "report"),
+        ],
+    );
+    let mut run = complete(&begin(&w), "triage", json!({"kind": "feature"}));
+    assert_eq!(status_of(&run, "fix", ""), Some(NodeStatus::Skipped));
+    assert_eq!(
+        session_node_ids(&next_actions(&run)),
+        vec!["plan".to_string()]
+    );
+    // The join waits for the live branch, not for the dead one.
+    run = started(&run, "plan");
+    assert_eq!(next_actions(&run), vec![]);
+    run = finished(&run, "plan", json!({}), "", AT);
+    assert_eq!(
+        session_node_ids(&next_actions(&run)),
+        vec!["join".to_string()]
+    );
+    run = complete(&run, "join", json!({}));
+    assert_eq!(status_of(&run, "join", ""), Some(NodeStatus::Done));
+    assert_eq!(next_actions(&run), post_report());
+}
+
+#[test]
+fn a_switch_inside_a_for_each_picks_a_branch_per_item() {
+    let kinds = json!([{"kind": "bug"}, {"kind": "feature"}, {"kind": "chore"}]);
+    let w = fan_out(
+        3,
+        Some(vec![
+            n(json!({"id": "route", "type": "switch", "parent": "each",
+                "value": "{{item.kind}}", "cases": ["bug", "feature"]})),
+            session("fix", json!({"parent": "each"})),
+            session("plan", json!({"parent": "each"})),
+            session("other", json!({"parent": "each"})),
+        ]),
+        vec![
+            eh("route", "fix", "bug"),
+            eh("route", "plan", "feature"),
+            eh("route", "other", "default"),
+        ],
+    );
+    let run = complete(&begin(&w), "fetch", json!({"tickets": kinds}));
+    let decisions: Vec<Option<String>> = (0..3)
+        .map(|i| {
+            node_of(&run, "route", &format!("each#{i}"))
+                .decision
+                .as_ref()
+                .map(|d| d.value.clone())
+        })
+        .collect();
+    assert_eq!(
+        decisions,
+        vec![
+            Some("bug".to_string()),
+            Some("feature".to_string()),
+            Some("default".to_string())
+        ]
+    );
+    assert_eq!(
+        session_targets(&next_actions(&run)),
+        pairs(&[("fix", "each#0"), ("plan", "each#1"), ("other", "each#2")])
+    );
+    assert_eq!(status_of(&run, "plan", "each#0"), Some(NodeStatus::Skipped));
+    assert_eq!(status_of(&run, "fix", "each#1"), Some(NodeStatus::Skipped));
+    assert_eq!(status_of(&run, "fix", "each#2"), Some(NodeStatus::Skipped));
+}

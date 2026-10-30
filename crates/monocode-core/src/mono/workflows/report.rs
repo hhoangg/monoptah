@@ -35,7 +35,7 @@ fn status_label(status: RunStatus) -> &'static str {
 
 /// A string longer than this (in UTF-16 units, like JS) is shown as a quoted block, not inline.
 const INLINE_STRING_MAX: usize = 200;
-const ACTION_TYPES: [&str; 4] = ["session", "command", "askMono", "if"];
+const ACTION_TYPES: [&str; 5] = ["session", "command", "askMono", "if", "switch"];
 
 struct BranchResult {
     branch: String,

@@ -594,7 +594,8 @@ fn lenient_parts_that_are_dropped_not_fatal() {
     let i = node(r#"{"id":"i","type":"if","decide":"human"}"#);
     assert!(matches!(i.kind, NodeKind::If { decide: None, .. }));
     let e = edge(r#"{"from":"a","to":"b","handle":"maybe"}"#);
-    assert_eq!(e.handle, None);
+    // Any handle is kept: a switch edge carries a case name, and validation judges it.
+    assert_eq!(e.handle, Some(Handle::Case("maybe".into())));
     let no_output =
         node(r#"{"id":"s","type":"session","project":"p","prompt":"x","checkout":"root"}"#);
     assert!(matches!(&no_output.kind, NodeKind::Session { output, .. } if output.is_empty()));
@@ -2739,4 +2740,225 @@ fn render_leaves_many_openers_without_a_closer_as_text() {
         ),
         "1{{#if b}}23{{#if a}}4"
     );
+}
+
+// ---- switch ---------------------------------------------------------------------------------
+
+/// The example with a switch `route` after `fetch`, its edges going straight to the report.
+fn with_switch(fields: &str, handles: &[&str]) -> Workflow {
+    let mut w = example();
+    w.nodes.push(node(&format!(
+        r#"{{"id":"route","type":"switch",{fields}}}"#
+    )));
+    w.edges.push(edge(r#"{"from":"fetch","to":"route"}"#));
+    for handle in handles {
+        w.edges.push(edge(&format!(
+            r#"{{"from":"route","to":"report","handle":"{handle}"}}"#
+        )));
+    }
+    w
+}
+
+const SWITCH_OK: &str = r#""value":"{{fetch.tickets}}","cases":["bug","feature"]"#;
+
+#[test]
+fn a_switch_with_cases_and_matching_handles_is_valid() {
+    assert_eq!(
+        validate_workflow(&with_switch(SWITCH_OK, &["bug", "feature", "default"])),
+        vec![]
+    );
+    let mono = r#""decide":"mono","question":"Which?","cases":["bug"]"#;
+    assert_eq!(validate_workflow(&with_switch(mono, &["bug"])), vec![]);
+}
+
+#[test]
+fn flags_a_switch_without_cases() {
+    assert!(flags(
+        &with_switch(r#""value":"{{fetch.tickets}}","cases":[]"#, &["default"]),
+        "at least one case"
+    ));
+    assert!(flags(
+        &with_switch(r#""value":"{{fetch.tickets}}""#, &["default"]),
+        "at least one case"
+    ));
+}
+
+#[test]
+fn flags_blank_duplicate_and_reserved_switch_cases() {
+    let cases = |c: &str| {
+        with_switch(
+            &format!(r#""value":"{{{{fetch.tickets}}}}","cases":{c}"#),
+            &["default"],
+        )
+    };
+    assert!(flags(&cases(r#"["a","  "]"#), "cannot be blank"));
+    assert!(flags(&cases(r#"["a",""]"#), "cannot be blank"));
+    assert!(flags(&cases(r#"["a","a"]"#), "listed more than once"));
+    assert!(flags(&cases(r#"["default"]"#), "reserved"));
+    assert_eq!(validate_workflow(&cases(r#"["a","A"]"#)), vec![]);
+}
+
+#[test]
+fn flags_a_switch_with_both_or_neither_of_value_and_decide() {
+    assert!(flags(
+        &with_switch(r#""cases":["a"]"#, &["a"]),
+        "value or decide"
+    ));
+    assert!(flags(
+        &with_switch(r#""value":"  ","cases":["a"]"#, &["a"]),
+        "value or decide"
+    ));
+    assert!(flags(
+        &with_switch(r#""value":"x","decide":"mono","cases":["a"]"#, &["a"]),
+        "value or decide"
+    ));
+}
+
+#[test]
+fn flags_switch_edges_with_unknown_missing_or_repeated_handles() {
+    let ok = |handles: &[&str]| with_switch(SWITCH_OK, handles);
+    assert!(flags(&ok(&["bug", "other"]), "not one of its cases"));
+    assert!(flags(&ok(&["true"]), "not one of its cases"));
+    assert!(flags(
+        &ok(&["bug", "bug"]),
+        "more than one edge for handle \"bug\""
+    ));
+    // Reported once per handle, however many edges share it.
+    let mut w = ok(&["bug", "bug", "bug"]);
+    w.edges
+        .push(edge(r#"{"from":"route","to":"fetch","handle":"default"}"#));
+    let repeated = messages(&w)
+        .into_iter()
+        .filter(|m| m.contains("more than one edge"))
+        .count();
+    assert_eq!(repeated, 1);
+    // A handle is required on every out edge.
+    let mut missing = ok(&["bug"]);
+    missing
+        .edges
+        .push(edge(r#"{"from":"route","to":"report"}"#));
+    assert!(flags(&missing, "without a case or \"default\" handle"));
+    // The same node may take two handles to one place.
+    assert_eq!(validate_workflow(&ok(&["bug", "feature"])), vec![]);
+}
+
+#[test]
+fn an_if_edge_accepts_only_true_and_false() {
+    let mut w = example();
+    w.nodes.push(node(
+        r#"{"id":"gate","type":"if","condition":"{{fetch.tickets}} not empty"}"#,
+    ));
+    w.edges.push(edge(r#"{"from":"fetch","to":"gate"}"#));
+    w.edges
+        .push(edge(r#"{"from":"gate","to":"report","handle":"default"}"#));
+    assert!(flags(&w, "use \"true\" or \"false\""));
+    w.edges.last_mut().unwrap().handle = Some(Handle::False);
+    assert_eq!(validate_workflow(&w), vec![]);
+}
+
+#[test]
+fn a_stray_handle_on_a_plain_or_loop_edge_is_dropped_when_a_workflow_is_read() {
+    let text = EXAMPLE_JSON
+        .replace(
+            r#"{ "from": "fetch", "to": "each" }"#,
+            r#"{ "from": "fetch", "to": "each", "handle": "bug" }"#,
+        )
+        .replace(
+            r#""to": "dev", "loop""#,
+            r#""to": "dev", "handle": "bug", "loop""#,
+        );
+    assert!(text.contains(r#""handle": "bug""#));
+    assert_eq!(text.matches(r#""handle": "bug""#).count(), 2);
+    let w = super::parse::parse_workflow(&json(&text)).expect("a workflow");
+    assert!(w.edges.iter().all(|e| e.handle.is_none()));
+    assert_eq!(validate_workflow(&w), vec![]);
+    assert_eq!(w, example());
+    assert!(!serde_json::to_string(&w).unwrap().contains("handle"));
+}
+
+#[test]
+fn a_stray_handle_on_a_loop_edge_of_a_switch_is_dropped() {
+    let mut w = with_switch(SWITCH_OK, &["bug", "feature", "default"]);
+    w.edges.push(edge(
+        r#"{"from":"route","to":"fetch","loop":{"maxRounds":2,"decide":"mono"}}"#,
+    ));
+    let mut raw = serde_json::to_value(&w).unwrap();
+    raw["edges"].as_array_mut().unwrap().last_mut().unwrap()["handle"] = json!("bug");
+    let read = super::parse::parse_workflow(&Json::from(&raw)).expect("a workflow");
+    assert!(read.edges.last().unwrap().handle.is_none());
+    assert!(!flags(&read, "handle"));
+}
+
+#[test]
+fn a_switch_case_with_an_absolute_path_is_flagged() {
+    let w = with_switch(
+        r#""value":"{{fetch.tickets}}","cases":["/Users/x/repo/notes.md"]"#,
+        &["default"],
+    );
+    assert!(flags(&w, "cases contains an absolute path"));
+}
+
+#[test]
+fn a_handle_on_any_other_node_is_still_flagged() {
+    let mut w = example();
+    for e in w.edges.iter_mut().filter(|e| e.from == "fetch") {
+        e.handle = Some(Handle::named("bug"));
+    }
+    assert!(flags(&w, "only If and Switch nodes have handles"));
+}
+
+#[test]
+fn handles_read_and_write_as_plain_strings() {
+    assert_eq!(Handle::named("true"), Handle::True);
+    assert_eq!(Handle::named("false"), Handle::False);
+    assert_eq!(Handle::named("bug"), Handle::Case("bug".into()));
+    for name in ["true", "false", "default", "a b", "日本"] {
+        let edge = edge(&json!({"from": "a", "to": "b", "handle": name}).to_string());
+        let written = serde_json::to_value(&edge).unwrap();
+        assert_eq!(written["handle"], name);
+        assert_eq!(super::parse::parse_edge(&Json::from(&written)), Some(edge));
+    }
+    // An If edge serialises exactly as before: a bare "true" or "false" string.
+    let mut e = Edge::new("gate", "yes");
+    e.handle = Some(Handle::True);
+    assert_eq!(
+        serde_json::to_string(&e).unwrap(),
+        r#"{"from":"gate","to":"yes","handle":"true"}"#
+    );
+    e.handle = Some(Handle::False);
+    assert_eq!(
+        serde_json::to_string(&e).unwrap(),
+        r#"{"from":"gate","to":"yes","handle":"false"}"#
+    );
+    // No handle and an empty one both mean none.
+    assert_eq!(edge_handle(r#"{"from":"a","to":"b"}"#), None);
+    assert_eq!(edge_handle(r#"{"from":"a","to":"b","handle":""}"#), None);
+}
+
+fn edge_handle(text: &str) -> Option<Handle> {
+    edge(text).handle
+}
+
+#[test]
+fn a_switch_node_reads_and_writes_back_unchanged() {
+    let text = r#"{"id":"route","type":"switch","value":"{{a.kind}}","cases":["x","y"],"decide":"mono","question":"q"}"#;
+    let n = node(text);
+    assert_eq!(
+        n.kind,
+        NodeKind::Switch {
+            value: Some("{{a.kind}}".into()),
+            cases: vec!["x".into(), "y".into()],
+            decide: Some(Decide::Mono),
+            question: Some("q".into()),
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(&n).unwrap(),
+        serde_json::from_str::<Value>(text).unwrap()
+    );
+    // Entries of `cases` that are not strings are dropped; no `cases` at all is an empty list.
+    let odd = node(r#"{"id":"r","type":"switch","value":"v","cases":["a",3,null,"b"]}"#);
+    assert!(matches!(&odd.kind, NodeKind::Switch { cases, .. } if cases == &["a", "b"]));
+    let none = node(r#"{"id":"r","type":"switch","value":"v"}"#);
+    assert!(matches!(&none.kind, NodeKind::Switch { cases, .. } if cases.is_empty()));
 }

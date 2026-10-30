@@ -7,7 +7,7 @@ use crate::monos::tests::{Setup, setup};
 use gpui::{Focusable, TestAppContext, VisualTestContext};
 use monocode_core::mono::workflows::{
     board_model::NodeType,
-    model::{Checkout, InputValue, NodeKind},
+    model::{Checkout, Decide, InputValue, NodeKind},
 };
 use serde_json::json;
 
@@ -211,6 +211,155 @@ fn the_checkout_nest_and_if_fields_write_their_values(cx: &mut TestAppContext) {
         panic!()
     };
     assert_eq!(condition.as_deref(), Some("{{a.b}} == 1"));
+}
+
+fn commit(s: &Setup, visual: &mut VisualTestContext, spec: BoardField) {
+    do_with(s, visual, |m, cx| m.board_commit(&spec, cx));
+}
+
+fn add_switch(s: &Setup, visual: &mut VisualTestContext) -> String {
+    do_with(s, visual, |m, cx| m.board_add(NodeType::Switch, cx));
+    on_board(s, visual, |b| {
+        b.flow
+            .nodes
+            .iter()
+            .find(|n| matches!(n.data.node.kind, NodeKind::Switch { .. }))
+            .map(|n| n.id.clone())
+            .expect("a switch")
+    })
+}
+
+fn cases_of(s: &Setup, visual: &mut VisualTestContext, id: &str) -> Vec<String> {
+    let NodeKind::Switch { cases, .. } = node_of(s, visual, id).kind else {
+        panic!()
+    };
+    cases
+}
+
+#[gpui::test]
+fn the_switch_decider_value_and_question_write_their_values(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let mut visual = open_board(&s, &ticket(json!({})), cx);
+    let visual = &mut visual;
+    let route = add_switch(&s, visual);
+    pick(&s, visual, BoardPick::SwitchDecider(route.clone()), "value");
+    let NodeKind::Switch { value, decide, .. } = node_of(&s, visual, &route).kind else {
+        panic!()
+    };
+    assert_eq!((value.as_deref(), decide), (Some(""), None));
+    type_in(
+        &s,
+        visual,
+        BoardField::SwitchValue(route.clone()),
+        "{{review.verdict}}",
+    );
+    let NodeKind::Switch { value, .. } = node_of(&s, visual, &route).kind else {
+        panic!()
+    };
+    assert_eq!(value.as_deref(), Some("{{review.verdict}}"));
+    // Mono decides drops the value and shows the question.
+    pick(&s, visual, BoardPick::SwitchDecider(route.clone()), "mono");
+    let NodeKind::Switch { value, decide, .. } = node_of(&s, visual, &route).kind else {
+        panic!()
+    };
+    assert_eq!((value, decide), (None, Some(Decide::Mono)));
+    type_in(
+        &s,
+        visual,
+        BoardField::SwitchQuestion(route.clone()),
+        "Which kind is it?",
+    );
+    let NodeKind::Switch { question, .. } = node_of(&s, visual, &route).kind else {
+        panic!()
+    };
+    assert_eq!(question.as_deref(), Some("Which kind is it?"));
+}
+
+#[gpui::test]
+fn switch_cases_can_be_added_renamed_and_removed(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let mut visual = open_board(&s, &ticket(json!({})), cx);
+    let visual = &mut visual;
+    let route = add_switch(&s, visual);
+    let start = cases_of(&s, visual, &route);
+    click(visual, "wf-case-add");
+    click(visual, "wf-case-add");
+    let cases = cases_of(&s, visual, &route);
+    assert_eq!(cases.len(), start.len() + 2);
+    let (first, second) = (
+        cases[cases.len() - 2].clone(),
+        cases[cases.len() - 1].clone(),
+    );
+    assert_ne!(first, second);
+    // A line leaving by the first new case follows it when it is renamed.
+    event(
+        &s,
+        visual,
+        GraphEvent::Connect {
+            source: route.clone(),
+            handle: Some(first.clone()),
+            target: "report".into(),
+            at: at(),
+        },
+    );
+    let leaves_by = |s: &Setup, visual: &mut VisualTestContext, case: &str| {
+        let (route, case) = (route.clone(), case.to_string());
+        on_board(s, visual, move |b| {
+            b.flow
+                .edges
+                .iter()
+                .any(|e| e.source == route && e.source_handle.as_deref() == Some(case.as_str()))
+        })
+    };
+    assert!(leaves_by(&s, visual, &first));
+    type_in(
+        &s,
+        visual,
+        BoardField::CaseName(route.clone(), first.clone()),
+        "bug",
+    );
+    commit(
+        &s,
+        visual,
+        BoardField::CaseName(route.clone(), first.clone()),
+    );
+    let cases = cases_of(&s, visual, &route);
+    assert_eq!(cases[cases.len() - 2], "bug");
+    assert!(leaves_by(&s, visual, "bug") && !leaves_by(&s, visual, &first));
+    // Blank, reserved and taken names go back to what the case was.
+    for bad in ["", "  ", "default", second.as_str()] {
+        type_in(
+            &s,
+            visual,
+            BoardField::CaseName(route.clone(), "bug".into()),
+            bad,
+        );
+        commit(
+            &s,
+            visual,
+            BoardField::CaseName(route.clone(), "bug".into()),
+        );
+        assert_eq!(cases_of(&s, visual, &route), cases, "{bad:?}");
+    }
+    // Removing a case takes the lines that left by it.
+    click(visual, "wf-case-remove-bug");
+    assert!(!cases_of(&s, visual, &route).contains(&"bug".to_string()));
+    assert!(!leaves_by(&s, visual, "bug"));
+    assert_eq!(cases_of(&s, visual, &route).len(), start.len() + 1);
+    // The last case cannot be removed.
+    while cases_of(&s, visual, &route).len() > 1 {
+        let case = cases_of(&s, visual, &route)[0].clone();
+        click(
+            visual,
+            Box::leak(format!("wf-case-remove-{case}").into_boxed_str()),
+        );
+    }
+    let last = cases_of(&s, visual, &route)[0].clone();
+    assert!(
+        visual
+            .debug_bounds(Box::leak(format!("wf-case-remove-{last}").into_boxed_str()))
+            .is_none()
+    );
 }
 
 #[gpui::test]

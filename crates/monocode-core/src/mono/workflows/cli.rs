@@ -17,7 +17,7 @@ use super::model::{
 };
 use super::models::{harnesses_used, native_probe, workflow_issues, ModelCatalog, Probe};
 use super::ordered::{js_number_text, Json, OrderedMap};
-use super::parse::{parse_edge, parse_inputs, parse_node};
+use super::parse::{drop_stray_handles, parse_edge, parse_inputs, parse_node};
 use super::store::{
     clear_runs, load_runs, load_workflows, to_json, update_workflows, workflow_json, MonoDir,
 };
@@ -514,7 +514,7 @@ fn definition_from(raw: Option<&Json>, now: u64, allowed: &[&str]) -> Result<Par
         };
         nodes.push(anchor_node(node, now));
     }
-    let edges: Vec<Edge> = match map.get("edges") {
+    let mut edges: Vec<Edge> = match map.get("edges") {
         None => Vec::new(),
         Some(Json::Array(entries)) => {
             let mut edges = Vec::with_capacity(entries.len());
@@ -527,6 +527,7 @@ fn definition_from(raw: Option<&Json>, now: u64, allowed: &[&str]) -> Result<Par
         }
         Some(_) => return Err("workflow.edges must be a list".into()),
     };
+    drop_stray_handles(&nodes, &mut edges);
     let inputs = match map.get("inputs") {
         None => OrderedMap::new(),
         Some(raw @ Json::Object(declared)) => {

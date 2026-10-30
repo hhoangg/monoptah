@@ -2,8 +2,8 @@
 //! app: the Mono and the workflow guide read them.
 use super::condition::condition_syntax_problem;
 use super::model::{
-    is_node_id, Checkout, Cwd, Node, NodeId, NodeKind, Workflow, MAX_PARALLEL_LIMIT,
-    MAX_ROUNDS_LIMIT, MAX_TIMEOUT_MINUTES,
+    is_node_id, Checkout, Cwd, Handle, Node, NodeId, NodeKind, Workflow, MAX_PARALLEL_LIMIT,
+    MAX_ROUNDS_LIMIT, MAX_TIMEOUT_MINUTES, SWITCH_DEFAULT,
 };
 use super::parse::{is_map_key, is_name};
 use super::template::{js_space, js_trim, shell_template_problems, template_vars};
@@ -523,6 +523,21 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            NodeKind::Switch {
+                value,
+                cases,
+                question,
+                ..
+            } => {
+                for (label, text) in [("value", value), ("question", question)] {
+                    if let Some(v) = text {
+                        fields.push((label.into(), v, false));
+                    }
+                }
+                for c in cases {
+                    fields.push(("cases".into(), c, false));
+                }
+            }
             NodeKind::ForEach { list, item, .. } => {
                 fields.push(("in".into(), list, false));
                 if let Some(item) = item {
@@ -684,6 +699,47 @@ impl<'a> Checker<'a> {
                 }
                 if let Some(c) = condition.as_deref().filter(|c| !c.is_empty()) {
                     self.check_text(c, node);
+                }
+                if let Some(q) = question.as_deref().filter(|q| !q.is_empty()) {
+                    self.check_text(q, node);
+                }
+            }
+            NodeKind::Switch {
+                value,
+                cases,
+                decide,
+                question,
+            } => {
+                let has_value = value.as_deref().is_some_and(|v| !js_trim(v).is_empty());
+                if has_value == decide.is_some() {
+                    self.add(
+                        "A Switch node needs either a value or decide \"mono\", not both or neither",
+                        Some(&node.id),
+                    );
+                }
+                if cases.is_empty() {
+                    self.add("A Switch node needs at least one case", Some(&node.id));
+                }
+                let mut seen: HashSet<&str> = HashSet::new();
+                for case in cases {
+                    if js_trim(case).is_empty() {
+                        self.add("A Switch case cannot be blank", Some(&node.id));
+                    } else if case == SWITCH_DEFAULT {
+                        self.add(
+                            format!(
+                                "\"{SWITCH_DEFAULT}\" is reserved for the Switch fallback and cannot be a case"
+                            ),
+                            Some(&node.id),
+                        );
+                    } else if !seen.insert(case.as_str()) {
+                        self.add(
+                            format!("Switch case \"{case}\" is listed more than once"),
+                            Some(&node.id),
+                        );
+                    }
+                }
+                if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
+                    self.check_text(v, node);
                 }
                 if let Some(q) = question.as_deref().filter(|q| !q.is_empty()) {
                     self.check_text(q, node);
@@ -918,27 +974,83 @@ pub fn validate_workflow(w: &Workflow) -> Vec<WorkflowIssue> {
 
     // --- edges -------------------------------------------------------------------------------
     let mut loop_sources: HashSet<&str> = HashSet::new();
+    let mut switch_handles: HashSet<(&str, &str)> = HashSet::new();
     for e in &w.edges {
         let from = c.g.by_id.get(e.from.as_str()).copied();
         let to = c.g.by_id.get(e.to.as_str()).copied();
         let is_if = |n: Option<&Node>| n.is_some_and(|n| matches!(n.kind, NodeKind::If { .. }));
-        if e.handle.is_some() && from.is_some() && !is_if(from) {
+        let switch_cases = from.and_then(|n| match &n.kind {
+            NodeKind::Switch { cases, .. } => Some(cases),
+            _ => None,
+        });
+        if e.handle.is_some() && from.is_some() && !is_if(from) && switch_cases.is_none() {
             c.add(
                 format!(
-                    "Edge {} -> {} has a handle, but only If nodes have true/false handles",
+                    "Edge {} -> {} has a handle, but only If and Switch nodes have handles",
                     e.from, e.to
                 ),
                 Some(&e.from),
             );
         }
-        if is_if(from) && e.loop_spec.is_none() && e.handle.is_none() {
-            c.add(
-                format!(
-                    "Edge {} -> {} leaves an If node without a \"true\" or \"false\" handle",
-                    e.from, e.to
+        if is_if(from) {
+            if e.loop_spec.is_none() && e.handle.is_none() {
+                c.add(
+                    format!(
+                        "Edge {} -> {} leaves an If node without a \"true\" or \"false\" handle",
+                        e.from, e.to
+                    ),
+                    Some(&e.from),
+                );
+            }
+            if let Some(Handle::Case(name)) = &e.handle {
+                c.add(
+                    format!(
+                        "Edge {} -> {} leaves an If node with handle \"{name}\"; use \"true\" or \"false\"",
+                        e.from, e.to
+                    ),
+                    Some(&e.from),
+                );
+            }
+        }
+        if let Some(cases) = switch_cases {
+            match &e.handle {
+                None if e.loop_spec.is_none() => c.add(
+                    format!(
+                        "Edge {} -> {} leaves a Switch node without a case or \"{SWITCH_DEFAULT}\" handle",
+                        e.from, e.to
+                    ),
+                    Some(&e.from),
                 ),
-                Some(&e.from),
-            );
+                Some(h) if h.as_str() != SWITCH_DEFAULT && !cases.iter().any(|x| x == h.as_str()) => {
+                    c.add(
+                        format!(
+                            "Edge {} -> {} leaves a Switch node with handle \"{}\", which is not one of its cases or \"{SWITCH_DEFAULT}\"",
+                            e.from,
+                            e.to,
+                            h.as_str()
+                        ),
+                        Some(&e.from),
+                    )
+                }
+                Some(h) => {
+                    let twins = w
+                        .edges
+                        .iter()
+                        .filter(|o| o.from == e.from && o.handle.as_ref() == Some(h))
+                        .count();
+                    if twins > 1 && switch_handles.insert((e.from.as_str(), h.as_str())) {
+                        c.add(
+                            format!(
+                                "Switch node \"{}\" has more than one edge for handle \"{}\"; only one is allowed",
+                                e.from,
+                                h.as_str()
+                            ),
+                            Some(&e.from),
+                        );
+                    }
+                }
+                None => {}
+            }
         }
         if from.is_some_and(|n| matches!(n.kind, NodeKind::Report { .. })) && e.loop_spec.is_none()
         {

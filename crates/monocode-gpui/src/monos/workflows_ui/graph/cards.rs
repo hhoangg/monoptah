@@ -4,11 +4,11 @@
 use super::super::review::node_title;
 use super::canvas::{GraphCanvas, GraphEvent};
 use super::hit::{HandleKind, handles_of};
-use super::scene::{Bar, BarKind, EdgeLabel, LABEL_H, SceneNode, TabItem};
+use super::scene::{Bar, BarKind, EdgeLabel, LABEL_H, SceneNode, TabItem, out_at};
 use crate::monos::*;
 use gpui::{BoxShadow, ClickEvent, Hsla, MouseDownEvent, Role, ScrollHandle, ScrollWheelEvent};
 use monocode_core::mono::workflows::{
-    board_model::{FlowKind, GROUP_HEADER, NODE_H, Point},
+    board_model::{FlowKind, GROUP_HEADER, NODE_H, Point, out_handles},
     model::{Decide, Node, NodeKind},
     run_graph_model::RunNodeStatus,
 };
@@ -16,6 +16,10 @@ use monocode_core::mono::workflows::{
 const EMERALD: u32 = 0x34d399;
 const AMBER: u32 = 0xfbbf24;
 const RED: u32 = 0xef4444;
+/// About how wide a character of a port label is, at its 11 pixel size.
+const PORT_CHAR: f32 = 6.;
+/// How far right of its out a port label starts.
+const PORT_LABEL_GAP: f32 = 9.;
 
 fn hue(color: u32, alpha: f32) -> Hsla {
     Hsla::from(rgb(color)).opacity(alpha)
@@ -29,7 +33,7 @@ pub(in crate::monos) fn type_icon(kind: &NodeKind) -> &'static str {
         NodeKind::Session { .. } => "message-multiple",
         NodeKind::Command { .. } => "terminal",
         NodeKind::AskMono { .. } => "circle-help",
-        NodeKind::If { .. } => "git-branch",
+        NodeKind::If { .. } | NodeKind::Switch { .. } => "git-branch",
         NodeKind::ForEach { .. } => "refresh-cw",
         NodeKind::Report { .. } => "paper-plane",
     }
@@ -63,6 +67,20 @@ pub(in crate::monos) fn node_summary(node: &Node) -> String {
                 or(condition.as_deref().unwrap_or(""), "No condition yet")
             }
         }
+        NodeKind::Switch {
+            decide,
+            value,
+            cases,
+            ..
+        } => {
+            if *decide == Some(Decide::Mono) {
+                "Mono decides".into()
+            } else if cases.is_empty() {
+                "No cases yet".into()
+            } else {
+                or(value.as_deref().unwrap_or(""), "No value yet")
+            }
+        }
         NodeKind::ForEach { list, .. } => {
             if list.is_empty() {
                 "No list yet".into()
@@ -94,7 +112,29 @@ pub(in crate::monos) fn without_round(label: &str) -> &str {
     }
 }
 
-fn handle_name(kind: HandleKind) -> &'static str {
+/// How wide the label right of out number `index` of `count` on a card `card_w` wide may be: the
+/// room up to the next out, or up to the card's right edge for the last one.
+pub(in crate::monos) fn port_label_width(card_w: f32, index: usize, count: usize) -> f32 {
+    let from = out_at(index, count);
+    let to = if index + 1 < count {
+        out_at(index + 1, count)
+    } else {
+        1.
+    };
+    (card_w * (to - from) - PORT_LABEL_GAP).max(PORT_CHAR * 2.)
+}
+
+/// `name` cut with an ellipsis to fit `width` (graph pixels) at the size of the port labels.
+pub(in crate::monos) fn port_label(name: &str, width: f32) -> String {
+    let fit = ((width / PORT_CHAR) as usize).max(2);
+    if name.chars().count() <= fit {
+        return name.to_string();
+    }
+    let cut: String = name.chars().take(fit - 1).collect();
+    format!("{cut}\u{2026}")
+}
+
+fn handle_name(kind: &HandleKind) -> &str {
     match kind {
         HandleKind::In => "in",
         HandleKind::Out(None) => "out",
@@ -220,8 +260,8 @@ impl GraphCanvas {
                     _ => false,
                 };
                 let target = connecting.as_ref().is_some_and(|c| {
-                    let from = match c.kind {
-                        HandleKind::Out(h) => h,
+                    let from = match &c.kind {
+                        HandleKind::Out(h) => h.as_deref(),
                         _ => None,
                     };
                     !leaves && self.may_connect(&c.source, from, &node.flow.id)
@@ -244,7 +284,8 @@ impl GraphCanvas {
                     })
                     .bg(pane_fill());
                 let id = node.flow.id.clone();
-                let selector = format!("wf-handle-{}-{}", node.flow.id, handle_name(handle.kind));
+                let kind = handle.kind.clone();
+                let selector = format!("wf-handle-{}-{}", node.flow.id, handle_name(&handle.kind));
                 div()
                     .id(SharedString::from(selector.clone()))
                     .debug_selector(move || selector.clone())
@@ -269,7 +310,7 @@ impl GraphCanvas {
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                 let focus = this.root_focus(cx);
                                 window.focus(&focus, cx);
-                                this.begin_connection(&id, handle.kind, handle.at, event.position);
+                                this.begin_connection(&id, kind.clone(), handle.at, event.position);
                                 cx.notify();
                                 cx.stop_propagation();
                             }),
@@ -487,25 +528,30 @@ impl GraphCanvas {
             .children(handles)
             .into_any_element();
         let mut out = vec![card];
-        // Under an If, which line is the true one and which the false one.
-        if matches!(data.node.kind, NodeKind::If { .. }) {
-            for (at, word) in [(0.28, "true"), (0.72, "false")] {
-                let (x, y) = self.at(Point {
-                    x: node.rect.x + node.rect.w * at + 9.,
-                    y: node.rect.y + NODE_H + 5.,
-                });
-                out.push(
-                    div()
-                        .absolute()
-                        .left(x)
-                        .top(y)
-                        .text_size(self.px(11.))
-                        .line_height(self.px(14.))
-                        .text_color(content(0.42))
-                        .child(word)
-                        .into_any_element(),
-                );
-            }
+        // Under an If, which line is the true one and which the false one; under a Switch, which
+        // line is which case. Each label starts just right of its out.
+        let outs = out_handles(&data.node);
+        for (index, word) in outs.iter().enumerate() {
+            let at = out_at(index, outs.len());
+            let (x, y) = self.at(Point {
+                x: node.rect.x + node.rect.w * at + PORT_LABEL_GAP,
+                y: node.rect.y + NODE_H + 5.,
+            });
+            let width = port_label_width(node.rect.w, index, outs.len());
+            out.push(
+                div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(self.px(width))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(self.px(11.))
+                    .line_height(self.px(14.))
+                    .text_color(content(0.42))
+                    .child(port_label(word, width))
+                    .into_any_element(),
+            );
         }
         out
     }

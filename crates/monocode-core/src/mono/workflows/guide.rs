@@ -414,6 +414,9 @@ pub fn workflow_guide() -> String {
             r##"`if`"##,
             r##"- Exactly one of `condition` (see Conditions) or `decide: "mono"` (you are asked true or false, with an optional `question` template). Its out edges must carry `handle: "true"` or `handle: "false"`; only the nodes on the matching side run, the others are skipped."##,
             "",
+            r##"`switch`"##,
+            r##"- `cases` (required, a non-empty list of distinct, non-blank strings; `default` is reserved) and exactly one of `value` (a template such as `{{triage.kind}}`) or `decide: "mono"` (you are asked to pick one case or `default`, with an optional `question` template). The rendered `value` is compared with each case by exact string equality; no match takes `default`. Its out edges must carry `handle: "<case>"` or `handle: "default"`, at most one edge per handle; only the nodes on the taken side run, the others are skipped. Example: `{"id": "route", "type": "switch", "value": "{{triage.kind}}", "cases": ["bug", "feature"]}` with edges `{"from": "route", "to": "fix", "handle": "bug"}`, `{"from": "route", "to": "plan", "handle": "feature"}` and `{"from": "route", "to": "report", "handle": "default"}`."##,
+            "",
             r##"`forEach`"##,
             format!(r##"- `in` (required): exactly one list reference such as `{{{{fetch.tickets}}}}`. Its nodes are the nodes that name it in `parent`; they run once per item, up to `maxParallel` items at a time (whole number 1 to {MAX_PARALLEL_LIMIT}, default {DEFAULT_MAX_PARALLEL}). `as` (default `item`) names the item variable, readable as `{{{{<as>.field}}}}` inside the group; it must be letters, digits and underscores, not `run`, `inputs` or `results`, and not a node id."##).as_str(),
             r##"- Inside the group, draw edges only between its own nodes; a child without an incoming edge starts at once. The group's own edges go to and from the nodes outside it. A For each cannot contain another For each or the report, and the trigger stays outside. When every item has finished, the group's output is `results`: the last output of each item."##,
@@ -424,7 +427,7 @@ pub fn workflow_guide() -> String {
             r##"### Edges"##,
             "",
             r##"- Edges are `{"from": "<id>", "to": "<id>"}`. A node with several incoming edges waits for all of them; a node whose every incoming path was skipped is skipped too. Cycles are only allowed through loop edges."##,
-            r##"- `handle` (`"true"` or `"false"`) goes only on edges that leave an `if` node, and every such edge needs one."##,
+            r##"- `handle` goes only on edges that leave an `if` node (`"true"` or `"false"`) or a `switch` node (a case or `"default"`), and every such edge needs one."##,
             r##"- A failed node fails its branch: the rest of that branch is skipped and the other items go on. The report is always posted, with the failures listed."##,
             "",
             r##"### Loops"##,
@@ -437,7 +440,7 @@ pub fn workflow_guide() -> String {
         &[
             r##"## Templates"##,
             "",
-            r##"Prompts, questions, commands, conditions, `forEach.in` and report templates use `{{path}}`. A path is dot separated: `{{inputs.list}}`, `{{fetch.tickets}}`, `{{ticket.title}}`. A missing value renders as an empty string; a list or object renders as indented JSON. The validator rejects a path that names no input, no earlier node and no loop variable."##,
+            r##"Prompts, questions, commands, conditions, `switch.value`, `forEach.in` and report templates use `{{path}}`. A path is dot separated: `{{inputs.list}}`, `{{fetch.tickets}}`, `{{ticket.title}}`. A missing value renders as an empty string; a list or object renders as indented JSON. The validator rejects a path that names no input, no earlier node and no loop variable."##,
             "",
             r##"Where each variable is readable (prompts, questions, conditions, `forEach.in` and commands):"##,
             r##"- `inputs.<name>`: a declared input."##,
@@ -447,7 +450,7 @@ pub fn workflow_guide() -> String {
             "",
             r##"The report template is narrower. It reads `inputs.*`, `run.round|id|startedAt` plus `run.name`, `run.status`, `run.statusLabel` and `run.endedAt`, `results`, and the outputs of top-level nodes that are upstream of the report. It cannot read steps inside a For each or the loop variable; their data reaches the report through `{{results}}` or `{{<forEachId>.results}}`. `{{results}}` is a list with one entry per piece of work: `branch`, `name`, `status`, `rounds`, `maxRoundsReached`, `errors` and `output` (the item's last session output). It starts with a `Run` entry for the work outside any For each, and has extra entries for earlier loop rounds that failed or ran out of rounds. Templates have no loops, so `{{results}}` prints as JSON; when you want a readable list, leave the template out and mark the fields to show with `inReport`."##,
             "",
-            r##"`{{#if path}}text{{/if}}` includes `text` only when the value is set: not empty, not false, not zero, not an empty list. It takes one path and nothing else (no comparison, no else, no nesting; use an `if` node for branching). It works in prompts, questions and report templates, and is refused in commands."##,
+            r##"`{{#if path}}text{{/if}}` includes `text` only when the value is set: not empty, not false, not zero, not an empty list. It takes one path and nothing else (no comparison, no else, no nesting; use an `if` or `switch` node for branching). It works in prompts, questions and report templates, and is refused in commands."##,
         ],
     );
     add(

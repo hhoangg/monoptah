@@ -232,7 +232,7 @@ mod connecting {
             .edges
             .iter()
             .filter(|e| e.source == "check")
-            .map(|e| (e.target.as_str(), e.source_handle))
+            .map(|e| (e.target.as_str(), e.source_handle.as_deref()))
             .collect();
         assert_eq!(from_check, vec![("b", Some("true"))]);
         // The other handle may go to the same place.
@@ -720,7 +720,7 @@ mod picker {
             .iter()
             .flat_map(|g| g.items.iter().map(|(ty, _)| *ty))
             .collect();
-        assert_eq!(types.len(), 8);
+        assert_eq!(types.len(), 9);
         for ty in NodeType::ALL {
             assert!(types.contains(&ty));
         }
@@ -977,5 +977,199 @@ mod fields {
         fields.insert("b", OutputField::new(OutputFieldType::Number));
         let out = rename_field(&fields, "a", "z");
         assert_eq!(out.keys().cloned().collect::<Vec<_>>(), vec!["z", "b"]);
+    }
+}
+
+mod switch {
+    use super::*;
+
+    fn routed() -> Workflow {
+        let mut w = workflow();
+        w.nodes = vec![
+            n(json!({"id": "trigger", "type": "manual", "ui": {"x": 0, "y": 0}})),
+            n(
+                json!({"id": "route", "type": "switch", "value": "{{inputs.x}}",
+                "cases": ["bug", "feature"], "ui": {"x": 0, "y": 80}}),
+            ),
+            n(
+                json!({"id": "a", "type": "command", "project": "x", "command": "ls", "ui": {"x": 0, "y": 160}}),
+            ),
+            n(
+                json!({"id": "b", "type": "command", "project": "x", "command": "ls", "ui": {"x": 300, "y": 160}}),
+            ),
+            n(json!({"id": "report", "type": "report", "ui": {"x": 0, "y": 240}})),
+        ];
+        w.edges = vec![
+            edge(r#"{"from": "trigger", "to": "route"}"#),
+            edge(r#"{"from": "route", "to": "a", "handle": "bug"}"#),
+            edge(r#"{"from": "route", "to": "b", "handle": "feature"}"#),
+            edge(r#"{"from": "route", "to": "report", "handle": "default"}"#),
+        ];
+        w
+    }
+
+    fn handles_from_route(flow: &Flow) -> Vec<(String, String)> {
+        flow.edges
+            .iter()
+            .filter(|e| e.source == "route")
+            .map(|e| {
+                (
+                    e.source_handle.clone().unwrap_or_default(),
+                    e.target.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn cases_of(flow: &Flow) -> Vec<String> {
+        match &node(flow, "route").data.node.kind {
+            NodeKind::Switch { cases, .. } => cases.clone(),
+            other => panic!("not a switch: {other:?}"),
+        }
+    }
+
+    fn pair(h: &str, t: &str) -> (String, String) {
+        (h.to_string(), t.to_string())
+    }
+
+    #[test]
+    fn connecting_by_a_case_handle_replaces_the_edge_of_that_handle_only() {
+        let w = routed();
+        let (flow, current) = board(&w);
+        assert!(can_connect(&current, "route", Some("bug"), "report"));
+        assert!(can_connect(&current, "route", Some("default"), "a"));
+        assert!(!can_connect(&current, "route", Some("nope"), "a"));
+        let Connected::Edge(out) = connect(&flow, &current, "route", "b", Some("bug")) else {
+            panic!("an edge")
+        };
+        assert_eq!(
+            handles_from_route(&out),
+            vec![
+                pair("feature", "b"),
+                pair("default", "report"),
+                pair("bug", "b")
+            ]
+        );
+        assert!(matches!(
+            connect(&flow, &current, "route", "b", Some("nope")),
+            Connected::Invalid
+        ));
+        // A handle may not repeat an existing edge to the same place.
+        assert!(matches!(
+            connect(&flow, &current, "route", "a", Some("bug")),
+            Connected::Invalid
+        ));
+    }
+
+    #[test]
+    fn renaming_a_case_renames_the_handle_of_its_edges_and_keeps_the_rest() {
+        let (flow, _) = board(&routed());
+        let out = rename_switch_case(&flow, "route", "bug", "defect");
+        assert_eq!(cases_of(&out), vec!["defect", "feature"]);
+        assert_eq!(
+            handles_from_route(&out),
+            vec![
+                pair("defect", "a"),
+                pair("feature", "b"),
+                pair("default", "report")
+            ]
+        );
+        assert_eq!(
+            out.edges.iter().find(|e| e.target == "a").unwrap().id,
+            "route.defect->a"
+        );
+        // Edges of other nodes are untouched, and the result is a valid workflow.
+        assert!(has_edge(&out, "trigger", "route"));
+        let w = from_flow(&routed(), &out.nodes, &out.edges);
+        assert_eq!(
+            crate::mono::workflows::validate::validate_workflow(&w)
+                .iter()
+                .filter(|i| i.message.contains("handle"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn removing_a_case_drops_the_edges_with_its_handle() {
+        let (flow, _) = board(&routed());
+        let out = remove_switch_case(&flow, "route", "bug");
+        assert_eq!(cases_of(&out), vec!["feature"]);
+        assert_eq!(
+            handles_from_route(&out),
+            vec![pair("feature", "b"), pair("default", "report")]
+        );
+        // Removing the default's neighbour never touches a case that is not there.
+        let same = remove_switch_case(&out, "route", "bug");
+        assert_eq!(same, out);
+    }
+
+    #[test]
+    fn adding_a_case_keeps_every_edge_and_does_not_repeat_a_case() {
+        let (flow, _) = board(&routed());
+        let out = add_switch_case(&flow, "route", "chore");
+        assert_eq!(cases_of(&out), vec!["bug", "feature", "chore"]);
+        assert_eq!(handles_from_route(&out), handles_from_route(&flow));
+        assert_eq!(add_switch_case(&out, "route", "chore"), out);
+    }
+
+    #[test]
+    fn a_case_is_not_renamed_to_a_handle_an_edge_of_the_switch_already_uses() {
+        let (mut flow, _) = board(&routed());
+        flow.edges
+            .push(make_edge("route", "b", Some(Handle::named("stray")), None));
+        assert!(out_edge_uses_handle(&flow, "route", "stray"));
+        assert!(!out_edge_uses_handle(&flow, "route", "nothing"));
+        assert_eq!(rename_switch_case(&flow, "route", "bug", "stray"), flow);
+        // A free name still works.
+        assert_ne!(rename_switch_case(&flow, "route", "bug", "defect"), flow);
+    }
+
+    #[test]
+    fn case_edits_leave_other_nodes_alone() {
+        let (flow, _) = board(&routed());
+        assert_eq!(rename_switch_case(&flow, "a", "bug", "x"), flow);
+        assert_eq!(remove_switch_case(&flow, "missing", "bug"), flow);
+        assert_eq!(add_switch_case(&flow, "trigger", "x"), flow);
+    }
+
+    #[test]
+    fn a_switch_decides_by_the_mono_or_by_a_value() {
+        let w = routed();
+        let route = w.node("route").unwrap();
+        let mono = switch_decided_by(route, true);
+        assert!(matches!(
+            &mono.kind,
+            NodeKind::Switch {
+                value: None,
+                decide: Some(Decide::Mono),
+                ..
+            }
+        ));
+        let by_value = switch_decided_by(&mono, false);
+        assert!(matches!(
+            &by_value.kind,
+            NodeKind::Switch { value: Some(v), decide: None, .. } if v.is_empty()
+        ));
+        // The cases stay either way.
+        assert_eq!(by_value.kind.type_name(), "switch");
+        assert!(
+            matches!(&by_value.kind, NodeKind::Switch { cases, .. } if cases == &["bug", "feature"])
+        );
+    }
+
+    #[test]
+    fn a_node_added_after_a_switch_is_not_wired_to_it() {
+        let mut w = routed();
+        w.edges.retain(|e| e.from == "trigger");
+        w.nodes
+            .retain(|n| n.id != "a" && n.id != "b" && n.id != "report");
+        w.nodes.last_mut().unwrap().ui = Some(Ui { x: 0.0, y: 80.0 });
+        let (flow, current) = board(&w);
+        let (out, id) = add_node(&flow, &current, NodeType::Command);
+        assert!(!out
+            .edges
+            .iter()
+            .any(|e| e.source == "route" && e.target == id));
     }
 }

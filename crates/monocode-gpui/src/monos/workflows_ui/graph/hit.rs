@@ -1,11 +1,9 @@
 //! The maths of editing on the canvas, with no window in it: where the handles of a card are, how
 //! far a drag moved a node, which card a connection was dropped on and which edge a click was on.
 use super::geometry::{Rect, Seg};
-use super::scene::{
-    FALSE_AT, LOOP_IN_AT, LOOP_OUT_AT, RoutedEdge, SceneNode, TRUE_AT, group_anchor,
-};
+use super::scene::{LOOP_IN_AT, LOOP_OUT_AT, RoutedEdge, SceneNode, group_anchor, out_at};
 use monocode_core::mono::workflows::{
-    board_model::{FlowKind, GROUP_HEADER, Point},
+    board_model::{FlowKind, GROUP_HEADER, Point, out_handles},
     model::NodeKind,
 };
 
@@ -19,18 +17,19 @@ pub(super) const DROP_RADIUS: f32 = 20.;
 pub(super) const EDGE_SLOP: f32 = 6.;
 
 /// Which of a card's handles.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::monos) enum HandleKind {
     /// Where lines arrive, at the top.
     In,
-    /// Where lines leave, at the bottom; an If has one for true and one for false.
-    Out(Option<&'static str>),
+    /// Where lines leave, at the bottom; an If has one for true and one for false, a Switch one
+    /// for each case and one for the default.
+    Out(Option<String>),
     /// Where a loop arrives and leaves, on the right.
     LoopIn,
     LoopOut,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(in crate::monos) struct Handle {
     pub kind: HandleKind,
     /// On the canvas.
@@ -66,17 +65,15 @@ pub(in crate::monos) fn handles_of(node: &SceneNode) -> Vec<Handle> {
         }
     }
     match kind {
-        NodeKind::If { .. } => {
-            out.push(handle(
-                HandleKind::Out(Some("true")),
-                r.x + r.w * TRUE_AT,
-                r.bottom(),
-            ));
-            out.push(handle(
-                HandleKind::Out(Some("false")),
-                r.x + r.w * FALSE_AT,
-                r.bottom(),
-            ));
+        NodeKind::If { .. } | NodeKind::Switch { .. } => {
+            let outs = out_handles(&node.flow.data.node);
+            for (index, name) in outs.iter().enumerate() {
+                out.push(handle(
+                    HandleKind::Out(Some(name.clone())),
+                    r.x + r.w * out_at(index, outs.len()),
+                    r.bottom(),
+                ));
+            }
         }
         _ if !report => out.push(handle(HandleKind::Out(None), r.x + r.w / 2., r.bottom())),
         _ => {}

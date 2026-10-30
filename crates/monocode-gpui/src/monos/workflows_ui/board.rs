@@ -14,12 +14,43 @@ use monocode_core::mono::workflows::{
         BoardNodeData, Flow, FlowKind, NodeType, Point, absolute, blank_workflow, definition_key,
         issues_by_node, to_flow,
     },
-    model::{InputValue, LoopSpec, Node, NodeKind, Workflow, WorkflowInput},
+    model::{InputValue, LoopSpec, Node, NodeKind, SWITCH_DEFAULT, Workflow, WorkflowInput},
     models::{ModelCatalog, harnesses_used},
     validate::WorkflowIssue,
 };
 use monocode_core::time::now_ms;
 use std::rc::Rc;
+
+/// Whether `name` may be a case of a Switch whose other cases are `cases`: not blank, not the
+/// reserved `default`, not one already there, and not the handle of a line the Switch already has
+/// (`taken`), which the case would capture.
+fn case_name_usable(name: &str, cases: &[String], taken: &[String]) -> bool {
+    !name.trim().is_empty()
+        && name != SWITCH_DEFAULT
+        && !cases.iter().any(|c| c == name)
+        && !taken.iter().any(|h| h == name)
+}
+
+/// The handles of the lines that leave the node `id` of `flow`.
+fn out_handles_taken(flow: &Flow, id: &str) -> Vec<String> {
+    flow.edges
+        .iter()
+        .filter(|e| e.loop_spec.is_none() && e.source == id)
+        .filter_map(|e| e.source_handle.clone())
+        .collect()
+}
+
+/// The name a new case of a Switch starts with.
+fn next_case_name(cases: &[String], taken: &[String]) -> String {
+    let mut n = 1;
+    loop {
+        let name = format!("case_{n}");
+        if case_name_usable(&name, cases, taken) {
+            return name;
+        }
+        n += 1;
+    }
+}
 
 /// What the slide-over of the board shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +71,8 @@ pub(super) enum BoardField {
     Question(String),
     Condition(String),
     IfQuestion(String),
+    SwitchValue(String),
+    SwitchQuestion(String),
     List(String),
     EachAs(String),
     AtOnce(String),
@@ -51,6 +84,8 @@ pub(super) enum BoardField {
     Time(String),
     /// Committed: the name of an output field of a node.
     OutputName(String, String),
+    /// Committed: the name of a case of a Switch.
+    CaseName(String, String),
     /// Committed: the value of a declared input.
     InputValue(String),
     /// Committed: the name of a new input.
@@ -63,7 +98,10 @@ impl BoardField {
     }
 
     fn commits(&self) -> bool {
-        matches!(self, Self::OutputName(..) | Self::InputValue(_))
+        matches!(
+            self,
+            Self::OutputName(..) | Self::CaseName(..) | Self::InputValue(_)
+        )
     }
 }
 
@@ -79,6 +117,7 @@ pub(in crate::monos) enum BoardPick {
     MaxRounds(Option<String>),
     Decider(Option<String>),
     IfDecider(String),
+    SwitchDecider(String),
     OutputType(String, String),
     ScheduleKind(String),
     ScheduleHours(String),
@@ -442,10 +481,11 @@ impl Monos {
                 target,
                 at,
             } => {
-                let (source, target, handle, at) = (source.clone(), target.clone(), *handle, *at);
+                let (source, target, handle, at) =
+                    (source.clone(), target.clone(), handle.clone(), *at);
                 let mut asked = None;
                 self.board_flow(
-                    |flow, w| match connect(flow, w, &source, &target, handle) {
+                    |flow, w| match connect(flow, w, &source, &target, handle.as_deref()) {
                         Connected::Edge(out) => out,
                         Connected::Loop => {
                             asked = Some(LoopAsk {
@@ -559,6 +599,27 @@ impl Monos {
                 }
             }
         }
+    }
+
+    /// A new case at the end of the Switch `id`, with a name no case has.
+    pub(super) fn board_add_case(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(board) = self.wf.board.as_ref() else {
+            return;
+        };
+        let Some(NodeKind::Switch { cases, .. }) = board.node(id).map(|n| &n.kind) else {
+            return;
+        };
+        let name = next_case_name(cases, &out_handles_taken(&board.flow, id));
+        let id = id.to_string();
+        self.board_flow(|flow, _| add_switch_case(flow, &id, &name), cx);
+    }
+
+    /// The case `case` of the Switch `id` and the lines that leave by it are removed.
+    pub(super) fn board_remove_case(&mut self, id: &str, case: &str, cx: &mut Context<Self>) {
+        let (id, case) = (id.to_string(), case.to_string());
+        self.fields
+            .remove(&BoardField::CaseName(id.clone(), case.clone()).key());
+        self.board_flow(|flow, _| remove_switch_case(flow, &id, &case), cx);
     }
 
     pub(super) fn board_remove_loop(&mut self, node: &str, cx: &mut Context<Self>) {
@@ -720,6 +781,8 @@ impl Monos {
             | BoardField::Question(id)
             | BoardField::Condition(id)
             | BoardField::IfQuestion(id)
+            | BoardField::SwitchValue(id)
+            | BoardField::SwitchQuestion(id)
             | BoardField::List(id)
             | BoardField::EachAs(id)
             | BoardField::Template(id) => self.board_node_edit(
@@ -736,6 +799,12 @@ impl Monos {
                     (BoardField::IfQuestion(_), NodeKind::If { question, .. }) => {
                         *question = some(&text)
                     }
+                    (BoardField::SwitchValue(_), NodeKind::Switch { value, .. }) => {
+                        *value = Some(text)
+                    }
+                    (BoardField::SwitchQuestion(_), NodeKind::Switch { question, .. }) => {
+                        *question = some(&text)
+                    }
                     (BoardField::List(_), NodeKind::ForEach { list, .. }) => *list = text,
                     (BoardField::EachAs(_), NodeKind::ForEach { item, .. }) => *item = some(&text),
                     (BoardField::Template(_), NodeKind::Report { template }) => {
@@ -745,12 +814,15 @@ impl Monos {
                 },
                 cx,
             ),
-            BoardField::OutputName(..) | BoardField::InputValue(_) | BoardField::NewInput => {}
+            BoardField::OutputName(..)
+            | BoardField::CaseName(..)
+            | BoardField::InputValue(_)
+            | BoardField::NewInput => {}
         }
     }
 
     /// A committed field was left or submitted.
-    fn board_commit(&mut self, spec: &BoardField, cx: &mut Context<Self>) {
+    pub(super) fn board_commit(&mut self, spec: &BoardField, cx: &mut Context<Self>) {
         let typed = self
             .fields
             .get(&spec.key())
@@ -789,6 +861,23 @@ impl Monos {
                     },
                     cx,
                 );
+            }
+            BoardField::CaseName(node, from) => {
+                let Some(NodeKind::Switch { cases, .. }) = b.node(node).map(|n| &n.kind) else {
+                    return;
+                };
+                if typed == *from {
+                    return;
+                }
+                // A blank, reserved or taken name goes back to the case it was.
+                if !case_name_usable(&typed, cases, &out_handles_taken(&b.flow, node)) {
+                    reset(self, from.clone(), cx);
+                    return;
+                }
+                let (node, from) = (node.clone(), from.clone());
+                // The field is rebuilt under its new name.
+                self.fields.remove(&spec.key());
+                self.board_flow(|flow, _| rename_switch_case(flow, &node, &from, &typed), cx);
             }
             BoardField::InputValue(name) => {
                 let Some(input) = b.meta.inputs.get(name).cloned() else {
