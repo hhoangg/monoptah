@@ -32,8 +32,14 @@ fn scene() -> Scene {
             {"id": "check", "type": "if", "decide": "mono", "ui": {"x": 0, "y": 200}},
             {"id": "each", "type": "forEach", "in": "{{a.list}}", "ui": {"x": 400, "y": 0}},
             {"id": "report", "type": "report", "ui": {"x": 0, "y": 300}},
+            {"id": "route", "type": "switch", "value": "{{a.kind}}",
+             "cases": ["bug", "feature", "chore"], "ui": {"x": 800, "y": 0}},
         ]),
-        json!([{"from": "trigger", "to": "a"}, {"from": "a", "to": "check"}]),
+        json!([
+            {"from": "trigger", "to": "a"}, {"from": "a", "to": "check"},
+            {"from": "route", "to": "report", "handle": "feature"},
+            {"from": "route", "to": "a", "handle": "default"},
+        ]),
     );
     let flow = to_flow(&w);
     Scene::build(&flow.nodes, &flow.edges, Vec::new(), "k".into())
@@ -44,7 +50,10 @@ fn node<'a>(scene: &'a Scene, id: &str) -> &'a SceneNode {
 }
 
 fn kinds(scene: &Scene, id: &str) -> Vec<HandleKind> {
-    handles_of(node(scene, id)).iter().map(|h| h.kind).collect()
+    handles_of(node(scene, id))
+        .into_iter()
+        .map(|h| h.kind)
+        .collect()
 }
 
 #[test]
@@ -64,11 +73,51 @@ fn a_session_has_in_out_and_both_loop_handles() {
 #[test]
 fn an_if_leaves_by_true_and_false_and_cannot_start_a_loop() {
     let kinds = kinds(&scene(), "check");
-    assert!(kinds.contains(&HandleKind::Out(Some("true"))));
-    assert!(kinds.contains(&HandleKind::Out(Some("false"))));
+    assert!(kinds.contains(&HandleKind::Out(Some("true".into()))));
+    assert!(kinds.contains(&HandleKind::Out(Some("false".into()))));
     assert!(!kinds.contains(&HandleKind::Out(None)));
     assert!(!kinds.contains(&HandleKind::LoopOut));
     assert!(kinds.contains(&HandleKind::LoopIn));
+}
+
+#[test]
+fn a_switch_leaves_by_each_case_and_default_spread_across_its_width() {
+    let scene = scene();
+    let outs: Vec<(Option<String>, f32)> = handles_of(node(&scene, "route"))
+        .into_iter()
+        .filter_map(|h| match h.kind {
+            HandleKind::Out(name) => Some((name, h.at.x - node(&scene, "route").rect.x)),
+            _ => None,
+        })
+        .collect();
+    let names: Vec<_> = outs.iter().map(|(n, _)| n.as_deref().unwrap()).collect();
+    assert_eq!(names, vec!["bug", "feature", "chore", "default"]);
+    // In order from left to right, apart, and all inside the card.
+    for pair in outs.windows(2) {
+        assert!(pair[1].1 - pair[0].1 > 20., "{outs:?}");
+    }
+    assert!(outs[0].1 > 0. && outs[3].1 < NODE_W, "{outs:?}");
+    let kinds = kinds(&scene, "route");
+    assert!(!kinds.contains(&HandleKind::Out(None)));
+    assert!(!kinds.contains(&HandleKind::LoopOut));
+    assert!(kinds.contains(&HandleKind::LoopIn));
+}
+
+#[test]
+fn the_line_of_a_case_leaves_from_the_handle_of_that_case() {
+    let scene = scene();
+    for (target, case) in [("report", "feature"), ("a", "default")] {
+        let handle = handles_of(node(&scene, "route"))
+            .into_iter()
+            .find(|h| h.kind == HandleKind::Out(Some(case.into())))
+            .unwrap();
+        let edge = scene
+            .edges
+            .iter()
+            .find(|e| e.id == format!("route.{case}->{target}"))
+            .unwrap();
+        assert_eq!(edge.segs[0], Seg::Move(handle.at), "{case}");
+    }
 }
 
 #[test]

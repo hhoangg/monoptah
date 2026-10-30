@@ -159,6 +159,21 @@ pub fn parse_node(raw: &Json) -> Option<Node> {
             decide: (str_of(raw, "decide").as_deref() == Some("mono")).then_some(Decide::Mono),
             question: str_of(raw, "question"),
         },
+        "switch" => NodeKind::Switch {
+            value: str_of(raw, "value"),
+            cases: raw
+                .get("cases")
+                .and_then(Json::as_array)
+                .map(|cases| {
+                    cases
+                        .iter()
+                        .filter_map(|c| c.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            decide: (str_of(raw, "decide").as_deref() == Some("mono")).then_some(Decide::Mono),
+            question: str_of(raw, "question"),
+        },
         "forEach" => NodeKind::ForEach {
             list: str_of(raw, "in")?,
             item: str_of(raw, "as"),
@@ -191,17 +206,35 @@ pub fn parse_edge(raw: &Json) -> Option<Edge> {
         }),
         Some(_) => return None,
     };
-    let handle = match raw.get("handle").and_then(Json::as_str) {
-        Some("true") => Some(Handle::True),
-        Some("false") => Some(Handle::False),
-        _ => None,
-    };
+    let handle = raw
+        .get("handle")
+        .and_then(Json::as_str)
+        .filter(|h| !h.is_empty())
+        .map(Handle::named);
     Some(Edge {
         from,
         to,
         handle,
         loop_spec,
     })
+}
+
+/// Drops the handles an edge cannot use. A named handle other than "true" or "false" only means
+/// something on a case or default edge of a Switch, so on a loop edge or on a node that is not a
+/// Switch (or an If, which reports it in validation) it is ignored, as such handles always were.
+pub(super) fn drop_stray_handles(nodes: &[Node], edges: &mut [Edge]) {
+    for edge in edges {
+        if !matches!(edge.handle, Some(Handle::Case(_))) {
+            continue;
+        }
+        let from = nodes.iter().find(|n| n.id == edge.from);
+        let keeps = edge.loop_spec.is_none()
+            && from
+                .is_some_and(|n| matches!(n.kind, NodeKind::Switch { .. } | NodeKind::If { .. }));
+        if !keeps {
+            edge.handle = None;
+        }
+    }
 }
 
 pub fn parse_inputs(raw: Option<&Json>) -> OrderedMap<WorkflowInput> {
@@ -266,7 +299,8 @@ pub fn parse_workflow(raw: &Json) -> Option<Workflow> {
         Some(edges) => edges.iter().map(parse_edge).collect(),
         None => Some(Vec::new()),
     };
-    let (nodes, edges) = (nodes?, edges?);
+    let (nodes, mut edges) = (nodes?, edges?);
+    drop_stray_handles(&nodes, &mut edges);
     let flag = |key: &str| raw.get(key) == Some(&Json::Bool(true));
     Some(Workflow {
         id,

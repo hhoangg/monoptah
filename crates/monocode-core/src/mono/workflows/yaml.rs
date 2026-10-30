@@ -6,13 +6,13 @@
 //! positions and edges. Every string in it is checked for absolute paths, so a file can be
 //! handed to someone else.
 use super::model::{
-    new_workflow_id, Checkout, Cwd, Decide, Edge, Handle, InputValue, Node, NodeId, NodeKind,
-    OutputField, OutputFieldType, Workflow, WorkflowId, WorkflowInput, NODE_TYPES,
+    new_workflow_id, Checkout, Cwd, Decide, Edge, InputValue, Node, NodeId, NodeKind, OutputField,
+    OutputFieldType, Workflow, WorkflowId, WorkflowInput, NODE_TYPES,
 };
 use super::models::{workflow_issues, ModelCatalog};
 use super::ordered::{Json, OrderedMap};
 use super::output::output_instruction;
-use super::parse::{parse_edge, parse_inputs, parse_node};
+use super::parse::{drop_stray_handles, parse_edge, parse_inputs, parse_node};
 use super::template::{js_space, js_trim};
 use super::validate::{find_absolute_path, WorkflowIssue};
 use super::yaml_emit::{stringify, Doc};
@@ -180,6 +180,21 @@ fn export_node(node: &Node) -> Doc {
             put(&mut out, "decide", decide.map(|Decide::Mono| text("mono")));
             put(&mut out, "question", question.as_deref().map(text));
         }
+        NodeKind::Switch {
+            value,
+            cases,
+            decide,
+            question,
+        } => {
+            put(&mut out, "value", value.as_deref().map(text));
+            put(
+                &mut out,
+                "cases",
+                Some(Doc::Seq(cases.iter().map(|c| text(c)).collect())),
+            );
+            put(&mut out, "decide", decide.map(|Decide::Mono| text("mono")));
+            put(&mut out, "question", question.as_deref().map(text));
+        }
         NodeKind::ForEach {
             list,
             item,
@@ -205,10 +220,7 @@ fn export_edge(edge: &Edge) -> Doc {
     put(
         &mut out,
         "handle",
-        edge.handle.map(|h| match h {
-            Handle::True => text("true"),
-            Handle::False => text("false"),
-        }),
+        edge.handle.as_ref().map(|h| text(h.as_str())),
     );
     put(
         &mut out,
@@ -380,6 +392,10 @@ pub fn review_texts(nodes: &[Node]) -> (Vec<ReviewCommand>, Vec<ReviewPrompt>) {
                 );
             }
             NodeKind::If {
+                question: Some(question),
+                ..
+            }
+            | NodeKind::Switch {
                 question: Some(question),
                 ..
             } => prompt(node, question.clone()),
@@ -575,6 +591,7 @@ pub fn preview_import(text: &str, catalog: &ModelCatalog) -> Result<ImportPrevie
         };
         edges.push(edge);
     }
+    drop_stray_handles(&nodes, &mut edges);
 
     let workflow = WorkflowDraft {
         name,

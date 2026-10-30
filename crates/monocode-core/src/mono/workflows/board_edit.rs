@@ -5,8 +5,8 @@
 use super::board_model::{
     auto_place, connection_kind, definition_key, deletion, drop_crossing_edges, drop_nodes,
     fit_groups, from_flow, groupable, is_group, make_edge, new_node, project_input_for, push_below,
-    settle_drop, BoardNodeData, ConnectionKind, Flow, FlowKind, FlowNode, NodeType, Point,
-    EMPTY_GROUP_H, GAP_Y, GROUP_PAD, NODE_H, NODE_W,
+    settle_drop, BoardNodeData, ConnectionKind, Flow, FlowEdge, FlowKind, FlowNode, NodeType,
+    Point, EMPTY_GROUP_H, GAP_Y, GROUP_PAD, NODE_H, NODE_W,
 };
 use super::engine::looped_node_ids;
 use super::model::{
@@ -230,6 +230,7 @@ pub fn picker_groups() -> &'static [PickerGroup] {
             title: "Flow",
             items: &[
                 (NodeType::If, "Go one way or the other"),
+                (NodeType::Switch, "Pick one of several ways"),
                 (NodeType::ForEach, "Repeat for each item of a list"),
             ],
         },
@@ -262,6 +263,7 @@ pub fn type_label(ty: NodeType) -> &'static str {
         NodeType::Command => "Command",
         NodeType::AskMono => "Ask Mono",
         NodeType::If => "If",
+        NodeType::Switch => "Switch",
         NodeType::ForEach => "For each",
         NodeType::Report => "Report to Mono",
     }
@@ -270,11 +272,7 @@ pub fn type_label(ty: NodeType) -> &'static str {
 // ---- editing the flow -------------------------------------------------------------------------
 
 fn handle_of(name: Option<&str>) -> Option<Handle> {
-    match name {
-        Some("true") => Some(Handle::True),
-        Some("false") => Some(Handle::False),
-        _ => None,
-    }
+    name.filter(|n| !n.is_empty()).map(Handle::named)
 }
 
 /// Whether a connection from `source` (leaving by the If handle `handle`, if any) to `target`
@@ -428,10 +426,14 @@ pub fn add_node(flow: &Flow, w: &Workflow, ty: NodeType) -> (Flow, NodeId) {
             .cloned()
             .collect();
         edges.retain(|e| !(e.loop_spec.is_none() && e.target == report.id));
-        edges.extend(
-            into.iter()
-                .map(|e| make_edge(&e.source, &node.id, handle_of(e.source_handle), None)),
-        );
+        edges.extend(into.iter().map(|e| {
+            make_edge(
+                &e.source,
+                &node.id,
+                handle_of(e.source_handle.as_deref()),
+                None,
+            )
+        }));
         if !into.is_empty() {
             edges.push(make_edge(&node.id, &report.id, None, None));
         }
@@ -457,11 +459,13 @@ pub fn add_node(flow: &Flow, w: &Workflow, ty: NodeType) -> (Flow, NodeId) {
             }
         }
         if let Some(lowest) = lowest {
-            let free = !matches!(lowest.kind, NodeKind::Report { .. } | NodeKind::If { .. })
-                && !w
-                    .edges
-                    .iter()
-                    .any(|e| e.loop_spec.is_none() && e.from == lowest.id);
+            let free = !matches!(
+                lowest.kind,
+                NodeKind::Report { .. } | NodeKind::If { .. } | NodeKind::Switch { .. }
+            ) && !w
+                .edges
+                .iter()
+                .any(|e| e.loop_spec.is_none() && e.from == lowest.id);
             if free {
                 let mut wider = w.clone();
                 let mut added = node.clone();
@@ -501,16 +505,17 @@ pub fn connect(
     handle: Option<&str>,
 ) -> Connected {
     let handle = handle_of(handle);
-    match connection_kind(w, source, target, handle) {
+    match connection_kind(w, source, target, handle.clone()) {
         ConnectionKind::Invalid => Connected::Invalid,
         ConnectionKind::Loop => Connected::Loop,
         ConnectionKind::Edge => {
             let mut out = flow.clone();
-            // An If node's true or false leads to one place.
-            if let Some(h) = handle {
-                let name = super::board_model::handle_name(h);
+            // An If node's true or false, and each handle of a Switch, leads to one place.
+            if let Some(h) = &handle {
                 out.edges.retain(|e| {
-                    !(e.loop_spec.is_none() && e.source == source && e.source_handle == Some(name))
+                    !(e.loop_spec.is_none()
+                        && e.source == source
+                        && e.source_handle.as_deref() == Some(h.as_str()))
                 });
             }
             out.edges.push(make_edge(source, target, handle, None));
@@ -822,6 +827,114 @@ pub fn if_decided_by(node: &Node, mono: bool) -> Node {
         }
     }
     out
+}
+
+/// A Switch decided by the Mono or by a value (which starts empty).
+pub fn switch_decided_by(node: &Node, mono: bool) -> Node {
+    let mut out = node.clone();
+    if let NodeKind::Switch { value, decide, .. } = &mut out.kind {
+        if mono {
+            *value = None;
+            *decide = Some(Decide::Mono);
+        } else {
+            *decide = None;
+            *value = Some(String::new());
+        }
+    }
+    out
+}
+
+/// The flow with the Switch `id` changed by `edit` on its cases, and every out edge of it
+/// passed through `edges` (which keeps, renames or drops it).
+fn edit_switch(
+    flow: &Flow,
+    id: &str,
+    edit: impl FnOnce(&mut Vec<String>),
+    edges: impl Fn(&FlowEdge) -> Option<Option<Handle>>,
+) -> Flow {
+    let mut out = flow.clone();
+    let Some(node) = out.nodes.iter_mut().find(|n| n.id == id) else {
+        return out;
+    };
+    let NodeKind::Switch { cases, .. } = &mut node.data.node.kind else {
+        return out;
+    };
+    edit(cases);
+    out.edges = flow
+        .edges
+        .iter()
+        .filter_map(|e| {
+            if e.loop_spec.is_some() || e.source != id {
+                return Some(e.clone());
+            }
+            let handle = edges(e)?;
+            let mut next = make_edge(&e.source, &e.target, handle, None);
+            next.selected = e.selected;
+            Some(next)
+        })
+        .collect();
+    out
+}
+
+/// The Switch `id` with `case` added as its last case. A case already there is not added twice.
+pub fn add_switch_case(flow: &Flow, id: &str, case: &str) -> Flow {
+    edit_switch(
+        flow,
+        id,
+        |cases| {
+            if !cases.iter().any(|c| c == case) {
+                cases.push(case.to_string());
+            }
+        },
+        |e| Some(e.source_handle.as_deref().map(Handle::named)),
+    )
+}
+
+/// Whether a line leaving the node `id` already uses `name` as its handle.
+pub fn out_edge_uses_handle(flow: &Flow, id: &str, name: &str) -> bool {
+    flow.edges.iter().any(|e| {
+        e.loop_spec.is_none() && e.source == id && e.source_handle.as_deref() == Some(name)
+    })
+}
+
+/// The Switch `id` with the case `from` called `to`, in the same place; the edges that left by
+/// `from` leave by `to`. A `to` that a line of the node already leaves by (and `from` does not)
+/// would capture that line, so nothing changes then.
+pub fn rename_switch_case(flow: &Flow, id: &str, from: &str, to: &str) -> Flow {
+    if from != to && out_edge_uses_handle(flow, id, to) {
+        return flow.clone();
+    }
+    edit_switch(
+        flow,
+        id,
+        |cases| {
+            for c in cases.iter_mut().filter(|c| *c == from) {
+                *c = to.to_string();
+            }
+        },
+        |e| {
+            Some(e.source_handle.as_deref().map(|h| {
+                if h == from {
+                    Handle::named(to)
+                } else {
+                    Handle::named(h)
+                }
+            }))
+        },
+    )
+}
+
+/// The Switch `id` without the case `case`; the edges that left by it are removed with it.
+pub fn remove_switch_case(flow: &Flow, id: &str, case: &str) -> Flow {
+    edit_switch(
+        flow,
+        id,
+        |cases| cases.retain(|c| c != case),
+        |e| match e.source_handle.as_deref() {
+            Some(h) if h == case => None,
+            other => Some(other.map(Handle::named)),
+        },
+    )
 }
 
 /// A loop decided by the Mono or by a condition (which starts empty).

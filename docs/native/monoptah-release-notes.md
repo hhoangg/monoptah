@@ -1,15 +1,13 @@
-# Monoptah Native 0.35.0
+# Monoptah Native 0.36.0
 
-A release of the experimental Rust + GPUI app for macOS on Apple silicon, merged with the upstream native 0.16.0-preview.10 work. The React/Tauri app, Monoptah, remains the production app.
+A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.34.3
+## Changes since 0.35.0
 
-- Merged upstream native 0.16.0-preview.10. A new Overview tab in a Mono shows its current activity, a contribution calendar, merged pull requests, lines changed and upcoming habits. The session list is now called Sub-agents, with cards showing model, provider, checkout and state.
-- Heartbeats: an idle Mono reviews recent work, sessions left unattended, notes and inbox items in its projects and suggests up to two follow-ups. On by default after 30 minutes of quiet; the Mono's settings offer an off switch and 15-minute, 30-minute, 1-hour and 2-hour intervals. Quiet checks leave no chat report, and a heartbeat that started sessions keeps its history.
-- /visualize and native visual documents: visuals published in a Mono chat also appear in Documents. New HTML artifacts are no longer accepted; use a Markdown document or visual_show.
-- Monos open every reply with a short sentence and hand longer work to background sessions. Launched sessions stay in the background unless split into the workspace explicitly.
-- New opt-in setting in Settings > Providers: Identify as Monoptah to Claude (experimental).
-- Hermes Agent receives the reasoning effort selected in the model picker, slash commands have distinct icons, and a transcript crash while messages merge during animation is fixed.
+- Mono workflows have a new Switch node. It routes a run to one of several named cases by comparing a value such as `{{triage.kind}}` with each case, and takes the `default` branch when none match. A Switch can also let the Mono choose the case, with an optional question.
+- On the workflow board a Switch card has one output port per case plus `default`. The inspector edits the value, the question, who decides, and the list of cases; renaming or removing a case keeps its connected edge in step.
+- Workflow validation checks Switch nodes: cases must be non-blank and unique, `default` is reserved, and every out-edge needs a case or `default` handle, with at most one edge per handle. `workflows.guide` documents the node.
+- Existing workflows with If nodes load and save unchanged.
 
 ## What it is
 

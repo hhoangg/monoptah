@@ -369,6 +369,60 @@ impl Monos {
         row.into_any_element()
     }
 
+    /// The cases of a Switch: a name each, a button to add one and one to remove each.
+    pub(super) fn board_cases(
+        &mut self,
+        id: &str,
+        cases: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let add_id = id.to_string();
+        let add = Self::section_button("wf-case-add", "Add case", "plus")
+            .on_click(cx.listener(move |this, _, _, cx| this.board_add_case(&add_id, cx)));
+        let mut body = div().px_1().flex().flex_col().gap_1();
+        for case in cases {
+            let spec = BoardField::CaseName(id.to_string(), case.clone());
+            let selector = spec.key();
+            let input = self.board_field(spec, "Case", "", case, false, None, window, cx);
+            let (remove_id, remove_case) = (id.to_string(), case.clone());
+            let remove_selector = format!("wf-case-remove-{case}");
+            let mut row = div().flex().items_center().gap_1p5().child(
+                div().flex_1().min_w_0().child(
+                    habit_field(input)
+                        .id(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector.clone())
+                        .h(px(28.))
+                        .bg(content(0.1)),
+                ),
+            );
+            // A Switch needs a case, so the last one cannot be removed.
+            if cases.len() > 1 {
+                row = row.child(
+                    habit_icon_button(
+                        SharedString::from(remove_selector.clone()),
+                        "Remove case",
+                        "close",
+                    )
+                    .debug_selector(move || remove_selector.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.board_remove_case(&remove_id, &remove_case, cx)
+                    })),
+                );
+            }
+            body = body.child(row);
+        }
+        body = body.child(
+            div()
+                .px_1()
+                .text_size(px(12.))
+                .line_height(px(20.))
+                .text_color(content(0.4))
+                .child("Anything that matches no case leaves by default."),
+        );
+        section("Cases", Some(add.into_any_element())).child(body)
+    }
+
     pub(super) fn board_outputs(
         &mut self,
         id: &str,

@@ -804,6 +804,54 @@ impl Monos {
                     )
                     .into_any_element()
             }
+            NodeKind::Switch {
+                value,
+                cases,
+                decide,
+                question,
+            } => {
+                let by_mono = decide.is_some();
+                let decider = self.choice_row(
+                    "Decided by",
+                    BoardPick::SwitchDecider(id.clone()),
+                    choices(&[("value", "A value"), ("mono", "Mono decides")]),
+                    if by_mono { "mono" } else { "value" },
+                    cx,
+                );
+                let mut rows = props().child(decider);
+                if !by_mono {
+                    rows = rows.child(self.text_row(
+                        "Value",
+                        BoardField::SwitchValue(id.clone()),
+                        value.as_deref().unwrap_or(""),
+                        "{{review.verdict}}",
+                        window,
+                        cx,
+                    ));
+                }
+                let tail = if by_mono {
+                    self.long_text(
+                        "Question",
+                        BoardField::SwitchQuestion(id.clone()),
+                        question.as_deref().unwrap_or(""),
+                        "What the Mono should check before choosing a case.",
+                        window,
+                        cx,
+                    )
+                    .into_any_element()
+                } else {
+                    hint("The line that leaves is the case equal to the value, else default.")
+                        .into_any_element()
+                };
+                let cases = self.board_cases(&id, cases, window, cx);
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(rows)
+                    .child(tail)
+                    .child(cases)
+                    .into_any_element()
+            }
             NodeKind::If {
                 condition,
                 decide,
@@ -1017,6 +1065,9 @@ impl Monos {
             }
             BoardPick::Decider(node) => {
                 self.board_loop_edit(node.as_deref(), |s| loop_decided_by(s, v == "mono"), cx)
+            }
+            BoardPick::SwitchDecider(id) => {
+                self.board_node_edit(id, |n| *n = switch_decided_by(n, v == "mono"), cx)
             }
             BoardPick::IfDecider(id) => {
                 self.board_node_edit(id, |n| *n = if_decided_by(n, v == "mono"), cx)

@@ -32,9 +32,12 @@ pub const WORKFLOW_NAME_MAX: usize = 80;
 pub const WORKFLOW_DESCRIPTION_MAX: usize = 1_000;
 pub const WORKFLOW_DEFINITION_MAX_BYTES: usize = 512 * 1024;
 
-pub const NODE_TYPES: [&str; 8] = [
-    "schedule", "manual", "session", "command", "askMono", "if", "forEach", "report",
+pub const NODE_TYPES: [&str; 9] = [
+    "schedule", "manual", "session", "command", "askMono", "if", "switch", "forEach", "report",
 ];
+
+/// The handle a switch sends the run down when no case matches. Not allowed as a case.
+pub const SWITCH_DEFAULT: &str = "default";
 
 /// `^[a-z][a-z0-9_]{0,39}$`
 pub fn is_node_id(id: &str) -> bool {
@@ -242,6 +245,17 @@ pub enum NodeKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         question: Option<String>,
     },
+    /// Routes to the out edge whose handle equals `value` after rendering, or to `default`.
+    /// Either `value` or `decide: "mono"` (with an optional `question`).
+    Switch {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        cases: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decide: Option<Decide>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        question: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     ForEach {
         /// A list expression such as `{{fetch.tickets}}`.
@@ -273,6 +287,7 @@ impl NodeKind {
             Self::Command { .. } => "command",
             Self::AskMono { .. } => "askMono",
             Self::If { .. } => "if",
+            Self::Switch { .. } => "switch",
             Self::ForEach { .. } => "forEach",
             Self::Report { .. } => "report",
         }
@@ -308,12 +323,38 @@ impl Node {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// The handle an out edge of an If or switch node leaves from. It is written as a plain string:
+/// "true" and "false" for an If, a case or "default" for a switch. Build one with
+/// `Handle::named` so "true" and "false" are always the first two variants.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Handle {
-    #[serde(rename = "true")]
     True,
-    #[serde(rename = "false")]
     False,
+    Case(String),
+}
+
+impl Handle {
+    pub fn named(name: &str) -> Self {
+        match name {
+            "true" => Self::True,
+            "false" => Self::False,
+            other => Self::Case(other.to_string()),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::True => "true",
+            Self::False => "false",
+            Self::Case(name) => name,
+        }
+    }
+}
+
+impl Serialize for Handle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 /// A back edge: after the source node, the decider may send the branch back to `to`.
@@ -331,7 +372,7 @@ pub struct LoopSpec {
 pub struct Edge {
     pub from: NodeId,
     pub to: NodeId,
-    /// Only on the out edges of an If node.
+    /// Only on the out edges of an If or switch node.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handle: Option<Handle>,
     #[serde(rename = "loop", skip_serializing_if = "Option::is_none")]

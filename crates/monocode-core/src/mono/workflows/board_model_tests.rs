@@ -105,7 +105,7 @@ mod to_flow_from_flow {
             .unwrap();
         assert_eq!(looped.source, "review");
         assert_eq!(looped.target, "dev");
-        assert_eq!(looped.source_handle, Some("loop-out"));
+        assert_eq!(looped.source_handle.as_deref(), Some("loop-out"));
         assert_eq!(looped.target_handle, Some("loop-in"));
         let spec = looped.loop_spec.as_ref().unwrap();
         assert_eq!(spec.max_rounds, 3.0);
@@ -134,7 +134,7 @@ mod to_flow_from_flow {
             edge(r#"{"from": "check", "to": "report", "handle": "true"}"#),
         ];
         let flow = to_flow(&w);
-        assert_eq!(flow.edges[1].source_handle, Some("true"));
+        assert_eq!(flow.edges[1].source_handle.as_deref(), Some("true"));
         assert_eq!(from_flow(&w, &flow.nodes, &flow.edges).edges, w.edges);
     }
 
@@ -977,7 +977,7 @@ mod whole_workflows {
         let looped = make_edge("a", "b", None, Some(spec));
         assert_eq!(looped.id, "a->b~loop");
         assert_eq!(
-            (looped.source_handle, looped.target_handle),
+            (looped.source_handle.as_deref(), looped.target_handle),
             (Some(LOOP_OUT), Some(LOOP_IN))
         );
     }
@@ -990,5 +990,121 @@ mod whole_workflows {
         let a: Value = serde_json::to_value(&w.nodes).unwrap();
         let b: Value = serde_json::to_value(&back.nodes).unwrap();
         assert_eq!(a, b);
+    }
+}
+
+mod switch {
+    use super::*;
+
+    fn routed() -> Workflow {
+        let mut w = workflow();
+        w.nodes = vec![
+            n(json!({"id": "trigger", "type": "manual", "ui": {"x": 0, "y": 0}})),
+            n(
+                json!({"id": "route", "type": "switch", "value": "{{inputs.x}}",
+                "cases": ["bug", "new feature"], "ui": {"x": 0, "y": 80}}),
+            ),
+            n(json!({"id": "report", "type": "report", "ui": {"x": 0, "y": 160}})),
+        ];
+        w.edges = vec![
+            edge(r#"{"from": "trigger", "to": "route"}"#),
+            edge(r#"{"from": "route", "to": "report", "handle": "bug"}"#),
+            edge(r#"{"from": "route", "to": "report", "handle": "new feature"}"#),
+            edge(r#"{"from": "route", "to": "report", "handle": "default"}"#),
+        ];
+        w
+    }
+
+    #[test]
+    fn a_switch_has_a_port_per_case_and_one_for_the_default() {
+        let w = routed();
+        assert_eq!(
+            out_handles(w.node("route").unwrap()),
+            vec!["bug", "new feature", "default"]
+        );
+        assert_eq!(
+            out_handles(&n(json!({"id": "c", "type": "if", "decide": "mono"}))),
+            vec!["true", "false"]
+        );
+        assert!(out_handles(w.node("trigger").unwrap()).is_empty());
+        assert_eq!(
+            NodeType::of(&w.node("route").unwrap().kind),
+            NodeType::Switch
+        );
+        assert_eq!(NodeType::Switch.name(), "switch");
+    }
+
+    #[test]
+    fn the_handles_of_a_switch_survive_the_flow_and_name_the_edge_ids() {
+        let w = routed();
+        let flow = to_flow(&w);
+        let handles: Vec<Option<&str>> = flow
+            .edges
+            .iter()
+            .map(|e| e.source_handle.as_deref())
+            .collect();
+        assert_eq!(
+            handles,
+            vec![None, Some("bug"), Some("new feature"), Some("default")]
+        );
+        assert_eq!(
+            edge_ids(&flow.edges)[1..],
+            [
+                "route.bug->report",
+                "route.new feature->report",
+                "route.default->report"
+            ]
+        );
+        assert_eq!(from_flow(&w, &flow.nodes, &flow.edges).edges, w.edges);
+    }
+
+    #[test]
+    fn a_switch_case_named_like_the_loop_handle_keeps_its_edges() {
+        let mut w = routed();
+        w.nodes[1] = n(
+            json!({"id": "route", "type": "switch", "value": "{{inputs.x}}",
+            "cases": ["loop-out"], "ui": {"x": 0, "y": 80}}),
+        );
+        w.edges = vec![
+            edge(r#"{"from": "trigger", "to": "route"}"#),
+            edge(r#"{"from": "route", "to": "report", "handle": "loop-out"}"#),
+            edge(r#"{"from": "route", "to": "report", "handle": "default"}"#),
+        ];
+        let flow = to_flow(&w);
+        assert_eq!(from_flow(&w, &flow.nodes, &flow.edges).edges, w.edges);
+    }
+
+    #[test]
+    fn a_connection_from_a_switch_needs_one_of_its_handles() {
+        let mut w = routed();
+        w.edges.retain(|e| e.from == "trigger");
+        w.nodes.push(n(
+            json!({"id": "x", "type": "command", "project": "p", "command": "ls"}),
+        ));
+        let kind = |h: &str| connection_kind(&w, "route", "x", Some(Handle::named(h)));
+        assert_eq!(kind("bug"), ConnectionKind::Edge);
+        assert_eq!(kind("new feature"), ConnectionKind::Edge);
+        assert_eq!(kind("default"), ConnectionKind::Edge);
+        assert_eq!(kind("other"), ConnectionKind::Invalid);
+        assert_eq!(kind("true"), ConnectionKind::Invalid);
+    }
+
+    #[test]
+    fn a_new_switch_starts_decided_by_the_mono_with_two_cases() {
+        let w = routed();
+        let node = new_node(NodeType::Switch, &w);
+        assert_eq!(node.id, "route_2");
+        assert!(matches!(
+            &node.kind,
+            NodeKind::Switch { value: None, cases, decide: Some(Decide::Mono), question: None }
+                if cases.len() == 2
+        ));
+        assert!(validate_workflow(&{
+            let mut v = w.clone();
+            v.nodes.push(node);
+            v
+        })
+        .iter()
+        .all(|i| i.node_id.as_deref() != Some("route_2") || i.message.contains("handle")));
     }
 }

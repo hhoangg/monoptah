@@ -1315,3 +1315,37 @@ fn visible_leaves_ordinary_text_alone() {
     assert_eq!(visible(text), text);
     assert_eq!(visible(""), "");
 }
+
+#[test]
+fn a_switch_and_its_handles_survive_export_and_import() {
+    let mut w = example();
+    w.nodes.push(node(
+        r#"{"id":"route","type":"switch","value":"{{fetch.tickets}}","cases":["bug","new feature"]}"#,
+    ));
+    w.nodes.push(node(
+        r#"{"id":"pick","type":"switch","decide":"mono","question":"Which?","cases":["a"]}"#,
+    ));
+    w.nodes.push(node(
+        r#"{"id":"gate","type":"if","condition":"{{fetch.tickets}} not empty"}"#,
+    ));
+    for text in [
+        r#"{"from":"fetch","to":"route"}"#,
+        r#"{"from":"route","to":"pick","handle":"bug"}"#,
+        r#"{"from":"route","to":"report","handle":"new feature"}"#,
+        r#"{"from":"route","to":"report","handle":"default"}"#,
+        r#"{"from":"pick","to":"gate","handle":"a"}"#,
+        r#"{"from":"gate","to":"report","handle":"true"}"#,
+        r#"{"from":"gate","to":"report","handle":"false"}"#,
+    ] {
+        w.edges.push(edge(text));
+    }
+    let yaml = export_workflow(&w);
+    assert!(yaml.contains("type: switch"));
+    assert!(yaml.contains("handle: new feature"));
+    assert!(yaml.contains("handle: \"true\"") || yaml.contains("handle: 'true'"));
+    let preview = ok(&yaml);
+    assert_eq!(preview.workflow.nodes, w.nodes);
+    assert_eq!(preview.workflow.edges, w.edges);
+    // A switch with a question is reviewed like an If with one.
+    assert!(preview.prompts.iter().any(|p| p.node_id == "pick"));
+}

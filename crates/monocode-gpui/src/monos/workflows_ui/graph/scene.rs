@@ -4,8 +4,10 @@
 //! so the board editor draws from the same thing.
 use super::geometry::{Rect, Seg, Side, arrow_head, bounds_of, rounded, step_points};
 use monocode_core::mono::workflows::{
-    board_model::{EdgeKind, FlowEdge, FlowKind, FlowNode, GROUP_PAD, NODE_W, Point, absolute},
-    model::LoopSpec,
+    board_model::{
+        EdgeKind, FlowEdge, FlowKind, FlowNode, GROUP_PAD, NODE_W, Point, absolute, out_handles,
+    },
+    model::{LoopSpec, Node},
     ordered::js_number_text,
     run_graph_model::{RunEdgeState, RunNodeStatus},
     template::js_trim,
@@ -27,6 +29,9 @@ const ARROW_HALF: f32 = 3.5;
 /// Where the true and false outs of an If leave its bottom, and the loop handles on the right.
 pub(super) const TRUE_AT: f32 = 0.28;
 pub(super) const FALSE_AT: f32 = 0.72;
+/// Where the first and last of three or more outs (a Switch) leave its bottom.
+const FIRST_OF_MANY_AT: f32 = 0.12;
+const LAST_OF_MANY_AT: f32 = 0.88;
 pub(super) const LOOP_OUT_AT: f32 = 0.7;
 pub(super) const LOOP_IN_AT: f32 = 0.3;
 /// The loop label is a pill this tall, and about this wide per character.
@@ -35,6 +40,27 @@ pub(in crate::monos) const LABEL_H: f32 = 16.;
 const LABEL_GAP: f32 = 8.;
 const LABEL_CHAR: f32 = 6.2;
 const LABEL_PAD: f32 = 12.;
+
+/// Where, as a share of the card's width, the out number `index` of `count` leaves its bottom: a
+/// lone one in the middle, two at the places of an If's true and false, more spread evenly.
+pub(super) fn out_at(index: usize, count: usize) -> f32 {
+    match count {
+        0 | 1 => 0.5,
+        2 => [TRUE_AT, FALSE_AT][index.min(1)],
+        _ => {
+            let step = (LAST_OF_MANY_AT - FIRST_OF_MANY_AT) / (count - 1) as f32;
+            FIRST_OF_MANY_AT + step * index.min(count - 1) as f32
+        }
+    }
+}
+
+/// Where the out of `node` named `handle` leaves its bottom, as a share of the card's width.
+fn out_at_of(node: &Node, handle: Option<&str>) -> f32 {
+    let outs = out_handles(node);
+    handle
+        .and_then(|name| outs.iter().position(|o| o == name))
+        .map_or(0.5, |index| out_at(index, outs.len()))
+}
 
 /// A card or a For each frame at its place on the canvas.
 #[derive(Clone, Debug)]
@@ -172,11 +198,7 @@ fn route(edge: &FlowEdge, source: &SceneNode, target: &SceneNode) -> RoutedEdge 
                 n.rect.x + n.rect.w * at
             }
         };
-        let out = match edge.source_handle {
-            Some("true") => TRUE_AT,
-            Some("false") => FALSE_AT,
-            _ => 0.5,
-        };
+        let out = out_at_of(&source.flow.data.node, edge.source_handle.as_deref());
         (
             Side::Bottom,
             Side::Top,

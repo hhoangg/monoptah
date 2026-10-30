@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 pub enum AskPurpose {
     AskMono,
     If,
+    Switch,
     Loop,
 }
 
@@ -523,15 +524,8 @@ enum Gate {
     Dead,
 }
 
-fn handle_text(h: Handle) -> &'static str {
-    match h {
-        Handle::True => "true",
-        Handle::False => "false",
-    }
-}
-
 /// Whether a pending node can start. Ready when every predecessor in the same branch is done
-/// (an If predecessor counts only along the matching handle). Dead when no predecessor leads
+/// (an If or switch predecessor counts only along the matching handle). Dead when no predecessor leads
 /// to it, so it is skipped. Blocked while a predecessor is still to finish.
 fn gate_of(d: &Draft, r: &NodeRun) -> Gate {
     let Some(edges) =
@@ -551,9 +545,12 @@ fn gate_of(d: &Draft, r: &NodeRun) -> Gate {
                 if open_loop(&d.g, src) {
                     return Gate::Blocked;
                 }
-                if matches!(d.g.kind(&e.from), Some(NodeKind::If { .. })) {
+                if matches!(
+                    d.g.kind(&e.from),
+                    Some(NodeKind::If { .. } | NodeKind::Switch { .. })
+                ) {
                     let taken = src.decision.as_ref().map(|x| x.value.as_str());
-                    if taken == e.handle.map(handle_text) {
+                    if taken == e.handle.as_ref().map(Handle::as_str) {
                         live += 1;
                     }
                 } else {
@@ -963,6 +960,28 @@ fn pass(d: &mut Draft) -> bool {
                     changed = true;
                 }
             }
+            NodeKind::Switch {
+                value,
+                cases,
+                decide,
+                ..
+            } => {
+                if decide.is_none() {
+                    let scope = Json::Object(scope_in(d, &branch, Some(&node_id)));
+                    let rendered = render_template(value.as_deref().unwrap_or(""), &scope, false);
+                    let taken = if cases.contains(&rendered) {
+                        rendered
+                    } else {
+                        SWITCH_DEFAULT.to_string()
+                    };
+                    d.run.nodes[i].decision = Some(Decision {
+                        value: taken,
+                        reason: None,
+                    });
+                    finish_node(d, i, None);
+                    changed = true;
+                }
+            }
             NodeKind::Command { command, .. } => {
                 // The dash check needs the values, so it runs once the node is ready to start.
                 let mut problems = shell_template_problems(command);
@@ -1222,6 +1241,30 @@ pub fn next_actions(run: &WorkflowRun) -> Vec<EngineAction> {
                     context: context_for(&d, r, &before),
                 });
             }
+            NodeKind::Switch {
+                decide: Some(_),
+                cases,
+                question,
+                ..
+            } => {
+                let mut answers = cases.clone();
+                answers.push(SWITCH_DEFAULT.to_string());
+                actions.push(EngineAction::AskMono {
+                    node_id: r.node_id.clone(),
+                    branch: r.branch.clone(),
+                    purpose: AskPurpose::Switch,
+                    question: match question.as_deref().filter(|q| !q.is_empty()) {
+                        Some(q) => render_template(q, &scope, false),
+                        None => format!(
+                            "Which case of {} applies? Answer with one of: {}.",
+                            describe_node(node),
+                            answers.join(", ")
+                        ),
+                    },
+                    answers,
+                    context: context_for(&d, r, &before),
+                });
+            }
             _ => {}
         }
     }
@@ -1384,6 +1427,23 @@ pub fn apply_event(run: &WorkflowRun, event: &EngineEvent) -> WorkflowRun {
                                 &mut d,
                                 i,
                                 format!("Invalid decision \"{value}\" (expected true or false)"),
+                            );
+                        } else {
+                            d.run.nodes[i].decision = Some(Decision {
+                                value: value.clone(),
+                                reason: reason.clone(),
+                            });
+                            finish_node(&mut d, i, None);
+                        }
+                    }
+                    NodeKind::Switch { cases, .. } => {
+                        if value != SWITCH_DEFAULT && !cases.contains(value) {
+                            fail_node(
+                                &mut d,
+                                i,
+                                format!(
+                                    "Invalid decision \"{value}\" (expected one of the cases or {SWITCH_DEFAULT})"
+                                ),
                             );
                         } else {
                             d.run.nodes[i].decision = Some(Decision {

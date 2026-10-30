@@ -74,7 +74,7 @@ fn state_of_node<'a>(nodes: &'a [FlowNode], id: &str) -> &'a RunNodeState {
 fn edge_of<'a>(edges: &'a [FlowEdge], from: &str, to: &str, handle: Option<&str>) -> &'a FlowEdge {
     edges
         .iter()
-        .find(|e| e.source == from && e.target == to && e.source_handle == handle)
+        .find(|e| e.source == from && e.target == to && e.source_handle.as_deref() == handle)
         .unwrap_or_else(|| panic!("no edge {from} -> {to}"))
 }
 
@@ -1162,4 +1162,72 @@ fn a_changed_node_or_input_makes_a_workflow_changed_but_a_rename_does_not() {
     let mut renamed = w;
     renamed.name = "Other name".into();
     assert!(!definition_changed(&r, &renamed));
+}
+
+#[test]
+fn a_switch_marks_only_the_edge_of_the_case_or_default_it_took() {
+    let mut w = workflow();
+    w.nodes = vec![
+        manual(),
+        n(
+            json!({"id": "route", "type": "switch", "value": "{{trigger.x}}", "cases": ["bug", "feature"]}),
+        ),
+        session("fix", json!({})),
+        session("plan", json!({})),
+        session("other", json!({})),
+    ];
+    w.edges = vec![
+        Edge::new("trigger", "route"),
+        super::fixtures::edge(r#"{"from": "route", "to": "fix", "handle": "bug"}"#),
+        super::fixtures::edge(r#"{"from": "route", "to": "plan", "handle": "feature"}"#),
+        super::fixtures::edge(r#"{"from": "route", "to": "other", "handle": "default"}"#),
+    ];
+    let taken = |decision: &str| {
+        let r = WorkflowRun {
+            definition: w.clone(),
+            nodes: vec![
+                nr("trigger"),
+                NodeRun {
+                    decision: Some(Decision {
+                        value: decision.into(),
+                        reason: None,
+                    }),
+                    ..nr("route")
+                },
+                nr_in("fix", "", NodeStatus::Pending),
+                nr_in("plan", "", NodeStatus::Pending),
+                nr_in("other", "", NodeStatus::Pending),
+            ],
+            ..run()
+        };
+        let RunGraph { edges, .. } = graph(&r, RunView::Lanes);
+        ["bug", "feature", "default"]
+            .map(|h| {
+                let to = match h {
+                    "bug" => "fix",
+                    "feature" => "plan",
+                    _ => "other",
+                };
+                edge_of(&edges, "route", to, Some(h)).run
+            })
+            .to_vec()
+    };
+    use RunEdgeState::{Idle, Taken};
+    assert_eq!(taken("feature"), vec![Some(Idle), Some(Taken), Some(Idle)]);
+    assert_eq!(taken("default"), vec![Some(Idle), Some(Idle), Some(Taken)]);
+    // A handle on an edge of a node that is not an If or Switch is ignored.
+    let mut stray = w.clone();
+    stray.edges.push(super::fixtures::edge(
+        r#"{"from": "trigger", "to": "other", "handle": "bug"}"#,
+    ));
+    let r = WorkflowRun {
+        definition: stray,
+        nodes: vec![nr("trigger"), nr_in("other", "", NodeStatus::Pending)],
+        ..run()
+    };
+    let RunGraph { edges, .. } = graph(&r, RunView::Lanes);
+    assert_eq!(
+        edge_of(&edges, "trigger", "other", Some("bug")).run,
+        Some(Taken)
+    );
 }
