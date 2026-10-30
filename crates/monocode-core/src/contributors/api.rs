@@ -9,6 +9,7 @@ use std::sync::Arc;
 use super::assessor::{self, AiConfig, AiConfigStatus};
 use super::clickup_tickets::TicketLink;
 use super::db::ContributorsDb;
+use super::fetch::{self, FetchOutcome, FetchRegistry};
 use super::jobs::{self, DbRunner, EventSink, JobManager, LoadResponse, Runner, SyncEvent};
 use super::sync::Estimate;
 use super::ticket_jobs::{
@@ -35,6 +36,7 @@ pub struct Contributors {
     data_dir: PathBuf,
     jobs: JobManager,
     tickets: TicketJobManager,
+    fetches: FetchRegistry,
 }
 
 impl Contributors {
@@ -80,6 +82,7 @@ impl Contributors {
             data_dir: data_dir.to_path_buf(),
             jobs: JobManager::new(Arc::new(runner), sink),
             tickets: TicketJobManager::new(Arc::new(deps), ticket_sink),
+            fetches: FetchRegistry::default(),
         }
     }
 
@@ -178,9 +181,24 @@ pub fn sync_start(
     contributors.jobs.start(spec)
 }
 
-/// Stops the running sync of the repository and drops the ones queued behind it.
+/// Brings the remote-tracking ref of `branch` (the default branch when `None`)
+/// up to date from `origin`. It is the only call that fetches a branch; loads,
+/// estimates and sync jobs never do (a job may still ask the remote for PR
+/// heads). `Err` only for a path that is not a repository.
+pub fn fetch_origin(
+    contributors: &Contributors,
+    cwd: &str,
+    branch: Option<&str>,
+) -> Result<FetchOutcome, String> {
+    fetch::fetch_origin(&contributors.fetches, &cwd_path(cwd), branch)
+}
+
+/// Stops the running sync of the repository and drops the ones queued behind
+/// it, and the fetch of `origin` when one runs.
 pub fn sync_cancel(contributors: &Contributors, cwd: &str) -> Result<(), String> {
-    contributors.jobs.cancel(&jobs::repo_key(&cwd_path(cwd))?);
+    let key = jobs::repo_key(&cwd_path(cwd))?;
+    contributors.fetches.cancel(&key);
+    contributors.jobs.cancel(&key);
     Ok(())
 }
 

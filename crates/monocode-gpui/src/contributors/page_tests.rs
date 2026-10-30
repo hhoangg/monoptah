@@ -17,6 +17,7 @@ use gpui::{
 };
 use monocode_core::contributors::{
     GitIdentity,
+    fetch::FetchOutcome,
     jobs::{JobState, SyncEvent},
     model::{
         period::{PeriodKind, current_period},
@@ -1007,4 +1008,43 @@ fn the_window_coming_back_revalidates_the_open_github_tab_only(cx: &mut TestAppC
     let after = ui.fake.loads().len();
     ui.page(&mut v, |page, cx| page.window_activated(cx));
     assert_eq!(ui.fake.loads().len(), after);
+}
+
+// ---- origin ----------------------------------------------------------------
+
+#[gpui::test]
+fn the_bar_offers_cancel_while_only_origin_is_being_checked(cx: &mut TestAppContext) {
+    let (ui, mut v) = github(cx, Fake::new());
+    assert!(!shown(&mut v, "contributors-checking-origin"));
+    let view = ui.view(&mut v);
+    view.update(&mut v, |view, cx| {
+        view.hold_fetch_answers();
+        view.refresh(true, cx);
+    });
+    settle(&mut v);
+    assert!(shown(&mut v, "contributors-checking-origin"));
+    assert!(shown(&mut v, "contributors-cancel"));
+    assert!(!shown(&mut v, "contributors-sync-again"));
+    click(&mut v, "contributors-cancel");
+    assert_eq!(ui.fake.count(|c| matches!(c, Call::Cancel)), 1);
+    view.update(&mut v, |view, cx| view.release_all(cx));
+    settle(&mut v);
+    assert!(!shown(&mut v, "contributors-checking-origin"));
+    assert!(shown(&mut v, "contributors-sync-again"));
+}
+
+#[gpui::test]
+fn an_unreachable_origin_is_a_quiet_note_for_every_ready_state(cx: &mut TestAppContext) {
+    for fake in [Fake::new(), unsynced_fake()] {
+        fake.with(|s| s.fetch.once.push_back(Ok(FetchOutcome::Failed("x".into()))));
+        let (_ui, mut v) = github(cx, fake);
+        assert!(!shown(&mut v, "contributors-origin-note"));
+        click(&mut v, "contributors-refresh");
+        assert!(shown(&mut v, "contributors-origin-note"));
+        assert!(!shown(&mut v, "contributors-refresh-error"));
+        assert!(!shown(&mut v, "contributors-load-error"));
+        // A good refresh takes it away.
+        click(&mut v, "contributors-refresh");
+        assert!(!shown(&mut v, "contributors-origin-note"));
+    }
 }

@@ -9,6 +9,7 @@ use chrono::{DateTime, Datelike, Local, TimeZone};
 use gpui::{Context, Entity};
 use monocode_core::contributors::{
     ContributorsBranches, GitUser, RawData,
+    fetch::FetchOutcome,
     jobs::{LoadResponse, SyncEvent},
     model::{
         config::{CONFIG_PATH, DEFAULT_CONFIG, parse_config_result, serialize_config},
@@ -203,6 +204,33 @@ pub(super) struct Effects {
     estimate: Option<(String, u64)>,
 }
 
+/// The fetch of `origin` in flight.
+pub(super) struct Fetching {
+    /// The branch key it was started for; a failure is remembered under it.
+    pub first_key: String,
+    /// A Sync pressed meanwhile: it starts when the fetch ends.
+    pub sync_after: Option<SyncAfter>,
+    /// What the note of `first_key` was before this fetch cleared it, put back
+    /// when the fetch found out nothing (`Busy`).
+    pub prior: Option<OriginIssue>,
+}
+
+/// A Sync waiting for the fetch.
+pub(super) struct SyncAfter {
+    /// The period key at the press; a different one at the end drops the sync.
+    pub key: String,
+    /// The period was fully synced at the press.
+    pub covered: bool,
+}
+
+/// What the last fetch of a branch found out, shown as a note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OriginIssue {
+    Unreachable,
+    /// Origin no longer has the branch.
+    Gone,
+}
+
 /// Everything the effects and the view read, worked out from the state.
 pub(super) struct Derived {
     pub period: Period,
@@ -244,6 +272,10 @@ pub(crate) struct Snapshot {
     pub status: Status,
     pub error: Option<String>,
     pub refreshing: bool,
+    /// A fetch of `origin` runs (and maybe no job): the bar offers Cancel.
+    pub fetching: bool,
+    /// The last fetch for this branch could not reach origin; the data shown may be behind.
+    pub origin_note: Option<String>,
     /// The data on screen is for the previous period or branch while the new one loads.
     pub stale: bool,
     pub sync_state: SyncState,
@@ -291,6 +323,33 @@ fn until_next_day(now: &DateTime<Local>, clock_now: &DateTime<Local>) -> Duratio
     Duration::from_millis(ms.max(1000) as u64)
 }
 
+/// "Data as of 14:30, could not reach origin": the time the period was last
+/// synced, as a clock time when that was today (by `now`), else with the date.
+pub(super) fn origin_note_text(
+    issue: OriginIssue,
+    synced_at: Option<i64>,
+    now: &DateTime<Local>,
+) -> String {
+    let reason = match issue {
+        OriginIssue::Unreachable => "could not reach origin",
+        OriginIssue::Gone => "origin no longer has this branch",
+    };
+    let at = synced_at
+        .and_then(|secs| DateTime::from_timestamp(secs, 0))
+        .map(|at| at.with_timezone(&Local));
+    let Some(at) = at else {
+        let mut text = reason.to_string();
+        text[..1].make_ascii_uppercase();
+        return text;
+    };
+    let stamp = if same_day(&at, now) {
+        at.format("%H:%M")
+    } else {
+        at.format("%b %-d, %H:%M")
+    };
+    format!("Data as of {stamp}, {reason}")
+}
+
 fn meta_scope(cwd: &str) -> String {
     format!("meta\u{0}{cwd}")
 }
@@ -315,6 +374,10 @@ impl GithubView {
         if self.manual {
             // The call is made now; only its answer is held back.
             let answer = work(backend);
+            if label == "fetch" && !self.hold_fetch {
+                finish(self, answer, cx);
+                return;
+            }
             self.held.push(super::github::Held {
                 label,
                 run: Some(Box::new(move |this, cx| finish(this, answer, cx))),
@@ -473,6 +536,10 @@ impl GithubView {
             status,
             error: d.failed.clone(),
             refreshing: self.running > 0,
+            fetching: self.fetching.is_some(),
+            origin_note: self.origin_issues.get(&d.first_key).map(|issue| {
+                origin_note_text(*issue, loaded.and_then(|l| l.synced_at), &(self.clock)())
+            }),
             stale: d.loaded.is_none() && d.shown.is_some(),
             sync_state: if d.loaded.is_none() {
                 SyncState::Loading
@@ -1062,7 +1129,8 @@ impl GithubView {
         self.settle(cx);
     }
 
-    /// `None`, or the checked-out branch, follows the checked-out branch.
+    /// `None`, or the branch a `None` pick follows (the default branch of
+    /// `origin`, else the checked-out one), follows that branch.
     pub(crate) fn set_branch(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
         let is_current =
             branch.as_deref() == self.meta.as_ref().map(|m| m.branches.current.as_str());
@@ -1078,6 +1146,87 @@ impl GithubView {
             self.fetch_first(true, cx);
         }
         self.load(force, force, cx);
+        // Only the user's Refresh asks origin; it never delays the read above.
+        if force {
+            self.start_fetch(None, cx);
+        }
+        self.settle(cx);
+    }
+
+    /// Asks `origin` for the branch the page reads, or joins the fetch already
+    /// running. `sync_after` (what Sync saw when pressed) decides, when it ends,
+    /// whether a full sync starts. False when there is nothing to ask (a remote
+    /// project, no backend yet): the caller then carries on without it.
+    fn start_fetch(&mut self, sync_after: Option<SyncAfter>, cx: &mut Context<Self>) -> bool {
+        if !self.can_run() {
+            return false;
+        }
+        if let Some(run) = self.fetching.as_mut() {
+            if sync_after.is_some() {
+                run.sync_after = sync_after;
+            }
+            return true;
+        }
+        let first_key = self.derive(cx).first_key;
+        let prior = self.origin_issues.remove(&first_key);
+        self.running += 1;
+        self.fetching = Some(Fetching {
+            first_key,
+            sync_after,
+            prior,
+        });
+        let (cwd, branch) = (self.cwd.clone(), self.picked_branch.clone());
+        self.spawn_job(
+            "fetch",
+            cx,
+            move |backend| backend.fetch_origin(&cwd, branch.as_deref()),
+            |this, answer, cx| this.finish_fetch(answer, cx),
+        );
+        true
+    }
+
+    fn finish_fetch(&mut self, answer: Result<FetchOutcome, String>, cx: &mut Context<Self>) {
+        let Some(run) = self.fetching.take() else {
+            return;
+        };
+        self.running = self.running.saturating_sub(1);
+        // The text of a failure is for logs: git's stderr can hold credentials.
+        // Only the branch this fetch was for gets a note, or loses one.
+        let issue = match &answer {
+            Ok(FetchOutcome::Failed(_)) | Err(_) => Some(OriginIssue::Unreachable),
+            Ok(FetchOutcome::Gone) => Some(OriginIssue::Gone),
+            // Nothing was learned: the earlier note stands.
+            Ok(FetchOutcome::Busy) => run.prior,
+            Ok(_) => None,
+        };
+        if let Some(issue) = issue {
+            self.origin_issues.insert(run.first_key.clone(), issue);
+        }
+        let moved = matches!(answer, Ok(FetchOutcome::Fetched { moved: true }));
+        if moved {
+            // The head moved: read it again; the effects top up or repair.
+            let d = self.derive(cx);
+            self.load(true, true, cx);
+            if d.wants_all && d.meta_ready {
+                self.fetch_first(true, cx);
+            }
+        }
+        if let Some(press) = run.sync_after {
+            let d = self.derive(cx);
+            // A failed fetch must not block the sync; a cancel or a move to
+            // another period or branch means the press no longer applies.
+            // A covered period whose branch moved is brought up to date by the
+            // reload above (top-up or repair); only a top-up bumps the
+            // coverage head, which a Full sync does not.
+            // Covered and unmoved still syncs: for a period still open, Sync
+            // extends the coverage to now and reads what is new since the last
+            // sync, GitHub data included; for a closed one it finds nothing.
+            let incremental = moved && press.covered;
+            if !matches!(answer, Ok(FetchOutcome::Cancelled)) && d.key == press.key && !incremental
+            {
+                self.begin(SyncMode::Full, &d, cx);
+            }
+        }
         self.settle(cx);
     }
 
@@ -1138,8 +1287,16 @@ impl GithubView {
         });
     }
 
+    /// A job resolves its head when it starts, so origin is asked first.
     pub(crate) fn start_sync(&mut self, cx: &mut Context<Self>) {
         let d = self.derive(cx);
+        let press = SyncAfter {
+            key: d.key.clone(),
+            covered: d.loaded.as_deref().is_some_and(|l| l.covered),
+        };
+        if self.start_fetch(Some(press), cx) {
+            return;
+        }
         self.begin(SyncMode::Full, &d, cx);
     }
 
@@ -1152,6 +1309,10 @@ impl GithubView {
     pub(crate) fn cancel_sync(&mut self, cx: &mut Context<Self>) {
         if self.cwd.is_empty() {
             return;
+        }
+        // A fetch that never sees this cancel must not start a job afterwards.
+        if let Some(run) = self.fetching.as_mut() {
+            run.sync_after = None;
         }
         let cwd = self.cwd.clone();
         let jobs = self.jobs.clone();

@@ -7,6 +7,7 @@ use chrono::{DateTime, Local};
 use monocode_core::contributors::{
     ContributorsBranches, GitUser,
     api::{self, Contributors},
+    fetch::FetchOutcome,
     jobs::{LoadResponse, SyncEvent},
     model::{
         period::PeriodPick,
@@ -38,6 +39,10 @@ pub(crate) trait Backend: Send + Sync {
         from: &str,
         to: &str,
     ) -> Result<Estimate, String>;
+    /// Fetches the branch (the default one when `None`) from `origin`, only on
+    /// the user's request. Loads never fetch a branch; sync jobs may still ask
+    /// the remote for PR heads.
+    fn fetch_origin(&self, cwd: &str, branch: Option<&str>) -> Result<FetchOutcome, String>;
     fn start(&self, cwd: &str, call: &StartCall) -> Result<(), String>;
     fn cancel(&self, cwd: &str) -> Result<(), String>;
     fn clear(&self, cwd: &str) -> Result<(), String>;
@@ -96,6 +101,9 @@ impl Backend for CoreBackend {
         to: &str,
     ) -> Result<Estimate, String> {
         api::sync_estimate(&self.core, cwd, branch, from, to)
+    }
+    fn fetch_origin(&self, cwd: &str, branch: Option<&str>) -> Result<FetchOutcome, String> {
+        api::fetch_origin(&self.core, cwd, branch)
     }
     fn start(&self, cwd: &str, call: &StartCall) -> Result<(), String> {
         api::sync_start(

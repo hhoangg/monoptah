@@ -108,6 +108,10 @@ pub(crate) struct GithubView {
     pub(super) save_error: Option<String>,
     pub(super) action_error: Option<String>,
     pub(super) running: usize,
+    /// The fetch of `origin` in flight, if any. It counts toward `running`.
+    pub(super) fetching: Option<super::data::Fetching>,
+    /// The notes about origin, by branch key (`first_key`): its last fetch failed or found the branch gone.
+    pub(super) origin_issues: HashMap<String, super::data::OriginIssue>,
     pub(super) estimate: Option<EstimateSlot>,
     pub(super) estimate_gen: u64,
     pub(super) saves: SaveState,
@@ -151,6 +155,10 @@ pub(crate) struct GithubView {
 
     #[cfg(test)]
     pub(super) manual: bool,
+    /// With `manual`, hold the answer of the fetch too; by default it is
+    /// delivered at once so tests that press Sync need not release it.
+    #[cfg(test)]
+    pub(super) hold_fetch: bool,
     #[cfg(test)]
     pub(super) held: Vec<Held>,
 }
@@ -223,6 +231,8 @@ impl GithubView {
             save_error: None,
             action_error: None,
             running: 0,
+            fetching: None,
+            origin_issues: HashMap::new(),
             estimate: None,
             estimate_gen: 0,
             saves: SaveState::default(),
@@ -252,6 +262,8 @@ impl GithubView {
             _subscriptions: subscriptions,
             #[cfg(test)]
             manual: false,
+            #[cfg(test)]
+            hold_fetch: false,
             #[cfg(test)]
             held: Vec::new(),
         }
@@ -329,6 +341,12 @@ impl GithubView {
     #[cfg(test)]
     pub(super) fn hold_backend_calls(&mut self) {
         self.manual = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_fetch_answers(&mut self) {
+        self.manual = true;
+        self.hold_fetch = true;
     }
 
     /// Test hook: the labels of the calls held back, in the order they were made.
@@ -506,7 +524,7 @@ impl GithubView {
                     },
                     busy,
                 )
-                .aria_description("Reload synced data")
+                .aria_description("Reload synced data and check origin for new commits")
                 .when(!busy, |d| {
                     d.on_click(cx.listener(|this, _, _, cx| this.refresh(true, cx)))
                 }),
@@ -768,6 +786,22 @@ impl GithubView {
     /// Everything under the toolbar.
     fn body(&mut self, snap: &Snapshot, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = self.alerts(snap, cx);
+        // Stored data stays on screen; this only says it may be behind.
+        if snap.status == Status::Ready
+            && let Some(note) = &snap.origin_note
+        {
+            out.push(
+                div()
+                    .id("contributors-origin-note")
+                    .debug_selector(|| "contributors-origin-note".into())
+                    .role(Role::Status)
+                    .mb_4()
+                    .text_size(px(12.))
+                    .text_color(content(0.5))
+                    .child(note.clone())
+                    .into_any_element(),
+            );
+        }
         let locked = snap.config_error.is_some();
         match (&snap.status, &snap.model) {
             (Status::Loading, _) => out.push(self.loading()),

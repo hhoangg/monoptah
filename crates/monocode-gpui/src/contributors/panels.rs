@@ -78,6 +78,24 @@ pub(crate) fn gh_notice_text(available: bool, incomplete: bool, note: Option<&st
     }
 }
 
+/// "Checking origin..." with the Cancel button, while only a fetch runs.
+fn checking_origin() -> AnyElement {
+    div()
+        .id("contributors-checking-origin")
+        .debug_selector(|| "contributors-checking-origin".into())
+        .role(Role::Status)
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .child(crate::right_panel::spinner(
+            "contributors-origin-spinner",
+            "loader",
+            12.,
+        ))
+        .child("Checking origin...")
+        .into_any_element()
+}
+
 fn progress_bar(percent: u8) -> AnyElement {
     div()
         .id("contributors-progress")
@@ -145,6 +163,19 @@ impl GithubView {
                 } else {
                     job.percent
                 }))
+                .child(
+                    self.panel_button("contributors-cancel", "Cancel", false, false)
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_sync(cx))),
+                )
+                .into_any_element(),
+            None if snap.fetching => div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(content(0.6))
+                .child(checking_origin())
                 .child(
                     self.panel_button("contributors-cancel", "Cancel", false, false)
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_sync(cx))),
@@ -267,6 +298,10 @@ impl GithubView {
                         self.panel_button("contributors-cancel", "Cancel", false, false)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_sync(cx))),
                     ),
+                None if snap.fetching => d.child(checking_origin()).child(
+                    self.panel_button("contributors-cancel", "Cancel", false, false)
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_sync(cx))),
+                ),
                 None => d.child(
                     self.panel_button("contributors-sync-again", "Sync again", true, false)
                         .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx))),
