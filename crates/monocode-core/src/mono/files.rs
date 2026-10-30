@@ -12,6 +12,7 @@
 //!     ├── habits.json       what it does on its own, on a schedule
 //!     ├── workflows.json    its workflows, as a pretty JSON list
 //!     ├── workflow-runs/    `<workflow id>.json`: the newest runs of each workflow
+//!     ├── heartbeat.json    when it last checked in and what it raised
 //!     └── memory/           topic notes read on demand, and archive.md
 //! ```
 //!
@@ -33,6 +34,7 @@ const MEMORY_DIR: &str = "memory";
 const HABITS_FILE: &str = "habits.json";
 pub const WORKFLOWS_FILE: &str = "workflows.json";
 pub const WORKFLOW_RUNS_DIR: &str = "workflow-runs";
+const HEARTBEAT_FILE: &str = "heartbeat.json";
 /// Larger than anything that would load: the soul and memory both have far
 /// smaller prompt budgets, this only stops a runaway write.
 const FILE_MAX: usize = 256 * 1024;
@@ -99,14 +101,18 @@ pub fn is_workflow_id(id: &str) -> bool {
 }
 
 /// The files the app reads and writes for an agent, relative to its folder:
-/// SOUL.md, MEMORY.md, habits.json, workflows.json, one `workflow-runs/<workflow id>.json`,
-/// or one `memory/<name>.md`. Nothing nested, nothing hidden, so a path from the agent's CLI
-/// can never leave the folder.
+/// SOUL.md, MEMORY.md, habits.json, heartbeat.json, workflows.json, one
+/// `workflow-runs/<workflow id>.json`, or one `memory/<name>.md`. Nothing nested, nothing
+/// hidden, so a path from the agent's CLI can never leave the folder.
 fn resolve_file(dir: &Path, relative: &str) -> Result<PathBuf, String> {
-    if relative == SOUL_FILE
-        || relative == MEMORY_FILE
-        || relative == HABITS_FILE
-        || relative == WORKFLOWS_FILE
+    if [
+        SOUL_FILE,
+        MEMORY_FILE,
+        HABITS_FILE,
+        HEARTBEAT_FILE,
+        WORKFLOWS_FILE,
+    ]
+    .contains(&relative)
     {
         return Ok(dir.join(relative));
     }

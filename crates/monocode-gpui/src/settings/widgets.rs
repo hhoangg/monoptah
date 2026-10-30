@@ -311,6 +311,7 @@ impl SettingsView {
                     | "show-remaining-usage"
                     | "mask-emails"
                     | "claude-hooks"
+                    | "claude-entrypoint"
                     | "monos-enabled"
                     | "rail-monos-pinned"
                     | "mono-menu-bar-icon"

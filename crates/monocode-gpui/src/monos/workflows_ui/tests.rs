@@ -599,7 +599,8 @@ pub(super) fn open_tab(s: &Setup, cx: &mut TestAppContext) {
     });
     s.window
         .update(cx, |shell, _, cx| {
-            shell.workspace.right_panel_width = 400.;
+            // Wide enough for the tab strip (now with Overview) plus the header buttons.
+            shell.workspace.right_panel_width = 520.;
             s.manager.update(cx, |m, cx| {
                 m.settings = None;
                 m.overview_tab = OverviewTab::Workflows;

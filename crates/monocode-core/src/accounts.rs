@@ -23,6 +23,16 @@ use std::{
 };
 
 pub const DEFAULT: &str = "default";
+static CLAUDE_ENTRYPOINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Opt-in: label spawned Claude processes as Monocode instead of the default
+/// `sdk-cli`, which is metered at a higher subscription rate
+/// (anthropics/claude-code#97074).
+pub fn set_claude_entrypoint(on: bool) {
+    CLAUDE_ENTRYPOINT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn claude_entrypoint() -> bool {
+    CLAUDE_ENTRYPOINT.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub const PROVIDERS: [Kind; 3] = [Kind::Claude, Kind::Codex, Kind::Devin];
 fn default_id() -> String {
     DEFAULT.into()
@@ -139,6 +149,9 @@ impl Profile {
         })
     }
     pub fn apply(&self, kind: Kind, command: &mut Command) -> Result<(), String> {
+        if kind == Kind::Claude && claude_entrypoint() {
+            command.env("CLAUDE_CODE_ENTRYPOINT", "monocode");
+        }
         let (set, remove) = self.env(kind)?;
         for (key, value) in set {
             command.env(key, value);

@@ -18,7 +18,6 @@ pub(super) struct Started {
     pub(super) summary: Session,
     settings: Settings,
     draft: bool,
-    reveal: bool,
     /// An explicit split beside a session (`placement` right or down), opened after install.
     placement: Option<(i64, crate::pane_layout::Edge)>,
     parent: Option<i64>,
@@ -329,6 +328,7 @@ impl Monos {
                         }
                     }
                     this.reload_files(&mono_id, cx);
+                    this.refresh_cards(cx);
                     this.changed(cx);
                     value
                 });
@@ -353,7 +353,6 @@ impl Monos {
             summary,
             settings,
             draft,
-            reveal,
             placement,
             parent,
             folder,
@@ -397,14 +396,14 @@ impl Monos {
             Some(folder) => self.file_launch(mono_id, &project, id, folder, cx),
             None => self.group_launch(mono_id, id, cx),
         }
-        if let Some(window) = window {
-            if placement.is_some() {
-                let _ = self.owner.update(cx, |owner, cx| {
-                    owner.app_place_launch(id, placement, true, window, cx)
-                });
-            } else if reveal {
-                self.open_workspace(id, window, cx);
-            }
+        // Like Tauri, Mono launches stay in the background even if the agent asks to
+        // reveal a tab. Only an explicit split places a new session in the workspace.
+        if let Some(window) = window
+            && placement.is_some()
+        {
+            let _ = self.owner.update(cx, |owner, cx| {
+                owner.app_place_launch(id, placement, true, window, cx)
+            });
         }
     }
     pub(super) fn app_call(&mut self, call: Call, _window: &mut Window, cx: &mut Context<Self>) {
@@ -827,8 +826,10 @@ impl Monos {
                     .get("kind")
                     .and_then(Value::as_str)
                     .unwrap_or("document");
-                if !["document", "html", "markdown"].contains(&kind) {
-                    Err("Use document or html".into())
+                if kind == "html" {
+                    Err("HTML artifacts are no longer supported. Write kind document, and show charts or visuals with visual_show in your reply.".into())
+                } else if !["document", "markdown"].contains(&kind) {
+                    Err("Use kind document".into())
                 } else {
                     match text(&input, "title", 512)
                         .and_then(|title| Ok((title, text(&input, "body", 512 * 1024)?)))
@@ -1009,7 +1010,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                 .unwrap_or_default();
         }
         let launches = mono.launches.clone();
-        let (draft, reveal) = (flag(&input, "draft", false), flag(&input, "reveal", false));
+        let draft = flag(&input, "draft", false);
         // The parent must be a session this Mono (or its habit run) started.
         let parent = match input.get("parentSessionId") {
             None => None,
@@ -1146,7 +1147,6 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                     summary,
                     settings,
                     draft,
-                    reveal,
                     placement,
                     parent,
                     folder,
