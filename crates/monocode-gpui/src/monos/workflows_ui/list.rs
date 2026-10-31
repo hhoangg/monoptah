@@ -2,6 +2,7 @@
 use super::super::scheduler::{duration, habit_icon_button};
 use super::super::*;
 use super::actions::{self, ReviewIntent};
+use super::requirements::missing_requirements_badge;
 use super::view::{needs_review_badge, notice_line};
 use monocode_core::mono::workflows::model::{
     NodeKind, NodeStatus, WORKFLOWS_MAX, Workflow, WorkflowRun, trigger_of,
@@ -145,6 +146,7 @@ impl Monos {
     pub(in crate::monos) fn workflows_list(
         &mut self,
         mono: &Mono,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.ensure_workflows(cx);
@@ -168,26 +170,31 @@ impl Monos {
                 ))
                 .into_any_element();
         }
+        let rows = workflows
+            .iter()
+            .map(|w| this.workflow_row(w, mono, cx))
+            .collect::<Vec<_>>();
+        let notice = this.wf.notice.clone();
+        let gate = self.run_gate_dialog(mono, window, cx);
         div()
-            .id("mono-workflows-list")
-            .debug_selector(|| "mono-workflows-list".into())
             .size_full()
             .min_w_0()
-            .overflow_y_scroll()
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_px()
-            .children(notice_line(
-                "mono-workflow-notice",
-                this.wf.notice.as_deref(),
-            ))
-            .children(
-                workflows
-                    .iter()
-                    .map(|w| this.workflow_row(w, mono, cx))
-                    .collect::<Vec<_>>(),
+            .relative()
+            .child(
+                div()
+                    .id("mono-workflows-list")
+                    .debug_selector(|| "mono-workflows-list".into())
+                    .size_full()
+                    .min_w_0()
+                    .overflow_y_scroll()
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_px()
+                    .children(notice_line("mono-workflow-notice", notice.as_deref()))
+                    .children(rows),
             )
+            .children(gate)
             .into_any_element()
     }
 
@@ -264,7 +271,10 @@ impl Monos {
                                             .text_color(content(if lit { 0.85 } else { 0.45 }))
                                             .child(w.name.clone()),
                                     )
-                                    .when(w.needs_review, |d| d.child(needs_review_badge())),
+                                    .when(w.needs_review, |d| d.child(needs_review_badge()))
+                                    .when(self.missing_requirements(w).is_some(), |d| {
+                                        d.child(missing_requirements_badge())
+                                    }),
                             )
                             .child(
                                 div()
@@ -412,12 +422,10 @@ impl Monos {
             self.open_workflow_review(id, ReviewIntent::Run, back, cx);
             return;
         }
-        let id = id.to_string();
-        self.workflow_task(
-            move |host| actions::run_now(host, &id),
-            move |this, notice, cx| this.workflow_said(notice, page, cx),
-            cx,
-        );
+        if self.run_gate_for_run(id, page, cx) {
+            return;
+        }
+        self.run_workflow_now(id, None, page, cx);
     }
 
     pub(in crate::monos) fn workflow_toggle_clicked(

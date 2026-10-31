@@ -163,6 +163,7 @@ impl Monos {
         let banners = self.board_banners(cx);
         let body = self.board_body(mono, window, cx);
         let leaving = self.board_leave_dialog(window, cx);
+        let gate = self.run_gate_dialog(mono, window, cx);
         div()
             .id("wf-board")
             .debug_selector(|| "wf-board".into())
@@ -191,6 +192,7 @@ impl Monos {
             .children(banners)
             .child(body)
             .children(leaving)
+            .children(gate)
             .into_any_element()
     }
 

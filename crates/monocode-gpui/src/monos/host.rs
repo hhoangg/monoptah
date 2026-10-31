@@ -907,13 +907,18 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                 return;
             }
             workflow if workflow.starts_with("workflows.") => {
-                // Probing the model catalog may start a CLI, so the whole handler runs off the UI
-                // thread. run/stop/resumeRun only write their request into the file.
+                // Probing the model catalog may start a CLI, and run/resumeRun/get check a
+                // workflow's requirements (up to 12 s), so the whole handler runs off the UI
+                // thread. run/stop/resumeRun then only write their request into the file.
                 let mut host = StoreHost::new(
                     MonoDir::new(root, target.clone()),
                     self.workflow_signals.clone(),
                 )
-                .with_probe(self.workflow_live.probe());
+                .with_probe(self.workflow_live.probe())
+                .with_preflight(self.workflow_live.preflight());
+                if let Some(m) = self.roster.get(&target) {
+                    host = host.with_projects(m.projects.clone());
+                }
                 let name = action.clone();
                 self.call_work(
                     call,

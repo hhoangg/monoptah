@@ -116,13 +116,13 @@ pub(super) fn listing(_: Kind) -> Probe {
 }
 
 /// A Mono's folder in a temp dir with the host the actions run over.
-struct Disk {
-    dir: MonoDir,
-    host: StoreHost,
-    signals: Arc<Signals>,
+pub(super) struct Disk {
+    pub(super) dir: MonoDir,
+    pub(super) host: StoreHost,
+    pub(super) signals: Arc<Signals>,
 }
 
-fn disk(list: Vec<Workflow>) -> Disk {
+pub(super) fn disk(list: Vec<Workflow>) -> Disk {
     let root = std::env::temp_dir().join(format!("wf-ui-{}", monocode_core::mono::new_id()));
     std::fs::create_dir_all(&root).unwrap();
     let dir = MonoDir::new(&root, "mono-1");
@@ -133,10 +133,10 @@ fn disk(list: Vec<Workflow>) -> Disk {
 }
 
 impl Disk {
-    fn saved(&self) -> Vec<Workflow> {
+    pub(super) fn saved(&self) -> Vec<Workflow> {
         load_workflows(&self.dir).unwrap().workflows
     }
-    fn first(&self) -> Workflow {
+    pub(super) fn first(&self) -> Workflow {
         self.saved().remove(0)
     }
 }
@@ -146,7 +146,7 @@ impl Disk {
 #[test]
 fn run_now_asks_for_a_run_and_wakes_the_runner() {
     let mut d = disk(vec![workflow(json!({}))]);
-    assert_eq!(actions::run_now(&mut d.host, A), None);
+    assert_eq!(actions::run_now(&mut d.host, A, None), None);
     assert!(d.first().run_requested);
     assert!(d.signals.take_check_now());
 }
@@ -154,7 +154,7 @@ fn run_now_asks_for_a_run_and_wakes_the_runner() {
 #[test]
 fn run_now_refuses_a_workflow_with_issues_and_says_why() {
     let mut d = disk(vec![broken(json!({}))]);
-    let notice = actions::run_now(&mut d.host, A).expect("a notice");
+    let notice = actions::run_now(&mut d.host, A, None).expect("a notice");
     assert!(notice.starts_with("Can't run yet: "), "{notice}");
     assert!(notice.ends_with('.'), "{notice}");
     assert!(!d.first().run_requested);
@@ -180,7 +180,7 @@ fn a_refusal_names_the_first_problem_and_counts_the_rest() {
 #[test]
 fn run_now_refuses_a_session_model_not_in_the_catalog_and_names_it() {
     let mut d = disk(vec![typed_model(json!({}))]);
-    let notice = actions::run_now(&mut d.host, A).expect("a notice");
+    let notice = actions::run_now(&mut d.host, A, None).expect("a notice");
     assert!(
         notice.contains(&format!("Model \"{MODEL}\" is not available")),
         "{notice}"
@@ -264,7 +264,7 @@ fn the_actions_refuse_a_flagged_workflow_whoever_calls_them() {
         json!({"enabled": false, "needsReview": true}),
     )]);
     let review = Some("Review this workflow before running or enabling it.".to_string());
-    assert_eq!(actions::run_now(&mut d.host, A), review);
+    assert_eq!(actions::run_now(&mut d.host, A, None), review);
     assert_eq!(actions::toggle(&mut d.host, A), review);
     let w = d.first();
     assert!(!w.enabled && w.needs_review && !w.run_requested);

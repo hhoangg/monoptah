@@ -263,6 +263,9 @@ impl Monos {
             return;
         };
         self.workflow_said(None, true, cx);
+        if self.run_gate_for_resume(&workflow, &run, true, cx) {
+            return;
+        }
         self.workflow_task(
             move |host| actions::resume_run(host, &workflow, &run),
             |this, notice, cx| this.workflow_said(notice, true, cx),
@@ -427,6 +430,7 @@ impl Monos {
             ),
             None => body,
         };
+        let gate = self.run_gate_dialog(mono, window, cx);
         div()
             .size_full()
             .min_w_0()
@@ -436,6 +440,7 @@ impl Monos {
             .flex_col()
             .child(header)
             .child(body)
+            .children(gate)
             .into_any_element()
     }
 

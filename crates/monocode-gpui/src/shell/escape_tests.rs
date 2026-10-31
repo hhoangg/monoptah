@@ -471,3 +471,54 @@ fn provider_sign_in_modal_escape_closes_it_only(cx: &mut TestAppContext) {
         |_, cx| crate::accounts::get(cx).is_some_and(|a| a.read(cx).has_modal_auth()),
     );
 }
+
+/// The Run dialog of a Mono: Escape closes it and never stops the Mono's turn. The Workspace
+/// binding runs before the dialog's own key handling, so the shell must route it.
+#[gpui::test]
+fn run_dialog_escape_closes_it_and_leaves_the_busy_mono_running(cx: &mut TestAppContext) {
+    let (window, _active) = setup(cx);
+    window
+        .update(cx, |shell, w, cx| {
+            shell
+                .mono_manager()
+                .update(cx, |m, cx| m.create(Vec::new(), w, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let (chat, opened) = window
+        .update(cx, |shell, w, cx| {
+            let monos = shell.mono_manager();
+            monos.update(cx, |m, cx| m.dismiss_settings(w, cx));
+            let chat = monos.read(cx).chat().expect("the Mono chat is open");
+            chat.update(cx, |c, _| c.busy = true);
+            let workflow = monocode_core::mono::workflows::parse::parse_workflow(
+                &monocode_core::mono::workflows::ordered::Json::from(&serde_json::json!({
+                    "id": "wf-aaaaaaaa", "name": "Nightly", "enabled": true, "createdAt": 1,
+                    "inputs": {"area": {"type": "string"}}, "inputValues": {"area": "src"},
+                    "nodes": [{"id": "trigger", "type": "manual"}, {"id": "report", "type": "report"}],
+                    "edges": [{"from": "trigger", "to": "report"}],
+                })),
+            )
+            .expect("a workflow");
+            let opened = monos.update(cx, |m, cx| m.open_gate_for_test(workflow, cx));
+            (chat, opened)
+        })
+        .unwrap();
+    assert!(opened, "the dialog opens");
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    focus_view(window, visual);
+    let shown = |visual: &mut VisualTestContext| {
+        window
+            .update(visual, |shell, _, cx| {
+                shell.mono_manager().read(cx).wf_gate_shown()
+            })
+            .unwrap()
+    };
+    assert!(shown(visual));
+    escape(visual);
+    assert!(!shown(visual), "Escape closes the dialog");
+    assert!(
+        chat.read_with(visual, |c, _| c.busy),
+        "and does not stop the Mono"
+    );
+}

@@ -118,6 +118,11 @@ pub(crate) fn resolve_gui_binary(name: &str) -> Option<PathBuf> {
     which_in_path(&gui_search_path(), name)
 }
 
+/// Where a terminal-like lookup of `name` finds it (same search path as `resolve_gui_binary`).
+pub(crate) fn find_on_gui_path(name: &str) -> Option<PathBuf> {
+    which_in_path(&gui_search_path(), name)
+}
+
 pub(crate) fn gui_search_path() -> String {
     gui_search_path_from(login_shell_path(), dirs_home(), std::env::var("PATH").ok())
 }

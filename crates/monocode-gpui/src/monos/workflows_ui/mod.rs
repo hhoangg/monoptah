@@ -27,10 +27,14 @@ mod list;
 mod page;
 #[cfg(test)]
 mod page_tests;
+mod requirements;
 mod review;
 #[cfg(test)]
 mod review_tests;
 mod run_details;
+mod run_gate;
+#[cfg(test)]
+mod run_gate_tests;
 mod run_model;
 #[cfg(test)]
 mod run_model_tests;
@@ -48,6 +52,7 @@ use crate::popover::{Align, MenuAction};
 use monocode_core::mono::workflows::{
     cli::StoreHost,
     model::{Workflow, WorkflowRun},
+    preflight::Preflight,
     store::{MonoDir, load_runs, load_workflows},
 };
 use std::collections::BTreeSet;
@@ -67,6 +72,8 @@ pub(super) enum Pick {
     Import(String, String),
     /// A drop-down of the board editor.
     Board(board::BoardPick),
+    /// An input of the Run dialog.
+    Gate(String),
 }
 
 #[derive(Default)]
@@ -96,6 +103,14 @@ pub(super) struct WorkflowsUi {
     run: run_page::RunPage,
     /// The open board editor.
     board: Option<board::BoardState>,
+    /// The open Run or Resume dialog, and the number of the last check it asked for.
+    gate: Option<run_gate::RunGate>,
+    gate_generation: u64,
+    /// What each workflow with `requires` found on this machine, by workflow id: the fingerprint
+    /// it was checked for, when, and what it found.
+    preflights: HashMap<String, (String, std::time::Instant, Preflight)>,
+    /// The workflows being checked now.
+    preflighting: HashSet<String>,
     /// How many times a run page built its state (a page sliding away must not add to it).
     #[cfg(test)]
     run_opens: u32,
@@ -127,11 +142,16 @@ impl Monos {
 
     /// The Mono's workflow files, with how this app probes the model catalog.
     pub(super) fn workflow_store(&self, mono: &str) -> StoreHost {
-        StoreHost::new(
+        let host = StoreHost::new(
             MonoDir::new(&self.root, mono),
             self.workflow_signals.clone(),
         )
         .with_probe(self.workflow_live.probe())
+        .with_preflight(self.workflow_live.preflight());
+        match self.roster.get(mono) {
+            Some(m) => host.with_projects(m.projects.clone()),
+            None => host,
+        }
     }
 
     /// Whether the tab or a workflow page is on screen.
@@ -285,6 +305,15 @@ impl Monos {
             if gone {
                 self.route = None;
             }
+            // The dialog of a workflow that is gone has nothing left to run.
+            if self
+                .wf
+                .gate
+                .as_ref()
+                .is_some_and(|g| self.mono_workflow(&g.workflow_id).is_none())
+            {
+                self.wf.gate = None;
+            }
             // A review that is no longer on screen is dropped, not probed again.
             if !matches!(self.route, Some(Route::WorkflowReview(..))) {
                 self.wf.review = None;
@@ -300,6 +329,7 @@ impl Monos {
                 self.board_sync(cx);
             }
         }
+        self.refresh_preflights(cx);
         if count_changed {
             self.changed(cx);
         } else {
@@ -351,11 +381,13 @@ impl Monos {
     /// The tab is left: its notice goes (React resets it on unmount).
     pub(super) fn wf_leave_tab(&mut self) {
         self.wf.notice = None;
+        self.wf.gate = None;
     }
 
     /// A page is closed: its notice and an open review go.
     pub(super) fn wf_leave_page(&mut self) {
         self.wf.page_notice = None;
+        self.wf.gate = None;
         self.wf.run.session_back = None;
         self.board_drop();
         if matches!(self.route, Some(Route::WorkflowReview(..))) {
@@ -543,6 +575,7 @@ impl Monos {
             Pick::Input(workflow, name) => self.workflow_choose_input(workflow, name, &value, cx),
             Pick::Import(name, ty) => self.import_choose(name, ty, &value, cx),
             Pick::Board(pick) => self.board_picked(pick, &value, cx),
+            Pick::Gate(name) => self.run_gate_picked(name, &value, cx),
         }
     }
 }

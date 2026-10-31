@@ -422,7 +422,7 @@ fn quitting_leaves_a_run_running_in_its_file_and_the_next_start_interrupts_it(
         &[],
         true,
         &signals,
-        probe,
+        probes(probe),
         monocode_core::time::now_ms(),
     );
     assert!(looked.swept);
@@ -487,11 +487,11 @@ fn a_look_over_missing_monos_is_empty_and_counts_as_swept() {
         &[],
         true,
         &signals,
-        probe,
+        probes(probe),
         1,
     );
     assert!(looked.swept && looked.monos.is_empty() && looked.errors.is_empty());
-    let looked = look_at(&root, &[], &[], false, &signals, probe, 1);
+    let looked = look_at(&root, &[], &[], false, &signals, probes(probe), 1);
     assert!(!looked.swept);
 }
 
@@ -578,6 +578,18 @@ fn a_leftover_question_that_is_already_gone_does_not_hold_up_the_others(cx: &mut
     );
 }
 
+fn probes(models: fn(Kind) -> Probe) -> Probes {
+    Probes {
+        models,
+        requirements: preflight_met,
+    }
+}
+
+/// Nothing a workflow requires is ever missing.
+fn preflight_met(_: &Workflow) -> monocode_core::mono::workflows::preflight::Preflight {
+    Default::default()
+}
+
 fn probe_nothing(_: Kind) -> Probe {
     Probe {
         installed: true,
@@ -599,7 +611,7 @@ fn half_a_look(s: &Setup, cx: &mut TestAppContext) -> Looked {
         &[],
         false,
         &signals,
-        probe_nothing,
+        probes(probe_nothing),
         monocode_core::time::now_ms(),
     )
 }

@@ -1136,7 +1136,7 @@ pub fn definition_key(w: &Workflow) -> String {
         Some(d) if !js_trim(d).is_empty() => d.as_str(),
         _ => "",
     };
-    let value = json!({
+    let mut value = json!({
         "name": w.name,
         "description": description,
         "enabled": w.enabled,
@@ -1145,6 +1145,9 @@ pub fn definition_key(w: &Workflow) -> String {
         "nodes": to_value(&flat.nodes),
         "edges": to_value(&flat.edges),
     });
+    if let (Some(map), false) = (value.as_object_mut(), w.requires.is_empty()) {
+        map.insert("requires".into(), to_value(&w.requires));
+    }
     stable_json(&value)
 }
 

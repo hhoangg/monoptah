@@ -633,13 +633,145 @@ impl Monos {
             );
         }
         inputs = inputs.child(self.board_add_input_row(w, window, cx));
+        let requires = self.board_requires_section(w, window, cx);
         div()
             .flex()
             .flex_col()
             .child(div().px_2().pt_1().child(switch))
             .child(description)
             .child(inputs)
+            .child(requires)
             .into_any_element()
+    }
+
+    /// What the workflow needs on a machine before it can run: commands, environment variables and
+    /// MCP servers, each by name. Declared, never run.
+    pub(super) fn board_requires_section(
+        &mut self,
+        w: &Workflow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let problems: Vec<String> = self
+            .wf
+            .board
+            .as_ref()
+            .map(|b| {
+                b.issues
+                    .iter()
+                    .filter(|i| {
+                        i.node_id.is_none() && i.message.to_lowercase().contains("requirement")
+                    })
+                    .map(|i| i.message.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let add = Self::section_button("wf-require-add", "Add requirement", "plus")
+            .on_click(cx.listener(|this, _, _, cx| this.board_add_requirement(cx)))
+            .into_any_element();
+        let mut block = section("Requires", Some(add))
+            .id("wf-requires")
+            .debug_selector(|| "wf-requires".into());
+        if w.requires.is_empty() {
+            block = block.child(
+                div()
+                    .px_2()
+                    .text_size(px(12.))
+                    .line_height(px(20.))
+                    .text_color(content(0.4))
+                    .child("Commands, environment variables and MCP servers this machine needs before it runs."),
+            );
+        }
+        let kinds = choices(&[
+            ("cli", "Command"),
+            ("env", "Variable"),
+            ("mcp", "MCP server"),
+        ]);
+        for (at, requirement) in w.requires.iter().enumerate() {
+            let kind_key = requirement.kind.key();
+            let picker = self.workflow_picker(
+                format!("wf-require-kind-{at}"),
+                "Requirement kind".into(),
+                Self::label_of(&kinds, kind_key),
+                kinds.clone(),
+                kind_key.to_string(),
+                Pick::Board(BoardPick::RequireKind(at)),
+                cx,
+            );
+            let name = self.board_field(
+                BoardField::RequireName(at),
+                "Requirement name",
+                "Name",
+                &requirement.name,
+                false,
+                None,
+                window,
+                cx,
+            );
+            let hint_field = self.board_field(
+                BoardField::RequireHint(at),
+                "Requirement hint",
+                "Hint, e.g. brew install gh",
+                requirement.hint.as_deref().unwrap_or(""),
+                false,
+                None,
+                window,
+                cx,
+            );
+            let selector = format!("wf-require-remove-{at}");
+            block = block.child(
+                div()
+                    .id(SharedString::from(format!("wf-require-{at}")))
+                    .debug_selector(move || format!("wf-require-{at}"))
+                    .px_2()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(picker)
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    habit_field(name)
+                                        .debug_selector(move || format!("wf-require-name-{at}"))
+                                        .h(px(28.))
+                                        .bg(content(0.1)),
+                                ),
+                            )
+                            .child(
+                                habit_icon_button(
+                                    SharedString::from(selector.clone()),
+                                    "Remove requirement",
+                                    "close",
+                                )
+                                .debug_selector(move || selector.clone())
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.board_remove_requirement(at, cx),
+                                )),
+                            ),
+                    )
+                    .child(
+                        habit_field(hint_field)
+                            .debug_selector(move || format!("wf-require-hint-{at}"))
+                            .h(px(28.))
+                            .bg(content(0.1)),
+                    ),
+            );
+        }
+        for problem in problems.into_iter().take(1) {
+            block = block.child(
+                div()
+                    .debug_selector(|| "wf-require-problem".into())
+                    .px_2()
+                    .text_size(px(12.))
+                    .text_color(gpui::Hsla::from(rgb(RED)).opacity(0.8))
+                    .child(problem),
+            );
+        }
+        block
     }
 
     pub(super) fn board_input_value(

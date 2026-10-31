@@ -16,6 +16,7 @@ use monocode_core::{
         model::{Checkout, Node, NodeKind, Workflow, WorkflowRun},
         models::{ModelCatalog, Probe, harnesses_used, session_node_problem},
         ordered::OrderedMap,
+        preflight::Preflight,
         store::{MonoDir, update_runs},
     },
     store::native_model,
@@ -45,6 +46,25 @@ fn trusting_probe(_: Kind) -> Probe {
     }
 }
 
+/// Requirements are all found, so a test never reaches a real CLI, login shell or MCP server;
+/// what a test wants missing it says itself.
+#[cfg(test)]
+fn trusting_preflight(w: &Workflow) -> Preflight {
+    Preflight {
+        statuses: w
+            .requires
+            .iter()
+            .map(
+                |requirement| monocode_core::mono::workflows::preflight::RequirementStatus {
+                    requirement: requirement.clone(),
+                    met: true,
+                    detail: None,
+                },
+            )
+            .collect(),
+    }
+}
+
 /// An Ask-Mono question being answered by its hidden session.
 pub(in crate::monos) struct Ask {
     mono: String,
@@ -67,6 +87,7 @@ pub(in crate::monos) struct Live {
     /// Persisted session ids (what run files hold) to local ones.
     ids: HashMap<String, i64>,
     probe: fn(Kind) -> Probe,
+    preflight: fn(&Workflow) -> Preflight,
 }
 
 impl Live {
@@ -81,6 +102,10 @@ impl Live {
             probe: trusting_probe,
             #[cfg(not(test))]
             probe: monocode_core::mono::workflows::models::native_probe,
+            #[cfg(test)]
+            preflight: trusting_preflight,
+            #[cfg(not(test))]
+            preflight: monocode_core::mono::workflows::preflight::native_preflight,
         }
     }
 
@@ -93,6 +118,11 @@ impl Live {
     /// How a harness is probed when a workflow's models are checked.
     pub(in crate::monos) fn probe(&self) -> fn(Kind) -> Probe {
         self.probe
+    }
+
+    /// How a workflow's `requires` are checked before a run starts.
+    pub(in crate::monos) fn preflight(&self) -> fn(&Workflow) -> Preflight {
+        self.preflight
     }
 
     /// The sessions of `mono`'s runs that wait on the user.
@@ -110,6 +140,12 @@ impl Live {
 
     fn wake(&mut self, session: i64) -> &(Sender<()>, Receiver<()>) {
         self.wakers.entry(session).or_insert_with(|| bounded(1))
+    }
+
+    /// Swaps how requirements are checked, for a test that wants some missing.
+    #[cfg(test)]
+    pub(in crate::monos) fn set_preflight(&mut self, preflight: fn(&Workflow) -> Preflight) {
+        self.preflight = preflight;
     }
 
     #[cfg(test)]

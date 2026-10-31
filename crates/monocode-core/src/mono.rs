@@ -112,32 +112,13 @@ impl Mono {
             .any(|p| crate::files::path_key(p) == crate::files::path_key(project))
     }
     pub fn project(&self, requested: Option<&str>) -> Result<String, String> {
-        if let Some(requested) = requested {
-            if let Some(path) = self
-                .projects
-                .iter()
-                .find(|path| crate::files::path_key(path) == crate::files::path_key(requested))
-            {
-                return Ok(path.clone());
-            }
-            let named: Vec<_> = self
-                .projects
-                .iter()
-                .filter(|p| {
-                    Path::new(p)
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(requested))
-                })
-                .collect();
-            if named.len() == 1 {
-                return Ok(named[0].clone());
-            }
-            return Err("Choose one of this Mono's assigned projects by full path".into());
-        }
-        match self.projects.as_slice() {
-            [project] => Ok(project.clone()),
-            [] => Err("Add a project in this Mono's settings first".into()),
-            _ => Err("This Mono has several projects; include project with its path".into()),
+        match requested {
+            Some(requested) => resolve_project(&self.projects, requested),
+            None => match self.projects.as_slice() {
+                [project] => Ok(project.clone()),
+                [] => Err("Add a project in this Mono's settings first".into()),
+                _ => Err("This Mono has several projects; include project with its path".into()),
+            },
         }
     }
     pub fn normalize(&mut self) {
@@ -346,7 +327,7 @@ pub fn context(mono: &Mono, files: &files::AgentFiles, executable: &Path) -> Str
 /// CLI's words: actions are named without `app`, and a session node's model is written
 /// `<harness>:<id from models.list>` with Claude's `claude-` prefix dropped, the form the React
 /// app stores, so that one workflows.json reads in both apps.
-const WORKFLOWS_RULES: &str = "Workflows are graphs of steps the app runs for you, each step usually a session, with results passed to later steps. Use them for multi-step work the user wants repeated, like pulling tickets, implementing each one and reviewing it. Node types: schedule and manual triggers, session, command, askMono, if, switch (routes by a value to one of its named cases or default), forEach (a group whose child nodes run once per list item), and report (one, at the end). A session node's harness comes from models.list, its model is written `<harness>:<id from models.list>`, for Claude without the `claude-` prefix (for example claude:sonnet-5, as in workflows.guide), and its effort is a value the model offers (workflows.validate flags one it does not); leave them out to use your own model, and a name like `sonnet` is refused. A session node declares output fields; later prompts read them as {{nodeId.field}}, {{item.field}} inside a forEach, {{inputs.name}} for workflow inputs and {{run.round}} in a loop. A loop is an edge back to an earlier node in the same branch with maxRounds and decide \"mono\" (you are asked loop or exit) or a condition. Projects are always inputs, never paths. Manage them with workflows.list, workflows.get, workflows.add, workflows.update, workflows.setInputs, workflows.run, workflows.stop, workflows.pause, workflows.resume, workflows.resumeRun, workflows.remove, workflows.export and workflows.import; add or change one only when the user asks, and show them the steps first. Before adding or changing a workflow, read workflows.guide, check the definition with workflows.validate, and only then save it with workflows.add or workflows.update. A workflow you add is always saved paused, however clean it is: the user enables it in the Workflows panel. One made from a file (workflows.import, or workflows.add with yaml) also needs the user's review first; you cannot resume or run it. workflows.run needs the workflow to be resumed (not paused). When a run finishes, its report arrives in this chat.";
+const WORKFLOWS_RULES: &str = "Workflows are graphs of steps the app runs for you, each step usually a session, with results passed to later steps. Use them for multi-step work the user wants repeated, like pulling tickets, implementing each one and reviewing it. Node types: schedule and manual triggers, session, command, askMono, if, switch (routes by a value to one of its named cases or default), forEach (a group whose child nodes run once per list item), and report (one, at the end). A session node's harness comes from models.list, its model is written `<harness>:<id from models.list>`, for Claude without the `claude-` prefix (for example claude:sonnet-5, as in workflows.guide), and its effort is a value the model offers (workflows.validate flags one it does not); leave them out to use your own model, and a name like `sonnet` is refused. A session node declares output fields; later prompts read them as {{nodeId.field}}, {{item.field}} inside a forEach, {{inputs.name}} for workflow inputs and {{run.round}} in a loop. A loop is an edge back to an earlier node in the same branch with maxRounds and decide \"mono\" (you are asked loop or exit) or a condition. Projects are always inputs, never paths. Manage them with workflows.list, workflows.get, workflows.add, workflows.update, workflows.setInputs, workflows.run, workflows.stop, workflows.pause, workflows.resume, workflows.resumeRun, workflows.remove, workflows.export and workflows.import; add or change one only when the user asks, and show them the steps first. Before adding or changing a workflow, read workflows.guide, check the definition with workflows.validate, and only then save it with workflows.add or workflows.update. A workflow you add is always saved paused, however clean it is: the user enables it in the Workflows panel. One made from a file (workflows.import, or workflows.add with yaml) also needs the user's review first; you cannot resume or run it. workflows.run needs the workflow to be resumed (not paused). workflows.run takes optional values that override inputs for that run only. A workflow can declare requires (CLIs, environment variables, MCP servers) that must be present before it starts; a missing one is reported by workflows.run. A `@workflow/<slug>` mention in the user's message is context about that workflow, not a request to run it. When a run finishes, its report arrives in this chat.";
 
 /// A fresh provider session gets a bounded brief; the saved chat stays whole.
 pub fn rotation_brief(rows: &[Row]) -> String {
@@ -397,4 +378,26 @@ pub fn rotation_brief(rows: &[Row]) -> String {
     format!(
         "Your provider context was rotated while preserving the full chat. Earlier exchanges:\n{earlier}\n\nRecent exchanges:\n{recent}"
     )
+}
+
+/// The assigned project `requested` names: by full path, or by folder name when that is unique.
+pub fn resolve_project(projects: &[String], requested: &str) -> Result<String, String> {
+    if let Some(path) = projects
+        .iter()
+        .find(|path| crate::files::path_key(path) == crate::files::path_key(requested))
+    {
+        return Ok(path.clone());
+    }
+    let named: Vec<_> = projects
+        .iter()
+        .filter(|p| {
+            Path::new(p)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(requested))
+        })
+        .collect();
+    if named.len() == 1 {
+        return Ok(named[0].clone());
+    }
+    Err("Choose one of this Mono's assigned projects by full path".into())
 }

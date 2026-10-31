@@ -788,3 +788,19 @@ fn take_requests_leaves_the_file_alone_when_nothing_was_asked() {
     assert!(racy.saves.borrow().is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn last_run_of_tells_never_ran_from_unreadable() {
+    let root = temp_root();
+    let d = dir(&root);
+    assert_eq!(last_run_of(&d, ID), Ok(None));
+    d.save(RUNS, "[]", None).unwrap();
+    assert_eq!(last_run_of(&d, ID), Ok(None));
+    let h = d.read(RUNS).unwrap().hash;
+    d.save(RUNS, "{ not json", Some(&h)).unwrap();
+    assert!(last_run_of(&d, ID).is_err());
+    assert!(load_runs(&d, ID).unwrap().is_empty());
+    let h = d.read(RUNS).unwrap().hash;
+    d.save(RUNS, "[{\"junk\": true}]", Some(&h)).unwrap();
+    assert!(last_run_of(&d, ID).is_err());
+}

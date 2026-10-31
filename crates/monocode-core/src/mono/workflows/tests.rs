@@ -10,7 +10,9 @@ use super::template::{
     lookup, render_template, shell_dash_problems, shell_quote, shell_template_problems,
     template_vars,
 };
-use super::validate::{find_absolute_path, validate_workflow, WorkflowIssue};
+use super::validate::{
+    find_absolute_path, is_cli_name, is_env_name, validate_workflow, WorkflowIssue,
+};
 use serde_json::{json, Value};
 
 fn messages(w: &Workflow) -> Vec<String> {
@@ -2961,4 +2963,287 @@ fn a_switch_node_reads_and_writes_back_unchanged() {
     assert!(matches!(&odd.kind, NodeKind::Switch { cases, .. } if cases == &["a", "b"]));
     let none = node(r#"{"id":"r","type":"switch","value":"v"}"#);
     assert!(matches!(&none.kind, NodeKind::Switch { cases, .. } if cases.is_empty()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// requires
+// ---------------------------------------------------------------------------------------------
+
+fn req(kind: RequirementKind, name: &str, hint: Option<&str>) -> Requirement {
+    Requirement {
+        kind,
+        name: name.into(),
+        hint: hint.map(str::to_string),
+    }
+}
+
+fn with_requires(requires: Vec<Requirement>) -> Workflow {
+    let mut w = example();
+    w.requires = requires;
+    w
+}
+
+fn requires_json(entries: &str) -> String {
+    format!(
+        r#"{{"id":"wf-1","name":"W","requires":{entries},"nodes":[{{"id":"trigger","type":"manual"}},{{"id":"report","type":"report"}}]}}"#
+    )
+}
+
+fn parse_str(text: &str) -> Option<Workflow> {
+    super::parse::parse_workflow(&Json::parse(text).unwrap())
+}
+
+#[test]
+fn requires_is_empty_when_absent_and_not_written_back() {
+    let w = workflow_from(
+        r#"{"id":"wf-1","name":"W","nodes":[{"id":"trigger","type":"manual"},{"id":"report","type":"report"}]}"#,
+    );
+    assert!(w.requires.is_empty());
+    assert!(w.run_values.is_none());
+    let written = text(&w);
+    assert!(!written.contains("requires"), "{written}");
+    assert!(!written.contains("runValues"), "{written}");
+}
+
+#[test]
+fn requires_reads_each_kind_with_and_without_a_hint() {
+    let w = parse_str(&requires_json(
+        r#"[{"cli":"gh","hint":"brew install gh"},{"env":"CLICKUP_TOKEN"},{"mcp":"docs server"}]"#,
+    ))
+    .unwrap();
+    assert_eq!(
+        w.requires,
+        vec![
+            req(RequirementKind::Cli, "gh", Some("brew install gh")),
+            req(RequirementKind::Env, "CLICKUP_TOKEN", None),
+            req(RequirementKind::Mcp, "docs server", None),
+        ]
+    );
+    let written: Value = serde_json::from_str(&text(&w)).unwrap();
+    assert_eq!(
+        written["requires"],
+        json!([{"cli":"gh","hint":"brew install gh"},{"env":"CLICKUP_TOKEN"},{"mcp":"docs server"}])
+    );
+    assert_eq!(parse_str(&text(&w)).unwrap().requires, w.requires);
+}
+
+#[test]
+fn a_requires_entry_that_cannot_be_read_leaves_the_workflow_out() {
+    for bad in [
+        r#"[{"cli":"gh"},"gh"]"#,
+        r#"[{"hint":"x"}]"#,
+        r#"[{"cli":"gh","env":"X"}]"#,
+        r#"[{"cli":5}]"#,
+        r#"[{"cli":"gh","hint":3}]"#,
+        r#"{"cli":"gh"}"#,
+        r#"[{"cli":"gh","hnit":"x"}]"#,
+        r#"[{"cli":"gh","version":"1"}]"#,
+    ] {
+        assert!(parse_str(&requires_json(bad)).is_none(), "{bad}");
+    }
+    let file = read_workflow_file(&format!("[{}]", requires_json(r#"[{"cli":5}]"#))).unwrap();
+    assert!(file.workflows.is_empty());
+    assert_eq!(file.unreadable.len(), 1);
+}
+
+#[test]
+fn a_bad_requirement_name_is_kept_so_validation_reports_it() {
+    let w = parse_str(&requires_json(r#"[{"cli":"gh; rm -rf ~"}]"#)).unwrap();
+    assert_eq!(w.requires.len(), 1);
+    assert!(flags(&with_requires(w.requires), "Invalid cli requirement"));
+}
+
+#[test]
+fn run_values_are_read_and_kept_apart_from_input_values() {
+    let w = parse_str(
+        r#"{"id":"wf-1","name":"W","inputs":{"a":{"type":"string"}},"inputValues":{"a":"x"},"runValues":{"a":"y","n":2},"nodes":[{"id":"trigger","type":"manual"},{"id":"report","type":"report"}]}"#,
+    )
+    .unwrap();
+    let rv = w.run_values.clone().unwrap();
+    assert_eq!(rv.get("a"), Some(&InputValue::String("y".into())));
+    assert_eq!(
+        w.input_values.get("a"),
+        Some(&InputValue::String("x".into()))
+    );
+    let merged = with_run_values(&w);
+    assert!(merged.run_values.is_none());
+    assert_eq!(
+        merged.input_values.get("a"),
+        Some(&InputValue::String("y".into()))
+    );
+    assert_eq!(merged.input_values.get("n"), Some(&InputValue::Number(2.0)));
+    assert_eq!(text(&parse_str(&text(&w)).unwrap()), text(&w));
+}
+
+#[test]
+fn cli_names_allow_plain_commands_only() {
+    for ok in ["gh", "node18", "g++", "python3.12", "a_b-c", "A"] {
+        assert!(is_cli_name(ok), "{ok}");
+    }
+    for bad in [
+        "",
+        "-x",
+        ".x",
+        "a b",
+        "a/b",
+        "./gh",
+        "gh;",
+        "$(x)",
+        "a`b`",
+        "a|b",
+        "a&b",
+        "a>b",
+        "a\nb",
+        "a*",
+        "é",
+        &"a".repeat(65),
+    ] {
+        assert!(!is_cli_name(bad), "{bad:?}");
+    }
+    assert!(is_cli_name(&"a".repeat(64)));
+}
+
+#[test]
+fn env_names_follow_the_shell_variable_rule() {
+    for ok in ["X", "_x", "CLICKUP_TOKEN", "a1"] {
+        assert!(is_env_name(ok), "{ok}");
+    }
+    for bad in ["", "1A", "A-B", "A B", "A=B", "$X", "A.B", &"A".repeat(129)] {
+        assert!(!is_env_name(bad), "{bad:?}");
+    }
+    assert!(is_env_name(&"A".repeat(128)));
+}
+
+#[test]
+fn validation_rejects_shell_metacharacters_in_names() {
+    for (kind, name) in [
+        (RequirementKind::Cli, "gh; rm -rf ~"),
+        (RequirementKind::Cli, "$(x)"),
+        (RequirementKind::Cli, "/bin/sh"),
+        (RequirementKind::Env, "X; echo"),
+        (RequirementKind::Env, "$(x)"),
+        (RequirementKind::Mcp, ""),
+        (RequirementKind::Mcp, " lead"),
+        (RequirementKind::Mcp, "trail "),
+        (RequirementKind::Mcp, "a\u{7}b"),
+        (RequirementKind::Mcp, "a\nb"),
+    ] {
+        let w = with_requires(vec![req(kind, name, None)]);
+        assert!(
+            flags(&w, &format!("Invalid {} requirement", kind.key())),
+            "{kind:?} {name:?}: {:?}",
+            messages(&w)
+        );
+    }
+}
+
+#[test]
+fn validation_accepts_good_requirements_and_a_spaced_mcp_name() {
+    let w = with_requires(vec![
+        req(RequirementKind::Cli, "gh", Some("brew install gh")),
+        req(RequirementKind::Env, "CLICKUP_TOKEN", None),
+        req(RequirementKind::Mcp, "docs server", None),
+        req(RequirementKind::Mcp, &"m".repeat(128), None),
+    ]);
+    assert_eq!(messages(&w), messages(&example()));
+    let long = with_requires(vec![req(RequirementKind::Mcp, &"m".repeat(129), None)]);
+    assert!(flags(&long, "Invalid mcp requirement"));
+}
+
+#[test]
+fn validation_limits_hints_count_and_duplicates() {
+    let good = req(RequirementKind::Cli, "gh", Some(&"h".repeat(300)));
+    assert_eq!(messages(&with_requires(vec![good])), messages(&example()));
+    let long = req(RequirementKind::Cli, "gh", Some(&"h".repeat(301)));
+    assert!(flags(
+        &with_requires(vec![long]),
+        "hint of requirement cli gh is too long"
+    ));
+    let control = req(RequirementKind::Env, "X", Some("a\nb"));
+    assert!(flags(&with_requires(vec![control]), "control characters"));
+
+    let many: Vec<Requirement> = (0..31)
+        .map(|i| req(RequirementKind::Cli, &format!("tool{i}"), None))
+        .collect();
+    assert!(flags(&with_requires(many.clone()), "Too many requirements"));
+    assert!(!flags(
+        &with_requires(many[..30].to_vec()),
+        "Too many requirements"
+    ));
+
+    let dup = vec![
+        req(RequirementKind::Cli, "gh", None),
+        req(RequirementKind::Cli, "gh", Some("other hint")),
+    ];
+    assert!(flags(
+        &with_requires(dup),
+        "Duplicate requirement cli \"gh\""
+    ));
+    // The same name under another kind is not a duplicate.
+    let same_name = vec![
+        req(RequirementKind::Cli, "gh", None),
+        req(RequirementKind::Mcp, "gh", None),
+    ];
+    assert!(!flags(&with_requires(same_name), "Duplicate requirement"));
+}
+
+#[test]
+fn requirement_issues_have_no_node_id() {
+    let w = with_requires(vec![req(RequirementKind::Cli, "a b", None)]);
+    let issues = validate_workflow(&w);
+    assert_eq!(issue_node(&issues, "Invalid cli requirement"), None);
+    assert!(issues
+        .iter()
+        .any(|i| i.message.contains("Invalid cli") && i.node_id.is_none()));
+}
+
+#[test]
+fn fingerprint_of_a_workflow_without_requires_is_byte_identical_to_the_old_shape() {
+    let mut w = Workflow::new("wf-golden", "Tiny");
+    w.nodes = vec![
+        node(r#"{"id":"trigger","type":"manual"}"#),
+        node(r#"{"id":"report","type":"report"}"#),
+    ];
+    w.edges = vec![edge(r#"{"from":"trigger","to":"report"}"#)];
+    assert_eq!(
+        definition_fingerprint(&w),
+        r#"{"description":"","edges":[{"from":"trigger","to":"report"}],"inputs":{},"name":"Tiny","nodes":[{"id":"trigger","type":"manual"},{"id":"report","type":"report"}]}"#
+    );
+    let mut with_values = w.clone();
+    with_values.run_values = Some(OrderedMap::new());
+    assert_eq!(
+        definition_fingerprint(&with_values),
+        definition_fingerprint(&w)
+    );
+}
+
+#[test]
+fn fingerprint_changes_when_a_requirement_or_its_hint_is_added_changed_or_removed() {
+    let base = example();
+    let plain = definition_fingerprint(&base);
+    let mut one = base.clone();
+    one.requires = vec![req(RequirementKind::Cli, "gh", None)];
+    let with_one = definition_fingerprint(&one);
+    assert_ne!(with_one, plain);
+    let mut hinted = one.clone();
+    hinted.requires[0].hint = Some("brew install gh".into());
+    assert_ne!(definition_fingerprint(&hinted), with_one);
+    let mut renamed = one.clone();
+    renamed.requires[0].name = "git".into();
+    assert_ne!(definition_fingerprint(&renamed), with_one);
+    let mut kind = one.clone();
+    kind.requires[0].kind = RequirementKind::Env;
+    assert_ne!(definition_fingerprint(&kind), with_one);
+    let mut removed = hinted.clone();
+    removed.requires.clear();
+    assert_eq!(definition_fingerprint(&removed), plain);
+}
+
+#[test]
+fn a_stored_run_whose_definition_has_no_requires_decodes_with_an_empty_list() {
+    let run: WorkflowRun = serde_json::from_str(
+        r#"{"id":"run-1","workflowId":"wf-1","definition":{"id":"wf-1","name":"W","nodes":[{"id":"trigger","type":"manual"},{"id":"report","type":"report"}]},"status":"done","startedAt":1,"trigger":"manual"}"#,
+    )
+    .unwrap();
+    assert!(run.definition.requires.is_empty());
 }

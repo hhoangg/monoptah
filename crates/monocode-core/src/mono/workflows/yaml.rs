@@ -7,12 +7,12 @@
 //! handed to someone else.
 use super::model::{
     new_workflow_id, Checkout, Cwd, Decide, Edge, InputValue, Node, NodeId, NodeKind, OutputField,
-    OutputFieldType, Workflow, WorkflowId, WorkflowInput, NODE_TYPES,
+    OutputFieldType, Requirement, Workflow, WorkflowId, WorkflowInput, NODE_TYPES,
 };
 use super::models::{workflow_issues, ModelCatalog};
 use super::ordered::{Json, OrderedMap};
 use super::output::output_instruction;
-use super::parse::{drop_stray_handles, parse_edge, parse_inputs, parse_node};
+use super::parse::{drop_stray_handles, parse_edge, parse_inputs, parse_node, read_requires};
 use super::template::{js_space, js_trim};
 use super::validate::{find_absolute_path, WorkflowIssue};
 use super::yaml_emit::{stringify, Doc};
@@ -249,8 +249,14 @@ fn export_input(input: &WorkflowInput) -> Doc {
     Doc::Map(out)
 }
 
-/// The shareable definition: only name, description, inputs (declarations, no values), nodes
-/// (with board positions) and edges. The output is deterministic.
+fn export_requirement(r: &Requirement) -> Doc {
+    let mut out = vec![(r.kind.key().to_string(), text(&r.name))];
+    put(&mut out, "hint", r.hint.as_deref().map(text));
+    Doc::Map(out)
+}
+
+/// The shareable definition: only name, description, inputs (declarations, no values),
+/// requirements, nodes (with board positions) and edges. The output is deterministic.
 fn export_document(w: &Workflow) -> Doc {
     let mut out = vec![
         (
@@ -269,6 +275,12 @@ fn export_document(w: &Workflow) -> Doc {
                 .collect(),
         ),
     ));
+    if !w.requires.is_empty() {
+        out.push((
+            "requires".to_string(),
+            Doc::Seq(w.requires.iter().map(export_requirement).collect()),
+        ));
+    }
     out.push((
         "nodes".to_string(),
         Doc::Seq(w.nodes.iter().map(export_node).collect()),
@@ -304,6 +316,7 @@ pub struct WorkflowDraft {
     pub name: String,
     pub description: Option<String>,
     pub inputs: OrderedMap<WorkflowInput>,
+    pub requires: Vec<Requirement>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
 }
@@ -314,6 +327,7 @@ impl From<&Workflow> for WorkflowDraft {
             name: w.name.clone(),
             description: w.description.clone(),
             inputs: w.inputs.clone(),
+            requires: w.requires.clone(),
             nodes: w.nodes.clone(),
             edges: w.edges.clone(),
         }
@@ -593,16 +607,19 @@ pub fn preview_import(text: &str, catalog: &ModelCatalog) -> Result<ImportPrevie
     }
     drop_stray_handles(&nodes, &mut edges);
 
+    let requires = read_requires(file.get("requires"))?;
     let workflow = WorkflowDraft {
         name,
         description,
         inputs: parse_inputs(file.get("inputs")),
+        requires,
         nodes,
         edges,
     };
     let mut preview = Workflow::new("wf-preview", workflow.name.clone());
     preview.description = workflow.description.clone();
     preview.inputs = workflow.inputs.clone();
+    preview.requires = workflow.requires.clone();
     preview.nodes = workflow.nodes.clone();
     preview.edges = workflow.edges.clone();
     let issues = workflow_issues(&preview, catalog);
@@ -749,6 +766,7 @@ pub fn finish_import_with_id(
     let mut workflow = Workflow::new(id, draft.name);
     workflow.description = draft.description;
     workflow.inputs = draft.inputs;
+    workflow.requires = draft.requires;
     workflow.input_values = values;
     workflow.nodes = draft.nodes;
     workflow.edges = draft.edges;

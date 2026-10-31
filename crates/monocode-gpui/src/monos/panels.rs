@@ -1155,7 +1155,7 @@ impl Monos {
             OverviewTab::Overview => self.dashboard(mono, window, cx),
             OverviewTab::Sessions => self.session_list(mono, cx),
             OverviewTab::Habits => self.habits_list(mono, cx),
-            OverviewTab::Workflows => self.workflows_list(mono, cx),
+            OverviewTab::Workflows => self.workflows_list(mono, window, cx),
             OverviewTab::Documents => self.document_list(mono, cx),
             OverviewTab::Changes => self.changes_list(mono, cx),
             OverviewTab::Activity => self.activity_view(mono, cx),

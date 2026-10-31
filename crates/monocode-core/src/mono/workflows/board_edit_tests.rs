@@ -1173,3 +1173,65 @@ mod switch {
             .any(|e| e.source == "route" && e.target == id));
     }
 }
+
+mod requires {
+    use super::*;
+
+    fn requirement(name: &str) -> Requirement {
+        Requirement {
+            kind: RequirementKind::Cli,
+            name: name.into(),
+            hint: None,
+        }
+    }
+
+    #[test]
+    fn the_board_carries_requires_through_meta_and_current() {
+        let mut w = ticket_workflow();
+        w.requires = vec![requirement("gh")];
+        let meta = Meta::of(&w);
+        assert_eq!(meta.requires, w.requires);
+        let (_, held) = board(&w);
+        assert_eq!(held.requires, w.requires);
+        let mut edited = meta.clone();
+        edited.requires.push(requirement("git"));
+        let next = current(&w, &to_flow(&w), &edited);
+        assert_eq!(next.requires.len(), 2);
+    }
+
+    #[test]
+    fn a_save_keeps_requires_from_the_board_and_does_not_touch_run_values() {
+        let mut stored = ticket_workflow();
+        stored.requires = vec![requirement("old")];
+        let mut values = OrderedMap::new();
+        values.insert("flag", InputValue::Bool(true));
+        stored.run_values = Some(values.clone());
+        let mut next = stored.clone();
+        next.requires = vec![requirement("gh"), requirement("git")];
+        next.run_values = None;
+        let saved = merged(Some(&stored), &next, 1);
+        assert_eq!(saved.requires, next.requires);
+        assert_eq!(saved.run_values, Some(values));
+        let fresh = merged(None, &next, 1);
+        assert_eq!(fresh.requires, next.requires);
+    }
+
+    #[test]
+    fn changing_requires_changes_the_definition_key_and_none_leaves_it_alone() {
+        let w = ticket_workflow();
+        let mut with = w.clone();
+        with.requires = vec![requirement("gh")];
+        assert_ne!(definition_key(&w), definition_key(&with));
+        let mut cleared = with.clone();
+        cleared.requires.clear();
+        assert_eq!(definition_key(&w), definition_key(&cleared));
+    }
+
+    #[test]
+    fn board_model_round_trip_keeps_requires() {
+        let mut w = ticket_workflow();
+        w.requires = vec![requirement("gh")];
+        let flow = to_flow(&w);
+        assert_eq!(from_flow(&w, &flow.nodes, &flow.edges).requires, w.requires);
+    }
+}
