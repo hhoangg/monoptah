@@ -164,7 +164,7 @@ test("macOS bundles automatically and preserves the selected data mode for Finde
       const packaged = f.calls.find((call) => call.command === "bash");
       assert.deepEqual(packaged.args, ["scripts/bundle-native-macos.sh", "native-dev", join(f.root, "custom-target"), "0.15.0", mode]);
       const app = f.calls.find((call) => !["cargo", "bash"].includes(call.command));
-      assert.equal(app.command, "/tmp/dev-apps/Monoptah Native Dev.app/Contents/MacOS/monocode-gpui");
+      assert.equal(app.command, join("/tmp/dev-apps", "Monoptah Native Dev.app/Contents/MacOS/monocode-gpui"));
       assert.deepEqual(app.args, args);
       const events = await f.events();
       assert.ok(events.indexOf("built") < events.indexOf("package"));
@@ -201,6 +201,6 @@ test("closing during compilation terminates Cargo and never launches an app", { 
 });
 
 test("the dev bundle path is fixed and overridable", () => {
-  assert.equal(devAppPath({ HOME: "/Users/a" }), "/Users/a/Applications/Monoptah Native Dev.app");
-  assert.equal(devAppPath({ HOME: "/Users/a", MONOCODE_DEV_APP_DIR: "/x" }), "/x/Monoptah Native Dev.app");
+  assert.equal(devAppPath({ HOME: "/Users/a" }), join("/Users/a", "Applications", "Monoptah Native Dev.app"));
+  assert.equal(devAppPath({ HOME: "/Users/a", MONOCODE_DEV_APP_DIR: "/x" }), join("/x", "Monoptah Native Dev.app"));
 });

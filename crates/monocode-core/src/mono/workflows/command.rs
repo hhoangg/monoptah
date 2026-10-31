@@ -784,7 +784,8 @@ mod imp {
             // A descendant keeps the pipe open past the shell, so collect() waits; the
             // command must already be gone from the registry by then.
             let id = unique_id();
-            let handle = start(&id, "sleep 3 & echo started");
+            // The short sleep keeps the shell alive long enough for start() to see it.
+            let handle = start(&id, "sleep 3 & echo started; sleep 0.2");
             let deadline = Instant::now() + Duration::from_secs(2);
             while lock_registry().running.contains_key(&id) {
                 assert!(Instant::now() < deadline, "still registered");
