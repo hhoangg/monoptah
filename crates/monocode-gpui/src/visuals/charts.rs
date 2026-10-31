@@ -55,6 +55,131 @@ fn drawn_to(points: &[[f32; 2]], curve: &Curve, x: f32) -> Vec<[f32; 2]> {
     out
 }
 
+/// A series with its colour resolved, ready to draw.
+pub(crate) struct Drawn {
+    pub label: String,
+    pub color: Hsla,
+    pub values: Vec<f64>,
+    /// Faded and drawn behind the others.
+    pub dimmed: bool,
+}
+
+/// Dimmed series keep this much of their colour.
+pub(crate) const DIM: f32 = 0.2;
+
+/// One readout row: swatch, name, value.
+pub(crate) type Row = (Hsla, String, String);
+/// The readout of a bucket: its title and rows. `None` shows no readout.
+pub(crate) type Tip<'a> = &'a dyn Fn(usize) -> Option<(String, Vec<Row>)>;
+
+/// Which bucket is hovered.
+#[derive(Clone, Copy)]
+pub(crate) enum Hover {
+    /// Whatever bucket the window's pointer is over.
+    Pointer,
+    /// What an owner that tracks the pointer itself says.
+    At(Option<usize>),
+}
+
+/// Everything `cartesian` draws.
+pub(crate) struct Plot<'a> {
+    pub kind: ChartKind,
+    pub series: &'a [Drawn],
+    pub labels: &'a [String],
+    /// Built by the caller (zero-based or not) so the hit test can share it.
+    pub scale: Scale,
+    pub hover: Hover,
+    /// Replaces the default readout (label, then one row per visible series).
+    pub tip: Option<Tip<'a>>,
+    /// A line resting on the zero baseline is drawn thin, without glow or
+    /// marker, so many idle series do not pile into a thick band.
+    pub quiet_zero: bool,
+}
+
+fn effective(d: &Drawn) -> Hsla {
+    if d.dimmed {
+        faint(d.color, d.color.a * DIM)
+    } else {
+        d.color
+    }
+}
+
+/// Where the plot sits inside a chart canvas: the one source for paint and hit test.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Geometry {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+impl Geometry {
+    /// The cell grid of the plot for a canvas at `origin`.
+    pub fn grid(&self, origin: gpui::Point<Pixels>) -> Grid {
+        Grid::new(
+            origin + point(px(self.left), px(self.top)),
+            self.width,
+            self.height,
+        )
+    }
+}
+
+/// The plot of a `width` x `height` canvas: room left for the y labels, above
+/// for a bar's value, below for the x labels.
+pub(crate) fn geometry(kind: ChartKind, scale: &Scale, width: f32, height: f32) -> Geometry {
+    let bars = matches!(kind, ChartKind::Bar);
+    let longest = scale
+        .ticks()
+        .iter()
+        .map(|t| scale.label(*t).len())
+        .max()
+        .unwrap_or(1) as f32;
+    let left = (longest * 6.1).ceil() + 10.;
+    let top = if bars { 16. } else { 8. };
+    let right = width - if bars { 0. } else { 6. };
+    Geometry {
+        left,
+        top,
+        width: right - left,
+        height: height - top - 22.,
+    }
+}
+
+/// Where bucket `i` of `count` sits across a `plot_w` wide plot: its slot's
+/// middle for bars, evenly from edge to edge for lines (one bucket is centred).
+pub(crate) fn x_at(kind: ChartKind, i: usize, count: usize, plot_w: f32) -> f32 {
+    if matches!(kind, ChartKind::Bar) {
+        plot_w / count.max(1) as f32 * (i as f32 + 0.5)
+    } else if count <= 1 {
+        plot_w / 2.
+    } else {
+        i as f32 * plot_w / (count - 1) as f32
+    }
+}
+
+/// The bucket under `x` (px from the plot's left edge): the band under it for
+/// bars, the nearest point for lines.
+pub(crate) fn bucket_at(kind: ChartKind, x: f32, plot_w: f32, count: usize) -> Option<usize> {
+    if count == 0 || plot_w <= 0. || !(0. ..=plot_w).contains(&x) {
+        return None;
+    }
+    if count == 1 {
+        return Some(0);
+    }
+    let at = if matches!(kind, ChartKind::Bar) {
+        (x / (plot_w / count as f32)) as usize
+    } else {
+        ((x / plot_w) * (count - 1) as f32).round() as usize
+    };
+    Some(at.min(count - 1))
+}
+
+/// Every how-many-th x label is written, so labels are at least 72px apart.
+pub(crate) fn label_stride(count: usize, plot_w: f32) -> usize {
+    (count as f32 / (plot_w / 72.).floor().max(1.))
+        .ceil()
+        .max(1.) as usize
+}
+
 pub(super) fn chart(
     kind: ChartKind,
     series: Vec<Series>,
@@ -70,17 +195,20 @@ pub(super) fn chart(
             .gap_x_4()
             .gap_y_1()
             .children(series.iter().map(|s| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .text_size(px(11.))
-                    .font_family(crate::fonts::mono())
-                    .text_color(content(0.6))
+                legend_style()
                     .child(swatch(color(&s.color)))
                     .child(s.label.clone())
             }))
     });
+    let drawn: Vec<Drawn> = series
+        .into_iter()
+        .map(|s| Drawn {
+            color: color(&s.color),
+            label: s.label,
+            values: s.values,
+            dimmed: false,
+        })
+        .collect();
     div()
         .w_full()
         .flex()
@@ -91,8 +219,21 @@ pub(super) fn chart(
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, cx| {
+                        let scale = Scale::nice(
+                            drawn.iter().flat_map(|s| s.values.iter().copied()),
+                            !matches!(kind, ChartKind::Line),
+                        );
+                        let plot = Plot {
+                            kind,
+                            series: &drawn,
+                            labels: &labels,
+                            scale,
+                            hover: Hover::Pointer,
+                            tip: None,
+                            quiet_zero: false,
+                        };
                         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                            cartesian(kind, &series, &labels, bounds, motion, window, cx)
+                            cartesian(&plot, bounds, motion, window, cx)
                         })
                     },
                 )
@@ -103,15 +244,44 @@ pub(super) fn chart(
         .into_any_element()
 }
 
-fn cartesian(
-    kind: ChartKind,
-    series: &[Series],
-    labels: &[String],
+/// A legend entry's frame and type: a row with the mono caption.
+pub(crate) fn legend_style() -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .text_size(px(11.))
+        .font_family(crate::fonts::mono())
+        .text_color(content(0.6))
+}
+
+/// The default readout rows of bucket `i`: the series that are not dimmed.
+fn default_tip(plot: &Plot, i: usize) -> (String, Vec<Row>) {
+    let title = plot
+        .labels
+        .get(i)
+        .cloned()
+        .unwrap_or_else(|| format!("#{}", i + 1));
+    let rows = plot
+        .series
+        .iter()
+        .filter(|s| !s.dimmed)
+        .filter_map(|s| {
+            let v = *s.values.get(i)?;
+            Some((s.color, s.label.clone(), reading(v)))
+        })
+        .collect();
+    (title, rows)
+}
+
+pub(crate) fn cartesian(
+    plot: &Plot,
     bounds: Bounds<Pixels>,
     motion: Motion,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let (kind, series, labels, scale) = (plot.kind, plot.series, plot.labels, &plot.scale);
     let bars = matches!(kind, ChartKind::Bar);
     let count = series
         .iter()
@@ -122,39 +292,23 @@ fn cartesian(
     if count == 0 {
         return;
     }
-    let values = series.iter().flat_map(|s| s.values.iter().copied());
-    let scale = Scale::nice(values, !matches!(kind, ChartKind::Line));
     let ticks = scale.ticks();
-    let tick_labels: Vec<String> = ticks.iter().map(|t| scale.label(*t)).collect();
-    let longest = tick_labels.iter().map(|l| l.len()).max().unwrap_or(1) as f32;
-    let width = bounds.size.width.as_f32();
-    let height = bounds.size.height.as_f32();
-    let left = (longest * 6.1).ceil() + 10.;
-    // Room above the plot for the highlighted bar's value.
-    let top = if bars { 16. } else { 8. };
-    let right = width - if bars { 0. } else { 6. };
-    let grid = Grid::new(
-        bounds.origin + point(px(left), px(top)),
-        right - left,
-        height - top - 22.,
+    let geo = geometry(
+        kind,
+        scale,
+        bounds.size.width.as_f32(),
+        bounds.size.height.as_f32(),
     );
+    let grid = geo.grid(bounds.origin);
     let plot_w = grid.cols as f32 * CELL;
     let plot_h = grid.rows as f32 * CELL;
     let origin = grid.origin;
     let y_of = |v: f64| scale.depth(v) * plot_h;
     let band = plot_w / count as f32;
-    let x_of = |i: usize| {
-        if bars {
-            band * (i as f32 + 0.5)
-        } else if count <= 1 {
-            plot_w / 2.
-        } else {
-            i as f32 * plot_w / (count - 1) as f32
-        }
-    };
+    let x_of = |i: usize| x_at(kind, i, count, plot_w);
 
     // Grid lines and ticks.
-    for (tick, label) in ticks.iter().zip(&tick_labels) {
+    for tick in &ticks {
         let y = y_of(*tick).round();
         window.paint_quad(gpui::fill(
             Bounds::new(
@@ -164,16 +318,14 @@ fn cartesian(
             content(0.07),
         ));
         axis().paint(
-            label,
+            &scale.label(*tick),
             origin + point(px(-10.), px(y)),
             Align::Right,
             window,
             cx,
         );
     }
-    let stride = (count as f32 / (plot_w / 72.).floor().max(1.))
-        .ceil()
-        .max(1.) as usize;
+    let stride = label_stride(count, plot_w);
     for (i, label) in labels.iter().enumerate().step_by(stride) {
         let align = if bars {
             Align::Center
@@ -198,26 +350,27 @@ fn cartesian(
         );
     }
 
-    let hover = pointer(bounds, window)
-        .map(|(x, y)| (x - (origin.x - bounds.origin.x).as_f32(), y))
-        .filter(|(x, _)| (0. ..=plot_w).contains(x));
-    let title = |i: usize| {
-        labels
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("#{}", i + 1))
+    let hovered = match plot.hover {
+        Hover::At(at) => at.filter(|i| *i < count),
+        Hover::Pointer => pointer(bounds, window).and_then(|(x, _)| {
+            bucket_at(
+                kind,
+                x - (origin.x - bounds.origin.x).as_f32(),
+                plot_w,
+                count,
+            )
+        }),
     };
-    let rows = |i: usize| -> Vec<(Hsla, String, String)> {
-        series
-            .iter()
-            .filter_map(|s| {
-                let v = s.values.get(i)?;
-                Some((color(&s.color), s.label.clone(), reading(*v)))
-            })
-            .collect()
+    let readout_at = |i: usize, anchor: gpui::Point<Pixels>, window: &mut Window, cx: &mut App| {
+        let tip = match plot.tip {
+            Some(tip) => tip(i),
+            None => Some(default_tip(plot, i)),
+        };
+        if let Some((title, rows)) = tip {
+            readout(&title, &rows, anchor, bounds, window, cx);
+        }
     };
     if bars {
-        let hovered = hover.map(|(x, _)| ((x / band) as usize).min(count - 1));
         if let Some(i) = hovered {
             // A soft column behind the hovered category.
             window.paint_quad(gpui::fill(
@@ -228,27 +381,20 @@ fn cartesian(
                 content(0.04),
             ));
         }
-        bar_marks(
-            series, count, &scale, &grid, band, hovered, motion, window, cx,
-        );
+        bar_marks(plot, count, &grid, band, hovered, motion, window, cx);
         if let Some(i) = hovered {
             let peak = series
                 .iter()
+                .filter(|s| !s.dimmed)
                 .filter_map(|s| s.values.get(i))
                 .copied()
                 .fold(f64::MIN, f64::max);
-            readout(
-                &title(i),
-                &rows(i),
-                origin
-                    + point(
-                        px(band * (i as f32 + 0.5)),
-                        px(y_of(peak).min(plot_h - 20.)),
-                    ),
-                bounds,
-                window,
-                cx,
-            );
+            let anchor = origin
+                + point(
+                    px(band * (i as f32 + 0.5)),
+                    px(y_of(peak).min(plot_h - 20.)),
+                );
+            readout_at(i, anchor, window, cx);
         }
         return;
     }
@@ -267,7 +413,7 @@ fn cartesian(
     let reach = motion.at(0., 900., window, cx) * plot_w;
     if matches!(kind, ChartKind::Area) {
         let baseline = y_of(scale.min.max(0.));
-        let colors: Vec<Hsla> = series.iter().map(|s| color(&s.color)).collect();
+        let colors: Vec<Hsla> = series.iter().map(effective).collect();
         // A wash of each colour under its area stands in for bloom.
         for (curve, color) in curves.iter().zip(&colors) {
             let mut area: Vec<[f32; 2]> = curve
@@ -307,20 +453,45 @@ fn cartesian(
             inked(col, row, tone).then_some(colors[index])
         });
     }
-    let hovered = hover.map(|(x, _)| {
-        if count <= 1 {
-            0
-        } else {
-            ((x / plot_w) * (count - 1) as f32).round() as usize
-        }
-    });
     if let Some(i) = hovered {
         crosshair(origin, x_of(i), plot_h, window);
     }
-    for (curve, (s, points)) in curves.iter().zip(series.iter().zip(&points)) {
-        let c = color(&s.color);
+    // Dimmed series first, so the lit ones draw over them.
+    let order = (0..series.len())
+        .filter(|s| series[*s].dimmed)
+        .chain((0..series.len()).filter(|s| !series[*s].dimmed));
+    for s in order {
+        let (d, curve, points) = (&series[s], &curves[s], &points[s]);
         let samples = drawn_to(&curve.samples(2.), curve, reach);
-        glowing_line(&samples, origin, 2., c, window);
+        if d.dimmed {
+            // No glow: a faded line must not light up.
+            super::paint_path(&samples, origin, 1., 2., false, effective(d), window);
+            // One point makes no stroke: a faded square stands in.
+            if let [only] = samples.as_slice() {
+                let side = 2. * CELL;
+                window.paint_quad(gpui::fill(
+                    Bounds::new(
+                        origin + point(px(only[0] - side / 2.), px(only[1] - side / 2.)),
+                        gpui::size(px(side), px(side)),
+                    ),
+                    effective(d),
+                ));
+            }
+            continue;
+        }
+        let base = y_of(0.);
+        let resting = |y: f32| plot.quiet_zero && y >= base - 0.5;
+        if plot.quiet_zero {
+            for (flat, run) in runs(&samples, resting) {
+                if flat {
+                    super::paint_path(&run, origin, 1., 2., false, d.color, window);
+                } else {
+                    glowing_line(&run, origin, 2., d.color, window);
+                }
+            }
+        } else {
+            glowing_line(&samples, origin, 2., d.color, window);
+        }
         // The end marker rides the head of the line as it draws in.
         let head = if reach >= curve.last_x() {
             points.last().copied()
@@ -328,41 +499,139 @@ fn cartesian(
             samples.last().copied()
         };
         if hovered.is_none()
-            && let Some(head) = head
+            && let Some(head) = head.filter(|h| !resting(h[1]))
         {
             marker(
                 window,
                 origin + point(px(head[0]), px(head[1])),
                 2. * CELL,
-                c,
+                d.color,
             );
         }
-        if let Some(p) = hovered.and_then(|i| points.get(i)) {
-            marker(window, origin + point(px(p[0]), px(p[1])), 2. * CELL, c);
+        if let Some(p) = hovered
+            .and_then(|i| points.get(i))
+            .filter(|p| !resting(p[1]))
+        {
+            marker(
+                window,
+                origin + point(px(p[0]), px(p[1])),
+                2. * CELL,
+                d.color,
+            );
         }
     }
     if let Some(i) = hovered {
-        let top = points
+        let top = series
             .iter()
-            .filter_map(|p| p.get(i))
+            .zip(&points)
+            .filter(|(s, _)| !s.dimmed)
+            .filter_map(|(_, p)| p.get(i))
             .map(|p| p[1])
             .fold(plot_h, f32::min);
-        readout(
-            &title(i),
-            &rows(i),
-            origin + point(px(x_of(i)), px(top)),
-            bounds,
-            window,
-            cx,
-        );
+        readout_at(i, origin + point(px(x_of(i)), px(top)), window, cx);
     }
+}
+
+/// Splits `samples` into consecutive runs of resting (`true`) and moving
+/// points. Neighbouring runs share their joint so the line stays whole.
+pub(super) fn runs(
+    samples: &[[f32; 2]],
+    resting: impl Fn(f32) -> bool,
+) -> Vec<(bool, Vec<[f32; 2]>)> {
+    let mut out: Vec<(bool, Vec<[f32; 2]>)> = vec![];
+    for p in samples {
+        let flat = resting(p[1]);
+        match out.last_mut() {
+            Some((kind, run)) if *kind == flat => run.push(*p),
+            _ => {
+                if let Some((_, previous)) = out.last_mut() {
+                    previous.push(*p);
+                }
+                out.push((flat, vec![*p]));
+            }
+        }
+    }
+    out
+}
+
+/// How a bucket's group of bars sits in its band, in cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BarLayout {
+    /// A bar's width.
+    pub wide: i32,
+    /// Empty cells between the bars of a group.
+    pub gap: i32,
+    /// How many of the series get a bar.
+    pub shown: usize,
+}
+impl BarLayout {
+    pub fn group(&self) -> i32 {
+        let shown = self.shown as i32;
+        self.wide * shown + self.gap * (shown - 1).max(0)
+    }
+}
+
+/// The layout of `n` side-by-side bars in a `band` px wide band. Bars take 70%
+/// of the band with a one cell gap, as long as that group fits. A group never
+/// reaches into its neighbours: when it does not fit, the bars narrow first,
+/// then lose the gap, and when even 1 cell bars would not fit, only the first
+/// `shown` series get a bar (the rest are in the readout only). Fallbacks also
+/// keep one cell clear between groups when the band allows.
+pub(crate) fn bar_layout(band: f32, n: usize) -> BarLayout {
+    let n = n.max(1);
+    let count = n as i32;
+    let width_px = ((band * 0.7 - CELL * (n - 1) as f32) / n as f32).min(MAX_BAR);
+    let wide = (width_px / CELL).round().max(1.) as i32;
+    // A group may take the whole band: starts are rounded, so neighbours
+    // never get closer than the whole cells of the band.
+    let room = ((band / CELL).floor() as i32).max(1);
+    if wide * count + count - 1 <= room {
+        return BarLayout {
+            wide,
+            gap: 1,
+            shown: n,
+        };
+    }
+    let room = if room > 1 { room - 1 } else { room };
+    let wide = (room - (count - 1)) / count;
+    if wide >= 1 {
+        return BarLayout {
+            wide,
+            gap: 1,
+            shown: n,
+        };
+    }
+    let wide = room / count;
+    if wide >= 1 {
+        return BarLayout {
+            wide,
+            gap: 0,
+            shown: n,
+        };
+    }
+    BarLayout {
+        wide: 1,
+        gap: 0,
+        shown: room as usize,
+    }
+}
+
+/// The series that get a bar when only `shown` fit: the lit ones first, in
+/// order, then the dimmed. Returned in series order.
+pub(super) fn bar_series(series: &[Drawn], shown: usize) -> Vec<usize> {
+    let mut picked: Vec<usize> = (0..series.len())
+        .filter(|s| !series[*s].dimmed)
+        .chain((0..series.len()).filter(|s| series[*s].dimmed))
+        .take(shown)
+        .collect();
+    picked.sort_unstable();
+    picked
 }
 
 #[allow(clippy::too_many_arguments)]
 fn bar_marks(
-    series: &[Series],
+    plot: &Plot,
     count: usize,
-    scale: &Scale,
     grid: &Grid,
     band: f32,
     hovered: Option<usize>,
@@ -370,11 +639,12 @@ fn bar_marks(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let (series, scale) = (plot.series, &plot.scale);
     let plot_h = grid.rows as f32 * CELL;
-    let n = series.len().max(1);
-    let width_px = ((band * 0.7 - CELL * (n - 1) as f32) / n as f32).min(MAX_BAR);
-    let wide = (width_px / CELL).round().max(1.) as i32;
-    let group = wide * n as i32 + (n as i32 - 1);
+    let layout = bar_layout(band, series.len());
+    let (wide, gap) = (layout.wide, layout.gap);
+    let group = layout.group();
+    let picked = bar_series(series, layout.shown);
     let row_of = |v: f64| ((scale.depth(v) * plot_h) / CELL).round() as i32;
     let zero = row_of(scale.min.max(0.).min(scale.max));
     let last = count - 1;
@@ -388,16 +658,16 @@ fn bar_marks(
         let rise = motion.at((i as f32 * 30.).min(360.), 700., window, cx);
         settled &= rise >= 1.;
         let start = ((band * (i as f32 + 0.5)) / CELL - group as f32 / 2.).round() as i32;
-        for (j, s) in series.iter().enumerate() {
-            let Some(value) = s.values.get(i) else {
+        for (slot, j) in picked.iter().enumerate() {
+            let Some(value) = series[*j].values.get(i) else {
                 continue;
             };
             let end = zero + ((row_of(*value) - zero) as f32 * rise).round() as i32;
             let (top, bottom) = (end.min(zero), end.max(zero));
-            let first = start + j as i32 * (wide + 1);
+            let first = start + slot as i32 * (wide + gap);
             for col in first..first + wide {
-                if let Some(slot) = columns.get_mut(col as usize) {
-                    *slot = Some((top, bottom, j, i));
+                if let Some(cell) = usize::try_from(col).ok().and_then(|c| columns.get_mut(c)) {
+                    *cell = Some((top, bottom, *j, i));
                 }
             }
             if i == last {
@@ -405,7 +675,7 @@ fn bar_marks(
             }
         }
     }
-    let colors: Vec<Hsla> = series.iter().map(|s| color(&s.color)).collect();
+    let colors: Vec<Hsla> = series.iter().map(effective).collect();
     grid.paint(window, |col, row| {
         let (top, bottom, j, i) = columns.get(col as usize).copied().flatten()?;
         if row < top || row >= bottom {
@@ -424,10 +694,12 @@ fn bar_marks(
     if let ([s], Some(top)) = (series, last_top)
         && settled
         && hovered.is_none()
+        && !s.dimmed
         && let Some(value) = s.values.get(last)
     {
+        let text = compact(*value, scale.step / 10.);
         Label::mono(10., content(0.9)).paint(
-            &compact(*value, scale.step / 10.),
+            &text,
             grid.origin + point(px(band * (last as f32 + 0.5)), px(top as f32 * CELL - 9.)),
             Align::Center,
             window,

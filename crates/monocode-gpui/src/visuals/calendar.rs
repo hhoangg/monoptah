@@ -97,7 +97,6 @@ pub(crate) fn summary<D: Active>(name: &str, days: &[D]) -> String {
     let mut text = format!("{name}: {total} contributions on {active} days");
     if let Some(best) = days
         .iter()
-        .rev()
         .max_by_key(|d| d.amount())
         .filter(|d| d.amount() > 0)
     {

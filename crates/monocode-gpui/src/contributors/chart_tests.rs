@@ -1,8 +1,8 @@
 //! The pure rules of the shared chart: series ranking, the focus rules, the
 //! y domain, the hit test, the tooltip and the screen reader summary.
 use super::chart::{
-    ChartBucket, ChartData, ChartKind, OTHERS_ID, Series, TOP, axis_labels, cumulative, hit_bucket,
-    is_dimmed, others_color, summary, toggled, tooltip, top_series, y_scale,
+    ChartBucket, ChartData, ChartKind, OTHERS_ID, Series, TOP, cumulative, hover_bucket, is_dimmed,
+    others_color, summary, toggled, tooltip, top_series, y_scale,
 };
 use crate::theme::content;
 use std::collections::BTreeSet;
@@ -133,17 +133,18 @@ fn clicking_toggles_a_member_in_and_out_of_the_focus() {
 }
 
 #[test]
-fn bars_stack_while_lines_use_the_biggest_value() {
+fn bars_sit_side_by_side_so_every_kind_scales_to_its_biggest_drawn_value() {
     let s = vec![series("a", &[2., 0.]), series("b", &[3., 1.])];
+    // Grouped, not stacked: the tallest bar is 3, not the 5 of its bucket.
     let bars = y_scale(ChartKind::Bars, &s);
-    // Stacked, the first bucket reaches 5 (the scale rounds up to a tick).
-    assert!(bars.max >= 5. && bars.max < 10.);
+    assert_eq!(bars.max, 3.);
     let line = y_scale(ChartKind::Line, &s);
     assert_eq!(line.max, 3.);
     // The running total of b reaches 4, a stays at 2.
     let running = y_scale(ChartKind::Cumulative, &s);
     assert_eq!(running.max, 4.);
     assert_eq!(bars.min, 0.);
+    assert_eq!(running.min, 0.);
 }
 
 #[test]
@@ -161,20 +162,43 @@ fn whole_counts_never_get_a_fractional_step() {
 }
 
 #[test]
-fn a_pointer_maps_to_the_bucket_under_it() {
-    assert_eq!(hit_bucket(ChartKind::Bars, 0., 100., 4), Some(0));
-    assert_eq!(hit_bucket(ChartKind::Bars, 24.9, 100., 4), Some(0));
-    assert_eq!(hit_bucket(ChartKind::Bars, 25., 100., 4), Some(1));
-    assert_eq!(hit_bucket(ChartKind::Bars, 99.9, 100., 4), Some(3));
-    assert_eq!(hit_bucket(ChartKind::Bars, 100., 100., 4), None);
-    assert_eq!(hit_bucket(ChartKind::Bars, -1., 100., 4), None);
-    assert_eq!(hit_bucket(ChartKind::Bars, 5., 100., 0), None);
-    assert_eq!(hit_bucket(ChartKind::Bars, 5., 0., 4), None);
-    assert_eq!(hit_bucket(ChartKind::Bars, 5., 100., 1), Some(0));
+fn a_pointer_maps_to_the_bucket_under_it_by_the_paint_geometry() {
+    use gpui::{point, px, size};
+    let at = |x: f32| point(px(x), px(100.));
+    let scale = y_scale(ChartKind::Bars, &[series("a", &[4.])]);
+    let bounds = gpui::Bounds::new(point(px(10.), px(20.)), size(px(400.), px(200.)));
+    // Four bucket bars: the plot starts after the y labels (27px from the
+    // screen's left) and runs to the right edge, 381px of 95.25px bands.
+    let bars = |x: f32| hover_bucket(ChartKind::Bars, &scale, 4, bounds, at(x));
+    assert_eq!(bars(26.), None, "the y label gutter hits nothing");
+    assert_eq!(bars(27.), Some(0));
+    assert_eq!(bars(27. + 95.), Some(0));
+    assert_eq!(bars(27. + 96.), Some(1));
+    assert_eq!(bars(27. + 380.), Some(3));
+    assert_eq!(bars(27. + 382.), None);
+    // Lines stop short of the right edge and pick the nearest point.
+    let line = |x: f32, count: usize| hover_bucket(ChartKind::Line, &scale, count, bounds, at(x));
+    assert_eq!(line(26., 3), None);
+    assert_eq!(line(27., 3), Some(0));
+    assert_eq!(line(27. + 93., 3), Some(0));
+    assert_eq!(line(27. + 94., 3), Some(1));
+    assert_eq!(line(27. + 375., 3), Some(2));
+    assert_eq!(line(27. + 377., 3), None);
+    // One bucket, and none.
+    assert_eq!(line(100., 1), Some(0));
+    assert_eq!(bars(27. + 100.), Some(1));
+    assert_eq!(
+        hover_bucket(ChartKind::Bars, &scale, 1, bounds, at(300.)),
+        Some(0)
+    );
+    assert_eq!(
+        hover_bucket(ChartKind::Bars, &scale, 0, bounds, at(300.)),
+        None
+    );
 }
 
 #[test]
-fn the_tooltip_lists_the_visible_series_with_something_and_their_total() {
+fn the_tooltip_lists_every_visible_series_with_its_value_and_their_total() {
     let d = data(
         vec![
             series("a", &[2., 0.]),
@@ -190,10 +214,11 @@ fn the_tooltip_lists_the_visible_series_with_something_and_their_total() {
         .iter()
         .map(|(_, n, v)| (n.as_str(), v.as_str()))
         .collect();
-    assert_eq!(rows, [("A", "2"), ("B", "3"), ("Total", "5")]);
-    // An empty bucket has a title and no rows.
+    assert_eq!(rows, [("A", "2"), ("B", "3"), ("C", "0"), ("Total", "5")]);
+    // An empty bucket still lists every series, at zero.
     let empty = tooltip(ChartKind::Line, &d, &set(&[]), 1).unwrap();
-    assert!(empty.rows.is_empty());
+    assert_eq!(empty.rows.len(), 4);
+    assert!(empty.rows.iter().all(|r| r.2 == "0"));
     assert!(tooltip(ChartKind::Line, &d, &set(&[]), 2).is_none());
 }
 
@@ -227,16 +252,6 @@ fn others_follow_the_theme_in_the_tooltip() {
 }
 
 #[test]
-fn the_axis_labels_the_first_and_last_bucket_and_few_between() {
-    let b = buckets(15);
-    let labels = axis_labels(&b);
-    assert_eq!(labels[0], (0, "D0"));
-    assert_eq!(labels[labels.len() - 1], (14, "D14"));
-    assert!((2..=10).contains(&labels.len()));
-    assert_eq!(axis_labels(&[]), []);
-}
-
-#[test]
 fn the_summary_names_the_busiest_bucket_or_says_there_was_nothing() {
     let b = buckets(3);
     assert_eq!(
@@ -251,38 +266,4 @@ fn the_summary_names_the_busiest_bucket_or_says_there_was_nothing() {
         summary("Points", "week", "points", &[], &[]),
         "Points per week: no points in 0 weeks."
     );
-}
-
-#[test]
-fn lines_run_edge_to_edge_while_bars_keep_their_slots() {
-    use super::chart::{x_frac, y_labels};
-    for kind in [ChartKind::Line, ChartKind::Cumulative] {
-        assert_eq!(x_frac(kind, 0, 3), 0.);
-        assert_eq!(x_frac(kind, 1, 3), 0.5);
-        assert_eq!(x_frac(kind, 2, 3), 1.);
-        // One bucket stays centred.
-        assert_eq!(x_frac(kind, 0, 1), 0.5);
-    }
-    assert_eq!(x_frac(ChartKind::Bars, 0, 4), 0.125);
-    assert_eq!(x_frac(ChartKind::Bars, 3, 4), 0.875);
-    assert_eq!(x_frac(ChartKind::Bars, 0, 1), 0.5);
-    // The pointer picks the nearest point of a line.
-    let line = ChartKind::Line;
-    assert_eq!(hit_bucket(line, 0., 100., 3), Some(0));
-    assert_eq!(hit_bucket(line, 24., 100., 3), Some(0));
-    assert_eq!(hit_bucket(line, 26., 100., 3), Some(1));
-    assert_eq!(hit_bucket(line, 99., 100., 3), Some(2));
-    assert_eq!(hit_bucket(line, 5., 100., 1), Some(0));
-    // y labels: one per gridline, top first.
-    let scale = crate::visuals::dither::Scale {
-        min: 0.,
-        max: 4.,
-        step: 2.,
-    };
-    let labels = y_labels(&scale, 100.);
-    assert_eq!(labels.len(), 3);
-    assert_eq!(labels[0].1, "4");
-    assert_eq!(labels[1].1, "2");
-    assert_eq!(labels[2].1, "0");
-    assert!(labels[0].0 < labels[1].0 && labels[1].0 < labels[2].0);
 }

@@ -1557,9 +1557,23 @@ fn the_pointer_moves_the_chart_hover_without_building_the_rows_again(cx: &mut Te
     assert!(view.shown("ticket-row-t1"));
     let chart = trend_chart(&mut view);
     let bounds = view.v.debug_bounds("ticket-trend-chart").unwrap();
+    // The first and last point of the plot the chart paints (after its y labels).
+    let (kind, scale) = view.v.read(|cx| {
+        let chart = chart.read(cx);
+        (
+            chart.kind,
+            crate::contributors::chart::y_scale(chart.kind, &chart.data.series),
+        )
+    });
+    let grid = crate::contributors::chart::plot_grid(kind, &scale, bounds);
+    let plot_w = gpui::px(grid.cols as f32 * crate::visuals::dither::CELL);
     let at = |x: f32| {
         gpui::point(
-            bounds.origin.x + bounds.size.width * x,
+            if x < 0.5 {
+                grid.origin.x + gpui::px(1.)
+            } else {
+                grid.origin.x + plot_w - gpui::px(1.)
+            },
             bounds.origin.y + bounds.size.height * 0.5,
         )
     };

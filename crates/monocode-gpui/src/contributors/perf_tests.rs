@@ -5,8 +5,10 @@
 //! Run with
 //! `cargo test --release perf_ -- --ignored --nocapture --test-threads=1`
 //! (add `--config 'profile.release.package.gpui-pre.debug-assertions=true'` and the same for
-//! `monocode-gpui` to get the hover rows: gpui records `debug_selector` bounds only
-//! with debug assertions). `PERF_REPO=/path/to/repo` picks the repository of
+//! `gpui-pre-macros` and `monocode-gpui` to get the hover rows: gpui records `debug_selector`
+//! bounds only with debug assertions, and `gpui-pre` does not build without them on
+//! `gpui-pre-macros` too). Motion is off (`open_page` sets reduce motion), so no hover row is
+//! measured during a draw-in. `PERF_REPO=/path/to/repo` picks the repository of
 //! `perf_real_repo` (default: the repository this crate is in).
 //!
 //! The test platform has no GPU: a draw covers building the elements, layout,
@@ -14,6 +16,7 @@
 use super::{
     ContributorsPage, Event, GithubView, Tab,
     backend::{Backend, CoreBackend},
+    chart::ChartKind,
     data::Clock,
     data_tests::{Fake, first_commit},
     github::Section,
@@ -464,6 +467,8 @@ struct Row {
     window_ms: f64,
     stats_build_ms: f64,
     hover: Option<(f64, f64, f64)>,
+    /// The same hover with each chart type, Line, Cumulative and Bars.
+    hover_kinds: Vec<(ChartKind, (f64, f64, f64))>,
     switch_ms: f64,
     open_ms: f64,
     leaderboard_ms: f64,
@@ -542,7 +547,25 @@ fn measure(
     eprintln!("[{label}] hover");
     // A tooltip with a hundred lines covers the pointer, and the hover then flips
     // on and off on every frame without settling, so dense cases skip hover.
-    let hover = if hover { page.hover(20) } else { None };
+    let hover_now = if hover { page.hover(20) } else { None };
+    let mut hover_kinds = vec![];
+    if hover {
+        for kind in ChartKind::ALL {
+            let view = page.view.clone();
+            view.update(&mut page.v, |this, cx| this.set_chart_kind(kind, cx));
+            settle(&mut page.v);
+            page.window_draw();
+            if let Some(numbers) = page.hover(20) {
+                hover_kinds.push((kind, numbers));
+            }
+        }
+        let view = page.view.clone();
+        view.update(&mut page.v, |this, cx| {
+            this.set_chart_kind(ChartKind::Line, cx)
+        });
+        settle(&mut page.v);
+    }
+    let hover = hover_now;
     // Switching: swap the data every load returns, ask for another kind, and
     // wait until its model is on screen (load, Loaded, model build, draw).
     eprintln!("[{label}] switch");
@@ -574,6 +597,7 @@ fn measure(
         window_ms,
         stats_build_ms,
         hover,
+        hover_kinds,
         switch_ms,
         open_ms,
         leaderboard_ms: other_sections[0],
@@ -585,6 +609,15 @@ fn measure(
 
 fn print_rows(title: &str, rows: &[Row]) {
     println!("\n== {title} ==");
+    for r in rows.iter().filter(|r| !r.hover_kinds.is_empty()) {
+        for (kind, (e, d, t)) in &r.hover_kinds {
+            println!(
+                "{:<18} hover over the {:<10} chart: event {e:.2} ms, draw {d:.2} ms, total {t:.2} ms",
+                r.label,
+                kind.label()
+            );
+        }
+    }
     println!(
         "{:<18} {:>6} {:>4} {:>9} {:>8} {:>5} {:>6} {:>8} {:>5} | {:>9} {:>9} {:>9} | {:>10} | {:>9} {:>9} {:>9} | {:>9} {:>9} | {:>9} {:>9}",
         "case",

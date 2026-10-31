@@ -411,3 +411,149 @@ fn width_changes_emit_row_remeasure_events(cx: &mut TestAppContext) {
         "Responsive width changes must also remeasure the transcript row"
     );
 }
+
+mod cartesian {
+    use super::super::{charts::*, dither::CELL};
+    use monocode_core::visual::ChartKind;
+
+    /// The columns every bar of every bucket takes, from the layout's own start rule.
+    fn spans(band: f32, n: usize, buckets: usize) -> Vec<(i32, i32)> {
+        let layout = bar_layout(band, n);
+        let mut spans = vec![];
+        for i in 0..buckets {
+            let start =
+                ((band * (i as f32 + 0.5)) / CELL - layout.group() as f32 / 2.).round() as i32;
+            for slot in 0..layout.shown as i32 {
+                let first = start + slot * (layout.wide + layout.gap);
+                spans.push((first, first + layout.wide));
+            }
+        }
+        spans
+    }
+
+    #[test]
+    fn a_group_that_fits_keeps_its_share_of_the_band() {
+        // A wide band: the old rule, 70% of the band with a one cell gap.
+        let layout = bar_layout(120., 3);
+        assert_eq!((layout.wide, layout.gap, layout.shown), (9, 1, 3));
+        // One series fills 70%, capped at the widest bar.
+        let layout = bar_layout(300., 1);
+        assert_eq!((layout.wide, layout.gap, layout.shown), (12, 1, 1));
+    }
+
+    #[test]
+    fn a_crowded_group_narrows_then_loses_its_gap_then_shows_what_fits() {
+        // 6 series in a 60px band (20 cells): the preferred 2 cell bars with
+        // gaps take 17 cells, and still fit.
+        assert_eq!(bar_layout(60., 6).shown, 6);
+        // 6 series in a 36px band (12 cells): 1 cell bars with gaps (11) fit.
+        let layout = bar_layout(36., 6);
+        assert_eq!((layout.wide, layout.gap, layout.shown), (1, 1, 6));
+        // 24px (8 cells): the gaps go, 1 cell bars touch.
+        let layout = bar_layout(24., 6);
+        assert_eq!((layout.wide, layout.gap, layout.shown), (1, 0, 6));
+        // 15px (5 cells): only four 1 cell bars fit, one cell left clear.
+        let layout = bar_layout(15., 6);
+        assert_eq!((layout.wide, layout.gap, layout.shown), (1, 0, 4));
+        // Narrower than a cell still draws one bar.
+        assert_eq!(bar_layout(2., 6).shown, 1);
+    }
+
+    #[test]
+    fn groups_never_overlap_their_neighbours_at_any_width() {
+        for n in 1..=7 {
+            for band_cells in 1..=60 {
+                let band = band_cells as f32 * CELL + 0.7;
+                let spans = spans(band, n, 12);
+                // Each bucket's bars are drawn left to right; none starts
+                // before the one drawn just before it ends.
+                for pair in spans.windows(2) {
+                    assert!(
+                        pair[0].1 <= pair[1].0,
+                        "n={n} band={band}: {:?} overlaps {:?}",
+                        pair[0],
+                        pair[1]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_series_that_get_a_bar_are_the_lit_ones_first() {
+        let drawn = |dimmed: bool| Drawn {
+            label: String::new(),
+            color: gpui::hsla(0., 0., 1., 1.),
+            values: vec![],
+            dimmed,
+        };
+        let series = [drawn(true), drawn(false), drawn(false)];
+        assert_eq!(bar_series(&series, 3), [0, 1, 2]);
+        assert_eq!(bar_series(&series, 2), [1, 2]);
+        assert_eq!(bar_series(&series, 1), [1]);
+    }
+
+    #[test]
+    fn lines_run_edge_to_edge_while_bars_keep_their_bands() {
+        for kind in [ChartKind::Line, ChartKind::Area] {
+            assert_eq!(x_at(kind, 0, 3, 100.), 0.);
+            assert_eq!(x_at(kind, 1, 3, 100.), 50.);
+            assert_eq!(x_at(kind, 2, 3, 100.), 100.);
+            assert_eq!(x_at(kind, 0, 1, 100.), 50.);
+        }
+        assert_eq!(x_at(ChartKind::Bar, 0, 4, 100.), 12.5);
+        assert_eq!(x_at(ChartKind::Bar, 3, 4, 100.), 87.5);
+        assert_eq!(x_at(ChartKind::Bar, 0, 1, 100.), 50.);
+    }
+
+    #[test]
+    fn the_pointer_picks_the_band_or_the_nearest_point() {
+        assert_eq!(bucket_at(ChartKind::Bar, 0., 100., 4), Some(0));
+        assert_eq!(bucket_at(ChartKind::Bar, 24.9, 100., 4), Some(0));
+        assert_eq!(bucket_at(ChartKind::Bar, 25., 100., 4), Some(1));
+        assert_eq!(bucket_at(ChartKind::Bar, 100., 100., 4), Some(3));
+        assert_eq!(bucket_at(ChartKind::Bar, 100.1, 100., 4), None);
+        assert_eq!(bucket_at(ChartKind::Line, 24., 100., 3), Some(0));
+        assert_eq!(bucket_at(ChartKind::Line, 26., 100., 3), Some(1));
+        assert_eq!(bucket_at(ChartKind::Line, -1., 100., 3), None);
+        assert_eq!(bucket_at(ChartKind::Line, 5., 100., 1), Some(0));
+        assert_eq!(bucket_at(ChartKind::Line, 5., 100., 0), None);
+        assert_eq!(bucket_at(ChartKind::Line, 5., 0., 3), None);
+    }
+
+    #[test]
+    fn x_labels_are_thinned_to_stay_72px_apart() {
+        assert_eq!(label_stride(7, 600.), 1);
+        assert_eq!(label_stride(15, 360.), 3);
+        assert_eq!(label_stride(48, 720.), 5);
+        assert_eq!(label_stride(1, 10.), 1);
+        assert_eq!(label_stride(0, 0.), 1);
+    }
+
+    #[test]
+    fn resting_samples_split_into_runs_that_share_their_joints() {
+        let samples = [[0., 10.], [1., 10.], [2., 5.], [3., 2.], [4., 10.]];
+        let out = runs(&samples, |y| y >= 10.);
+        let shape: Vec<(bool, usize)> = out.iter().map(|(f, r)| (*f, r.len())).collect();
+        // Each run takes the first point of the next, so the line stays whole.
+        assert_eq!(shape, [(true, 3), (false, 3), (true, 1)]);
+        assert_eq!(out[0].1[2], [2., 5.]);
+        assert!(runs(&[], |_| true).is_empty());
+    }
+
+    #[test]
+    fn the_plot_leaves_room_for_the_y_labels_and_a_bars_value() {
+        use super::super::dither::Scale;
+        let scale = Scale {
+            min: 0.,
+            max: 1200.,
+            step: 400.,
+        };
+        // "1.2K" is the longest label: 4 chars.
+        let lines = geometry(ChartKind::Line, &scale, 400., 200.);
+        assert_eq!((lines.left, lines.top), (35., 8.));
+        assert_eq!((lines.width, lines.height), (359., 170.));
+        let bars = geometry(ChartKind::Bar, &scale, 400., 200.);
+        assert_eq!((bars.top, bars.width, bars.height), (16., 365., 162.));
+    }
+}

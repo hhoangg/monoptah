@@ -1016,6 +1016,8 @@ impl Render for GithubView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    // A sideways swipe must not be turned into a vertical move.
+                    .restrict_scroll_to_axis()
                     .track_scroll(&self.scroll)
                     .child(
                         div()

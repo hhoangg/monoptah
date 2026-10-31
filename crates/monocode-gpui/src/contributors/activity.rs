@@ -6,7 +6,7 @@
 use super::{
     github::GithubView,
     stats::{card, card_title},
-    ui::hex_color,
+    ui::{self, hex_color},
 };
 use crate::{
     theme::*,
@@ -19,7 +19,7 @@ use crate::{
 use chrono::{DateTime, Duration as Days, Local, NaiveDate};
 use gpui::{
     AnyElement, App, Bounds, Context, Entity, Hsla, MouseMoveEvent, Pixels, Point, Render, Role,
-    SharedString, StyleRefinement, WeakEntity, Window, div, prelude::*, px,
+    ScrollHandle, SharedString, StyleRefinement, WeakEntity, Window, canvas, div, prelude::*, px,
 };
 use monocode_core::contributors::{
     RawData,
@@ -419,18 +419,58 @@ impl Render for RhythmView {
     }
 }
 
-/// The selection pills: Team and each member, one row that scrolls sideways
-/// so its height is fixed and it can be drawn from a cache.
+/// The selection pills: Team and each member, one row of fixed height so it
+/// can be drawn from a cache. The row takes no wheel or trackpad input (the
+/// page scrolls over it); only the chevrons at its ends and a click on a
+/// partly hidden pill move it, through a `ScrollHandle` driven from code.
 pub(super) struct PillsView {
     host: WeakEntity<GithubView>,
     /// Person id (`None` for the team), label and color of each pill.
     pub(super) people: Arc<Vec<(Option<String>, SharedString, Hsla)>>,
     pub(super) selected: Option<String>,
     pub(super) dim: bool,
+    /// The row's offset; the scrolling element never handles the wheel.
+    pub(super) scroll: ScrollHandle,
+    /// Which chevrons show (left, right). Overflow is only known after layout,
+    /// so a prepaint check corrects this once, outside the draw.
+    pub(super) shown: (bool, bool),
+    /// The selected pill is brought into view after the next layout: it may
+    /// start hidden (a saved pick) or be set from code.
+    pub(super) reveal_selected: bool,
 }
 type Pill = (Option<String>, SharedString, Hsla);
 /// The height of the pill row.
 const PILLS_H: f32 = 28.;
+/// The width of the slot of each chevron. The right one is kept even when
+/// hidden; the left one collapses so the first pill lines up with the title.
+const CHEVRON_SLOT: f32 = 26.;
+
+/// Which chevrons show for a row scrolled `scrolled` px of at most `max`:
+/// left when something is hidden before, right when something is hidden after.
+pub(super) fn chevrons(scrolled: f32, max: f32) -> (bool, bool) {
+    (scrolled > 0.5, max - scrolled > 0.5)
+}
+
+/// Where a chevron click takes the row (`dir` is -1 for left, 1 for right):
+/// about one row width minus one pill, clamped to the two ends.
+pub(super) fn step_target(scrolled: f32, max: f32, viewport: f32, pill: f32, dir: i32) -> f32 {
+    let step = (viewport - pill).max(viewport / 2.).max(1.);
+    (scrolled + dir.signum() as f32 * step).clamp(0., max.max(0.))
+}
+
+/// Where a click on a pill takes the row so the pill is fully in view, the
+/// smallest move. `left` and `right` are the pill's edges in the row's own
+/// coordinates (not scrolled).
+pub(super) fn reveal(scrolled: f32, max: f32, viewport: f32, left: f32, right: f32) -> f32 {
+    let target = if left < scrolled || right - left > viewport {
+        left
+    } else if right > scrolled + viewport {
+        right - viewport
+    } else {
+        scrolled
+    };
+    target.clamp(0., max.max(0.))
+}
 
 impl PillsView {
     /// The page around is dimmed or not. The cached frame bakes the opacity in,
@@ -446,76 +486,243 @@ impl PillsView {
         if *self.people == *people && self.selected == selected {
             return;
         }
+        if self.selected != selected {
+            self.reveal_selected = true;
+        }
         self.people = people;
         self.selected = selected;
         cx.notify();
+    }
+
+    /// Distance the row is scrolled, and the most it can be.
+    fn extent(&self) -> (f32, f32) {
+        (
+            -self.scroll.offset().x.as_f32(),
+            self.scroll.max_offset().x.as_f32(),
+        )
+    }
+
+    /// Which chevrons the last layout calls for.
+    fn wanted(&self) -> (bool, bool) {
+        let (scrolled, max) = self.extent();
+        chevrons(scrolled, max)
+    }
+
+    /// Takes the layout's verdict on the chevrons; notifies only on a change.
+    fn sync(&mut self, cx: &mut Context<Self>) {
+        let wanted = self.wanted();
+        if self.shown != wanted {
+            self.shown = wanted;
+            cx.notify();
+        }
+    }
+
+    fn move_to(&mut self, scrolled: f32, cx: &mut Context<Self>) {
+        let mut offset = self.scroll.offset();
+        offset.x = px(-scrolled);
+        self.scroll.set_offset(offset);
+        // The chevrons are settled by the next layout.
+        self.shown = chevrons(scrolled, self.extent().1);
+        cx.notify();
+    }
+
+    /// Distance scrolled, most it can be and the width seen, as they will be
+    /// once the left slot is on (it takes `CHEVRON_SLOT` from the row when it
+    /// is off now, which is also when the row cannot be scrolled left).
+    fn space(&self) -> (f32, f32, f32) {
+        let (scrolled, max) = self.extent();
+        let viewport = self.scroll.bounds().size.width.as_f32();
+        if self.shown.0 {
+            (scrolled, max, viewport)
+        } else {
+            (scrolled, max + CHEVRON_SLOT, viewport - CHEVRON_SLOT)
+        }
+    }
+
+    /// After a layout: brings the selected pill into view once.
+    fn settle_selected(&mut self, cx: &mut Context<Self>) {
+        self.reveal_selected = false;
+        if let Some(index) = self.people.iter().position(|(p, ..)| *p == self.selected) {
+            self.reveal_pill(index, cx);
+        }
+    }
+
+    fn step(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let (scrolled, max, viewport) = self.space();
+        let count = self.people.len().max(1) as f32;
+        let pill = (viewport + max) / count;
+        self.move_to(step_target(scrolled, max, viewport, pill, dir), cx);
+    }
+
+    fn reveal_pill(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(item) = self.scroll.bounds_for_item(index) else {
+            return;
+        };
+        let (scrolled, max, viewport) = self.space();
+        let area = self.scroll.bounds();
+        let left = (item.left() - area.left()).as_f32();
+        let target = reveal(
+            scrolled,
+            max,
+            viewport,
+            left,
+            left + item.size.width.as_f32(),
+        );
+        if target != scrolled {
+            self.move_to(target, cx);
+        }
+    }
+
+    /// The fixed slot of a chevron: the button when it shows, else empty.
+    fn slot(
+        &self,
+        on: bool,
+        id: &'static str,
+        label: &'static str,
+        icon: &'static str,
+        dir: i32,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .w(px(CHEVRON_SLOT))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(on, |d| {
+                d.child(
+                    ui::icon_button(id, label, icon, 14., false)
+                        .on_click(cx.listener(move |this, _, _, cx| this.step(dir, cx))),
+                )
+            })
     }
 }
 impl Render for PillsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         built(2);
+        let (left, right) = self.shown;
+        let entity = cx.entity();
+        let scroll = self.scroll.clone();
+        let shown = self.shown;
+        let pending = self.reveal_selected;
         div()
             .id("contributors-activity-pills")
             .debug_selector(|| "contributors-activity-pills".into())
             .w_full()
             .h(px(PILLS_H))
             .flex()
-            .flex_nowrap()
             .items_center()
-            .gap(px(6.))
-            .overflow_x_scroll()
-            .children(
-                self.people
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (person, label, color))| {
-                        let on = self.selected == *person;
-                        let person = person.clone();
-                        div()
-                            .id(SharedString::from(format!(
-                                "contributors-activity-pill-{index}"
-                            )))
-                            .debug_selector(move || format!("contributors-activity-pill-{index}"))
-                            .role(Role::Button)
-                            .aria_label(label.clone())
-                            .aria_toggled(if on {
-                                gpui::Toggled::True
-                            } else {
-                                gpui::Toggled::False
-                            })
-                            .flex_shrink_0()
-                            .max_w(px(200.))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(content(if on { 0.25 } else { 0.1 }))
-                            .px(px(10.))
-                            .py(px(3.))
-                            .text_size(px(12.))
-                            .text_color(content(if on { 0.95 } else { 0.6 }))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(content(0.06)))
-                            .when(on, |d| d.bg(content(0.08)))
-                            .child(
-                                div()
-                                    .size(px(8.))
-                                    .flex_shrink_0()
-                                    .rounded(px(2.))
-                                    .bg(*color),
-                            )
-                            .child(div().min_w_0().truncate().child(label.clone()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let (person, host) = (person.clone(), this.host.clone());
-                                // After this update ends: the host pushes into this view.
-                                cx.defer(move |cx| {
-                                    let _ = host
-                                        .update(cx, |host, cx| host.select_activity(person, cx));
+            .child(
+                self.slot(
+                    left,
+                    "contributors-activity-pills-left",
+                    "Scroll members left",
+                    "chevron-left",
+                    -1,
+                    cx,
+                )
+                // Collapsed while off, so the first pill lines up with the title.
+                .when(!left, |d| d.w(px(0.))),
+            )
+            .child(
+                div()
+                    .id("contributors-activity-pills-row")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_nowrap()
+                    .items_center()
+                    .gap(px(6.))
+                    // Hidden, not scroll: the element ignores the wheel, so the page scrolls.
+                    .overflow_hidden()
+                    .track_scroll(&self.scroll)
+                    .children(self.people.iter().enumerate().map(
+                        |(index, (person, label, color))| {
+                            let on = self.selected == *person;
+                            let person = person.clone();
+                            div()
+                                .id(SharedString::from(format!(
+                                    "contributors-activity-pill-{index}"
+                                )))
+                                .debug_selector(move || {
+                                    format!("contributors-activity-pill-{index}")
+                                })
+                                .role(Role::Button)
+                                .aria_label(label.clone())
+                                .aria_toggled(if on {
+                                    gpui::Toggled::True
+                                } else {
+                                    gpui::Toggled::False
+                                })
+                                .flex_shrink_0()
+                                .max_w(px(200.))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(content(if on { 0.25 } else { 0.1 }))
+                                .px(px(10.))
+                                .py(px(3.))
+                                .text_size(px(12.))
+                                .text_color(content(if on { 0.95 } else { 0.6 }))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(content(0.06)))
+                                .when(on, |d| d.bg(content(0.08)))
+                                .child(
+                                    div()
+                                        .size(px(8.))
+                                        .flex_shrink_0()
+                                        .rounded(px(2.))
+                                        .bg(*color),
+                                )
+                                .child(div().min_w_0().truncate().child(label.clone()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reveal_pill(index, cx);
+                                    let (person, host) = (person.clone(), this.host.clone());
+                                    // After this update ends: the host pushes into this view.
+                                    cx.defer(move |cx| {
+                                        let _ = host.update(cx, |host, cx| {
+                                            host.select_activity(person, cx)
+                                        });
+                                    });
+                                }))
+                        },
+                    )),
+            )
+            .child(self.slot(
+                right,
+                "contributors-activity-pills-right",
+                "Scroll members right",
+                "chevron-right",
+                1,
+                cx,
+            ))
+            // Overflow is only known after layout and a notify while drawing is
+            // dropped: check it in prepaint and correct once, after the frame.
+            .child(
+                canvas(
+                    move |_, window, cx| {
+                        let (scrolled, max) =
+                            (-scroll.offset().x.as_f32(), scroll.max_offset().x.as_f32());
+                        if pending || chevrons(scrolled, max) != shown {
+                            let entity = entity.clone();
+                            window.defer(cx, move |_, cx| {
+                                entity.update(cx, |view, cx| {
+                                    if view.reveal_selected {
+                                        view.settle_selected(cx);
+                                    }
+                                    view.sync(cx);
                                 });
-                            }))
-                    }),
+                            });
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_0(),
             )
     }
 }
@@ -782,6 +989,9 @@ impl GithubView {
             people,
             selected,
             dim: false,
+            scroll: ScrollHandle::new(),
+            shown: (false, false),
+            reveal_selected: true,
         });
         self.activity.note = self.activity_note(cx);
         self.activity.calendar = Some(calendar.clone());

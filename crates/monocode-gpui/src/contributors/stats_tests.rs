@@ -421,28 +421,18 @@ fn the_column_of_a_bucket_names_the_day_and_every_person_in_the_tooltip() {
         .iter()
         .map(|(_, n, v)| (n.as_str(), v.as_str()))
         .collect();
-    assert_eq!(rows, [("Bob", "2")]);
-    let tip = chart::tooltip(chart::ChartKind::Bars, &data, &focus, at("2026-10-02")).unwrap();
-    assert!(tip.rows.is_empty());
-}
-
-#[test]
-fn the_x_axis_labels_the_first_and_last_bucket_and_few_between() {
-    let m = month();
-    let data = chart_data(&m.stats);
-    let labels = chart::axis_labels(&data.buckets);
-    let buckets = &m.stats.buckets;
-    assert_eq!(labels[0].1, buckets[0].short);
-    assert_eq!(labels[labels.len() - 1].1, buckets[buckets.len() - 1].short);
-    assert_eq!(labels[0].0, 0);
-    assert_eq!(labels[labels.len() - 1].0, buckets.len() - 1);
-    assert!((2..=10).contains(&labels.len()));
-    let week = chart_data(&model_of(fixture(), PeriodKind::Days7).stats);
-    let first = &chart::axis_labels(&week.buckets)[0].1;
-    assert!(
-        first.len() >= 5 && first.len() <= 6 && first.chars().nth(3) == Some(' '),
-        "{first}"
+    // Everyone is listed, at zero when they did nothing that day.
+    // (plus the Total row when there are several).
+    let listed = data.series.len() + usize::from(data.series.len() > 1);
+    assert_eq!(rows.len(), listed);
+    assert!(rows.contains(&("Bob", "2")));
+    assert_eq!(
+        rows.iter().filter(|r| r.0 != "Total" && r.1 != "0").count(),
+        1
     );
+    let tip = chart::tooltip(chart::ChartKind::Bars, &data, &focus, at("2026-10-02")).unwrap();
+    assert_eq!(tip.rows.len(), listed);
+    assert!(tip.rows.iter().all(|r| r.2 == "0"));
 }
 
 #[test]
@@ -609,33 +599,6 @@ fn leak(text: String) -> &'static str {
 }
 
 #[gpui::test]
-fn the_chart_labels_the_y_maximum_and_only_the_chosen_x_ticks(cx: &mut TestAppContext) {
-    let (ui, mut v) = stats_window(cx);
-    assert!(shown(&mut v, "contributors-stats-ymax"));
-    let view = ui.view(&mut v);
-    let (count, ticks) = v.read(|cx| {
-        let model = view.read(cx).snapshot(cx).model.expect("a model");
-        let data = chart_data(&model.stats);
-        (
-            data.buckets.len(),
-            chart::axis_labels(&data.buckets)
-                .into_iter()
-                .map(|(i, _)| i)
-                .collect::<Vec<_>>(),
-        )
-    });
-    // Oct 1 to Oct 15: the days that have happened.
-    assert_eq!(count, 15);
-    for i in 0..count {
-        assert_eq!(
-            shown(&mut v, leak(format!("contributors-stats-axis-{i}"))),
-            ticks.contains(&i),
-            "tick {i}"
-        );
-    }
-}
-
-#[gpui::test]
 fn the_chart_is_one_labelled_image_and_not_an_element_per_segment(cx: &mut TestAppContext) {
     let (ui, mut v) = stats_window(cx);
     assert!(shown(&mut v, "contributors-stats-chart"));
@@ -766,15 +729,23 @@ fn the_pointer_moves_the_chart_hover_without_redrawing_the_page(cx: &mut TestApp
     let _watch = v.update(|_, cx| cx.observe(&view, move |_, _| count.set(count.get() + 1)));
     assert_eq!(v.read(|cx| chart.read(cx).hover), None);
     let bounds = v.debug_bounds("contributors-stats-chart").unwrap();
-    // The first bucket, then the last.
-    for (x, expected) in [(0.01, 0), (0.99, 14)] {
-        let at = gpui::point(
-            bounds.origin.x + bounds.size.width * x,
-            bounds.origin.y + bounds.size.height * 0.5,
-        );
+    // The y label gutter hits nothing; then the first bucket and the last, by
+    // the grid the chart paints.
+    let (kind, scale) = v.read(|cx| {
+        let chart = chart.read(cx);
+        (chart.kind, chart::y_scale(chart.kind, &chart.data.series))
+    });
+    let grid = chart::plot_grid(kind, &scale, bounds);
+    let plot_w = gpui::px(grid.cols as f32 * crate::visuals::dither::CELL);
+    for (x, expected) in [
+        (bounds.origin.x + gpui::px(2.), None),
+        (grid.origin.x + gpui::px(1.), Some(0)),
+        (grid.origin.x + plot_w - gpui::px(1.), Some(14)),
+    ] {
+        let at = gpui::point(x, bounds.origin.y + bounds.size.height * 0.5);
         v.simulate_mouse_move(at, None, Default::default());
         settle(&mut v);
-        assert_eq!(v.read(|cx| chart.read(cx).hover), Some(expected));
+        assert_eq!(v.read(|cx| chart.read(cx).hover), expected);
     }
     move_away(&mut v);
     assert_eq!(v.read(|cx| chart.read(cx).hover), None);
@@ -783,6 +754,44 @@ fn the_pointer_moves_the_chart_hover_without_redrawing_the_page(cx: &mut TestApp
         0,
         "hovering the chart did not notify the page"
     );
+}
+
+#[gpui::test]
+fn the_chart_draws_in_for_new_data_or_a_new_type_but_not_for_hover_or_focus(
+    cx: &mut TestAppContext,
+) {
+    let (ui, mut v) = stats_window(cx);
+    let chart = chart_of(&ui, &mut v);
+    let started = |v: &mut VisualTestContext| v.read(|cx| chart.read(cx).motion.0);
+    let first = started(&mut v);
+    // Hovering and a legend focus leave it alone.
+    let bounds = v.debug_bounds("contributors-stats-chart").unwrap();
+    v.simulate_mouse_move(bounds.center(), None, Default::default());
+    settle(&mut v);
+    assert!(v.read(|cx| chart.read(cx).hover).is_some());
+    click(&mut v, "contributors-stats-legend-0");
+    move_away(&mut v);
+    assert_eq!(started(&mut v), first);
+    // The same data again is not new data.
+    let data = v.read(|cx| chart.read(cx).data.clone());
+    chart.update(&mut v, |c, cx| c.set_data(data.clone(), cx));
+    assert_eq!(started(&mut v), first);
+    // Another type starts it again, and so do other numbers.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    chart.update(&mut v, |c, cx| c.set_kind(chart::ChartKind::Bars, cx));
+    let second = started(&mut v);
+    assert!(second > first);
+    // A color picked in the palette is not new data either.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let mut recolored = (*data).clone();
+    recolored.series[0].color.h = (recolored.series[0].color.h + 0.3) % 1.;
+    chart.update(&mut v, |c, cx| c.set_data(Arc::new(recolored), cx));
+    assert_eq!(started(&mut v), second);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let mut other = (*data).clone();
+    other.series[0].values[0] += 1.;
+    chart.update(&mut v, |c, cx| c.set_data(Arc::new(other), cx));
+    assert!(started(&mut v) > second);
 }
 
 #[gpui::test]
@@ -1680,4 +1689,179 @@ fn a_dim_change_redraws_the_cached_calendar_rhythm_and_pills(cx: &mut TestAppCon
     });
     v.update(|window, cx| window.draw(cx).clear(cx));
     assert!(builds()[1] > dimmed[1], "and the end of the dim is");
+}
+
+#[test]
+fn the_pill_row_shows_a_chevron_only_where_there_is_more_to_reveal() {
+    use super::activity::chevrons;
+    assert_eq!(chevrons(0., 0.), (false, false), "all pills fit");
+    assert_eq!(chevrons(0., 300.), (false, true));
+    assert_eq!(chevrons(120., 300.), (true, true));
+    assert_eq!(chevrons(300., 300.), (true, false));
+}
+
+#[test]
+fn a_chevron_scrolls_one_row_width_minus_a_pill_and_stops_at_the_ends() {
+    use super::activity::step_target;
+    assert_eq!(step_target(0., 500., 400., 80., 1), 320.);
+    assert_eq!(step_target(320., 500., 400., 80., 1), 500., "clamped right");
+    assert_eq!(step_target(500., 500., 400., 80., -1), 180.);
+    assert_eq!(step_target(100., 500., 400., 80., -1), 0., "clamped left");
+    assert_eq!(step_target(0., 0., 400., 80., 1), 0., "nothing to reveal");
+}
+
+#[test]
+fn a_partly_hidden_pill_is_brought_fully_into_view_by_the_smallest_move() {
+    use super::activity::reveal;
+    assert_eq!(
+        reveal(100., 500., 400., 150., 250.),
+        100.,
+        "already in view"
+    );
+    assert_eq!(
+        reveal(100., 500., 400., 60., 160.),
+        60.,
+        "cut off on the left"
+    );
+    assert_eq!(
+        reveal(100., 500., 400., 450., 540.),
+        140.,
+        "cut off on the right"
+    );
+    assert_eq!(
+        reveal(0., 100., 400., 450., 540.),
+        100.,
+        "clamped to the end"
+    );
+}
+
+#[gpui::test]
+fn the_pill_row_ignores_the_wheel_and_its_chevrons_move_it(cx: &mut TestAppContext) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+    // Many members, so the row overflows.
+    let mut raw = fixture();
+    for i in 0..30 {
+        let author = who(&format!("Member number {i}"), &format!("m{i}@example.com"));
+        raw.commits.push(commit(
+            &format!("m{i}"),
+            &author,
+            local(2026, 10, 14, 10),
+            &[("src/a.ts", 3, 0)],
+        ));
+    }
+    let (ui, mut v) = stats_window_of(cx, raw);
+    let view = ui.view(&mut v);
+    let pills = v.read(|cx| view.read(cx).activity.pills.clone().expect("the pills"));
+    settle(&mut v);
+    settle(&mut v);
+    let offset = |v: &mut VisualTestContext| v.read(|cx| pills.read(cx).scroll.offset().x);
+    assert!(
+        !shown(&mut v, "contributors-activity-pills-left"),
+        "at the start"
+    );
+    assert!(
+        shown(&mut v, "contributors-activity-pills-right"),
+        "more to the right"
+    );
+    assert_eq!(offset(&mut v), px(0.));
+    let page = |v: &mut VisualTestContext| v.read(|cx| view.read(cx).scroll.offset());
+    let wheel = |v: &mut VisualTestContext, at, dx: f32, dy: f32| {
+        v.simulate_event(ScrollWheelEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+            modifiers: Default::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        settle(v);
+    };
+    // A vertical wheel still scrolls the page: bring the row into the window.
+    assert_eq!(page(&mut v).y, px(0.));
+    wheel(&mut v, point(px(500.), px(300.)), 0., -300.);
+    // Leave room to move in both directions, so a clamp cannot hide a move.
+    let end = page(&mut v);
+    wheel(&mut v, point(px(500.), px(300.)), 0., 20.);
+    let moved = page(&mut v);
+    assert!(end.y < px(0.), "a y gesture moves the page");
+    assert!(
+        moved.y > end.y && moved.y < px(0.),
+        "room both ways: {end:?} {moved:?}"
+    );
+    let row = v
+        .debug_bounds("contributors-activity-pills")
+        .expect("the row");
+    // A sideways swipe over the row moves neither the row nor the page.
+    wheel(&mut v, row.center(), -80., 0.);
+    assert_eq!(offset(&mut v), px(0.), "the row did not take the wheel");
+    assert_eq!(page(&mut v), moved, "a pure x gesture leaves the page");
+    // A y gesture over the row scrolls the page only.
+    let row = v
+        .debug_bounds("contributors-activity-pills")
+        .expect("the row");
+    wheel(&mut v, row.center(), 0., 40.);
+    assert_eq!(offset(&mut v), px(0.));
+    assert!(
+        page(&mut v).y > moved.y,
+        "a y gesture over the row moves the page"
+    );
+    let row = v
+        .debug_bounds("contributors-activity-pills")
+        .expect("the row");
+    wheel(&mut v, row.center(), -60., -60.);
+    assert_eq!(offset(&mut v), px(0.), "a diagonal gesture leaves the row");
+    wheel(&mut v, row.center(), 0., 5000.);
+    wheel(&mut v, point(px(500.), px(300.)), 0., -300.);
+    click(&mut v, "contributors-activity-pills-right");
+    assert!(offset(&mut v) < px(0.), "the chevron moved the row");
+    settle(&mut v);
+    assert!(
+        shown(&mut v, "contributors-activity-pills-left"),
+        "something is now hidden on the left"
+    );
+    click(&mut v, "contributors-activity-pills-left");
+    assert_eq!(offset(&mut v), px(0.));
+    settle(&mut v);
+    assert!(!shown(&mut v, "contributors-activity-pills-left"));
+}
+
+#[gpui::test]
+fn a_selection_set_from_code_is_brought_into_view_and_the_left_slot_is_collapsed(
+    cx: &mut TestAppContext,
+) {
+    use gpui::px;
+    let mut raw = fixture();
+    for i in 0..30 {
+        let author = who(&format!("Member number {i}"), &format!("m{i}@example.com"));
+        raw.commits.push(commit(
+            &format!("m{i}"),
+            &author,
+            local(2026, 10, 14, 10),
+            &[("src/a.ts", 3, 0)],
+        ));
+    }
+    let (ui, mut v) = stats_window_of(cx, raw);
+    let view = ui.view(&mut v);
+    let pills = v.read(|cx| view.read(cx).activity.pills.clone().expect("the pills"));
+    settle(&mut v);
+    let first = v.debug_bounds("contributors-activity-pill-0").unwrap();
+    let title = v.debug_bounds("contributors-activity").unwrap();
+    assert!(
+        first.left() - title.left() < px(20.),
+        "the first pill sits at the card edge while the left chevron is off"
+    );
+    let last = v.read(|cx| pills.read(cx).people.len() - 1);
+    let person = v.read(|cx| pills.read(cx).people[last].0.clone());
+    view.update_in(&mut v, |this, _, cx| this.select_activity(person, cx));
+    settle(&mut v);
+    settle(&mut v);
+    assert!(v.read(|cx| pills.read(cx).scroll.offset().x) < px(0.));
+    let pill = v
+        .debug_bounds(Box::leak(
+            format!("contributors-activity-pill-{last}").into_boxed_str(),
+        ))
+        .expect("the selected pill is drawn");
+    let row = v.debug_bounds("contributors-activity-pills").unwrap();
+    assert!(
+        pill.right() <= row.right(),
+        "the selected pill is fully in view"
+    );
 }

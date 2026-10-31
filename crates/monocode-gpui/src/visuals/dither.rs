@@ -393,7 +393,7 @@ pub(crate) fn readout(
 }
 
 /// A dashed vertical guide at `x`, from `top` down `height` px.
-pub(super) fn crosshair(origin: Point<Pixels>, x: f32, height: f32, window: &mut Window) {
+pub(crate) fn crosshair(origin: Point<Pixels>, x: f32, height: f32, window: &mut Window) {
     let mut y = 0.;
     while y < height {
         window.paint_quad(fill(
@@ -408,6 +408,7 @@ pub(super) fn crosshair(origin: Point<Pixels>, x: f32, height: f32, window: &mut
 }
 
 /// A y domain with round ticks covering every value, as charts want.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Scale {
     pub min: f64,
     pub max: f64,
@@ -472,7 +473,7 @@ impl Scale {
 }
 
 /// 1.2K, 48K, 3.4M; plain numbers keep `step`'s decimals.
-pub(super) fn compact(value: f64, step: f64) -> String {
+pub(crate) fn compact(value: f64, step: f64) -> String {
     let trim = |s: String| {
         if s.contains('.') {
             s.trim_end_matches('0').trim_end_matches('.').to_owned()
@@ -501,7 +502,7 @@ pub(super) fn compact(value: f64, step: f64) -> String {
 
 /// A smooth curve through points that never overshoots them (monotone
 /// cubic, Fritsch–Carlson), so peaks stay at the data.
-pub(super) struct Curve {
+pub(crate) struct Curve {
     xs: Vec<f32>,
     ys: Vec<f32>,
     ms: Vec<f32>,
@@ -595,7 +596,7 @@ impl Curve {
 }
 
 /// Strokes `points` (relative to `origin`) with a soft glow under the line.
-pub(super) fn glowing_line(
+pub(crate) fn glowing_line(
     points: &[[f32; 2]],
     origin: Point<Pixels>,
     width: f32,
@@ -612,7 +613,7 @@ pub(super) fn glowing_line(
 }
 
 /// A square end marker in a faint halo of its colour.
-pub(super) fn marker(window: &mut Window, center: Point<Pixels>, side: f32, color: Hsla) {
+pub(crate) fn marker(window: &mut Window, center: Point<Pixels>, side: f32, color: Hsla) {
     let mut halo = color;
     halo.a = 0.25;
     for (side, color) in [(side + 6., halo), (side, color)] {
@@ -627,7 +628,7 @@ pub(super) fn marker(window: &mut Window, center: Point<Pixels>, side: f32, colo
 }
 
 /// A legend swatch: a translucent body under a solid cap, like a bar.
-pub(super) fn swatch(color: Hsla) -> gpui::Div {
+pub(crate) fn swatch(color: Hsla) -> gpui::Div {
     use gpui::{Styled, div, prelude::*};
     let mut body = color;
     body.a = 0.4;

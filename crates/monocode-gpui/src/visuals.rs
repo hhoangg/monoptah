@@ -16,7 +16,7 @@ use std::{
 };
 
 pub(crate) mod calendar;
-mod charts;
+pub(crate) mod charts;
 pub(crate) mod dither;
 pub(crate) mod rhythm;
 mod scene;
@@ -132,7 +132,7 @@ fn button(id: impl Into<SharedString>) -> Stateful<Div> {
         .hover(|s| s.bg(content(0.06)).text_color(content(1.)))
         .focus(|s| s.border_color(accent_color()))
 }
-fn tab_button(id: impl Into<SharedString>, selected: bool) -> Stateful<Div> {
+pub(crate) fn tab_button(id: impl Into<SharedString>, selected: bool) -> Stateful<Div> {
     let light = content(1.).l < 0.5;
     let selected_fill: Hsla = gpui::rgb(if light { 0x000000 } else { 0xffffff }).into();
     let selected_text: Hsla = gpui::rgb(if light { 0xffffff } else { 0x141414 }).into();

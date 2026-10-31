@@ -6,24 +6,23 @@
 use super::ui;
 use crate::{
     popover::{Align, Anchor, AnchorSlot, Side, popover},
-    right_panel::tabular,
     theme::*,
-    visuals::dither::{Scale, readout},
+    visuals::{
+        charts::{self, DIM, Drawn, Hover, Plot, bucket_at, geometry, legend_style},
+        dither::{CELL, Motion, Scale, swatch},
+        tab_button,
+    },
 };
 use gpui::{
     AnyElement, App, Bounds, Context, Div, ElementId, EventEmitter, FocusHandle, Hsla,
-    KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, Role,
-    SharedString, Window, canvas, div, fill, point, prelude::*, px, relative, size,
+    KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Render, Role, SharedString,
+    Window, canvas, div, prelude::*, px,
 };
-use monocode_core::contributors::model::{axis::axis_ticks, palette::PERSON_COLORS};
-use std::{cell::Cell, collections::BTreeSet, rc::Rc, sync::Arc};
+use monocode_core::contributors::model::palette::PERSON_COLORS;
+use monocode_core::visual::ChartKind as Shape;
+use std::{cell::Cell, collections::BTreeSet, rc::Rc, sync::Arc, time::Instant};
 
-pub(super) const CHART_H: f32 = 180.;
-const PAD: f32 = 8.;
-/// The bars fill this much of their slot, so neighbours never touch.
-const BAR_SHARE: f32 = 0.7;
-/// Dimmed series keep this much of their color.
-const DIM: f32 = 0.2;
+pub(super) const CHART_H: f32 = 200.;
 /// Series shown on their own; everyone else is summed into "Others".
 pub(super) const TOP: usize = 5;
 pub(super) const OTHERS_ID: &str = "others";
@@ -56,6 +55,13 @@ impl ChartKind {
     }
     pub(super) fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.id() == value)
+    }
+    /// How the shared chart draws it: a running total is a line over other values.
+    fn shape(self) -> Shape {
+        match self {
+            Self::Line | Self::Cumulative => Shape::Line,
+            Self::Bars => Shape::Bar,
+        }
     }
 }
 
@@ -155,17 +161,18 @@ pub(super) fn toggled(focus: &BTreeSet<String>, id: &str) -> BTreeSet<String> {
     next
 }
 
-/// The y domain: stacked totals for bars, the biggest value for lines and
-/// running totals for the cumulative view. Whole counts never get a step below 1.
+/// What a series draws as: its running total for the cumulative view.
+fn plotted(kind: ChartKind, series: &Series) -> Vec<f64> {
+    match kind {
+        ChartKind::Cumulative => cumulative(&series.values),
+        _ => series.values.clone(),
+    }
+}
+
+/// The y domain, from zero: the biggest value drawn (bars sit side by side, so
+/// no stacking). Whole counts never get a step below 1.
 pub(super) fn y_scale(kind: ChartKind, series: &[Series]) -> Scale {
-    let count = series.iter().map(|s| s.values.len()).max().unwrap_or(0);
-    let values: Vec<f64> = match kind {
-        ChartKind::Bars => (0..count)
-            .map(|i| series.iter().filter_map(|s| s.values.get(i)).sum())
-            .collect(),
-        ChartKind::Line => series.iter().flat_map(|s| s.values.clone()).collect(),
-        ChartKind::Cumulative => series.iter().flat_map(|s| cumulative(&s.values)).collect(),
-    };
+    let values: Vec<f64> = series.iter().flat_map(|s| plotted(kind, s)).collect();
     let scale = Scale::nice(values.iter().copied(), true);
     if scale.step < 1. && values.iter().all(|v| v.fract() == 0.) {
         let max = values.iter().copied().fold(0., f64::max).max(1.);
@@ -178,58 +185,58 @@ pub(super) fn y_scale(kind: ChartKind, series: &[Series]) -> Scale {
     scale
 }
 
-/// Where bucket `i` of `count` sits across the plot, 0 at the left edge and 1 at
-/// the right. Lines run edge to edge so the first and last points line up with
-/// the first and last axis label; bars keep their slots; one bucket is centred.
-pub(super) fn x_frac(kind: ChartKind, i: usize, count: usize) -> f32 {
-    if count <= 1 {
-        return 0.5;
-    }
-    match kind {
-        ChartKind::Bars => (i as f32 + 0.5) / count as f32,
-        _ => i as f32 / (count - 1) as f32,
-    }
+/// Whether two datasets draw the same shape: the same buckets and series
+/// (ids, names, values), whatever their colors.
+fn same_shape(a: &ChartData, b: &ChartData) -> bool {
+    a.buckets == b.buckets
+        && a.series.len() == b.series.len()
+        && a.series
+            .iter()
+            .zip(&b.series)
+            .all(|(x, y)| x.id == y.id && x.name == y.name && x.values == y.values)
 }
 
-/// Which bucket `x` (px from the left edge of a `width` wide plot) is on: the
-/// slot under it for bars, the nearest point for lines.
-pub(super) fn hit_bucket(kind: ChartKind, x: f32, width: f32, count: usize) -> Option<usize> {
-    if count == 0 || width <= 0. || !(0. ..width).contains(&x) {
-        return None;
-    }
-    if count == 1 {
-        return Some(0);
-    }
-    let at = match kind {
-        ChartKind::Bars => (x / width * count as f32) as usize,
-        _ => (x / width * (count - 1) as f32).round() as usize,
-    };
-    Some(at.min(count - 1))
+/// How many buckets the chart draws: the longest series or the labels.
+fn bucket_count(data: &ChartData) -> usize {
+    data.series
+        .iter()
+        .map(|s| s.values.len())
+        .max()
+        .unwrap_or(0)
+        .max(data.buckets.len())
 }
 
-/// One label per gridline, top first: its y in px from the top of the plot
-/// element (`height` tall, with `PAD` above and below the lines) and the text.
-pub(super) fn y_labels(scale: &Scale, height: f32) -> Vec<(f32, String)> {
-    let plot_h = (height - PAD * 2.).max(1.);
-    let span = (scale.max - scale.min).max(1e-9);
-    let mut labels: Vec<(f32, String)> = scale
-        .ticks()
-        .into_iter()
-        .map(|tick| {
-            let y = PAD + (1. - ((tick - scale.min) / span) as f32) * plot_h;
-            (y, scale.label(tick))
-        })
-        .collect();
-    labels.sort_by(|a, b| a.0.total_cmp(&b.0));
-    labels
+/// The plot of a chart canvas at `bounds`: the one grid both the paint and the
+/// pointer use, the y label gutter left of it included.
+pub(super) fn plot_grid(
+    kind: ChartKind,
+    scale: &Scale,
+    bounds: Bounds<Pixels>,
+) -> crate::visuals::dither::Grid {
+    geometry(
+        kind.shape(),
+        scale,
+        bounds.size.width.as_f32(),
+        bounds.size.height.as_f32(),
+    )
+    .grid(bounds.origin)
 }
 
-/// Which buckets get an x label, and the label.
-pub(super) fn axis_labels(buckets: &[ChartBucket]) -> Vec<(usize, &str)> {
-    axis_ticks(buckets.len())
-        .into_iter()
-        .map(|i| (i, buckets[i].short.as_str()))
-        .collect()
+/// The bucket under `at` in a chart canvas at `bounds`.
+pub(super) fn hover_bucket(
+    kind: ChartKind,
+    scale: &Scale,
+    count: usize,
+    bounds: Bounds<Pixels>,
+    at: gpui::Point<Pixels>,
+) -> Option<usize> {
+    let grid = plot_grid(kind, scale, bounds);
+    bucket_at(
+        kind.shape(),
+        (at.x - grid.origin.x).as_f32(),
+        grid.cols as f32 * CELL,
+        count,
+    )
 }
 
 fn value_text(value: f64) -> String {
@@ -248,8 +255,8 @@ pub(super) struct Tooltip {
     pub rows: Vec<(Hsla, String, String)>,
 }
 
-/// The tooltip of bucket `index`: the visible (not dimmed) series that have
-/// something in it, and their total when there are several.
+/// The tooltip of bucket `index`: every visible (not dimmed) series with its
+/// value, zero included, and their total when there are several.
 pub(super) fn tooltip(
     kind: ChartKind,
     data: &ChartData,
@@ -269,10 +276,8 @@ pub(super) fn tooltip(
             _ => series.values.get(index).copied(),
         }
         .unwrap_or(0.);
-        if value > 0. {
-            sum += value;
-            rows.push((color_of(series), series.name.clone(), value_text(value)));
-        }
+        sum += value;
+        rows.push((color_of(series), series.name.clone(), value_text(value)));
     }
     if rows.len() > 1 {
         rows.push((content(0.35), "Total".into(), value_text(sum)));
@@ -357,6 +362,8 @@ pub(super) struct ChartView {
     pub(super) hover: Option<usize>,
     /// Where the chart was laid out, for the pointer.
     bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// When the lines and bars last started drawing in: new data or another type.
+    pub(super) motion: Motion,
     /// The series whose palette is open.
     pub(super) palette: Option<String>,
     /// Series colors can be picked. Off for charts whose series are not people.
@@ -384,6 +391,7 @@ impl ChartView {
             focus: BTreeSet::new(),
             hover: None,
             bounds: Rc::default(),
+            motion: Motion(Instant::now()),
             palette: None,
             colorable: true,
             tabs: true,
@@ -409,6 +417,10 @@ impl ChartView {
         if *self.data == *data {
             return;
         }
+        // A new color (the palette) is not new data: nothing draws in again.
+        if !same_shape(&self.data, &data) {
+            self.motion = Motion(Instant::now());
+        }
         self.data = data;
         if self.hover.is_some_and(|i| i >= self.data.buckets.len()) {
             self.hover = None;
@@ -424,6 +436,7 @@ impl ChartView {
     pub(super) fn set_kind(&mut self, kind: ChartKind, cx: &mut Context<Self>) {
         if self.kind != kind {
             self.kind = kind;
+            self.motion = Motion(Instant::now());
             cx.notify();
         }
     }
@@ -431,6 +444,7 @@ impl ChartView {
     fn pick_kind(&mut self, kind: ChartKind, cx: &mut Context<Self>) {
         if self.kind != kind {
             self.kind = kind;
+            self.motion = Motion(Instant::now());
             cx.emit(ChartEvent::Kind(kind));
             cx.notify();
         }
@@ -493,14 +507,11 @@ impl ChartView {
 
     fn move_pointer(&mut self, at: Option<gpui::Point<Pixels>>, cx: &mut Context<Self>) {
         let bounds = self.bounds.get();
-        let next = at.filter(|p| bounds.contains(p)).and_then(|p| {
-            hit_bucket(
-                self.kind,
-                (p.x - bounds.origin.x).as_f32(),
-                bounds.size.width.as_f32(),
-                self.data.buckets.len(),
-            )
-        });
+        let scale = y_scale(self.kind, &self.data.series);
+        let count = bucket_count(&self.data);
+        let next = at
+            .filter(|p| bounds.contains(p))
+            .and_then(|p| hover_bucket(self.kind, &scale, count, bounds, p));
         if next != self.hover {
             self.hover = next;
             cx.notify();
@@ -511,205 +522,72 @@ impl ChartView {
 // ---- drawing -----------------------------------------------------------------------
 
 /// What the canvas needs, copied out of the view so it can outlive the render.
-struct Plot {
+struct Painted {
     data: Arc<ChartData>,
     kind: ChartKind,
-    dim: Vec<bool>,
+    series: Vec<Drawn>,
+    labels: Vec<String>,
+    scale: Scale,
     hover: Option<usize>,
     focus: BTreeSet<String>,
+    motion: Motion,
 }
 
-fn faded(color: Hsla, dim: bool) -> Hsla {
-    let mut color = color;
-    if dim {
-        color.a *= DIM;
-    }
-    color
+/// The series as the shared chart draws them: colors resolved, running totals
+/// for the cumulative view.
+fn drawn(kind: ChartKind, data: &ChartData, dim: &[bool]) -> Vec<Drawn> {
+    data.series
+        .iter()
+        .zip(dim)
+        .map(|(s, dimmed)| Drawn {
+            label: s.name.clone(),
+            color: color_of(s),
+            values: plotted(kind, s),
+            dimmed: *dimmed,
+        })
+        .collect()
 }
 
-fn quad(window: &mut Window, x: f32, y: f32, w: f32, h: f32, color: Hsla, radius: f32) {
-    window.paint_quad(
-        fill(Bounds::new(point(px(x), px(y)), size(px(w), px(h))), color).corner_radii(px(radius)),
-    );
-}
-
-fn paint_plot(plot: &Plot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
-    let data = &plot.data;
-    let count = data.buckets.len();
-    if count == 0 {
-        return;
-    }
-    let (left, top) = (bounds.origin.x.as_f32(), bounds.origin.y.as_f32());
-    let (width, height) = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
-    let plot_h = (height - PAD * 2.).max(1.);
-    let scale = y_scale(plot.kind, &data.series);
-    let span = (scale.max - scale.min).max(1e-9);
-    let y_of = |v: f64| top + PAD + (1. - ((v - scale.min) / span) as f32) * plot_h;
-    let band = width / count as f32;
-    let x_of = |i: usize| left + width * x_frac(plot.kind, i, count);
-
-    for tick in scale.ticks() {
-        quad(
-            window,
-            left,
-            y_of(tick).round(),
-            width,
-            1.,
-            content(0.07),
-            0.,
-        );
-    }
-    quad(window, left, y_of(scale.min), width, 1., content(0.15), 0.);
-    if let Some(i) = plot.hover {
-        let (x0, w) = match plot.kind {
-            ChartKind::Bars => (left + band * i as f32, band),
-            _ => {
-                let x0 = (x_of(i) - band / 2.).max(left);
-                let x1 = (x_of(i) + band / 2.).min(left + width);
-                (x0, x1 - x0)
-            }
-        };
-        quad(window, x0, top, w, height, content(0.04), 0.);
-    }
-
-    match plot.kind {
-        ChartKind::Bars => {
-            let bar = band * BAR_SHARE;
-            for b in 0..count {
-                let x = x_of(b) - bar / 2.;
-                let mut base = 0.;
-                for (s, series) in data.series.iter().enumerate() {
-                    let v = series.values.get(b).copied().unwrap_or(0.);
-                    if v <= 0. {
-                        continue;
-                    }
-                    let (y0, y1) = (y_of(base), y_of(base + v));
-                    base += v;
-                    let color = faded(color_of(series), plot.dim[s]);
-                    quad(window, x, y1, bar, (y0 - y1).max(0.), color, 1.);
-                }
-            }
-        }
-        ChartKind::Line | ChartKind::Cumulative => {
-            let lines: Vec<Vec<f64>> = data
-                .series
-                .iter()
-                .map(|s| match plot.kind {
-                    ChartKind::Cumulative => cumulative(&s.values),
-                    _ => s.values.clone(),
-                })
-                .collect();
-            // Faded series first, so the focused ones draw over them.
-            let order = (0..lines.len())
-                .filter(|s| plot.dim[*s])
-                .chain((0..lines.len()).filter(|s| !plot.dim[*s]));
-            for s in order {
-                let color = faded(color_of(&data.series[s]), plot.dim[s]);
-                let at = |i: usize| {
-                    point(
-                        px(x_of(i)),
-                        px(y_of(lines[s].get(i).copied().unwrap_or(0.))),
-                    )
-                };
-                if count == 1 {
-                    let p = at(0);
-                    quad(
-                        window,
-                        p.x.as_f32() - 4.,
-                        p.y.as_f32() - 4.,
-                        8.,
-                        8.,
-                        color,
-                        4.,
-                    );
-                    continue;
-                }
-                let mut path = PathBuilder::stroke(px(2.));
-                path.move_to(at(0));
-                for i in 1..count {
-                    path.line_to(at(i));
-                }
-                if let Ok(path) = path.build() {
-                    window.paint_path(path, color);
-                }
-            }
-            if let Some(i) = plot.hover {
-                for (s, line) in lines.iter().enumerate() {
-                    if plot.dim[s] {
-                        continue;
-                    }
-                    let y = y_of(line.get(i).copied().unwrap_or(0.));
-                    quad(
-                        window,
-                        x_of(i) - 3.,
-                        y - 3.,
-                        6.,
-                        6.,
-                        color_of(&data.series[s]),
-                        3.,
-                    );
-                }
-            }
-        }
-    }
-
-    if let Some(i) = plot.hover
-        && let Some(tip) = tooltip(plot.kind, data, &plot.focus, i)
-    {
-        let high = match plot.kind {
-            ChartKind::Bars => {
-                let sum: f64 = data
-                    .series
-                    .iter()
-                    .enumerate()
-                    .filter(|(s, _)| !plot.dim[*s])
-                    .filter_map(|(_, s)| s.values.get(i))
-                    .sum();
-                y_of(sum)
-            }
-            _ => data
-                .series
-                .iter()
-                .enumerate()
-                .filter(|(s, _)| !plot.dim[*s])
-                .map(|(_, s)| {
-                    let value = match plot.kind {
-                        ChartKind::Cumulative => cumulative(&s.values).get(i).copied(),
-                        _ => s.values.get(i).copied(),
-                    };
-                    y_of(value.unwrap_or(0.))
-                })
-                .fold(top + height / 2., f32::min),
-        };
-        readout(
-            &tip.title,
-            &tip.rows,
-            point(px(x_of(i)), px(high)),
-            bounds,
-            window,
-            cx,
-        );
-    }
+fn paint_plot(painted: &Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    let tip = |i: usize| {
+        tooltip(painted.kind, &painted.data, &painted.focus, i).map(|t| (t.title, t.rows))
+    };
+    let plot = Plot {
+        kind: painted.kind.shape(),
+        series: &painted.series,
+        labels: &painted.labels,
+        scale: painted.scale,
+        hover: Hover::At(painted.hover),
+        tip: Some(&tip),
+        quiet_zero: true,
+    };
+    window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+        charts::cartesian(&plot, bounds, painted.motion, window, cx)
+    });
 }
 
 impl ChartView {
     fn tabs(&self, cx: &mut Context<Self>) -> Div {
-        let options: Vec<(&'static str, &'static str)> = ChartKind::ALL
-            .iter()
-            .map(|kind| (kind.id(), kind.label()))
-            .collect();
-        div().mb(px(8.)).flex().justify_end().child(ui::segmented(
-            "chart-kind",
-            "Chart type",
-            self.kind.id(),
-            &options,
-            cx,
-            |this: &mut Self, value, cx| {
-                if let Some(kind) = ChartKind::parse(value) {
-                    this.pick_kind(kind, cx);
-                }
-            },
-        ))
+        div().mb(px(8.)).child(
+            div()
+                .id("segmented-chart-kind")
+                .role(Role::RadioGroup)
+                .aria_label("Chart type")
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .children(ChartKind::ALL.into_iter().map(|kind| {
+                    let selected = self.kind == kind;
+                    let id = kind.id();
+                    tab_button(format!("segmented-chart-kind-{id}"), selected)
+                        .debug_selector(move || format!("contributors-chart-kind-{id}"))
+                        .role(Role::RadioButton)
+                        .aria_label(kind.label())
+                        .aria_selected(selected)
+                        .child(kind.label())
+                        .on_click(cx.listener(move |this, _, _, cx| this.pick_kind(kind, cx)))
+                })),
+        )
     }
 
     fn plot(&self, dim: &[bool], cx: &mut Context<Self>) -> AnyElement {
@@ -717,14 +595,16 @@ impl ChartView {
         let id = SharedString::from(format!("{prefix}-chart"));
         let selector = id.to_string();
         let bounds = self.bounds.clone();
-        let plot = Plot {
+        let painted = Painted {
             data: self.data.clone(),
             kind: self.kind,
-            dim: dim.to_vec(),
+            series: drawn(self.kind, &self.data, dim),
+            labels: self.data.buckets.iter().map(|b| b.short.clone()).collect(),
+            scale: y_scale(self.kind, &self.data.series),
             hover: self.hover,
             focus: self.focus.clone(),
+            motion: self.motion,
         };
-        let scale = y_scale(self.kind, &self.data.series);
         div()
             .id(id)
             .debug_selector(move || selector.clone())
@@ -745,70 +625,12 @@ impl ChartView {
             .child(
                 canvas(
                     move |area, _, _| bounds.set(area),
-                    move |area, (), window, cx| paint_plot(&plot, area, window, cx),
+                    move |area, (), window, cx| paint_plot(&painted, area, window, cx),
                 )
                 .absolute()
                 .size_full(),
             )
-            .children(
-                y_labels(&scale, CHART_H)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(n, (y, text))| {
-                        let label = div()
-                            .absolute()
-                            .top(px((y - 6.).max(0.)))
-                            .left_0()
-                            .text_size(px(10.))
-                            .text_color(content(0.4))
-                            .font_features(tabular())
-                            .child(text);
-                        if n == 0 {
-                            label.debug_selector(move || format!("{prefix}-ymax"))
-                        } else {
-                            label.debug_selector(move || format!("{prefix}-ytick-{n}"))
-                        }
-                    }),
-            )
             .into_any_element()
-    }
-
-    fn axis(&self) -> Div {
-        let prefix = self.prefix;
-        let count = self.data.buckets.len();
-        let last = count.saturating_sub(1);
-        let kind = self.kind;
-        div()
-            .relative()
-            .mt(px(4.))
-            .h(px(16.))
-            .text_size(px(10.))
-            .text_color(content(0.45))
-            .children(
-                axis_labels(&self.data.buckets)
-                    .into_iter()
-                    .map(|(i, text)| {
-                        // The first label starts at the left edge, the last ends at the
-                        // right one, the others are centred on their slot.
-                        let slot = div()
-                            .debug_selector(move || format!("{prefix}-axis-{i}"))
-                            .absolute()
-                            .top_0()
-                            .whitespace_nowrap()
-                            .child(text.to_string());
-                        if i == 0 {
-                            slot.left_0()
-                        } else if i == last {
-                            slot.right_0()
-                        } else {
-                            let centre = x_frac(kind, i, count);
-                            slot.left(relative(centre - 0.5 / count as f32))
-                                .w(relative(1. / count as f32))
-                                .flex()
-                                .justify_center()
-                        }
-                    }),
-            )
     }
 
     fn legend(&self, dim: &[bool], cx: &mut Context<Self>) -> Div {
@@ -845,7 +667,7 @@ impl ChartView {
         let editable = series.id != OTHERS_ID && self.colorable;
         let open = self.palette.as_deref() == Some(series.id.as_str());
         let (on_click, on_right) = (id.clone(), id.clone());
-        div()
+        legend_style()
             .id(SharedString::from(selector.clone()))
             .debug_selector({
                 let selector = selector.clone();
@@ -861,14 +683,11 @@ impl ChartView {
             })
             .relative()
             .max_w(px(200.))
-            .flex()
-            .items_center()
-            .gap(px(6.))
             .rounded(px(6.))
             .px(px(6.))
             .py(px(2.))
             .cursor_pointer()
-            .text_color(content(if dimmed { 0.3 } else { 0.7 }))
+            .text_color(content(if dimmed { 0.3 } else { 0.6 }))
             .hover(|s| s.bg(content(0.06)))
             .when(focused, |d| d.bg(content(0.08)))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_focus(&on_click, cx)))
@@ -881,13 +700,7 @@ impl ChartView {
                     }),
                 )
             })
-            .child(
-                div()
-                    .size(px(8.))
-                    .flex_shrink_0()
-                    .rounded(px(2.))
-                    .bg(faded(color_of(series), dimmed)),
-            )
+            .child(swatch(color_of(series)).opacity(if dimmed { DIM } else { 1. }))
             .child(div().min_w_0().truncate().child(series.name.clone()))
             .when(editable, |d| {
                 let open_id = id.clone();
@@ -999,7 +812,6 @@ impl Render for ChartView {
             .py(px(8.))
             .when(self.tabs, |d| d.child(self.tabs(cx)))
             .child(self.plot(&dim, cx))
-            .child(self.axis())
             .child(self.legend(&dim, cx))
     }
 }
