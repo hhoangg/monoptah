@@ -219,7 +219,9 @@ fn point_origin_head(root: &Path, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::super::db::ContributorsDb;
-    use super::super::jobs::{self, estimate_response, load_response, prepare_job, run_job};
+    #[cfg(unix)]
+    use super::super::jobs::estimate_response;
+    use super::super::jobs::{self, load_response, prepare_job, run_job};
     use super::super::sync::{Reporter, SyncStep};
     use super::super::tests::{TestRepo, ALICE, BOB};
     use super::*;

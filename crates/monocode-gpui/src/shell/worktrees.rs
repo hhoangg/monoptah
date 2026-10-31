@@ -5,6 +5,22 @@ use crate::worktree_switcher::{Event, TabSession, WorktreeFocus, WorktreeSwitche
 use monocode_core::files::path_key;
 
 impl Shell {
+    /// A saved focus keeps its own copy of the branch, so a generated name has
+    /// to reach it or the old branch would be shown and used as a base.
+    pub(super) fn worktree_renamed(&mut self, path: &str, branch: &str, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for focus in self.worktree_focus.values_mut() {
+            if path_key(&focus.path) == path_key(path) {
+                focus.branch = Some(branch.into());
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist(cx);
+            cx.notify();
+        }
+    }
+
     pub(super) fn working_copy(&self) -> &str {
         self.worktree_focus
             .get(&self.workspace.project)
@@ -365,6 +381,51 @@ mod tests {
                         .as_deref()
                         .unwrap_or(&session.summary.cwd),
                     project
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_generated_branch_name_reaches_the_saved_focus_of_its_worktree(cx: &mut TestAppContext) {
+        let (window, session, _) = window(cx);
+        let project = "/work/monocode";
+        let path = "/work/monocode-worktrees/mc-native-1-2";
+        let other = "/work/monocode-worktrees/other";
+        window
+            .update(cx, |shell, _, cx| {
+                for (key, path) in [(project, path), ("/work/other", other)] {
+                    shell.worktree_focus.insert(
+                        key.into(),
+                        WorktreeFocus {
+                            path: path.into(),
+                            branch: Some("mc/native-1-2".into()),
+                        },
+                    );
+                }
+                shell.sessions[&session].update(cx, |_, cx| {
+                    cx.emit(crate::conversation::WorktreeRenamed {
+                        path: path.into(),
+                        branch: "mc/faster-worktrees".into(),
+                    })
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(
+                    shell.worktree_focus[project].branch.as_deref(),
+                    Some("mc/faster-worktrees")
+                );
+                assert_eq!(
+                    shell.worktree_focus["/work/other"].branch.as_deref(),
+                    Some("mc/native-1-2")
+                );
+                assert_eq!(
+                    shell.workspace.worktree_focus[project].branch.as_deref(),
+                    Some("mc/faster-worktrees"),
+                    "the new name is saved with the workspace"
                 );
             })
             .unwrap();

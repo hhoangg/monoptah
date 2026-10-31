@@ -1,8 +1,9 @@
 use super::*;
 use crate::popover::{Align, Anchor, popover};
 use gpui::{
-    AnyElement, ClipboardItem, CursorStyle, Div, FontWeight, Hsla, MouseButton, Pixels, Role,
-    SharedString, Stateful, Window, canvas, div, list, prelude::*, px, rgb,
+    Animation, AnimationExt, AnyElement, ClipboardItem, CursorStyle, Div, FontWeight, Hsla,
+    MouseButton, Pixels, Role, SharedString, Stateful, Window, canvas, div, list, prelude::*, px,
+    rgb,
 };
 
 fn action(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Stateful<Div> {
@@ -30,6 +31,15 @@ fn action_frame(id: impl Into<SharedString>, label: impl Into<SharedString>) -> 
         .text_color(content(0.7))
         .cursor_pointer()
 }
+/// The green of the tick that confirms a copy.
+const COPIED: Hsla = Hsla {
+    h: 0.396,
+    s: 0.72,
+    l: 0.56,
+    a: 1.,
+};
+const COPIED_POP: Duration = Duration::from_millis(260);
+
 fn icon_action(id: impl Into<SharedString>, label: &str, name: &'static str) -> Stateful<Div> {
     icon_action_ink(id, label, name, content(0.7))
 }
@@ -37,6 +47,14 @@ fn icon_action_ink(
     id: impl Into<SharedString>,
     label: &str,
     name: &'static str,
+    ink: Hsla,
+) -> Stateful<Div> {
+    icon_action_with(id, label, action_icon(name, ink), ink)
+}
+fn icon_action_with(
+    id: impl Into<SharedString>,
+    label: &str,
+    glyph: impl IntoElement,
     ink: Hsla,
 ) -> Stateful<Div> {
     let id: SharedString = id.into();
@@ -61,7 +79,7 @@ fn icon_action_ink(
                 s.bg(content(0.07)).text_color(content(1.))
             }
         })
-        .child(action_icon(name, ink))
+        .child(glyph)
         .child(label.to_owned())
 }
 fn action_icon(name: &'static str, ink: Hsla) -> gpui::Svg {
@@ -1009,7 +1027,7 @@ impl Inbox {
                             .items_center()
                             .gap(px(8.))
                             .child(
-                                action("inbox-send-agent", "Send to agent")
+                                action("inbox-send-agent", "Open in new session")
                                     .px(px(12.))
                                     .bg(content(1.))
                                     .text_color(shell_fill())
@@ -1046,6 +1064,7 @@ impl Inbox {
                             .when(is_pr && item.provider == "github", |d| {
                                 d.child(self.pr_actions(&item, cx))
                             })
+                            .child(self.copy_link_button(&item, cx))
                             .child(
                                 icon_action(
                                     "inbox-open-external",
@@ -1150,6 +1169,33 @@ impl Inbox {
             .into_any_element()
     }
 
+    /// Copy link, which turns into a green tick reading "Copied link" for a
+    /// moment once the address is on the clipboard.
+    fn copy_link_button(&self, item: &Item, cx: &mut Context<Self>) -> AnyElement {
+        let copied = self
+            .copied_link
+            .as_ref()
+            .filter(|(url, _)| *url == item.url)
+            .map(|(_, press)| *press);
+        let url = item.url.clone();
+        let on_click = cx.listener(move |this, _, _, cx| this.copy_link(url.clone(), cx));
+        let button = match copied {
+            Some(press) => icon_action_with(
+                "inbox-copy-link",
+                "Copied link",
+                action_icon("check", COPIED).with_animation(
+                    ("inbox-copied-tick", press),
+                    Animation::new(COPIED_POP).with_easing(|t| 1. - (1. - t).powi(3)),
+                    |svg, t| svg.size(px(14. * (0.5 + 0.5 * t))).opacity(t),
+                ),
+                COPIED,
+            )
+            .text_color(content(1.)),
+            None => icon_action("inbox-copy-link", "Copy link", "response-copy")
+                .when(item.url.is_empty(), |d| d.opacity(0.4)),
+        };
+        button.on_click(on_click).into_any_element()
+    }
     fn pr_actions(&self, item: &Item, cx: &mut Context<Self>) -> AnyElement {
         let open = item.state.eq_ignore_ascii_case("open");
         let selected = self.merge_action.clone();
@@ -2199,6 +2245,8 @@ impl Inbox {
         self.save();
         if let Some(item) = self.visible_items(cx).first() {
             self.select(item.key(), cx);
+        } else {
+            self.selected = None;
         }
         if refetch {
             self.refresh(cx);
@@ -3231,6 +3279,49 @@ mod tests {
                     assert_eq!(first.id, id);
                     assert_eq!(inbox.summary_scroll.logical_scroll_top().item_ix, 0);
                 })
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn linear_team_filters_hide_cached_issues_before_refresh(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, cx| {
+                    inbox.state.source = "linear".into();
+                    inbox.state.filters = model::Filters::default();
+                    inbox.snapshot.items = ["web", "mobile"]
+                        .into_iter()
+                        .map(|team| Item {
+                            provider: "linear".into(),
+                            identifier: format!("{team}-1"),
+                            team_id: team.into(),
+                            ..Default::default()
+                        })
+                        .collect();
+                    let visible_teams = |inbox: &Inbox, cx: &App| {
+                        inbox
+                            .visible_items(cx)
+                            .into_iter()
+                            .map(|item| item.team_id)
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(visible_teams(inbox, cx), ["web", "mobile"]);
+                    toggle(&mut inbox.state.hidden_linear_teams, "web".into());
+                    assert_eq!(visible_teams(inbox, cx), ["mobile"]);
+                    let mobile = inbox.visible_items(cx).remove(0);
+                    inbox.selected = Some(mobile.key());
+                    inbox.filters_changed(false, cx);
+                    assert_eq!(inbox.item().map(|item| item.team_id), Some("mobile".into()));
+                    toggle(&mut inbox.state.hidden_linear_teams, "mobile".into());
+                    assert!(inbox.visible_items(cx).is_empty());
+                    inbox.filters_changed(false, cx);
+                    assert!(inbox.item().is_none());
+                    toggle(&mut inbox.state.hidden_linear_teams, "web".into());
+                    assert_eq!(visible_teams(inbox, cx), ["web"]);
+                    inbox.state.hidden_linear_teams.clear();
+                    assert_eq!(visible_teams(inbox, cx), ["web", "mobile"]);
+                });
             })
             .unwrap();
     }

@@ -47,6 +47,7 @@ mod settings;
 mod shortcuts;
 mod sidebar_list;
 mod sidebar_peek;
+mod space_reorder;
 mod started_rail;
 #[cfg(test)]
 pub(crate) mod surface_tests;
@@ -124,6 +125,8 @@ actions!(
         NextSessionInTab,
         PreviousProject,
         NextProject,
+        MoveProjectBack,
+        MoveProjectForward,
         SwitchModel,
         ToggleRightPanel,
         SplitRight,
@@ -250,6 +253,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-down"), NextSessionInTab, context),
         KeyBinding::new(&format!("{modifier}-shift-left"), PreviousProject, context),
         KeyBinding::new(&format!("{modifier}-shift-right"), NextProject, context),
+        KeyBinding::new(&format!("{modifier}-alt-shift-left"), MoveProjectBack, context),
+        KeyBinding::new(&format!("{modifier}-alt-shift-right"), MoveProjectForward, context),
         KeyBinding::new(&format!("{modifier}-."), SwitchModel, context),
         KeyBinding::new(&format!("{modifier}-shift-b"), ToggleRightPanel, context),
         KeyBinding::new(&format!("{modifier}-d"), SplitRight, context),
@@ -621,6 +626,7 @@ pub(crate) struct Shell {
     projects_frame: Entity<Chrome>,
     project_rail_list: project_rail::ProjectRailList,
     project_rail_drag: Option<project_rail::ProjectRailDrag>,
+    space_reorder: space_reorder::SpaceReorder,
     project_rail_stats: project_rail::ProjectRailStats,
     project_resize: Option<(Pixels, f32)>,
     classic_sidebar_tab: classic_sidebar::ClassicSidebarTab,
@@ -1027,6 +1033,7 @@ impl Shell {
             projects_frame,
             project_rail_list: project_rail::ProjectRailList::new(cx),
             project_rail_drag: None,
+            space_reorder: Default::default(),
             project_rail_stats: Default::default(),
             project_resize: None,
             classic_sidebar_tab,
@@ -1276,8 +1283,14 @@ impl Shell {
         ));
         let mut mono_chrome = monos.read(cx).overview_chrome();
         let mut mono_error = monos.read(cx).error.clone();
+        let mut mono_session = monos.read(cx).routed_session();
         this.observations
             .push(cx.observe(&monos, move |this, monos, cx| {
+                let session = monos.read(cx).routed_session();
+                if session != mono_session {
+                    mono_session = session;
+                    this.update_chat_visibility(cx);
+                }
                 let chrome = monos.read(cx).overview_chrome();
                 if chrome != mono_chrome {
                     mono_chrome = chrome;
@@ -1342,7 +1355,7 @@ impl Shell {
             inbox.update(cx, |inbox, cx| inbox.set_active(active, cx));
         }
         // Every pane of the active tab is on screen, not just the focused one.
-        let shown: HashSet<i64> = match self.workspace.active_tab() {
+        let mut shown: HashSet<i64> = match self.workspace.active_tab() {
             Some(tab)
                 if !self.app_view_open()
                     && self.settings.is_none()
@@ -1353,6 +1366,20 @@ impl Shell {
             }
             _ => HashSet::new(),
         };
+        // A session opened in the Mono details panel is on screen too. Left
+        // out, it was trimmed as inactive and the panel showed it empty.
+        if self.mono_active(cx)
+            && self.workspace.right_panel_open
+            && !self.app_view_open()
+            && self.settings.is_none()
+            && self.app_search.is_none()
+        {
+            shown.extend(
+                self.monos
+                    .as_ref()
+                    .and_then(|m| m.read(cx).routed_session()),
+            );
+        }
         // Hidden tabs keep their prepared image and any in-flight load. Only
         // closing a tab/pane should discard its background.
         let open: HashSet<i64> = self.workspace.open_sessions().into_iter().collect();
@@ -1433,6 +1460,12 @@ impl Shell {
                 this.invalidate_chrome(cx);
                 cx.notify();
             }));
+        self.observations.push(cx.subscribe(
+            &view,
+            |this, _, renamed: &crate::conversation::WorktreeRenamed, cx| {
+                this.worktree_renamed(&renamed.path, &renamed.branch, cx);
+            },
+        ));
         self.observations
             .push(cx.subscribe(&view, |this, _, transfer: &Transfer, cx| {
                 this.transfer_response(transfer.clone(), cx)
@@ -5757,6 +5790,37 @@ impl Shell {
                         .into(),
                     ]);
                 }
+                let peers = self.workspace.project_peers(path);
+                if peers.len() > 1 {
+                    let ix = peers.iter().position(|p| p == path).unwrap_or(0);
+                    let (first, last) = (ix == 0, ix + 1 == peers.len());
+                    let (back, forward) = if self.workspace.classic_layout {
+                        ("Move up", "Move down")
+                    } else {
+                        ("Move left", "Move right")
+                    };
+                    let shortcut = |command| {
+                        crate::settings::command_shortcut(&self.workspace.preferences, command)
+                    };
+                    let step = |id, label, command, disabled| {
+                        let action = MenuAction::new(id, label).disabled(disabled);
+                        match shortcut(command) {
+                            Some(keys) => action.shortcut(keys),
+                            None => action,
+                        }
+                    };
+                    items.push(
+                        MenuAction::new("move", "Move")
+                            .icon("chevrons-up-down")
+                            .submenu(vec![
+                                step("move:back", back, "Project: Move Back", first),
+                                step("move:forward", forward, "Project: Move Forward", last),
+                                MenuAction::new("move:start", "Move to start").disabled(first),
+                                MenuAction::new("move:end", "Move to end").disabled(last),
+                            ])
+                            .into(),
+                    );
+                }
                 items.extend([
                     MenuAction::new("reveal", REVEAL_LABEL)
                         .icon("folder-open")
@@ -5868,6 +5932,16 @@ impl Shell {
                     );
                 } else if let Some(group) = action.strip_prefix("project-group:") {
                     self.assign_project_rail_group(&path, group, cx);
+                } else if let Some(direction) = action.strip_prefix("move:") {
+                    let moved = match direction {
+                        "back" => self.workspace.step_project_order(&path, -1),
+                        "forward" => self.workspace.step_project_order(&path, 1),
+                        "start" => self.workspace.move_project_to_end(&path, -1),
+                        _ => self.workspace.move_project_to_end(&path, 1),
+                    };
+                    if moved {
+                        self.project_order_changed(&path, cx);
+                    }
                 } else if action == "reveal" {
                     if path.starts_with("remote://") {
                         self.error = Some("Remote folders stay on their host machine.".into());
@@ -6666,12 +6740,36 @@ impl Shell {
         }
         self.open(next, window, cx);
     }
+    /// `Project: Move Back/Forward` moves the current project one place.
+    fn move_current_project(&mut self, step: isize, cx: &mut Context<Self>) {
+        if self.menu.is_some() {
+            return;
+        }
+        let path = self.workspace.project.clone();
+        if self.workspace.step_project_order(&path, step) {
+            self.project_order_changed(&path, cx);
+        }
+    }
+    /// Saves a new project order and keeps the moved project in view.
+    fn project_order_changed(&mut self, path: &str, cx: &mut Context<Self>) {
+        if let Some(ix) = self.workspace.projects.iter().position(|p| p == path) {
+            if ix < self.spaces_start {
+                self.spaces_start = ix;
+            } else if ix >= self.spaces_start + 5 {
+                self.spaces_start = ix - 4;
+            }
+        }
+        self.persist(cx);
+        self.invalidate_chrome(cx);
+        self.projects_frame.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
     /// `Project: Previous/Next` along the project rail.
     fn step_project(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() {
             return;
         }
-        let projects = self.workspace.projects.clone();
+        let projects = self.workspace.visible_project_order();
         if let Some(next) = adjacent(&projects, Some(&self.workspace.project), step)
             && next != self.workspace.project
         {
@@ -6925,13 +7023,12 @@ impl Shell {
         self.spaces_start = self.spaces_start.min(last);
         let first = self.spaces_start;
         let projects: Vec<_> = self
-            .workspace
-            .projects
-            .iter()
+            .space_reorder
+            .order(&self.workspace.projects)
+            .into_iter()
             .enumerate()
             .skip(first)
             .take(shown)
-            .map(|(ix, p)| (ix, p.clone()))
             .collect();
         if self
             .hovered_space
@@ -7021,9 +7118,12 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .child(self.space_reorder.strip.probe())
                     .children(projects.into_iter().map(|(ix, path)| {
                         let active = path == self.workspace.project;
                         let hovered = self.hovered_space.as_ref() == Some(&path);
+                        let dragging = self.space_reorder.dragging(&path);
+                        let offset = self.space_reorder.offset(&path, ix, first);
                         div()
                             .id(("project-space", ix))
                             .debug_selector(move || format!("project-space-{ix}"))
@@ -7040,8 +7140,11 @@ impl Shell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .opacity(if active { 1. } else { 0.45 })
-                            .when(active, |d| d.bg(content(0.1)))
+                            .relative()
+                            .left(px(offset))
+                            .opacity(if active || dragging { 1. } else { 0.45 })
+                            .when(active || dragging, |d| d.bg(content(0.1)))
+                            .when(dragging, |d| d.cursor(CursorStyle::ClosedHand))
                             .hover(|s| s.opacity(1.).bg(content(if active { 0.1 } else { 0.05 })))
                             .child(self.project_mark(&path, 12.))
                             .when(hovered, |d| d.child(self.space_anchor.probe()))
@@ -7058,18 +7161,28 @@ impl Shell {
                                     this.invalidate_chrome(cx);
                                 })
                             })
+                            .on_mouse_down(MouseButton::Left, {
+                                let path = path.clone();
+                                cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                                    this.start_space_drag(&path, event);
+                                })
+                            })
                             .on_mouse_down(MouseButton::Right, {
                                 let path = path.clone();
                                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                     let anchor = Anchor::Point(event.position);
+                                    // Spaces have no pins or groups to offer.
                                     let target = MenuTarget::Project {
                                         path: path.clone(),
-                                        rail: true,
+                                        rail: false,
                                     };
                                     this.open_menu(target, anchor, window, cx);
                                 })
                             })
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.space_reorder.take_click() {
+                                    return;
+                                }
                                 // The tip steps aside once a space is clicked.
                                 this.hovered_space = None;
                                 this.select_project(path.clone(), window, cx)
@@ -8717,13 +8830,19 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &NextProject, window, cx| this.step_project(1, window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &MoveProjectBack, _, cx| this.move_current_project(-1, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &MoveProjectForward, _, cx| this.move_current_project(1, cx)),
+            )
             .on_action(cx.listener(|this, _: &SwitchModel, window, cx| {
                 if let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id)) {
                     view.update(cx, |v, cx| v.toggle_recent_models(window, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &DismissMenu, window, cx| {
-                if this.cancel_project_rail_drag(cx) {
+                if this.cancel_project_rail_drag(cx) || this.cancel_space_drag(cx) {
                     return;
                 }
                 if this.cancel_classic_sidebar_tab(cx) {
@@ -8892,7 +9011,7 @@ impl Render for Shell {
             }))
             .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
             .on_action(|_: &FocusPrevious, window, cx| window.focus_prev(cx))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if let Some(monos) = &this.monos {
                     monos.update(cx, |m, cx| m.move_rail_drag(event, cx));
                 }
@@ -8901,6 +9020,7 @@ impl Render for Shell {
                 this.move_pane_drag(event, cx);
                 this.move_folder_drag(event, cx);
                 this.move_project_rail_drag(event, cx);
+                this.move_space_drag(event, window, cx);
                 this.move_classic_sidebar_tab(event, cx);
                 this.drag_sash(event, cx);
                 this.drag_dock(event, cx);
@@ -8933,6 +9053,7 @@ impl Render for Shell {
                     this.finish_pane_drag(window, cx);
                     this.finish_folder_drag(cx);
                     this.finish_project_rail_drag(cx);
+                    this.finish_space_drag(cx);
                     this.end_classic_sidebar_tab(cx);
                     if let Some(m) = this.monos.clone() {
                         m.update(cx, |m, cx| m.finish_reorder(cx));
@@ -11999,18 +12120,26 @@ mod tests {
         })
         .unwrap();
         let mut frames = Vec::new();
+        let mut settling_passes = 0;
         for opening in [true, false] {
             window
-                .update(cx, |shell, w, cx| shell.toggle_right_panel(w, cx))
+                .update(cx, |shell, w, cx| {
+                    shell.toggle_right_panel(w, cx);
+                    if let Some(slide) = &shell.right_slide {
+                        slide.freeze_elapsed(Duration::ZERO);
+                    }
+                })
                 .unwrap();
             for frame in 1..=40 {
                 let root = window.root(cx).unwrap();
-                let before = root.read_with(cx, |shell, _| shell.render_passes);
+                let (before, sliding) = root.read_with(cx, |shell, _| {
+                    (shell.render_passes, shell.right_slide.is_some())
+                });
                 let start = Instant::now();
                 window
                     .update(cx, |shell, _, cx| {
                         if let Some(slide) = &shell.right_slide {
-                            slide.elapsed(Duration::from_secs_f32(frame as f32 / 120.));
+                            slide.freeze_elapsed(Duration::from_secs_f32(frame as f32 / 120.));
                         }
                         cx.notify();
                     })
@@ -12022,11 +12151,18 @@ mod tests {
                     })
                     .unwrap();
                 }
-                assert_eq!(
-                    root.read_with(cx, |shell, _| shell.render_passes),
-                    before + 1,
-                    "measure one rendered frame per sample"
+                let (after, settled) = root.read_with(cx, |shell, _| {
+                    (shell.render_passes, shell.right_slide.is_none())
+                });
+                let passes = after - before;
+                // Finishing the slide installs the settled panel layout and
+                // can notify the shell once more. Include that work in this
+                // sample; every other frame must still render exactly once.
+                assert!(
+                    passes == 1 || (passes == 2 && sliding && settled),
+                    "expected one render, or two at settling; got {passes}"
                 );
+                settling_passes += passes - 1;
                 frames.push(start.elapsed().as_secs_f64() * 1000.);
                 let rendered = transcript.read_with(cx, |view, _| view.rendered);
                 assert!(
@@ -12042,7 +12178,7 @@ mod tests {
         }
         frames.sort_by(f64::total_cmp);
         eprintln!(
-            "CoreText, 10,000 messages, {} simulated 120Hz frames: CPU p50={:.2}ms p95={:.2}ms max={:.2}ms (excludes presentation/GPU)",
+            "CoreText, 10,000 messages, {} simulated 120Hz frames: CPU p50={:.2}ms p95={:.2}ms max={:.2}ms ({settling_passes} extra settling passes included; excludes presentation/GPU)",
             frames.len(),
             frames[frames.len() / 2],
             frames[frames.len() * 95 / 100],
