@@ -383,6 +383,9 @@ fn mcp_discover_error_marks_every_mcp_requirement() {
 
 #[test]
 fn mcp_looks_in_project_inputs_and_home_only() {
+    // An absolute path on every platform: `/work/a` is not one on Windows.
+    let absolute = |name: &str| std::env::temp_dir().join(name).display().to_string();
+    let (stored, overridden, other) = (absolute("a"), absolute("b"), absolute("not-a-project"));
     let probe = Fake::default();
     let mut w = workflow(vec![req(RequirementKind::Mcp, "docs")], false, true);
     w.inputs.insert("p", WorkflowInput::new(InputType::Project));
@@ -390,20 +393,20 @@ fn mcp_looks_in_project_inputs_and_home_only() {
     w.inputs
         .insert("note", WorkflowInput::new(InputType::String));
     w.input_values
-        .insert("p", InputValue::String("/work/a".into()));
+        .insert("p", InputValue::String(stored.clone()));
     w.input_values
         .insert("q", InputValue::String("relative/dir".into()));
     w.input_values
-        .insert("note", InputValue::String("/not/a/project".into()));
+        .insert("note", InputValue::String(other.clone()));
     let mut run = super::ordered::OrderedMap::new();
-    run.insert("p", InputValue::String("/work/b".into()));
+    run.insert("p", InputValue::String(overridden.clone()));
     w.run_values = Some(run);
     evaluate(&w, &probe);
     let cwds = probe.server_cwds.lock().unwrap().clone();
-    assert_eq!(cwds.first().map(String::as_str), Some("/work/b"));
+    assert_eq!(cwds.first(), Some(&overridden));
     assert!(!cwds
         .iter()
-        .any(|c| c == "relative/dir" || c == "/not/a/project" || c == "/work/a"));
+        .any(|c| c == "relative/dir" || *c == other || *c == stored));
 }
 
 #[test]
