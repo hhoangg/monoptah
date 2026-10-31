@@ -1148,7 +1148,10 @@ impl Conversation {
             ..Default::default()
         });
         if !self.is_remote() && settings.prepared_prompt.is_none() {
-            let prepared = self.completion.read(cx).prepare_prompt(&prompt);
+            let prepared = self
+                .completion
+                .read(cx)
+                .prepare_prompt_for(&prompt, !settings.internal_message);
             if prepared != prompt {
                 settings.prepared_prompt = Some(prepared);
             }

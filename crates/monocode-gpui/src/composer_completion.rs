@@ -13,9 +13,17 @@ use gpui::{
 use monocode_core::{
     composer::{self, Token, Trigger},
     files::ProjectFile,
+    mono::workflows::{
+        mention::{self, MentionFacts, RequiresView, WorkflowSlug},
+        model::{Workflow, WorkflowId},
+        preflight::{Preflight, native_preflight},
+        store::{MonoDir, last_run_of, load_workflows},
+    },
     skills::DiscoveredSkill,
 };
 use std::{
+    collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,6 +32,25 @@ use std::{
 };
 
 actions!(completion, [Accept, Dismiss]);
+/// How long a preflight result stays good for the next mention.
+const PREFLIGHT_FRESH: Duration = Duration::from_secs(60);
+/// Past this a cached result is too old to report; the send says "not checked" instead.
+const PREFLIGHT_USABLE: Duration = Duration::from_secs(10 * 60);
+
+/// What a preflight depends on: the whole definition (env status depends on the node kinds) and
+/// the project inputs it resolves folders from.
+fn requires_key(w: &Workflow) -> String {
+    use monocode_core::mono::workflows::model::{InputType, InputValue, definition_fingerprint};
+    let mut key = definition_fingerprint(w);
+    for (name, input) in w.inputs.iter() {
+        if input.ty == InputType::Project
+            && let Some(InputValue::String(value)) = w.input_values.get(name)
+        {
+            key.push_str(&format!("\u{2}{name}\u{1}{value}"));
+        }
+    }
+    key
+}
 pub(crate) fn bind(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("tab", Accept, Some("Completion")),
@@ -56,6 +83,8 @@ impl Choice {
                 return (
                     if self.insertion.starts_with("@note/") {
                         "note"
+                    } else if self.insertion.starts_with("@workflow/") {
+                        "git-branch"
                     } else {
                         "sparkles"
                     },
@@ -75,6 +104,17 @@ pub(crate) struct Completion {
     input: Entity<input::Input>,
     store: Option<crate::runtime::Database>,
     notes: Vec<monocode_core::notes::Note>,
+    /// The Mono this composer belongs to (root, id). `None` for every other composer, which then
+    /// offers and expands no `@workflow/` mention.
+    mono: Option<(PathBuf, String)>,
+    workflows: Vec<Workflow>,
+    workflow_slugs: Vec<WorkflowSlug>,
+    workflows_loaded: Option<Instant>,
+    workflows_loading: bool,
+    /// Preflight results by workflow, filled in the background. Sending only reads this.
+    preflights: HashMap<WorkflowId, (Instant, Preflight, String)>,
+    preflight_running: std::collections::HashSet<WorkflowId>,
+    preflight: fn(&Workflow) -> Preflight,
     cwd: String,
     token: Option<Token>,
     dismissed: Option<Token>,
@@ -142,6 +182,14 @@ impl Completion {
             input,
             store: None,
             notes: Vec::new(),
+            mono: None,
+            workflows: Vec::new(),
+            workflow_slugs: Vec::new(),
+            workflows_loaded: None,
+            workflows_loading: false,
+            preflights: HashMap::new(),
+            preflight_running: Default::default(),
+            preflight: native_preflight,
             cwd,
             token: None,
             dismissed: None,
@@ -188,6 +236,28 @@ impl Completion {
     pub(crate) fn with_store(mut self, store: crate::runtime::Database) -> Self {
         self.store = Some(store);
         self
+    }
+    /// Makes this the composer of one Mono, so `@workflow/<slug>` offers and attaches that Mono's
+    /// workflows. Called for Mono conversations only.
+    pub(crate) fn set_mono(&mut self, root: PathBuf, mono: String, cx: &mut Context<Self>) {
+        if self.mono.as_ref() == Some(&(root.clone(), mono.clone())) {
+            return;
+        }
+        self.mono = Some((root, mono));
+        // An in-flight load belongs to the previous Mono and must not fill this one's list.
+        self.generation += 1;
+        self.loading = false;
+        self.workflows_loading = false;
+        self.native_loading = false;
+        self.native_revision = self.native_revision.wrapping_add(1);
+        self.preflight_running.clear();
+        self.workflows.clear();
+        self.workflow_slugs.clear();
+        self.workflows_loaded = None;
+        self.preflights.clear();
+        self.known.retain(|token| !token.starts_with("@workflow/"));
+        self.loaded = None;
+        self.sync(cx);
     }
     /// Growing document fields anchor suggestions beside the visible caret.
     pub(crate) fn inline_field(mut self) -> Self {
@@ -236,6 +306,11 @@ impl Completion {
         ]
         .map(str::to_owned)
         .into_iter()
+        .chain(
+            self.workflow_slugs
+                .iter()
+                .map(|w| format!("@workflow/{}", w.slug)),
+        )
         .collect();
         self.loaded = None;
         self.loading = false;
@@ -308,9 +383,15 @@ impl Completion {
         cx.notify();
     }
     pub(crate) fn prepare_prompt(&self, text: &str) -> String {
+        self.prepare_prompt_for(text, true)
+    }
+    /// `typed` is false for a message the app wrote (an Ask Mono prompt, a completion message):
+    /// those never attach workflow context, whatever their text mentions.
+    pub(crate) fn prepare_prompt_for(&self, text: &str, typed_by_user: bool) -> String {
         if self.cwd.starts_with("remote://") {
             return text.to_owned();
         }
+        let typed = text;
         let text = self.expand_mentions(text);
         let text = monocode_core::provider::native_prompt(self.provider, &text);
         let text = self
@@ -348,7 +429,7 @@ impl Completion {
                 )
             })
             .collect::<Vec<_>>();
-        if servers.is_empty() {
+        let text = if servers.is_empty() {
             text
         } else {
             format!(
@@ -356,6 +437,12 @@ impl Completion {
                 if servers.len() == 1 { "" } else { "s" },
                 servers.join(", ")
             )
+        };
+        // Last, so a workflow's own text is never scanned for MCP tokens.
+        if typed_by_user {
+            self.attach_workflows(text, typed)
+        } else {
+            text
         }
     }
     /// The bare file name when no other project file shares it.
@@ -406,6 +493,7 @@ impl Completion {
             self.token = None;
         }
         self.highlight(cx);
+        self.check_requirements(cx);
         let token = self.input.read(cx).completion_token();
         if token.is_some() && token == self.dismissed {
             return;
@@ -432,6 +520,17 @@ impl Completion {
                 .is_none_or(|at| at.elapsed() > Duration::from_secs(30))
         {
             self.load(cx);
+        } else if self.mono.is_some()
+            && !self.loading
+            && self.token.as_ref().is_some_and(|token| {
+                token.trigger == Trigger::Mention && token.query.starts_with("workflow")
+            })
+            && self
+                .workflows_loaded
+                .is_none_or(|at| at.elapsed() > Duration::from_secs(2))
+        {
+            // A workflow made a moment ago should show without waiting for the full reload.
+            self.reload_workflows(cx);
         }
         self.rank();
         cx.notify();
@@ -502,7 +601,11 @@ impl Completion {
         let generation = self.generation;
         let disabled = self.disabled_paths.clone();
         let store = self.store.clone();
+        let mono = self.mono.clone();
         let work = cx.background_executor().spawn(async move {
+            let workflows = mono
+                .and_then(|(root, id)| load_workflows(&MonoDir::new(root, id)).ok())
+                .map(|loaded| loaded.workflows);
             let notes = store
                 .and_then(|s| {
                     crate::runtime::locked(&s)
@@ -515,10 +618,10 @@ impl Completion {
             let files =
                 monocode_core::files::list_project_files_sync_cancellable(&cwd, Some(&cancel));
             let mcp = monocode_core::mcp::mcp_discover(cwd).unwrap_or_default();
-            (skills, files, notes, mcp)
+            (skills, files, notes, mcp, workflows)
         });
         cx.spawn(async move |this, cx| {
-            let (skills, files, notes, mcp) = work.await;
+            let (skills, files, notes, mcp, workflows) = work.await;
             let _ = this.update(cx, |this, cx| {
                 if generation != this.generation {
                     return;
@@ -528,6 +631,13 @@ impl Completion {
                 this.skills = skills;
                 this.mcp = mcp;
                 this.notes = notes;
+                if this.mono.is_some()
+                    && let Some(workflows) = workflows
+                {
+                    this.workflow_slugs = mention::workflow_slugs(&workflows);
+                    this.workflows = workflows;
+                    this.workflows_loaded = Some(Instant::now());
+                }
                 match files {
                     Ok(files) => this.files = files,
                     Err(error) => this.error = Some(error),
@@ -560,13 +670,150 @@ impl Completion {
                 )
                 .chain(this.short_mentions.keys().cloned())
                 .chain(this.notes.iter().map(|n| format!("@note/{}", n.slug)))
+                .chain(
+                    this.workflow_slugs
+                        .iter()
+                        .map(|w| format!("@workflow/{}", w.slug)),
+                )
                 .collect();
                 this.highlight(cx);
+                this.check_requirements(cx);
                 this.rank();
                 cx.notify();
             });
         })
         .detach();
+    }
+    /// Re-reads only the Mono's workflows, off the UI thread.
+    fn reload_workflows(&mut self, cx: &mut Context<Self>) {
+        let Some((root, id)) = self.mono.clone() else {
+            return;
+        };
+        if self.workflows_loading {
+            return;
+        }
+        self.workflows_loading = true;
+        let generation = self.generation;
+        let work = cx
+            .background_executor()
+            .spawn(async move { load_workflows(&MonoDir::new(root, id)).map(|l| l.workflows) });
+        cx.spawn(async move |this, cx| {
+            let loaded = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.workflows_loading = false;
+                if generation != this.generation || this.mono.is_none() {
+                    return;
+                }
+                let Ok(workflows) = loaded else {
+                    return;
+                };
+                this.workflows_loaded = Some(Instant::now());
+                this.workflow_slugs = mention::workflow_slugs(&workflows);
+                this.workflows = workflows;
+                this.known.retain(|token| !token.starts_with("@workflow/"));
+                this.known.extend(
+                    this.workflow_slugs
+                        .iter()
+                        .map(|w| format!("@workflow/{}", w.slug)),
+                );
+                this.highlight(cx);
+                this.check_requirements(cx);
+                this.rank();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    /// Checks, in the background, what each mentioned workflow requires, so a send never waits for
+    /// it. A result is kept for 60 seconds.
+    fn check_requirements(&mut self, cx: &mut Context<Self>) {
+        if self.mono.is_none() || self.workflows.is_empty() {
+            return;
+        }
+        let typed = self.input.read(cx).content.clone();
+        for slug in mention::mentioned_slugs(&typed) {
+            let mut holders = self.workflow_slugs.iter().filter(|w| w.slug == slug);
+            let (Some(found), None) = (holders.next(), holders.next()) else {
+                continue;
+            };
+            let Some(workflow) = self.workflows.iter().find(|w| w.id == found.id) else {
+                continue;
+            };
+            let key = requires_key(workflow);
+            let fresh = self
+                .preflights
+                .get(&workflow.id)
+                .is_some_and(|(at, _, cached)| at.elapsed() < PREFLIGHT_FRESH && *cached == key);
+            if workflow.requires.is_empty()
+                || fresh
+                || !self.preflight_running.insert(workflow.id.clone())
+            {
+                continue;
+            }
+            let workflow = workflow.clone();
+            let id = workflow.id.clone();
+            let check = self.preflight;
+            let generation = self.generation;
+            let work = cx
+                .background_executor()
+                .spawn(async move { check(&workflow) });
+            cx.spawn(async move |this, cx| {
+                let result = work.await;
+                let _ = this.update(cx, |this, _| {
+                    this.preflight_running.remove(&id);
+                    if generation == this.generation && this.mono.is_some() {
+                        this.preflights.insert(id, (Instant::now(), result, key));
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+    /// The context block for each workflow the user typed, read fresh from the Mono's files so a
+    /// removed workflow stops resolving. Reads files only; it never runs a preflight.
+    fn attach_workflows(&self, prompt: String, typed: &str) -> String {
+        self.attach_workflows_with(prompt, typed, Instant::now())
+    }
+    fn attach_workflows_with(&self, prompt: String, typed: &str, now: Instant) -> String {
+        let Some((root, id)) = &self.mono else {
+            return prompt;
+        };
+        if mention::mentioned_slugs(typed).is_empty() {
+            return prompt;
+        }
+        let dir = MonoDir::new(root, id);
+        let Ok(loaded) = load_workflows(&dir) else {
+            return prompt;
+        };
+        mention::attach_workflows(&prompt, typed, &loaded.workflows, |workflow| {
+            let runs = last_run_of(&dir, &workflow.id);
+            let last_run_unreadable = runs.is_err();
+            let last_run = runs.ok().flatten();
+            let requires = if workflow.requires.is_empty() {
+                RequiresView::None
+            } else {
+                // Only a result for exactly these requirements and project folders still counts.
+                match self.preflights.get(&workflow.id) {
+                    Some((at, preflight, key))
+                        if now.saturating_duration_since(*at) < PREFLIGHT_USABLE
+                            && *key == requires_key(workflow)
+                            && preflight
+                                .statuses
+                                .iter()
+                                .map(|s| &s.requirement)
+                                .eq(workflow.requires.iter()) =>
+                    {
+                        RequiresView::Checked(preflight.clone())
+                    }
+                    _ => RequiresView::NotChecked(workflow.requires.clone()),
+                }
+            };
+            MentionFacts {
+                last_run,
+                last_run_unreadable,
+                requires,
+            }
+        })
     }
     fn highlight(&self, cx: &mut Context<Self>) {
         let ranges = composer::highlight_ranges(&self.input.read(cx).content, &self.known);
@@ -623,42 +870,77 @@ impl Completion {
                     server: None,
                 })
                 .collect();
-            let query = token
-                .query
-                .strip_prefix("note/")
-                .unwrap_or(&token.query)
-                .trim_end_matches('/');
-            let mut notes: Vec<_> = self
-                .notes
-                .iter()
-                .filter_map(|note| {
-                    let title = composer::score(query, &note.title).map(|score| score + 400);
-                    let slug = composer::score(query, &note.slug);
-                    let tag = note
-                        .tags
-                        .iter()
-                        .filter_map(|tag| composer::score(query.trim_start_matches('#'), tag))
-                        .max()
-                        .map(|score| score + 200);
-                    title.or(slug).or(tag).map(|score| (score, note))
-                })
-                .collect();
-            notes.sort_by(|(a_score, a), (b_score, b)| {
-                b_score.cmp(a_score).then(b.updated_at.cmp(&a.updated_at))
-            });
-            if token.query.starts_with("note/") {
+            let only_workflow = self.mono.is_some() && token.query.starts_with("workflow/");
+            let only_note = token.query.starts_with("note/");
+            if only_workflow {
                 self.choices.clear();
             }
-            self.choices
-                .extend(notes.into_iter().take(8).map(|(_, note)| Choice {
-                    label: note.title.clone(),
-                    detail: format!("note/{}", note.slug),
-                    insertion: format!("@note/{}", note.slug),
-                    builtin: None,
-                    mode: None,
-                    file: false,
-                    server: None,
-                }));
+            if !only_workflow {
+                let query = token
+                    .query
+                    .strip_prefix("note/")
+                    .unwrap_or(&token.query)
+                    .trim_end_matches('/');
+                let mut notes: Vec<_> = self
+                    .notes
+                    .iter()
+                    .filter_map(|note| {
+                        let title = composer::score(query, &note.title).map(|score| score + 400);
+                        let slug = composer::score(query, &note.slug);
+                        let tag = note
+                            .tags
+                            .iter()
+                            .filter_map(|tag| composer::score(query.trim_start_matches('#'), tag))
+                            .max()
+                            .map(|score| score + 200);
+                        title.or(slug).or(tag).map(|score| (score, note))
+                    })
+                    .collect();
+                notes.sort_by(|(a_score, a), (b_score, b)| {
+                    b_score.cmp(a_score).then(b.updated_at.cmp(&a.updated_at))
+                });
+                if only_note {
+                    self.choices.clear();
+                }
+                self.choices
+                    .extend(notes.into_iter().take(8).map(|(_, note)| Choice {
+                        label: note.title.clone(),
+                        detail: format!("note/{}", note.slug),
+                        insertion: format!("@note/{}", note.slug),
+                        builtin: None,
+                        mode: None,
+                        file: false,
+                        server: None,
+                    }));
+            }
+            if !only_note {
+                let query = token
+                    .query
+                    .strip_prefix("workflow/")
+                    .unwrap_or(&token.query)
+                    .trim_end_matches('/');
+                let mut found: Vec<_> = self
+                    .workflow_slugs
+                    .iter()
+                    .filter_map(|w| {
+                        let name = composer::score(query, &w.name).map(|score| score + 400);
+                        name.or_else(|| composer::score(query, &w.slug))
+                            .map(|score| (score, w))
+                    })
+                    .collect();
+                // Equal scores keep the file's order, which is the order the user sees them in.
+                found.sort_by(|(a, _), (b, _)| b.cmp(a));
+                self.choices
+                    .extend(found.into_iter().take(8).map(|(_, w)| Choice {
+                        label: w.name.clone(),
+                        detail: format!("workflow/{}", w.slug),
+                        insertion: format!("@workflow/{}", w.slug),
+                        builtin: None,
+                        mode: None,
+                        file: false,
+                        server: None,
+                    }));
+            }
         } else {
             let mut choices = Vec::new();
             for (order, (id, label, detail)) in [
@@ -1465,6 +1747,289 @@ mod tests {
                     v.expand_mentions("see @README.md and @src/mod.rs\n> @README.md"),
                     "see @app/apps/README.md and @src/mod.rs\n> @README.md"
                 );
+            })
+            .unwrap();
+    }
+
+    /// Checks run per workflow id, so tests running side by side never share a count.
+    static PREFLIGHTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    fn checks(id: &str) -> usize {
+        PREFLIGHTS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| *i == id)
+            .count()
+    }
+    fn fake_preflight(w: &Workflow) -> Preflight {
+        use monocode_core::mono::workflows::preflight::RequirementStatus;
+        PREFLIGHTS.lock().unwrap().push(w.id.clone());
+        Preflight {
+            statuses: w
+                .requires
+                .iter()
+                .map(|r| RequirementStatus {
+                    requirement: r.clone(),
+                    met: false,
+                    detail: Some("Not found on PATH".into()),
+                })
+                .collect(),
+        }
+    }
+    fn mono_root(workflows: &[(&str, &str, &str)]) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("wf-mention-{}", monocode_core::mono::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for (mono, id, name) in workflows {
+            let mut w = Workflow::new(*id, *name);
+            w.requires = vec![monocode_core::mono::workflows::model::Requirement {
+                kind: monocode_core::mono::workflows::model::RequirementKind::Cli,
+                name: "gh".into(),
+                hint: None,
+            }];
+            monocode_core::mono::workflows::store::update_workflows(
+                &MonoDir::new(&root, *mono),
+                |mut list| {
+                    list.push(w.clone());
+                    Ok((list, ()))
+                },
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    #[gpui::test]
+    fn a_non_mono_composer_offers_and_attaches_nothing(cx: &mut TestAppContext) {
+        let window = window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.loaded = None;
+                view.input
+                    .update(cx, |input, cx| input.set_text("@workflow/".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.mono.is_none());
+                assert!(
+                    view.choices
+                        .iter()
+                        .all(|c| !c.insertion.starts_with("@workflow/"))
+                );
+                assert!(view.workflow_slugs.is_empty());
+                assert!(!view.known.iter().any(|k| k.starts_with("@workflow/")));
+                let text = "run @workflow/deploy please";
+                assert_eq!(view.prepare_prompt(text), text);
+                view.input
+                    .update(cx, |input, cx| input.set_text(text.into(), cx));
+                assert!(composer::highlight_ranges(text, &view.known).is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_mono_composer_lists_only_its_own_workflows_and_attaches_them(cx: &mut TestAppContext) {
+        let root = mono_root(&[
+            ("mono-a", "wf-cnt1", "Nightly Deploy"),
+            ("mono-b", "wf-bbbb", "Other Mono Flow"),
+        ]);
+        let window = window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.preflight = fake_preflight;
+                view.loaded = None;
+                view.set_mono(root.clone(), "mono-a".into(), cx);
+                view.input
+                    .update(cx, |input, cx| input.set_text("@workflow/".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                let choices: Vec<_> = view
+                    .choices
+                    .iter()
+                    .map(|c| (c.insertion.as_str(), c.detail.as_str(), c.label.as_str()))
+                    .collect();
+                assert_eq!(
+                    choices,
+                    [(
+                        "@workflow/nightly-deploy",
+                        "workflow/nightly-deploy",
+                        "Nightly Deploy"
+                    )]
+                );
+                assert_eq!(view.choices[0].icon().0, "git-branch");
+                assert!(view.known.contains("@workflow/nightly-deploy"));
+                view.input.update(cx, |input, cx| {
+                    input.set_text("run @workflow/nightly-deploy now @workflow/gone".into(), cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                let typed = view.input.read(cx).content.clone();
+                assert_eq!(composer::highlight_ranges(&typed, &view.known).len(), 1);
+                // The check ran in the background and left its answer for the send.
+                assert_eq!(checks("wf-cnt1"), 1);
+                let sent = view.prepare_prompt("run @workflow/nightly-deploy now @workflow/gone");
+                assert!(
+                    sent.starts_with("run @workflow/nightly-deploy now @workflow/gone\n\n---\n")
+                );
+                assert!(sent.contains("\"id\":\"wf-cnt1\""), "{sent}");
+                assert!(sent.contains("\"status\":\"missing\""), "{sent}");
+                assert!(!sent.contains("wf-bbbb"));
+                assert_eq!(sent.matches("Referenced workflow").count(), 1);
+                // Sending reads the cache; it never runs a check itself.
+                assert_eq!(checks("wf-cnt1"), 1);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_send_before_the_check_finished_says_not_checked(cx: &mut TestAppContext) {
+        let root = mono_root(&[("mono-a", "wf-cnt2", "Deploy")]);
+        let window = window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.preflight = fake_preflight;
+                view.mono = Some((root.clone(), "mono-a".into()));
+                let sent = view.prepare_prompt("@workflow/deploy");
+                assert!(sent.contains("\"status\":\"not checked\""), "{sent}");
+                assert_eq!(checks("wf-cnt2"), 0);
+                let _ = cx;
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_workflow_removed_since_loading_no_longer_resolves(cx: &mut TestAppContext) {
+        let root = mono_root(&[("mono-a", "wf-aaaa", "Deploy")]);
+        let window = window(cx);
+        window
+            .update(cx, |view, _, _| {
+                view.mono = Some((root.clone(), "mono-a".into()));
+                view.workflow_slugs = mention::workflow_slugs(&[Workflow::new("wf-zzzz", "Stale")]);
+                let text = "@workflow/stale";
+                assert_eq!(view.prepare_prompt(text), text);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_non_mono_composer_keeps_file_choices_for_a_workflow_folder(cx: &mut TestAppContext) {
+        let window = window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.files = vec![ProjectFile {
+                    name: "ci.yml".into(),
+                    relative: "workflow/ci.yml".into(),
+                    path: "/repo/workflow/ci.yml".into(),
+                }];
+                view.input
+                    .update(cx, |input, cx| input.set_text("@workflow/ci".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    view.choices.iter().any(|c| c.file),
+                    "file choice lost: {:?}",
+                    view.choices
+                        .iter()
+                        .map(|c| &c.insertion)
+                        .collect::<Vec<_>>()
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn app_written_messages_and_quoted_lines_attach_nothing(cx: &mut TestAppContext) {
+        let root = mono_root(&[("mono-a", "wf-aaaa", "Deploy")]);
+        let window = window(cx);
+        window
+            .update(cx, |view, _, _| {
+                view.mono = Some((root.clone(), "mono-a".into()));
+                let text = "step output says @workflow/deploy";
+                assert_eq!(view.prepare_prompt_for(text, false), text);
+                assert!(
+                    view.prepare_prompt_for(text, true)
+                        .contains("Referenced workflow")
+                );
+                let quoted = "> @workflow/deploy";
+                assert_eq!(view.prepare_prompt(quoted), quoted);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_cached_check_counts_only_for_the_same_requirements(cx: &mut TestAppContext) {
+        use monocode_core::mono::workflows::model::{Requirement, RequirementKind};
+        let root = mono_root(&[("mono-a", "wf-aaaa", "Deploy")]);
+        let window = window(cx);
+        window
+            .update(cx, |view, _, _| {
+                view.mono = Some((root.clone(), "mono-a".into()));
+                let stored = load_workflows(&MonoDir::new(&root, "mono-a"))
+                    .unwrap()
+                    .workflows
+                    .remove(0);
+                let key = requires_key(&stored);
+                let text = "@workflow/deploy";
+                let put = |view: &mut Completion, w: &Workflow, key: &str| {
+                    view.preflights.insert(
+                        w.id.clone(),
+                        (Instant::now(), fake_preflight(w), key.to_owned()),
+                    );
+                };
+                put(view, &stored, &key);
+                assert!(view.prepare_prompt(text).contains("\"status\":\"missing\""));
+                // The cached result was for other requirements: a new one must not vanish.
+                let mut older = stored.clone();
+                older.requires = vec![Requirement {
+                    kind: RequirementKind::Cli,
+                    name: "jq".into(),
+                    hint: None,
+                }];
+                put(view, &older, &key);
+                let sent = view.prepare_prompt(text);
+                assert!(
+                    sent.contains("not checked") && !sent.contains("jq"),
+                    "{sent}"
+                );
+                // Same requirements but another fingerprint (a project input moved).
+                put(view, &stored, "other");
+                assert!(view.prepare_prompt(text).contains("not checked"));
+                // Too old to report.
+                put(view, &stored, &key);
+                let late = Instant::now() + Duration::from_secs(11 * 60);
+                assert!(
+                    view.attach_workflows_with(text.into(), text, late)
+                        .contains("not checked")
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn changing_mono_drops_in_flight_loads_of_the_old_one(cx: &mut TestAppContext) {
+        let root = mono_root(&[
+            ("mono-a", "wf-aaaa", "Deploy"),
+            ("mono-b", "wf-bbbb", "Other"),
+        ]);
+        let window = window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.set_mono(root.clone(), "mono-a".into(), cx);
+                let before = view.generation;
+                view.workflows_loading = true;
+                view.set_mono(root.clone(), "mono-b".into(), cx);
+                assert!(view.generation > before && !view.workflows_loading);
             })
             .unwrap();
     }

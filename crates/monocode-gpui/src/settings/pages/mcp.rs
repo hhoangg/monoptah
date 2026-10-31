@@ -317,67 +317,47 @@ impl SettingsView {
             .spawn(async move { monocode_core::mcp::claude_health(&cwd) });
         self.mcp_health = Some(cx.spawn(async move |this, cx| {
             let result = work.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.selected_project != expected {
-                    return;
-                }
-                match result {
-                    Ok(output) => {
-                        for line in output.lines() {
-                            let Some((name, detail)) = line.split_once(": ") else {
-                                continue;
-                            };
-                            let name = name.trim();
-                            if name.is_empty()
-                                || !name
-                                    .bytes()
-                                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-                            {
-                                continue;
-                            }
-                            let lower = detail.to_lowercase();
-                            let status = if lower.contains("connected") {
-                                "Connected"
-                            } else if lower.contains("authentication")
-                                || lower.contains("needs auth")
-                            {
-                                "Needs authentication"
-                            } else if lower.contains("failed") {
-                                "Failed"
-                            } else if lower.contains("disabled") {
-                                "Disabled"
-                            } else {
-                                "Configured"
-                            };
-                            let mut found = false;
-                            for server in &mut this.discovery.mcp {
-                                if server.provider == "claude" && server.name == name {
-                                    if server.status != "Disabled" {
-                                        server.status = status.into();
+            let _ =
+                this.update(cx, |this, cx| {
+                    if this.selected_project != expected {
+                        return;
+                    }
+                    match result {
+                        Ok(output) => {
+                            for (name, status) in monocode_core::mcp::parse_claude_health(&output) {
+                                let name = name.as_str();
+                                let status = status.as_str();
+                                let http = output.lines().filter_map(|l| l.split_once(": ")).any(
+                                    |(n, d)| n.trim() == name && d.to_lowercase().contains("http"),
+                                );
+                                let mut found = false;
+                                for server in &mut this.discovery.mcp {
+                                    if server.provider == "claude" && server.name == name {
+                                        if server.status != "Disabled" {
+                                            server.status = status.into();
+                                        }
+                                        found = true;
                                     }
-                                    found = true;
+                                }
+                                if !found {
+                                    this.discovery.mcp.push(super::super::data::McpServer {
+                                        name: name.into(),
+                                        provider: "claude".into(),
+                                        scope: "local".into(),
+                                        path: Default::default(),
+                                        transport: if http { "http" } else { "" }.into(),
+                                        status: status.into(),
+                                    });
                                 }
                             }
-                            if !found {
-                                this.discovery.mcp.push(super::super::data::McpServer {
-                                    name: name.into(),
-                                    provider: "claude".into(),
-                                    scope: "local".into(),
-                                    path: Default::default(),
-                                    transport: if lower.contains("http") { "http" } else { "" }
-                                        .into(),
-                                    status: status.into(),
-                                });
-                            }
+                        }
+                        Err(e) => {
+                            this.discovery.mcp_error =
+                                Some(format!("Claude connection status unavailable: {e}"))
                         }
                     }
-                    Err(e) => {
-                        this.discovery.mcp_error =
-                            Some(format!("Claude connection status unavailable: {e}"))
-                    }
-                }
-                cx.notify();
-            });
+                    cx.notify();
+                });
         }));
     }
     fn mcp_action(

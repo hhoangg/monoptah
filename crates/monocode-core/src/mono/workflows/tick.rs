@@ -10,12 +10,14 @@
 use std::collections::HashSet;
 
 use super::engine::{mark_interrupted, start_run};
-use super::model::{RunStatus, RunTrigger, Workflow, WorkflowRun};
+use super::model::{with_run_values, RunStatus, RunTrigger, Workflow, WorkflowRun};
 use super::models::{harnesses_used, workflow_issues, ModelCatalog, Probe};
+use super::preflight::{union_requires, Preflight};
 use super::schedule::{after_claim, due_workflows};
 use super::store::{
     load_runs, load_workflows, take_requests, update_runs, update_workflows, MonoFiles,
 };
+use super::yaml::input_value_problems;
 use crate::provider::Kind;
 
 /// What a look needs to know.
@@ -31,6 +33,10 @@ pub struct Tick<'a> {
     /// can take a while) and before anyone starts the run: the caller marks the workflow as
     /// running, so it cannot be removed, run twice or reported "not running" in between.
     pub on_claim: &'a dyn Fn(&str),
+    /// Whether the machine has what a workflow declares in `requires`. Called only for a workflow
+    /// that declares something, after its definition and models passed (tests must not reach real
+    /// CLIs or shells).
+    pub preflight: &'a dyn Fn(&Workflow) -> Preflight,
 }
 
 /// The message for the Mono's chat when a run could not even start.
@@ -50,6 +56,14 @@ pub enum Start {
     },
     /// An interrupted run asked to continue, as stored.
     Resume { run: WorkflowRun },
+    /// An interrupted run asked to continue that may not resume yet (a requirement is missing).
+    /// The run stays interrupted; `failure` is for the Mono's chat.
+    Refused {
+        workflow_id: String,
+        workflow_name: String,
+        run_id: String,
+        failure: Failure,
+    },
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -106,14 +120,32 @@ fn begin(claimed: &Workflow, tick: &Tick, run_id: &str) -> Start {
     } else {
         RunTrigger::Schedule
     };
-    let mut run = start_run(claimed, trigger, tick.now, run_id);
-    let catalog = ModelCatalog::for_harnesses(&harnesses_used(claimed), tick.probe);
-    let issues = workflow_issues(claimed, &catalog);
-    if issues.is_empty() {
-        return Start::Run { run, failure: None };
+    // The run sees the values asked for this run laid over the stored ones, and keeps only that.
+    let effective = with_run_values(claimed);
+    let mut run = start_run(&effective, trigger, tick.now, run_id);
+    let catalog = ModelCatalog::for_harnesses(&harnesses_used(&effective), tick.probe);
+    let mut messages: Vec<String> = workflow_issues(&effective, &catalog)
+        .into_iter()
+        .map(|issue| issue.message)
+        .collect();
+    // The definition may have changed since the values were asked for.
+    if claimed.run_values.is_some() {
+        messages.extend(input_value_problems(
+            &effective.inputs,
+            &effective.input_values,
+        ));
     }
-    let messages: Vec<&str> = issues.iter().map(|issue| issue.message.as_str()).collect();
-    let error = format!("The workflow is not valid: {}", messages.join("; "));
+    let error = if !messages.is_empty() {
+        format!("The workflow is not valid: {}", messages.join("; "))
+    } else if effective.requires.is_empty() {
+        return Start::Run { run, failure: None };
+    } else {
+        let check = (tick.preflight)(&effective);
+        if check.all_met() {
+            return Start::Run { run, failure: None };
+        }
+        format!("Missing requirements: {}", check.summary())
+    };
     run.status = RunStatus::Failed;
     run.ended_at = Some(tick.now);
     run.error = Some(error.clone());
@@ -128,6 +160,40 @@ fn begin(claimed: &Workflow, tick: &Tick, run_id: &str) -> Start {
     Start::Run {
         run,
         failure: Some(failure),
+    }
+}
+
+/// An interrupted run asked to continue: resumed as stored when what it declared and what the
+/// workflow declares now are present, otherwise refused (the run stays interrupted). The stored
+/// definition is checked rather than the live one so the run keeps its own steps; the live
+/// `requires` are added because they may have grown since.
+fn resume_or_refuse(run: WorkflowRun, live: Option<&Workflow>, tick: &Tick) -> Start {
+    let requires = union_requires(
+        &run.definition.requires,
+        live.map_or(&[][..], |w| &w.requires),
+    );
+    if requires.is_empty() {
+        return Start::Resume { run };
+    }
+    let mut checked = run.definition.clone();
+    checked.requires = requires;
+    let check = (tick.preflight)(&checked);
+    if check.all_met() {
+        return Start::Resume { run };
+    }
+    let name = run.definition.name.clone();
+    let failure = Failure {
+        title: format!("{name} \u{b7} not resumed"),
+        text: format!(
+            "## {name} \u{b7} not resumed\n\nThe run could not continue yet and stays interrupted. Missing requirements: {}",
+            check.summary()
+        ),
+    };
+    Start::Refused {
+        workflow_id: run.workflow_id,
+        workflow_name: name,
+        run_id: run.id,
+        failure,
     }
 }
 
@@ -155,7 +221,9 @@ pub fn check(files: &impl MonoFiles, tick: &Tick) -> Result<Found, String> {
                             if let Some(run) = runs.into_iter().find(|r| r.id == request.run_id) {
                                 if run.status == RunStatus::Interrupted {
                                     (tick.on_claim)(&request.workflow_id);
-                                    found.starts.push(Start::Resume { run });
+                                    let live =
+                                        workflows.iter().find(|w| w.id == request.workflow_id);
+                                    found.starts.push(resume_or_refuse(run, live, tick));
                                 }
                             }
                         }

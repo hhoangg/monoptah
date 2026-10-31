@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use super::model::{Workflow, WorkflowRun, WORKFLOW_RUNS_KEPT};
+use super::model::{RunStatus, Workflow, WorkflowRun, WORKFLOW_RUNS_KEPT};
 use super::ordered::{Json, OrderedMap};
 use super::parse::read_workflow_file;
 use super::template::js_trim;
@@ -448,6 +448,24 @@ pub fn load_runs(files: &impl MonoFiles, workflow_id: &str) -> Result<Vec<Workfl
     Ok(read_runs_file(file.text.as_deref().unwrap_or(""))
         .map(|f| f.runs.into_iter().map(|s| s.run).collect())
         .unwrap_or_default())
+}
+
+/// The newest run's status and start time. `Ok(None)` means the workflow never ran (no file, an
+/// empty file or an empty list). A file that is not a JSON list, or holds only entries this app
+/// cannot read, is an `Err`: the history is unknown, which is not the same as never having run.
+pub fn last_run_of(
+    files: &impl MonoFiles,
+    workflow_id: &str,
+) -> Result<Option<(RunStatus, u64)>, String> {
+    let file = files.read(&runs_path(workflow_id))?;
+    let Some(runs) = read_runs_file(file.text.as_deref().unwrap_or("")) else {
+        return Err(unreadable_error(&runs_path(workflow_id), "its runs"));
+    };
+    match runs.runs.first() {
+        Some(stored) => Ok(Some((stored.run.status, stored.run.started_at))),
+        None if runs.unreadable.is_empty() => Ok(None),
+        None => Err(unreadable_error(&runs_path(workflow_id), "its runs")),
+    }
 }
 
 /// The newest runs that fit: at most 20 and under the size budget, never fewer than one. Entries

@@ -2,6 +2,7 @@
 use super::super::*;
 use super::actions;
 use super::list::workflow_trigger_label;
+use super::requirements::missing_requirements_badge;
 use super::view::{needs_review_badge, notice_line, property, section};
 use super::{
     super::scheduler::{duration, habit_field, when},
@@ -148,6 +149,9 @@ impl Monos {
         if w.needs_review {
             info = info.child(property("Status", needs_review_badge()));
         }
+        if self.missing_requirements(&w).is_some() {
+            info = info.child(property("Requires", missing_requirements_badge()));
+        }
         info = info.child(property(
             "Runs",
             if w.enabled {
@@ -195,6 +199,8 @@ impl Monos {
             None => {}
         }
 
+        let missing = self.missing_requirements_section(&w);
+        let gate = self.run_gate_dialog(mono, window, cx);
         let (edit, export_w) = (w.id.clone(), w.clone());
         let export = icon_button("mono-workflow-export", "Export", "share")
             .debug_selector(|| "mono-workflow-export".into())
@@ -234,6 +240,7 @@ impl Monos {
                         self.wf.page_notice.as_deref(),
                     ))
                     .child(info)
+                    .children(missing)
                     .when_some(
                         w.description.as_deref().filter(|d| !d.is_empty()),
                         |d, description| {
@@ -259,6 +266,7 @@ impl Monos {
                     })
                     .child(history),
             )
+            .children(gate)
             .into_any_element()
     }
 

@@ -11,7 +11,7 @@ use super::board_model::{
 use super::engine::looped_node_ids;
 use super::model::{
     trigger_of, Checkout, Cwd, Decide, Handle, InputValue, LoopSpec, Node, NodeId, NodeKind,
-    OutputField, Workflow, WorkflowInput, WORKFLOWS_MAX,
+    OutputField, Requirement, Workflow, WorkflowInput, WORKFLOWS_MAX,
 };
 use super::models::{workflow_issues, ModelCatalog};
 use super::ordered::OrderedMap;
@@ -41,6 +41,7 @@ pub struct Meta {
     pub enabled: bool,
     pub inputs: OrderedMap<WorkflowInput>,
     pub input_values: OrderedMap<InputValue>,
+    pub requires: Vec<Requirement>,
 }
 
 impl Meta {
@@ -51,6 +52,7 @@ impl Meta {
             enabled: w.enabled,
             inputs: w.inputs.clone(),
             input_values: w.input_values.clone(),
+            requires: w.requires.clone(),
         }
     }
 }
@@ -63,6 +65,7 @@ pub fn current(base: &Workflow, flow: &Flow, meta: &Meta) -> Workflow {
     w.enabled = meta.enabled;
     w.inputs = meta.inputs.clone();
     w.input_values = meta.input_values.clone();
+    w.requires = meta.requires.clone();
     w
 }
 
@@ -142,6 +145,7 @@ pub fn merged(stored: Option<&Workflow>, next: &Workflow, now: u64) -> Workflow 
         .filter(|(key, _)| next.inputs.contains_key(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
+    base.requires = next.requires.clone();
     base.nodes = next
         .nodes
         .iter()

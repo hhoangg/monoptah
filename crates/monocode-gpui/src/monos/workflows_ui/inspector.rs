@@ -10,7 +10,9 @@ use super::view::{hint, property, section};
 use gpui::{Div, FontWeight};
 use monocode_core::mono::workflows::{
     board_edit::*,
-    model::{InputType, InputValue, LoopSpec, Node, NodeKind, OutputFieldType, Workflow},
+    model::{
+        InputType, InputValue, LoopSpec, Node, NodeKind, OutputFieldType, RequirementKind, Workflow,
+    },
     models::stored_model_id,
     ordered::js_number_text,
 };
@@ -1141,6 +1143,22 @@ impl Monos {
                     _ => InputValue::String(v),
                 };
                 self.board_set_input(name, &input, Some(value), cx)
+            }
+            BoardPick::RequireKind(at) => {
+                let kind = match v.as_str() {
+                    "env" => RequirementKind::Env,
+                    "mcp" => RequirementKind::Mcp,
+                    _ => RequirementKind::Cli,
+                };
+                let at = *at;
+                self.board_meta_edit(
+                    |m| {
+                        if let Some(r) = m.requires.get_mut(at) {
+                            r.kind = kind;
+                        }
+                    },
+                    cx,
+                );
             }
             BoardPick::NewInputType => {
                 if let Some(b) = self.wf.board.as_mut() {

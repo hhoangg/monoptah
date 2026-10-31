@@ -3,10 +3,14 @@
 //! (the Mono's files, or a test host), so the rules are the CLI's: the same refusals, the same
 //! review mark, the same issue check. They block (files, CLI probes): call them off the UI thread.
 use monocode_core::mono::workflows::{
-    cli::WorkflowHost,
-    model::{InputValue, NodeKind, Workflow, WorkflowInput, definition_fingerprint, trigger_of},
+    cli::{WorkflowHost, checked_run_values},
+    model::{
+        InputValue, NodeKind, Workflow, WorkflowInput, definition_fingerprint, trigger_of,
+        with_run_values,
+    },
     models::workflow_issues,
     ordered::OrderedMap,
+    preflight::{Preflight, union_requires},
     validate::WorkflowIssue,
     yaml::input_value_problems,
 };
@@ -98,20 +102,71 @@ fn change<H: WorkflowHost>(
     })
 }
 
-/// Asks for a run. Resolves to why the workflow cannot run yet, if it cannot. Never around the
-/// review, whichever screen asked.
-pub(super) fn run_now(host: &mut impl WorkflowHost, id: &str) -> Option<String> {
+/// Why a run or resume waits for what the machine lacks, in one line.
+pub(super) fn missing_notice(verb: &str, check: &Preflight) -> String {
+    format!("Can't {verb} yet: {}.", check.summary())
+}
+
+/// What the machine has of what `w` requires. Blocks (CLI lookups, a login shell, MCP): only ever
+/// called before `change`, never inside it, because the edit is hash-checked and may run twice.
+fn check_requires(host: &mut impl WorkflowHost, w: &Workflow) -> Option<Preflight> {
+    (!w.requires.is_empty()).then(|| host.preflight(w))
+}
+
+/// Asks for a run, with `values` for this run only (None: the stored input values). Resolves to
+/// why the workflow cannot run yet, if it cannot. Never around the review, whichever screen asked.
+/// The rules are those of `workflows.run`: the values are checked against the declared inputs and
+/// the requirements have to be found, both before anything is saved. One exception: a user's click
+/// may run a paused workflow (as it always could), where the Mono's `workflows.run` may not.
+pub(super) fn run_now(
+    host: &mut impl WorkflowHost,
+    id: &str,
+    values: Option<OrderedMap<InputValue>>,
+) -> Option<String> {
+    let values = values.filter(|v| !v.is_empty());
+    let stored = host
+        .load()
+        .ok()
+        .and_then(|list| list.into_iter().find(|w| w.id == id));
+    let mut values = values;
+    if let Some(current) = stored {
+        if current.needs_review {
+            return Some(REVIEW_FIRST.into());
+        }
+        if let Some(given) = values.take() {
+            match checked_run_values(host, &current, given) {
+                Ok(checked) => values = Some(checked),
+                Err(error) => return Some(error),
+            }
+        }
+        let mut asked = current;
+        asked.run_values = values.clone();
+        let effective = with_run_values(&asked);
+        let issues = issues_of(host, &effective);
+        if !issues.is_empty() {
+            return Some(refusal("run", &issues));
+        }
+        if let Some(check) = check_requires(host, &effective)
+            && !check.all_met()
+        {
+            return Some(missing_notice("run", &check));
+        }
+    }
     let notice = change(host, id, |host, w| {
         if w.needs_review {
             return Ok((Some(w), Some(REVIEW_FIRST.into())));
         }
-        let issues = issues_of(host, &w);
+        let mut asked = w.clone();
+        asked.run_values = values.clone();
+        let issues = issues_of(host, &with_run_values(&asked));
         if !issues.is_empty() {
             let notice = refusal("run", &issues);
             return Ok((Some(w), Some(notice)));
         }
         let mut next = w;
         next.run_requested = true;
+        // Only for the run that starts now; a value left by an earlier request must not leak in.
+        next.run_values = values.clone();
         Ok((Some(next), None))
     });
     if notice.is_none() {
@@ -122,7 +177,27 @@ pub(super) fn run_now(host: &mut impl WorkflowHost, id: &str) -> Option<String> 
 
 /// Asks for an interrupted run to continue from where it stopped. Resolves to why it cannot yet.
 /// Two runs of one workflow would race over its files, so the request waits for the other to end.
+/// What the run was made with and what the workflow asks now both have to be there.
 pub(super) fn resume_run(host: &mut impl WorkflowHost, id: &str, run: &str) -> Option<String> {
+    if let Some(current) = host
+        .load()
+        .ok()
+        .and_then(|list| list.into_iter().find(|w| w.id == id))
+        && !current.needs_review
+        && !host.is_running(&current.id)
+    {
+        let mut subject = host
+            .runs(id)
+            .ok()
+            .and_then(|runs| runs.into_iter().find(|r| r.id == run))
+            .map_or_else(|| current.clone(), |r| r.definition);
+        subject.requires = union_requires(&subject.requires, &current.requires);
+        if let Some(check) = check_requires(host, &subject)
+            && !check.all_met()
+        {
+            return Some(missing_notice("resume", &check));
+        }
+    }
     let notice = change(host, id, |host, w| {
         if w.needs_review {
             return Ok((Some(w), Some(RESUME_REVIEW.into())));
@@ -174,6 +249,19 @@ pub(super) fn approve(
     intent: ReviewIntent,
     fingerprint: &str,
 ) -> Approval {
+    // Running it is the point of approving, so what it requires has to be there. Looked up here,
+    // before the save: a slow check must not sit inside it. Approving to enable is not a run.
+    if intent == ReviewIntent::Run
+        && let Some(w) = host
+            .load()
+            .ok()
+            .and_then(|list| list.into_iter().find(|w| w.id == id))
+        && definition_fingerprint(&w) == fingerprint
+        && let Some(check) = check_requires(host, &w)
+        && !check.all_met()
+    {
+        return Approval::Refused(missing_notice("run", &check));
+    }
     let saved = host.update(|host, list| {
         let mut result = Approval::Refused("That workflow is gone.".into());
         let mut kept = Vec::with_capacity(list.len());
@@ -205,6 +293,7 @@ pub(super) fn approve(
             let approved = match intent {
                 ReviewIntent::Run => {
                     approved.run_requested = true;
+                    approved.run_values = None;
                     Ok(approved)
                 }
                 ReviewIntent::Enable => enabled_now(approved, host.now()),

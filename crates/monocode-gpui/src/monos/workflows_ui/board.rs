@@ -14,7 +14,10 @@ use monocode_core::mono::workflows::{
         BoardNodeData, Flow, FlowKind, NodeType, Point, absolute, blank_workflow, definition_key,
         issues_by_node, to_flow,
     },
-    model::{InputValue, LoopSpec, Node, NodeKind, SWITCH_DEFAULT, Workflow, WorkflowInput},
+    model::{
+        InputValue, LoopSpec, Node, NodeKind, Requirement, RequirementKind, SWITCH_DEFAULT,
+        Workflow, WorkflowInput,
+    },
     models::{ModelCatalog, harnesses_used},
     validate::WorkflowIssue,
 };
@@ -90,6 +93,9 @@ pub(super) enum BoardField {
     InputValue(String),
     /// Committed: the name of a new input.
     NewInput,
+    /// Committed: the name, and the hint, of the requirement at this place.
+    RequireName(usize),
+    RequireHint(usize),
 }
 
 impl BoardField {
@@ -100,7 +106,11 @@ impl BoardField {
     fn commits(&self) -> bool {
         matches!(
             self,
-            Self::OutputName(..) | Self::CaseName(..) | Self::InputValue(_)
+            Self::OutputName(..)
+                | Self::CaseName(..)
+                | Self::InputValue(_)
+                | Self::RequireName(_)
+                | Self::RequireHint(_)
         )
     }
 }
@@ -125,6 +135,8 @@ pub(in crate::monos) enum BoardPick {
     ScheduleMinute(String),
     InputValue(String),
     NewInputType,
+    /// The kind of the requirement at this place.
+    RequireKind(usize),
 }
 
 /// The loop being asked for after a connection back up a branch.
@@ -817,7 +829,9 @@ impl Monos {
             BoardField::OutputName(..)
             | BoardField::CaseName(..)
             | BoardField::InputValue(_)
-            | BoardField::NewInput => {}
+            | BoardField::NewInput
+            | BoardField::RequireName(_)
+            | BoardField::RequireHint(_) => {}
         }
     }
 
@@ -900,6 +914,20 @@ impl Monos {
                 };
                 self.board_set_input(name, &input, value, cx);
             }
+            BoardField::RequireName(at) => {
+                let name = typed.trim().to_string();
+                let at = *at;
+                if b.meta.requires.get(at).is_some_and(|r| r.name != name) {
+                    self.board_meta_edit(|m| m.requires[at].name = name, cx);
+                }
+            }
+            BoardField::RequireHint(at) => {
+                let hint = (!typed.trim().is_empty()).then(|| typed.trim().to_string());
+                let at = *at;
+                if b.meta.requires.get(at).is_some_and(|r| r.hint != hint) {
+                    self.board_meta_edit(|m| m.requires[at].hint = hint, cx);
+                }
+            }
             BoardField::NewInput => {
                 let name = typed;
                 let ty = b.new_input_type.clone();
@@ -933,6 +961,31 @@ impl Monos {
                 self.board_meta_edit(|m| m.input_values.insert(name, value), cx);
             }
             _ => cx.notify(),
+        }
+    }
+
+    /// A blank requirement row, a command to start with; its name is typed in the row.
+    pub(super) fn board_add_requirement(&mut self, cx: &mut Context<Self>) {
+        self.board_meta_edit(
+            |m| {
+                m.requires.push(Requirement {
+                    kind: RequirementKind::Cli,
+                    name: String::new(),
+                    hint: None,
+                })
+            },
+            cx,
+        );
+    }
+
+    pub(super) fn board_remove_requirement(&mut self, at: usize, cx: &mut Context<Self>) {
+        if self
+            .wf
+            .board
+            .as_ref()
+            .is_some_and(|b| at < b.meta.requires.len())
+        {
+            self.board_meta_edit(|m| drop(m.requires.remove(at)), cx);
         }
     }
 
@@ -1181,11 +1234,10 @@ impl Monos {
             self.open_workflow_review(&id, super::ReviewIntent::Run, back, cx);
             return;
         }
-        self.workflow_task(
-            move |host| actions::run_now(host, &id),
-            |this, notice, cx| this.workflow_said(notice, true, cx),
-            cx,
-        );
+        if self.run_gate_for_run(&id, true, cx) {
+            return;
+        }
+        self.run_workflow_now(&id, None, true, cx);
     }
 
     pub(super) fn board_toggle_enabled(&mut self, cx: &mut Context<Self>) {

@@ -6,6 +6,7 @@ use super::guide::{guide_examples, workflow_guide};
 use super::model::*;
 use super::models::{CatalogHarness, CatalogModel, ModelCatalog, Probe};
 use super::ordered::Json;
+use super::preflight::{Preflight, RequirementStatus};
 use super::store::{load_runs, load_workflows, MonoDir};
 use super::validate::validate_workflow;
 use crate::provider::Kind;
@@ -52,6 +53,12 @@ struct Memory {
     checks: usize,
     updates: usize,
     cleared: Vec<String>,
+    /// What `preflight` answers; None finds every requirement met.
+    preflight: Option<Preflight>,
+    /// The requirement names each `preflight` call was asked about.
+    preflights: Vec<Vec<String>>,
+    /// The Mono's projects; None accepts a project value as given.
+    projects: Option<Vec<String>>,
 }
 
 impl WorkflowHost for Memory {
@@ -84,6 +91,27 @@ impl WorkflowHost for Memory {
     }
     fn now(&self) -> u64 {
         now()
+    }
+    fn preflight(&mut self, w: &Workflow) -> Preflight {
+        self.preflights
+            .push(w.requires.iter().map(|r| r.name.clone()).collect());
+        self.preflight.clone().unwrap_or_else(|| Preflight {
+            statuses: w
+                .requires
+                .iter()
+                .map(|r| RequirementStatus {
+                    requirement: r.clone(),
+                    met: true,
+                    detail: None,
+                })
+                .collect(),
+        })
+    }
+    fn project_path(&self, input: &str) -> Option<String> {
+        match &self.projects {
+            None => Some(input.to_string()),
+            Some(projects) => crate::mono::resolve_project(projects, input).ok(),
+        }
     }
 }
 
@@ -235,7 +263,7 @@ fn add_rejects_unknown_fields() {
     );
     assert!(e.contains("Unknown workflow fields: extra"), "{e}");
     assert!(
-        e.contains("Allowed: name, description, inputs, inputValues, nodes, edges;"),
+        e.contains("Allowed: name, description, inputs, requires, inputValues, nodes, edges;"),
         "{e}"
     );
     for field in [
@@ -1800,6 +1828,13 @@ fn add_probes_the_catalog_before_the_save() {
         fn now(&self) -> u64 {
             now()
         }
+        fn preflight(&mut self, w: &Workflow) -> Preflight {
+            self.1.push("preflight");
+            self.0.preflight(w)
+        }
+        fn project_path(&self, input: &str) -> Option<String> {
+            self.0.project_path(input)
+        }
     }
     let mut host = Order(Memory::default(), Vec::new());
     handle(
@@ -1809,4 +1844,650 @@ fn add_probes_the_catalog_before_the_save() {
     )
     .unwrap();
     assert_eq!(host.1, ["catalog", "update"]);
+}
+
+// ---- requires ---------------------------------------------------------------------------
+
+#[test]
+fn add_stores_requires_and_get_shows_them() {
+    let mut f = Fx::new();
+    let requires =
+        json!([{"cli": "gh", "hint": "brew install gh"}, {"env": "TOKEN"}, {"mcp": "docs server"}]);
+    let id = id_of(&f.add(definition(json!({"requires": requires}))));
+    let saved = &f.stored()[0];
+    assert_eq!(saved.requires.len(), 3);
+    assert_eq!(saved.requires[0].hint.as_deref(), Some("brew install gh"));
+    let got = f.ok("workflows.get", json!({"id": id}));
+    assert_eq!(got.get("requires").unwrap().to_value(), requires);
+}
+
+#[test]
+fn add_reports_an_unsafe_requirement_as_an_issue() {
+    let mut f = Fx::new();
+    let added = f.add(definition(json!({"requires": [{"cli": "gh; rm -rf ~"}]})));
+    assert!(
+        joined(&added).contains("Invalid cli requirement"),
+        "{}",
+        joined(&added)
+    );
+}
+
+#[test]
+fn add_refuses_a_malformed_requires_instead_of_dropping_it() {
+    let mut f = Fx::new();
+    for bad in [
+        json!("gh"),
+        json!(["gh"]),
+        json!([{"hint": "x"}]),
+        json!([{"cli": "gh", "mcp": "x"}]),
+        json!([{"cli": 1}]),
+        json!([{"cli": "gh", "hint": 1}]),
+        json!([{"cli": "gh", "hnit": "x"}]),
+        json!([{"cli": "gh", "version": "1"}]),
+        json!(null),
+    ] {
+        let e = f.err(
+            "workflows.add",
+            json!({"workflow": definition(json!({"requires": bad.clone()}))}),
+        );
+        assert!(e.contains("requires"), "{bad}: {e}");
+    }
+    assert!(f.stored().is_empty());
+}
+
+#[test]
+fn update_keeps_requires_when_omitted_clears_with_an_empty_list_and_replaces_with_a_new_one() {
+    let mut f = Fx::new();
+    let id = id_of(&f.add(definition(json!({"requires": [{"cli": "gh"}]}))));
+    f.ok(
+        "workflows.update",
+        json!({"id": id, "workflow": definition(json!({"name": "Renamed"}))}),
+    );
+    assert_eq!(f.stored()[0].requires.len(), 1);
+    assert_eq!(f.stored()[0].requires[0].name, "gh");
+    f.ok(
+        "workflows.update",
+        json!({"id": id, "workflow": definition(json!({"requires": [{"env": "TOKEN"}]}))}),
+    );
+    assert_eq!(f.stored()[0].requires.len(), 1);
+    assert_eq!(f.stored()[0].requires[0].name, "TOKEN");
+    f.ok(
+        "workflows.update",
+        json!({"id": id, "workflow": definition(json!({"requires": []}))}),
+    );
+    assert!(f.stored()[0].requires.is_empty());
+}
+
+#[test]
+fn validate_with_an_id_judges_the_stored_requires_when_none_are_given() {
+    let mut f = Fx::new();
+    let mut stored = workflow_stub("wf-dup");
+    stored.requires = vec![
+        Requirement {
+            kind: RequirementKind::Cli,
+            name: "gh".into(),
+            hint: None,
+        },
+        Requirement {
+            kind: RequirementKind::Cli,
+            name: "gh".into(),
+            hint: None,
+        },
+    ];
+    f.seed(vec![stored]);
+    for extra in [json!({}), json!({"inputValues": {"project": "/code/app"}})] {
+        let checked = f.ok(
+            "workflows.validate",
+            json!({"id": "wf-dup", "workflow": definition(extra)}),
+        );
+        assert!(
+            joined(&checked).contains("Duplicate requirement"),
+            "{}",
+            joined(&checked)
+        );
+    }
+    // An explicit list is judged as given.
+    let cleared = f.ok(
+        "workflows.validate",
+        json!({"id": "wf-dup", "workflow": definition(json!({"requires": []}))}),
+    );
+    assert!(!joined(&cleared).contains("Duplicate requirement"));
+}
+
+#[test]
+fn validate_judges_requires_like_add() {
+    let mut f = Fx::new();
+    let checked = f.ok(
+        "workflows.validate",
+        json!({"workflow": definition(json!({"requires": [{"env": "1BAD"}]}))}),
+    );
+    assert!(joined(&checked).contains("Invalid env requirement"));
+}
+
+#[test]
+fn yaml_add_carries_requires_and_keeps_the_mark() {
+    let (mut f, yaml) = imported();
+    let yaml = yaml.replacen("nodes:", "requires:\n  - cli: gh\nnodes:", 1);
+    let added = f.ok(
+        "workflows.add",
+        json!({"yaml": yaml, "values": {"project": "/code/app"}}),
+    );
+    let _ = added;
+    assert_eq!(f.stored()[0].requires.len(), 1);
+    assert!(f.stored()[0].needs_review);
+}
+
+#[test]
+fn update_of_a_needs_review_workflow_keeps_the_mark_and_takes_requires() {
+    let (mut f, yaml) = imported();
+    let id = id_of(&f.ok(
+        "workflows.add",
+        json!({"yaml": yaml, "values": {"project": "/code/app"}}),
+    ));
+    f.ok(
+        "workflows.update",
+        json!({"id": id, "workflow": definition(json!({"requires": [{"cli": "gh"}]}))}),
+    );
+    assert!(f.stored()[0].needs_review && !f.stored()[0].enabled);
+    assert_eq!(f.stored()[0].requires.len(), 1);
+}
+
+// ---- run values, start gates and validate warnings --------------------------------------
+
+const SECRET: &str = "sentinel-secret-value-123";
+
+fn missing(kind: RequirementKind, name: &str, hint: Option<&str>) -> Preflight {
+    Preflight {
+        statuses: vec![RequirementStatus {
+            requirement: Requirement {
+                kind,
+                name: name.into(),
+                hint: hint.map(str::to_string),
+            },
+            met: false,
+            detail: Some("Not found on PATH".into()),
+        }],
+    }
+}
+
+/// An enabled workflow with a project input, a number input and optional extras.
+fn enabled_with_count(f: &mut Fx, extra: Value) -> String {
+    let mut base = json!({
+        "inputs": {"project": {"type": "project"}, "count": {"type": "number"}},
+        "inputValues": {"project": "/code/app", "count": 2}
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        base[k] = v.clone();
+    }
+    let id = id_of(&f.add(definition(base)));
+    f.ok("workflows.resume", json!({"id": id}));
+    id
+}
+
+fn tail_json(error: &str, prefix: &str) -> Value {
+    let tail = error
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("{error}"));
+    serde_json::from_str(tail).unwrap_or_else(|e| panic!("{e}: {tail}"))
+}
+
+const MISSING_PREFIX: &str = "The workflow cannot run yet. Missing requirements: ";
+
+#[test]
+fn run_values_are_kept_for_the_run_and_never_written_to_the_input_values() {
+    let mut f = Fx::new();
+    let id = enabled_with_count(&mut f, json!({}));
+    f.ok("workflows.run", json!({"id": id, "values": {"count": 7}}));
+    let saved = &f.stored()[0];
+    assert!(saved.run_requested);
+    assert_eq!(
+        saved.run_values.as_ref().unwrap().get("count"),
+        Some(&InputValue::Number(7.0))
+    );
+    assert_eq!(
+        saved.input_values.get("count"),
+        Some(&InputValue::Number(2.0))
+    );
+    assert_eq!(f.host.checks, 1);
+}
+
+#[test]
+fn run_without_values_leaves_no_run_values() {
+    let mut f = Fx::new();
+    let id = enabled_with_count(&mut f, json!({}));
+    f.ok("workflows.run", json!({"id": id, "values": {}}));
+    assert!(f.stored()[0].run_requested);
+    assert!(f.stored()[0].run_values.is_none());
+}
+
+#[test]
+fn run_values_of_the_wrong_type_or_an_unknown_name_are_refused_and_nothing_is_requested() {
+    let mut f = Fx::new();
+    let id = enabled_with_count(&mut f, json!({}));
+    let updates = f.host.updates;
+    let e = f.err(
+        "workflows.run",
+        json!({"id": id, "values": {"count": "many"}}),
+    );
+    assert!(
+        e.contains("must be a number") && e.contains("Declared inputs: "),
+        "{e}"
+    );
+    let e = f.err("workflows.run", json!({"id": id, "values": {"nope": 1}}));
+    assert!(e.contains("Unknown input \"nope\""), "{e}");
+    let e = f.err("workflows.run", json!({"id": id, "values": "x"}));
+    assert!(e.contains("values must be an object"), "{e}");
+    assert!(!f.stored()[0].run_requested && f.stored()[0].run_values.is_none());
+    assert_eq!((f.host.updates, f.host.checks), (updates, 0));
+}
+
+#[test]
+fn a_project_value_must_resolve_to_an_assigned_project() {
+    let mut f = Fx::new();
+    let id = enabled_with_count(&mut f, json!({}));
+    f.host.projects = Some(vec!["/code/app".into(), "/code/other".into()]);
+    let e = f.err(
+        "workflows.run",
+        json!({"id": id, "values": {"project": "/elsewhere/x"}}),
+    );
+    assert_eq!(
+        e,
+        "Choose one of this Mono's assigned projects by full path"
+    );
+    assert!(!f.stored()[0].run_requested && f.stored()[0].run_values.is_none());
+    // A folder name resolves to the full path, which is what the run sees.
+    f.ok(
+        "workflows.run",
+        json!({"id": id, "values": {"project": "other"}}),
+    );
+    assert_eq!(
+        f.stored()[0].run_values.as_ref().unwrap().get("project"),
+        Some(&InputValue::String("/code/other".into()))
+    );
+}
+
+#[test]
+fn run_blocked_by_a_missing_requirement_ends_in_parseable_json_and_requests_nothing() {
+    let mut f = Fx::new();
+    let id = enabled_with_count(&mut f, json!({"requires": [{"cli": "gh"}]}));
+    f.host.preflight = Some(missing(RequirementKind::Cli, "gh", Some("brew install gh")));
+    let updates = f.host.updates;
+    let e = f.err("workflows.run", json!({"id": id, "values": {"count": 3}}));
+    let list = tail_json(&e, MISSING_PREFIX);
+    assert_eq!(
+        list,
+        json!([{"kind": "cli", "name": "gh", "detail": "Not found on PATH", "hint": "brew install gh"}])
+    );
+    assert!(!f.stored()[0].run_requested && f.stored()[0].run_values.is_none());
+    assert_eq!((f.host.updates, f.host.checks), (updates, 0));
+    assert!(!e.contains(SECRET));
+}
+
+#[test]
+fn run_checks_requirements_on_the_workflow_with_the_run_values_laid_over() {
+    let mut f = Fx::new();
+    let id = enabled_with_count(
+        &mut f,
+        json!({"requires": [{"cli": "gh"}, {"env": "TOKEN"}]}),
+    );
+    f.ok("workflows.run", json!({"id": id}));
+    assert_eq!(
+        f.host.preflights,
+        vec![vec!["gh".to_string(), "TOKEN".to_string()]]
+    );
+}
+
+#[test]
+fn a_workflow_without_requires_is_never_preflighted() {
+    let mut f = Fx::new();
+    let id = enabled_with_count(&mut f, json!({}));
+    f.host.preflight = Some(missing(RequirementKind::Cli, "gh", None));
+    f.ok("workflows.run", json!({"id": id}));
+    f.ok("workflows.get", json!({"id": id}));
+    assert!(f.host.preflights.is_empty());
+}
+
+#[test]
+fn needs_review_and_paused_still_win_over_a_missing_requirement() {
+    let mut f = Fx::new();
+    let id = enabled_with_count(&mut f, json!({"requires": [{"cli": "gh"}]}));
+    f.host.preflight = Some(missing(RequirementKind::Cli, "gh", None));
+    f.host.stored[0].needs_review = true;
+    assert_eq!(f.err("workflows.run", json!({"id": id})), NEEDS_REVIEW_TEXT);
+    f.host.stored[0].needs_review = false;
+    f.ok("workflows.pause", json!({"id": id}));
+    assert_eq!(
+        f.err("workflows.run", json!({"id": id})),
+        "Resume the workflow before running it."
+    );
+    assert!(f.host.preflights.is_empty());
+}
+
+const NEEDS_REVIEW_TEXT: &str = "This workflow came from a file and the user has not reviewed it yet. Ask the user to review it and enable it in the Workflows panel.";
+
+#[test]
+fn run_does_not_preflight_inside_the_hash_checked_update() {
+    // add() computes problems first for the same reason: the edit may run twice.
+    struct Order(Memory, Vec<&'static str>);
+    impl WorkflowHost for Order {
+        fn load(&mut self) -> Result<Vec<Workflow>, String> {
+            self.0.load()
+        }
+        fn update<T>(
+            &mut self,
+            mut edit: impl FnMut(&mut Self, Vec<Workflow>) -> Result<(Vec<Workflow>, T), String>,
+        ) -> Result<T, String> {
+            self.1.push("update");
+            let (next, result) = edit(self, self.0.stored.clone())?;
+            self.0.stored = next;
+            Ok(result)
+        }
+        fn runs(&mut self, id: &str) -> Result<Vec<WorkflowRun>, String> {
+            self.0.runs(id)
+        }
+        fn clear_runs(&mut self, id: &str) {
+            self.0.clear_runs(id)
+        }
+        fn catalog(&mut self, _: &Workflow) -> ModelCatalog {
+            catalog()
+        }
+        fn is_running(&self, id: &str) -> bool {
+            self.0.is_running(id)
+        }
+        fn request_check_now(&mut self) {}
+        fn now(&self) -> u64 {
+            now()
+        }
+        fn preflight(&mut self, w: &Workflow) -> Preflight {
+            self.1.push("preflight");
+            self.0.preflight(w)
+        }
+        fn project_path(&self, input: &str) -> Option<String> {
+            self.0.project_path(input)
+        }
+    }
+    let mut seed = Fx::new();
+    let id = enabled_with_count(&mut seed, json!({"requires": [{"cli": "gh"}]}));
+    let mut host = Order(seed.host, Vec::new());
+    handle("workflows.run", &Json::from(&json!({"id": id})), &mut host).unwrap();
+    assert_eq!(host.1, ["preflight", "update"]);
+}
+
+#[test]
+fn resume_run_is_blocked_by_what_the_run_or_the_workflow_requires() {
+    let mut f = Fx::new();
+    let id = id_of(&f.add(definition(json!({"requires": [{"env": "TOKEN"}]}))));
+    let mut stored_run = run("run-1", RunStatus::Interrupted, &id);
+    stored_run.definition.requires = vec![Requirement {
+        kind: RequirementKind::Cli,
+        name: "gh".into(),
+        hint: None,
+    }];
+    f.host.runs.insert(id.clone(), vec![stored_run]);
+    f.host.preflight = Some(missing(RequirementKind::Cli, "gh", None));
+    let e = f.err("workflows.resumeRun", json!({"id": id, "runId": "run-1"}));
+    assert_eq!(tail_json(&e, MISSING_PREFIX)[0]["name"], "gh");
+    assert_eq!(f.stored()[0].resume_run_id, None);
+    assert_eq!(f.host.checks, 0);
+    // The run's own list and the live one are both asked about.
+    assert_eq!(
+        f.host.preflights,
+        vec![vec!["gh".to_string(), "TOKEN".to_string()]]
+    );
+    f.host.preflight = None;
+    f.ok("workflows.resumeRun", json!({"id": id, "runId": "run-1"}));
+    assert_eq!(f.stored()[0].resume_run_id.as_deref(), Some("run-1"));
+}
+
+#[test]
+fn enabling_and_saving_stay_ungated_by_a_missing_requirement() {
+    let mut f = Fx::new();
+    f.host.preflight = Some(missing(RequirementKind::Cli, "gh", None));
+    let id = id_of(&f.add(definition(json!({"requires": [{"cli": "gh"}]}))));
+    f.ok("workflows.resume", json!({"id": id}));
+    f.ok(
+        "workflows.update",
+        json!({"id": id, "workflow": definition(json!({"requires": [{"cli": "gh"}]}))}),
+    );
+    f.ok(
+        "workflows.validate",
+        json!({"workflow": definition(json!({"requires": [{"cli": "gh"}]}))}),
+    );
+    assert!(f.stored()[0].enabled);
+    assert!(f.host.preflights.is_empty());
+}
+
+#[test]
+fn get_shows_the_status_of_each_requirement_under_requires_status() {
+    let mut f = Fx::new();
+    let requires = json!([{"cli": "gh", "hint": "brew install gh"}, {"env": "TOKEN"}]);
+    let id = id_of(&f.add(definition(json!({"requires": requires}))));
+    f.host.preflight = Some(Preflight {
+        statuses: vec![
+            RequirementStatus {
+                requirement: Requirement {
+                    kind: RequirementKind::Cli,
+                    name: "gh".into(),
+                    hint: Some("brew install gh".into()),
+                },
+                met: false,
+                detail: Some("Not found on PATH".into()),
+            },
+            RequirementStatus {
+                requirement: Requirement {
+                    kind: RequirementKind::Env,
+                    name: "TOKEN".into(),
+                    hint: None,
+                },
+                met: true,
+                detail: None,
+            },
+        ],
+    });
+    let got = f.ok("workflows.get", json!({"id": id}));
+    assert_eq!(got.get("requires").unwrap().to_value(), requires);
+    assert_eq!(
+        got.get("requiresStatus").unwrap().to_value(),
+        json!([
+            {"kind": "cli", "name": "gh", "hint": "brew install gh", "met": false, "detail": "Not found on PATH"},
+            {"kind": "env", "name": "TOKEN", "met": true}
+        ])
+    );
+    assert!(!got.stringify(false).contains(SECRET));
+}
+
+fn command_flow(command: &str, requires: Value) -> Value {
+    definition(json!({
+        "nodes": [
+            {"id": "trigger", "type": "manual"},
+            {"id": "build", "type": "command", "project": "{{inputs.project}}", "command": command},
+            {"id": "report", "type": "report"}
+        ],
+        "edges": [{"from": "trigger", "to": "build"}, {"from": "build", "to": "report"}],
+        "requires": requires
+    }))
+}
+
+#[test]
+fn validate_warns_about_undeclared_clis_in_command_steps_without_blocking() {
+    let mut f = Fx::new();
+    let result = f.ok(
+        "workflows.validate",
+        json!({"workflow": command_flow("gh pr list | jq . && ls", json!([{"cli": "gh"}]))}),
+    );
+    assert!(list(&result, "issues").is_empty());
+    let warnings = list(&result, "warnings");
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(text(&warnings[0], "nodeId"), "build");
+    assert_eq!(text(&warnings[0], "cli"), "jq");
+    assert!(text(&warnings[0], "message").contains("jq"));
+    // Nothing declared: both CLIs are named; a base utility never is.
+    let result = f.ok(
+        "workflows.validate",
+        json!({"workflow": command_flow("gh pr list | jq . && ls", json!([]))}),
+    );
+    let clis: Vec<String> = list(&result, "warnings")
+        .iter()
+        .map(|w| text(w, "cli"))
+        .collect();
+    assert_eq!(clis, ["gh", "jq"]);
+    // No command step, no warnings; and add still saves it.
+    let result = f.ok(
+        "workflows.validate",
+        json!({"workflow": definition(json!({}))}),
+    );
+    assert!(list(&result, "warnings").is_empty());
+    f.add(command_flow("gh pr list", json!([])));
+    assert_eq!(f.stored().len(), 1);
+}
+
+#[test]
+fn a_secret_in_the_environment_never_reaches_a_result_a_run_file_or_a_failure_text() {
+    use super::fixtures::SecretProbe;
+    use super::preflight::evaluate;
+    let probe = SecretProbe(SECRET);
+    let requires = json!([{"env": "TOKEN"}, {"env": "LOGIN_TOKEN"}, {"env": "MISSING", "hint": "export MISSING"}, {"cli": "gh"}, {"mcp": "docs"}]);
+    let mut f = Fx::new();
+    // A command step, so the login shell is consulted for LOGIN_TOKEN.
+    let flow = command_flow("true", json!([]));
+    let id = enabled_with_count(
+        &mut f,
+        json!({"requires": requires, "nodes": flow["nodes"], "edges": flow["edges"]}),
+    );
+    // The host answers from a real evaluation over the secret-holding machine.
+    f.host.preflight = Some(evaluate(&f.host.stored[0].clone(), &probe));
+    let judged = f.host.preflight.clone().unwrap();
+    assert!(!judged.all_met());
+    let status_of = |name: &str| {
+        judged
+            .statuses
+            .iter()
+            .find(|s| s.requirement.name == name)
+            .unwrap()
+    };
+    // Consulted: the login shell answered for LOGIN_TOKEN (it prints the secret too, filtered out).
+    assert!(status_of("TOKEN").met && status_of("LOGIN_TOKEN").met);
+    // The failed MCP listing carries the secret in its error; only a fixed text may surface.
+    assert_eq!(
+        status_of("docs").detail.as_deref(),
+        Some("Could not list MCP servers")
+    );
+    let mut seen: Vec<String> = Vec::new();
+    seen.push(f.err("workflows.run", json!({"id": id, "values": {"count": 3}})));
+    let mut interrupted = run("run-1", RunStatus::Interrupted, &id);
+    interrupted.definition.requires = f.host.stored[0].requires.clone();
+    f.host.runs.insert(id.clone(), vec![interrupted]);
+    seen.push(f.err("workflows.resumeRun", json!({"id": id, "runId": "run-1"})));
+    seen.push(f.ok("workflows.get", json!({"id": id})).stringify(false));
+    seen.push(f.ok("workflows.list", json!({})).stringify(false));
+    seen.push(f.ok("workflows.runs", json!({"id": id})).stringify(false));
+    for text in &seen {
+        assert!(!text.contains(SECRET), "leaked: {text}");
+    }
+    // The checks did run: the unset variable and the missing CLI are named, the set ones are not.
+    let blocked = &seen[0];
+    assert!(
+        blocked.contains("MISSING") && blocked.contains("export MISSING") && blocked.contains("gh")
+    );
+    // The same machine behind a tick: the failed run's file and the chat text carry no value.
+    let root = std::env::temp_dir().join(format!("wf-secret-{}", crate::mono::new_id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let disk = MonoDir::new(&root, "mono-1");
+    let mut w = f.host.stored[0].clone();
+    w.run_requested = true;
+    super::store::update_workflows(&disk, |_| Ok((vec![w.clone()], ()))).unwrap();
+    let judge = |w: &Workflow| evaluate(w, &probe);
+    let found = super::tick::check(
+        &disk,
+        &super::tick::Tick {
+            now: now(),
+            is_running: &|_| false,
+            has_chat: true,
+            probe: no_probe,
+            on_claim: &|_| {},
+            preflight: &judge,
+        },
+    )
+    .unwrap();
+    let super::tick::Start::Run { run, failure } = &found.starts[0] else {
+        panic!("no run")
+    };
+    assert_eq!(run.status, RunStatus::Failed);
+    let failure = failure.as_ref().unwrap();
+    assert!(failure.text.contains("MISSING"));
+    super::store::update_runs(&disk, &id, |_| Ok((vec![run.clone()], ()))).unwrap();
+    let mut files = String::new();
+    fn gather(dir: &std::path::Path, out: &mut String) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                gather(&path, out);
+            } else {
+                out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    gather(&root, &mut files);
+    assert!(
+        files.contains("Missing requirements"),
+        "run file was written"
+    );
+    for text in [&failure.text, &failure.title, &files] {
+        assert!(!text.contains(SECRET), "leaked: {text}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn the_store_host_refuses_a_run_value_project_outside_the_assigned_projects() {
+    let (host, _, root) = store_host();
+    let mut host = host.with_projects(vec!["/code/app".into(), "/code/other".into()]);
+    assert_eq!(host.project_path("other").as_deref(), Some("/code/other"));
+    assert_eq!(host.project_path("/code/app").as_deref(), Some("/code/app"));
+    assert_eq!(host.project_path("/elsewhere/x"), None);
+    let wf = json!({
+        "name": "Build",
+        "inputs": {"project": {"type": "project"}},
+        "inputValues": {"project": "/code/app"},
+        "nodes": [
+            {"id": "trigger", "type": "manual"},
+            {"id": "build", "type": "command", "project": "{{inputs.project}}", "command": "true"},
+            {"id": "report", "type": "report"}
+        ],
+        "edges": [{"from": "trigger", "to": "build"}, {"from": "build", "to": "report"}]
+    });
+    let mut call = |action: &str, input: Value| handle(action, &Json::from(&input), &mut host);
+    let id = id_of(&call("workflows.add", json!({"workflow": wf})).unwrap());
+    call("workflows.resume", json!({"id": id})).unwrap();
+    let e = call(
+        "workflows.run",
+        json!({"id": id, "values": {"project": "/elsewhere/x"}}),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e,
+        "Choose one of this Mono's assigned projects by full path"
+    );
+    let dir = MonoDir::new(&root, "mono-1");
+    assert!(!load_workflows(&dir).unwrap().workflows[0].run_requested);
+    call(
+        "workflows.run",
+        json!({"id": id, "values": {"project": "other"}}),
+    )
+    .unwrap();
+    let saved = &load_workflows(&dir).unwrap().workflows[0];
+    assert_eq!(
+        saved.run_values.as_ref().unwrap().get("project"),
+        Some(&InputValue::String("/code/other".into()))
+    );
+    assert_eq!(
+        saved.input_values.get("project"),
+        Some(&InputValue::String("/code/app".into()))
+    );
+    // Without with_projects a value is accepted as given.
+    let (plain, _, _) = store_host();
+    assert_eq!(
+        plain.project_path("/anywhere").as_deref(),
+        Some("/anywhere")
+    );
 }

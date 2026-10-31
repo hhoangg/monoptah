@@ -153,6 +153,11 @@ impl Conversation {
             .delivered
             .retain(|id| mono.outbox.iter().any(|m| &m.id == id));
         self.sync_mono_pending(cx);
+        // Only a Mono's composer knows `@workflow/`; no other conversation ever gets this.
+        let (mono_root, mono_id) = (root.clone(), mono.id.clone());
+        self.completion.update(cx, |completion, cx| {
+            completion.set_mono(mono_root, mono_id, cx)
+        });
         self.settings.mono = Some(monocode_core::agent::MonoContext {
             mono,
             root,
@@ -208,7 +213,10 @@ impl Conversation {
             {
                 return false;
             }
-            let prepared = self.completion.read(cx).prepare_prompt(&message.text);
+            let prepared = self
+                .completion
+                .read(cx)
+                .prepare_prompt_for(&message.text, !message.internal);
             let steer = monocode_core::follow_up::Message {
                 id: message.id.clone(),
                 text: message.text.clone(),

@@ -4,6 +4,7 @@
 use super::engine::{mark_interrupted, start_run};
 use super::model::*;
 use super::models::Probe;
+use super::preflight::{Preflight, RequirementStatus};
 use super::store::*;
 use super::tick::*;
 use super::validate::validate_workflow;
@@ -146,9 +147,58 @@ fn look_with(
             has_chat,
             probe,
             on_claim: &|_| {},
+            preflight: &|_| Preflight::default(),
         },
     )
     .unwrap()
+}
+
+fn look_pf(
+    files: &impl MonoFiles,
+    running: &dyn Fn(&str) -> bool,
+    preflight: &dyn Fn(&Workflow) -> Preflight,
+) -> Found {
+    check(
+        files,
+        &Tick {
+            now: now(),
+            is_running: running,
+            has_chat: true,
+            probe: probe_nothing,
+            on_claim: &|_| {},
+            preflight,
+        },
+    )
+    .unwrap()
+}
+
+/// Every requirement missing, with a reason.
+fn all_missing(w: &Workflow) -> Preflight {
+    Preflight {
+        statuses: w
+            .requires
+            .iter()
+            .map(|r| RequirementStatus {
+                requirement: r.clone(),
+                met: false,
+                detail: Some("Not found on PATH".into()),
+            })
+            .collect(),
+    }
+}
+
+fn all_found(w: &Workflow) -> Preflight {
+    Preflight {
+        statuses: w
+            .requires
+            .iter()
+            .map(|r| RequirementStatus {
+                requirement: r.clone(),
+                met: true,
+                detail: None,
+            })
+            .collect(),
+    }
 }
 
 fn runs_of(found: &Found) -> Vec<(&WorkflowRun, Option<&Failure>)> {
@@ -407,6 +457,7 @@ fn a_workflow_is_reported_claimed_before_its_models_are_probed() {
             has_chat: true,
             probe: probing,
             on_claim: &on_claim,
+            preflight: &|_| Preflight::default(),
         },
     )
     .unwrap();
@@ -810,5 +861,276 @@ fn a_run_history_that_cannot_be_read_does_not_stop_the_sweep_of_the_others() {
     // The workflow file itself reads through `workflows.json`; only the first history fails.
     assert_eq!(sweep_interrupted(&broken, &[]).unwrap_err(), "disk error");
     assert_eq!(statuses(&disk, OTHER)[0].1, RunStatus::Interrupted);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// --- run values and requirements -------------------------------------------------------------
+
+fn counted(extra: Value) -> Workflow {
+    let mut base = json!({
+        "inputs": {"count": {"type": "number"}},
+        "inputValues": {"count": 2}
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        base[k] = v.clone();
+    }
+    workflow(base)
+}
+
+fn count_of(w: &Workflow) -> Option<InputValue> {
+    w.input_values.get("count").cloned()
+}
+
+#[test]
+fn a_requested_run_uses_its_run_values_and_keeps_the_stored_ones() {
+    let root = temp_root();
+    let disk = dir(&root);
+    save(
+        &disk,
+        &[counted(
+            json!({"runRequested": true, "runValues": {"count": 9}}),
+        )],
+    );
+    let found = look(&disk, true, &idle);
+    let (run, failure) = runs_of(&found)[0];
+    assert!(failure.is_none());
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(count_of(&run.definition), Some(InputValue::Number(9.0)));
+    assert!(run.definition.run_values.is_none());
+    let after = stored_one(&disk);
+    assert_eq!(count_of(&after), Some(InputValue::Number(2.0)));
+    assert!(after.run_values.is_none() && !after.run_requested);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn run_values_that_no_longer_fit_the_definition_fail_the_run() {
+    let root = temp_root();
+    let disk = dir(&root);
+    save(
+        &disk,
+        &[counted(
+            json!({"runRequested": true, "runValues": {"count": "many"}}),
+        )],
+    );
+    let found = look(&disk, true, &idle);
+    let (run, failure) = runs_of(&found)[0];
+    assert_eq!(run.status, RunStatus::Failed);
+    assert!(run
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("The workflow is not valid"));
+    assert!(failure.unwrap().text.contains("count"));
+    assert!(stored_one(&disk).run_values.is_none());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_scheduled_run_with_a_missing_requirement_fails_with_a_chat_message_and_the_schedule_moves_on()
+{
+    let root = temp_root();
+    let disk = dir(&root);
+    save(
+        &disk,
+        &[workflow(
+            json!({"requires": [{"cli": "gh", "hint": "brew install gh"}]}),
+        )],
+    );
+    let found = look_pf(&disk, &idle, &all_missing);
+    let (run, failure) = runs_of(&found)[0];
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.trigger, RunTrigger::Schedule);
+    assert_eq!(run.ended_at, Some(now()));
+    let error = run.error.as_deref().unwrap();
+    assert_eq!(
+        error,
+        "Missing requirements: cli gh: not found on PATH (brew install gh)"
+    );
+    let failure = failure.unwrap();
+    assert_eq!(failure.title, "Ship it \u{b7} failed");
+    assert!(failure
+        .text
+        .contains("The workflow could not start. Missing requirements:"));
+    let after = stored_one(&disk);
+    assert!(after.next_run_at.unwrap() > now());
+    assert_eq!(after.last_run_id.as_deref(), Some(run.id.as_str()));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_requested_run_with_a_missing_requirement_fails_the_same_way_and_is_consumed() {
+    let root = temp_root();
+    let disk = dir(&root);
+    let later = now() + 3_600_000;
+    save(
+        &disk,
+        &[workflow(
+            json!({"runRequested": true, "nextRunAt": later, "requires": [{"env": "TOKEN"}]}),
+        )],
+    );
+    let found = look_pf(&disk, &idle, &all_missing);
+    let (run, failure) = runs_of(&found)[0];
+    assert_eq!(run.trigger, RunTrigger::Manual);
+    assert_eq!(run.status, RunStatus::Failed);
+    assert!(run
+        .error
+        .as_deref()
+        .unwrap()
+        .starts_with("Missing requirements: env TOKEN"));
+    assert!(failure.is_some());
+    let after = stored_one(&disk);
+    assert!(!after.run_requested);
+    assert_eq!(after.next_run_at, Some(later));
+    assert!(look(&disk, true, &idle).starts.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn met_requirements_start_the_run_and_a_workflow_without_any_is_never_preflighted() {
+    let root = temp_root();
+    let disk = dir(&root);
+    save(&disk, &[workflow(json!({"requires": [{"cli": "gh"}]}))]);
+    let found = look_pf(&disk, &idle, &all_found);
+    assert_eq!(runs_of(&found)[0].0.status, RunStatus::Running);
+    save(&disk, &[workflow(json!({}))]);
+    let asked = Cell::new(0);
+    let counting = |w: &Workflow| {
+        asked.set(asked.get() + 1);
+        all_missing(w)
+    };
+    let found = look_pf(&disk, &idle, &counting);
+    assert_eq!(runs_of(&found)[0].0.status, RunStatus::Running);
+    assert_eq!(asked.get(), 0);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_resume_is_refused_while_a_requirement_is_missing_and_the_run_stays_interrupted() {
+    let root = temp_root();
+    let disk = dir(&root);
+    // The run was made when the workflow required gh; the live workflow now adds TOKEN.
+    let mut old = workflow(json!({}));
+    old.requires = vec![Requirement {
+        kind: RequirementKind::Cli,
+        name: "gh".into(),
+        hint: None,
+    }];
+    let run = mark_interrupted(&start_run(&old, RunTrigger::Manual, 1_000, "run-old"));
+    save(
+        &disk,
+        &[workflow(
+            json!({"enabled": false, "resumeRunId": "run-old", "requires": [{"env": "TOKEN"}]}),
+        )],
+    );
+    put_runs(&disk, ID, vec![run]);
+    let seen = RefCell::new(Vec::new());
+    let refusing = |w: &Workflow| {
+        seen.borrow_mut().push(
+            w.requires
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>(),
+        );
+        all_missing(w)
+    };
+    let claimed = RefCell::new(Vec::new());
+    let on_claim = |id: &str| claimed.borrow_mut().push(id.to_string());
+    let found = check(
+        &disk,
+        &Tick {
+            now: now(),
+            is_running: &idle,
+            has_chat: true,
+            probe: probe_nothing,
+            on_claim: &on_claim,
+            preflight: &refusing,
+        },
+    )
+    .unwrap();
+    assert_eq!(found.starts.len(), 1);
+    let Start::Refused {
+        workflow_id,
+        workflow_name,
+        run_id,
+        failure,
+    } = &found.starts[0]
+    else {
+        panic!("not refused: {:?}", found.starts);
+    };
+    assert_eq!(
+        (
+            workflow_id.as_str(),
+            workflow_name.as_str(),
+            run_id.as_str()
+        ),
+        (ID, "Ship it", "run-old")
+    );
+    assert!(failure.text.contains("Missing requirements: cli gh"));
+    assert!(failure.text.contains("env TOKEN"));
+    assert_eq!(
+        *seen.borrow(),
+        vec![vec!["gh".to_string(), "TOKEN".to_string()]]
+    );
+    assert_eq!(*claimed.borrow(), vec![ID.to_string()]);
+    // The run is untouched and the request is consumed.
+    assert_eq!(
+        load_runs(&disk, ID).unwrap()[0].status,
+        RunStatus::Interrupted
+    );
+    assert_eq!(stored_one(&disk).resume_run_id, None);
+    assert!(look(&disk, true, &idle).starts.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_resume_goes_ahead_when_the_requirements_are_met_with_the_values_it_started_with() {
+    let root = temp_root();
+    let disk = dir(&root);
+    // The run started with count 9 (a run value); the stored value is 2.
+    let started = counted(json!({"requires": [{"cli": "gh"}], "runValues": {"count": 9}}));
+    let run = mark_interrupted(&start_run(
+        &super::model::with_run_values(&started),
+        RunTrigger::Manual,
+        1_000,
+        "run-old",
+    ));
+    save(
+        &disk,
+        &[counted(
+            json!({"enabled": false, "resumeRunId": "run-old", "requires": [{"cli": "gh"}]}),
+        )],
+    );
+    put_runs(&disk, ID, vec![run]);
+    let found = look_pf(&disk, &idle, &all_found);
+    let resumes = resumes_of(&found);
+    assert_eq!(resumes.len(), 1);
+    assert_eq!(
+        count_of(&resumes[0].definition),
+        Some(InputValue::Number(9.0))
+    );
+    assert_eq!(count_of(&stored_one(&disk)), Some(InputValue::Number(2.0)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_resume_of_a_run_that_requires_nothing_is_not_preflighted() {
+    let root = temp_root();
+    let disk = dir(&root);
+    save(
+        &disk,
+        &[workflow(
+            json!({"enabled": false, "resumeRunId": "run-old"}),
+        )],
+    );
+    put_runs(&disk, ID, vec![interrupted("run-old")]);
+    let asked = Cell::new(0);
+    let counting = |w: &Workflow| {
+        asked.set(asked.get() + 1);
+        all_missing(w)
+    };
+    let found = look_pf(&disk, &idle, &counting);
+    assert_eq!(resumes_of(&found).len(), 1);
+    assert_eq!(asked.get(), 0);
     std::fs::remove_dir_all(root).unwrap();
 }

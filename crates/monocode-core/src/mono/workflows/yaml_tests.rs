@@ -2,7 +2,7 @@
 //! files written by the React export (npm `yaml`) and a corpus of YAML snippets read by npm
 //! `yaml` with `schema: "core"`.
 use super::fixtures::{edge, node, workflow_from};
-use super::model::{InputValue, Node, NodeKind, Workflow};
+use super::model::{InputValue, Node, NodeKind, Requirement, RequirementKind, Workflow};
 use super::models::{CatalogHarness, CatalogModel, ModelCatalog};
 use super::ordered::{Json, OrderedMap};
 use super::yaml::*;
@@ -1348,4 +1348,110 @@ fn a_switch_and_its_handles_survive_export_and_import() {
     assert_eq!(preview.workflow.edges, w.edges);
     // A switch with a question is reviewed like an If with one.
     assert!(preview.prompts.iter().any(|p| p.node_id == "pick"));
+}
+
+// --- requires ---------------------------------------------------------------------------------
+
+fn requirement(kind: RequirementKind, name: &str, hint: Option<&str>) -> Requirement {
+    Requirement {
+        kind,
+        name: name.into(),
+        hint: hint.map(str::to_string),
+    }
+}
+
+#[test]
+fn requires_export_after_inputs_in_the_documented_shape() {
+    let mut w = example();
+    w.requires = vec![
+        requirement(RequirementKind::Cli, "gh", Some("brew install gh")),
+        requirement(
+            RequirementKind::Env,
+            "CLICKUP_TOKEN",
+            Some("Create one in ClickUp settings"),
+        ),
+        requirement(RequirementKind::Mcp, "clickup", None),
+    ];
+    let text = export_workflow(&w);
+    let block = "requires:\n  - cli: gh\n    hint: brew install gh\n  - env: CLICKUP_TOKEN\n    hint: Create one in ClickUp settings\n  - mcp: clickup\n";
+    assert!(text.contains(block), "{text}");
+    let inputs_at = text.find("\ninputs:").unwrap();
+    let requires_at = text.find("\nrequires:").unwrap();
+    let nodes_at = text.find("\nnodes:").unwrap();
+    assert!(inputs_at < requires_at && requires_at < nodes_at, "{text}");
+}
+
+#[test]
+fn a_workflow_without_requires_exports_no_requires_key() {
+    assert!(!export_workflow(&example()).contains("requires"));
+}
+
+#[test]
+fn requires_round_trip_including_hints_that_need_quoting() {
+    let mut w = example();
+    w.requires = vec![
+        requirement(RequirementKind::Cli, "gh", Some("brew install gh")),
+        requirement(RequirementKind::Env, "TOKEN", Some("true")),
+        requirement(
+            RequirementKind::Env,
+            "OTHER",
+            Some("key: value # not a comment"),
+        ),
+        requirement(
+            RequirementKind::Mcp,
+            "docs server",
+            Some("  padded \"quote\" "),
+        ),
+        requirement(RequirementKind::Cli, "node", Some("12")),
+    ];
+    let preview = ok(&export_workflow(&w));
+    assert_eq!(preview.workflow.requires, w.requires);
+    assert_eq!(preview.issues, vec![]);
+    let mut values = OrderedMap::new();
+    for name in preview.workflow.inputs.keys() {
+        values.insert(name.clone(), InputValue::String("/code/app".into()));
+    }
+    let finished = finish_import(&preview, &values, 7).unwrap();
+    assert_eq!(finished.requires, w.requires);
+}
+
+#[test]
+fn requires_in_a_json_file_import_too() {
+    let text = r#"{"monoptahWorkflow":1,"name":"W","requires":[{"cli":"gh","hint":"h"}],"nodes":[{"id":"trigger","type":"manual"},{"id":"report","type":"report"}],"edges":[{"from":"trigger","to":"report"}]}"#;
+    let preview = ok(text);
+    assert_eq!(
+        preview.workflow.requires,
+        vec![requirement(RequirementKind::Cli, "gh", Some("h"))]
+    );
+}
+
+#[test]
+fn a_malformed_requires_is_an_import_error_not_a_drop() {
+    let file = |requires: &str| {
+        format!(
+            "monoptahWorkflow: 1\nname: W\n{requires}\nnodes:\n  - id: trigger\n    type: manual\n  - id: report\n    type: report\n"
+        )
+    };
+    for bad in [
+        "requires: gh",
+        "requires:\n  - gh",
+        "requires:\n  - hint: x",
+        "requires:\n  - cli: gh\n    env: X",
+        "requires:\n  - cli: 5",
+        "requires:\n  - cli: gh\n    hint: 3",
+        "requires:\n  - cli: gh\n    hnit: x",
+        "requires:\n  - cli: gh\n    version: 1",
+    ] {
+        let e = error(&file(bad));
+        assert!(e.contains("requires"), "{bad}: {e}");
+    }
+}
+
+#[test]
+fn an_unsafe_requirement_name_imports_with_a_validation_issue() {
+    let text = "monoptahWorkflow: 1\nname: W\nrequires:\n  - cli: \"gh; rm -rf ~\"\nnodes:\n  - id: trigger\n    type: manual\n  - id: report\n    type: report\nedges:\n  - from: trigger\n    to: report\n";
+    let preview = ok(text);
+    assert!(messages(&preview.issues)
+        .iter()
+        .any(|m| m.contains("Invalid cli requirement")));
 }

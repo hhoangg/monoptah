@@ -12,7 +12,9 @@ use super::{
     *,
 };
 use monocode_core::mono::workflows::{
+    model::Workflow,
     models::Probe,
+    preflight::Preflight,
     store::MonoDir,
     tick::{self, Found, Start, Tick},
 };
@@ -42,6 +44,15 @@ pub(super) struct Looked {
     errors: Vec<String>,
 }
 
+/// How a look judges what it finds, injected so tests never reach real CLIs, shells or MCP servers.
+#[derive(Clone, Copy)]
+pub(super) struct Probes {
+    /// How a harness is probed for the model catalog.
+    pub(super) models: fn(Kind) -> Probe,
+    /// How a workflow's `requires` are checked.
+    pub(super) requirements: fn(&Workflow) -> Preflight,
+}
+
 /// One look at every Mono's files. Blocks (files, CLI probes): call it off the UI thread.
 /// `monos` is `(id, has a chat)`; `driven` the runs the runner is driving, which the sweep leaves
 /// alone.
@@ -51,7 +62,7 @@ pub(super) fn look_at(
     driven: &[(String, String)],
     sweep: bool,
     signals: &monocode_core::mono::workflows::cli::Signals,
-    probe: fn(Kind) -> Probe,
+    probes: Probes,
     now: u64,
 ) -> Looked {
     let mut looked = Looked {
@@ -71,7 +82,8 @@ pub(super) fn look_at(
             now,
             is_running: &running,
             has_chat: *has_chat,
-            probe,
+            probe: probes.models,
+            preflight: &probes.requirements,
             on_claim: &|workflow: &str| signals.set_running(workflow, true),
         };
         match tick::check(&dir, &tick) {
@@ -168,6 +180,10 @@ impl Monos {
         let signals = self.workflow_signals.clone();
         let root = self.root.clone();
         let probe = self.workflow_live.probe();
+        let probes = Probes {
+            models: probe,
+            requirements: self.workflow_live.preflight(),
+        };
         let work = cx.background_executor().spawn(async move {
             look_at(
                 &root,
@@ -175,7 +191,7 @@ impl Monos {
                 &driven,
                 sweep,
                 &signals,
-                probe,
+                probes,
                 monocode_core::time::now_ms(),
             )
         });
@@ -200,6 +216,7 @@ impl Monos {
             .flat_map(|(_, found)| &found.starts)
             .map(|start| match start {
                 Start::Run { run, .. } | Start::Resume { run } => run.workflow_id.clone(),
+                Start::Refused { workflow_id, .. } => workflow_id.clone(),
             })
             .collect();
         // A look that was going when the app began to quit finds nothing to start.
@@ -229,6 +246,26 @@ impl Monos {
                 match start {
                     Start::Resume { run } => {
                         self.resume_workflow_run(&mono_id, &run, cx);
+                    }
+                    Start::Refused {
+                        workflow_id,
+                        workflow_name,
+                        run_id,
+                        failure,
+                    } => {
+                        // The run stays interrupted; the Mono's chat says why it did not continue.
+                        self.workflow_post(
+                            Posted {
+                                mono_id: mono_id.clone(),
+                                workflow_id,
+                                workflow_name,
+                                run_id,
+                                title: failure.title,
+                                text: failure.text,
+                                launches: Vec::new(),
+                            },
+                            cx,
+                        );
                     }
                     Start::Run { run, failure } => {
                         // A run that never starts would otherwise only show in the run history.

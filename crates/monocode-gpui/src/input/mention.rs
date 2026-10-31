@@ -15,13 +15,17 @@ pub(super) const ICON_LEN: usize = '\u{2003}'.len_utf8();
 pub(super) enum MentionIcon {
     File(SharedString),
     Note,
+    Workflow,
 }
 impl MentionIcon {
-    /// `@path`, `@"spaced path"`, or `@note/slug`.
+    /// `@path`, `@"spaced path"`, or `@note/slug`, or `@workflow/slug`.
     pub fn of(token: &str) -> Option<Self> {
         let path = token.strip_prefix('@')?;
         if path.starts_with("note/") {
             return Some(Self::Note);
+        }
+        if path.starts_with("workflow/") {
+            return Some(Self::Workflow);
         }
         let path = path
             .strip_prefix('"')

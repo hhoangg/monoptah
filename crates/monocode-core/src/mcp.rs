@@ -930,17 +930,96 @@ pub fn remove(cwd: &str, name: &str, scope: &str) -> Result<(), String> {
     .map(|_| ())
 }
 pub fn claude_health(cwd: &str) -> Result<String, String> {
+    claude_health_within(cwd, Duration::from_secs(30))
+}
+
+/// `claude mcp list` with a caller-chosen timeout.
+pub fn claude_health_within(cwd: &str, timeout: Duration) -> Result<String, String> {
     mcp_command(
         resolve_mcp_binary("claude", None)?,
         vec!["mcp".into(), "list".into()],
         cwd.into(),
-        Duration::from_secs(30),
+        timeout,
     )
+}
+
+/// `claude mcp list` that ends after `max` and never past `deadline`. The time left is measured
+/// after the binary is resolved, because that can take seconds in a login shell.
+pub fn claude_health_until(
+    cwd: &str,
+    max: Duration,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    let binary = resolve_mcp_binary("claude", None)?;
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let timeout = max.min(left);
+    if timeout.is_zero() {
+        return Err("No time left".into());
+    }
+    mcp_command(
+        binary,
+        vec!["mcp".into(), "list".into()],
+        cwd.into(),
+        timeout,
+    )
+}
+
+/// Reads `claude mcp list` output into (server name, status) pairs. The status is one of
+/// "Connected", "Needs authentication", "Failed", "Disabled" or "Configured". Lines that do not
+/// start with a plain server name are skipped.
+pub fn parse_claude_health(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((name, detail)) = line.split_once(": ") else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            continue;
+        }
+        let lower = detail.to_lowercase();
+        let status = if lower.contains("connected") {
+            "Connected"
+        } else if lower.contains("authentication") || lower.contains("needs auth") {
+            "Needs authentication"
+        } else if lower.contains("failed") {
+            "Failed"
+        } else if lower.contains("disabled") {
+            "Disabled"
+        } else {
+            "Configured"
+        };
+        out.push((name.to_string(), status.to_string()));
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_claude_health_statuses() {
+        let text = "Checking MCP server health...\n\
+            docs: https://x.example/mcp (HTTP) - \u{2713} Connected\n\
+            linear: https://y.example (HTTP) - Needs authentication\n\
+            broken: npx broken - \u{2717} Failed to connect\n\
+            off: npx off - disabled\n\
+            plain: npx plain\n\
+            bad name: npx x - Connected\n";
+        let got = parse_claude_health(text);
+        let status = |n: &str| got.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+        assert_eq!(status("docs"), Some("Connected"));
+        assert_eq!(status("linear"), Some("Needs authentication"));
+        assert_eq!(status("broken"), Some("Failed"));
+        assert_eq!(status("off"), Some("Disabled"));
+        assert_eq!(status("plain"), Some("Configured"));
+        assert_eq!(got.len(), 5);
+    }
 
     #[test]
     fn parses_single_server_from_standard_json() {

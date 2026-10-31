@@ -171,6 +171,48 @@ impl Serialize for InputValue {
     }
 }
 
+/// What a workflow needs on the machine that runs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RequirementKind {
+    Cli,
+    Env,
+    Mcp,
+}
+
+impl RequirementKind {
+    pub const ALL: [Self; 3] = [Self::Cli, Self::Env, Self::Mcp];
+
+    /// The key a requirement is written under in the file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Env => "env",
+            Self::Mcp => "mcp",
+        }
+    }
+}
+
+/// One declared precondition: a command on PATH, an environment variable, or an MCP server.
+/// It is only ever looked up by name, never run. The hint tells the user how to satisfy it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Requirement {
+    pub kind: RequirementKind,
+    pub name: String,
+    pub hint: Option<String>,
+}
+
+impl Serialize for Requirement {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(1 + usize::from(self.hint.is_some())))?;
+        map.serialize_entry(self.kind.key(), &self.name)?;
+        if let Some(hint) = &self.hint {
+            map.serialize_entry("hint", hint)?;
+        }
+        map.end()
+    }
+}
+
 /// Board position, kept so an exported file opens with the same layout.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Ui {
@@ -404,6 +446,12 @@ pub struct Workflow {
     pub inputs: OrderedMap<WorkflowInput>,
     /// Values for the declared inputs. Not exported.
     pub input_values: OrderedMap<InputValue>,
+    /// What the workflow needs on this machine. Part of the shared definition.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Requirement>,
+    /// Values for one run, laid over `input_values` by `with_run_values`. Never exported.
+    #[serde(rename = "runValues", skip_serializing_if = "Option::is_none")]
+    pub run_values: Option<OrderedMap<InputValue>>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub enabled: bool,
@@ -438,6 +486,8 @@ impl Workflow {
             description: None,
             inputs: OrderedMap::new(),
             input_values: OrderedMap::new(),
+            requires: Vec::new(),
+            run_values: None,
             nodes: Vec::new(),
             edges: Vec::new(),
             enabled: false,
@@ -458,6 +508,18 @@ impl Workflow {
     pub fn trigger(&self) -> Option<&Node> {
         self.nodes.iter().find(|n| n.is_trigger())
     }
+}
+
+/// The workflow with its per-run values laid over the stored input values and cleared, so what
+/// runs reads one set of values.
+pub fn with_run_values(w: &Workflow) -> Workflow {
+    let mut out = w.clone();
+    if let Some(run_values) = out.run_values.take() {
+        for (name, value) in run_values.iter() {
+            out.input_values.insert(name.clone(), value.clone());
+        }
+    }
+    out
 }
 
 /// The workflow's trigger node, when it has one.
@@ -534,6 +596,12 @@ pub fn definition_fingerprint(w: &Workflow) -> String {
         "inputs".into(),
         serde_json::to_value(&w.inputs).unwrap_or(Value::Null),
     );
+    if !w.requires.is_empty() {
+        root.insert(
+            "requires".into(),
+            serde_json::to_value(&w.requires).unwrap_or(Value::Null),
+        );
+    }
     root.insert("nodes".into(), Value::Array(nodes));
     root.insert(
         "edges".into(),

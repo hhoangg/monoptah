@@ -3,21 +3,25 @@
 //! app's, because the Mono and the workflow guide read them.
 //!
 //! `handle` is pure over a `WorkflowHost`: the real one (`StoreHost`) reads and writes the Mono's
-//! files; tests use an in-memory one. Every action returns fast. `run`, `stop` and `resumeRun`
-//! only write their request into `workflows.json` (`runRequested`, `stopRequested`,
-//! `resumeRunId`) and call `request_check_now`; the runner does the work. The only slow part is
-//! probing the model catalog, which `native_probe` bounds, so call `handle` off the UI thread.
+//! files; tests use an in-memory one. `run`, `stop` and `resumeRun` only write their request into
+//! `workflows.json` (`runRequested`, `stopRequested`, `resumeRunId`) and call
+//! `request_check_now`; the runner does the work. Two things can block: probing the model
+//! catalog (`native_probe` bounds it) and, for `run`, `resumeRun` and `get` of a workflow with
+//! `requires`, the preflight (`native_preflight` waits up to 12 s). Call `handle` off the UI
+//! thread.
 //!
 //! Local times in results (`nextRunAt`, `startedAt`, `endedAt`) read `YYYY-MM-DD HH:MM` in the
 //! machine's time zone, where React printed `toLocaleString()`.
 use super::guide::workflow_guide;
 use super::model::{
-    new_workflow_id, trigger_of, Edge, InputValue, Node, NodeKind, Workflow, WorkflowRun,
-    WORKFLOWS_MAX, WORKFLOW_DEFINITION_MAX_BYTES, WORKFLOW_DESCRIPTION_MAX, WORKFLOW_NAME_MAX,
+    new_workflow_id, trigger_of, with_run_values, Edge, InputValue, Node, NodeKind,
+    RequirementKind, Workflow, WorkflowRun, WORKFLOWS_MAX, WORKFLOW_DEFINITION_MAX_BYTES,
+    WORKFLOW_DESCRIPTION_MAX, WORKFLOW_NAME_MAX,
 };
 use super::models::{harnesses_used, native_probe, workflow_issues, ModelCatalog, Probe};
 use super::ordered::{js_number_text, Json, OrderedMap};
-use super::parse::{drop_stray_handles, parse_edge, parse_inputs, parse_node};
+use super::parse::{drop_stray_handles, parse_edge, parse_inputs, parse_node, read_requires};
+use super::preflight::{likely_clis, native_preflight, union_requires, Preflight};
 use super::store::{
     clear_runs, load_runs, load_workflows, to_json, update_workflows, workflow_json, MonoDir,
 };
@@ -58,6 +62,11 @@ pub trait WorkflowHost: Sized {
     fn request_check_now(&mut self);
     /// Milliseconds since the epoch.
     fn now(&self) -> u64;
+    /// Whether this machine has what `w` declares in `requires`. Blocks while the checks run, so
+    /// it must never be called inside `update` (the edit is hash-checked and may run twice).
+    fn preflight(&mut self, w: &Workflow) -> Preflight;
+    /// The assigned project an input value names (a full path, or a folder name), if any.
+    fn project_path(&self, input: &str) -> Option<String>;
 }
 
 /// What the runner and the actions tell each other, shared as an `Arc`: the runner calls
@@ -112,6 +121,9 @@ pub struct StoreHost {
     dir: MonoDir,
     signals: Arc<Signals>,
     probe: fn(Kind) -> Probe,
+    preflight: fn(&Workflow) -> Preflight,
+    /// The Mono's assigned projects; None accepts a project value as given.
+    projects: Option<Vec<String>>,
 }
 
 impl StoreHost {
@@ -120,7 +132,19 @@ impl StoreHost {
             dir,
             signals,
             probe: native_probe,
+            preflight: native_preflight,
+            projects: None,
         }
+    }
+    /// Replaces how requirements are checked (tests must never reach real CLIs or shells).
+    pub fn with_preflight(mut self, preflight: fn(&Workflow) -> Preflight) -> Self {
+        self.preflight = preflight;
+        self
+    }
+    /// The projects assigned to the Mono, which a per-run `project` value must name.
+    pub fn with_projects(mut self, projects: Vec<String>) -> Self {
+        self.projects = Some(projects);
+        self
     }
     /// Replaces how a harness is probed (tests must never reach real CLIs).
     pub fn with_probe(mut self, probe: fn(Kind) -> Probe) -> Self {
@@ -158,13 +182,23 @@ impl WorkflowHost for StoreHost {
     fn now(&self) -> u64 {
         crate::time::now_ms()
     }
+    fn preflight(&mut self, w: &Workflow) -> Preflight {
+        (self.preflight)(w)
+    }
+    fn project_path(&self, input: &str) -> Option<String> {
+        match &self.projects {
+            None => Some(input.to_string()),
+            Some(projects) => crate::mono::resolve_project(projects, input).ok(),
+        }
+    }
 }
 
 /// The fields of a workflow definition the CLI accepts; the app owns everything else.
-const DEFINITION_FIELDS: [&str; 6] = [
+const DEFINITION_FIELDS: [&str; 7] = [
     "name",
     "description",
     "inputs",
+    "requires",
     "inputValues",
     "nodes",
     "edges",
@@ -179,8 +213,9 @@ const RUNS_MAX: f64 = 20.0;
 pub fn fields(action: &str) -> Option<&'static str> {
     Some(match action {
         "workflows.list" | "workflows.guide" => "project",
-        "workflows.get" | "workflows.run" | "workflows.stop" | "workflows.pause"
-        | "workflows.resume" | "workflows.remove" | "workflows.export" => "id project",
+        "workflows.get" | "workflows.stop" | "workflows.pause" | "workflows.resume"
+        | "workflows.remove" | "workflows.export" => "id project",
+        "workflows.run" => "id values project",
         "workflows.add" => "workflow yaml values project",
         "workflows.validate" => "id workflow yaml values project",
         "workflows.update" => "id workflow project",
@@ -460,6 +495,9 @@ fn input_values(value: Option<&Json>, name: &str) -> Result<OrderedMap<InputValu
 struct Parsed {
     definition: WorkflowDraft,
     values: Option<OrderedMap<InputValue>>,
+    /// Whether the definition said anything about `requires`; an update that does not keeps the
+    /// stored list.
+    requires_given: bool,
 }
 
 fn definition_from(raw: Option<&Json>, now: u64, allowed: &[&str]) -> Result<Parsed, String> {
@@ -547,6 +585,7 @@ fn definition_from(raw: Option<&Json>, now: u64, allowed: &[&str]) -> Result<Par
         }
         Some(_) => return Err("workflow.inputs must be an object".into()),
     };
+    let requires = read_requires(map.get("requires")).map_err(|e| format!("workflow.{e}"))?;
     let values = match map.get("inputValues") {
         None => None,
         some => Some(input_values(some, "workflow.inputValues")?),
@@ -556,10 +595,12 @@ fn definition_from(raw: Option<&Json>, now: u64, allowed: &[&str]) -> Result<Par
             name,
             description,
             inputs,
+            requires,
             nodes,
             edges,
         },
         values,
+        requires_given: map.contains_key("requires"),
     })
 }
 
@@ -610,6 +651,7 @@ fn new_workflow_from(input: &Json, now: u64) -> Result<(Workflow, Option<Review>
     let mut draft = Workflow::new(new_workflow_id(), definition.name);
     draft.description = definition.description;
     draft.inputs = definition.inputs;
+    draft.requires = definition.requires;
     draft.input_values = values;
     draft.nodes = definition.nodes;
     draft.edges = definition.edges;
@@ -700,6 +742,29 @@ fn list<H: WorkflowHost>(host: &mut H) -> Result<Json, String> {
     Ok(obj([("workflows", Json::Array(out))]))
 }
 
+/// `[{kind,name,hint?,met,detail?}]`: every requirement with whether this machine has it.
+fn requires_status(check: &Preflight) -> Json {
+    Json::Array(
+        check
+            .statuses
+            .iter()
+            .map(|s| {
+                let mut o = OrderedMap::new();
+                o.insert("kind", st(s.requirement.kind.key()));
+                o.insert("name", st(&s.requirement.name));
+                if let Some(hint) = &s.requirement.hint {
+                    o.insert("hint", st(hint));
+                }
+                o.insert("met", Json::Bool(s.met));
+                if let Some(detail) = &s.detail {
+                    o.insert("detail", st(detail));
+                }
+                Json::Object(o)
+            })
+            .collect(),
+    )
+}
+
 fn get<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
     let workflows = host.load()?;
     let w = find(&workflows, input)?;
@@ -715,6 +780,11 @@ fn get<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
     out.push(("running", Json::Bool(host.is_running(&w.id))));
     out.push(("inputs", part("inputs")));
     out.push(("inputValues", part("inputValues")));
+    if !w.requires.is_empty() {
+        out.push(("requires", part("requires")));
+        let check = host.preflight(w);
+        out.push(("requiresStatus", requires_status(&check)));
+    }
     out.push(("nodes", part("nodes")));
     out.push(("edges", part("edges")));
     out.push(("issues", issues_json(&problems(host, w))));
@@ -749,6 +819,37 @@ fn add<H: WorkflowHost>(host: &mut H, input: &Json, now: u64) -> Result<Json, St
     })
 }
 
+/// Command steps that seem to call a CLI that `requires` does not declare. Advice only: it never
+/// blocks a save or a run, because the guess can be wrong.
+fn undeclared_cli_warnings(w: &Workflow) -> Json {
+    let mut out = Vec::new();
+    for node in &w.nodes {
+        let NodeKind::Command { command, .. } = &node.kind else {
+            continue;
+        };
+        for cli in likely_clis(command) {
+            let declared = w
+                .requires
+                .iter()
+                .any(|r| r.kind == RequirementKind::Cli && r.name == cli);
+            if declared {
+                continue;
+            }
+            out.push(obj([
+                ("nodeId", st(&node.id)),
+                ("cli", st(&cli)),
+                (
+                    "message",
+                    st(format!(
+                        "This step seems to run \"{cli}\", which requires does not declare. Add {{\"cli\": \"{cli}\"}} to requires so a missing install is reported before the run starts."
+                    )),
+                ),
+            ]));
+        }
+    }
+    Json::Array(out)
+}
+
 fn validate<H: WorkflowHost>(host: &mut H, input: &Json, now: u64) -> Result<Json, String> {
     // The same parse and checks as workflows.add, without saving anything.
     let (parsed, _) = new_workflow_from(input, now)?;
@@ -766,14 +867,20 @@ fn validate<H: WorkflowHost>(host: &mut H, input: &Json, now: u64) -> Result<Jso
         Some(Json::Object(w)) => w.contains_key("inputValues"),
         _ => input.get("values").is_some(),
     };
-    let draft = match existing {
-        Some(existing) if !given => {
-            let mut draft = parsed;
+    let mut draft = parsed;
+    if let Some(existing) = existing {
+        if !given {
             draft.input_values = declared_values(&draft.inputs, &existing.input_values);
-            draft
         }
-        _ => parsed,
-    };
+        // A JSON change that does not mention `requires` keeps the stored list, as update does.
+        let requires_given = match input.get("workflow") {
+            Some(Json::Object(w)) => w.contains_key("requires"),
+            _ => true,
+        };
+        if !requires_given {
+            draft.requires = existing.requires.clone();
+        }
+    }
     // Read only: add would be refused at the limit, so say so here instead of at save time.
     let mut issues = problems(host, &draft);
     // Checking a change to an existing workflow adds nothing, so the limit does not apply.
@@ -788,6 +895,7 @@ fn validate<H: WorkflowHost>(host: &mut H, input: &Json, now: u64) -> Result<Jso
     let (commands, prompts) = review_texts(&draft.nodes);
     Ok(obj([
         ("issues", issues_json(&issues)),
+        ("warnings", undeclared_cli_warnings(&draft)),
         ("commands", commands_json(&commands)),
         ("prompts", prompts_json(&prompts)),
     ]))
@@ -812,6 +920,9 @@ fn update<H: WorkflowHost>(host: &mut H, input: &Json, now: u64) -> Result<Json,
         draft.name = parsed.definition.name.clone();
         draft.description = parsed.definition.description.clone();
         draft.inputs = parsed.definition.inputs.clone();
+        if parsed.requires_given {
+            draft.requires = parsed.definition.requires.clone();
+        }
         draft.nodes = parsed.definition.nodes.clone();
         draft.edges = parsed.definition.edges.clone();
         // Values of inputs the new definition dropped go with them; given ones are checked as given.
@@ -876,6 +987,67 @@ fn set_inputs<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, Strin
     })
 }
 
+/// The error for a start path that found requirements missing: a sentence, then the missing
+/// list as compact JSON so the Mono can read which ones and what to tell the user.
+fn missing_requirements(check: &Preflight) -> String {
+    format!(
+        "The workflow cannot run yet. Missing requirements: {}",
+        check.missing_json().stringify(false)
+    )
+}
+
+/// The per-run values of `workflows.run`, checked against the declared inputs the way
+/// `setInputs` checks them, with each `project` value resolved to an assigned project.
+fn run_values<H: WorkflowHost>(
+    host: &H,
+    w: &Workflow,
+    input: &Json,
+) -> Result<OrderedMap<InputValue>, String> {
+    match input.get("values") {
+        None => Ok(OrderedMap::new()),
+        given => checked_run_values(host, w, input_values(given, "values")?),
+    }
+}
+
+/// `values` for one run, checked against the declared inputs of `w` the way `setInputs` checks
+/// them, with each `project` value resolved to an assigned project. The one rule behind
+/// `workflows.run` and the app's Run dialog.
+pub fn checked_run_values<H: WorkflowHost>(
+    host: &H,
+    w: &Workflow,
+    mut values: OrderedMap<InputValue>,
+) -> Result<OrderedMap<InputValue>, String> {
+    let declared: OrderedMap<_> = values
+        .keys()
+        .filter_map(|key| w.inputs.get(key).map(|i| (key.clone(), i.clone())))
+        .collect();
+    let bad = input_value_problems(&declared, &values);
+    if !bad.is_empty() {
+        let names: Vec<&str> = w.inputs.keys().map(String::as_str).collect();
+        return Err(format!(
+            "{}. Declared inputs: {}",
+            bad.join("; "),
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        ));
+    }
+    for (name, input) in w.inputs.iter() {
+        if input.ty != super::model::InputType::Project {
+            continue;
+        }
+        if let Some(InputValue::String(given)) = values.get(name).cloned() {
+            let path = host
+                .project_path(&given)
+                .ok_or("Choose one of this Mono's assigned projects by full path")?;
+            values.insert(name.clone(), InputValue::String(path));
+        }
+    }
+    Ok(values)
+}
+
 fn run<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
     let workflows = host.load()?;
     let current = find(&workflows, input)?.clone();
@@ -887,7 +1059,11 @@ fn run<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
             "That workflow is already running; its report is posted here when it ends".into(),
         );
     }
-    let issues = problems(host, &current);
+    let values = run_values(host, &current, input)?;
+    let mut asked = current.clone();
+    asked.run_values = Some(values.clone());
+    let effective = with_run_values(&asked);
+    let issues = problems(host, &effective);
     if !issues.is_empty() {
         return Err(format!(
             "The workflow cannot run yet: {}",
@@ -898,6 +1074,13 @@ fn run<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
     if !current.enabled {
         return Err(NOT_ENABLED.into());
     }
+    // Outside the edit below: checking can take seconds, and the edit may run twice.
+    if !effective.requires.is_empty() {
+        let check = host.preflight(&effective);
+        if !check.all_met() {
+            return Err(missing_requirements(&check));
+        }
+    }
     host.update(|_, list| {
         let mut latest = find(&list, input)?.clone();
         if latest.needs_review {
@@ -907,6 +1090,8 @@ fn run<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
             return Err(NOT_ENABLED.into());
         }
         latest.run_requested = true;
+        // Only for the run that is about to start; never written to the stored input values.
+        latest.run_values = (!values.is_empty()).then(|| values.clone());
         Ok((replace(list, latest), ()))
     })?;
     host.request_check_now();
@@ -994,6 +1179,15 @@ fn resume_run<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, Strin
             "Only an interrupted run can be resumed; this one is {}",
             status.as_str().unwrap_or_default()
         ));
+    }
+    // What the run was made with and what the workflow asks now both have to be there.
+    let mut stored = run.definition.clone();
+    stored.requires = union_requires(&run.definition.requires, &current.requires);
+    if !stored.requires.is_empty() {
+        let check = host.preflight(&stored);
+        if !check.all_met() {
+            return Err(missing_requirements(&check));
+        }
     }
     host.update(|_, list| {
         let list = list

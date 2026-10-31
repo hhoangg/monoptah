@@ -2,8 +2,8 @@
 //! app: the Mono and the workflow guide read them.
 use super::condition::condition_syntax_problem;
 use super::model::{
-    is_node_id, Checkout, Cwd, Handle, Node, NodeId, NodeKind, Workflow, MAX_PARALLEL_LIMIT,
-    MAX_ROUNDS_LIMIT, MAX_TIMEOUT_MINUTES, SWITCH_DEFAULT,
+    is_node_id, Checkout, Cwd, Handle, Node, NodeId, NodeKind, Requirement, RequirementKind,
+    Workflow, MAX_PARALLEL_LIMIT, MAX_ROUNDS_LIMIT, MAX_TIMEOUT_MINUTES, SWITCH_DEFAULT,
 };
 use super::parse::{is_map_key, is_name};
 use super::template::{js_space, js_trim, shell_template_problems, template_vars};
@@ -864,6 +864,78 @@ fn schedule_problem(s: &Schedule) -> Option<String> {
     Schedule::from_cli(&input).err()
 }
 
+pub const REQUIRES_MAX: usize = 30;
+pub const REQUIREMENT_HINT_MAX: usize = 300;
+const MCP_NAME_MAX: usize = 128;
+
+/// `^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`: a command name, never a path or anything a shell reads.
+pub fn is_cli_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    (1..=64).contains(&b.len())
+        && b[0].is_ascii_alphanumeric()
+        && b[1..]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'+' | b'-'))
+}
+
+/// `^[A-Za-z_][A-Za-z0-9_]{0,127}$`
+pub fn is_env_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    (1..=128).contains(&b.len())
+        && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+        && b[1..]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
+
+/// An MCP server name is only compared with the names the harness reports, so spaces inside are
+/// fine ("docs server"); control characters and edge spaces are not.
+fn is_mcp_name(name: &str) -> bool {
+    (1..=MCP_NAME_MAX).contains(&name.chars().count())
+        && !name.chars().any(char::is_control)
+        && name.trim() == name
+}
+
+fn requirement_problem(r: &Requirement) -> Option<String> {
+    let name = &r.name;
+    let ok = match r.kind {
+        RequirementKind::Cli => is_cli_name(name),
+        RequirementKind::Env => is_env_name(name),
+        RequirementKind::Mcp => is_mcp_name(name),
+    };
+    if !ok {
+        let rule = match r.kind {
+            RequirementKind::Cli => {
+                "a command name of letters, digits, dots, underscores, plus signs and hyphens (max 64), with no path or spaces"
+            }
+            RequirementKind::Env => {
+                "letters, digits and underscores, not starting with a digit (max 128)"
+            }
+            RequirementKind::Mcp => {
+                "1 to 128 characters, no control characters, no leading or trailing space"
+            }
+        };
+        return Some(format!(
+            "Invalid {} requirement {name:?}: use {rule}",
+            r.kind.key()
+        ));
+    }
+    let hint = r.hint.as_deref()?;
+    if hint.chars().count() > REQUIREMENT_HINT_MAX {
+        return Some(format!(
+            "The hint of requirement {} {name} is too long (max {REQUIREMENT_HINT_MAX} characters)",
+            r.kind.key()
+        ));
+    }
+    if hint.chars().any(char::is_control) {
+        return Some(format!(
+            "The hint of requirement {} {name} must not contain control characters",
+            r.kind.key()
+        ));
+    }
+    None
+}
+
 pub fn validate_workflow(w: &Workflow) -> Vec<WorkflowIssue> {
     let mut c = Checker {
         w,
@@ -937,6 +1009,28 @@ pub fn validate_workflow(w: &Workflow) -> Vec<WorkflowIssue> {
         if !is_map_key(name) {
             c.add(
                 format!("Invalid input name \"{name}\": use letters, digits and underscores"),
+                None,
+            );
+        }
+    }
+
+    if w.requires.len() > REQUIRES_MAX {
+        c.add(
+            format!(
+                "Too many requirements ({}); a workflow may declare at most {REQUIRES_MAX}",
+                w.requires.len()
+            ),
+            None,
+        );
+    }
+    let mut seen_requirements: HashSet<(RequirementKind, &str)> = HashSet::new();
+    for r in &w.requires {
+        if let Some(problem) = requirement_problem(r) {
+            c.add(problem, None);
+        }
+        if !seen_requirements.insert((r.kind, r.name.as_str())) {
+            c.add(
+                format!("Duplicate requirement {} {:?}", r.kind.key(), r.name),
                 None,
             );
         }

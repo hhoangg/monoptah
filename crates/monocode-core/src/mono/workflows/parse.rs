@@ -2,7 +2,8 @@
 //! dropping it quietly would change what the workflow does, so the whole entry is left out.
 use super::model::{
     Checkout, Cwd, Decide, Edge, Handle, InputType, InputValue, LoopSpec, Node, NodeKind,
-    OutputField, OutputFieldType, Ui, Workflow, WorkflowInput, NODE_TYPES,
+    OutputField, OutputFieldType, Requirement, RequirementKind, Ui, Workflow, WorkflowInput,
+    NODE_TYPES,
 };
 use super::ordered::{Json, OrderedMap};
 use crate::mono::habits::Schedule;
@@ -284,6 +285,58 @@ fn parse_input_values(raw: Option<&Json>) -> OrderedMap<InputValue> {
     values
 }
 
+/// The `requires` list of a definition. Absent is an empty list. An entry that cannot be read
+/// is an error: a precondition dropped quietly would change what the workflow guards. A name
+/// with unsafe characters is well formed, so it is kept for validation to report.
+pub fn read_requires(raw: Option<&Json>) -> Result<Vec<Requirement>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let Json::Array(entries) = raw else {
+        return Err("requires must be a list".into());
+    };
+    let mut out = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let at = index + 1;
+        let Json::Object(fields) = entry else {
+            return Err(format!(
+                "requires entry {at} must be an object like {{cli: gh}}"
+            ));
+        };
+        let mut found = RequirementKind::ALL
+            .iter()
+            .filter(|kind| fields.contains_key(kind.key()));
+        let (Some(kind), None) = (found.next(), found.next()) else {
+            return Err(format!(
+                "requires entry {at} needs exactly one of cli, env or mcp"
+            ));
+        };
+        if let Some(extra) = fields
+            .keys()
+            .find(|key| *key != kind.key() && *key != "hint")
+        {
+            return Err(format!(
+                "requires entry {at} has an unknown field \"{extra}\"; use {} and an optional hint",
+                kind.key()
+            ));
+        }
+        let Some(name) = fields.get(kind.key()).and_then(Json::as_str) else {
+            return Err(format!("requires entry {at}: {} must be text", kind.key()));
+        };
+        let hint = match fields.get("hint") {
+            None => None,
+            Some(Json::String(hint)) => Some(hint.clone()),
+            Some(_) => return Err(format!("requires entry {at}: hint must be text")),
+        };
+        out.push(Requirement {
+            kind: *kind,
+            name: name.to_string(),
+            hint,
+        });
+    }
+    Ok(out)
+}
+
 pub fn parse_workflow(raw: &Json) -> Option<Workflow> {
     if !is_rec(raw) {
         return None;
@@ -300,6 +353,7 @@ pub fn parse_workflow(raw: &Json) -> Option<Workflow> {
         None => Some(Vec::new()),
     };
     let (nodes, mut edges) = (nodes?, edges?);
+    let requires = read_requires(raw.get("requires")).ok()?;
     drop_stray_handles(&nodes, &mut edges);
     let flag = |key: &str| raw.get(key) == Some(&Json::Bool(true));
     Some(Workflow {
@@ -308,6 +362,11 @@ pub fn parse_workflow(raw: &Json) -> Option<Workflow> {
         description: str_of(raw, "description"),
         inputs: parse_inputs(raw.get("inputs")),
         input_values: parse_input_values(raw.get("inputValues")),
+        requires,
+        run_values: raw
+            .get("runValues")
+            .filter(|v| is_rec(v))
+            .map(|v| parse_input_values(Some(v))),
         nodes,
         edges,
         // An entry that says nothing about being enabled stays paused.

@@ -194,3 +194,28 @@ pub const TICKET_JSON: &str = r#"{
   "enabled": true,
   "createdAt": 1
 }"#;
+
+/// A machine whose environment holds a secret: `TOKEN` is set in the process, `LOGIN_TOKEN` only
+/// in the login shell (whose raw output is noisy with the value), `MISSING` nowhere. The value is
+/// what a leak would carry; a preflight built on this probe must never repeat it.
+pub struct SecretProbe(pub &'static str);
+
+impl super::preflight::PreflightProbe for SecretProbe {
+    fn cli_found(&self, _: &str) -> bool {
+        false
+    }
+    fn env_process(&self, name: &str) -> bool {
+        name == "TOKEN"
+    }
+    fn env_login(&self, names: &[String]) -> Option<Vec<String>> {
+        // What a login shell would print, secret included, filtered the way the real probe does.
+        let raw = format!("{}\nLOGIN_TOKEN\n", self.0);
+        Some(super::preflight::names_in_output(&raw, names))
+    }
+    fn mcp_servers(&self, _: &[String]) -> Result<Vec<crate::mcp::McpConnection>, String> {
+        Err(format!("cannot list ({})", self.0))
+    }
+    fn mcp_statuses(&self, _: &str) -> Option<Vec<(String, String)>> {
+        None
+    }
+}

@@ -1791,10 +1791,15 @@ impl Element for InputElement {
                                     );
                                 }
                             }
-                            MentionIcon::Note => {
+                            MentionIcon::Note | MentionIcon::Workflow => {
                                 let _ = w.paint_svg(
                                     icon_bounds,
-                                    "note".into(),
+                                    if matches!(icon, MentionIcon::Note) {
+                                        "note"
+                                    } else {
+                                        "git-branch"
+                                    }
+                                    .into(),
                                     None,
                                     Default::default(),
                                     crate::theme::accent_color(),
@@ -1955,11 +1960,13 @@ mod tests {
         let asset = |token| match MentionIcon::of(token) {
             Some(MentionIcon::File(asset)) => asset.to_string(),
             Some(MentionIcon::Note) => "note".into(),
+            Some(MentionIcon::Workflow) => "git-branch".into(),
             None => String::new(),
         };
         assert_eq!(asset("@src/main.rs"), "mi/rust.svg");
         assert_eq!(asset("@\"docs/My Notes.md\""), "mi/markdown.svg");
         assert_eq!(asset("@note/todo"), "note");
+        assert_eq!(asset("@workflow/nightly"), "git-branch");
         assert_eq!(asset("/plan"), "");
     }
     #[::core::prelude::v1::test]

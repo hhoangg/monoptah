@@ -17,11 +17,17 @@ mod engine_tests;
 #[cfg(test)]
 mod fixtures;
 pub mod guide;
+pub mod mention;
+#[cfg(test)]
+mod mention_tests;
 pub mod model;
 pub mod models;
 pub mod ordered;
 pub mod output;
 pub mod parse;
+pub mod preflight;
+#[cfg(test)]
+mod preflight_tests;
 pub mod report;
 #[cfg(test)]
 mod report_tests;

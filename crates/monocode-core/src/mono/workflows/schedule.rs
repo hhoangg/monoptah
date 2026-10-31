@@ -71,6 +71,8 @@ pub fn after_claim(workflow: &Workflow, now: u64, run_id: Option<&str>) -> Workf
     let run_id = run_id.filter(|id| !id.is_empty());
     let mut next = workflow.clone();
     next.run_requested = false;
+    // The values were for the run that is being claimed now; they never carry to a later one.
+    next.run_values = None;
     // A stop asked for before a run started was meant for an earlier one. Moving the schedule
     // past a workflow whose run is still going must keep a stop written for that run.
     next.stop_requested = workflow.stop_requested && run_id.is_none();
@@ -132,6 +134,21 @@ mod tests {
             assert!(!claimed.stop_requested);
             assert_eq!(claimed.last_run_id.as_deref(), Some("run-1"));
             assert!(claimed.next_run_at.unwrap() > now());
+        }
+
+        #[test]
+        fn a_claim_clears_the_run_values_asked_for_that_run() {
+            let mut w = workflow();
+            w.run_requested = true;
+            let mut values = crate::mono::workflows::ordered::OrderedMap::new();
+            values.insert(
+                "n".to_string(),
+                crate::mono::workflows::model::InputValue::Number(1.0),
+            );
+            w.run_values = Some(values);
+            let claimed = after_claim(&w, now(), Some("run-1"));
+            assert!(claimed.run_values.is_none());
+            assert!(after_claim(&w, now(), None).run_values.is_none());
         }
 
         #[test]

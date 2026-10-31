@@ -362,6 +362,10 @@ fn run_now_asks_for_a_run_of_a_saved_board_and_is_off_while_unsaved(cx: &mut Tes
     let visual = &mut visual;
     do_with(&s, visual, |m, cx| m.board_run_now(cx));
     visual.run_until_parked();
+    // The board has inputs, so the Run dialog confirms them first.
+    assert!(s.manager.read_with(visual, |m, _| m.wf.gate.is_some()));
+    assert!(!stored_first(&s).run_requested);
+    click(visual, "wf-gate-submit");
     // Asked for without a refusal; the runner may already have taken the request.
     assert_eq!(page_notice(&s, visual), None);
     let asked = stored_first(&s).run_requested

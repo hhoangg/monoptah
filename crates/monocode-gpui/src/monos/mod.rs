@@ -1184,6 +1184,15 @@ impl Monos {
             cx.notify();
             return true;
         }
+        // The Run dialog is a window-level modal, so Escape reaches it here: the Workspace
+        // binding runs before any key handler of the dialog itself.
+        if self.wf_gate_shown() {
+            self.wf_gate_close(cx);
+            if let Some(chat) = self.chat() {
+                window.focus(&chat.read(cx).input.focus_handle(cx), cx);
+            }
+            return true;
+        }
         if self.settings.take().is_none() {
             return false;
         }

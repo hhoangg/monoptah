@@ -343,6 +343,25 @@ impl Monos {
                 )
                 .into_any_element(),
         );
+        if !preview.workflow.requires.is_empty() {
+            out.push(
+                section("Needs on this machine", None)
+                    .id("mono-workflow-requires")
+                    .debug_selector(|| "mono-workflow-requires".into())
+                    .children(preview.workflow.requires.iter().map(|r| {
+                        labelled(
+                            format!("{} {}", r.kind.key(), visible(&r.name)),
+                            plain(
+                                &r.hint
+                                    .as_deref()
+                                    .map_or_else(|| "No hint.".to_string(), visible),
+                            ),
+                        )
+                    }))
+                    .child(hint("Only looked up by name. Nothing here is run."))
+                    .into_any_element(),
+            );
+        }
         let open = !self.wf.prompts_closed;
         let toggle = div()
             .id("mono-workflow-prompts-toggle")
