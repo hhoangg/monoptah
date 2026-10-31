@@ -210,6 +210,7 @@ pub(super) fn model_in(
             name: "Ana".into(),
             email: "ana@example.com".into(),
         }),
+        color_overrides: Default::default(),
     })
 }
 
@@ -535,6 +536,7 @@ fn window_fake(raw: RawData) -> Arc<Fake> {
         raw,
         covered: true,
         has_gaps: false,
+        missing: vec![],
         missing_commits: 0,
         synced_at: Some(start_of_tests().timestamp() - 300),
         coverage_head: Some("h1".into()),

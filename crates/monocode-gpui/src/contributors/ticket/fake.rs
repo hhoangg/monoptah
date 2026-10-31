@@ -1,7 +1,7 @@
 //! A fake `TicketBackend` and builders for the Ticket tab's tests. Nothing here
 //! reaches ClickUp, `claude` or the user's files.
 use super::backend::{Named, Patch, TicketBackend};
-use crate::contributors::data::Clock;
+use crate::contributors::{backend::ColorOverrides, data::Clock};
 use chrono::{DateTime, Local, SecondsFormat, TimeZone, Utc};
 use monocode_core::contributors::{
     model::period::{PeriodKind, PeriodPick},
@@ -55,6 +55,23 @@ pub(super) enum Call {
         note: Option<String>,
     },
     Patch(Patch),
+    /// The previous period read from the store: never a fetch.
+    Previous {
+        workspace: String,
+        from: String,
+        to: String,
+    },
+    /// A year of tickets read from the store: never a fetch.
+    History {
+        workspace: String,
+        from: String,
+        to: String,
+    },
+    SaveChartKind(String),
+    SaveColors {
+        workspace: String,
+        colors: ColorOverrides,
+    },
 }
 
 /// Answers in order, then the default.
@@ -90,11 +107,17 @@ pub(super) struct State {
     pub(super) assess: Script<Result<u64, String>>,
     pub(super) status: Script<Result<TicketJobStatus, String>>,
     pub(super) covered: Script<Result<bool, String>>,
+    /// What the store has of the previous period; `None` is "not covered".
+    pub(super) previous: Script<Result<Option<Vec<TicketRecord>>, String>>,
     pub(super) overridden: Script<Result<(), String>>,
     /// Runs inside `fetch` with the job id about to be answered.
     pub(super) on_fetch: Option<OnFetch>,
     pub(super) stored: TicketBoardSettings,
     pub(super) range: PeriodPick,
+    /// Whether the store holds the whole year the member page reads.
+    pub(super) history_covered: bool,
+    pub(super) chart_kind: Option<String>,
+    pub(super) colors: std::collections::BTreeMap<String, ColorOverrides>,
 }
 
 pub(super) struct TicketFake(Mutex<State>);
@@ -246,6 +269,7 @@ impl TicketFake {
             assess: Script::new(Ok(1)),
             status: Script::new(Ok(idle())),
             covered: Script::new(Ok(false)),
+            previous: Script::new(Ok(None)),
             overridden: Script::new(Ok(())),
             on_fetch: None,
             stored: settings(Some(scope()), 100.),
@@ -253,6 +277,9 @@ impl TicketFake {
                 kind: PeriodKind::Month,
                 id: None,
             },
+            history_covered: true,
+            chart_kind: None,
+            colors: Default::default(),
         })))
     }
 
@@ -274,6 +301,10 @@ impl TicketFake {
 
     pub(super) fn loads(&self) -> usize {
         self.count(|c| matches!(c, Call::Load { .. }))
+    }
+
+    pub(super) fn previous_reads(&self) -> usize {
+        self.count(|c| matches!(c, Call::Previous { .. }))
     }
 
     pub(super) fn estimates(&self) -> Vec<Vec<String>> {
@@ -380,6 +411,40 @@ impl TicketBackend for TicketFake {
             s.covered.next()
         })
     }
+    fn previous(
+        &self,
+        scope: &WorkspaceScope,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<Vec<TicketRecord>>, String> {
+        self.with(|s| {
+            s.calls.push(Call::Previous {
+                workspace: scope.workspace_id.clone(),
+                from: from.into(),
+                to: to.into(),
+            });
+            s.previous.next()
+        })
+    }
+    fn history(
+        &self,
+        scope: &WorkspaceScope,
+        from: &str,
+        to: &str,
+    ) -> Result<(Vec<TicketRecord>, bool), String> {
+        self.with(|s| {
+            s.calls.push(Call::History {
+                workspace: scope.workspace_id.clone(),
+                from: from.into(),
+                to: to.into(),
+            });
+            // What the store holds is what a load answers.
+            s.load
+                .default
+                .clone()
+                .map(|tickets| (tickets, s.history_covered))
+        })
+    }
     fn set_override(
         &self,
         ticket_id: &str,
@@ -417,6 +482,27 @@ impl TicketBackend for TicketFake {
             }
             s.stored.clone()
         })
+    }
+    fn load_chart_kind(&self) -> Option<String> {
+        self.with(|s| s.chart_kind.clone())
+    }
+    fn save_chart_kind(&self, kind: &str) {
+        self.with(|s| {
+            s.calls.push(Call::SaveChartKind(kind.into()));
+            s.chart_kind = Some(kind.into());
+        });
+    }
+    fn load_colors(&self, workspace_id: &str) -> ColorOverrides {
+        self.with(|s| s.colors.get(workspace_id).cloned().unwrap_or_default())
+    }
+    fn save_colors(&self, workspace_id: &str, colors: &ColorOverrides) {
+        self.with(|s| {
+            s.calls.push(Call::SaveColors {
+                workspace: workspace_id.into(),
+                colors: colors.clone(),
+            });
+            s.colors.insert(workspace_id.into(), colors.clone());
+        });
     }
 }
 

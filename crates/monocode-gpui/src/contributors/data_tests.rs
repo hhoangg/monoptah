@@ -3,7 +3,7 @@
 //! and the clock is a cell the tests move. Nothing here touches a real
 //! repository, the network or the user's files.
 use super::{
-    backend::Backend,
+    backend::{Backend, ColorOverrides},
     data::{Clock, Snapshot, Status, SyncState, origin_note_text},
     github::GithubView,
     jobs::SyncJobs,
@@ -85,6 +85,8 @@ pub(super) struct State {
     pub(super) user: Script<Result<GitUser, String>>,
     pub(super) first: Script<Result<Option<String>, String>>,
     pub(super) load: Script<Result<LoadResponse, String>>,
+    /// The answer to the Activity card's year read, when it differs from `load`.
+    pub(super) year_load: Option<Result<LoadResponse, String>>,
     pub(super) estimate: Script<Result<Estimate, String>>,
     pub(super) write: Script<Result<(), String>>,
     pub(super) fetch: Script<Result<FetchOutcome, String>>,
@@ -95,6 +97,9 @@ pub(super) struct State {
     pub(super) listed: Vec<SyncEvent>,
     pub(super) saved_range: Option<String>,
     pub(super) saved_merge: Option<String>,
+    pub(super) saved_chart_kind: Option<String>,
+    /// The colors saved per project.
+    pub(super) saved_colors: std::collections::BTreeMap<String, ColorOverrides>,
 }
 
 pub(super) struct Fake(Mutex<State>);
@@ -119,6 +124,7 @@ impl Fake {
             })),
             first: Script::new(Ok(Some(first_commit().to_rfc3339()))),
             load: Script::new(load_ok(synced("h1"))),
+            year_load: None,
             estimate: Script::new(Ok(ESTIMATE)),
             write: Script::new(Ok(())),
             fetch: Script::new(Ok(FetchOutcome::Skipped)),
@@ -128,6 +134,8 @@ impl Fake {
             listed: Vec::new(),
             saved_range: None,
             saved_merge: None,
+            saved_chart_kind: None,
+            saved_colors: Default::default(),
         })))
     }
 
@@ -147,6 +155,15 @@ impl Fake {
         self.calls()
             .into_iter()
             .filter(|c| matches!(c, Call::Load { .. }))
+            .collect()
+    }
+
+    /// The loads of the page's period: the Activity card's year read is left out.
+    pub(super) fn period_loads(&self) -> Vec<Call> {
+        let (_, year, _) = super::activity::window(&start_of_tests());
+        self.loads()
+            .into_iter()
+            .filter(|c| !matches!(c, Call::Load { since, .. } if *since == year))
             .collect()
     }
 
@@ -226,7 +243,11 @@ impl Backend for Fake {
                 since: since.into(),
                 until: until.into(),
             });
-            s.load.next()
+            let (_, year, _) = super::activity::window(&start_of_tests());
+            match &s.year_load {
+                Some(answer) if since == year => answer.clone(),
+                _ => s.load.next(),
+            }
         })
     }
     fn estimate(
@@ -298,6 +319,20 @@ impl Backend for Fake {
     }
     fn save_merge(&self, merge: bool) {
         self.with(|s| s.saved_merge = Some(merge.to_string()));
+    }
+    fn load_chart_kind(&self) -> Option<String> {
+        self.with(|s| s.saved_chart_kind.clone())
+    }
+    fn save_chart_kind(&self, kind: &str) {
+        self.with(|s| s.saved_chart_kind = Some(kind.into()));
+    }
+    fn load_colors(&self, project: &str) -> ColorOverrides {
+        self.with(|s| s.saved_colors.get(project).cloned().unwrap_or_default())
+    }
+    fn save_colors(&self, project: &str, colors: &ColorOverrides) {
+        self.with(|s| {
+            s.saved_colors.insert(project.into(), colors.clone());
+        });
     }
 }
 
@@ -377,6 +412,7 @@ pub(super) fn synced(head: &str) -> LoadResponse {
         raw: raw(head, &start_of_tests()),
         covered: true,
         has_gaps: false,
+        missing: vec![],
         missing_commits: 0,
         synced_at: Some(start_of_tests().timestamp() - 300),
         coverage_head: Some(head.into()),
@@ -393,6 +429,7 @@ pub(super) fn unsynced() -> LoadResponse {
         raw,
         covered: false,
         has_gaps: true,
+        missing: vec![],
         missing_commits: 40,
         synced_at: None,
         coverage_head: None,

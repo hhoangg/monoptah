@@ -360,6 +360,8 @@ impl TicketView {
     }
 
     fn ticket_row(&self, entry: &MemberTicket, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg(test)]
+        super::built(2);
         let ticket = &entry.ticket;
         let id = ticket.id.clone();
         let edited = ticket.override_level.is_some();

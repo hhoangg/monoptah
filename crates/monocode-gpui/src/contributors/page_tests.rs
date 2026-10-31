@@ -50,7 +50,15 @@ pub(super) fn open(
     let window = cx
         .update(|cx| {
             let jobs = jobs.clone();
-            cx.open_window(WindowOptions::default(), move |_, cx| {
+            // Tall, so the whole Stats page is on screen: clicks need visible targets.
+            let options = WindowOptions {
+                window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                    gpui::point(gpui::px(0.), gpui::px(0.)),
+                    gpui::size(gpui::px(1024.), gpui::px(2400.)),
+                ))),
+                ..Default::default()
+            };
+            cx.open_window(options, move |_, cx| {
                 cx.new(|cx| ContributorsPage::new(jobs, cx).with_clock(clock, cx))
             })
         })
@@ -122,7 +130,7 @@ impl Ui {
         v.read(|cx| view.read(cx).snapshot(cx))
     }
 
-    fn page<R>(
+    pub(super) fn page<R>(
         &self,
         v: &mut VisualTestContext,
         f: impl FnOnce(&mut ContributorsPage, &mut gpui::Context<ContributorsPage>) -> R,
@@ -132,7 +140,7 @@ impl Ui {
         out
     }
 
-    fn emit(&self, v: &mut VisualTestContext, event: SyncEvent) {
+    pub(super) fn emit(&self, v: &mut VisualTestContext, event: SyncEvent) {
         self.fake.list(&event);
         self.jobs.update(v, |jobs, cx| jobs.apply_sync(event, cx));
         settle(v);
@@ -441,7 +449,15 @@ fn shows_a_loading_state_before_the_data_arrives(cx: &mut TestAppContext) {
     let jobs = cx.update(|cx| cx.new(SyncJobs::new));
     let window = cx
         .update(|cx| {
-            cx.open_window(WindowOptions::default(), move |_, cx| {
+            // Tall, so the whole Stats page is on screen: clicks need visible targets.
+            let options = WindowOptions {
+                window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                    gpui::point(gpui::px(0.), gpui::px(0.)),
+                    gpui::size(gpui::px(1024.), gpui::px(2400.)),
+                ))),
+                ..Default::default()
+            };
+            cx.open_window(options, move |_, cx| {
                 let jobs = jobs.clone();
                 cx.new(|cx| {
                     let mut view = GithubView::new("/work/alpha".into(), jobs, clock, cx);
@@ -535,7 +551,7 @@ fn shows_the_load_error_with_a_retry_that_reloads(cx: &mut TestAppContext) {
     click(&mut v, "contributors-load-error-action");
     assert!(!shown(&mut v, "contributors-load-error"));
     assert!(shown(&mut v, "contributors-panel"));
-    assert_eq!(ui.fake.loads().len(), 2);
+    assert_eq!(ui.fake.period_loads().len(), 2);
 }
 
 #[gpui::test]
@@ -641,7 +657,7 @@ fn without_a_branch_list_the_select_offers_only_the_branch_shown(cx: &mut TestAp
 fn refresh_reloads_the_synced_data(cx: &mut TestAppContext) {
     let (ui, mut v) = github(cx, Fake::new());
     click(&mut v, "contributors-refresh");
-    assert_eq!(ui.fake.loads().len(), 2);
+    assert_eq!(ui.fake.period_loads().len(), 2);
 }
 
 // ---- Ask Agent ------------------------------------------------------------

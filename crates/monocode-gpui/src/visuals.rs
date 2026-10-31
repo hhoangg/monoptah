@@ -15,8 +15,10 @@ use std::{
     rc::Rc,
 };
 
+pub(crate) mod calendar;
 mod charts;
 pub(crate) mod dither;
+pub(crate) mod rhythm;
 mod scene;
 #[cfg(test)]
 mod tests;

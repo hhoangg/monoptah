@@ -9,7 +9,7 @@ use super::period::{
 };
 use super::types::ContributorsConfig;
 use super::{js_cmp, js_round, js_trim, locale_cmp, serialize_number, OrderedMap};
-use crate::contributors::{GitIdentity, RawCommit, RawData, RawFile, RawPr};
+use crate::contributors::{GitIdentity, RawCommit, RawData, RawFile, RawPr, RawReview};
 use chrono::{DateTime, Local};
 use regex::Regex;
 use serde::ser::SerializeMap;
@@ -593,6 +593,57 @@ pub fn attribute_prs<'a>(
     out
 }
 
+/// Who a review counts for: the reviewer, unless a bot, the PR's author or
+/// anyone who shares in the PR's credit (a self review is worth nothing).
+fn review_credit(
+    ctx: &Ctx,
+    pr_credits: &HashMap<String, Credit>,
+    pr: &RawPr,
+    review: &RawReview,
+) -> Option<String> {
+    if !is_human(ctx.config, &review.reviewer) {
+        return None;
+    }
+    let reviewer_id = ctx.resolver.person_of(&review.reviewer);
+    let owner_id = pr_credits.get(&pr.id).and_then(Credit::owner);
+    let sharing = owner_id.is_some_and(|owner| {
+        shares_of(ctx, pr, owner)
+            .iter()
+            .any(|(id, _)| *id == reviewer_id)
+    });
+    (!sharing && reviewer_id != ctx.resolver.person_of(&pr.author)).then_some(reviewer_id)
+}
+
+#[derive(Clone, Debug)]
+pub struct AttributedReview<'a> {
+    pub review: &'a RawReview,
+    pub person_id: String,
+}
+
+/// The reviews that count, for whom: the same rule `score_period` applies to
+/// `reviewed_prs`. Reviews of PRs missing from the data, and all reviews
+/// without GitHub, are left out.
+pub fn attribute_reviews<'a>(
+    raw: &'a RawData,
+    config: &ContributorsConfig,
+    resolver: &Resolver,
+) -> Vec<AttributedReview<'a>> {
+    if !raw.gh_available {
+        return vec![];
+    }
+    let ctx = make_ctx(raw, config, resolver);
+    let pr_credits = credit_prs(&ctx, &raw.prs);
+    let pr_by_id: HashMap<&str, &RawPr> = raw.prs.iter().map(|pr| (pr.id.as_str(), pr)).collect();
+    raw.reviews
+        .iter()
+        .filter_map(|review| {
+            let pr = pr_by_id.get(review.pr_id.as_str())?;
+            let person_id = review_credit(&ctx, &pr_credits, pr, review)?;
+            Some(AttributedReview { review, person_id })
+        })
+        .collect()
+}
+
 struct Acc {
     person_id: String,
     delivery: f64,
@@ -848,19 +899,9 @@ pub fn score_period(
             let Some(pr) = pr_by_id.get(review.pr_id.as_str()) else {
                 continue;
             };
-            if !is_human(config, &review.reviewer) {
+            let Some(reviewer_id) = review_credit(&ctx, &pr_credits, pr, review) else {
                 continue;
-            }
-            let reviewer_id = resolver.person_of(&review.reviewer);
-            let owner_id = pr_credits.get(&pr.id).and_then(Credit::owner);
-            let sharing = owner_id.is_some_and(|owner| {
-                shares_of(&ctx, pr, owner)
-                    .iter()
-                    .any(|(id, _)| *id == reviewer_id)
-            });
-            if sharing || reviewer_id == resolver.person_of(&pr.author) {
-                continue;
-            }
+            };
             note(&mut first_activity, &reviewer_id, &review.submitted_at);
             if !is_in_period(period, &review.submitted_at) {
                 continue;

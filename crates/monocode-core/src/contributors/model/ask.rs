@@ -920,6 +920,7 @@ mod tests {
                     name: "Ana".into(),
                     email: "ana@example.com".into(),
                 }),
+                color_overrides: Default::default(),
             })
         }
 

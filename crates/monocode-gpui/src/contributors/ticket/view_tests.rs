@@ -6,16 +6,19 @@ use super::{
     TicketEvent,
     backend::TicketBackend,
     fake::{
-        Call, TicketFake, assessment, clock, event, now, scope, settings, ticket, ticket_with, user,
+        Call, TicketFake, assessment, at, clock, event, now, scope, settings, ticket, ticket_with,
+        user,
     },
-    state::{BodyState, Spaces, TicketView},
+    state::{BodyState, Comparison, Spaces, TicketView},
 };
 use crate::{
     contributors::{
         ContributorsPage, Event, Tab,
+        chart::{ChartKind, ChartView},
         data_tests::Fake as GithubFake,
         jobs::SyncJobs,
         page_tests::{click, open as open_page, settle, shown},
+        stats_tests::right_click,
     },
     input,
 };
@@ -864,11 +867,11 @@ fn it_says_so_when_no_ticket_closed_in_the_period(cx: &mut TestAppContext) {
 fn a_member_expands_to_their_tickets_and_collapses_again(cx: &mut TestAppContext) {
     let mut view = open(cx, with_four);
     assert!(!view.shown("ticket-row-t1"));
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     assert!(view.shown("ticket-row-t1"));
     assert!(view.shown("ticket-row-t2"));
     assert!(!view.shown("ticket-row-t3"), "another member's ticket");
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     assert!(!view.shown("ticket-row-t1"));
 }
 
@@ -887,7 +890,7 @@ fn an_active_only_member_has_no_delivered_tickets(cx: &mut TestAppContext) {
         view.shown("ticket-leaderboard"),
         "listed for the work in progress"
     );
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     assert!(view.shown("ticket-tickets-a"));
     assert!(!view.shown("ticket-reassess"));
 }
@@ -895,7 +898,7 @@ fn an_active_only_member_has_no_delivered_tickets(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_reasons_of_a_criterion_open_and_close(cx: &mut TestAppContext) {
     let mut view = open(cx, with_four);
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     assert!(!view.shown("ticket-reasons-t1"));
     view.click("ticket-criterion-t1-ambiguity");
     assert!(view.shown("ticket-reasons-t1"));
@@ -908,7 +911,7 @@ fn the_reasons_of_a_criterion_open_and_close(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_level_is_overridden_from_the_set_level_menu(cx: &mut TestAppContext) {
     let mut view = open(cx, with_four);
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     view.scroll_tickets_right();
     view.click("ticket-level-t1");
     assert!(view.shown("menu-action-ai"));
@@ -932,7 +935,7 @@ fn ai_level_clears_an_override(cx: &mut TestAppContext) {
             })])
         })
     });
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     view.scroll_tickets_right();
     view.click("ticket-level-t1");
     view.click("menu-action-ai");
@@ -953,7 +956,7 @@ fn the_note_is_saved_on_blur_only_for_an_edited_ticket(cx: &mut TestAppContext) 
             ])
         })
     });
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     view.scroll_tickets_right();
     let note = |view: &mut View, id: &str| {
         let root = view.window.root(&mut view.v).unwrap();
@@ -992,7 +995,7 @@ fn escape_in_a_note_field_leaves_it_and_saves_the_note(cx: &mut TestAppContext) 
             })])
         })
     });
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     view.scroll_tickets_right();
     let root = view.window.root(&mut view.v).unwrap();
     let input = view.v.read(|cx| root.read(cx).ui.notes["t1"].input.clone());
@@ -1019,7 +1022,7 @@ fn choosing_a_level_sends_the_note_typed_so_far(cx: &mut TestAppContext) {
             })])
         })
     });
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     view.scroll_tickets_right();
     let root = view.window.root(&mut view.v).unwrap();
     let input = view.v.read(|cx| root.read(cx).ui.notes["t1"].input.clone());
@@ -1039,7 +1042,7 @@ fn choosing_a_level_sends_the_note_typed_so_far(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_selected_tickets_are_reassessed_and_the_selection_cleared(cx: &mut TestAppContext) {
     let mut view = open(cx, with_four);
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     // Nothing selected: off.
     view.click("ticket-reassess");
     assert_eq!(view.fake.count(|c| matches!(c, Call::Assess { .. })), 0);
@@ -1056,7 +1059,7 @@ fn the_selected_tickets_are_reassessed_and_the_selection_cleared(cx: &mut TestAp
 fn reassess_selected_is_off_while_a_job_runs(cx: &mut TestAppContext) {
     let mut view = open(cx, with_four);
     view.emit(running("assess", 1, 0));
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     view.click("ticket-select-t1");
     view.click("ticket-reassess");
     assert_eq!(view.fake.count(|c| matches!(c, Call::Assess { .. })), 0);
@@ -1065,10 +1068,10 @@ fn reassess_selected_is_off_while_a_job_runs(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_selection_does_not_survive_collapsing_the_member(cx: &mut TestAppContext) {
     let mut view = open(cx, with_four);
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
     view.click("ticket-select-t1");
-    view.click("ticket-member-a");
-    view.click("ticket-member-a");
+    view.click("ticket-expand-a");
+    view.click("ticket-expand-a");
     view.read(|v| assert!(v.ui.selected.is_empty()));
 }
 
@@ -1100,7 +1103,7 @@ fn every_member_row_has_an_exclude_button_that_takes_the_member_off_without_a_re
 #[gpui::test]
 fn excluding_a_member_collapses_their_open_row(cx: &mut TestAppContext) {
     let mut view = open(cx, with_four);
-    view.click("ticket-member-b");
+    view.click("ticket-expand-b");
     assert!(view.shown("ticket-tickets-b"));
     view.click("ticket-exclude-b");
     assert!(!view.shown("ticket-tickets-b"));
@@ -1345,4 +1348,737 @@ fn the_page_clock_reaches_the_ticket_tab(cx: &mut TestAppContext) {
     let ticket = v.read(|cx| page_view.read(cx).ticket.clone());
     let expected = crate::contributors::data_tests::start_of_tests();
     assert_eq!(v.read(|cx| ticket.read(cx).now), expected);
+}
+
+// ---- the overview: cards, trend, difficulty map ----------------------------------------------------
+
+fn trend_chart(view: &mut View) -> gpui::Entity<ChartView> {
+    let root = view.window.root(&mut view.v).unwrap();
+    view.v.read(|cx| {
+        root.read(cx)
+            .overview
+            .chart
+            .clone()
+            .expect("the trend chart")
+    })
+}
+
+/// A ticket Alpha closed in September, which the store holds.
+fn september(id: &str) -> TicketRecord {
+    ticket_with(id, |t| {
+        t.done_at = Some(at(9, 5, 10));
+        t.updated_at = at(9, 5, 10);
+        t.override_level = Some("S".into());
+    })
+}
+
+/// `n` members with one scored ticket each.
+fn crowd(n: usize) -> Vec<TicketRecord> {
+    (1..=n)
+        .map(|i| {
+            ticket_with(&format!("c{i}"), |t| {
+                t.assignees = vec![user(&format!("m{i}"), &format!("Member {i}"))];
+                t.override_level = Some(["XS", "S", "M", "L", "XL"][i % 5].into());
+            })
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn the_board_opens_with_cards_a_trend_and_a_difficulty_map(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    for selector in [
+        "ticket-stats",
+        "ticket-stat-delivered",
+        "ticket-stat-points",
+        "ticket-stat-scored",
+        "ticket-stat-median",
+        "ticket-trend-chart",
+        "ticket-trend-legend-0",
+        "ticket-levels",
+        "ticket-levels-row-a",
+        "ticket-levels-a-S",
+        "ticket-levels-row-b",
+        "ticket-levels-row-unassigned",
+        "ticket-leaderboard",
+    ] {
+        assert!(view.shown(selector), "{selector} is drawn");
+    }
+}
+
+#[gpui::test]
+fn nothing_delivered_shows_no_cards_chart_or_map(cx: &mut TestAppContext) {
+    let mut view = open(cx, |fake| fake.with(|s| s.load.default = Ok(vec![])));
+    for selector in ["ticket-stats", "ticket-trend-chart", "ticket-levels"] {
+        assert!(!view.shown(selector), "{selector} is not drawn");
+    }
+}
+
+#[gpui::test]
+fn tickets_not_scored_yet_are_flagged_on_the_card(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    assert!(view.shown("ticket-stat-scored-flag"));
+    let mut all = open(cx, |fake| {
+        fake.with(|s| {
+            s.load.default = Ok(vec![ticket_with("x", |t| {
+                t.assessment = Some(assessment(2))
+            })])
+        })
+    });
+    assert!(!all.shown("ticket-stat-scored-flag"));
+}
+
+#[gpui::test]
+fn the_unassigned_row_of_the_map_has_counts_and_no_points(cx: &mut TestAppContext) {
+    let mut view = open(cx, |fake| {
+        fake.with(|s| {
+            s.load.default = Ok(vec![
+                ticket_with("u1", |t| {
+                    t.assignees.clear();
+                    t.override_level = Some("M".into());
+                }),
+                ticket_with("u2", |t| t.assignees.clear()),
+            ])
+        })
+    });
+    assert!(view.shown("ticket-levels-row-unassigned"));
+    view.read(|v| {
+        let row = v.derived.matrix.last().unwrap();
+        assert!(row.unassigned);
+        assert_eq!((row.total.delivered, row.total.scored), (2, 1));
+        assert!(row.cells.iter().all(|c| c.points == 0.0));
+        assert_eq!(row.cells[2].delivered, 1);
+    });
+}
+
+#[gpui::test]
+fn a_previous_period_in_the_store_makes_the_cards_say_how_they_moved(cx: &mut TestAppContext) {
+    let mut view = open(cx, |fake| {
+        fake.with(|s| s.previous.default = Ok(Some(vec![september("p1")])))
+    });
+    assert!(!view.shown("ticket-comparison-note"));
+    view.read(|v| match &v.derived.comparison {
+        Comparison::Ready { stats, against, .. } => {
+            assert_eq!(stats.delivered, 1);
+            assert_eq!(against, "the same days of Sep 2026");
+        }
+        other => panic!("{other:?}"),
+    });
+}
+
+#[gpui::test]
+fn a_previous_period_the_store_lacks_gets_a_note_and_no_fetch_of_its_own(cx: &mut TestAppContext) {
+    let mut view = open(cx, |_| {});
+    assert!(view.shown("ticket-comparison-note"));
+    // The window on screen is fetched, as before; the previous one never.
+    let (from, _) = view.read(|v| v.window());
+    let fetched: Vec<String> = view
+        .fake
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Fetch { from, .. } => Some(from),
+            _ => None,
+        })
+        .collect();
+    assert!(!fetched.is_empty());
+    assert!(fetched.iter().all(|f| *f == from), "{fetched:?}");
+    assert_eq!(view.fake.previous_reads(), 1);
+}
+
+#[gpui::test]
+fn the_trend_has_a_legend_of_five_members_and_others(cx: &mut TestAppContext) {
+    let mut view = open(cx, |fake| fake.with(|s| s.load.default = Ok(crowd(8))));
+    let chart = trend_chart(&mut view);
+    let series = view.v.read(|cx| chart.read(cx).data.series.len());
+    assert_eq!(series, 6);
+    for n in 0..6 {
+        assert!(view.shown(sel(format!("ticket-trend-legend-{n}"))));
+    }
+    assert!(!view.shown("ticket-trend-legend-6"));
+    let last = view.v.read(|cx| chart.read(cx).data.series[5].id.clone());
+    assert_eq!(last, "others");
+    // Others has no color button; a member has one.
+    assert!(!view.shown("ticket-trend-legend-5-color"));
+    assert!(view.shown("ticket-trend-legend-0-color"));
+}
+
+#[gpui::test]
+fn a_legend_click_focuses_a_member_and_a_second_lets_go(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    let chart = trend_chart(&mut view);
+    view.click("ticket-trend-legend-0");
+    assert_eq!(view.v.read(|cx| chart.read(cx).focus.len()), 1);
+    view.click("ticket-trend-legend-0");
+    assert!(view.v.read(|cx| chart.read(cx).focus.is_empty()));
+}
+
+#[gpui::test]
+fn the_chart_type_is_the_apps_and_a_pick_is_saved(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    let chart = trend_chart(&mut view);
+    assert_eq!(view.v.read(|cx| chart.read(cx).kind), ChartKind::Line);
+    for kind in ["line", "cumulative", "bars"] {
+        assert!(view.shown(sel(format!("contributors-chart-kind-{kind}"))));
+    }
+    view.click("contributors-chart-kind-bars");
+    assert_eq!(view.v.read(|cx| chart.read(cx).kind), ChartKind::Bars);
+    assert_eq!(
+        view.fake.with(|s| s.chart_kind.clone()).as_deref(),
+        Some("bars")
+    );
+    let prefs = view.read(|v| v.chart_prefs.clone());
+    assert_eq!(view.v.read(|cx| prefs.read(cx).kind), ChartKind::Bars);
+}
+
+/// A frame as a pointer move causes it: no refresh, so cached views are replayed
+/// (`settle` refreshes, which draws everything afresh).
+fn frame(view: &mut View) {
+    view.v.run_until_parked();
+    view.v.update(|window, cx| window.draw(cx).clear(cx));
+    view.v.run_until_parked();
+}
+
+fn chart_len(view: &mut View) -> usize {
+    let chart = trend_chart(view);
+    view.v.read(|cx| chart.read(cx).data.buckets.len())
+}
+
+/// Builds of the tab, of leaderboard rows and of ticket rows so far.
+fn built() -> [usize; 3] {
+    super::BUILT.with(|b| b.get())
+}
+
+#[gpui::test]
+fn the_pointer_moves_the_chart_hover_without_building_the_rows_again(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    // A member's tickets open, so both kinds of row are on screen.
+    view.click("ticket-expand-a");
+    assert!(view.shown("ticket-row-t1"));
+    let chart = trend_chart(&mut view);
+    let bounds = view.v.debug_bounds("ticket-trend-chart").unwrap();
+    let at = |x: f32| {
+        gpui::point(
+            bounds.origin.x + bounds.size.width * x,
+            bounds.origin.y + bounds.size.height * 0.5,
+        )
+    };
+    // Frames that measure the parts, then the hover.
+    frame(&mut view);
+    frame(&mut view);
+    let before = built();
+    for x in [0.01, 0.99] {
+        view.v.simulate_mouse_move(at(x), None, Default::default());
+        frame(&mut view);
+        assert_eq!(
+            view.v.read(|cx| chart.read(cx).hover),
+            Some(if x < 0.5 { 0 } else { chart_len(&mut view) - 1 })
+        );
+    }
+    view.v.simulate_mouse_move(
+        gpui::point(gpui::px(1.), gpui::px(1.)),
+        None,
+        Default::default(),
+    );
+    frame(&mut view);
+    assert_eq!(view.v.read(|cx| chart.read(cx).hover), None);
+    let after = built();
+    assert_eq!(after[1], before[1], "no leaderboard row was built again");
+    assert_eq!(after[2], before[2], "no ticket row was built again");
+    // The counter is live: a change of the tab does build the rows.
+    view.click("ticket-expand-b");
+    assert!(built()[1] > after[1]);
+}
+
+#[gpui::test]
+fn a_color_picked_in_the_legend_is_saved_for_the_workspace(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    right_click(&mut view.v, "ticket-trend-legend-0");
+    assert!(view.shown("ticket-trend-palette-3"));
+    view.click("ticket-trend-palette-3");
+    let saved = view.fake.calls().into_iter().find_map(|c| match c {
+        Call::SaveColors { workspace, colors } => Some((workspace, colors)),
+        _ => None,
+    });
+    let (workspace, colors) = saved.expect("a save");
+    assert_eq!(workspace, "w1");
+    assert_eq!(colors.len(), 1);
+    assert_eq!(
+        colors.values().next().copied(),
+        Some(monocode_core::contributors::model::palette::PERSON_COLORS[3])
+    );
+}
+
+// ---- a member's page ---------------------------------------------------------------------------------
+
+fn detail_of(view: &mut View) -> Option<String> {
+    view.read(|v| v.detail.clone())
+}
+
+#[gpui::test]
+fn a_row_opens_the_members_page_in_place_of_the_board(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    view.click("ticket-board-row-a");
+    assert_eq!(detail_of(&mut view), Some("a".into()));
+    for selector in [
+        "ticket-detail",
+        "ticket-detail-back",
+        "ticket-detail-header",
+        "ticket-detail-kpi-points",
+        "ticket-detail-kpi-delivered",
+        "ticket-detail-kpi-scored",
+        "ticket-detail-kpi-coverage",
+        "ticket-detail-chart",
+        "ticket-detail-legend-0",
+        "ticket-detail-calendar",
+        "ticket-detail-rhythm",
+        "ticket-detail-levels",
+        "ticket-detail-recent",
+        "ticket-tickets-a",
+        "ticket-row-t1",
+    ] {
+        assert!(view.shown(selector), "{selector} is drawn");
+    }
+    for selector in [
+        "ticket-leaderboard",
+        "ticket-levels",
+        "ticket-stats",
+        "ticket-trend-chart",
+        "ticket-score",
+    ] {
+        assert!(!view.shown(selector), "{selector} is not drawn");
+    }
+    assert!(view.shown("ticket-refresh"), "the toolbar stays");
+}
+
+#[gpui::test]
+fn the_name_opens_the_page_but_the_chevron_and_the_exclude_button_do_not(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    view.click("ticket-expand-a");
+    assert_eq!(detail_of(&mut view), None);
+    assert!(view.shown("ticket-tickets-a"));
+    view.click("ticket-exclude-b");
+    assert_eq!(detail_of(&mut view), None);
+    view.click("ticket-member-a");
+    assert_eq!(detail_of(&mut view), Some("a".into()));
+}
+
+#[gpui::test]
+fn a_hover_on_the_page_does_not_build_its_ticket_rows_again(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    view.click("ticket-board-row-a");
+    assert!(view.shown("ticket-row-t1"));
+    // The first frames measure the part; a hover comes after they settled.
+    frame(&mut view);
+    frame(&mut view);
+    let before = built();
+    for selector in [
+        "ticket-detail-calendar",
+        "ticket-detail-rhythm",
+        "ticket-detail-chart",
+        "ticket-detail-tickets-chart",
+    ] {
+        let bounds = view.v.debug_bounds(selector).unwrap();
+        view.v
+            .simulate_mouse_move(bounds.center(), None, Default::default());
+        frame(&mut view);
+    }
+    view.v.simulate_mouse_move(
+        gpui::point(gpui::px(1.), gpui::px(1.)),
+        None,
+        Default::default(),
+    );
+    frame(&mut view);
+    assert_eq!(built()[2], before[2], "no ticket row was built again");
+    // A change of the page does build them: ticking one.
+    view.click("ticket-select-t1");
+    assert!(built()[2] > before[2]);
+}
+
+#[gpui::test]
+fn the_page_has_a_chart_of_points_and_one_of_tickets_following_one_type(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    view.click("ticket-board-row-a");
+    assert!(view.shown("ticket-detail-chart"));
+    assert!(view.shown("ticket-detail-tickets-chart"));
+    // One set of type tabs, which drive both.
+    view.click("contributors-chart-kind-bars");
+    let root = view.window.root(&mut view.v).unwrap();
+    let kinds = view.v.read(|cx| {
+        let tab = root.read(cx);
+        (tab.detail_chart_kinds(cx), tab.chart_prefs.read(cx).kind)
+    });
+    assert_eq!(kinds.0, (ChartKind::Bars, ChartKind::Bars));
+    assert_eq!(kinds.1, ChartKind::Bars);
+}
+
+#[gpui::test]
+fn back_puts_the_list_back_as_it_was(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    // Something of every kind to remember: b's tickets open, one ticked, a scroll.
+    view.click("ticket-expand-b");
+    view.click("ticket-select-t3");
+    view.v
+        .simulate_resize(gpui::size(gpui::px(1600.), gpui::px(300.)));
+    settle(&mut view.v);
+    let offset = gpui::point(gpui::px(0.), gpui::px(-80.));
+    view.read(|v| v.ui.scroll.set_offset(offset));
+    settle(&mut view.v);
+    let snapshot = |view: &mut View| {
+        let focus = view.read(|v| v.ui.focus.clone());
+        let focused = view.v.update(|window, _| focus.is_focused(window));
+        view.read(|v| {
+            let mut selected: Vec<String> = v.ui.selected.iter().cloned().collect();
+            selected.sort();
+            (
+                v.ui.open_member.clone(),
+                selected,
+                v.ui.scroll.offset(),
+                focused,
+            )
+        })
+    };
+    let before = snapshot(&mut view);
+    assert_eq!(before.2, offset, "the scroll took");
+    assert_eq!(before.0.as_deref(), Some("b"));
+    // The row is scrolled out of the short window, so the page is opened directly.
+    let window = view.window;
+    window
+        .update(&mut view.v, |v, window, cx| {
+            v.open_detail("a".into(), window, cx)
+        })
+        .unwrap();
+    settle(&mut view.v);
+    // The page opens at the top, with a's own tickets.
+    assert_eq!(
+        view.read(|v| v.ui.scroll.offset()),
+        gpui::point(gpui::px(0.), gpui::px(0.))
+    );
+    assert!(view.shown("ticket-tickets-a"));
+    assert!(!view.shown("ticket-tickets-b"));
+    view.click("ticket-detail-back");
+    assert_eq!(detail_of(&mut view), None);
+    assert!(view.shown("ticket-tickets-b"));
+    assert!(!view.shown("ticket-tickets-a"));
+    assert_eq!(snapshot(&mut view), before);
+}
+
+#[gpui::test]
+fn escape_closes_the_members_page_first_and_the_page_next(cx: &mut TestAppContext) {
+    let (ui, mut v, _fake) = page(cx, Tab::Ticket);
+    click(&mut v, "ticket-board-row-a");
+    assert!(shown(&mut v, "ticket-detail"));
+    v.simulate_keystrokes("escape");
+    settle(&mut v);
+    assert!(!shown(&mut v, "ticket-detail"));
+    assert!(shown(&mut v, "ticket-leaderboard"));
+    assert_eq!(ui.closed_count(), 0);
+    v.simulate_keystrokes("escape");
+    settle(&mut v);
+    assert_eq!(ui.closed_count(), 1);
+}
+
+#[gpui::test]
+fn escape_closes_the_members_page_wherever_the_focus_is(cx: &mut TestAppContext) {
+    let (ui, mut v, _fake) = page(cx, Tab::Ticket);
+    click(&mut v, "ticket-board-row-a");
+    // The page root, as after a project switch or a reopened page.
+    ui.window
+        .update(&mut v, |page, window, cx| window.focus(&page.focus, cx))
+        .unwrap();
+    settle(&mut v);
+    v.simulate_keystrokes("escape");
+    settle(&mut v);
+    assert!(!shown(&mut v, "ticket-detail"));
+    assert_eq!(ui.closed_count(), 0, "the page stayed open");
+}
+
+#[gpui::test]
+fn a_member_missing_from_the_period_gets_a_line_and_the_way_back(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    let window = view.window;
+    window
+        .update(&mut view.v, |v, window, cx| {
+            v.open_detail("nobody".into(), window, cx)
+        })
+        .unwrap();
+    settle(&mut view.v);
+    assert!(view.shown("ticket-detail-empty"));
+    assert!(view.shown("ticket-detail-back"));
+    view.click("ticket-detail-back");
+    assert!(view.shown("ticket-leaderboard"));
+}
+
+#[gpui::test]
+fn a_page_leaves_out_the_cards_that_have_no_data(cx: &mut TestAppContext) {
+    // Only unscored work: no points, and nothing in a working status.
+    let mut view = open(cx, |fake| {
+        fake.with(|s| s.load.default = Ok(vec![ticket("w1")]))
+    });
+    view.click("ticket-board-row-a");
+    assert!(view.shown("ticket-detail-kpi-delivered"));
+    assert!(view.shown("ticket-detail-kpi-coverage"));
+    assert!(!view.shown("ticket-detail-kpi-points"));
+    assert!(!view.shown("ticket-detail-kpi-active"));
+    // And the levels list says there is nothing to list.
+    assert!(view.shown("ticket-detail-levels"));
+}
+
+#[gpui::test]
+fn a_page_shows_the_active_card_only_with_work_in_progress(cx: &mut TestAppContext) {
+    let mut view = open(cx, |_| {});
+    view.click("ticket-board-row-a");
+    assert!(
+        view.shown("ticket-detail-kpi-active"),
+        "the default fixture has a ticket in testing"
+    );
+}
+
+#[gpui::test]
+fn the_numbers_of_a_page_are_worked_out_again_when_the_board_is_rebuilt(cx: &mut TestAppContext) {
+    let mut view = open(cx, |_| {});
+    view.click("ticket-board-row-a");
+    let shown = |view: &mut View| view.read(|v| v.cached_detail());
+    let (seq, delivered) = shown(&mut view).expect("numbers");
+    assert_eq!(delivered, 1);
+    // The store gains a ticket and a fetch ends: the board is rebuilt.
+    view.fake.with(|s| {
+        s.load.default = Ok(vec![ticket("done"), ticket("later")]);
+    });
+    view.emit(event("fetch", "done", 1, 0));
+    let (again, delivered) = shown(&mut view).expect("numbers");
+    assert!(again > seq);
+    assert_eq!(delivered, 2);
+}
+
+// ---- hover cost ------------------------------------------------------------------------------------------
+
+/// What one hover costs the ClickUp tab: builds of the tab, leaderboard rows
+/// and ticket rows, and the median wall time of a frame, per move.
+/// Read through `Debug` by the timing test.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::contributors) struct HoverNumbers {
+    pub tab: f64,
+    pub member_rows: f64,
+    pub ticket_rows: f64,
+    pub frame_ms: f64,
+    pub moves: usize,
+}
+
+fn crowded(members: usize, each: usize) -> Vec<TicketRecord> {
+    (0..members * each)
+        .map(|i| {
+            ticket_with(&format!("h{i}"), |t| {
+                t.assignees = vec![user(
+                    &format!("m{}", i % members),
+                    &format!("Member {}", i % members),
+                )];
+                t.override_level = Some(["XS", "S", "M", "L", "XL"][i % 5].into());
+                t.done_at = Some(at(10, 1 + (i % 16) as u32, 9 + (i % 8) as u32));
+                t.updated_at = t.done_at.clone().unwrap();
+            })
+        })
+        .collect()
+}
+
+/// Moves the pointer along `selector` and reports the cost per move. `detail`
+/// opens the page of member `m0` first.
+pub(in crate::contributors) fn hover_numbers(
+    cx: &mut TestAppContext,
+    members: usize,
+    each: usize,
+    detail: Option<&'static str>,
+    selector: &'static str,
+) -> HoverNumbers {
+    let mut view = open(cx, |fake| {
+        fake.with(|s| s.load.default = Ok(crowded(members, each)))
+    });
+    if let Some(who) = detail {
+        let window = view.window;
+        window
+            .update(&mut view.v, |v, window, cx| {
+                v.open_detail(who.into(), window, cx)
+            })
+            .unwrap();
+        settle(&mut view.v);
+    }
+    let bounds = view.v.debug_bounds(selector).expect("the hovered element");
+    let spot = |x: f32| {
+        gpui::point(
+            bounds.origin.x + bounds.size.width * x,
+            bounds.origin.y + bounds.size.height * 0.5,
+        )
+    };
+    let mut times = vec![];
+    let (mut before, mut moves) = ([0; 3], 0);
+    for n in 0..24 {
+        if n == 4 {
+            before = super::BUILT.with(|b| b.get());
+        }
+        let t = std::time::Instant::now();
+        view.v
+            .simulate_mouse_move(spot([0.1, 0.5, 0.9][n % 3]), None, Default::default());
+        view.v.update(|window, cx| window.draw(cx).clear(cx));
+        if n >= 4 {
+            times.push(t.elapsed().as_secs_f64() * 1000.);
+            moves += 1;
+        }
+    }
+    let after = super::BUILT.with(|b| b.get());
+    times.sort_by(|a, b| a.total_cmp(b));
+    let per = |i: usize| (after[i] - before[i]) as f64 / moves as f64;
+    HoverNumbers {
+        tab: per(0),
+        member_rows: per(1),
+        ticket_rows: per(2),
+        frame_ms: times[times.len() / 2],
+        moves,
+    }
+}
+
+// ---- the member's year ---------------------------------------------------------------------------------
+
+/// Alpha's tickets: one this month, one in March (outside the period, inside the year).
+fn this_year() -> Vec<TicketRecord> {
+    vec![
+        ticket_with("now", |t| t.assessment = Some(assessment(2))),
+        ticket_with("march", |t| {
+            t.done_at = Some(at(3, 9, 10));
+            t.updated_at = at(3, 9, 10);
+        }),
+    ]
+}
+
+fn calendar_total(view: &mut View) -> u32 {
+    let root = view.window.root(&mut view.v).unwrap();
+    view.v.read(|cx| {
+        root.read(cx)
+            .calendar_days(cx)
+            .expect("a calendar")
+            .iter()
+            .map(|d| d.delivery.tickets)
+            .sum()
+    })
+}
+
+#[gpui::test]
+fn the_calendar_covers_the_last_year_read_from_the_store_without_a_fetch(cx: &mut TestAppContext) {
+    let mut view = open(cx, |fake| fake.with(|s| s.load.default = Ok(this_year())));
+    let fetches = view.fake.fetches();
+    view.click("ticket-board-row-a");
+    // The period holds one ticket; the year holds both.
+    assert_eq!(view.read(|v| v.derived.board.total), 1);
+    assert_eq!(calendar_total(&mut view), 2);
+    assert_eq!(view.fake.fetches(), fetches, "opening the page fetched");
+    let reads: Vec<Call> = view
+        .fake
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, Call::History { .. }))
+        .collect();
+    assert_eq!(reads.len(), 1);
+    // The year runs from the Sunday 53 weeks back to the next midnight.
+    let Call::History {
+        workspace, from, ..
+    } = &reads[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(workspace, "w1");
+    assert!(from.as_str() < at(10, 17, 12).as_str());
+    assert_eq!(view.read(|v| v.year_state()), super::detail::Year::Whole);
+    // And it stays the year when the period changes with the page open.
+    view.act(|v, cx| v.set_kind(PeriodKind::Year, cx));
+    assert!(view.shown("ticket-detail"));
+    assert_eq!(calendar_total(&mut view), 2);
+}
+
+#[gpui::test]
+fn a_year_the_store_does_not_hold_whole_says_so(cx: &mut TestAppContext) {
+    let mut view = open(cx, |fake| {
+        fake.with(|s| {
+            s.load.default = Ok(this_year());
+            s.history_covered = false;
+        })
+    });
+    view.click("ticket-board-row-a");
+    assert_eq!(view.read(|v| v.year_state()), super::detail::Year::Partial);
+}
+
+#[gpui::test]
+fn the_year_is_read_again_after_a_job_changed_the_store_and_not_while_the_page_is_closed(
+    cx: &mut TestAppContext,
+) {
+    let mut view = open(cx, |fake| fake.with(|s| s.load.default = Ok(this_year())));
+    let reads = |view: &mut View| view.fake.count(|c| matches!(c, Call::History { .. }));
+    assert_eq!(reads(&mut view), 0, "the board does not need a year");
+    view.click("ticket-board-row-a");
+    assert_eq!(reads(&mut view), 1);
+    view.emit(event("fetch", "done", 1, 0));
+    assert_eq!(reads(&mut view), 2);
+}
+
+#[gpui::test]
+fn a_members_page_frees_its_atlas_tiles_when_it_closes(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    view.click("ticket-board-row-a");
+    frame(&mut view);
+    // The image is made once the motion has settled: say it started long ago.
+    let root = view.window.root(&mut view.v).unwrap();
+    let long_ago = crate::visuals::dither::Motion(
+        std::time::Instant::now() - std::time::Duration::from_secs(5),
+    );
+    view.v.update(|_, cx| {
+        let ui = &root.read(cx).detail_ui;
+        let (calendar, rhythm) = (ui.calendar.clone().unwrap(), ui.rhythm.clone().unwrap());
+        calendar.update(cx, |c, cx| {
+            c.motion = long_ago;
+            cx.notify();
+        });
+        rhythm.update(cx, |r, cx| {
+            r.motion = long_ago;
+            cx.notify();
+        });
+    });
+    frame(&mut view);
+    frame(&mut view);
+    let images = view.v.read(|cx| {
+        let ui = &root.read(cx).detail_ui;
+        let of = |s: &crate::visuals::dither::Sheets| s.borrow().as_ref().map(|s| s.image());
+        (
+            ui.calendar.as_ref().and_then(|c| of(&c.read(cx).sheet)),
+            ui.rhythm.as_ref().and_then(|r| of(&r.read(cx).sheet)),
+        )
+    });
+    let (calendar, rhythm) = (
+        images.0.expect("a calendar image"),
+        images.1.expect("a rhythm image"),
+    );
+    let held = |view: &mut View| {
+        view.v.update(|window, _| {
+            (
+                window.has_image_atlas_entry(&calendar),
+                window.has_image_atlas_entry(&rhythm),
+            )
+        })
+    };
+    assert_eq!(held(&mut view), (true, true));
+    view.click("ticket-detail-back");
+    frame(&mut view);
+    assert_eq!(held(&mut view), (false, false));
+}
+
+#[gpui::test]
+fn unmounting_closes_a_palette_left_open_on_the_overview_chart(cx: &mut TestAppContext) {
+    let mut view = open(cx, with_four);
+    frame(&mut view);
+    let chart = trend_chart(&mut view);
+    let id = view.v.read(|cx| chart.read(cx).data.series[0].id.clone());
+    view.v.update(|window, cx| {
+        chart.update(cx, |c, cx| c.open_palette(&id, window, cx));
+    });
+    assert!(view.v.read(|cx| chart.read(cx).palette.is_some()));
+    view.act(|v, cx| v.unmount(cx));
+    assert!(view.v.read(|cx| chart.read(cx).palette.is_none()));
 }

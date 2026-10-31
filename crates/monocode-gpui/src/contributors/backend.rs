@@ -11,12 +11,18 @@ use monocode_core::contributors::{
     jobs::{LoadResponse, SyncEvent},
     model::{
         period::PeriodPick,
-        prefs::{load_merge, load_period_pick, save_merge, save_period_pick},
+        prefs::{
+            load_chart_kind, load_color_overrides, load_merge, load_period_pick, save_chart_kind,
+            save_color_overrides, save_merge, save_period_pick,
+        },
         sync_jobs::StartCall,
     },
     sync::Estimate,
 };
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
+
+/// Person id to palette color, as the user picked them.
+pub(crate) type ColorOverrides = BTreeMap<String, &'static str>;
 
 pub(crate) trait Backend: Send + Sync {
     fn read_config(&self, cwd: &str) -> Result<Option<String>, String>;
@@ -52,6 +58,12 @@ pub(crate) trait Backend: Send + Sync {
     fn load_prefs(&self, now: &DateTime<Local>) -> (PeriodPick, bool);
     fn save_pick(&self, pick: &PeriodPick);
     fn save_merge(&self, merge: bool);
+    /// The saved chart type text (`line`, `cumulative`, `bars`), shared by every chart.
+    fn load_chart_kind(&self) -> Option<String>;
+    fn save_chart_kind(&self, kind: &str);
+    /// The colors picked for the people of one project.
+    fn load_colors(&self, project: &str) -> ColorOverrides;
+    fn save_colors(&self, project: &str, colors: &ColorOverrides);
 }
 
 /// The real thing: the core's sync API and the shell store's preferences.
@@ -142,6 +154,28 @@ impl Backend for CoreBackend {
     fn save_merge(&self, merge: bool) {
         if let Some(Ok(store)) = self.store.as_ref().map(locked) {
             let _ = save_merge(&store, merge);
+        }
+    }
+    fn load_chart_kind(&self) -> Option<String> {
+        match self.store.as_ref().map(locked) {
+            Some(Ok(store)) => load_chart_kind(&store),
+            _ => None,
+        }
+    }
+    fn save_chart_kind(&self, kind: &str) {
+        if let Some(Ok(store)) = self.store.as_ref().map(locked) {
+            let _ = save_chart_kind(&store, kind);
+        }
+    }
+    fn load_colors(&self, project: &str) -> ColorOverrides {
+        match self.store.as_ref().map(locked) {
+            Some(Ok(store)) => load_color_overrides(&store, project),
+            _ => ColorOverrides::new(),
+        }
+    }
+    fn save_colors(&self, project: &str, colors: &ColorOverrides) {
+        if let Some(Ok(store)) = self.store.as_ref().map(locked) {
+            let _ = save_color_overrides(&store, project, colors);
         }
     }
 }
@@ -313,5 +347,18 @@ mod tests {
         backend.save_pick(&pinned);
         backend.save_merge(false);
         assert_eq!(backend.load_prefs(&now), (pinned, false));
+    }
+
+    #[test]
+    fn the_chart_kind_and_the_colors_are_saved_in_the_store_and_read_back() {
+        let backend = backend();
+        assert_eq!(backend.load_chart_kind(), None);
+        backend.save_chart_kind("cumulative");
+        assert_eq!(backend.load_chart_kind().as_deref(), Some("cumulative"));
+        // Colors are kept per project.
+        let picked = ColorOverrides::from([("ana@x.io".to_string(), "#3fb950")]);
+        backend.save_colors("/work/alpha", &picked);
+        assert_eq!(backend.load_colors("/work/alpha"), picked);
+        assert!(backend.load_colors("/work/beta").is_empty());
     }
 }

@@ -2,6 +2,7 @@
 //! Port of `src/features/contributors/model/`; no I/O besides the preference
 //! helpers in `prefs`.
 
+pub mod activity;
 pub mod agent_session;
 pub mod ask;
 pub mod axis;
@@ -10,6 +11,7 @@ pub mod config;
 pub mod format;
 pub mod identity;
 pub mod leaderboard;
+pub mod member;
 pub mod palette;
 pub mod patterns;
 pub mod period;

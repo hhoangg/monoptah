@@ -11,6 +11,8 @@ use super::{
     export::ExportWait,
 };
 use crate::contributors::{
+    backend::ColorOverrides,
+    chart::{self, ChartKind, ChartPrefs},
     data::Clock,
     jobs::{JobsEvent, SyncJobs},
 };
@@ -29,6 +31,10 @@ use monocode_core::contributors::{
             should_fetch, store_may_have_changed, window_of,
         },
         prefs::TicketBoardSettings,
+        report::{
+            MatrixRow, MemberTrend, TileStats, TrendUnit, level_matrix, member_trend,
+            no_comparison_note, previous_span, tile_stats,
+        },
         tickets::{
             AiConfigStatus, DEFAULT_TICKET_POINTS, ExcludedMember, TicketRecord, WorkspaceScope,
         },
@@ -76,28 +82,70 @@ pub(super) struct Loaded {
     pub tickets: Arc<Vec<TicketRecord>>,
 }
 
+/// How the period compares with the previous one.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Comparison {
+    /// There is nothing to compare with: All time, or no scope.
+    Off,
+    /// The store is being read.
+    Pending,
+    /// The store does not hold the whole previous period; nothing is fetched
+    /// for it, so the cards say why they do not show a change.
+    Missing { note: String },
+    Ready {
+        /// What the change reads against: "Sep 2026", "the same days of Sep 2026".
+        against: String,
+        stats: TileStats,
+        board: Board,
+    },
+}
+
 /// Everything the board shows, derived from the loaded tickets, the scope, the
 /// points, the coverage and the period. Rebuilt only when one of them changes.
 pub(super) struct Derived {
+    /// Names this build: whatever is cached from a board is dropped when it moves.
+    pub seq: u64,
     pub shown: Vec<TicketRecord>,
     pub board: Board,
     pub statuses: Vec<StatusInfo>,
     pub to_assess: usize,
     pub run_ids: Vec<String>,
     pub run_key: String,
+    pub stats: TileStats,
+    pub comparison: Comparison,
+    pub trend: Arc<MemberTrend>,
+    pub matrix: Vec<MatrixRow>,
 }
 
 impl Default for Derived {
     fn default() -> Self {
+        let board = build_board(&[], &DEFAULT_TICKET_POINTS, &[]);
         Self {
+            seq: 0,
             shown: Vec::new(),
-            board: build_board(&[], &DEFAULT_TICKET_POINTS, &[]),
+            stats: tile_stats(&board),
+            board,
             statuses: Vec::new(),
             to_assess: 0,
             run_ids: Vec::new(),
             run_key: String::new(),
+            comparison: Comparison::Off,
+            trend: Arc::new(MemberTrend {
+                unit: TrendUnit::Week,
+                buckets: Vec::new(),
+                members: Vec::new(),
+            }),
+            matrix: Vec::new(),
         }
     }
+}
+
+/// The previous period as the store held it when it was read.
+pub(super) struct PreviousRead {
+    /// The workspace, spaces and window it is for.
+    pub key: String,
+    /// `None`: the store did not cover the window.
+    pub tickets: Option<Arc<Vec<TicketRecord>>>,
 }
 
 /// The spaces the Scope panel lists, for the workspace it was asked about.
@@ -120,6 +168,9 @@ struct Effects {
     run_key: Option<String>,
     export: Option<(String, String)>,
     spaces: Option<String>,
+    /// The previous period's window, read from the store.
+    previous: Option<Option<String>>,
+    colors: Option<String>,
 }
 
 /// A backend call the tests keep back until they answer it.
@@ -199,6 +250,21 @@ pub(crate) struct TicketView {
     pub(super) export_timeout: Duration,
     pub(super) reveal: Reveal,
     pub(super) ui: super::draw::UiState,
+    // The overview, the member pages and what they are fed.
+    pub(super) chart_prefs: Entity<ChartPrefs>,
+    pub(super) overview: super::overview::OverviewUi,
+    /// The previous period's tickets, from the store only.
+    pub(super) previous: Option<PreviousRead>,
+    /// The colors picked for the members of this workspace.
+    pub(super) colors: ColorOverrides,
+    colors_touched: bool,
+    /// Bumped when `colors` change.
+    pub(super) colors_gen: u64,
+    /// The member whose page is open.
+    pub(super) detail: Option<String>,
+    pub(super) detail_ui: super::detail::DetailUi,
+    /// Counts the builds of `derived`.
+    derived_seq: u64,
     // Tests.
     #[cfg(test)]
     pub(super) manual: bool,
@@ -206,6 +272,11 @@ pub(crate) struct TicketView {
     pub(super) held: Vec<Held>,
 }
 impl EventEmitter<TicketEvent> for TicketView {}
+
+/// The text a previous read is told apart by.
+fn key_text(key: &(String, String, String)) -> String {
+    format!("{}\0{}\0{}", key.0, key.1, key.2)
+}
 
 fn error_text(error: impl ToString) -> String {
     error.to_string()
@@ -274,6 +345,15 @@ impl TicketView {
             export_timeout: super::export::PREVIOUS_FETCH_TIMEOUT,
             reveal: Rc::new(|path, cx| cx.reveal_path(path)),
             ui: super::draw::UiState::new(cx),
+            chart_prefs: chart::shared_prefs(cx),
+            overview: super::overview::OverviewUi::default(),
+            previous: None,
+            colors: ColorOverrides::new(),
+            colors_touched: false,
+            colors_gen: 0,
+            detail: None,
+            detail_ui: super::detail::DetailUi::default(),
+            derived_seq: 0,
             #[cfg(test)]
             manual: false,
             #[cfg(test)]
@@ -397,6 +477,12 @@ impl TicketView {
         self.reset_export();
         self.ui.reset();
         self.derived = Derived::default();
+        self.previous = None;
+        self.colors = ColorOverrides::new();
+        self.colors_touched = false;
+        self.colors_gen += 1;
+        self.detail = None;
+        self.drop_detail_ui(cx);
         self.dirty = true;
         self.try_start(cx);
         cx.notify();
@@ -415,6 +501,9 @@ impl TicketView {
         self.prefs_ready = false;
         self.estimate_task = None;
         self.reset_export();
+        // A palette left open would be open again at the next mount.
+        self.dismiss_palettes(cx);
+        self.release_detail_images(cx);
         cx.notify();
     }
 
@@ -492,6 +581,24 @@ impl TicketView {
                 this.prefs_ready = true;
                 this.dirty = true;
                 this.settle(cx);
+            },
+        );
+        // The first page to read it decides; the choice is app-wide.
+        self.spawn_job(
+            "chart-kind",
+            cx,
+            |backend| backend.load_chart_kind(),
+            |this, kind, cx| {
+                this.chart_prefs.update(cx, |prefs, cx| {
+                    if !prefs.settled {
+                        prefs.settled = true;
+                        prefs.kind = kind
+                            .as_deref()
+                            .and_then(ChartKind::parse)
+                            .unwrap_or_default();
+                        cx.notify();
+                    }
+                });
             },
         );
         self.spawn_job(
@@ -640,6 +747,9 @@ impl TicketView {
         }
         if store_may_have_changed(&event) {
             self.reload(cx);
+            // A fetch may have completed the previous period's window too.
+            self.effects.previous = None;
+            self.forget_year();
         }
         self.settle(cx);
     }
@@ -725,15 +835,174 @@ impl TicketView {
         let board = build_board(&shown, &self.settings.points, &active);
         let to_assess = to_assess_count(shown.len(), board.assessed, self.settings.percent);
         let run_ids = pick_for_run(&shown, to_assess);
+        self.derived_seq += 1;
         self.derived = Derived {
+            seq: self.derived_seq,
             statuses: statuses_of(&tickets),
             run_key: run_ids.join("\0"),
             run_ids,
             to_assess,
+            stats: tile_stats(&board),
+            comparison: self.comparison(),
+            trend: Arc::new(member_trend(&self.period, &shown, &board, &self.now)),
+            matrix: level_matrix(&board, &shown),
             board,
             shown,
         };
         self.dirty = false;
+    }
+
+    /// The previous period's key: its workspace, spaces and whole window. `None`
+    /// when there is nothing to compare with.
+    fn previous_key(&self) -> Option<(String, String, String)> {
+        let scope = self.settings.scope.as_ref()?;
+        let before = previous_span(&self.period, None, &self.now)?;
+        let window = window_of(&before.before);
+        Some((scope_fetch_id(scope), window.from, window.to))
+    }
+
+    /// How the period compares with the previous one, from what the store held.
+    fn comparison(&self) -> Comparison {
+        let Some(scope) = &self.settings.scope else {
+            return Comparison::Off;
+        };
+        let Some(before) = previous_span(&self.period, None, &self.now) else {
+            return Comparison::Off;
+        };
+        let Some(key) = self.previous_key().map(|k| key_text(&k)) else {
+            return Comparison::Off;
+        };
+        match &self.previous {
+            Some(read) if read.key == key => match &read.tickets {
+                None => Comparison::Missing {
+                    note: no_comparison_note(&before.label),
+                },
+                Some(tickets) => {
+                    let then = period_tickets(tickets, scope, &before.span);
+                    let board = build_board(&then, &self.settings.points, &[]);
+                    Comparison::Ready {
+                        against: before.against,
+                        stats: tile_stats(&board),
+                        board,
+                    }
+                }
+            },
+            _ => Comparison::Pending,
+        }
+    }
+
+    /// Reads the previous period from the store for the window now on screen.
+    /// Never fetches: a window the store does not hold whole is left out.
+    fn read_previous(&mut self, cx: &mut Context<Self>) {
+        let (Some(scope), Some(key)) = (self.settings.scope.clone(), self.previous_key()) else {
+            self.previous = None;
+            self.dirty = true;
+            return;
+        };
+        let text = key_text(&key);
+        let (from, to) = (key.1, key.2);
+        let done = text.clone();
+        self.spawn_job(
+            "previous",
+            cx,
+            move |backend| backend.previous(&scope, &from, &to),
+            move |this, answer, cx| {
+                // The window moved on while this was read.
+                if this.previous_key().map(|k| key_text(&k)).as_deref() != Some(done.as_str()) {
+                    return;
+                }
+                this.previous = Some(PreviousRead {
+                    key: done,
+                    tickets: answer.ok().flatten().map(Arc::new),
+                });
+                this.dirty = true;
+                this.settle(cx);
+            },
+        );
+    }
+
+    /// Reads the colors picked for the members of the workspace now shown.
+    fn read_colors(&mut self, cx: &mut Context<Self>) {
+        let workspace = self.workspace_id();
+        self.colors_touched = false;
+        // Another workspace's picks are not this one's, whatever is read next.
+        self.colors = ColorOverrides::new();
+        self.colors_gen += 1;
+        if workspace.is_empty() {
+            return;
+        }
+        let asked = workspace.clone();
+        self.spawn_job(
+            "colors",
+            cx,
+            move |backend| backend.load_colors(&workspace),
+            move |this, saved, cx| {
+                if this.workspace_id() != asked {
+                    return;
+                }
+                // A color picked while this was read wins; the rest is what was saved.
+                let picked = std::mem::take(&mut this.colors);
+                this.colors = saved;
+                this.colors.extend(picked);
+                this.colors_gen += 1;
+                if this.colors_touched {
+                    let colors = this.colors.clone();
+                    this.spawn_job(
+                        "save-colors",
+                        cx,
+                        move |backend| backend.save_colors(&asked, &colors),
+                        |_, (), _| {},
+                    );
+                }
+                this.settle(cx);
+            },
+        );
+    }
+
+    /// A color picked from the palette for one member; saved for the workspace.
+    pub(super) fn set_member_color(
+        &mut self,
+        member: &str,
+        hex: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace_id();
+        if workspace.is_empty() {
+            return;
+        }
+        self.colors_touched = true;
+        self.colors.insert(member.to_string(), hex);
+        self.colors_gen += 1;
+        let colors = self.colors.clone();
+        self.spawn_job(
+            "save-colors",
+            cx,
+            move |backend| backend.save_colors(&workspace, &colors),
+            |_, (), _| {},
+        );
+        self.settle(cx);
+    }
+
+    /// The chart type every chart on every page shares; saved for next time.
+    pub(super) fn set_chart_kind(&mut self, kind: ChartKind, cx: &mut Context<Self>) {
+        let changed = self.chart_prefs.update(cx, |prefs, cx| {
+            prefs.settled = true;
+            let changed = prefs.kind != kind;
+            if changed {
+                prefs.kind = kind;
+                cx.notify();
+            }
+            changed
+        });
+        if changed {
+            self.spawn_job(
+                "save-chart-kind",
+                cx,
+                move |backend| backend.save_chart_kind(kind.id()),
+                |_, (), _| {},
+            );
+        }
+        self.settle(cx);
     }
 
     // ---- the effects --------------------------------------------------------
@@ -777,6 +1046,19 @@ impl TicketView {
             self.reload(cx);
         }
 
+        // The previous period is only read from the store: it never fetches, and
+        // the fetch below does not wait for it.
+        let previous = self.previous_key().map(|k| key_text(&k));
+        if self.effects.previous.as_ref() != Some(&previous) {
+            self.effects.previous = Some(previous);
+            self.read_previous(cx);
+        }
+        let workspace = self.workspace_id();
+        if self.effects.colors.as_ref() != Some(&workspace) {
+            self.effects.colors = Some(workspace);
+            self.read_colors(cx);
+        }
+
         // Without a connection the job would only fail; connecting re-runs this.
         let busy = fetch_busy(self.job.as_ref());
         let fetch_id = scope.as_ref().map(scope_fetch_id).unwrap_or_default();
@@ -810,6 +1092,9 @@ impl TicketView {
                 }
             }
         }
+
+        // The page's year is read from the store when it is open; never fetched.
+        self.ensure_year(cx);
 
         let run_key = self.derived.run_key.clone();
         if self.effects.run_key.as_ref() != Some(&run_key) {

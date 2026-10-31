@@ -2,12 +2,21 @@
 //! the ticket jobs, the preferences). Every method blocks, so callers run
 //! them on the background executor. The trait is the seam the tests use: they
 //! never reach ClickUp, `claude` or the user's files.
-use crate::runtime::{Database, locked};
+use crate::{
+    contributors::backend::ColorOverrides,
+    runtime::{Database, locked},
+};
 use chrono::{DateTime, Local};
 use monocode_core::{
     contributors::{
         api::{self, Contributors},
-        model::period::PeriodPick,
+        model::{
+            period::PeriodPick,
+            prefs::{
+                load_chart_kind, load_workspace_color_overrides, save_chart_kind,
+                save_workspace_color_overrides,
+            },
+        },
         ticket_jobs::{TicketEstimate, TicketJobStatus},
         tickets::{
             prefs::{TicketBoardSettings, load_range, load_settings, save_range, save_settings},
@@ -65,6 +74,21 @@ impl Patch {
     }
 }
 
+/// What `TicketBackend::previous` does: the store's tickets when it holds the
+/// whole window, else nothing. Only `window_covered` and `load` are used, so
+/// nothing is ever fetched.
+pub(crate) fn previous_from_store<B: TicketBackend + ?Sized>(
+    backend: &B,
+    scope: &WorkspaceScope,
+    from: &str,
+    to: &str,
+) -> Result<Option<Vec<TicketRecord>>, String> {
+    if !backend.window_covered(scope, from, to)? {
+        return Ok(None);
+    }
+    backend.load(&scope.workspace_id, from).map(Some)
+}
+
 pub(crate) trait TicketBackend: Send + Sync {
     /// Whether a ClickUp token is saved.
     fn connected(&self) -> Result<bool, String>;
@@ -80,6 +104,30 @@ pub(crate) trait TicketBackend: Send + Sync {
     fn cancel(&self);
     fn status(&self) -> Result<TicketJobStatus, String>;
     fn window_covered(&self, scope: &WorkspaceScope, from: &str, to: &str) -> Result<bool, String>;
+    /// The tickets of a window as the store has them, for the comparison with
+    /// the previous period; `None` when the store does not cover the whole
+    /// window. Reads the store only: it never fetches from ClickUp.
+    fn previous(
+        &self,
+        scope: &WorkspaceScope,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<Vec<TicketRecord>>, String> {
+        previous_from_store(self, scope, from, to)
+    }
+    /// The tickets of a long window as the store has them, and whether the
+    /// store holds the whole window. Reads the store only: it never fetches
+    /// from ClickUp.
+    fn history(
+        &self,
+        scope: &WorkspaceScope,
+        from: &str,
+        to: &str,
+    ) -> Result<(Vec<TicketRecord>, bool), String> {
+        let covered = self.window_covered(scope, from, to).unwrap_or(false);
+        self.load(&scope.workspace_id, from)
+            .map(|tickets| (tickets, covered))
+    }
     fn set_override(
         &self,
         ticket_id: &str,
@@ -90,6 +138,12 @@ pub(crate) trait TicketBackend: Send + Sync {
     fn load_prefs(&self, now: &DateTime<Local>) -> (TicketBoardSettings, PeriodPick);
     /// Applies the patch to the stored settings and returns what is stored now.
     fn patch_prefs(&self, patch: &Patch) -> TicketBoardSettings;
+    /// The chart type every Contributors chart shares.
+    fn load_chart_kind(&self) -> Option<String>;
+    fn save_chart_kind(&self, kind: &str);
+    /// The colors picked for the members of one workspace.
+    fn load_colors(&self, workspace_id: &str) -> ColorOverrides;
+    fn save_colors(&self, workspace_id: &str, colors: &ColorOverrides);
 }
 
 /// The real thing: the core's ticket API, the native ClickUp client and the
@@ -197,5 +251,27 @@ impl TicketBackend for CoreTicketBackend {
             let _ = save_range(&store, range);
         }
         next
+    }
+    fn load_chart_kind(&self) -> Option<String> {
+        match self.store.as_ref().map(locked) {
+            Some(Ok(store)) => load_chart_kind(&store),
+            _ => None,
+        }
+    }
+    fn save_chart_kind(&self, kind: &str) {
+        if let Some(Ok(store)) = self.store.as_ref().map(locked) {
+            let _ = save_chart_kind(&store, kind);
+        }
+    }
+    fn load_colors(&self, workspace_id: &str) -> ColorOverrides {
+        match self.store.as_ref().map(locked) {
+            Some(Ok(store)) => load_workspace_color_overrides(&store, workspace_id),
+            _ => ColorOverrides::new(),
+        }
+    }
+    fn save_colors(&self, workspace_id: &str, colors: &ColorOverrides) {
+        if let Some(Ok(store)) = self.store.as_ref().map(locked) {
+            let _ = save_workspace_color_overrides(&store, workspace_id, colors);
+        }
     }
 }

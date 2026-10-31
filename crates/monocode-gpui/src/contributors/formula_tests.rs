@@ -485,6 +485,7 @@ fn fake_with_board() -> std::sync::Arc<Fake> {
         raw,
         covered: true,
         has_gaps: false,
+        missing: vec![],
         missing_commits: 0,
         synced_at: Some(super::data_tests::start_of_tests().timestamp() - 300),
         coverage_head: Some("h1".into()),

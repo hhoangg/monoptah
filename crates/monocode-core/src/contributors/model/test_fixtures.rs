@@ -384,5 +384,6 @@ pub fn leaderboard_model() -> super::pipeline::ContributorsModel {
             name: "Ana".into(),
             email: "ana@example.com".into(),
         }),
+        color_overrides: Default::default(),
     })
 }
