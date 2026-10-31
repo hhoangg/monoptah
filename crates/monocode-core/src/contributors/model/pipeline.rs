@@ -49,6 +49,9 @@ pub struct ModelInput {
     pub period: Period,
     pub now: DateTime<Local>,
     pub user: Option<GitUser>,
+    /// Colors the user picked for a person; they win over the computed ones.
+    /// Ids that are not in the data are ignored.
+    pub color_overrides: BTreeMap<String, &'static str>,
 }
 
 /// Pure; callers cache it, so rescoring never touches git or the network.
@@ -61,6 +64,7 @@ pub fn build_contributors_model(input: ModelInput) -> ContributorsModel {
         period,
         now,
         user,
+        color_overrides,
     } = input;
     let observed = observed_identities(&raw);
     let resolver = build_resolver(
@@ -100,7 +104,12 @@ pub fn build_contributors_model(input: ModelInput) -> ContributorsModel {
                 .flat_map(|p| p.people.iter().map(|p| p.person_id.clone())),
         )
         .collect();
-    let colors = person_color_map(&ids);
+    let mut colors = person_color_map(&ids);
+    for (id, color) in color_overrides {
+        if let Some(slot) = colors.get_mut(&id) {
+            *slot = color;
+        }
+    }
     let stats = build_stats(&StatsInput {
         raw: &raw,
         config: &config,
@@ -173,6 +182,7 @@ mod tests {
             period,
             now: now(),
             user: None,
+            color_overrides: Default::default(),
         }
     }
 
@@ -322,6 +332,28 @@ mod tests {
         names.sort();
         assert_eq!(names, ["Ana", "Bob"]);
         assert_eq!(off.stats.rows.len(), 3);
+    }
+
+    #[test]
+    fn color_overrides_replace_the_shared_color_the_rows_and_the_legend_use() {
+        let base = model(raw(), month());
+        let ana = "ana@example.com";
+        let picked = *crate::contributors::model::palette::PERSON_COLORS
+            .iter()
+            .find(|c| **c != base.colors[ana])
+            .unwrap();
+        let m = model_with(raw(), month(), |i| {
+            i.color_overrides.insert(ana.into(), picked);
+            i.color_overrides.insert("nobody@x.io".into(), picked);
+        });
+        assert_eq!(m.colors[ana], picked);
+        assert!(!m.colors.contains_key("nobody@x.io"));
+        let row = m.stats.rows.iter().find(|r| r.person_id == ana).unwrap();
+        assert_eq!(row.color, picked);
+        let entry = m.stats.legend.iter().find(|l| l.person_id == ana).unwrap();
+        assert_eq!(entry.color, picked);
+        // Everyone else keeps the color they had.
+        assert_eq!(m.colors["bob@example.com"], base.colors["bob@example.com"]);
     }
 
     #[test]
@@ -878,6 +910,7 @@ mod tests {
                 period: month(),
                 now: now(),
                 user: None,
+                color_overrides: Default::default(),
             })
         };
         // Warm the pattern caches the way a second edit finds them.

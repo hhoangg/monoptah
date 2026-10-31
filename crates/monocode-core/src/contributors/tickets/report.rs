@@ -308,7 +308,7 @@ fn fmt(n: f64) -> String {
 
 /// Rounded percent that never crosses a boundary by rounding: below 100% it
 /// stays at 99 or less, below 50% at 49 or less, and above 0 it is at least 1.
-fn percent(part: f64, whole: f64) -> i64 {
+pub(super) fn percent(part: f64, whole: f64) -> i64 {
     if whole <= 0.0 || part <= 0.0 {
         return 0;
     }
@@ -611,6 +611,101 @@ fn bucket_index(starts: &[DateTime<Local>], time: i64) -> Option<usize> {
     index
 }
 
+/// The buckets of the trend: `plan_buckets`, less those that start after the
+/// report was generated (still to come).
+fn trend_plan(
+    period: &Period,
+    delivered: &[TicketRecord],
+    generated_at: &DateTime<Local>,
+) -> BucketPlan {
+    let planned = plan_buckets(period, delivered);
+    BucketPlan {
+        unit: planned.unit,
+        starts: planned
+            .starts
+            .into_iter()
+            .filter(|start| ms(start) <= ms(generated_at))
+            .collect(),
+    }
+}
+
+/// Points and ticket counts per bucket for each member of the board, and the
+/// team's points per bucket (member shares, summed in board order). A ticket
+/// belongs to the bucket of its delivery date.
+fn bucket_series(board: &Board, plan: &BucketPlan) -> (Vec<f64>, Vec<MemberSeries>) {
+    let mut totals = vec![0.0; plan.starts.len()];
+    let mut members = Vec::with_capacity(board.members.len());
+    for member in &board.members {
+        let mut series = MemberSeries {
+            id: member.id.clone(),
+            name: member.name.clone(),
+            points: vec![0.0; plan.starts.len()],
+            tickets: vec![0; plan.starts.len()],
+        };
+        for entry in &member.ticket_list {
+            if let Some(index) = bucket_index(&plan.starts, delivered_time(&entry.ticket) as i64) {
+                totals[index] += entry.share;
+                series.points[index] += entry.share;
+                series.tickets[index] += 1;
+            }
+        }
+        members.push(series);
+    }
+    (totals, members)
+}
+
+/// One member's points and delivered tickets per bucket.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemberSeries {
+    pub id: String,
+    pub name: String,
+    pub points: Vec<f64>,
+    pub tickets: Vec<usize>,
+}
+
+/// The trend by member: the same buckets as `Trend` (its `points` are the
+/// team's), and for each member of the board their share of each.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemberTrend {
+    pub unit: TrendUnit,
+    pub buckets: Vec<TrendBucket>,
+    /// In board order (most points first).
+    pub members: Vec<MemberSeries>,
+}
+
+/// The trend of `build_report`, split by member. `delivered` are the tickets
+/// of the period (they decide the buckets of All time) and `board` is built
+/// from them.
+pub fn member_trend(
+    period: &Period,
+    delivered: &[TicketRecord],
+    board: &Board,
+    generated_at: &DateTime<Local>,
+) -> MemberTrend {
+    let plan = trend_plan(period, delivered, generated_at);
+    let (totals, members) = bucket_series(board, &plan);
+    MemberTrend {
+        unit: plan.unit,
+        buckets: trend_buckets(&plan, &totals, period),
+        members,
+    }
+}
+
+fn trend_buckets(plan: &BucketPlan, totals: &[f64], period: &Period) -> Vec<TrendBucket> {
+    plan.starts
+        .iter()
+        .enumerate()
+        .map(|(i, start)| {
+            let (label, title) = bucket_labels(plan.unit, start, period);
+            TrendBucket {
+                label,
+                title,
+                points: totals[i],
+            }
+        })
+        .collect()
+}
+
 fn report_members(board: &Board) -> (Vec<ReportMember>, f64) {
     let team_points = board.members.iter().fold(0.0, |sum, m| sum + m.points);
     let members = board
@@ -750,6 +845,70 @@ fn hardest_of(delivered: &[TicketRecord], points: &Points, limit: usize) -> Vec<
         .collect()
 }
 
+/// The step of the blue ramp (0 to 4) a cell of `points` gets against the
+/// busiest cell `max`; `None` for an empty cell.
+fn shade_of(points: f64, max: f64) -> Option<usize> {
+    if max > 0.0 && points > 0.0 {
+        let step = ((points / max) * CELL_RAMP.len() as f64).ceil() as i64 - 1;
+        Some(step.clamp(0, CELL_RAMP.len() as i64 - 1) as usize)
+    } else {
+        None
+    }
+}
+
+/// Why there is no comparison with `label`.
+pub fn no_comparison_note(label: &str) -> String {
+    format!(
+        "No comparison with {label}: its tickets were not fully fetched. Open that period in Ticket Contributors once to include it."
+    )
+}
+
+/// The previous Period a report compares with, and the span of it that counts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviousSpan {
+    pub before: Period,
+    /// `Sep 2026`, or `the previous 7 days`.
+    pub label: String,
+    /// What the change reads against: `Sep 2026`, or `the same days of Sep 2026`.
+    pub against: String,
+    /// The days of `before` that are compared: the whole of it, or for a
+    /// Period still running only as many days as have passed.
+    pub span: Period,
+}
+
+/// The Period to compare `period` with. `None` for All time, which has none,
+/// and when there is no earlier Period. `previous` replaces the natural one.
+pub fn previous_span(
+    period: &Period,
+    previous: Option<&Period>,
+    generated_at: &DateTime<Local>,
+) -> Option<PreviousSpan> {
+    if period.kind == PeriodKind::All {
+        return None;
+    }
+    let before = previous.cloned().or_else(|| previous_period_of(period))?;
+    let label = if before.kind == PeriodKind::Days7 {
+        "the previous 7 days".to_string()
+    } else {
+        before.label.clone()
+    };
+    let running = period.kind != PeriodKind::Days7 && ms(generated_at) < ms(&period.end);
+    let mut against = label.clone();
+    let mut span = before.clone();
+    if running {
+        let elapsed = ms(generated_at) - ms(&period.start);
+        let end = ms(&before.end).min(ms(&before.start) + elapsed.max(0));
+        span.end = from_ms(end);
+        against = format!("the same days of {}", before.label);
+    }
+    Some(PreviousSpan {
+        before,
+        label,
+        against,
+        span,
+    })
+}
+
 /// One month per column of a quarter or a year, up to the month of
 /// `generated_at`. A ticket belongs to the month of its delivery date (an
 /// active one, of its update date); one dated after the last month joins it,
@@ -865,13 +1024,128 @@ fn build_monthly(
         .fold(0.0_f64, f64::max);
     for row in &mut rows {
         for cell in &mut row.cells {
-            if max > 0.0 && cell.points > 0.0 {
-                let step = ((cell.points / max) * CELL_RAMP.len() as f64).ceil() as i64 - 1;
-                cell.shade = Some(step.clamp(0, CELL_RAMP.len() as i64 - 1) as usize);
-            }
+            cell.shade = shade_of(cell.points, max);
         }
     }
     ReportMonthly { months, rows }
+}
+
+/// Members by the difficulty level of their delivered tickets: one row per
+/// member with delivered tickets, one cell per level in `LEVELS` order, then an
+/// "Unassigned" row of counts when there are such tickets. The cells are shaded
+/// like the month matrix, by points against the busiest cell. `delivered` are
+/// the tickets the board was built from.
+pub fn level_matrix(board: &Board, delivered: &[TicketRecord]) -> Vec<MatrixRow> {
+    let cell_of = |points: f64, count: usize| MatrixCell {
+        points,
+        delivered: count,
+        scored: count,
+        shade: None,
+    };
+    let mut rows: Vec<MatrixRow> = board
+        .members
+        .iter()
+        .filter(|m| m.tickets > 0)
+        .map(|m| {
+            let coverage = m.assessed as f64 / m.tickets as f64;
+            MatrixRow {
+                id: m.id.clone(),
+                name: m.name.clone(),
+                unassigned: false,
+                faded: coverage < FADE_BELOW,
+                cells: LEVELS
+                    .iter()
+                    .map(|level| {
+                        let own = m.ticket_list.iter().filter(|e| e.level == Some(*level));
+                        cell_of(own.clone().map(|e| e.share).sum(), own.count())
+                    })
+                    .collect(),
+                total: MatrixCell {
+                    points: m.points,
+                    delivered: m.tickets,
+                    scored: m.assessed,
+                    shade: None,
+                },
+            }
+        })
+        .collect();
+    if board.unassigned.tickets > 0 {
+        let loose: Vec<&TicketRecord> = delivered
+            .iter()
+            .filter(|t| t.assignees.is_empty())
+            .collect();
+        rows.push(MatrixRow {
+            id: String::new(),
+            name: "Unassigned".into(),
+            unassigned: true,
+            faded: false,
+            cells: LEVELS
+                .iter()
+                .map(|level| {
+                    cell_of(
+                        0.0,
+                        loose
+                            .iter()
+                            .filter(|t| effective_level(t) == Some(*level))
+                            .count(),
+                    )
+                })
+                .collect(),
+            total: MatrixCell {
+                points: 0.0,
+                delivered: board.unassigned.tickets,
+                scored: board.unassigned.assessed,
+                shade: None,
+            },
+        });
+    }
+    let max = rows
+        .iter()
+        .filter(|r| !r.unassigned)
+        .flat_map(|r| r.cells.iter().map(|c| c.points))
+        .fold(0.0_f64, f64::max);
+    for row in &mut rows {
+        for cell in &mut row.cells {
+            cell.shade = shade_of(cell.points, max);
+        }
+    }
+    rows
+}
+
+/// The numbers of the report tiles for a board: what a period delivered.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TileStats {
+    pub delivered: usize,
+    pub scored: usize,
+    /// Team points, scored tickets only.
+    pub points: f64,
+    /// Median points per person among those with scored work.
+    pub median: Option<f64>,
+    /// Scored out of delivered, as the Scored tile shows it.
+    pub coverage_percent: i64,
+}
+
+pub fn tile_stats(board: &Board) -> TileStats {
+    let points = board.members.iter().fold(0.0, |sum, m| sum + m.points);
+    let scored: Vec<f64> = board
+        .members
+        .iter()
+        .filter(|m| m.assessed > 0)
+        .map(|m| m.points)
+        .collect();
+    TileStats {
+        delivered: board.total,
+        scored: board.assessed,
+        points,
+        median: median(&scored),
+        coverage_percent: percent(board.assessed as f64, board.total as f64),
+    }
+}
+
+/// How much `current` moved against `previous`, in whole percent; `None` when
+/// there is nothing to compare with (no previous value).
+pub fn percent_change(current: f64, previous: f64) -> Option<f64> {
+    (previous > 0.0).then(|| js_round(((current - previous) / previous) * 100.0))
 }
 
 pub fn build_report(input: &ReportInput) -> ReportData {
@@ -891,40 +1165,21 @@ pub fn build_report(input: &ReportInput) -> ReportData {
     // Comparison with the previous Period: not for All time, nor from zero. A
     // Period still running is compared with the same elapsed span of the
     // previous one; the rolling 7 days and a finished Period compare whole.
-    let before = input
-        .previous_period
-        .clone()
-        .or_else(|| previous_period_of(period));
     let mut comparison: Option<String> = None;
     let mut comparison_note: Option<String> = None;
-    if let (true, Some(before)) = (period.kind != PeriodKind::All, &before) {
-        let label = if before.kind == PeriodKind::Days7 {
-            "the previous 7 days".to_string()
-        } else {
-            before.label.clone()
-        };
+    if let Some(before) = previous_span(period, input.previous_period.as_ref(), generated_at) {
         if input.previous_incomplete {
-            comparison_note = Some(format!(
-                "No comparison with {label}: its tickets were not fully fetched. Open that period in Ticket Contributors once to include it."
-            ));
+            comparison_note = Some(no_comparison_note(&before.label));
         } else {
-            let running = period.kind != PeriodKind::Days7 && ms(generated_at) < ms(&period.end);
-            let mut against = label;
-            let mut span = before.clone();
-            if running {
-                let elapsed = ms(generated_at) - ms(&period.start);
-                let end = ms(&before.end).min(ms(&before.start) + elapsed.max(0));
-                span.end = from_ms(end);
-                against = format!("the same days of {}", before.label);
-            }
-            let previous = period_tickets(&input.previous_tickets, scope, &span).len();
+            let previous = period_tickets(&input.previous_tickets, scope, &before.span).len();
             if previous > 0 {
                 let change =
                     js_round(((board.total as f64 - previous as f64) / previous as f64) * 100.0);
                 comparison = Some(format!(
-                    "{}{}% vs {against}",
+                    "{}{}% vs {}",
                     if change > 0.0 { "+" } else { "" },
-                    js_number_text(change)
+                    js_number_text(change),
+                    before.against
                 ));
             }
         }
@@ -979,36 +1234,9 @@ pub fn build_report(input: &ReportInput) -> ReportData {
 
     // Trend: team points (member shares) by delivery date. Buckets that start
     // after the report was generated are still to come.
-    let planned = plan_buckets(period, &delivered);
-    let plan = BucketPlan {
-        unit: planned.unit,
-        starts: planned
-            .starts
-            .into_iter()
-            .filter(|start| ms(start) <= ms(generated_at))
-            .collect(),
-    };
-    let mut totals = vec![0.0; plan.starts.len()];
-    for member in &board.members {
-        for entry in &member.ticket_list {
-            if let Some(index) = bucket_index(&plan.starts, delivered_time(&entry.ticket) as i64) {
-                totals[index] += entry.share;
-            }
-        }
-    }
-    let buckets: Vec<TrendBucket> = plan
-        .starts
-        .iter()
-        .enumerate()
-        .map(|(i, start)| {
-            let (label, title) = bucket_labels(plan.unit, start, period);
-            TrendBucket {
-                label,
-                title,
-                points: totals[i],
-            }
-        })
-        .collect();
+    let plan = trend_plan(period, &delivered, generated_at);
+    let (totals, _) = bucket_series(&board, &plan);
+    let buckets = trend_buckets(&plan, &totals, period);
 
     // Hardest tickets: delivered and scored, by points then newest delivery.
     let hardest = hardest_of(&delivered, points, HARDEST_LIMIT);
@@ -3759,5 +3987,213 @@ mod tests {
         assert!(html.contains("No work to show in this period."));
         assert!(html.contains("No members to show in this period."));
         assert!(html.contains("No scored tickets in this period."));
+    }
+
+    // member trend, level matrix, tile stats
+
+    fn board_of(tickets: &[TicketRecord]) -> Board {
+        let delivered = period_tickets(tickets, &scope(), &october());
+        build_board(&delivered, &DEFAULT_TICKET_POINTS, &[])
+    }
+
+    fn mixed() -> Vec<TicketRecord> {
+        vec![
+            owned("a", at(2026, 10, 2), "S", &["1"]),
+            owned("b", at(2026, 10, 7), "M", &["1", "2"]),
+            owned("c", at(2026, 10, 7), "L", &["2"]),
+            owned("d", at(2026, 10, 14), "XL", &["1"]),
+            owned("e", at(2026, 10, 9), "XS", &["3"]),
+            ticket("f", |t| {
+                done(t, at(2026, 10, 9));
+                t.assignees = vec![user("3")];
+            }),
+        ]
+    }
+
+    #[test]
+    fn member_trend_sums_to_the_team_trend_bucket_by_bucket() {
+        for (kind, tickets) in [
+            (PeriodKind::Month, mixed()),
+            (PeriodKind::Quarter, mixed()),
+            (PeriodKind::Year, mixed()),
+            (PeriodKind::Days7, mixed()),
+            (PeriodKind::All, mixed()),
+        ] {
+            let period = current_period(kind, &now(), None);
+            let data = build_report(&input(tickets.clone(), |i| {
+                i.previous_period = previous_period(&period);
+                i.period = period.clone();
+            }));
+            let delivered = period_tickets(&tickets, &scope(), &period);
+            let board = build_board(&delivered, &DEFAULT_TICKET_POINTS, &[]);
+            let trend = member_trend(&period, &delivered, &board, &now());
+            assert_eq!(trend.unit, data.trend.unit, "{kind:?}");
+            assert_eq!(trend.buckets, data.trend.buckets, "{kind:?}");
+            for (i, bucket) in data.trend.buckets.iter().enumerate() {
+                let sum: f64 = trend.members.iter().map(|m| m.points[i]).sum();
+                assert_eq!(sum, bucket.points, "{kind:?} bucket {i}");
+            }
+            let count: usize = trend.members.iter().flat_map(|m| m.tickets.iter()).sum();
+            let listed: usize = board.members.iter().map(|m| m.tickets).sum();
+            assert_eq!(count, listed, "{kind:?}: every ticket lands in a bucket");
+        }
+    }
+
+    #[test]
+    fn member_trend_splits_the_buckets_by_member_and_counts_tickets() {
+        let delivered = period_tickets(&mixed(), &scope(), &october());
+        let board = build_board(&delivered, &DEFAULT_TICKET_POINTS, &[]);
+        let trend = member_trend(&october(), &delivered, &board, &now());
+        assert_eq!(trend.unit, TrendUnit::Week);
+        let one = trend.members.iter().find(|m| m.id == "1").unwrap();
+        let two = trend.members.iter().find(|m| m.id == "2").unwrap();
+        // Weeks of Sep 28, Oct 5, Oct 12: member 1 has S (8) in the first,
+        // half of M (8) in the second and XL (48) in the third.
+        assert_eq!(one.points, [8.0, 8.0, 48.0]);
+        assert_eq!(one.tickets, [1, 1, 1]);
+        assert_eq!(two.points, [0.0, 8.0 + 32.0, 0.0]);
+        assert_eq!(two.tickets, [0, 2, 0]);
+        assert_eq!(
+            trend
+                .members
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            board
+                .members
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            "board order"
+        );
+    }
+
+    #[test]
+    fn level_matrix_has_one_cell_per_level_and_a_total_per_member() {
+        let delivered = period_tickets(&mixed(), &scope(), &october());
+        let board = build_board(&delivered, &DEFAULT_TICKET_POINTS, &[]);
+        let rows = level_matrix(&board, &delivered);
+        let one = rows.iter().find(|r| r.id == "1").unwrap();
+        assert_eq!(one.cells.len(), 5);
+        // XS, S, M, L, XL: member 1 has S (8), half an M (8) and an XL (48).
+        let points: Vec<f64> = one.cells.iter().map(|c| c.points).collect();
+        assert_eq!(points, [0.0, 8.0, 8.0, 0.0, 48.0]);
+        let counts: Vec<usize> = one.cells.iter().map(|c| c.delivered).collect();
+        assert_eq!(counts, [0, 1, 1, 0, 1]);
+        assert_eq!(
+            counts,
+            one.cells.iter().map(|c| c.scored).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            (one.total.points, one.total.delivered, one.total.scored),
+            (64.0, 3, 3)
+        );
+        assert!(!one.unassigned);
+        // Member 3 delivered an XS and an unscored ticket.
+        let three = rows.iter().find(|r| r.id == "3").unwrap();
+        assert_eq!((three.total.delivered, three.total.scored), (2, 1));
+        assert!(!three.faded, "half the tickets are scored: not below 50%");
+    }
+
+    #[test]
+    fn level_matrix_shades_by_points_against_the_busiest_cell() {
+        let delivered = period_tickets(&mixed(), &scope(), &october());
+        let board = build_board(&delivered, &DEFAULT_TICKET_POINTS, &[]);
+        let rows = level_matrix(&board, &delivered);
+        let one = rows.iter().find(|r| r.id == "1").unwrap();
+        // XL (48) is the busiest cell: the top step. 8 of 48 is the first.
+        assert_eq!(one.cells[4].shade, Some(4));
+        assert_eq!(one.cells[1].shade, Some(0));
+        assert_eq!(one.cells[0].shade, None, "an empty cell has no shade");
+        assert_eq!(shade_of(0.0, 48.0), None);
+        assert_eq!(shade_of(5.0, 0.0), None);
+        assert_eq!(shade_of(24.0, 48.0), Some(2));
+    }
+
+    #[test]
+    fn level_matrix_ends_with_an_unassigned_row_of_counts_only() {
+        let mut tickets = mixed();
+        tickets.push(owned("u1", at(2026, 10, 3), "M", &[]));
+        tickets.push(ticket("u2", |t| done(t, at(2026, 10, 4))));
+        let delivered = period_tickets(&tickets, &scope(), &october());
+        let board = build_board(&delivered, &DEFAULT_TICKET_POINTS, &[]);
+        let rows = level_matrix(&board, &delivered);
+        let last = rows.last().unwrap();
+        assert!(last.unassigned);
+        assert_eq!(last.name, "Unassigned");
+        assert_eq!((last.total.delivered, last.total.scored), (2, 1));
+        assert_eq!(last.total.points, 0.0);
+        assert!(last
+            .cells
+            .iter()
+            .all(|c| c.points == 0.0 && c.shade.is_none()));
+        assert_eq!(last.cells[2].delivered, 1, "the scored M");
+        // Without unassigned tickets there is no such row.
+        let none = level_matrix(
+            &board_of(&mixed()),
+            &period_tickets(&mixed(), &scope(), &october()),
+        );
+        assert!(none.iter().all(|r| !r.unassigned));
+    }
+
+    #[test]
+    fn tile_stats_agree_with_the_report_tiles() {
+        let tickets = mixed();
+        let data = report(tickets.clone());
+        let stats = tile_stats(&board_of(&tickets));
+        assert_eq!(stats.delivered.to_string(), tile(&data, "delivered").value);
+        assert_eq!(fmt(stats.points), tile(&data, "points").value);
+        assert_eq!(
+            stats.median.map_or_else(|| "-".into(), fmt),
+            tile(&data, "median").value
+        );
+        assert_eq!(
+            format!("{}%", stats.coverage_percent),
+            tile(&data, "scored").value
+        );
+        assert_eq!((stats.delivered, stats.scored), (6, 5));
+    }
+
+    #[test]
+    fn tile_stats_of_nothing_have_no_coverage_and_no_median() {
+        let stats = tile_stats(&board_of(&[]));
+        assert_eq!((stats.delivered, stats.scored, stats.points), (0, 0, 0.0));
+        assert_eq!(stats.median, None);
+        assert_eq!(stats.coverage_percent, 0);
+    }
+
+    #[test]
+    fn percent_change_is_rounded_and_needs_something_to_compare_with() {
+        assert_eq!(percent_change(12.0, 10.0), Some(20.0));
+        assert_eq!(percent_change(5.0, 10.0), Some(-50.0));
+        assert_eq!(percent_change(10.0, 10.0), Some(0.0));
+        assert_eq!(percent_change(1.0, 3.0), Some(-67.0));
+        assert_eq!(percent_change(4.0, 0.0), None);
+    }
+
+    #[test]
+    fn previous_span_compares_a_running_period_with_the_same_days() {
+        // Oct 18 at noon: 17.5 days of October.
+        let span = previous_span(&october(), None, &now()).unwrap();
+        assert_eq!(span.before, september());
+        assert_eq!(span.label, "Sep 2026");
+        assert_eq!(span.against, "the same days of Sep 2026");
+        assert!(ms(&span.span.end) < ms(&span.before.end));
+        assert_eq!(ms(&span.span.start), ms(&span.before.start));
+        // A finished period compares whole.
+        let later = local_at(2026, 10, 3, 12, 0);
+        let whole = previous_span(&october(), None, &later).unwrap();
+        assert_eq!(whole.against, "Sep 2026");
+        assert_eq!(whole.span, whole.before);
+    }
+
+    #[test]
+    fn previous_span_is_none_for_all_time_and_names_the_rolling_week() {
+        let all = current_period(PeriodKind::All, &now(), None);
+        assert_eq!(previous_span(&all, None, &now()), None);
+        let week = current_period(PeriodKind::Days7, &now(), None);
+        let span = previous_span(&week, None, &now()).unwrap();
+        assert_eq!(span.label, "the previous 7 days");
+        assert_eq!(span.against, "the previous 7 days");
     }
 }

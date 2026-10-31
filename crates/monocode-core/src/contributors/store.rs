@@ -143,6 +143,8 @@ pub(super) struct Loaded {
     /// Part of the window was never synced (or its sync was cancelled), as
     /// opposed to a synced window that only lacks some commits.
     pub has_gaps: bool,
+    /// The parts of the window no sync covers, as inclusive epoch seconds.
+    pub missing: Vec<(i64, i64)>,
     pub missing_commits: u64,
     pub synced_at: Option<i64>,
     pub coverage_head: Option<String>,
@@ -1023,7 +1025,8 @@ fn load_in(
     }
 
     let intervals = coverage(conn, repo, branch)?;
-    let has_gaps = !missing_intervals(&intervals, since, until).is_empty();
+    let missing = missing_intervals(&intervals, since, until);
+    let has_gaps = !missing.is_empty();
     let covered = !has_gaps && missing_commits == 0;
     let overlapping: Vec<&CoverageRow> = intervals
         .iter()
@@ -1067,6 +1070,7 @@ fn load_in(
         },
         covered,
         has_gaps,
+        missing,
         missing_commits,
         synced_at: oldest.map(|r| r.synced_at),
         coverage_head: oldest.map(|r| r.head.clone()),
@@ -1940,6 +1944,7 @@ mod tests {
         let loaded = load_all(&f, &f.hashes[2]);
         assert!(!loaded.covered);
         assert!(loaded.has_gaps);
+        assert!(!loaded.missing.is_empty());
         assert_eq!(loaded.missing_commits, 0);
         assert_eq!(loaded.synced_at, Some(5));
     }
@@ -1955,6 +1960,8 @@ mod tests {
         let loaded = load_all(&f, &f.hashes[2]);
         assert!(!loaded.covered);
         assert!(loaded.has_gaps);
+        // Everything in the window is missing, in one piece.
+        assert_eq!(loaded.missing.len(), 1);
         assert_eq!(loaded.synced_at, None);
         assert_eq!(loaded.coverage_head, None);
         assert_eq!(loaded.gh_state, None);

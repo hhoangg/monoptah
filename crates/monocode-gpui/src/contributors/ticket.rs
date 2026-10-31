@@ -15,12 +15,15 @@ use monocode_core::contributors::{
 };
 
 pub(super) mod backend;
+mod detail;
 mod draw;
 mod export;
 #[cfg(test)]
 mod export_tests;
 #[cfg(test)]
 mod fake;
+mod overview;
+mod part;
 mod rows;
 mod scope;
 mod state;
@@ -30,6 +33,23 @@ mod state_tests;
 mod view_tests;
 
 pub(crate) use state::{TicketEvent, TicketView};
+#[cfg(test)]
+pub(super) use view_tests::hover_numbers;
+
+#[cfg(test)]
+thread_local! {
+    /// How many times the tab, a leaderboard row and a ticket row were built.
+    pub(super) static BUILT: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+/// Counts one build: 0 the tab, 1 a leaderboard row, 2 a ticket row.
+#[cfg(test)]
+pub(super) fn built(which: usize) {
+    BUILT.with(|n| {
+        let mut all = n.get();
+        all[which] += 1;
+        n.set(all);
+    });
+}
 
 impl ContributorsPage {
     /// The Ticket tab: one view for the page's life; opening the tab mounts it.

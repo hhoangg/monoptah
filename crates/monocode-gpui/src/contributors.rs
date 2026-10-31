@@ -21,13 +21,20 @@ use monocode_core::contributors::{
 };
 use std::sync::Arc;
 
+mod activity;
 mod ask;
 #[cfg(test)]
 mod ask_tests;
 pub(crate) mod backend;
+mod chart;
+#[cfg(test)]
+mod chart_tests;
 mod data;
 #[cfg(test)]
 mod data_tests;
+mod detail;
+#[cfg(test)]
+mod detail_tests;
 mod formula;
 #[cfg(test)]
 mod formula_tests;
@@ -42,6 +49,8 @@ mod leaderboard_tests;
 #[cfg(test)]
 mod page_tests;
 mod panels;
+#[cfg(test)]
+mod perf_tests;
 mod stats;
 #[cfg(test)]
 mod stats_tests;
@@ -275,6 +284,9 @@ impl ContributorsPage {
     /// The page is not on screen any more (another view, Settings): the Ticket
     /// tab goes with it. [`Self::reveal`] brings it back.
     pub(crate) fn hide(&mut self, cx: &mut Context<Self>) {
+        for (_, view) in &self.views {
+            view.update(cx, |view, cx| view.leave(cx));
+        }
         self.unmount_ticket(cx);
     }
 
@@ -367,6 +379,20 @@ impl ContributorsPage {
         )
     }
 
+    /// Closes the topmost layer of the open tab; whether there was one. Tabs with
+    /// layers of their own (the ClickUp detail) add their arm here.
+    fn close_top_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match (self.tab, self.current_view()) {
+            (Tab::Github, Some(view)) => {
+                view.update(cx, |view, cx| view.close_top_layer(window, cx))
+            }
+            (Tab::Ticket, _) => self
+                .ticket
+                .update(cx, |ticket, cx| ticket.close_top_layer(window, cx)),
+            _ => false,
+        }
+    }
+
     /// The GitHub view of the selected project, once it exists.
     pub(crate) fn current_view(&self) -> Option<Entity<GithubView>> {
         let selected = self.selected_project()?;
@@ -379,10 +405,16 @@ impl ContributorsPage {
     /// Makes sure the selected project has a GitHub view (made when the tab is
     /// opened, like the React view mounts) and marks it the most recent.
     fn sync_view(&mut self, cx: &mut Context<Self>) {
-        if self.tab != Tab::Github {
-            return;
+        let selected = (self.tab == Tab::Github)
+            .then(|| self.selected_project())
+            .flatten();
+        // A view that is not shown any more closes what it had open.
+        for (project, view) in &self.views {
+            if selected.as_deref().is_none_or(|s| !same_path(project, s)) {
+                view.update(cx, |view, cx| view.leave(cx));
+            }
         }
-        let Some(selected) = self.selected_project() else {
+        let Some(selected) = selected else {
             return;
         };
         match self
@@ -702,8 +734,13 @@ impl Render for ContributorsPage {
             .flex()
             .flex_col()
             .text_color(content(1.))
-            .on_key_down(cx.listener(|_, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
+                    // The open tab's own layers (a detail page) go before the page.
+                    if this.close_top_layer(window, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     cx.emit(Event::Close);
                     cx.stop_propagation();
                 }

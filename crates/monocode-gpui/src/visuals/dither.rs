@@ -67,6 +67,108 @@ impl Grid {
     }
 }
 
+/// The inked cells of a grid drawn once as an image: thousands of tiny quads
+/// replayed on every frame of a page that is only partly redrawn cost far more
+/// than one textured quad.
+pub(crate) struct Sheet {
+    pub(crate) key: u64,
+    image: std::sync::Arc<gpui::RenderImage>,
+}
+/// Where a view keeps its `Sheet` between frames.
+pub(crate) type Sheets = std::rc::Rc<std::cell::RefCell<Option<Sheet>>>;
+
+#[cfg(test)]
+impl Sheet {
+    pub(crate) fn image(&self) -> std::sync::Arc<gpui::RenderImage> {
+        self.image.clone()
+    }
+}
+
+/// Frees the image a view holds, when the view is going away: the atlas keeps a
+/// tile until it is dropped explicitly.
+pub(crate) fn release_sheet(slot: &Sheets, cx: &mut App) {
+    if let Some(old) = slot.borrow_mut().take() {
+        // Deferred: a window being updated (Back, Escape) is out of `cx`'s
+        // window list, and `drop_image` would miss its atlas.
+        let image = old.image;
+        cx.defer(move |cx| cx.drop_image(image, None));
+    }
+}
+
+/// Whether `paint_inked` can draw `color` here: opaque, on a whole-number scale.
+pub(crate) fn sheetable(color: Hsla, window: &Window) -> bool {
+    let scale = window.scale_factor();
+    color.a >= 1. && scale >= 1. && scale.fract() == 0.
+}
+
+/// Paints the cells `inked` selects in `color` as one image, remade only when
+/// `key` (what the cells depend on) or the screen's scale changes. Returns
+/// `false` when it cannot (a translucent color, a fractional scale), and the
+/// caller paints the cells another way.
+pub(crate) fn paint_inked(
+    slot: &Sheets,
+    key: u64,
+    grid: &Grid,
+    color: Hsla,
+    window: &mut Window,
+    cx: &mut App,
+    inked: impl Fn(i32, i32) -> bool,
+) -> bool {
+    if !sheetable(color, window) || grid.cols == 0 || grid.rows == 0 {
+        return false;
+    }
+    let scale = window.scale_factor();
+    let side = CELL as u32 * scale as u32;
+    let (width, height) = (grid.cols as u32 * side, grid.rows as u32 * side);
+    let key = key ^ ((scale as u64) << 56) ^ ((grid.cols as u64) << 28) ^ grid.rows as u64;
+    let mut held = slot.borrow_mut();
+    if held.as_ref().is_none_or(|sheet| sheet.key != key) {
+        let rgba = gpui::Rgba::from(color);
+        let to_byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
+        // The atlas takes blue first; the cells are opaque, so nothing to premultiply.
+        let ink = [to_byte(rgba.b), to_byte(rgba.g), to_byte(rgba.r), 255];
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        for row in 0..grid.rows {
+            for col in 0..grid.cols {
+                if !inked(col, row) {
+                    continue;
+                }
+                for y in 0..side {
+                    let start =
+                        (((row as u32 * side + y) * width + col as u32 * side) * 4) as usize;
+                    for x in 0..side as usize {
+                        pixels[start + x * 4..start + x * 4 + 4].copy_from_slice(&ink);
+                    }
+                }
+            }
+        }
+        let Some(buffer) = image::RgbaImage::from_raw(width, height, pixels) else {
+            return false;
+        };
+        let image = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buffer)]));
+        if let Some(old) = held.replace(Sheet { key, image }) {
+            cx.drop_image(old.image, Some(window));
+        }
+    }
+    let Some(sheet) = held.as_ref() else {
+        return false;
+    };
+    let bounds = Bounds::new(
+        grid.origin,
+        size(px(grid.cols as f32 * CELL), px(grid.rows as f32 * CELL)),
+    );
+    window
+        .paint_image(
+            bounds,
+            bounds,
+            Corners::default(),
+            sheet.image.clone(),
+            0,
+            false,
+        )
+        .is_ok()
+}
+
 /// A soft bloom over `bounds`, inside as well as around it, so it shows
 /// through the gaps of a dithered fill painted on top.
 pub(crate) fn glow(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla, strength: f32) {
@@ -215,9 +317,16 @@ pub(crate) fn pointer(bounds: Bounds<Pixels>, window: &Window) -> Option<(f32, f
 
 /// A chart canvas that repaints as the pointer moves over it and leaves.
 pub(crate) fn hoverable(id: gpui::SharedString) -> gpui::Stateful<gpui::Div> {
-    use gpui::{InteractiveElement, StatefulInteractiveElement, div};
-    div()
-        .id(id)
+    use gpui::{InteractiveElement, div};
+    repaints(div().id(id))
+}
+
+/// `element` asks the whole window to repaint as the pointer moves over it and
+/// leaves. That bypasses view caching, so a page that cares gives the element
+/// an entity of its own instead and notifies that.
+pub(crate) fn repaints(element: gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div> {
+    use gpui::{InteractiveElement, StatefulInteractiveElement};
+    element
         .on_mouse_move(|_, window, _| window.refresh())
         .on_hover(|_, window, _| window.refresh())
 }
@@ -284,7 +393,7 @@ pub(crate) fn readout(
 }
 
 /// A dashed vertical guide at `x`, from `top` down `height` px.
-pub(super) fn crosshair(origin: Point<Pixels>, x: f32, height: f32, window: &mut Window) {
+pub(crate) fn crosshair(origin: Point<Pixels>, x: f32, height: f32, window: &mut Window) {
     let mut y = 0.;
     while y < height {
         window.paint_quad(fill(
@@ -299,7 +408,8 @@ pub(super) fn crosshair(origin: Point<Pixels>, x: f32, height: f32, window: &mut
 }
 
 /// A y domain with round ticks covering every value, as charts want.
-pub(super) struct Scale {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Scale {
     pub min: f64,
     pub max: f64,
     pub step: f64,
@@ -363,7 +473,7 @@ impl Scale {
 }
 
 /// 1.2K, 48K, 3.4M; plain numbers keep `step`'s decimals.
-pub(super) fn compact(value: f64, step: f64) -> String {
+pub(crate) fn compact(value: f64, step: f64) -> String {
     let trim = |s: String| {
         if s.contains('.') {
             s.trim_end_matches('0').trim_end_matches('.').to_owned()
@@ -392,7 +502,7 @@ pub(super) fn compact(value: f64, step: f64) -> String {
 
 /// A smooth curve through points that never overshoots them (monotone
 /// cubic, Fritsch–Carlson), so peaks stay at the data.
-pub(super) struct Curve {
+pub(crate) struct Curve {
     xs: Vec<f32>,
     ys: Vec<f32>,
     ms: Vec<f32>,
@@ -486,7 +596,7 @@ impl Curve {
 }
 
 /// Strokes `points` (relative to `origin`) with a soft glow under the line.
-pub(super) fn glowing_line(
+pub(crate) fn glowing_line(
     points: &[[f32; 2]],
     origin: Point<Pixels>,
     width: f32,
@@ -503,7 +613,7 @@ pub(super) fn glowing_line(
 }
 
 /// A square end marker in a faint halo of its colour.
-pub(super) fn marker(window: &mut Window, center: Point<Pixels>, side: f32, color: Hsla) {
+pub(crate) fn marker(window: &mut Window, center: Point<Pixels>, side: f32, color: Hsla) {
     let mut halo = color;
     halo.a = 0.25;
     for (side, color) in [(side + 6., halo), (side, color)] {
@@ -518,7 +628,7 @@ pub(super) fn marker(window: &mut Window, center: Point<Pixels>, side: f32, colo
 }
 
 /// A legend swatch: a translucent body under a solid cap, like a bar.
-pub(super) fn swatch(color: Hsla) -> gpui::Div {
+pub(crate) fn swatch(color: Hsla) -> gpui::Div {
     use gpui::{Styled, div, prelude::*};
     let mut body = color;
     body.a = 0.4;

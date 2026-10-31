@@ -17,7 +17,7 @@ use crate::{
 use chrono::{DateTime, Local};
 use gpui::{
     AnyElement, AnyView, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    Render, Role, SharedString, Subscription, Task, Window, div, prelude::*, px, rgb,
+    Render, Role, ScrollHandle, SharedString, Subscription, Task, Window, div, prelude::*, px, rgb,
 };
 use monocode_core::contributors::{
     RawData,
@@ -89,6 +89,14 @@ pub(crate) struct GithubView {
     pub(super) merge: bool,
     pub(super) pick_touched: bool,
     pub(super) merge_touched: bool,
+    /// The chart type every chart on the page shares, and whether the user set it
+    /// before the saved one was read.
+    pub(super) chart_prefs: Entity<super::chart::ChartPrefs>,
+    /// A screen reader is attached: the table is not drawn from a cache.
+    pub(super) a11y: bool,
+    /// The colors picked for people of this project (saved apart from the config).
+    pub(super) color_overrides: super::backend::ColorOverrides,
+    pub(super) colors_touched: bool,
     pub(super) prefs_ready: bool,
     pub(super) picked_branch: Option<String>,
 
@@ -130,6 +138,8 @@ pub(crate) struct GithubView {
     pub(super) model_gen: u64,
     pub(super) model_requested: u64,
     pub(super) model_done: u64,
+    /// The model on its way differs only by a color: the page is not stale meanwhile.
+    pub(super) model_quiet: bool,
 
     // the clock
     pub(super) midnight: Option<Task<()>>,
@@ -145,8 +155,16 @@ pub(crate) struct GithubView {
     pub(super) focus: FocusHandle,
     /// The formula sidebar of the Leaderboard: drawn over the right 400px of the body.
     pub(super) sidebar: Option<AnyView>,
-    /// The open table row and the chart tooltips of the Stats section.
+    /// The chart and the table of the Stats section.
     pub(super) stats_ui: super::stats::StatsUi,
+    /// The Activity card: the year read for it and what it shows.
+    pub(super) activity: super::activity::ActivityUi,
+    /// The person whose detail page replaces the Stats body, if one is open.
+    pub(super) detail: Option<String>,
+    /// What the detail page keeps: its chart, its numbers and the list's scroll.
+    pub(super) detail_ui: super::detail::DetailUi,
+    /// The scroll of the page body, so Back puts the list where it was.
+    pub(super) scroll: ScrollHandle,
     /// The Leaderboard's "how" link focus and podium width.
     pub(super) leaderboard_ui: super::leaderboard::LeaderboardUi,
     /// The Identities section: an entity that keeps its fields, menu and drag.
@@ -182,7 +200,9 @@ impl GithubView {
         } else {
             project.clone()
         };
+        let chart_prefs = super::chart::shared_prefs(cx);
         let subscriptions = vec![
+            cx.observe(&chart_prefs, |this, _, cx| this.push_stats(cx)),
             // Progress and the job list redraw the panels and may unlock effects.
             cx.observe(&jobs, |this, _, cx| this.settle(cx)),
             cx.subscribe(&jobs, |this, _, event: &JobsEvent, cx| {
@@ -215,6 +235,10 @@ impl GithubView {
             merge: true,
             pick_touched: false,
             merge_touched: false,
+            chart_prefs,
+            a11y: false,
+            color_overrides: Default::default(),
+            colors_touched: false,
             prefs_ready: false,
             picked_branch: None,
             meta: None,
@@ -246,6 +270,7 @@ impl GithubView {
             model_gen: 0,
             model_requested: 0,
             model_done: 0,
+            model_quiet: false,
             midnight: None,
             midnight_for: None,
             _minute: minute,
@@ -257,6 +282,10 @@ impl GithubView {
             focus: cx.focus_handle(),
             sidebar: None,
             stats_ui: Default::default(),
+            activity: Default::default(),
+            detail: None,
+            detail_ui: Default::default(),
+            scroll: ScrollHandle::new(),
             leaderboard_ui: super::leaderboard::LeaderboardUi::new(cx),
             identities_ui: None,
             _subscriptions: subscriptions,
@@ -267,6 +296,11 @@ impl GithubView {
             #[cfg(test)]
             held: Vec::new(),
         }
+    }
+
+    /// The chart type every chart of every page shows.
+    pub(super) fn chart_kind(&self, cx: &gpui::App) -> super::chart::ChartKind {
+        self.chart_prefs.read(cx).kind
     }
 
     /// Whether the project is a remote one: no local history to read.
@@ -287,10 +321,35 @@ impl GithubView {
 
     pub(crate) fn set_section(&mut self, section: Section, cx: &mut Context<Self>) {
         if self.section != section {
+            self.leave(cx);
+            self.drop_detail(cx);
             self.section = section;
             // The formula sidebar belongs to the Leaderboard section.
             self.sidebar = None;
             cx.notify();
+        }
+    }
+
+    /// The view is hidden or its section changes: an open palette goes.
+    pub(crate) fn leave(&mut self, cx: &mut Context<Self>) {
+        if let Some(chart) = self.stats_ui.chart.clone() {
+            chart.update(cx, |chart, cx| chart.dismiss_palette(cx));
+        }
+    }
+
+    /// Escape: closes the topmost thing the view opened (the formula sidebar,
+    /// else the detail page); whether there was one. The page calls this too, so
+    /// the rule holds wherever the focus is. A palette stops its own Escape first.
+    pub(crate) fn close_top_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.sidebar.is_some() {
+            self.set_sidebar(None, cx);
+            window.focus(&self.leaderboard_ui.how_focus, cx);
+            true
+        } else if self.detail.is_some() {
+            self.close_detail(window, cx);
+            true
+        } else {
+            false
         }
     }
 
@@ -868,8 +927,13 @@ impl GithubView {
                             .into_any_element(),
                     );
                 }
-                out.push(self.section_tabs(&model, cx));
+                // A detail page stands where the whole section was: no tabs over it.
+                let detailed = self.detail.is_some() && self.section == Section::Stats;
+                if !detailed {
+                    out.push(self.section_tabs(&model, cx));
+                }
                 let body = match self.section {
+                    Section::Stats if detailed => self.detail_body(&model, cx),
                     Section::Stats if model.has_activity => self.stats_body(&model, cx),
                     Section::Stats => self.no_commits(),
                     Section::Leaderboard => self.leaderboard_body(&model, cx),
@@ -892,7 +956,8 @@ impl GithubView {
 }
 
 impl Render for GithubView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.a11y = window.is_a11y_active();
         let snap = self.snapshot(cx);
         let content_column = if self.is_remote() {
             vec![self.remote_panel()]
@@ -931,9 +996,10 @@ impl Render for GithubView {
             // The formula sidebar closes on any Escape, wherever the focus is
             // (a click in the body moves it to this view), before the page sees it.
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" && this.sidebar.is_some() {
-                    this.set_sidebar(None, cx);
-                    window.focus(&this.leaderboard_ui.how_focus, cx);
+                if event.keystroke.key != "escape" {
+                    return;
+                }
+                if this.close_top_layer(window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -950,6 +1016,9 @@ impl Render for GithubView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    // A sideways swipe must not be turned into a vertical move.
+                    .restrict_scroll_to_axis()
+                    .track_scroll(&self.scroll)
                     .child(
                         div()
                             .mx_auto()

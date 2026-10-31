@@ -3,6 +3,8 @@
 //! the background executor; every answer comes back through a generation
 //! check, so a late answer for an abandoned request cannot change what the
 //! page shows.
+use super::backend::ColorOverrides;
+use super::chart::ChartKind;
 use super::github::GithubView;
 use super::jobs::{JobsEvent, SyncJobs};
 use chrono::{DateTime, Datelike, Local, TimeZone};
@@ -182,9 +184,15 @@ pub(super) struct ModelInputs {
     period: Period,
     now: DateTime<Local>,
     user: Option<GitUser>,
+    color_overrides: ColorOverrides,
 }
 impl ModelInputs {
     fn same_as(&self, other: &Self) -> bool {
+        self.color_overrides == other.color_overrides && self.same_but_colors(other)
+    }
+
+    /// Everything but the colors the user picked.
+    fn same_but_colors(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.raw, &other.raw)
             && (Arc::ptr_eq(&self.config, &other.config) || self.config == other.config)
             && (Arc::ptr_eq(&self.mailmap, &other.mailmap) || self.mailmap == other.mailmap)
@@ -565,7 +573,8 @@ impl GithubView {
             action_error: self.action_error.clone(),
             raw: d.shown.clone(),
             model: self.model.clone(),
-            model_pending: self.model_requested != self.model_done,
+            // A recolor rebuilds the model too, but nothing on screen is out of date.
+            model_pending: self.model_requested != self.model_done && !self.model_quiet,
             config: meta.map_or_else(
                 || Arc::new(DEFAULT_CONFIG.clone()),
                 |meta| meta.config.clone(),
@@ -963,6 +972,7 @@ impl GithubView {
             period: d.shown_period.clone(),
             now: self.now,
             user,
+            color_overrides: self.color_overrides.clone(),
         };
         if self
             .model_inputs
@@ -971,6 +981,13 @@ impl GithubView {
         {
             return;
         }
+        // Only a color changed, and the page is not waiting on anything else.
+        let pending = self.model_requested != self.model_done;
+        let recolor = self
+            .model_inputs
+            .as_ref()
+            .is_some_and(|last| last.same_but_colors(&inputs));
+        self.model_quiet = recolor && (!pending || self.model_quiet);
         self.model_gen += 1;
         let generation = self.model_gen;
         self.model_requested = generation;
@@ -984,6 +1001,7 @@ impl GithubView {
                 period: inputs.period,
                 now: inputs.now,
                 user: inputs.user,
+                color_overrides: inputs.color_overrides,
             })
         });
         cx.spawn(async move |this, cx| {
@@ -1062,16 +1080,37 @@ impl GithubView {
         }
         // The saved period and merge toggle, before anything is loaded.
         let now = self.now;
+        let project = self.project.clone();
         self.spawn_job(
             "prefs",
             cx,
-            move |backend| backend.load_prefs(&now),
-            |this, (pick, merge), cx| {
+            move |backend| {
+                (
+                    backend.load_prefs(&now),
+                    backend.load_chart_kind(),
+                    backend.load_colors(&project),
+                )
+            },
+            |this, ((pick, merge), kind, colors), cx| {
                 if !this.pick_touched {
                     this.pick = pick;
                 }
                 if !this.merge_touched {
                     this.merge = merge;
+                }
+                // The first page to read it decides; the choice is app-wide.
+                this.chart_prefs.update(cx, |prefs, cx| {
+                    if !prefs.settled {
+                        prefs.settled = true;
+                        prefs.kind = kind
+                            .as_deref()
+                            .and_then(ChartKind::parse)
+                            .unwrap_or_default();
+                        cx.notify();
+                    }
+                });
+                if !this.colors_touched {
+                    this.color_overrides = colors;
                 }
                 this.prefs_ready = true;
                 this.settle(cx);
@@ -1094,6 +1133,48 @@ impl GithubView {
 
     pub(crate) fn set_kind(&mut self, kind: PeriodKind, cx: &mut Context<Self>) {
         self.select_pick(PeriodPick { kind, id: None }, cx);
+    }
+
+    /// The chart type every chart on the page shares; saved for next time.
+    pub(super) fn set_chart_kind(&mut self, kind: ChartKind, cx: &mut Context<Self>) {
+        let changed = self.chart_prefs.update(cx, |prefs, cx| {
+            prefs.settled = true;
+            let changed = prefs.kind != kind;
+            if changed {
+                prefs.kind = kind;
+                cx.notify();
+            }
+            changed
+        });
+        if changed {
+            self.spawn_job(
+                "save-chart-kind",
+                cx,
+                move |backend| backend.save_chart_kind(kind.id()),
+                |_, (), _| {},
+            );
+        }
+        self.settle(cx);
+    }
+
+    /// A color picked from the palette for one person of this project. It is
+    /// saved, and the model is rebuilt with it so every tab shows it.
+    pub(super) fn set_person_color(
+        &mut self,
+        person_id: &str,
+        hex: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.colors_touched = true;
+        self.color_overrides.insert(person_id.to_string(), hex);
+        let (project, colors) = (self.project.clone(), self.color_overrides.clone());
+        self.spawn_job(
+            "save-colors",
+            cx,
+            move |backend| backend.save_colors(&project, &colors),
+            |_, (), _| {},
+        );
+        self.settle(cx);
     }
 
     pub(crate) fn go_previous(&mut self, cx: &mut Context<Self>) {
@@ -1387,6 +1468,7 @@ impl GithubView {
         // synced" would flash "No data" when shown again.
         let mine = format!("{}\u{0}", self.cwd);
         self.loads.remove_prefix(&mine);
+        self.forget_activity_loads();
         self.load_inflight.clear();
         self.load(false, true, cx);
         self.settle(cx);

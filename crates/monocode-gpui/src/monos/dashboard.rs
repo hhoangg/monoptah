@@ -4,11 +4,10 @@
 use super::*;
 use crate::right_panel::{DIFF_ADD, DIFF_DEL, format_integer, tabular};
 use crate::runtime::{Database, locked};
-use crate::visuals::dither::{
-    Align, CELL, Grid, Label, Motion, glow, hoverable, inked, pointer, readout,
-};
-use chrono::{DateTime, Datelike, Duration as Days, Local, NaiveDate};
-use gpui::{Bounds, Div, FontWeight, Hsla, canvas, point, size};
+use crate::visuals::calendar;
+use crate::visuals::dither::{Motion, repaints};
+use chrono::{DateTime, Duration as Days, Local, NaiveDate};
+use gpui::{Div, FontWeight, Hsla};
 use monocode_core::contributions::{self, Contribution, Kind};
 use monocode_core::time::{now_ms, relative};
 use std::collections::HashSet;
@@ -42,6 +41,34 @@ impl Day {
     /// lines never do.
     pub fn count(&self) -> u32 {
         self.commits + self.reviews + self.opened + self.merged
+    }
+}
+
+impl calendar::Active for Day {
+    fn date(&self) -> NaiveDate {
+        self.date
+    }
+    fn amount(&self) -> u32 {
+        Day::count(self)
+    }
+    fn details(&self, tint: Hsla) -> Vec<(Hsla, String, String)> {
+        let mut rows = vec![];
+        for (name, n) in [
+            ("Commits", self.commits),
+            ("Reviews", self.reviews),
+            ("PRs opened", self.opened),
+            ("PRs merged", self.merged),
+        ] {
+            if n > 0 {
+                rows.push((tint, name.into(), n.to_string()));
+            }
+        }
+        rows.push((
+            content(0.3),
+            "Lines".into(),
+            format!("+{} −{}", self.additions, self.deletions),
+        ));
+        rows
     }
 }
 
@@ -189,27 +216,23 @@ fn check_landed(store: &Database, sessions: &[i64]) {
 
 /// The Sunday that opens the graph's first week.
 fn first_day(today: NaiveDate) -> NaiveDate {
-    today - Days::days(today.weekday().num_days_from_sunday() as i64) - Days::weeks(WEEKS - 1)
+    calendar::first_day(today, WEEKS)
 }
 
-/// Calendar intensity, 0 for an empty day and 1 to 4 by quartile of the
-/// Mono's own active days, so a quiet Mono still shows contrast.
-pub(super) fn levels(days: &[Day]) -> Vec<u8> {
-    let mut active: Vec<u32> = days.iter().map(Day::count).filter(|c| *c > 0).collect();
-    active.sort_unstable();
-    let at = |q: f32| {
-        active
-            .get(((active.len() as f32 * q) as usize).min(active.len().saturating_sub(1)))
-            .copied()
-            .unwrap_or(0)
-    };
-    let cuts = [at(0.25), at(0.5), at(0.75)];
-    days.iter()
-        .map(|d| match d.count() {
-            0 => 0,
-            c => 1 + cuts.iter().filter(|cut| c > **cut).count() as u8,
-        })
-        .collect()
+/// The contribution calendar in the Mono's colour. The whole window repaints
+/// as the pointer moves: this page has no cached rows to protect.
+fn graph(days: Arc<Vec<Day>>, tint: Hsla, motion: Motion) -> AnyElement {
+    let label = calendar::summary("Contribution calendar", &days[..]);
+    repaints(calendar::calendar(
+        days,
+        tint,
+        motion,
+        WEEKS,
+        "mono-contributions-graph",
+        label,
+        Default::default(),
+    ))
+    .into_any_element()
 }
 
 /// Consecutive days with a contribution, ending today or yesterday.
@@ -224,191 +247,6 @@ pub(super) fn streak(days: &[Day]) -> usize {
 
 fn local_day(ms: u64) -> Option<NaiveDate> {
     DateTime::from_timestamp_millis(ms as i64).map(|t| t.with_timezone(&Local).date_naive())
-}
-
-/// Dithered tone per level: a quarter of the cells up to every cell.
-const TONES: [f32; 5] = [0., 0.25, 0.5, 0.75, 1.];
-/// Each day is a square of 4×4 dither cells, a cell apart.
-const SQUARE: i32 = 4;
-const PITCH: i32 = 5;
-const GUTTER: f32 = 28.;
-const MONTHS: f32 = 18.;
-const LEGEND: f32 = 22.;
-
-/// The contribution calendar: weeks as columns, Sunday to Saturday down,
-/// each day a Bayer-dithered square in the Mono's colour.
-fn graph(days: Arc<Vec<Day>>, tint: Hsla, motion: Motion) -> AnyElement {
-    let levels = levels(&days);
-    let start = days.first().map(|d| d.date);
-    let height = MONTHS + (7 * PITCH) as f32 * CELL + LEGEND;
-    let map = canvas(
-        |_, _, _| {},
-        move |bounds, _, window, cx| {
-            let Some(start) = start else { return };
-            let track = content(0.07);
-            let pitch = PITCH as f32 * CELL;
-            let square = SQUARE as f32 * CELL;
-            let grid = Grid::new(
-                bounds.origin + point(px(GUTTER), px(MONTHS)),
-                bounds.size.width.as_f32() - GUTTER,
-                7. * pitch,
-            );
-            let weeks = (days.len() as i32 + 6) / 7;
-            // A narrow panel keeps the latest weeks, as calendars do.
-            let fits = ((grid.cols + PITCH - SQUARE) / PITCH).clamp(1, weeks);
-            let skip = weeks - fits;
-            let day = |c: i32, r: i32| {
-                let ix = ((c + skip) * 7 + r) as usize;
-                (r < 7).then_some(ix).filter(|ix| *ix < days.len())
-            };
-            // Weeks thicken in left to right.
-            let grown: Vec<f32> = (0..fits)
-                .map(|c| motion.at(c as f32 * 12., 420., window, cx))
-                .collect();
-            let hovered = pointer(bounds, window).and_then(|(x, y)| {
-                let (x, y) = (x - GUTTER, y - MONTHS);
-                if x < 0. || y < 0. {
-                    return None;
-                }
-                let (c, r) = ((x / pitch) as i32, (y / pitch) as i32);
-                (c < fits).then_some(()).and(day(c, r)).map(|ix| (c, r, ix))
-            });
-            let today = days.len() - 1;
-            if levels[today] > 0 {
-                let c = (today / 7) as i32 - skip;
-                let r = (today % 7) as f32;
-                glow(
-                    window,
-                    Bounds::new(
-                        grid.origin + point(px(c as f32 * pitch), px(r * pitch)),
-                        size(px(square), px(square)),
-                    ),
-                    tint,
-                    0.35,
-                );
-            }
-            grid.paint(window, |col, row| {
-                let (x, y) = (col % PITCH, row % PITCH);
-                let (c, r) = (col / PITCH, row / PITCH);
-                if x >= SQUARE || y >= SQUARE || c >= fits {
-                    return None;
-                }
-                let ix = day(c, r)?;
-                let level = levels[ix];
-                if level == 0 {
-                    return Some(track);
-                }
-                let mut tone = TONES[level as usize] * grown[c as usize];
-                if hovered.is_some_and(|(hc, hr, _)| (hc, hr) == (c, r)) {
-                    tone = (tone + 0.3).min(1.);
-                }
-                let tone = (tone * 16.).round() / 16.;
-                Some(if inked(x, y, tone) { tint } else { track })
-            });
-            let axis = Label::mono(10., content(0.45));
-            for (r, name) in [(1, "Mon"), (3, "Wed"), (5, "Fri")] {
-                axis.paint(
-                    name,
-                    grid.origin + point(px(-GUTTER), px(r as f32 * pitch + square / 2.)),
-                    Align::Left,
-                    window,
-                    cx,
-                );
-            }
-            // A month is named over the first week that starts in it.
-            let mut last_at = f32::MIN;
-            for c in 0..fits {
-                let week = start + Days::weeks((c + skip) as i64);
-                let label_month = c == 0 || week.day() <= 7;
-                let x = c as f32 * pitch;
-                if !label_month || x - last_at < 30. {
-                    continue;
-                }
-                last_at = x;
-                axis.paint(
-                    &week.format("%b").to_string(),
-                    grid.origin + point(px(x), px(-MONTHS / 2.)),
-                    Align::Left,
-                    window,
-                    cx,
-                );
-            }
-            // Less ▫▪▪▪▪ More, flush right under the latest weeks.
-            let legend_y = grid.origin.y.as_f32() + 7. * pitch + LEGEND / 2. + 2.;
-            let more = Label::mono(10., content(0.4));
-            let edge = (grid.origin.x.as_f32() + fits as f32 * pitch - CELL).round();
-            more.paint(
-                "More",
-                point(px(edge), px(legend_y)),
-                Align::Right,
-                window,
-                cx,
-            );
-            let right = edge - more.measure("More", window) - 6.;
-            let swatches = (right - 5. * pitch + CELL).round();
-            more.paint(
-                "Less",
-                point(px(swatches - 6.), px(legend_y)),
-                Align::Right,
-                window,
-                cx,
-            );
-            let key = Grid::new(
-                point(px(swatches), px(legend_y - square / 2.)),
-                5. * pitch,
-                square,
-            );
-            key.paint(window, |col, row| {
-                let (x, level) = (col % PITCH, (col / PITCH) as usize);
-                if x >= SQUARE || level > 4 {
-                    return None;
-                }
-                Some(if inked(x, row, TONES[level]) {
-                    tint
-                } else {
-                    track
-                })
-            });
-            if let Some((c, r, ix)) = hovered {
-                let d = &days[ix];
-                let mut rows = vec![];
-                if d.count() == 0 {
-                    rows.push((track, "Contributions".into(), "None".into()));
-                } else {
-                    for (name, n) in [
-                        ("Commits", d.commits),
-                        ("Reviews", d.reviews),
-                        ("PRs opened", d.opened),
-                        ("PRs merged", d.merged),
-                    ] {
-                        if n > 0 {
-                            rows.push((tint, name.into(), n.to_string()));
-                        }
-                    }
-                    rows.push((
-                        content(0.3),
-                        "Lines".into(),
-                        format!("+{} −{}", d.additions, d.deletions),
-                    ));
-                }
-                readout(
-                    &d.date.format("%a, %b %-d").to_string(),
-                    &rows,
-                    grid.origin + point(px(c as f32 * pitch + square), px(r as f32 * pitch)),
-                    bounds,
-                    window,
-                    cx,
-                );
-            }
-        },
-    )
-    .size_full();
-    hoverable("mono-contributions-graph".into())
-        .debug_selector(|| "mono-contributions-graph".into())
-        .w_full()
-        .h(px(height))
-        .child(map)
-        .into_any_element()
 }
 
 /// How far list rows reach past the section's edge: their hover fill gets
@@ -975,6 +813,8 @@ impl Monos {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::visuals::calendar::levels;
+    use chrono::Datelike;
 
     fn day(count: u32) -> Day {
         Day {

@@ -478,6 +478,10 @@ pub struct LoadResponse {
     /// with `covered` false means a synced period that lacks some commits (a
     /// merge brought older ones in): it can be repaired in the background.
     pub has_gaps: bool,
+    /// The parts of the period no sync covers, as inclusive epoch seconds. Not
+    /// part of the wire shape.
+    #[serde(skip)]
+    pub missing: Vec<(i64, i64)>,
     /// Commits of the period that the store does not have.
     pub missing_commits: u64,
     pub synced_at: Option<i64>,
@@ -553,6 +557,7 @@ pub(super) fn load_response(
         raw: loaded.raw,
         covered: loaded.covered,
         has_gaps: loaded.has_gaps,
+        missing: loaded.missing,
         missing_commits: loaded.missing_commits,
         synced_at: loaded.synced_at,
         coverage_head: loaded.coverage_head,

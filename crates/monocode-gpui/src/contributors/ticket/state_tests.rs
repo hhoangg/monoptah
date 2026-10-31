@@ -4,10 +4,10 @@
 //! tests move. Nothing here reaches the network or the user's files.
 use super::{
     backend::Patch,
-    fake::{Call, TicketFake, clock, event, now, scope, settings, ticket, ticket_with, user},
-    state::{Spaces, TicketEvent, TicketView, WorkspacesState},
+    fake::{Call, TicketFake, at, clock, event, now, scope, settings, ticket, ticket_with, user},
+    state::{Comparison, Spaces, TicketEvent, TicketView, WorkspacesState},
 };
-use crate::contributors::jobs::SyncJobs;
+use crate::contributors::{chart::ChartKind, jobs::SyncJobs};
 use gpui::{AppContext as _, Context, Entity, TestAppContext};
 use monocode_core::contributors::{
     model::period::{PeriodKind, PeriodPick},
@@ -1368,4 +1368,327 @@ fn opening_settings_is_the_hosts_business(cx: &mut TestAppContext) {
     });
     rig.act(cx, |view, cx| view.open_settings(cx));
     assert_eq!(heard.get(), 1);
+}
+
+// ---- the previous period, the chart type and the colors ---------------------------------------------
+
+/// A ticket Alpha closed on the 5th of September, the month before "today".
+fn september_ticket(id: &str) -> monocode_core::contributors::tickets::tickets::TicketRecord {
+    ticket_with(id, |t| {
+        t.done_at = Some(at(9, 5, 10));
+        t.updated_at = at(9, 5, 10);
+    })
+}
+
+/// Nothing is fetched on its own, so any fetch seen is the previous read's.
+fn offline_with_september(
+    tickets: Option<Vec<monocode_core::contributors::tickets::tickets::TicketRecord>>,
+) -> Arc<TicketFake> {
+    let fake = TicketFake::new();
+    fake.with(|s| {
+        s.connected.default = Ok(false);
+        s.previous.default = Ok(tickets);
+    });
+    fake
+}
+
+#[gpui::test]
+fn the_previous_period_is_read_from_the_store_and_never_fetched(cx: &mut TestAppContext) {
+    let fake = offline_with_september(Some(vec![september_ticket("p1"), september_ticket("p2")]));
+    let rig = Rig::with(cx, fake, false);
+    assert_eq!(rig.fake.previous_reads(), 1);
+    assert_eq!(rig.fake.fetches(), 0, "{:?}", rig.fake.calls());
+    let september = window_of(
+        &monocode_core::contributors::tickets::board_state::period_of(
+            &PeriodPick {
+                kind: PeriodKind::Month,
+                id: Some("2026-09".into()),
+            },
+            &now(),
+        ),
+    );
+    assert!(rig.fake.calls().contains(&Call::Previous {
+        workspace: "w1".into(),
+        from: september.from,
+        to: september.to,
+    }));
+    rig.read(cx, |view| match &view.derived.comparison {
+        Comparison::Ready { against, stats, .. } => {
+            // October is running: the same days of September.
+            assert_eq!(against, "the same days of Sep 2026");
+            assert_eq!(stats.delivered, 2);
+        }
+        other => panic!("{other:?}"),
+    });
+}
+
+#[gpui::test]
+fn a_previous_period_the_store_does_not_hold_is_a_note_not_a_fetch(cx: &mut TestAppContext) {
+    let rig = Rig::with(cx, offline_with_september(None), false);
+    assert_eq!(rig.fake.previous_reads(), 1);
+    assert_eq!(rig.fake.fetches(), 0);
+    rig.read(cx, |view| match &view.derived.comparison {
+        Comparison::Missing { note } => assert!(
+            note.starts_with("No comparison with Sep 2026: its tickets were not fully fetched."),
+            "{note}"
+        ),
+        other => panic!("{other:?}"),
+    });
+}
+
+#[gpui::test]
+fn a_previous_read_that_fails_is_a_missing_comparison(cx: &mut TestAppContext) {
+    let fake = TicketFake::new();
+    fake.with(|s| {
+        s.connected.default = Ok(false);
+        s.previous.default = Err("disk".into());
+    });
+    let rig = Rig::with(cx, fake, false);
+    rig.read(cx, |view| {
+        assert!(matches!(
+            view.derived.comparison,
+            Comparison::Missing { .. }
+        ))
+    });
+}
+
+#[gpui::test]
+fn all_time_has_no_previous_period_to_read(cx: &mut TestAppContext) {
+    let fake = offline_with_september(Some(vec![september_ticket("p1")]));
+    fake.with(|s| {
+        s.range = PeriodPick {
+            kind: PeriodKind::All,
+            id: None,
+        }
+    });
+    let rig = Rig::with(cx, fake, false);
+    assert_eq!(rig.fake.previous_reads(), 0);
+    rig.read(cx, |view| {
+        assert_eq!(view.derived.comparison, Comparison::Off)
+    });
+}
+
+#[gpui::test]
+fn another_period_reads_its_own_previous_one_and_the_scope_does_not_read_again(
+    cx: &mut TestAppContext,
+) {
+    let rig = Rig::with(cx, offline_with_september(None), false);
+    assert_eq!(rig.fake.previous_reads(), 1);
+    // Excluding a member changes what is compared, not what is read.
+    rig.act(cx, |view, cx| {
+        view.set_scope(
+            Some(WorkspaceScope {
+                excluded_members: vec![ExcludedMember {
+                    id: "a".into(),
+                    name: "Alpha".into(),
+                }],
+                ..scope()
+            }),
+            cx,
+        )
+    });
+    assert_eq!(rig.fake.previous_reads(), 1);
+    rig.act(cx, |view, cx| view.go_previous(cx));
+    assert_eq!(rig.fake.previous_reads(), 2);
+    assert_eq!(rig.fake.fetches(), 0);
+}
+
+#[gpui::test]
+fn the_comparison_is_rebuilt_with_the_scope_from_what_was_read(cx: &mut TestAppContext) {
+    let fake = offline_with_september(Some(vec![september_ticket("p1")]));
+    let rig = Rig::with(cx, fake, false);
+    let delivered = |rig: &Rig, cx: &mut TestAppContext| {
+        rig.read(cx, |view| match &view.derived.comparison {
+            Comparison::Ready { stats, .. } => stats.delivered,
+            other => panic!("{other:?}"),
+        })
+    };
+    assert_eq!(delivered(&rig, cx), 1);
+    rig.act(cx, |view, cx| {
+        view.set_scope(
+            Some(WorkspaceScope {
+                excluded_members: vec![ExcludedMember {
+                    id: "a".into(),
+                    name: "Alpha".into(),
+                }],
+                ..scope()
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        delivered(&rig, cx),
+        0,
+        "Alpha is off the board, and off last month's too"
+    );
+}
+
+#[gpui::test]
+fn a_finished_fetch_reads_the_previous_period_again(cx: &mut TestAppContext) {
+    let rig = Rig::with(cx, offline_with_september(None), false);
+    assert_eq!(rig.fake.previous_reads(), 1);
+    rig.emit(cx, event("fetch", "done", 1, 0));
+    assert_eq!(rig.fake.previous_reads(), 2, "the store may hold it now");
+}
+
+#[gpui::test]
+fn every_rebuild_of_the_board_has_its_own_number(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    let first = rig.read(cx, |view| view.derived.seq);
+    assert!(first > 0);
+    rig.emit(cx, event("assess", "done", 1, 0));
+    let second = rig.read(cx, |view| view.derived.seq);
+    assert!(second > first, "{second} after {first}");
+}
+
+fn kind_of(rig: &Rig, cx: &mut TestAppContext) -> ChartKind {
+    rig.view
+        .read_with(cx, |view, cx| view.chart_prefs.read(cx).kind)
+}
+
+fn saves_of_kind(rig: &Rig) -> usize {
+    rig.fake.count(|c| matches!(c, Call::SaveChartKind(_)))
+}
+
+#[gpui::test]
+fn the_saved_chart_type_is_read_and_a_pick_is_saved_once(cx: &mut TestAppContext) {
+    let fake = TicketFake::new();
+    fake.with(|s| s.chart_kind = Some("bars".into()));
+    let rig = Rig::with(cx, fake, false);
+    assert_eq!(kind_of(&rig, cx), ChartKind::Bars);
+    assert_eq!(saves_of_kind(&rig), 0, "reading is not saving");
+    rig.act(cx, |view, cx| {
+        view.set_chart_kind(ChartKind::Cumulative, cx)
+    });
+    assert_eq!(kind_of(&rig, cx), ChartKind::Cumulative);
+    assert_eq!(
+        rig.fake.calls().last(),
+        Some(&Call::SaveChartKind("cumulative".into()))
+    );
+    rig.act(cx, |view, cx| {
+        view.set_chart_kind(ChartKind::Cumulative, cx)
+    });
+    assert_eq!(saves_of_kind(&rig), 1, "the same type again saves nothing");
+    assert_eq!(
+        rig.fake.with(|s| s.chart_kind.clone()).as_deref(),
+        Some("cumulative")
+    );
+}
+
+#[gpui::test]
+fn a_chart_type_nobody_saved_is_the_line(cx: &mut TestAppContext) {
+    let rig = Rig::new(cx);
+    assert_eq!(kind_of(&rig, cx), ChartKind::Line);
+}
+
+#[gpui::test]
+fn the_colors_of_the_workspace_are_read_and_a_pick_is_saved_for_it(cx: &mut TestAppContext) {
+    let fake = TicketFake::new();
+    fake.with(|s| {
+        s.colors
+            .insert("w1".into(), [("a".to_string(), "#e3a008")].into());
+        s.colors
+            .insert("w2".into(), [("a".to_string(), "#3fb950")].into());
+    });
+    let rig = Rig::with(cx, fake, false);
+    rig.read(cx, |view| assert_eq!(view.colors["a"], "#e3a008"));
+    rig.act(cx, |view, cx| view.set_member_color("b", "#f85149", cx));
+    let saved = rig.fake.calls().into_iter().rev().find_map(|c| match c {
+        Call::SaveColors { workspace, colors } => Some((workspace, colors)),
+        _ => None,
+    });
+    let (workspace, colors) = saved.expect("a save");
+    assert_eq!(workspace, "w1");
+    assert_eq!(colors["a"], "#e3a008", "what was there stays");
+    assert_eq!(colors["b"], "#f85149");
+    // Another workspace has its own.
+    rig.act(cx, |view, cx| view.pick_workspace("w2", cx));
+    rig.read(cx, |view| {
+        assert_eq!(view.colors.len(), 1);
+        assert_eq!(view.colors["a"], "#3fb950");
+    });
+}
+
+#[gpui::test]
+fn a_color_picked_before_the_saved_ones_arrive_is_not_overwritten(cx: &mut TestAppContext) {
+    let fake = TicketFake::new();
+    fake.with(|s| {
+        s.colors.insert(
+            "w1".into(),
+            [("a".to_string(), "#e3a008"), ("b".to_string(), "#3fb950")].into(),
+        )
+    });
+    let rig = Rig::with(cx, fake, true);
+    rig.act(cx, |view, cx| view.release("prefs", cx));
+    assert!(rig.read(cx, |view| view.held_labels().contains(&"colors")));
+    rig.act(cx, |view, cx| view.set_member_color("a", "#f85149", cx));
+    rig.act(cx, |view, cx| view.release("colors", cx));
+    rig.read(cx, |view| {
+        assert_eq!(view.colors["a"], "#f85149", "the pick wins");
+        assert_eq!(view.colors["b"], "#3fb950", "what was saved stays");
+    });
+    // And what is saved is the two together.
+    let saved = rig.fake.with(|s| s.colors["w1"].clone());
+    assert_eq!((saved["a"], saved["b"]), ("#f85149", "#3fb950"));
+}
+
+#[test]
+fn the_real_previous_read_is_a_coverage_check_and_a_load_and_never_a_fetch() {
+    use super::backend::previous_from_store;
+    let fake = TicketFake::new();
+    fake.with(|s| s.covered.default = Ok(true));
+    let held = previous_from_store(
+        &*fake,
+        &scope(),
+        "2026-09-01T00:00:00Z",
+        "2026-10-01T00:00:00Z",
+    );
+    assert!(matches!(held, Ok(Some(_))));
+    assert_eq!(
+        fake.calls(),
+        [
+            Call::Covered {
+                workspace: "w1".into(),
+                spaces: None,
+                from: "2026-09-01T00:00:00Z".into(),
+                to: "2026-10-01T00:00:00Z".into(),
+            },
+            Call::Load {
+                workspace: "w1".into(),
+                since: "2026-09-01T00:00:00Z".into(),
+            },
+        ]
+    );
+    // Not covered: nothing is loaded, and nothing is fetched to make it so.
+    let fake = TicketFake::new();
+    let none = previous_from_store(&*fake, &scope(), "a", "b");
+    assert!(matches!(none, Ok(None)));
+    assert_eq!(fake.loads(), 0);
+    assert_eq!(fake.fetches(), 0);
+    // A failing check is an error, not a silent "covered".
+    fake.with(|s| s.covered.default = Err("db".into()));
+    assert!(previous_from_store(&*fake, &scope(), "a", "b").is_err());
+}
+
+#[gpui::test]
+fn a_year_that_arrives_after_the_workspace_changed_is_not_shown(cx: &mut TestAppContext) {
+    let rig = Rig::with(cx, TicketFake::new(), true);
+    rig.act(cx, |view, cx| view.release_all(cx));
+    rig.act(cx, |view, cx| {
+        view.hold_backend_calls();
+        view.detail = Some("a".into());
+        view.ensure_year(cx);
+    });
+    assert!(rig.read(cx, |view| view.held_labels().contains(&"year")));
+    rig.act(cx, |view, cx| view.pick_workspace("w2", cx));
+    rig.act(cx, |view, cx| view.release("year", cx));
+    rig.read(cx, |view| {
+        assert!(
+            view.detail_ui
+                .year
+                .as_ref()
+                .is_none_or(|y| y.key.starts_with("w2")),
+            "another workspace's year is never shown"
+        )
+    });
 }

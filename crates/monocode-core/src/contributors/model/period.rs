@@ -63,7 +63,7 @@ pub(crate) const MONTHS: [&str; 12] = [
 
 /// `new Date(y, m, d)`: local midnight of a calendar day. A midnight that does
 /// not exist (a DST change at 00:00) moves forward to the first instant that does.
-pub(crate) fn midnight(date: NaiveDate) -> DateTime<Local> {
+pub fn midnight(date: NaiveDate) -> DateTime<Local> {
     let start = date.and_hms_opt(0, 0, 0).expect("midnight");
     for hours in 0..=3 {
         match Local.from_local_datetime(&(start + Duration::hours(hours))) {

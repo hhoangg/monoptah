@@ -5,6 +5,7 @@
 
 pub mod board;
 pub mod board_state;
+pub mod member;
 pub mod prefs;
 pub mod report;
 #[allow(clippy::module_inception)]

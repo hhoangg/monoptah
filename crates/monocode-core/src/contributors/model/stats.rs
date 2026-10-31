@@ -389,7 +389,7 @@ fn iso_millis(ms: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn day_key(date: NaiveDate) -> String {
+pub fn day_key(date: NaiveDate) -> String {
     format!("{}-{:02}-{:02}", date.year(), date.month(), date.day())
 }
 
@@ -414,7 +414,7 @@ fn bucket_at(start: NaiveDate, granularity: BucketGranularity) -> Bucket {
 }
 
 /// The first day of the bucket a day belongs to.
-fn bucket_start(date: NaiveDate, granularity: BucketGranularity) -> NaiveDate {
+pub fn bucket_start(date: NaiveDate, granularity: BucketGranularity) -> NaiveDate {
     let first = |y: i32, m: u32| NaiveDate::from_ymd_opt(y, m, 1).unwrap_or(date);
     match granularity {
         BucketGranularity::Year => first(date.year(), 1),

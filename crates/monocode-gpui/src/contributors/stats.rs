@@ -1,37 +1,33 @@
 //! The Stats section of the GitHub tab (`StatsTab.tsx`): four KPI cards with
-//! their change against the previous period, the stacked commit chart with its
-//! legend, and the contributors table with expandable identities and a per-row
-//! Ask button. What the cards and the chart say is computed by the pure
-//! functions below (unit tested); the `GithubView` methods only draw it.
+//! their change against the previous period, the commit chart (see
+//! `chart.rs`) and the contributors table, whose rows open a member's detail
+//! page (`detail.rs`), with a per-row Ask button. What the cards and the chart
+//! say is computed by the pure functions below (unit tested); the `GithubView` methods only lay it
+//! out. The chart and the table are entities of their own, so hovering the
+//! chart repaints the chart alone and the table is drawn from a cache.
 use super::{
+    chart::{self, ChartBucket, ChartData, Series},
     github::GithubView,
     ui::{self, AvatarSize},
 };
 use crate::{
-    popover::{Align, Anchor, AnchorSlot, Side, popover},
     right_panel::{DIFF_ADD, DIFF_DEL, tabular},
     theme::*,
 };
+use chrono::{DateTime, Local};
 use gpui::{
-    AnyElement, Context, Div, ElementId, Role, SharedString, Stateful, div, prelude::*, px,
-    relative, rgb,
+    AnyElement, Context, Div, ElementId, Entity, Render, Role, SharedString, Stateful,
+    StyleRefinement, Styled, Subscription, WeakEntity, Window, div, prelude::*, px, relative, rgb,
 };
 use monocode_core::contributors::model::{
-    axis::axis_ticks,
     compact::format_compact,
     format::{format_delta, relative_time},
     period::PeriodKind,
     pipeline::ContributorsModel,
     snapshot::SnapshotScope,
-    stats::{Bucket, BucketGranularity, LegendEntry, Stats, StatsRow},
+    stats::{Bucket, BucketGranularity, Stats, StatsRow},
 };
 use std::sync::Arc;
-
-const CHART_H: f32 = 180.;
-const CHART_PAD: f32 = 8.;
-/// The bars fill this much of their slot, so neighbours never touch.
-const BAR_SHARE: f32 = 0.7;
-const LEGEND_LIMIT: usize = 8;
 
 // Table columns (the contributor column takes the rest).
 const W_RANK: f32 = 36.;
@@ -43,6 +39,10 @@ const W_SHARE: f32 = 160.;
 const W_LAST: f32 = 104.;
 const W_ASK: f32 = 64.;
 const TABLE_MIN: f32 = 880.;
+// The table is drawn from a cache, which needs its height up front: every row
+// has a fixed height.
+const HEAD_H: f32 = 34.;
+const ROW_H: f32 = 41.;
 
 // ---- the pure view functions ---------------------------------------------------
 
@@ -81,6 +81,23 @@ pub(super) fn change(
         tone,
         text: format!("{arrow}{text}"),
         suffix,
+    })
+}
+
+/// The change of a card that moved by a fraction: "▲ +18%".
+pub(super) fn fraction_change(delta: Option<f64>, versus: &Option<String>) -> Option<ChangeView> {
+    delta.and_then(|d| change(Some(d), format_delta(d), versus.clone()))
+}
+
+/// The change of a card that moved by a count: "▲ +3".
+pub(super) fn count_change(delta: Option<i64>, versus: &Option<String>) -> Option<ChangeView> {
+    delta.and_then(|d| {
+        let text = if d > 0 {
+            format!("+{d}")
+        } else {
+            d.to_string()
+        };
+        change(Some(d as f64), text, versus.clone())
     })
 }
 
@@ -124,10 +141,7 @@ pub(super) fn kpi_texts(model: &ContributorsModel) -> KpiTexts {
     KpiTexts {
         commits: CountCard {
             value: kpis.commits.value.to_string(),
-            change: kpis
-                .commits
-                .delta
-                .and_then(|d| change(Some(d), format_delta(d), versus.clone())),
+            change: fraction_change(kpis.commits.delta, &versus),
         },
         contributors: ContributorsCard {
             value: kpis.contributors.value.to_string(),
@@ -148,26 +162,16 @@ pub(super) fn kpi_texts(model: &ContributorsModel) -> KpiTexts {
         lines: LinesCard {
             added: format!("+{}", format_compact(kpis.lines.added as f64)),
             deleted: format!("-{}", format_compact(kpis.lines.deleted as f64)),
-            change: kpis
-                .lines
-                .delta
-                .and_then(|d| change(Some(d), format_delta(d), versus.clone())),
+            change: fraction_change(kpis.lines.delta, &versus),
         },
         prs: CountCard {
             value: kpis.prs_merged.value.to_string(),
-            change: kpis.prs_merged.delta.and_then(|d| {
-                let text = if d > 0 {
-                    format!("+{d}")
-                } else {
-                    d.to_string()
-                };
-                change(Some(d as f64), text, versus.clone())
-            }),
+            change: count_change(kpis.prs_merged.delta, &versus),
         },
     }
 }
 
-fn unit(granularity: BucketGranularity) -> &'static str {
+pub(super) fn unit(granularity: BucketGranularity) -> &'static str {
     match granularity {
         BucketGranularity::Day => "day",
         BucketGranularity::Week => "week",
@@ -180,119 +184,56 @@ fn bucket_total(bucket: &Bucket) -> u64 {
     bucket.by_person.values().sum()
 }
 
-fn commits_text(n: u64) -> String {
-    format!("{n} {}", if n == 1 { "commit" } else { "commits" })
-}
-
-/// The commits of the busiest bucket: the y-axis maximum.
-pub(super) fn chart_peak(stats: &Stats) -> u64 {
-    stats.buckets.iter().map(bucket_total).max().unwrap_or(0)
-}
-
 /// The text a screen reader gets for the chart.
 pub(super) fn chart_summary(stats: &Stats) -> String {
-    let unit = unit(stats.granularity);
-    let count = stats.buckets.len();
-    let all: u64 = stats.buckets.iter().map(bucket_total).sum();
-    let mut busiest: Option<&Bucket> = None;
-    for bucket in &stats.buckets {
-        if busiest.is_none_or(|best| bucket_total(bucket) > bucket_total(best)) {
-            busiest = Some(bucket);
-        }
-    }
-    match busiest {
-        Some(best) if all > 0 => format!(
-            "Commit activity per {unit}: {all} commits over {count} {unit}s, busiest {unit} {} with {}.",
-            best.label,
-            bucket_total(best)
-        ),
-        _ => format!("Commit activity per {unit}: no commits in {count} {unit}s."),
-    }
-}
-
-fn name_of<'a>(stats: &'a Stats, person_id: &'a str) -> &'a str {
-    stats
-        .legend
+    let buckets = chart_buckets(stats);
+    let totals: Vec<f64> = stats
+        .buckets
         .iter()
-        .find(|entry| entry.person_id == person_id)
-        .map_or(person_id, |entry| entry.name.as_str())
+        .map(|b| bucket_total(b) as f64)
+        .collect();
+    chart::summary(
+        "Commit activity",
+        unit(stats.granularity),
+        "commits",
+        &buckets,
+        &totals,
+    )
 }
 
-/// The tooltip of a bar: the bucket and its total, then one line per person
-/// in legend order.
-pub(super) fn bucket_lines(stats: &Stats, index: usize) -> Vec<String> {
-    let bucket = &stats.buckets[index];
-    let mut lines = vec![format!(
-        "{}: {}",
-        bucket.label,
-        commits_text(bucket_total(bucket))
-    )];
-    lines.extend(stats.legend.iter().filter_map(|entry| {
-        let count = *bucket.by_person.get(&entry.person_id)?;
-        (count > 0).then(|| format!("{}: {count}", entry.name))
-    }));
-    lines
-}
-
-/// One person's segment: "Ana Sol: 3".
-fn segment_line(stats: &Stats, person_id: &str, count: u64) -> String {
-    format!("{}: {count}", name_of(stats, person_id))
-}
-
-/// The segments of one bar, bottom to top: legend order, only people with
-/// commits, each as tall as its share of the busiest bucket (`peak`).
-pub(super) fn segment_heights(stats: &Stats, bucket: &Bucket, peak: f64) -> Vec<(String, f32)> {
-    let usable = f64::from(CHART_H - CHART_PAD * 2.);
-    let max = peak.max(1.);
+pub(super) fn chart_buckets(stats: &Stats) -> Vec<ChartBucket> {
     stats
-        .legend
+        .buckets
         .iter()
-        .filter_map(|entry| {
-            let count = *bucket.by_person.get(&entry.person_id)?;
-            (count > 0).then(|| {
-                (
-                    entry.person_id.clone(),
-                    (count as f64 / max * usable) as f32,
-                )
-            })
+        .map(|b| ChartBucket {
+            label: b.label.clone(),
+            short: b.short.clone(),
         })
         .collect()
 }
 
-/// Which buckets get an x label, and the label.
-pub(super) fn axis_labels(stats: &Stats) -> Vec<(usize, &str)> {
-    axis_ticks(stats.buckets.len())
-        .into_iter()
-        .map(|i| (i, stats.buckets[i].short.as_str()))
-        .collect()
-}
-
-/// The busiest contributors, then the rest: a big team must not push the chart
-/// down.
-pub(super) fn legend_parts(stats: &Stats) -> (Vec<&LegendEntry>, Vec<&LegendEntry>) {
-    let commits = |entry: &LegendEntry| {
-        stats
-            .rows
-            .iter()
-            .find(|row| row.person_id == entry.person_id)
-            .map_or(0, |row| row.commits)
-    };
-    let mut ranked: Vec<&LegendEntry> = stats.legend.iter().collect();
-    // A stable sort keeps the legend order among equals.
-    ranked.sort_by_key(|entry| std::cmp::Reverse(commits(entry)));
-    let rest = ranked.split_off(ranked.len().min(LEGEND_LIMIT));
-    (ranked, rest)
-}
-
-/// The "+4 more" chip and the names it stands for.
-pub(super) fn more_chip(rest: &[&LegendEntry]) -> (String, String) {
-    (
-        format!("+{} more", rest.len()),
-        rest.iter()
-            .map(|entry| entry.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
+/// The chart's input: one series of commits per bucket for each person in the
+/// legend, the busiest five on their own and the rest as "Others".
+pub(super) fn chart_data(stats: &Stats) -> ChartData {
+    let series = stats
+        .legend
+        .iter()
+        .map(|entry| Series {
+            id: entry.person_id.clone(),
+            name: entry.name.clone(),
+            color: ui::hex_color(&entry.color),
+            values: stats
+                .buckets
+                .iter()
+                .map(|b| b.by_person.get(&entry.person_id).copied().unwrap_or(0) as f64)
+                .collect(),
+        })
+        .collect();
+    ChartData {
+        buckets: chart_buckets(stats),
+        series: chart::top_series(series),
+        summary: chart_summary(stats),
+    }
 }
 
 fn identity_count(n: usize) -> String {
@@ -304,9 +245,9 @@ pub(super) fn identities_chip(row: &StatsRow) -> Option<String> {
     (row.identities.len() > 1).then(|| identity_count(row.identities.len()))
 }
 
-/// The accessible name of a row's expand button.
+/// The accessible name of a row's button, the keyboard route to its detail page.
 pub(super) fn row_label(row: &StatsRow) -> String {
-    format!("{}, {}", row.name, identity_count(row.identities.len()))
+    format!("Open details for {}", row.name)
 }
 
 pub(super) fn share_label(row: &StatsRow) -> String {
@@ -314,25 +255,22 @@ pub(super) fn share_label(row: &StatsRow) -> String {
     format!("{}%", (row.share_pct + 0.5).floor() as i64)
 }
 
-// ---- state -------------------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq)]
-enum ChartHover {
-    /// A bar slot (the gap above a bar counts).
-    Bucket(usize),
-    /// One segment of a bar.
-    Segment(usize, String),
+/// The height of the whole table: the head and a fixed height per row.
+pub(super) fn table_height(rows: usize) -> f32 {
+    HEAD_H + rows as f32 * ROW_H
 }
 
-/// What the section remembers between frames.
+// ---- state -------------------------------------------------------------------------
+
+/// The entities of the section, made when it is first drawn and kept: the
+/// chart repaints itself on hover and the table is drawn from a cache.
 #[derive(Default)]
 pub(super) struct StatsUi {
-    /// The person whose identities are shown.
-    open: Option<String>,
-    hover: Option<ChartHover>,
-    more_hover: bool,
-    /// Where the hovered bar (or the chip) is, for its tooltip.
-    anchor: AnchorSlot,
+    pub(super) chart: Option<Entity<chart::ChartView>>,
+    pub(super) table: Option<Entity<StatsTable>>,
+    /// The model the chart was last given (its address).
+    pushed: Option<usize>,
+    subscriptions: Vec<Subscription>,
 }
 
 // ---- drawing -----------------------------------------------------------------------
@@ -345,7 +283,7 @@ fn tone_color(tone: Tone) -> gpui::Hsla {
     }
 }
 
-fn card() -> Div {
+pub(super) fn card() -> Div {
     div()
         .overflow_hidden()
         .rounded_xl()
@@ -354,7 +292,7 @@ fn card() -> Div {
         .bg(content(0.03))
 }
 
-fn card_title(title: &'static str, note: String) -> Div {
+pub(super) fn card_title(title: &'static str, note: String) -> Div {
     div()
         .px(px(12.))
         .py(px(10.))
@@ -388,7 +326,12 @@ fn change_line(change: Option<&ChangeView>) -> Div {
     }
 }
 
-fn kpi(id: &'static str, label: &'static str, value: Div, change: Option<&ChangeView>) -> Div {
+pub(super) fn kpi(
+    id: &'static str,
+    label: &'static str,
+    value: Div,
+    change: Option<&ChangeView>,
+) -> Div {
     div()
         .debug_selector(move || id.to_string())
         .flex_1()
@@ -421,8 +364,29 @@ impl GithubView {
         model: &Arc<ContributorsModel>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let now = (self.clock)();
         let stats = &model.stats;
+        let (chart, table) = self.stats_views(model, cx);
+        let table = if stats.rows.is_empty() {
+            div()
+                .px(px(12.))
+                .py(px(24.))
+                .flex()
+                .justify_center()
+                .text_size(px(12.))
+                .text_color(content(0.5))
+                .child("No contributors in this period.")
+                .into_any_element()
+        } else {
+            if self.a11y {
+                // Replayed frames carry no accessibility nodes: draw it afresh.
+                table.into_any_element()
+            } else {
+                let height = table.read(cx).height();
+                table
+                    .cached(StyleRefinement::default().w_full().h(px(height)))
+                    .into_any_element()
+            }
+        };
         div()
             .debug_selector(|| "contributors-body-stats".into())
             .flex()
@@ -433,20 +397,89 @@ impl GithubView {
                 card()
                     .child(card_title(
                         "Commit activity",
-                        format!("per {}, stacked by contributor", unit(stats.granularity)),
+                        format!("per {}", unit(stats.granularity)),
                     ))
-                    .child(self.legend(stats, cx))
-                    .child(self.chart(stats, cx)),
+                    .child(chart),
             )
+            .child(self.activity_card(model, true, cx))
             .child(
                 card()
-                    .child(card_title(
-                        "Contributors",
-                        "click a row to see its identities".into(),
-                    ))
-                    .child(self.table(stats, &now, cx)),
+                    .child(card_title("Contributors", "click a row for details".into()))
+                    .child(table),
             )
             .into_any_element()
+    }
+
+    /// The chart and the table, made on first use. They learn about a new
+    /// model (or minute, or chart type) from `push_stats`, which runs when this
+    /// view notifies, never while it draws.
+    fn stats_views(
+        &mut self,
+        model: &Arc<ContributorsModel>,
+        cx: &mut Context<Self>,
+    ) -> (Entity<chart::ChartView>, Entity<StatsTable>) {
+        if let (Some(chart), Some(table)) = (&self.stats_ui.chart, &self.stats_ui.table) {
+            return (chart.clone(), table.clone());
+        }
+        let data = Arc::new(chart_data(&model.stats));
+        let kind = self.chart_kind(cx);
+        let chart = cx.new(|cx| chart::ChartView::new("contributors-stats", data, kind, cx));
+        let github = cx.weak_entity();
+        let (shown, now) = (model.clone(), (self.clock)());
+        let dim = self.page_dim(cx);
+        let table = cx.new(|_| StatsTable::new(github, shown, now, dim));
+        let me = cx.entity();
+        self.stats_ui.subscriptions = vec![
+            cx.subscribe(&chart, |this, _, event: &chart::ChartEvent, cx| {
+                this.chart_event(event, cx)
+            }),
+            cx.observe(&me, |this, _, cx| this.push_stats(cx)),
+        ];
+        self.stats_ui.pushed = Some(Arc::as_ptr(model) as usize);
+        self.stats_ui.chart = Some(chart.clone());
+        self.stats_ui.table = Some(table.clone());
+        (chart, table)
+    }
+
+    /// Hands the chart and the table what changed. Each notifies itself only
+    /// when its input differs, so most calls cost nothing.
+    pub(super) fn push_stats(&mut self, cx: &mut Context<Self>) {
+        let (Some(chart), Some(table)) = (self.stats_ui.chart.clone(), self.stats_ui.table.clone())
+        else {
+            return;
+        };
+        let Some(model) = self.model.clone() else {
+            return;
+        };
+        let at = Arc::as_ptr(&model) as usize;
+        if self.stats_ui.pushed != Some(at) {
+            self.stats_ui.pushed = Some(at);
+            let data = Arc::new(chart_data(&model.stats));
+            chart.update(cx, |chart, cx| chart.set_data(data, cx));
+        }
+        let kind = self.chart_kind(cx);
+        chart.update(cx, |chart, cx| chart.set_kind(kind, cx));
+        let now = (self.clock)();
+        let dim = self.page_dim(cx);
+        table.update(cx, |table, cx| table.set_input(model, now, dim, cx));
+        if self.section == super::github::Section::Stats {
+            self.ensure_activity(cx);
+        }
+        self.push_activity(cx);
+        self.push_detail(cx);
+    }
+
+    /// Whether the body is drawn dimmed: stale data or a model on its way.
+    pub(super) fn page_dim(&self, cx: &gpui::App) -> bool {
+        let snap = self.snapshot(cx);
+        snap.stale || snap.model_pending
+    }
+
+    pub(super) fn chart_event(&mut self, event: &chart::ChartEvent, cx: &mut Context<Self>) {
+        match event {
+            chart::ChartEvent::Kind(kind) => self.set_chart_kind(*kind, cx),
+            chart::ChartEvent::Color { id, hex } => self.set_person_color(id, hex, cx),
+        }
     }
 
     /// Two pairs that sit side by side when the window is wide and stack as a
@@ -518,277 +551,263 @@ impl GithubView {
                 ),
             ))
     }
+}
 
-    fn legend(&mut self, stats: &Stats, cx: &mut Context<Self>) -> Div {
-        let (shown, rest) = legend_parts(stats);
-        let chip = (!rest.is_empty()).then(|| {
-            let (text, names) = more_chip(&rest);
-            let anchor = self.stats_ui.anchor.clone();
-            let hovered = self.stats_ui.more_hover;
-            div()
-                .id("contributors-stats-legend-more")
-                .debug_selector(|| "contributors-stats-legend-more".into())
-                .relative()
-                .rounded_full()
-                .bg(content(0.08))
-                .px(px(6.))
-                .text_color(content(0.6))
-                .aria_label(format!("{text}: {names}"))
-                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                    this.stats_ui.more_hover = *hovered;
-                    cx.notify();
-                }))
-                .child(text)
-                .when(hovered, |d| {
-                    d.child(anchor.probe()).child(
-                        popover("contributors-stats-more-tip", Anchor::Slot(anchor.clone()))
-                            .side(Side::Bottom)
-                            .align(Align::Start)
-                            .gap(6.)
-                            .padding(8.)
-                            .max_width(280.)
-                            .without_animation()
-                            .allow_outside_press()
-                            .child(
-                                div()
-                                    .id("contributors-stats-tip-more")
-                                    .debug_selector(|| "contributors-stats-tip-more".into())
-                                    .role(Role::Tooltip)
-                                    .text_size(px(12.))
-                                    .line_height(px(16.))
-                                    .child(names),
-                            ),
-                    )
-                })
-        });
-        div()
-            .debug_selector(|| "contributors-stats-legend".into())
-            .px(px(12.))
-            .pt(px(8.))
-            .flex()
-            .flex_wrap()
-            .gap_x(px(12.))
-            .gap_y(px(4.))
-            .text_size(px(12.))
-            .text_color(content(0.5))
-            .children(shown.into_iter().map(|entry| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .size(px(8.))
-                            .rounded(px(2.))
-                            .bg(ui::hex_color(&entry.color)),
-                    )
-                    .child(entry.name.clone())
-            }))
-            .children(chip)
+// ---- the table ---------------------------------------------------------------------
+
+/// The contributors table: an entity so that it is drawn from a cache while
+/// the chart above it is hovered.
+pub(super) struct StatsTable {
+    github: WeakEntity<GithubView>,
+    model: Arc<ContributorsModel>,
+    now: DateTime<Local>,
+    /// The page is dimmed (stale data or a model on its way). The cached rows
+    /// bake that in when they paint, so a change must redraw them.
+    pub(super) dim: bool,
+}
+
+fn minute(at: &DateTime<Local>) -> i64 {
+    at.timestamp() / 60
+}
+
+impl StatsTable {
+    fn new(
+        github: WeakEntity<GithubView>,
+        model: Arc<ContributorsModel>,
+        now: DateTime<Local>,
+        dim: bool,
+    ) -> Self {
+        Self {
+            github,
+            model,
+            now,
+            dim,
+        }
     }
 
-    fn chart(&mut self, stats: &Stats, cx: &mut Context<Self>) -> Div {
-        let count = stats.buckets.len();
-        let peak = chart_peak(stats);
-        let hover = self.stats_ui.hover.clone();
-        let anchor = self.stats_ui.anchor.clone();
-        let columns = stats.buckets.iter().enumerate().map(|(i, bucket)| {
-            let bucket_hovered = matches!(&hover, Some(ChartHover::Bucket(at) | ChartHover::Segment(at, _)) if *at == i);
-            let segments = segment_heights(stats, bucket, peak as f64);
-            let tip = match &hover {
-                Some(ChartHover::Bucket(at)) if *at == i => {
-                    Some(("contributors-stats-tip-bucket", bucket_lines(stats, i)))
-                }
-                Some(ChartHover::Segment(at, id)) if *at == i => bucket
-                    .by_person
-                    .get(id)
-                    .map(|n| ("contributors-stats-tip-segment", vec![segment_line(stats, id, *n)])),
-                _ => None,
-            };
-            let bar = div()
-                .w(relative(BAR_SHARE))
-                .flex()
-                .flex_col_reverse()
-                .children(segments.into_iter().map(|(id, height)| {
-                    let color = stats
-                        .legend
-                        .iter()
-                        .find(|entry| entry.person_id == id)
-                        .map_or("", |entry| entry.color.as_str());
-                    let seg_id = id.clone();
-                    let selector = format!("contributors-stats-seg-{i}-{id}");
-                    div()
-                        .id(SharedString::from(selector.clone()))
-                        .debug_selector(move || selector.clone())
-                        .w_full()
-                        .h(px(height))
-                        .rounded(px(1.))
-                        .bg(ui::hex_color(color))
-                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            let now = Some(ChartHover::Segment(i, seg_id.clone()));
-                            if *hovered {
-                                this.stats_ui.hover = now;
-                            } else if this.stats_ui.hover == now {
-                                // Still inside the bar: back to the bucket.
-                                this.stats_ui.hover = Some(ChartHover::Bucket(i));
-                            }
-                            cx.notify();
-                        }))
-                }));
-            div()
-                .id(("contributors-stats-bucket", i))
-                .debug_selector(move || format!("contributors-stats-bucket-{i}"))
-                .relative()
-                .flex_1()
-                .h_full()
-                .pb(px(CHART_PAD))
-                .flex()
-                .justify_center()
-                .items_end()
-                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    let hover = &mut this.stats_ui.hover;
-                    if *hovered {
-                        if !matches!(hover, Some(ChartHover::Segment(at, _)) if *at == i) {
-                            *hover = Some(ChartHover::Bucket(i));
-                        }
-                    } else if matches!(hover, Some(ChartHover::Bucket(at) | ChartHover::Segment(at, _)) if *at == i) {
-                        *hover = None;
-                    }
-                    cx.notify();
-                }))
-                .child(bar)
-                .when(bucket_hovered, |d| d.child(anchor.probe()))
-                .when_some(tip, |d, (selector, lines)| {
-                    d.child(
-                        popover("contributors-stats-tip", Anchor::Slot(anchor.clone()))
-                            .side(Side::Top)
-                            .align(Align::Center)
-                            .gap(6.)
-                            .padding(8.)
-                            .max_width(280.)
-                            .without_animation()
-                            .allow_outside_press()
-                            .child(
-                                div()
-                                    .id(selector)
-                                    .debug_selector(move || selector.into())
-                                    .role(Role::Tooltip)
-                                    .flex()
-                                    .flex_col()
-                                    .text_size(px(12.))
-                                    .line_height(px(16.))
-                                    .children(lines.into_iter().enumerate().map(|(n, line)| {
-                                        div()
-                                            .when(n == 0, |d| {
-                                                d.font_weight(gpui::FontWeight::MEDIUM)
-                                            })
-                                            .when(n > 0, |d| d.text_color(content(0.7)))
-                                            .child(line)
-                                    })),
-                            ),
-                    )
-                })
+    /// A new model, or a new minute for "Last active".
+    fn set_input(
+        &mut self,
+        model: Arc<ContributorsModel>,
+        now: DateTime<Local>,
+        dim: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if Arc::ptr_eq(&self.model, &model) && minute(&self.now) == minute(&now) && self.dim == dim
+        {
+            return;
+        }
+        self.dim = dim;
+        self.model = model;
+        self.now = now;
+        cx.notify();
+    }
+
+    /// The height the cache lays the table out at.
+    fn height(&self) -> f32 {
+        table_height(self.model.stats.rows.len())
+    }
+
+    /// Opens the detail page of a person and hands the keys to the page, so
+    /// Escape closes the detail even though the clicked row is gone.
+    fn open(&mut self, person_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.github.update(cx, |github, cx| {
+            github.open_detail(person_id, cx);
+            window.focus(&github.focus, cx);
         });
-        let last = count.saturating_sub(1);
-        let axis = axis_labels(stats)
-            .into_iter()
-            .map(|(i, text)| {
-                // The first label starts at the left edge, the last ends at the
-                // right one, the others are centred on their slot.
-                let slot = div()
-                    .debug_selector(move || format!("contributors-stats-axis-{i}"))
-                    .absolute()
-                    .top_0()
-                    .whitespace_nowrap()
-                    .child(text.to_string());
-                if i == 0 {
-                    slot.left_0()
-                } else if i == last {
-                    slot.right_0()
-                } else {
-                    slot.left(relative(i as f32 / count as f32))
-                        .w(relative(1. / count as f32))
-                        .flex()
-                        .justify_center()
-                }
-            })
-            .collect::<Vec<_>>();
-        div()
-            .px(px(12.))
-            .py(px(8.))
+    }
+
+    fn ask(&mut self, person_id: String, cx: &mut Context<Self>) {
+        let _ = self.github.update(cx, |github, cx| {
+            github.open_ask(SnapshotScope::Person { person_id }, cx);
+        });
+    }
+
+    fn contributor_row(&self, index: usize, row: &StatsRow, cx: &mut Context<Self>) -> AnyElement {
+        let group = SharedString::from(format!("contributors-stats-group-{index}"));
+        let (on_row, on_name, person) = (
+            row.person_id.clone(),
+            row.person_id.clone(),
+            row.person_id.clone(),
+        );
+        row_div(("contributors-stats-row", index))
+            .debug_selector(move || format!("contributors-stats-row-{index}"))
+            .group(group.clone())
+            .role(Role::Row)
+            .h(px(ROW_H))
+            .flex()
+            .border_t_1()
+            .border_color(content(0.1))
+            .cursor_pointer()
+            .hover(|s| s.bg(content(0.03)))
+            .on_click(cx.listener(move |this, _, window, cx| this.open(on_row.clone(), window, cx)))
             .child(
-                div()
-                    .id("contributors-stats-chart")
-                    .debug_selector(|| "contributors-stats-chart".into())
-                    .role(Role::Image)
-                    .aria_label(chart_summary(stats))
-                    .relative()
-                    .h(px(CHART_H))
-                    .w_full()
+                cell(Some(index))
+                    .w(px(W_RANK))
+                    .text_color(content(0.5))
+                    .child((index + 1).to_string()),
+            )
+            .child(
+                cell(None).flex_1().min_w(px(200.)).justify_start().child(
+                    div()
+                        .id(("contributors-stats-name", index))
+                        .debug_selector(move || format!("contributors-stats-name-{index}"))
+                        .role(Role::Button)
+                        .aria_label(row_label(row))
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open(on_name.clone(), window, cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(ui::avatar(&row.name, &row.color, AvatarSize::Sm))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(row.name.clone()),
+                        )
+                        .children(identities_chip(row).map(|chip| {
+                            div()
+                                .rounded_full()
+                                .border_1()
+                                .border_dashed()
+                                .border_color(content(0.2))
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(content(0.5))
+                                .child(chip)
+                        })),
+                ),
+            )
+            .child(
+                cell(Some(index))
+                    .w(px(W_COMMITS))
+                    .justify_end()
+                    .child(row.commits.to_string()),
+            )
+            .child(
+                cell(None)
+                    .w(px(W_LINES))
+                    .justify_end()
+                    .gap(px(6.))
+                    .font_features(tabular())
                     .child(
                         div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .bottom(px(CHART_PAD))
-                            .h(px(1.))
-                            .bg(content(0.15)),
+                            .text_color(rgb(DIFF_ADD))
+                            .child(format!("+{}", format_compact(row.added as f64))),
                     )
                     .child(
                         div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .bottom_0()
-                            .flex()
-                            .children(columns),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "contributors-stats-ymax".into())
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .text_size(px(10.))
-                            .text_color(content(0.4))
-                            .font_features(tabular())
-                            .child(peak.to_string()),
+                            .text_color(rgb(DIFF_DEL))
+                            .child(format!("-{}", format_compact(row.deleted as f64))),
                     ),
             )
             .child(
-                div()
-                    .relative()
-                    .mt(px(4.))
-                    .h(px(16.))
-                    .text_size(px(10.))
-                    .text_color(content(0.45))
-                    .children(axis),
+                cell(Some(index))
+                    .w(px(W_FILES))
+                    .justify_end()
+                    .child(row.files.to_string()),
             )
+            .child(
+                cell(Some(index))
+                    .w(px(W_AI))
+                    .justify_end()
+                    .child(format!("{}%", row.ai_assisted_pct)),
+            )
+            .child(
+                cell(None)
+                    .w(px(W_SHARE))
+                    .justify_start()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .w(px(96.))
+                            .h(px(6.))
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .rounded_full()
+                            .bg(content(0.1))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative((row.share_pct.min(100.) / 100.) as f32))
+                                    .rounded_full()
+                                    .bg(ui::hex_color(&row.color)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(32.))
+                            .text_size(px(11.))
+                            .text_color(content(0.5))
+                            .font_features(tabular())
+                            .child(share_label(row)),
+                    ),
+            )
+            .child(
+                cell(None)
+                    .w(px(W_LAST))
+                    .justify_end()
+                    .whitespace_nowrap()
+                    .text_color(content(0.5))
+                    .child(
+                        row.last_active
+                            .as_deref()
+                            .map(|at| relative_time(at, &self.now))
+                            .unwrap_or_default(),
+                    ),
+            )
+            .child(
+                cell(None).w(px(W_ASK)).justify_end().child(
+                    div()
+                        .id(("contributors-stats-ask", index))
+                        .debug_selector(move || format!("contributors-stats-ask-{index}"))
+                        .role(Role::Button)
+                        .aria_label(format!("Ask Agent about {}", row.name))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(content(0.1))
+                        .px(px(8.))
+                        .py(px(2.))
+                        .text_size(px(11.))
+                        .text_color(accent_color())
+                        .opacity(0.)
+                        .group_hover(group, |s| s.opacity(1.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(content(0.05)))
+                        .child("Ask")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ask(person.clone(), cx);
+                            cx.stop_propagation();
+                        })),
+                ),
+            )
+            .into_any_element()
     }
+}
 
-    fn table(
-        &mut self,
-        stats: &Stats,
-        now: &chrono::DateTime<chrono::Local>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if stats.rows.is_empty() {
-            return div()
-                .px(px(12.))
-                .py(px(24.))
-                .flex()
-                .justify_center()
-                .text_size(px(12.))
-                .text_color(content(0.5))
-                .child("No contributors in this period.")
-                .into_any_element();
-        }
+#[cfg(test)]
+thread_local! {
+    /// How many times the table was built, for the tests that prove a cache is kept.
+    pub(super) static TABLE_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Render for StatsTable {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        TABLE_RENDERS.with(|n| n.set(n.get() + 1));
+        let model = self.model.clone();
         let head = |text: &'static str| cell(None).child(text).text_color(content(0.5));
         div()
             .id("contributors-stats-table-scroll")
             .role(Role::Region)
             .aria_label("Contributors table")
+            .w_full()
+            .h(px(self.height()))
             .overflow_x_scroll()
             .restrict_scroll_to_axis()
             .child(
@@ -802,6 +821,7 @@ impl GithubView {
                         div()
                             .id("contributors-stats-head")
                             .role(Role::Row)
+                            .h(px(HEAD_H))
                             .flex()
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
@@ -816,227 +836,14 @@ impl GithubView {
                             .child(cell(None).w(px(W_ASK))),
                     )
                     .children(
-                        stats
+                        model
+                            .stats
                             .rows
                             .iter()
                             .enumerate()
-                            .map(|(i, row)| self.contributor_row(i, row, now, cx)),
+                            .map(|(i, row)| self.contributor_row(i, row, cx)),
                     ),
             )
-            .into_any_element()
-    }
-
-    fn contributor_row(
-        &self,
-        index: usize,
-        row: &StatsRow,
-        now: &chrono::DateTime<chrono::Local>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let expanded = self.stats_ui.open.as_deref() == Some(row.person_id.as_str());
-        let group = SharedString::from(format!("contributors-stats-group-{index}"));
-        let toggle = |id: String| {
-            move |this: &mut Self, cx: &mut Context<Self>| {
-                this.stats_ui.open = if this.stats_ui.open.as_deref() == Some(id.as_str()) {
-                    None
-                } else {
-                    Some(id.clone())
-                };
-                cx.notify();
-            }
-        };
-        let on_row = toggle(row.person_id.clone());
-        let on_name = toggle(row.person_id.clone());
-        let person = row.person_id.clone();
-        let identities = expanded.then(|| {
-            div()
-                .debug_selector(move || format!("contributors-stats-identities-{index}"))
-                .flex()
-                .bg(content(0.03))
-                .child(div().w(px(W_RANK)).flex_shrink_0())
-                .child(
-                    div()
-                        .flex_1()
-                        .px(px(12.))
-                        .py(px(8.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .text_size(px(12.))
-                        .text_color(content(0.5))
-                        .font_family(crate::fonts::mono())
-                        .when(row.identities.is_empty(), |d| {
-                            d.child("No commit identities")
-                        })
-                        .children(row.identities.iter().map(|id| div().child(id.clone()))),
-                )
-        });
-        div()
-            .child(
-                row_div(("contributors-stats-row", index))
-                    .debug_selector(move || format!("contributors-stats-row-{index}"))
-                    .group(group.clone())
-                    .role(Role::Row)
-                    .flex()
-                    .border_t_1()
-                    .border_color(content(0.1))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(content(0.03)))
-                    .on_click(cx.listener(move |this, _, _, cx| on_row(this, cx)))
-                    .child(
-                        cell(Some(index))
-                            .w(px(W_RANK))
-                            .text_color(content(0.5))
-                            .child((index + 1).to_string()),
-                    )
-                    .child(
-                        cell(None).flex_1().min_w(px(200.)).justify_start().child(
-                            div()
-                                .id(("contributors-stats-name", index))
-                                .debug_selector(move || format!("contributors-stats-name-{index}"))
-                                .role(Role::Button)
-                                .aria_label(row_label(row))
-                                .aria_expanded(expanded)
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    on_name(this, cx);
-                                    cx.stop_propagation();
-                                }))
-                                .child(ui::avatar(&row.name, &row.color, AvatarSize::Sm))
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .child(row.name.clone()),
-                                )
-                                .children(identities_chip(row).map(|chip| {
-                                    div()
-                                        .rounded_full()
-                                        .border_1()
-                                        .border_dashed()
-                                        .border_color(content(0.2))
-                                        .px(px(6.))
-                                        .text_size(px(11.))
-                                        .text_color(content(0.5))
-                                        .child(chip)
-                                })),
-                        ),
-                    )
-                    .child(
-                        cell(Some(index))
-                            .w(px(W_COMMITS))
-                            .justify_end()
-                            .child(row.commits.to_string()),
-                    )
-                    .child(
-                        cell(None)
-                            .w(px(W_LINES))
-                            .justify_end()
-                            .gap(px(6.))
-                            .font_features(tabular())
-                            .child(
-                                div()
-                                    .text_color(rgb(DIFF_ADD))
-                                    .child(format!("+{}", format_compact(row.added as f64))),
-                            )
-                            .child(
-                                div()
-                                    .text_color(rgb(DIFF_DEL))
-                                    .child(format!("-{}", format_compact(row.deleted as f64))),
-                            ),
-                    )
-                    .child(
-                        cell(Some(index))
-                            .w(px(W_FILES))
-                            .justify_end()
-                            .child(row.files.to_string()),
-                    )
-                    .child(
-                        cell(Some(index))
-                            .w(px(W_AI))
-                            .justify_end()
-                            .child(format!("{}%", row.ai_assisted_pct)),
-                    )
-                    .child(
-                        cell(None)
-                            .w(px(W_SHARE))
-                            .justify_start()
-                            .gap(px(8.))
-                            .child(
-                                div()
-                                    .w(px(96.))
-                                    .h(px(6.))
-                                    .flex_shrink_0()
-                                    .overflow_hidden()
-                                    .rounded_full()
-                                    .bg(content(0.1))
-                                    .child(
-                                        div()
-                                            .h_full()
-                                            .w(relative((row.share_pct.min(100.) / 100.) as f32))
-                                            .rounded_full()
-                                            .bg(ui::hex_color(&row.color)),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w(px(32.))
-                                    .text_size(px(11.))
-                                    .text_color(content(0.5))
-                                    .font_features(tabular())
-                                    .child(share_label(row)),
-                            ),
-                    )
-                    .child(
-                        cell(None)
-                            .w(px(W_LAST))
-                            .justify_end()
-                            .whitespace_nowrap()
-                            .text_color(content(0.5))
-                            .child(
-                                row.last_active
-                                    .as_deref()
-                                    .map(|at| relative_time(at, now))
-                                    .unwrap_or_default(),
-                            ),
-                    )
-                    .child(
-                        cell(None).w(px(W_ASK)).justify_end().child(
-                            div()
-                                .id(("contributors-stats-ask", index))
-                                .debug_selector(move || format!("contributors-stats-ask-{index}"))
-                                .role(Role::Button)
-                                .aria_label(format!("Ask Agent about {}", row.name))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(content(0.1))
-                                .px(px(8.))
-                                .py(px(2.))
-                                .text_size(px(11.))
-                                .text_color(accent_color())
-                                .opacity(0.)
-                                .group_hover(group, |s| s.opacity(1.))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(content(0.05)))
-                                .child("Ask")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_ask(
-                                        SnapshotScope::Person {
-                                            person_id: person.clone(),
-                                        },
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                })),
-                        ),
-                    ),
-            )
-            .children(identities)
-            .into_any_element()
     }
 }
 

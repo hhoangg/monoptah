@@ -1,14 +1,14 @@
-# Monoptah Native 0.36.0
+# Monoptah Native 0.36.1
 
 A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.35.0
+## Changes since 0.36.0
 
-- Mono workflows have a new Switch node. It routes a run to one of several named cases by comparing a value such as `{{triage.kind}}` with each case, and takes the `default` branch when none match. A Switch can also let the Mono choose the case, with an optional question.
-- On the workflow board a Switch card has one output port per case plus `default`. The inspector edits the value, the question, who decides, and the list of cases; renaming or removing a case keeps its connected edge in step.
-- Workflow validation checks Switch nodes: cases must be non-blank and unique, `default` is reserved, and every out-edge needs a case or `default` handle, with at most one edge per handle. `workflows.guide` documents the node.
-- Existing workflows with If nodes load and save unchanged.
-- Contributors: Refresh and Sync on the GitHub tab now fetch the default branch from `origin` and read `refs/remotes/origin/<branch>`, so commits that landed on the remote show up without a manual `git pull`. With no branch selected the page follows the default branch of `origin`, and unpushed commits are not counted. Fetching never changes the working tree or local branches. If `origin` cannot be reached, the stored data stays and the page says how old it is. Repositories without `origin` keep reading the local branch.
+- Contributors, GitHub tab: the commit chart has Line, Cumulative and Bars views, and the choice is remembered. It shows the top 5 members plus Others. Click a legend item to focus members. Right-click it, or use its color button, to pick a member color, saved per project and used across the page.
+- Contributors: a year calendar and a week rhythm heatmap, for the team or one member. Chevrons move through the member list.
+- Contributors: click a table row to open a member page with stats, trend, calendar, rhythm, areas of the code and recent PRs. Back returns to the list where you left it.
+- Contributors, ClickUp tab: stat cards with changes against the previous period, a points trend, a member by level heatmap and a member page with points and tickets. Comparisons and the year view read local data only.
+- Contributors: moving the pointer over a chart no longer redraws the table.
 
 ## What it is
 

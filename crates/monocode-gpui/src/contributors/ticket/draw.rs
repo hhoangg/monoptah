@@ -21,8 +21,8 @@ use crate::{
 };
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Render, Role, SharedString,
-    Subscription, Window, canvas, div, prelude::*, px, relative, rgb,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Render, Role, ScrollHandle,
+    SharedString, Subscription, Window, canvas, div, prelude::*, px, relative, rgb,
 };
 use monocode_core::contributors::{
     model::period::PeriodKind,
@@ -71,6 +71,10 @@ pub(super) struct UiState {
     pub slots: HashMap<String, AnchorSlot>,
     pub level_menu: Option<OpenLevel>,
     pub wide: Rc<Cell<bool>>,
+    /// The scroll of the tab's body, so Back from a member's page puts the list where it was.
+    pub scroll: ScrollHandle,
+    /// Accessibility is on: cached frames carry no nodes, so views are drawn afresh.
+    pub a11y: bool,
 }
 impl UiState {
     pub(super) fn new(cx: &mut App) -> Self {
@@ -88,6 +92,8 @@ impl UiState {
             slots: HashMap::new(),
             level_menu: None,
             wide: Rc::new(Cell::new(true)),
+            scroll: ScrollHandle::new(),
+            a11y: false,
         }
     }
 }
@@ -150,6 +156,9 @@ pub(super) fn shown_kind(kind: PeriodKind) -> PeriodKind {
 
 impl Render for TicketView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        super::built(0);
+        self.ui.a11y = window.is_a11y_active();
         self.sync_fields(window, cx);
         let workspace_list = self.ui.workspace_dd.open.then(|| {
             let options = workspace_options(self.settings.scope.as_ref(), &self.workspaces);
@@ -253,6 +262,7 @@ impl Render for TicketView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.ui.scroll)
                     .child(
                         div()
                             .relative()
@@ -523,7 +533,7 @@ impl TicketView {
 
     // ---- the body ----------------------------------------------------------------
 
-    fn body(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn body(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         match self.body_state() {
             BodyState::Problem { message, retry } => vec![self.problem(message, retry, cx)],
             BodyState::Checking => {
@@ -554,8 +564,16 @@ impl TicketView {
                 if self.scope_open {
                     out.push(self.scope_panel(&scope, cx));
                 }
+                if self.detail.is_some() {
+                    out.push(self.detail_page(cx));
+                    return out;
+                }
                 out.push(self.score_card(cx));
-                out.push(self.leaderboard(cx));
+                let board = &self.derived.board;
+                if !board.members.is_empty() || board.unassigned.tickets > 0 {
+                    out.extend(self.overview(cx));
+                }
+                out.push(self.part(super::part::PartKind::Leaderboard, cx));
                 out
             }
         }
@@ -1154,7 +1172,7 @@ impl TicketView {
 
     // ---- the leaderboard ---------------------------------------------------------------
 
-    fn leaderboard(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn leaderboard(&self, cx: &mut Context<Self>) -> AnyElement {
         let board = &self.derived.board;
         if board.members.is_empty() && board.unassigned.tickets == 0 {
             return empty_board();
@@ -1196,15 +1214,33 @@ impl TicketView {
     }
 
     fn member_row(&self, index: usize, row: &MemberRow, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg(test)]
+        super::built(1);
         let expanded = self.ui.open_member.as_deref() == Some(row.id.as_str());
-        let (toggle_id, exclude_id) = (row.id.clone(), row.id.clone());
-        let (exclude_name, selector_id) = (row.name.clone(), row.id.clone());
+        let (toggle_id, exclude_id, open_id, open_name_id) = (
+            row.id.clone(),
+            row.id.clone(),
+            row.id.clone(),
+            row.id.clone(),
+        );
+        let (exclude_name, selector_id, expand_id) =
+            (row.name.clone(), row.id.clone(), row.id.clone());
         let line = div()
             .id(SharedString::from(format!("ticket-board-row-{}", row.id)))
+            .debug_selector({
+                let id = row.id.clone();
+                move || format!("ticket-board-row-{id}")
+            })
             .flex()
             .border_t_1()
             .border_color(content(0.1))
+            .cursor_pointer()
             .hover(|s| s.bg(content(0.03)))
+            .on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.open_detail(open_id.clone(), window, cx)
+                }),
+            )
             .child(
                 cell(W_RANK)
                     .text_color(content(0.6))
@@ -1220,21 +1256,17 @@ impl TicketView {
                         .gap_2()
                         .child(
                             div()
-                                .id(SharedString::from(format!("ticket-member-{}", row.id)))
-                                .debug_selector({
-                                    let id = selector_id.clone();
-                                    move || format!("ticket-member-{id}")
-                                })
+                                .id(SharedString::from(format!("ticket-expand-{}", row.id)))
+                                .debug_selector(move || format!("ticket-expand-{expand_id}"))
                                 .role(Role::Button)
-                                .aria_label(row.name.clone())
+                                .aria_label(format!("Tickets of {}", row.name))
                                 .aria_expanded(expanded)
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
-                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .flex_shrink_0()
+                                .rounded(px(4.))
+                                .px(px(4.))
+                                .py(px(4.))
                                 .cursor_pointer()
-                                .hover(|s| s.text_color(accent_color()))
+                                .hover(|s| s.bg(content(0.08)))
                                 .child(icon("chevron-right", 12.).text_color(content(0.45)).when(
                                     expanded,
                                     |i| {
@@ -1243,9 +1275,30 @@ impl TicketView {
                                         ))
                                     },
                                 ))
-                                .child(div().min_w_0().truncate().child(row.name.clone()))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle_member(&toggle_id, cx)
+                                    this.toggle_member(&toggle_id, cx);
+                                    cx.stop_propagation();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("ticket-member-{}", row.id)))
+                                .debug_selector({
+                                    let id = selector_id.clone();
+                                    move || format!("ticket-member-{id}")
+                                })
+                                .role(Role::Button)
+                                .aria_label(format!("Open details for {}", row.name))
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(accent_color()))
+                                .child(div().min_w_0().truncate().child(row.name.clone()))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_detail(open_name_id.clone(), window, cx);
+                                    cx.stop_propagation();
                                 })),
                         )
                         .child(
@@ -1262,7 +1315,8 @@ impl TicketView {
                                 .hover(|s| s.bg(content(0.08)))
                                 .child(icon("x", 12.).text_color(content(0.5)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.exclude_member(&exclude_id, &exclude_name, cx)
+                                    this.exclude_member(&exclude_id, &exclude_name, cx);
+                                    cx.stop_propagation();
                                 })),
                         ),
                 ),
