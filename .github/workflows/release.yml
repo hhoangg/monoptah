@@ -1,4 +1,4 @@
-# Fork-local release workflow (Monoptah). Pushing a v* tag builds an ad-hoc
+# Fork-local release workflow (Monoptah). Run on a v* tag, it builds an ad-hoc
 # signed macOS app plus Linux, Windows, and standalone host packages, and
 # attaches them all to one GitHub Release (the macOS zip is what a Homebrew
 # cask pins). The secrets read are the two updater signing secrets,
@@ -18,12 +18,14 @@
 # Staging never asserts a signature file name. It globs for *.sig, pairs each
 # with the file it signs, and fails when there is none, so a build that did
 # not sign cannot slip into a release.
+#
+# Paused on this fork while releases are native only: pushing a v* tag does
+# nothing. To cut a Tauri release, push the tag, then run this workflow on it:
+# gh workflow run release.yml --ref vX.Y.Z. To resume, restore the v* tag trigger.
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 # Only the release job publishes, so only it gets write access.
 permissions:

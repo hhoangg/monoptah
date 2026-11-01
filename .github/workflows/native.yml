@@ -14,6 +14,7 @@ on:
       - 'scripts/native-editor/**'
       - 'scripts/native-settings/**'
       - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/native.yml'
       - '.github/workflows/native-release.yml'
       - '.github/workflows/native-release-monoptah.yml'
@@ -41,11 +42,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/monocode-gpui
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Linux core dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libdbus-1-dev pkg-config
+      # ci.yml, the other npm ci, is paused; the native release needs a good lock.
+      - if: runner.os == 'macOS'
+        run: npm ci
       - run: npm run native:test:dev
       - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --all-targets --profile native-dev -- -D warnings
       - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --profile native-dev
@@ -58,9 +67,44 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/monocode-gpui
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --manifest-path crates/monocode-gpui/Cargo.toml --all --check
       - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core -p monocode-gpui --all-targets --profile native-dev -- -D warnings
-      - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --profile native-dev
       - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui --profile native-dev -- --test-threads=1
       - run: cargo build --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui --profile native-dev
 
+  # Tag runs restore this, which is what makes a native release fast. Keep the
+  # toolchain, Metal step and build command in step with native-release-monoptah.yml.
+  release-cache:
+    name: Seed the release build cache
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    continue-on-error: true
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - id: cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/monocode-gpui
+          shared-key: native-monoptah-release
+          lookup-only: true
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          if ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+      - if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --target "$TARGET" --release
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-core --example verify_monoptah_native_update --profile native-dev
