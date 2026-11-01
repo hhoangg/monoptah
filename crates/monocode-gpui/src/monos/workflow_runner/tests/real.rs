@@ -2,8 +2,8 @@
 //! sessions, the report in the chat and the run history file. No provider is ever started.
 use super::*;
 use crate::monos::tests::{
-    Setup, call_from, chat_rows, edit_mono, groups_of, launches_of, session_count, setup,
-    started_link,
+    Setup, WORKFLOW_ACTIONS, call_from, chat_rows, edit_mono, fake_run, groups_of, launches_of,
+    session_count, setup, started_link,
 };
 use crate::monos::workflow_runner::Live;
 use crate::runtime::locked;
@@ -774,13 +774,16 @@ fn the_question_session_reads_the_app_but_cannot_schedule_work(cx: &mut TestAppC
         .try_recv()
         .unwrap();
     assert_eq!(refused, Err("A habit run cannot schedule more runs".into()));
-    let refused = call_from(&s, session, "w1", "workflows.list", json!({}), cx)
-        .try_recv()
-        .unwrap();
-    assert_eq!(
-        refused,
-        Err("Only a Mono's own conversation can manage its workflows".into())
-    );
+    for action in WORKFLOW_ACTIONS {
+        let refused = call_from(&s, session, action, action, json!({}), cx)
+            .try_recv()
+            .unwrap();
+        assert_eq!(
+            refused,
+            Err("A workflow's question to its Mono cannot use workflows".into()),
+            "{action}"
+        );
+    }
     assert!(
         call_from(&s, session, "h2", "habits.list", json!({}), cx)
             .try_recv()
@@ -847,6 +850,92 @@ fn the_app_starts_a_run_through_the_real_host_and_stops_it(cx: &mut TestAppConte
         chat_rows(&s)
             .iter()
             .any(|r| r.starts_with("## Ship it · stopped")),
+        "{:?}",
+        chat_rows(&s)
+    );
+}
+
+#[gpui::test]
+fn a_workflow_a_habit_run_starts_reports_to_the_chat_and_outlives_the_run(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let add = |request: &str, name: &str, ask: bool, cx: &mut TestAppContext| {
+        let mut nodes = vec![json!({"id": "trigger", "type": "manual"})];
+        let mut edges = vec![json!({"from": "trigger", "to": "report"})];
+        if ask {
+            nodes.push(json!({"id": "ask", "type": "askMono", "question": "Ship it?", "answers": ["yes", "no"]}));
+            edges = vec![
+                json!({"from": "trigger", "to": "ask"}),
+                json!({"from": "ask", "to": "report"}),
+            ];
+        }
+        nodes.push(json!({"id": "report", "type": "report"}));
+        let definition = json!({"name": name, "nodes": nodes, "edges": edges});
+        let added = call_from(
+            &s,
+            s.session,
+            request,
+            "workflows.add",
+            json!({"workflow": definition}),
+            cx,
+        )
+        .try_recv()
+        .unwrap()
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+        call_from(
+            &s,
+            s.session,
+            &format!("{request}-resume"),
+            "workflows.resume",
+            json!({"id": id}),
+            cx,
+        )
+        .try_recv()
+        .unwrap()
+        .unwrap();
+        id
+    };
+    // A short workflow finishes while the habit run is still going, and its report is the
+    // usual one in the Mono's chat.
+    let quick = add("a1", "Quick", false, cx);
+    call_from(&s, run, "r1", "workflows.run", json!({"id": quick}), cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+    cx.run_until_parked();
+    let runs = load_runs(&MonoDir::new(&s.root, &s.id), &quick).unwrap();
+    assert_eq!(runs[0].status, RunStatus::Done);
+    assert!(
+        chat_rows(&s).iter().any(|r| r.starts_with("## Quick")),
+        "{:?}",
+        chat_rows(&s)
+    );
+    // A workflow that waits on its question is not held by the habit run: it keeps going when
+    // the run ends, leaves `active_run` alone, and reports to the chat when it stops.
+    let slow = add("a2", "Slow", true, cx);
+    cx.update(|cx| s.manager.update(cx, |m, _| m.active_run = Some(run)));
+    call_from(&s, run, "r2", "workflows.run", json!({"id": slow}), cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(ask_session_count(&s, cx), 1, "the question is not blocked");
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            m.running.remove(&run);
+            assert_eq!(m.active_run, Some(run));
+            assert!(m.workflows.is_running(&slow));
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| assert!(s.manager.read(cx).workflows.is_running(&slow)));
+    assert!(cx.update(|cx| s.manager.update(cx, |m, _| m.stop_workflow_run(&slow))));
+    cx.run_until_parked();
+    assert!(
+        chat_rows(&s)
+            .iter()
+            .any(|r| r.starts_with("## Slow · stopped")),
         "{:?}",
         chat_rows(&s)
     );

@@ -1056,7 +1056,7 @@ fn run<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
     }
     if host.is_running(&current.id) {
         return Err(
-            "That workflow is already running; its report is posted here when it ends".into(),
+            "That workflow is already running; its report is posted to the Mono's chat when it ends".into(),
         );
     }
     let values = run_values(host, &current, input)?;
@@ -1099,7 +1099,7 @@ fn run<H: WorkflowHost>(host: &mut H, input: &Json) -> Result<Json, String> {
         ("id", st(&current.id)),
         (
             "note",
-            st("It starts now, on its own. Its report is posted to this chat when it finishes."),
+            st("It starts now, on its own. Its report is posted to the Mono's chat when it finishes."),
         ),
     ]))
 }
