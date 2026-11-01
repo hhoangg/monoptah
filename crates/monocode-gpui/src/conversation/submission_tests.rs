@@ -345,8 +345,9 @@ fn a_mono_chat_shows_the_workflow_popup_and_enter_picks_before_sending(cx: &mut 
         .expect("the popup row must exist in the Mono chat");
     let list = visual.debug_bounds("composer-completion-list").unwrap();
     let composer = visual.debug_bounds("mono-composer").unwrap();
+    // The row, not the list: the list's edge moves with the opening animation.
     assert!(
-        list.bottom() <= composer.top(),
+        row.bottom() <= composer.top(),
         "popup sits above the composer"
     );
     assert!(list.top() >= gpui::px(0.), "popup is fully visible");
