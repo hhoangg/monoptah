@@ -939,6 +939,15 @@ impl Conversation {
                 .size_full(),
             )
             .child(self.composer_anchor.probe())
+            .child(
+                // The box has padding, not a border, so inset the probe by the
+                // 1px that `composer_probe` adds back: the menu then matches
+                // the painted border.
+                div()
+                    .absolute()
+                    .inset(px(1.))
+                    .child(self.completion.read(cx).composer_probe()),
+            )
             .children(runner)
             .children(self.attachment_chips(cx))
             .child(
@@ -956,7 +965,7 @@ impl Conversation {
                             .self_center()
                             .px_1p5()
                             .py_1()
-                            .child(self.input.clone()),
+                            .child(self.completion.clone()),
                     )
                     .child(
                         div()

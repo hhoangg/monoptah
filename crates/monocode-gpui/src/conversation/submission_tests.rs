@@ -301,3 +301,164 @@ fn stopping_before_the_worker_runs_keeps_the_optimistic_message(cx: &mut TestApp
             .unwrap();
     }
 }
+
+/// A real Mono conversation with one stored workflow, its input focused.
+fn mono_with_workflow(cx: &mut TestAppContext) -> (WindowHandle<Conversation>, std::path::PathBuf) {
+    use monocode_core::mono::workflows::{model::Workflow, store::update_workflows};
+    let root = std::env::temp_dir().join(format!("mono-popup-{}", monocode_core::mono::new_id()));
+    std::fs::create_dir_all(&root).unwrap();
+    update_workflows(
+        &monocode_core::mono::workflows::store::MonoDir::new(&root, "mono-a"),
+        |mut list| {
+            list.push(Workflow::new("wf-popup", "Nightly Deploy"));
+            Ok((list, ()))
+        },
+    )
+    .unwrap();
+    cx.update(crate::composer_completion::bind);
+    let window = conversation(cx);
+    window
+        .update(cx, |view, window, cx| {
+            let mono = monocode_core::mono::Mono {
+                id: "mono-a".into(),
+                ..Default::default()
+            };
+            view.configure_mono(mono, root.clone(), Default::default(), cx);
+            window.focus(&view.input.focus_handle(cx), cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    (window, root)
+}
+
+#[gpui::test]
+fn a_mono_chat_shows_the_workflow_popup_and_enter_picks_before_sending(cx: &mut TestAppContext) {
+    let (window, root) = mono_with_workflow(cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    type_into_visual(&window, visual, "@workflow/");
+    visual.refresh().unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("completion-title-Workflows").is_some());
+    let row = visual
+        .debug_bounds("completion-row-0")
+        .expect("the popup row must exist in the Mono chat");
+    let list = visual.debug_bounds("composer-completion-list").unwrap();
+    let composer = visual.debug_bounds("mono-composer").unwrap();
+    // The row, not the list: the list's edge moves with the opening animation.
+    assert!(
+        row.bottom() <= composer.top(),
+        "popup sits above the composer"
+    );
+    assert!(list.top() >= gpui::px(0.), "popup is fully visible");
+    assert!(row.size.width > gpui::px(0.));
+    assert!(list.size.width <= composer.size.width + gpui::px(2.));
+
+    visual.simulate_keystrokes("enter");
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, cx| {
+            assert_eq!(view.input.read(cx).content, "@workflow/nightly-deploy ");
+            assert!(!view.summary.has_messages, "the pick must not send");
+        })
+        .unwrap();
+    visual.simulate_keystrokes("enter");
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, cx| {
+            assert!(
+                view.input.read(cx).content.is_empty(),
+                "the next Enter sends"
+            );
+        })
+        .unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn type_into_visual(
+    window: &WindowHandle<Conversation>,
+    cx: &mut gpui::VisualTestContext,
+    text: &str,
+) {
+    window
+        .update(cx, |view, window, cx| {
+            window.focus(&view.input.focus_handle(cx), cx);
+            view.input
+                .update(cx, |input, cx| input.set_text(text.into(), cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn enter_on_a_slash_command_in_a_mono_chat_sends_at_once(cx: &mut TestAppContext) {
+    let (window, root) = mono_with_workflow(cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    type_into_visual(&window, visual, "/foo");
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("completion-row-0").is_none());
+    assert!(visual.debug_bounds("composer-completion-list").is_none());
+    visual.simulate_keystrokes("enter");
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, cx| {
+            assert!(
+                view.input.read(cx).content.is_empty(),
+                "sent on first Enter"
+            );
+        })
+        .unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[gpui::test]
+fn escape_closes_the_mono_popup_and_tab_picks(cx: &mut TestAppContext) {
+    let (window, root) = mono_with_workflow(cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    type_into_visual(&window, visual, "@workflow/");
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("completion-row-0").is_some());
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("completion-row-0").is_none());
+    window
+        .update(visual, |view, _, cx| {
+            assert!(view.settings.mono.is_some());
+            assert_eq!(view.input.read(cx).content, "@workflow/");
+        })
+        .unwrap();
+    type_into_visual(&window, visual, "");
+    type_into_visual(&window, visual, "@workflow/");
+    visual.refresh().unwrap();
+    visual.simulate_keystrokes("tab");
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, cx| {
+            assert_eq!(view.input.read(cx).content, "@workflow/nightly-deploy ");
+        })
+        .unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[gpui::test]
+fn mcp_in_a_mono_chat_sends_like_any_message(cx: &mut TestAppContext) {
+    let (window, root) = mono_with_workflow(cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    type_into_visual(&window, visual, "/mcp");
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("composer-completion-list").is_none());
+    visual.simulate_keystrokes("enter");
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("composer-completion-list").is_none());
+    window
+        .update(visual, |view, _, cx| {
+            assert!(
+                view.input.read(cx).content.is_empty(),
+                "sent on first Enter"
+            );
+        })
+        .unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}

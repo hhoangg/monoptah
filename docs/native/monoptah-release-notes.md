@@ -2,7 +2,7 @@
 
 A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.38.0
+## Changes since 0.38.1
 
 - Background model: a new setting in Settings > Providers > Background tasks chooses the model that writes session titles, worktree branch names, commit messages and pull request text, on the desktop and for a paired phone's Git actions. Automatic keeps using each session's provider and its quick model.
 - Editor: Zig files get syntax highlighting and fold their struct, enum, union, error-set and switch blocks. ZON files are not supported.
