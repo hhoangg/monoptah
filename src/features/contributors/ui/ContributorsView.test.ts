@@ -663,13 +663,20 @@ describe("ContributorsView", () => {
   });
 
   it("shows how the previous period is compared", async () => {
-    await mount();
-    expect(container.textContent).toContain("vs prev 7d");
-    await act(async () => periodButton("Month")?.click());
-    await act(async () => {});
-    const previous = priorOf(currentPeriod("month", new Date()));
-    // The mocked data starts 70 days back, so it covers the previous month.
-    expect(container.textContent).toContain(`vs ${previous.label}`);
+    // Mid-month: on the 1st the mocked commits are all before the current
+    // month, so the view shows its empty state instead of the comparison.
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date(2026, 5, 15, 12) });
+    try {
+      await mount();
+      expect(container.textContent).toContain("vs prev 7d");
+      await act(async () => periodButton("Month")?.click());
+      await act(async () => {});
+      const previous = priorOf(currentPeriod("month", new Date()));
+      // The mocked data starts 70 days back, so it covers the previous month.
+      expect(container.textContent).toContain(`vs ${previous.label}`);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("toggles merge identities and remembers it", async () => {
