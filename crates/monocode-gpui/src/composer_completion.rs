@@ -494,7 +494,14 @@ impl Completion {
         }
         self.highlight(cx);
         self.check_requirements(cx);
-        let token = self.input.read(cx).completion_token();
+        // A Mono composer offers `@` mentions only; `/` stays plain text so
+        // Enter sends it at once.
+        let mono = self.mono.is_some();
+        let token = self
+            .input
+            .read(cx)
+            .completion_token()
+            .filter(|token| !(mono && token.trigger == Trigger::Skill));
         if token.is_some() && token == self.dismissed {
             return;
         }
@@ -1244,6 +1251,7 @@ impl Render for Completion {
                     let (icon_path, icon_color) = choice.icon();
                     div()
                         .id(("completion-row", ix))
+                        .debug_selector(|| format!("completion-row-{ix}"))
                         .role(Role::ListItem)
                         .aria_label(choice.label.clone())
                         .px_3()
@@ -1311,7 +1319,16 @@ impl Render for Completion {
                 .as_ref()
                 .is_some_and(|t| t.trigger == Trigger::Mention)
             {
-                "FILES & NOTES"
+                if !self.choices.is_empty()
+                    && self
+                        .choices
+                        .iter()
+                        .all(|c| !c.file && c.insertion.starts_with("@workflow/"))
+                {
+                    "Workflows"
+                } else {
+                    "FILES & NOTES"
+                }
             } else {
                 "SKILLS & COMMANDS"
             };
@@ -1372,6 +1389,7 @@ impl Render for Completion {
                             .flex_col()
                             .child(
                                 div()
+                                    .debug_selector(|| format!("completion-title-{title}"))
                                     .flex_shrink_0()
                                     .px_2()
                                     .py_1()

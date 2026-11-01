@@ -1,14 +1,10 @@
-# Monoptah Native 0.38.0
+# Monoptah Native 0.38.1
 
 A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.37.0
+## Changes since 0.38.0
 
-- Monos: mention a workflow in a Mono chat with `@workflow/<slug>`. The turn gets its state, inputs, requirements and last run, so the Mono can discuss, edit or run it. A mention never starts a run by itself.
-- Workflows: Run opens a small form prefilled with the current values when a workflow has inputs. Values set there apply to that run only and are not saved. The `workflows.run` action accepts the same `values`.
-- Workflows can declare what they need with `requires`: a command on the PATH, an environment variable, or a configured MCP server, each with an optional hint. Add them on the board, or in YAML. Only names are checked, nothing from the file is run, and a variable's value is never read into any output.
-- Workflows: a run does not start while a requirement is missing. Run shows a checklist with Re-check, the Mono gets a list of what is missing, and a scheduled run ends as failed with that list in the Mono's chat, then the schedule moves on. The workflow list and page show what is missing, and the review of an imported workflow shows what it needs.
-- Workflows: `workflows.validate` warns about commands in command steps that `requires` does not declare.
+- Monos: the `@` suggestion list now opens in Mono chats, so `@workflow/` offers that Mono's workflows, as 0.38.0 was meant to. Notes can be picked the same way. Enter and Tab pick the highlighted row and Esc closes the list.
 
 ## What it is
 
