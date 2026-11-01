@@ -332,7 +332,26 @@ impl Today {
             .child(field("Due", due_text(task).unwrap_or("Not set".into())))
             .child(field("Priority", priority_value));
         if let Some(link) = task.link.as_deref().filter(|l| !l.trim().is_empty()) {
-            fields = fields.child(field("Link", div().truncate().child(link.to_string())));
+            let shown = link.to_string();
+            let target = link.trim().to_string();
+            fields = fields.child(field(
+                "Link",
+                if only_http(link) {
+                    div()
+                        .id("today-link-value")
+                        .debug_selector(|| "today-link-value".into())
+                        .role(Role::Link)
+                        .aria_label("Open link")
+                        .truncate()
+                        .cursor_pointer()
+                        .underline()
+                        .child(shown)
+                        .on_click(move |_, _, cx| cx.open_url(&target))
+                        .into_any_element()
+                } else {
+                    div().truncate().child(shown).into_any_element()
+                },
+            ));
         }
         if !task.tags.is_empty() {
             fields = fields.child(field("Tags", task.tags.join(", ")));
@@ -590,6 +609,35 @@ mod tests {
             selected(DayMode::Current, 0, Vec::new(), None),
         );
         assert!(!has(&mut visual, "today-open-link"));
+    }
+    #[gpui::test]
+    fn the_link_field_opens_an_http_link(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(
+            cx,
+            Show::Detail,
+            selected(
+                DayMode::Past,
+                0,
+                Vec::new(),
+                Some(" https://example.com/1 "),
+            ),
+        );
+        visual.refresh().unwrap();
+        let value = visual
+            .debug_bounds("today-link-value")
+            .expect("the link field is clickable");
+        visual.simulate_click(value.center(), Default::default());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/1"));
+    }
+    #[gpui::test]
+    fn the_link_field_stays_plain_text_for_anything_but_http(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(
+            cx,
+            Show::Detail,
+            selected(DayMode::Current, 0, Vec::new(), Some("file:///etc/passwd")),
+        );
+        assert!(has(&mut visual, "today-detail"));
+        assert!(!has(&mut visual, "today-link-value"));
     }
     #[gpui::test]
     fn an_old_task_with_no_note_gets_a_hint_a_noted_one_does_not(cx: &mut TestAppContext) {
