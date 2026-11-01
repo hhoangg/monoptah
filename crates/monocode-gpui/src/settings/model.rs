@@ -448,6 +448,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "chat tui terminal interactive cli surface",
     ),
     (
+        "background-model",
+        Section::Providers,
+        "Background model",
+        "title generation commit message branch worktree name pull request haiku fast small",
+    ),
+    (
         "provider-accounts",
         Section::Providers,
         "Provider accounts",

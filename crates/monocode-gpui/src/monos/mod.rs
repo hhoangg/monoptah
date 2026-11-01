@@ -12,6 +12,7 @@ mod habit_stop;
 mod host;
 mod html;
 mod memory_ui;
+mod mobile;
 mod notifications;
 mod overview;
 mod panel_stack;
@@ -58,7 +59,9 @@ use std::{
 pub(crate) struct Changed;
 pub(crate) struct TabOpened(pub String);
 pub(crate) struct ShowDetails(pub String);
-pub(crate) use notifications::{NotificationChanged, NotificationFinished};
+/// A Mono's chat has opened, so a paired phone can follow it.
+pub(crate) struct ChatOpened;
+pub(crate) use notifications::{NotificationChanged, NotificationFinished, NotificationPosted};
 pub(crate) use workflow_schedule::begin_quit;
 #[derive(Clone, PartialEq)]
 pub(crate) struct OverviewChrome {
@@ -103,6 +106,8 @@ pub(crate) struct Monos {
     work: work::Cache,
     pub(crate) error: Option<String>,
     reset: Option<reset::ResetDialog>,
+    /// Monos a paired phone is resetting; there is no dialog to mark them busy.
+    phone_resets: HashSet<String>,
     cleanup: reset::CleanupRunner,
     notice_region: AnchorSlot,
     pub(crate) details: Entity<overview::Overview>,
@@ -183,6 +188,7 @@ pub(crate) struct Monos {
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
 impl EventEmitter<ShowDetails> for Monos {}
+impl EventEmitter<ChatOpened> for Monos {}
 impl Monos {
     #[cfg(test)]
     pub(crate) fn observation_count(&self) -> usize {
@@ -374,6 +380,7 @@ impl Monos {
             work: work::Cache::default(),
             error: roster_error,
             reset: None,
+            phone_resets: HashSet::new(),
             cleanup: reset::default_cleanup(),
             notice_region,
             details,
@@ -728,7 +735,12 @@ impl Monos {
         outcome
     }
     fn ensure_chat(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.chats.contains_key(id) || !self.loading_chats.insert(id.into()) {
+        // A reset is deleting the conversation this would open; it makes the
+        // fresh chat itself, and a failed one opens the kept chat again.
+        if self.resetting(id)
+            || self.chats.contains_key(id)
+            || !self.loading_chats.insert(id.into())
+        {
             return;
         }
         let Some(mono) = self.roster.get(id).cloned() else {
@@ -737,6 +749,7 @@ impl Monos {
         let store = self.store.clone();
         let prefs = self.prefs.clone();
         let id = id.to_string();
+        let expected = mono.session_id;
         let work = cx.background_executor().spawn(async move {
             let db = locked(&store)?;
             if let Some(missing) = &mono.unavailable_session {
@@ -782,6 +795,16 @@ impl Monos {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.loading_chats.remove(&id);
+                // A reset started while this read the conversation it is
+                // deleting: that one is not opened. Whoever resets opens the
+                // fresh one, or the kept one if the reset fails.
+                if expected.is_some()
+                    && (this.resetting(&id)
+                        || this.roster.get(&id).map(|m| m.session_id) != Some(expected))
+                {
+                    this.ensure_chat(&id, cx);
+                    return;
+                }
                 let (summary, settings, delivered) = match result {
                     Ok(value) => value,
                     Err(e) => {
@@ -918,6 +941,7 @@ impl Monos {
                     },
                 ));
                 this.chats.insert(id.clone(), view);
+                cx.emit(ChatOpened);
                 if let Some(handle) = this.parent_window {
                     let owner = cx.weak_entity();
                     let id = id.clone();
@@ -1052,10 +1076,19 @@ impl Monos {
                         .strip_prefix("mono-card:")
                         .map(|s| ("mono-card", s.to_string()))
                         .unwrap_or_else(|| ("assistant", report.clone()));
+                    let body = (role == "assistant").then(|| {
+                        text.strip_prefix("**Habit report**")
+                            .unwrap_or(&text)
+                            .trim()
+                            .to_owned()
+                    });
                     if let Err(error) = view.update(cx, |v, cx| v.mono_post(role, text, cx)) {
                         self.error = Some(error);
                         self.failed_reports.insert(id.into());
                         failed.push(report);
+                    } else if let Some(body) = body {
+                        let session = view.read(cx).summary.id;
+                        cx.emit(NotificationPosted { session, body });
                     }
                 }
                 if let Some(mono) = self.roster.get_mut(id) {

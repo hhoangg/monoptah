@@ -61,7 +61,7 @@ pub(super) struct ResetDialog {
 impl Monos {
     /// Reads what a reset could also delete, off the main thread, then asks.
     pub(super) fn request_reset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.reset.is_some() {
+        if self.reset.is_some() || self.resetting(id) {
             return;
         }
         let Some(mono) = self.roster.get(id) else {
@@ -82,7 +82,10 @@ impl Monos {
         cx.spawn_in(window, async move |this, cx| {
             let files = read.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.reset.is_some() {
+                // A phone may have started resetting this Mono while the files
+                // were being read; what was read is stale then.
+                if this.reset.is_some() || this.resetting(&mono) || this.roster.get(&mono).is_none()
+                {
                     return;
                 }
                 let files = match files {
@@ -109,9 +112,11 @@ impl Monos {
         })
         .detach();
     }
-    /// True while a reset of this Mono's conversation is deleting it.
+    /// True while a reset of this Mono's conversation is deleting it, whether
+    /// confirmed in the dialog or on a paired phone.
     pub(super) fn resetting(&self, id: &str) -> bool {
-        self.reset.as_ref().is_some_and(|d| d.busy && d.mono == id)
+        self.phone_resets.contains(id)
+            || self.reset.as_ref().is_some_and(|d| d.busy && d.mono == id)
     }
     /// Dismisses the dialog; nothing can be abandoned while the reset runs.
     pub(super) fn close_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -123,27 +128,64 @@ impl Monos {
             cx.notify();
         }
     }
-    /// Stops the chat, deletes the old conversation row (reading what to clean
-    /// up first), and only then starts a fresh conversation. A failed deletion
-    /// keeps the original conversation and reports in the dialog.
+    /// Confirms the dialog: the shared reset below, then focus back on the chat.
     pub(super) fn confirm_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dialog) = self.reset.as_mut().filter(|d| !d.busy) else {
+        let Some(id) = self
+            .reset
+            .as_ref()
+            .filter(|d| !d.busy)
+            .map(|d| d.mono.clone())
+        else {
+            return;
+        };
+        if self.phone_resets.contains(&id) {
+            return;
+        }
+        let Some(dialog) = self.reset.as_mut() else {
             return;
         };
         dialog.busy = true;
         dialog.error = None;
-        let id = dialog.mono.clone();
         let delete_files =
             dialog.delete_files && dialog.files.as_ref().is_some_and(|f| f.supported);
         let label = dialog.files.as_ref().map(|f| f.label.clone());
+        let reset = self.run_reset(id, Some(delete_files), label, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if reset.await.is_ok() {
+                let _ = this.update_in(cx, |this, window, cx| this.focus_active(window, cx));
+            }
+        })
+        .detach();
+    }
+    /// Stops the chat, deletes the old conversation row (reading what to clean
+    /// up first), and only then starts a fresh conversation. A failed deletion
+    /// keeps the original conversation and reports why. The dialog and a paired
+    /// phone both come through here.
+    ///
+    /// `delete_files` is the dialog's choice; `None` is the phone's, which has
+    /// no box and takes the dialog's default: delete the provider files exactly
+    /// when the provider supports it. The caller marks the Mono as resetting
+    /// first (the dialog's busy flag, or `phone_resets`).
+    pub(super) fn run_reset(
+        &mut self,
+        id: String,
+        delete_files: Option<bool>,
+        label: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<Result<(), String>> {
         if let Some(view) = self.chats.get(&id) {
             view.update(cx, |v, cx| v.mono_stop_turn(cx));
         }
         let old = self.roster.get(&id).and_then(|m| m.session_id);
+        let queued: Vec<String> = self
+            .roster
+            .get(&id)
+            .map(|m| m.outbox.iter().map(|q| q.id.clone()).collect())
+            .unwrap_or_default();
         let view = self.chats.get(&id).cloned();
         let store = self.store.clone();
         cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             // A stopped turn may still be saving; its rows must not land in a
             // conversation that reuses this id.
             let mut waited = Duration::ZERO;
@@ -153,7 +195,7 @@ impl Monos {
             {
                 if waited >= STOP_WAIT {
                     let _ = this.update(cx, |this, cx| this.reset_failed(&id, STOP_TIMEOUT, cx));
-                    return;
+                    return Err(failure(STOP_TIMEOUT));
                 }
                 cx.background_executor().timer(STOP_POLL).await;
                 waited += STOP_POLL;
@@ -162,34 +204,61 @@ impl Monos {
                 .background_executor()
                 .spawn(async move {
                     let Some(old) = old else {
-                        return Ok((None, None));
+                        return Ok((None, None, Vec::new()));
                     };
                     let mut db = locked(&store)?;
-                    let read = delete_files
-                        .then(|| provider_files::read_reset(&db, old))
-                        .transpose()?;
+                    // Messages the old conversation took are recorded in the
+                    // store too, which matters when its chat was not open.
+                    let taken: Vec<String> = queued
+                        .into_iter()
+                        .filter(|q| {
+                            db.setting(&format!("mono-delivered:{old}:{q}"))
+                                .ok()
+                                .flatten()
+                                .is_some()
+                        })
+                        .collect();
+                    let read = match delete_files {
+                        Some(delete) => delete
+                            .then(|| provider_files::read_reset(&db, old))
+                            .transpose()?,
+                        // Unsupported providers keep their files, and no
+                        // cleanup request runs for them.
+                        None => Some(provider_files::read_reset(&db, old)?)
+                            .filter(|r| r.files.as_ref().is_some_and(|f| f.supported)),
+                    };
                     db.delete(old)?;
                     // Drop the conversation's recorded turns and their Git refs.
                     if let Some(checkpoints) = monocode_core::checkpoint::store() {
                         let _ = checkpoints.exclusive(|c| c.forget(&old.to_string()));
                     }
-                    Ok::<_, String>((read, db.data_dir().map(Path::to_path_buf)))
+                    Ok::<_, String>((read, db.data_dir().map(Path::to_path_buf), taken))
                 })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(deleted) => this.finish_reset(&id, old, deleted, label, window, cx),
-                Err(error) => this.reset_failed(&id, &error, cx),
-            });
+            match result {
+                Ok(deleted) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.finish_reset(&id, old, deleted, label, cx)
+                    });
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| this.reset_failed(&id, &error, cx));
+                    Err(failure(&error))
+                }
+            }
         })
-        .detach();
     }
     /// Keeps the original conversation and says why in the dialog. What the
     /// reset held back is delivered to that conversation now.
     fn reset_failed(&mut self, id: &str, error: &str, cx: &mut Context<Self>) {
-        if let Some(dialog) = &mut self.reset {
+        self.phone_resets.remove(id);
+        if let Some(dialog) = self.reset.as_mut().filter(|d| d.mono == id) {
             dialog.busy = false;
             dialog.error = Some(failure(error));
         }
+        // The kept conversation may not have been open (opening waits out a reset).
+        self.ensure_chat(id, cx);
         self.dispatch(id, cx);
         cx.notify();
     }
@@ -197,32 +266,39 @@ impl Monos {
         &mut self,
         id: &str,
         old: Option<i64>,
-        (read, data_dir): (Option<ResetRead>, Option<std::path::PathBuf>),
+        (read, data_dir, taken): (Option<ResetRead>, Option<std::path::PathBuf>, Vec<String>),
         label: Option<String>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.reset = None;
+        // The gate opens before the fresh chat is made, so that chat is not
+        // held back by it.
+        self.phone_resets.remove(id);
+        if self.reset.as_ref().is_some_and(|d| d.mono == id) {
+            self.reset = None;
+        }
         // Messages the old conversation already took are not sent again; the
         // rest, and any reports, wait for the fresh conversation.
-        let delivered = self
+        let mut delivered = self
             .chats
             .get(id)
             .map(|v| v.read(cx).mono_delivered().clone())
             .unwrap_or_default();
+        delivered.extend(taken);
         self.chats.remove(id);
         if let Some(old) = old {
             self.roster.hidden_sessions.retain(|&s| s != old);
         }
+        // The Mono may have been deleted while the row was going: it must not
+        // come back, and there is no chat to make.
         if let Some(mono) = self.roster.get_mut(id) {
             mono.session_id = None;
             mono.unavailable_session = None;
             mono.seen_rows = 0;
             mono.outbox.retain(|m| !delivered.contains(&m.id));
+            self.save(cx);
+            self.ensure_chat(id, cx);
         }
-        self.save(cx);
-        self.ensure_chat(id, cx);
-        self.focus_active(window, cx);
+        cx.notify();
         let Some(read) = read else {
             return;
         };

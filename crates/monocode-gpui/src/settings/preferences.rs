@@ -102,6 +102,9 @@ pub(crate) struct Preferences {
     pub default_access: Option<String>,
     /// Last explicit effort choice for each provider, shared across projects.
     pub provider_efforts: HashMap<String, String>,
+    /// The model for session titles, branch names, commit messages and pull
+    /// requests; `None` lets each use its own harness's quick model.
+    pub background_model: Option<ModelChoice>,
     // Monos
     pub monos: bool,
     pub rail_monos_pinned: bool,
@@ -184,6 +187,7 @@ impl Default for Preferences {
             model_picker_tab: None,
             default_access: None,
             provider_efforts: HashMap::new(),
+            background_model: None,
             monos: true,
             rail_monos_pinned: false,
             mono_menu_bar_icon: true,
@@ -263,6 +267,11 @@ pub(crate) struct ModelChoice {
 
 impl gpui::Global for Preferences {}
 impl Preferences {
+    /// The background model picked in Settings, if any.
+    pub(crate) fn background_text_model(&self) -> Option<(Kind, Option<String>)> {
+        let choice = self.background_model.as_ref()?;
+        Some((Kind::parse(&choice.provider)?, choice.model.clone()))
+    }
     pub(crate) fn hidden_for(&self, project: &str) -> Vec<String> {
         let mut hidden = self.hidden_providers.clone();
         if let Some(settings) = self.project_providers.get(project) {

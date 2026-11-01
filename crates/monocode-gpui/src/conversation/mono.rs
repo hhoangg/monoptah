@@ -424,6 +424,11 @@ impl Conversation {
     pub(crate) fn mono_delivered(&self) -> &std::collections::HashSet<String> {
         &self.mono_ui.delivered
     }
+    /// Marks a queued message as taken by this conversation, as a delivery does.
+    #[cfg(test)]
+    pub(crate) fn mark_mono_delivered(&mut self, id: &str) {
+        self.mono_ui.delivered.insert(id.to_string());
+    }
     pub(super) fn mono_message_delivered(&mut self, id: String, cx: &mut Context<Self>) {
         if self.mono_ui.sending.as_ref() == Some(&id) {
             self.mono_ui.sending = None;
