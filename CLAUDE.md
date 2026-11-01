@@ -78,12 +78,16 @@ identifier and share WebKit storage (localStorage) with the installed app.
 
 ## Releasing
 
-`npm run set-version -- X.Y.Z`, add a `CHANGELOG.md` section, commit as `Release vX.Y.Z`,
-then push the tag. Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds
-macOS, Linux and Windows, signs the updater bundles with the `TAURI_SIGNING_PRIVATE_KEY`
-secret, and publishes a GitHub Release with `latest.json`.
+Releases are native only for now, see "Releasing the native app". The Tauri workflows
+`.github/workflows/ci.yml` and `release.yml` are paused: they have only `workflow_dispatch`,
+so pushes, pull requests and `v*` tags start nothing. Keep that when merging from upstream.
 
-The same tag also bumps the Homebrew cask in `hhoangg/homebrew-monoptah` (the `homebrew`
+To cut a Tauri release anyway: `npm run set-version -- X.Y.Z`, add a `CHANGELOG.md` section,
+commit as `Release vX.Y.Z`, push the tag, then run `gh workflow run release.yml --ref vX.Y.Z`.
+That workflow builds macOS, Linux and Windows, signs the updater bundles with the
+`TAURI_SIGNING_PRIVATE_KEY` secret, and publishes a GitHub Release with `latest.json`.
+
+The same run also bumps the Homebrew cask in `hhoangg/homebrew-monoptah` (the `homebrew`
 job) when the `HOMEBREW_TAP_TOKEN` secret is set. Pre-release tags (containing `-`) are
 skipped, and the script never lowers the cask version, so re-running an old tag is safe.
 If the secret is missing the job only prints a notice, so bump `Casks/monoptah.rb` by hand
@@ -100,8 +104,9 @@ trust that one key, so a replacement key would strand them.
 
 Monoptah Native (GPUI, macOS arm64 only, ad-hoc signed, not notarized) releases separately
 from the Tauri app. Edit `docs/native/monoptah-release-notes.md` (its first line must be
-`# Monoptah Native X.Y.Z`), commit it, then push the tag `native-vX.Y.Z` (plain `X.Y.Z`, no
-pre-release form). `.github/workflows/native-release-monoptah.yml` builds, signs with the same
+`# Monoptah Native X.Y.Z`), commit it, wait for `native.yml` on main to pass (the release does
+not wait for it, and its `release-cache` job seeds the build cache), then push the tag
+`native-vX.Y.Z` (plain `X.Y.Z`, no pre-release form). `.github/workflows/native-release-monoptah.yml` builds, signs with the same
 `TAURI_SIGNING_PRIVATE_KEY`, and publishes:
 
 - Release `native-vX.Y.Z` (never "latest": Tauri's updater reads `releases/latest`) with

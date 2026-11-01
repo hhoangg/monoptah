@@ -1,9 +1,10 @@
+# Tauri app checks. Paused on this fork while releases are native only, so they
+# run only by hand: gh workflow run ci.yml --ref <branch>. Native checks live in
+# native.yml. To resume, restore the push (main) and pull_request triggers.
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}

@@ -93,6 +93,7 @@ impl Shell {
                         }
                         if !cfg!(test) {
                             this.ensure_background_inbox(window, cx);
+                            this.ensure_background_today(window, cx);
                         }
                         this.poll_automations(cx);
                         if this
@@ -113,6 +114,10 @@ impl Shell {
                         }
                     }
                     Err(error) => {
+                        // Today does not depend on the automation service.
+                        if !cfg!(test) {
+                            this.ensure_background_today(window, cx);
+                        }
                         this.error = Some(format!("Could not open automations: {error}"));
                         cx.notify();
                     }

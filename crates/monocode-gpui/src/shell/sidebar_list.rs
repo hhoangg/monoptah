@@ -574,6 +574,10 @@ impl Shell {
 impl Shell {
     pub(super) fn sidebar_options_menu_items(&self) -> Vec<MenuItem> {
         vec![
+            MenuAction::new("sidebar-today", "Today")
+                .icon("clock")
+                .toggle(self.workspace.sidebar_today_visible)
+                .into(),
             MenuAction::new("sidebar-notes", "Notes")
                 .icon("note")
                 .toggle(self.workspace.sidebar_notes_visible)
@@ -610,6 +614,7 @@ impl Shell {
 
     pub(super) fn change_sidebar_option(&mut self, action: &str, cx: &mut Context<Self>) {
         let value = match action {
+            "sidebar-today" => &mut self.workspace.sidebar_today_visible,
             "sidebar-notes" => &mut self.workspace.sidebar_notes_visible,
             "sidebar-automations" => &mut self.workspace.sidebar_automations_visible,
             "sidebar-inbox" => &mut self.workspace.sidebar_inbox_visible,
@@ -715,6 +720,7 @@ impl Shell {
             )
             .children(
                 [
+                    ("Today", "clock"),
                     ("Inbox", "inbox"),
                     ("Notes", "note"),
                     ("Automations", "zap"),
@@ -722,6 +728,7 @@ impl Shell {
                 ]
                 .into_iter()
                 .filter(|(label, _)| match *label {
+                    "Today" => self.workspace.sidebar_today_visible,
                     "Notes" => {
                         self.workspace.preferences.notes && self.workspace.sidebar_notes_visible
                     }
@@ -737,6 +744,11 @@ impl Shell {
                         glyph
                     };
                     let selected = self.app_view_label() == Some(label);
+                    let open_count = if label == "Today" {
+                        self.today.as_ref().map_or(0, |t| t.read(cx).open_count())
+                    } else {
+                        0
+                    };
                     let unread = label == "Inbox"
                         && self
                             .inbox
@@ -746,7 +758,13 @@ impl Shell {
                         .id(label)
                         .debug_selector(move || format!("sidebar-navigation-{label}"))
                         .role(Role::Button)
-                        .aria_label(if unread { "Inbox, new items" } else { label })
+                        .aria_label(if unread {
+                            "Inbox, new items".to_string()
+                        } else if open_count > 0 {
+                            format!("{label}, {open_count} open")
+                        } else {
+                            label.to_string()
+                        })
                         .aria_selected(selected)
                         .cursor_pointer()
                         .group("rail-action")
@@ -771,6 +789,16 @@ impl Shell {
                             0.35
                         })))
                         .child(div().flex_1().child(label))
+                        .when(open_count > 0, |row| {
+                            row.child(
+                                div()
+                                    .debug_selector(|| "sidebar-today-count".into())
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(content(0.45))
+                                    .child(open_count.to_string()),
+                            )
+                        })
                         .when(unread, |row| {
                             row.child(
                                 div()
@@ -784,6 +812,7 @@ impl Shell {
                             )
                         })
                         .on_click(cx.listener(move |this, _, window, cx| match label {
+                            "Today" => this.open_today(window, cx),
                             "Inbox" => this.open_inbox(window, cx),
                             "Notes" => this.open_notes(window, cx),
                             "Automations" => this.open_automations(window, cx),

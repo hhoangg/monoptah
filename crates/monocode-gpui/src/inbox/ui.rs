@@ -6,11 +6,14 @@ use gpui::{
     rgb,
 };
 
-fn action(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Stateful<Div> {
+pub(crate) fn action(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Stateful<Div> {
     plain_action(id, label).hover(|s| s.bg(content(0.07)).text_color(content(1.)))
 }
 /// An [`action`] without its hover, for callers that set their own.
-fn plain_action(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Stateful<Div> {
+pub(crate) fn plain_action(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+) -> Stateful<Div> {
     let label = label.into();
     action_frame(id, label.clone()).child(label)
 }
@@ -40,7 +43,11 @@ const COPIED: Hsla = Hsla {
 };
 const COPIED_POP: Duration = Duration::from_millis(260);
 
-fn icon_action(id: impl Into<SharedString>, label: &str, name: &'static str) -> Stateful<Div> {
+pub(crate) fn icon_action(
+    id: impl Into<SharedString>,
+    label: &str,
+    name: &'static str,
+) -> Stateful<Div> {
     icon_action_ink(id, label, name, content(0.7))
 }
 fn icon_action_ink(
@@ -211,7 +218,7 @@ fn menu_row(
         )
         .child(div().flex_1().min_w_0().truncate().child(label))
 }
-fn caption(text: impl Into<SharedString>) -> Div {
+pub(crate) fn caption(text: impl Into<SharedString>) -> Div {
     div()
         .px(px(8.))
         .pt(px(10.))
@@ -221,7 +228,7 @@ fn caption(text: impl Into<SharedString>) -> Div {
         .text_color(content(0.4))
         .child(text.into())
 }
-fn message(text: impl Into<SharedString>) -> Div {
+pub(crate) fn message(text: impl Into<SharedString>) -> Div {
     div()
         .p(px(12.))
         .text_size(px(12.))
@@ -389,7 +396,7 @@ fn project_name(path: &std::path::Path) -> String {
         .into_owned()
 }
 
-fn label_badge(label: &model::Label, compact: bool) -> Div {
+pub(crate) fn label_badge(label: &model::Label, compact: bool) -> Div {
     let color = u32::from_str_radix(label.color.trim().trim_start_matches('#'), 16)
         .ok()
         .filter(|_| label.color.trim().trim_start_matches('#').len() == 6);

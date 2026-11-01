@@ -66,7 +66,7 @@ The Windows build emits an NSIS installer under `target/release/bundle/nsis/`.
 
 ## Releases and updates
 
-The [release workflow](../.github/workflows/release.yml) packages the platform builds, signs the updater bundles, and publishes the updater feed.
+The [release workflow](../.github/workflows/release.yml) packages the platform builds, signs the updater bundles, and publishes the updater feed. It is paused on this fork and runs only by hand, on a `v*` tag.
 
 Read [CONTRIBUTING.md](../CONTRIBUTING.md) for contribution guidelines and checks. The experimental remote host has its own [build and packaging instructions](remote-access.md#release-packaging).
 

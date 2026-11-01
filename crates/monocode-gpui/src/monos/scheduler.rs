@@ -1763,7 +1763,7 @@ impl Monos {
                 self.discard_quiet_heartbeat(&run.mono, session, cx);
             }
         } else {
-            self.file_work(
+            self.habit_file_work(
                 id.clone(),
                 move || {
                     habits::update(&root, &id, |all| {

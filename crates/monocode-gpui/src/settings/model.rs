@@ -249,6 +249,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "spotlight global shortcut hotkey floating prompt anywhere",
     ),
     (
+        "today-rollover",
+        Section::General,
+        "Work day starts at",
+        "today day rollover midnight morning late night",
+    ),
+    (
         "working-agents",
         Section::General,
         "Working agents",

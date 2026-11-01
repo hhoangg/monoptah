@@ -85,6 +85,7 @@ mod tab_motion;
 mod telegram_dialog;
 mod terminal;
 mod theme;
+mod today;
 #[cfg(target_os = "macos")]
 mod traffic_lights;
 mod transcript;

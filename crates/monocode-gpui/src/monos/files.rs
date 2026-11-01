@@ -198,6 +198,25 @@ impl Monos {
         work: impl FnOnce() -> Result<(), String> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        self.file_work_inner(id, work, false, cx);
+    }
+    /// Like `file_work`, and reloads the Today habit cache once the write landed, so a
+    /// finished run stops reading as busy.
+    pub(super) fn habit_file_work(
+        &mut self,
+        id: String,
+        work: impl FnOnce() -> Result<(), String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_work_inner(id, work, true, cx);
+    }
+    fn file_work_inner(
+        &mut self,
+        id: String,
+        work: impl FnOnce() -> Result<(), String> + Send + 'static,
+        reload_habits: bool,
+        cx: &mut Context<Self>,
+    ) {
         let work = cx.background_executor().spawn(async move { work() });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -205,6 +224,9 @@ impl Monos {
                 match result {
                     Ok(()) => {
                         this.reload_files(&id, cx);
+                        if reload_habits {
+                            this.reload_today_habits(cx);
+                        }
                     }
                     Err(e) => this.error = Some(e),
                 }

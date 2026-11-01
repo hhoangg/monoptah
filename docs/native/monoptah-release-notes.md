@@ -1,21 +1,14 @@
-# Monoptah Native 0.39.0
+# Monoptah Native 0.40.0
 
 A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.38.1
+## Changes since 0.39.0
 
-- Background model: a new setting in Settings > Providers > Background tasks chooses the model that writes session titles, worktree branch names, commit messages and pull request text, on the desktop and for a paired phone's Git actions. Automatic keeps using each session's provider and its quick model.
-- Editor: Zig files get syntax highlighting and fold their struct, enum, union, error-set and switch blocks. ZON files are not supported.
-- Paired phones can answer an agent's pending questions, page back through the history of long conversations, and reopen the last project or Mono on launch.
-- Paired phones can browse Monos with search, filters and unread replies, see reply bubbles, reactions, suggested replies, document cards and the sessions a Mono launched, create Monos, and edit a Mono's name, mascot, color, model, projects, soul and memory. Saving a soul or memory file is refused if it changed on the desktop since it was opened.
-- Paired phones can reset or delete a Mono. They do what the desktop does: a reset stops the reply, deletes the old conversation and starts a fresh one. A phone has no checkbox for it, so a reset also deletes the provider's session files on this computer whenever that provider supports it, as the desktop's dialog does by default. Those files can't be recovered. A delete also stops the Mono's workflows.
-- Monoptah does not build or publish a phone app. These changes are what the desktop does for a phone that is paired with it.
-
-### Privacy: phone notifications go through Expo
-
-Paired phones get push notifications while the desktop is running and the phone app is closed. They are sent from your computer through Expo's push service (`exp.host`), a third party. Each notification carries the content needed to show it: the session title, the project name, and an excerpt of the reply, or for a Mono its name and an excerpt of its message.
-
-Nothing is sent unless a phone has registered for notifications. The desktop has no setting that turns push notifications off on their own: the kinds of notification are chosen on the phone. Removing the phone on the desktop stops them, and so does turning off phone access.
+- Today: a new page above Inbox that keeps a daily ledger of your work across all projects. It shows what is new, what carried over and what needs a check, keeps past days as they were, and rolls over to a new work day at 04:00 (Settings > General).
+- Ask a Mono to set up a source, for example your GitHub review requests or your ClickUp tasks. It fetches once and shows you the list, then saves a habit that keeps Today up to date. Monoptah has no fetching of its own for this: the Mono uses gh, MCP or anything else, and rules live in the habit.
+- A failed sync changes nothing and shows a warning, so it never looks like an empty list. A task leaves only when its source confirms it or you act on it.
+- Tasks have a detail panel with Open link, Start session, Snooze and Dismiss, and a timeline of notes that stay on this machine.
+- Habits do not catch up when the app was closed more than 2 hours past their time. Today then shows Not synced today, and Sync now runs them.
 
 ## What it is
 

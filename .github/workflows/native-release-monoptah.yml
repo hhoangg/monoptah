@@ -112,11 +112,13 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
+      # A tag cannot read another tag's cache, only main's, so the release-cache
+      # job in native.yml seeds this and a tag run never saves one.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/monocode-gpui
-          key: native-monoptah-release-${{ env.TARGET }}
-          cache-on-failure: true
+          shared-key: native-monoptah-release
+          save-if: false
 
       - run: npm ci
 
