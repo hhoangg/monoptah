@@ -4049,6 +4049,590 @@ mod reset_flow {
         assert!(!busy);
         assert!(pending.is_empty() && posted, "{pending:?} posted={posted}");
     }
+
+    // --- a paired phone's reset goes through the same flow ---------------------------------
+
+    type Answer = Arc<Mutex<Option<Result<Value, String>>>>;
+
+    /// Starts a phone reset of the Mono; the answer lands in the returned slot once it is done.
+    fn phone_reset(s: &Setup, cx: &mut TestAppContext) -> Answer {
+        let answer: Answer = Default::default();
+        let slot = answer.clone();
+        cx.update(|cx| {
+            let task = s.manager.update(cx, |m, cx| m.mobile_reset(&s.id, cx));
+            cx.spawn(async move |_| *slot.lock().unwrap() = Some(task.await))
+                .detach();
+        });
+        answer
+    }
+    fn answer_of(answer: &Answer) -> Option<Result<Value, String>> {
+        answer.lock().unwrap().clone()
+    }
+    fn resetting(s: &Setup, cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| s.manager.read(cx).resetting(&s.id))
+    }
+    fn queued(id: &str) -> mono::Message {
+        mono::Message {
+            id: id.into(),
+            text: id.into(),
+            sent_at: None,
+            internal: false,
+            // Never sent, so no provider process is started by this test.
+            error: Some("not sent".into()),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[gpui::test]
+    fn a_phone_reset_deletes_the_row_and_cleans_the_files_like_the_ticked_box(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[("claude", B), ("codex", C)]);
+        let calls = recorder(&s, Vec::new(), cx);
+        let answer = phone_reset(&s, cx);
+        assert!(resetting(&s, cx), "the reset holds reports from the start");
+        cx.run_until_parked();
+
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        assert!(!resetting(&s, cx));
+        assert!(!old_exists(&s), "the old row is deleted");
+        let fresh = session_of(&s, cx).expect("a fresh conversation");
+        assert!(rows(&s).contains(&fresh));
+        let hidden = cx.update(|cx| s.manager.read(cx).roster.hidden_sessions.clone());
+        assert_eq!(hidden.iter().filter(|&&id| id == fresh).count(), 1);
+        let mut calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let (mut requests, gone) = calls.remove(0);
+        requests.sort_by_key(|(kind, _)| kind.id());
+        assert_eq!(
+            requests,
+            vec![
+                (Kind::Claude, vec![A.to_string(), B.to_string()]),
+                (Kind::Codex, vec![C.to_string()]),
+            ]
+        );
+        assert!(gone, "the cleanup runs after the row is gone");
+        assert_eq!(cx.update(|cx| s.manager.read(cx).error.clone()), None);
+    }
+
+    #[gpui::test]
+    fn a_phone_reset_keeps_the_files_of_a_provider_that_cannot_delete_them(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "cursor", Some(A), &[]);
+        let calls = recorder(&s, Vec::new(), cx);
+        let answer = phone_reset(&s, cx);
+        cx.run_until_parked();
+
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        assert!(!old_exists(&s));
+        assert!(session_of(&s, cx).is_some());
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(cx.update(|cx| s.manager.read(cx).error.clone()), None);
+    }
+
+    #[gpui::test]
+    fn a_phone_reset_reports_cleanup_problems_without_undoing_the_reset(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, vec!["one".into()], cx);
+        let answer = phone_reset(&s, cx);
+        cx.run_until_parked();
+
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        assert!(!old_exists(&s));
+        assert_eq!(
+            cx.update(|cx| s.manager.read(cx).error.clone()).as_deref(),
+            Some(provider_files::problem_message("Claude Code", 1).as_str())
+        );
+    }
+
+    #[gpui::test]
+    fn a_phone_reset_keeps_undelivered_messages_and_drops_delivered_ones(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        cx.update(|cx| {
+            s.manager.update(cx, |m, cx| {
+                let mono = m.roster.get_mut(&s.id).unwrap();
+                mono.outbox.push(queued("taken"));
+                mono.outbox.push(queued("waiting"));
+                m.chats[&s.id].update(cx, |chat, _| chat.mark_mono_delivered("taken"));
+            })
+        });
+        let answer = phone_reset(&s, cx);
+        cx.run_until_parked();
+
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        let outbox: Vec<String> = cx.update(|cx| {
+            let mono = s.manager.read(cx).roster.get(&s.id).unwrap().clone();
+            mono.outbox.iter().map(|m| m.id.clone()).collect()
+        });
+        assert_eq!(outbox, vec!["waiting".to_string()]);
+    }
+
+    #[gpui::test]
+    fn a_phone_reset_without_a_saved_conversation_starts_a_fresh_one(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        let calls = recorder(&s, Vec::new(), cx);
+        cx.update(|cx| {
+            s.manager.update(cx, |m, _| {
+                let mono = m.roster.get_mut(&s.id).unwrap();
+                mono.session_id = None;
+                mono.unavailable_session = Some("missing".into());
+            })
+        });
+        let answer = phone_reset(&s, cx);
+        cx.run_until_parked();
+
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        let unavailable = cx.update(|cx| {
+            s.manager
+                .read(cx)
+                .roster
+                .get(&s.id)
+                .unwrap()
+                .unavailable_session
+                .clone()
+        });
+        assert_eq!(unavailable, None);
+        assert!(session_of(&s, cx).is_some());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn a_phone_reset_of_an_unknown_mono_is_refused(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        let task = cx.update(|cx| s.manager.update(cx, |m, cx| m.mobile_reset("nobody", cx)));
+        let answer: Answer = Default::default();
+        let slot = answer.clone();
+        cx.update(|cx| {
+            cx.spawn(async move |_| *slot.lock().unwrap() = Some(task.await))
+                .detach()
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            answer_of(&answer),
+            Some(Err("Mono is no longer available".to_string()))
+        );
+    }
+
+    #[gpui::test]
+    fn a_phone_reset_whose_reply_will_not_stop_keeps_the_conversation(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        let calls = recorder(&s, Vec::new(), cx);
+        cx.update(|cx| {
+            let chat = s.manager.read(cx).chats[&s.id].clone();
+            chat.update(cx, |chat, cx| {
+                chat.busy = true;
+                chat.mono_stop(cx);
+            });
+        });
+        let answer = phone_reset(&s, cx);
+        cx.run_until_parked();
+        assert!(
+            old_exists(&s),
+            "nothing is deleted while the reply may still write"
+        );
+        assert_eq!(answer_of(&answer), None, "the phone is still waiting");
+        assert!(resetting(&s, cx));
+        cx.executor().advance_clock(Duration::from_secs(11));
+        cx.run_until_parked();
+
+        assert_eq!(
+            answer_of(&answer),
+            Some(Err(
+                "Could not reset the conversation. The reply did not stop in time. Try again."
+                    .to_string()
+            ))
+        );
+        assert!(old_exists(&s));
+        assert_eq!(session_of(&s, cx), Some(s.session));
+        assert!(!resetting(&s, cx), "the Mono can be reset again");
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn a_report_held_back_by_a_failed_phone_reset_is_delivered_to_the_kept_conversation(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        // The row cannot be deleted, while the store keeps working for the report.
+        let path = locked(&s.store).unwrap().database_path().to_path_buf();
+        let blocked = std::process::Command::new("sqlite3")
+            .arg(&path)
+            .arg("CREATE TRIGGER keep_rows BEFORE DELETE ON native_sessions BEGIN SELECT RAISE(ABORT, 'kept'); END;")
+            .status();
+        if !blocked.is_ok_and(|status| status.success()) {
+            eprintln!("skipped: the sqlite3 command is not available");
+            return;
+        }
+        let slot: Answer = Default::default();
+        let out = slot.clone();
+        cx.update(|cx| {
+            s.manager.update(cx, |m, cx| {
+                m.roster
+                    .get_mut(&s.id)
+                    .unwrap()
+                    .pending_reports
+                    .push("Habit finished.".into());
+                let task = m.mobile_reset(&s.id, cx);
+                cx.spawn(async move |_, _| *out.lock().unwrap() = Some(task.await))
+                    .detach();
+                m.dispatch(&s.id, cx);
+                assert_eq!(m.roster.get(&s.id).unwrap().pending_reports.len(), 1);
+            })
+        });
+        cx.run_until_parked();
+
+        assert!(
+            answer_of(&slot)
+                .unwrap()
+                .unwrap_err()
+                .starts_with("Could not reset the conversation. ")
+        );
+        assert_eq!(session_of(&s, cx), Some(s.session));
+        assert!(!resetting(&s, cx));
+        let (pending, posted) = cx.update(|cx| {
+            let m = s.manager.read(cx);
+            let rows = m.chats[&s.id]
+                .read(cx)
+                .transcript
+                .read(cx)
+                .source_rows()
+                .to_vec();
+            (
+                m.roster.get(&s.id).unwrap().pending_reports.clone(),
+                rows.iter().any(|r| r.text == "Habit finished."),
+            )
+        });
+        assert!(pending.is_empty() && posted, "{pending:?} posted={posted}");
+    }
+
+    #[gpui::test]
+    fn queued_messages_and_reports_wait_during_a_phone_reset(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        cx.update(|cx| {
+            s.manager.update(cx, |m, cx| {
+                // Held with an error so that no provider process is ever started by
+                // this test: sending to the fresh chat would launch a real one.
+                let mono = m.roster.get_mut(&s.id).unwrap();
+                mono.outbox.push(queued("queued"));
+                mono.pending_reports.push("Habit finished.".into());
+                m.mobile_reset(&s.id, cx).detach();
+                m.dispatch(&s.id, cx);
+                assert!(m.inflight.is_empty());
+                let mono = m.roster.get(&s.id).unwrap();
+                assert_eq!(mono.pending_reports, vec!["Habit finished.".to_string()]);
+                assert_eq!(mono.outbox.len(), 1);
+            })
+        });
+        cx.run_until_parked();
+
+        assert!(!old_exists(&s));
+        cx.update(|cx| {
+            let m = s.manager.read(cx);
+            assert_eq!(m.roster.get(&s.id).unwrap().outbox.len(), 1);
+            let rows = m.chats[&s.id]
+                .read(cx)
+                .transcript
+                .read(cx)
+                .source_rows()
+                .to_vec();
+            let pending = m.roster.get(&s.id).unwrap().pending_reports.clone();
+            assert!(
+                pending.is_empty() && rows.iter().any(|r| r.text == "Habit finished."),
+                "the report reached the fresh conversation: {pending:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_chat_is_not_opened_while_a_reset_deletes_its_conversation(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        cx.update(|cx| {
+            s.manager.update(cx, |m, cx| {
+                m.chats.remove(&s.id);
+                m.mobile_reset(&s.id, cx).detach();
+                m.ensure_chat(&s.id, cx);
+                assert!(m.loading_chats.is_empty(), "opening waits for the reset");
+            })
+        });
+        cx.run_until_parked();
+        assert!(!old_exists(&s));
+        let opened = cx.update(|cx| s.manager.read(cx).chats.contains_key(&s.id));
+        assert!(opened, "the reset opens the fresh chat itself");
+    }
+
+    #[gpui::test]
+    fn a_failed_phone_reset_opens_the_kept_chat_when_it_was_closed(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        // The row cannot be deleted, while the store keeps working.
+        let path = locked(&s.store).unwrap().database_path().to_path_buf();
+        let blocked = std::process::Command::new("sqlite3")
+            .arg(&path)
+            .arg("CREATE TRIGGER keep_rows BEFORE DELETE ON native_sessions BEGIN SELECT RAISE(ABORT, 'kept'); END;")
+            .status();
+        if !blocked.is_ok_and(|status| status.success()) {
+            eprintln!("skipped: the sqlite3 command is not available");
+            return;
+        }
+        let slot: Answer = Default::default();
+        let out = slot.clone();
+        cx.update(|cx| {
+            s.manager.update(cx, |m, cx| {
+                m.chats.remove(&s.id);
+                let task = m.mobile_reset(&s.id, cx);
+                cx.spawn(async move |_, _| *out.lock().unwrap() = Some(task.await))
+                    .detach();
+            })
+        });
+        cx.run_until_parked();
+
+        assert!(answer_of(&slot).unwrap().is_err());
+        assert!(old_exists(&s));
+        assert_eq!(session_of(&s, cx), Some(s.session));
+        let opened = cx.update(|cx| s.manager.read(cx).chats.contains_key(&s.id));
+        assert!(opened, "the kept conversation can be used again");
+    }
+
+    #[gpui::test]
+    fn a_message_the_store_records_as_taken_is_not_sent_again_after_a_reset(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        cx.update(|cx| {
+            s.manager.update(cx, |m, _| {
+                // The chat is closed, so only the store knows it took "taken".
+                m.chats.remove(&s.id);
+                let mono = m.roster.get_mut(&s.id).unwrap();
+                mono.outbox.push(queued("taken"));
+                mono.outbox.push(queued("waiting"));
+            })
+        });
+        locked(&s.store)
+            .unwrap()
+            .save_setting(&format!("mono-delivered:{}:taken", s.session), "1")
+            .unwrap();
+        let answer = phone_reset(&s, cx);
+        cx.run_until_parked();
+
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        let outbox: Vec<String> = cx.update(|cx| {
+            let mono = s.manager.read(cx).roster.get(&s.id).unwrap().clone();
+            mono.outbox.iter().map(|m| m.id.clone()).collect()
+        });
+        assert_eq!(outbox, vec!["waiting".to_string()]);
+    }
+
+    #[gpui::test]
+    fn a_phone_reset_announces_the_fresh_chat_so_watches_can_follow_it(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        let opened = Arc::new(Mutex::new(Vec::<()>::new()));
+        let log = opened.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&s.manager, move |_, _: &ChatOpened, _| {
+                log.lock().unwrap().push(())
+            })
+        });
+        let answer = phone_reset(&s, cx);
+        cx.run_until_parked();
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        assert_eq!(*opened.lock().unwrap(), vec![()]);
+    }
+
+    #[gpui::test]
+    fn a_phone_delete_closes_an_idle_dialog_for_that_mono(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        assert!(dialog(&s, cx, |_| ()).is_some());
+        let deleted = cx.update(|cx| s.manager.update(cx, |m, cx| m.mobile_delete(&s.id, cx)));
+        assert_eq!(deleted, Ok(Value::Null));
+        assert!(
+            dialog(&s, cx, |_| ()).is_none(),
+            "no dialog for a Mono that is gone"
+        );
+    }
+
+    #[gpui::test]
+    fn a_dialog_does_not_open_for_a_mono_deleted_while_its_files_were_read(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        let handle: gpui::AnyWindowHandle = s.window.into();
+        handle
+            .update(cx, |_, w, cx| {
+                s.manager.update(cx, |m, cx| {
+                    m.request_reset(&s.id, w, cx);
+                    m.remove_mono(&s.id, cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(dialog(&s, cx, |_| ()).is_none());
+    }
+
+    #[gpui::test]
+    fn a_dialog_does_not_open_when_a_phone_reset_began_while_its_files_were_read(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        // A turn that never reports back keeps the reset waiting to stop it.
+        cx.update(|cx| {
+            let chat = s.manager.read(cx).chats[&s.id].clone();
+            chat.update(cx, |chat, cx| {
+                chat.busy = true;
+                chat.mono_stop(cx);
+            });
+        });
+        let handle: gpui::AnyWindowHandle = s.window.into();
+        handle
+            .update(cx, |_, w, cx| {
+                s.manager.update(cx, |m, cx| {
+                    m.request_reset(&s.id, w, cx);
+                    // The phone's reset starts before the read lands.
+                    m.mobile_reset(&s.id, cx).detach();
+                })
+            })
+            .unwrap();
+        // The read lands while the reset is still waiting for the turn to stop.
+        cx.run_until_parked();
+        assert!(resetting(&s, cx));
+        assert!(dialog(&s, cx, |_| ()).is_none());
+    }
+
+    #[gpui::test]
+    fn a_second_phone_reset_is_refused_and_delete_waits_for_the_first(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        let first = phone_reset(&s, cx);
+        let second = phone_reset(&s, cx);
+        let delete = cx.update(|cx| s.manager.update(cx, |m, cx| m.mobile_delete(&s.id, cx)));
+        assert!(delete.is_err(), "a Mono being reset is not deleted");
+        cx.run_until_parked();
+
+        assert_eq!(answer_of(&first), Some(Ok(Value::Null)));
+        assert_eq!(
+            answer_of(&second),
+            Some(Err("This Mono is already being reset".to_string()))
+        );
+        assert!(cx.update(|cx| s.manager.read(cx).roster.get(&s.id).is_some()));
+        assert!(!old_exists(&s));
+        // Once it is over, the Mono can be deleted.
+        let delete = cx.update(|cx| s.manager.update(cx, |m, cx| m.mobile_delete(&s.id, cx)));
+        assert_eq!(delete, Ok(Value::Null));
+    }
+
+    #[gpui::test]
+    fn a_phone_reset_closes_an_idle_dialog_for_that_mono_and_refuses_while_one_is_busy(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        let calls = recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        assert!(dialog(&s, cx, |_| ()).is_some());
+        let answer = phone_reset(&s, cx);
+        assert!(
+            dialog(&s, cx, |_| ()).is_none(),
+            "its file choice would be stale"
+        );
+        // Asking again while the phone's reset runs does not open another.
+        ask(&s, cx);
+        assert!(dialog(&s, cx, |_| ()).is_none());
+        cx.run_until_parked();
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        assert!(!old_exists(&s));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        // A dialog that is already resetting is left alone.
+        ask(&s, cx);
+        let handle: gpui::AnyWindowHandle = s.window.into();
+        handle
+            .update(cx, |_, w, cx| {
+                s.manager.update(cx, |m, cx| m.confirm_reset(w, cx))
+            })
+            .unwrap();
+        let answer = phone_reset(&s, cx);
+        cx.run_until_parked();
+        assert_eq!(
+            answer_of(&answer),
+            Some(Err("This Mono is already being reset".to_string()))
+        );
+        assert!(
+            dialog(&s, cx, |_| ()).is_none(),
+            "the desktop reset finished on its own"
+        );
+    }
+
+    #[gpui::test]
+    fn a_phone_reset_leaves_a_dialog_for_another_mono_alone(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        cx.update(|cx| {
+            s.manager.update(cx, |m, _| {
+                let mut other = m.roster.get(&s.id).unwrap().clone();
+                other.id = "other-mono".into();
+                other.session_id = None;
+                m.roster.monos.push(other);
+            })
+        });
+        let handle: gpui::AnyWindowHandle = s.window.into();
+        handle
+            .update(cx, |_, w, cx| {
+                s.manager
+                    .update(cx, |m, cx| m.request_reset("other-mono", w, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let answer = phone_reset(&s, cx);
+        cx.run_until_parked();
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        assert_eq!(
+            dialog(&s, cx, |d| d.mono.clone()).as_deref(),
+            Some("other-mono")
+        );
+    }
+
+    #[gpui::test]
+    fn a_mono_deleted_during_a_phone_reset_is_not_brought_back(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        let answer = phone_reset(&s, cx);
+        cx.update(|cx| s.manager.update(cx, |m, cx| m.remove_mono(&s.id, cx)));
+        cx.run_until_parked();
+
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        cx.update(|cx| {
+            let m = s.manager.read(cx);
+            assert!(m.roster.get(&s.id).is_none());
+            assert!(!m.chats.contains_key(&s.id));
+            assert!(m.phone_resets.is_empty());
+        });
+    }
 }
 
 fn workflow_input(name: &str) -> Value {

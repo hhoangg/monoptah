@@ -1257,6 +1257,11 @@ impl Shell {
                 cx.notify();
             }),
         );
+        this.observations.push(
+            cx.subscribe(&monos, |this, _, _: &crate::monos::ChatOpened, cx| {
+                this.push_mobile_watches(cx)
+            }),
+        );
         this.observations.push(cx.subscribe(
             &monos,
             |this, _, opened: &crate::monos::TabOpened, cx| {

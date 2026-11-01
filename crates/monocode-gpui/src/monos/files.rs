@@ -227,20 +227,35 @@ impl Monos {
                 return;
             }
             let _ = this.update(cx, |this, cx| {
-                if let Some(view) = this.chats.remove(&id) {
-                    view.update(cx, |v, cx| v.mono_stop(cx));
+                // A reset in flight would recreate this Mono's chat after the
+                // delete; the user can delete once it has finished.
+                if this.resetting(&id) {
+                    this.error = Some("This Mono is being reset. Try again in a moment.".into());
+                    this.changed(cx);
+                    return;
                 }
-                for run in this.running.values().filter(|r| r.mono == id) {
-                    run.view.update(cx, |v, cx| v.mono_stop(cx));
-                }
-                this.stop_workflows_of(&id, cx);
-                this.roster.monos.retain(|m| m.id != id);
-                if this.active.as_ref() == Some(&id) {
-                    this.active = None;
-                }
-                this.save(cx);
+                this.remove_mono(&id, cx)
             });
         })
         .detach();
+    }
+    /// Takes the Mono off the roster, once confirmed here or on the phone.
+    pub(super) fn remove_mono(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(view) = self.chats.remove(id) {
+            view.update(cx, |v, cx| v.mono_stop(cx));
+        }
+        for run in self.running.values().filter(|r| r.mono == id) {
+            run.view.update(cx, |v, cx| v.mono_stop(cx));
+        }
+        self.stop_workflows_of(id, cx);
+        // A reset dialog for it would be asking about a Mono that is gone.
+        if self.reset.as_ref().is_some_and(|d| d.mono == id && !d.busy) {
+            self.reset = None;
+        }
+        self.roster.monos.retain(|m| m.id != id);
+        if self.active.as_deref() == Some(id) {
+            self.active = None;
+        }
+        self.save(cx);
     }
 }

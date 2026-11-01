@@ -473,6 +473,32 @@ fn deleting_a_mono_stops_its_workflow_runs(cx: &mut TestAppContext) {
     assert_eq!(runs(&s, A)[0].status, RunStatus::Stopped);
 }
 
+#[gpui::test]
+fn deleting_a_mono_from_the_phone_stops_its_workflow_runs_too(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    put(&s, vec![waiting(A, json!({"runRequested": true}))]);
+    look(&s, cx);
+    assert!(running(&s, A, cx));
+    assert_eq!(
+        cx.update(|cx| s.manager.read(cx).workflow_live.asks.len()),
+        1
+    );
+    let deleted = cx.update(|cx| s.manager.update(cx, |m, cx| m.mobile_delete(&s.id, cx)));
+    assert_eq!(deleted, Ok(Value::Null));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let monos = s.manager.read(cx);
+        assert!(monos.roster.get(&s.id).is_none());
+        assert!(!monos.workflows.is_running(A));
+        assert!(!monos.workflow_signals.is_running(A));
+        assert!(
+            monos.workflow_live.asks.is_empty(),
+            "its question ended too"
+        );
+    });
+    assert_eq!(runs(&s, A)[0].status, RunStatus::Stopped);
+}
+
 #[test]
 fn a_look_over_missing_monos_is_empty_and_counts_as_swept() {
     let root = std::env::temp_dir().join(format!("wf-look-{}", mono::new_id()));
