@@ -15,7 +15,6 @@ type Placement = Option<(i64, Edge)>;
 enum Effect {
     None,
     Start(Box<(Session, Settings, bool, bool, Placement)>),
-    Groups(String, monocode_core::session_groups::Groups),
     /// The sessions an archive covered, those the store saved, and why it stopped.
     Archive(Vec<i64>, Vec<i64>, Option<String>),
 }
@@ -109,9 +108,6 @@ impl Shell {
                                 view.update(cx, |v, cx| v.install_app_launch(settings, !draft, cx));
                             }
                             this.app_place_launch(id, placement, reveal, window, cx);
-                        }
-                        Effect::Groups(project, groups) => {
-                            this.groups.insert(project, groups);
                         }
                         Effect::Archive(family, written, error) => {
                             this.finish_archive(
@@ -634,7 +630,32 @@ impl Shell {
                                 } else {
                                     groups.add_to_folder(&folder, id);
                                     let name = groups.folder(&folder).unwrap().name.clone();
-                                    self.app_background(call,move|store|{locked(&store)?.save_groups(&project,&groups)?;Ok((json!({"sessionId":id,"folderId":folder,"folderName":name}),Effect::Groups(project,groups)))},cx);
+                                    // Apply now, on this thread, and save through the shared
+                                    // queue: a delete finishing while the save runs would
+                                    // otherwise be overwritten by this snapshot.
+                                    self.groups.insert(project.clone(), groups.clone());
+                                    self.invalidate_chrome(cx);
+                                    cx.notify();
+                                    let saved = self.store_write_reporting(
+                                        "save folders",
+                                        cx,
+                                        move |store| store.save_groups(&project, &groups),
+                                    );
+                                    let value =
+                                        json!({"sessionId":id,"folderId":folder,"folderName":name});
+                                    cx.spawn(async move |this, cx| {
+                                        let result = saved
+                                            .recv()
+                                            .await
+                                            .unwrap_or_else(|_| {
+                                                Err("Could not confirm the folder save".into())
+                                            })
+                                            .map(|()| value);
+                                        let _ = this.update(cx, |this, cx| {
+                                            this.finish_app_call(call, result, cx)
+                                        });
+                                    })
+                                    .detach();
                                     return;
                                 }
                             }

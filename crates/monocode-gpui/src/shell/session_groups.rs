@@ -1,6 +1,8 @@
 //! Sidebar.tsx's session actions: pins, renames, GitHub links, reminders,
 //! folders and deletion, and the grouped list they shape.
-use super::project_removal::{DeleteOptions, provider_cleanup_request, remove_unused_worktree};
+use super::project_removal::{
+    DeleteOptions, FilesOutcome, provider_cleanup_request, remove_unused_worktree,
+};
 use super::*;
 use chrono::{Local, NaiveDateTime, TimeZone};
 use gpui::EventEmitter;
@@ -343,6 +345,17 @@ impl Shell {
         cx: &mut Context<Self>,
         write: impl FnOnce(&mut monocode_core::store::Store) -> Result<(), String> + Send + 'static,
     ) {
+        let _ = self.store_write_reporting(what, cx, write);
+    }
+    /// Like [`Shell::store_write`], and also sends the write's result on the
+    /// returned channel once it has run. A failure still sets `error`.
+    pub(crate) fn store_write_reporting(
+        &mut self,
+        what: &'static str,
+        cx: &mut Context<Self>,
+        write: impl FnOnce(&mut monocode_core::store::Store) -> Result<(), String> + Send + 'static,
+    ) -> async_channel::Receiver<Result<(), String>> {
+        let (done, outcome) = async_channel::bounded(1);
         let store = self.store.clone();
         let previous = self.group_writes.take();
         self.group_writes = Some(cx.spawn(async move |this, cx| {
@@ -352,13 +365,16 @@ impl Shell {
             let work = cx
                 .background_executor()
                 .spawn(async move { write(&mut *locked(&store)?) });
-            if let Err(error) = work.await {
+            let result = work.await;
+            if let Err(error) = &result {
                 let _ = this.update(cx, |this, cx| {
                     this.error = Some(format!("Could not {what}: {error}"));
                     cx.notify();
                 });
             }
+            let _ = done.try_send(result);
         }));
+        outcome
     }
 
     /// The project's sidebar entries, reminders first.
@@ -788,10 +804,17 @@ impl Shell {
     pub(super) fn delete_session_with(
         &mut self,
         id: i64,
-        options: DeleteOptions,
+        mut options: DeleteOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let report = options.report.take();
+        let refuse = |report: &Option<async_channel::Sender<Result<FilesOutcome, String>>>,
+                      message: &str| {
+            if let Some(report) = report {
+                let _ = report.try_send(Err(message.to_string()));
+            }
+        };
         if self.workspace.review_owners.iter().any(|(pane, owner)| {
             *owner == id
                 && (self.workspace.tab_of(*pane).is_some()
@@ -800,11 +823,14 @@ impl Shell {
                         .get(pane)
                         .is_some_and(|r| r.read(cx).unsaved_files(cx)))
         }) {
-            self.error = Some("Close this session's detached file panes before deleting it".into());
+            let message = "Close this session's detached file panes before deleting it";
+            refuse(&report, message);
+            self.error = Some(message.into());
             cx.notify();
             return;
         }
         if !self.session_summaries.contains_key(&id) || !self.deleting.insert(id) {
+            refuse(&report, "Session is not available to delete");
             return;
         }
         self.close_preview(cx);
@@ -816,7 +842,9 @@ impl Shell {
         }
         if self.workspace.tab_of(id).is_some() {
             self.deleting.remove(&id);
-            self.error = Some("Could not delete a session that is still open".into());
+            let message = "Could not delete a session that is still open";
+            refuse(&report, message);
+            self.error = Some(message.into());
             cx.notify();
             return;
         }
@@ -854,11 +882,22 @@ impl Shell {
                         // removal run apart from the group writes: they can be
                         // slow and nothing queued behind them depends on them.
                         if request.is_some() || options.worktree.is_some() {
-                            this.finish_delete(store, request, data_dir, options.worktree, cx);
+                            this.finish_delete(
+                                store,
+                                request,
+                                data_dir,
+                                options.worktree,
+                                report,
+                                cx,
+                            );
+                        } else if let Some(report) = report {
+                            let _ = report.try_send(Ok(FilesOutcome::Nothing));
                         }
                     }
                     Err(error) => {
-                        this.error = Some(format!("Could not delete the session: {error}"))
+                        let message = format!("Could not delete the session: {error}");
+                        refuse(&report, &message);
+                        this.error = Some(message);
                     }
                 }
                 this.invalidate_chrome(cx);
@@ -875,14 +914,33 @@ impl Shell {
         request: Option<monocode_core::provider_cleanup::CleanupRequest>,
         data_dir: Option<std::path::PathBuf>,
         worktree: Option<String>,
+        report: Option<async_channel::Sender<Result<FilesOutcome, String>>>,
         cx: &mut Context<Self>,
     ) {
         let cleanup = self.provider_cleanup.clone();
         let work = cx.background_executor().spawn(async move {
+            let mut outcome = FilesOutcome::Nothing;
             if let Some(request) = request {
-                for problem in cleanup(data_dir.as_deref(), &request) {
+                let mut done = cleanup(data_dir.as_deref(), &request);
+                if done.kept > 0 {
+                    done.problems.push(format!(
+                        "{} Codex thread(s) kept because another conversation continues from them",
+                        done.kept
+                    ));
+                }
+                for problem in &done.problems {
                     eprintln!("Provider session cleanup: {problem}");
                 }
+                outcome = if !done.problems.is_empty() {
+                    FilesOutcome::Failed(done.problems)
+                } else if done.removed > 0 {
+                    FilesOutcome::Removed
+                } else {
+                    FilesOutcome::Nothing
+                };
+            }
+            if let Some(report) = report {
+                let _ = report.try_send(Ok(outcome));
             }
             worktree.map(|path| {
                 remove_unused_worktree(&store, &path)
@@ -958,9 +1016,27 @@ impl Shell {
             .filter(|(_, g)| g.folder_of(id).is_some())
             .map(|(p, _)| p.clone())
             .collect();
+        // A child with no folder of its own shows under its parent, inside the
+        // parent's folder. File it there first so the folder survives and the
+        // child stays where it was on screen.
+        let children: Vec<i64> = self
+            .started_by
+            .iter()
+            .filter(|&(child, parent)| {
+                *parent == id
+                    && self.session_summaries.contains_key(child)
+                    && !self.sidebar_hidden_sessions.contains(child)
+            })
+            .map(|(child, _)| *child)
+            .collect();
         for project in projects {
             let groups = self.groups.get_mut(&project).unwrap();
-            groups.remove_sessions(&[id]);
+            if let Some(folder) = groups.folder_of(id).map(|f| f.id.clone()) {
+                for &child in &children {
+                    groups.push_unfiled(&folder, child);
+                }
+            }
+            groups.remove_deleted_session(id);
             let groups = groups.clone();
             self.store_write("save folders", cx, move |s| {
                 s.save_groups(&project, &groups)

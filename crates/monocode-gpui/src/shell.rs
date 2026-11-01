@@ -28,6 +28,7 @@ mod orchestration;
 mod picker_preferences;
 mod project_rail;
 mod project_removal;
+pub(crate) use project_removal::FilesOutcome;
 mod project_settings;
 mod provider_prompt;
 mod quick_composer;
@@ -4577,6 +4578,9 @@ impl Shell {
     ) {
         let store = self.store.clone();
         let cwd = self.workspace.project.clone();
+        // The folder as it is now: a delete may remove it before the row exists,
+        // and the session must still end up in it.
+        let folder = folder.and_then(|id| self.groups.get(&cwd)?.folder(&id).cloned());
         let focus = self.worktree_focus.get(&cwd).cloned();
         // The project folder as a selected checkout is not a separate worktree.
         let copy = focus.clone().filter(|f| {
@@ -4652,7 +4656,7 @@ impl Shell {
                         this.add(summary, cx);
                         if let Some(folder) = &folder {
                             let groups = this.groups.entry(cwd.clone()).or_default();
-                            groups.add_to_folder(folder, id);
+                            groups.add_or_restore(folder, id);
                             let groups = groups.clone();
                             let project = cwd.clone();
                             this.store_write("save folders", cx, move |store| {

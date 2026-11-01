@@ -8,7 +8,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId",
         "sessions.send"=>"sessionId prompt project notifyOnComplete completionDelivery",
         "sessions.draft"=>"sessionId prompt project",
-        "sessions.stop"|"sessions.archive"|"sessions.delete"=>"sessionId project",
+        "sessions.stop"|"sessions.archive"=>"sessionId project",
+        "sessions.delete"=>"sessionId project providerFiles",
         "worktrees.create"=>"branch base existing project",
         "folders.move"=>"sessionId folderId newFolderName project",
         "notes.list"=>"limit offset","notes.read"=>"id","notes.write"=>"id title body tags",
@@ -56,7 +57,15 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
                 ));
             }
         }
-        if ["draft", "reveal", "notifyOnComplete", "existing", "enabled"].contains(&key.as_str())
+        if [
+            "draft",
+            "reveal",
+            "notifyOnComplete",
+            "existing",
+            "enabled",
+            "providerFiles",
+        ]
+        .contains(&key.as_str())
             && !value.is_boolean()
         {
             return Err(format!("{key} must be true or false"));
@@ -81,6 +90,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "notifyOnComplete",
             "existing",
             "enabled",
+            "providerFiles",
             "before",
             "limit",
             "offset",
@@ -168,6 +178,25 @@ mod tests {
             &json!({"prompt":"x","project":"/code","draft":true})
         )
         .is_ok());
+    }
+    #[test]
+    fn provider_files_is_a_boolean_on_delete_only() {
+        let delete = |input| validate("sessions.delete", &input);
+        assert!(delete(json!({"sessionId":1,"providerFiles":true})).is_ok());
+        assert!(delete(json!({"sessionId":1,"providerFiles":false})).is_ok());
+        for bad in [json!("true"), json!(1), json!(null)] {
+            assert_eq!(
+                delete(json!({"sessionId":1,"providerFiles":bad})).unwrap_err(),
+                "providerFiles must be true or false"
+            );
+        }
+        for action in ["sessions.stop", "sessions.archive"] {
+            assert_eq!(
+                validate(action, &json!({"sessionId":1,"providerFiles":true})).unwrap_err(),
+                format!("{action} does not take providerFiles")
+            );
+        }
+        assert!(delete(json!({"sessionId":1,"force":true})).is_err());
     }
     #[test]
     fn today_actions_take_their_own_fields_and_non_text_values() {

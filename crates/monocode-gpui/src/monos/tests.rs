@@ -5020,3 +5020,462 @@ fn habits_and_documents_search_like_sessions(cx: &mut TestAppContext) {
     assert!(visual.debug_bounds("mono-document-plan").is_none());
     assert!(visual.debug_bounds("mono-document-summary").is_some());
 }
+
+const FILES_CODEX_ID: &str = "00000000-0000-4000-8000-0000000000c1";
+const REFUSED: &str = "Only other regular project sessions can be managed here";
+
+/// Every request the cleanup seam received, and whether the row was still stored then.
+type CleanupSeen = Arc<Mutex<Vec<(Vec<String>, bool)>>>;
+
+/// A regular project session the shell knows, as if the user had made it.
+fn regular_session(
+    s: &Setup,
+    provider: &str,
+    provider_id: Option<&str>,
+    cx: &mut TestAppContext,
+) -> i64 {
+    let session = {
+        let db = locked(&s.store).unwrap();
+        let mut session = db.create(provider, &s.project).unwrap();
+        if let Some(provider_id) = provider_id {
+            db.provider_id(session.id, provider_id).unwrap();
+            session.provider_id = Some(provider_id.into());
+        }
+        session
+    };
+    let id = session.id;
+    s.window
+        .update(cx, |shell, _, _| shell.mono_test_adopt(session))
+        .unwrap();
+    id
+}
+
+/// Replaces the shell's cleanup with a fake that records its requests.
+fn fake_cleanup(
+    s: &Setup,
+    report: monocode_core::provider_cleanup::CleanupReport,
+    cx: &mut TestAppContext,
+) -> CleanupSeen {
+    let seen = CleanupSeen::default();
+    let (store, record) = (s.store.clone(), seen.clone());
+    s.window
+        .update(cx, |shell, _, _| {
+            shell.mono_set_provider_cleanup(move |_, request| {
+                let ids = request.ids().to_vec();
+                let stored = locked(&store)
+                    .unwrap()
+                    .sessions()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.provider_id.as_deref() == ids.first().map(String::as_str));
+                record.lock().unwrap().push((ids, stored));
+                report.clone()
+            });
+        })
+        .unwrap();
+    seen
+}
+
+fn stored(s: &Setup, id: i64) -> bool {
+    locked(&s.store)
+        .unwrap()
+        .sessions()
+        .unwrap()
+        .iter()
+        .any(|row| row.id == id)
+}
+
+fn shell_has(s: &Setup, id: i64, cx: &mut TestAppContext) -> bool {
+    s.window
+        .update(cx, |shell, _, _| shell.mono_test_has_session(id))
+        .unwrap()
+}
+
+fn delete(
+    s: &Setup,
+    caller: i64,
+    request: &str,
+    input: Value,
+    cx: &mut TestAppContext,
+) -> Result<Value, String> {
+    call_from(s, caller, request, "sessions.delete", input, cx)
+        .try_recv()
+        .unwrap()
+}
+
+#[gpui::test]
+fn delete_without_provider_files_keeps_them_and_accepts_at_once(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let seen = fake_cleanup(&s, Default::default(), cx);
+    for (request, extra) in [
+        ("plain", json!({})),
+        ("false", json!({"providerFiles":false})),
+    ] {
+        let id = regular_session(&s, "codex", Some(FILES_CODEX_ID), cx);
+        let mut input = json!({"sessionId":id});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert_eq!(
+            delete(&s, s.session, request, input, cx).unwrap(),
+            json!({"accepted":true})
+        );
+        assert!(!stored(&s, id) && !shell_has(&s, id, cx));
+    }
+    assert!(seen.lock().unwrap().is_empty(), "no cleanup was requested");
+}
+
+#[gpui::test]
+fn delete_with_provider_files_reports_what_the_cleanup_did(cx: &mut TestAppContext) {
+    use monocode_core::provider_cleanup::CleanupReport;
+    let s = setup(cx);
+    for (name, report, expected) in [
+        (
+            "removed",
+            CleanupReport {
+                removed: 3,
+                problems: vec![],
+                ..Default::default()
+            },
+            json!({"providerFiles":"removed"}),
+        ),
+        (
+            "none",
+            CleanupReport::default(),
+            json!({"providerFiles":"none"}),
+        ),
+        (
+            "failed",
+            CleanupReport {
+                removed: 1,
+                problems: vec!["a.jsonl: denied".into()],
+                ..Default::default()
+            },
+            json!({"providerFiles":"failed","problems":["a.jsonl: denied"]}),
+        ),
+    ] {
+        let seen = fake_cleanup(&s, report, cx);
+        let id = regular_session(&s, "codex", Some(FILES_CODEX_ID), cx);
+        let mut want = json!({"sessionId":id,"deleted":true});
+        want.as_object_mut()
+            .unwrap()
+            .extend(expected.as_object().unwrap().clone());
+        let result = delete(
+            &s,
+            s.session,
+            name,
+            json!({"sessionId":id,"providerFiles":true}),
+            cx,
+        );
+        assert_eq!(result.unwrap(), want, "{name}");
+        // The request came from the record, read before the row went.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(vec![FILES_CODEX_ID.to_string()], false)],
+            "{name}: one cleanup, and the row was gone by then"
+        );
+        assert!(!stored(&s, id) && !shell_has(&s, id, cx), "{name}: deleted");
+    }
+}
+
+#[gpui::test]
+fn provider_files_must_be_a_boolean_before_anything_changes(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let seen = fake_cleanup(&s, Default::default(), cx);
+    let id = regular_session(&s, "codex", Some(FILES_CODEX_ID), cx);
+    let error = delete(
+        &s,
+        s.session,
+        "bad",
+        json!({"sessionId":id,"providerFiles":"true"}),
+        cx,
+    )
+    .unwrap_err();
+    assert_eq!(error, "providerFiles must be true or false");
+    assert!(stored(&s, id) && shell_has(&s, id, cx));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn only_other_regular_sessions_can_be_deleted(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let seen = fake_cleanup(&s, Default::default(), cx);
+    let run = fake_run(&s, cx);
+    let handle: gpui::AnyWindowHandle = s.window.into();
+    handle
+        .update(cx, |_, w, cx| {
+            s.manager
+                .update(cx, |m, cx| m.create(vec![s.project.clone()], w, cx))
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let other_chat = cx.update(|cx| {
+        let m = s.manager.read(cx);
+        m.roster
+            .monos
+            .iter()
+            .find(|mono| mono.id != s.id)
+            .and_then(|mono| mono.session_id)
+            .expect("the second Mono has a chat")
+    });
+    let lead = regular_session(&s, "codex", Some(FILES_CODEX_ID), cx);
+    let worker = regular_session(&s, "codex", Some(FILES_CODEX_ID), cx);
+    s.window
+        .update(cx, |shell, _, _| shell.mono_test_make_worker(lead, worker))
+        .unwrap();
+    for (caller, target, label) in [
+        (s.session, s.session, "the caller itself"),
+        (s.session, other_chat, "another Mono's chat"),
+        (run, s.session, "a Mono chat, asked by a habit run"),
+        (run, run, "the caller, a habit run"),
+        (s.session, run, "a habit run target"),
+        (s.session, worker, "an orchestration worker"),
+    ] {
+        for (n, extra) in [json!({}), json!({"providerFiles":true})]
+            .into_iter()
+            .enumerate()
+        {
+            let mut input = json!({"sessionId":target});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let request = format!("{label}-{n}");
+            assert_eq!(
+                delete(&s, caller, &request, input, cx).unwrap_err(),
+                REFUSED,
+                "{label} {n}"
+            );
+            assert!(stored(&s, target), "{label} {n}: still stored");
+        }
+    }
+    assert!(seen.lock().unwrap().is_empty(), "nothing was removed");
+    assert!(shell_has(&s, worker, cx));
+}
+
+#[gpui::test]
+fn a_habit_run_can_delete_a_regular_session_with_its_files(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let seen = fake_cleanup(
+        &s,
+        monocode_core::provider_cleanup::CleanupReport {
+            removed: 2,
+            problems: vec![],
+            ..Default::default()
+        },
+        cx,
+    );
+    let run = fake_run(&s, cx);
+    let id = regular_session(&s, "codex", Some(FILES_CODEX_ID), cx);
+    let result = delete(
+        &s,
+        run,
+        "run",
+        json!({"sessionId":id,"providerFiles":true}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(result["providerFiles"], "removed");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(!stored(&s, id));
+}
+
+#[gpui::test]
+fn a_harness_without_cleanup_deletes_and_reports_none(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let seen = fake_cleanup(&s, Default::default(), cx);
+    let no_cleanup = regular_session(&s, "grok", Some(FILES_CODEX_ID), cx);
+    let no_id = regular_session(&s, "codex", None, cx);
+    for (id, name) in [(no_cleanup, "grok"), (no_id, "no id")] {
+        let result = delete(
+            &s,
+            s.session,
+            name,
+            json!({"sessionId":id,"providerFiles":true}),
+            cx,
+        );
+        assert_eq!(
+            result.unwrap(),
+            json!({"sessionId":id,"deleted":true,"providerFiles":"none"}),
+            "{name}"
+        );
+        assert!(!stored(&s, id), "{name}");
+    }
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn a_refused_delete_restores_the_launch_flag_and_removes_nothing(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let seen = fake_cleanup(&s, Default::default(), cx);
+    let started = start(
+        &s,
+        "start",
+        json!({"project":s.project,"prompt":"Review","draft":true}),
+        cx,
+    )
+    .unwrap();
+    let child = started["sessionId"].as_i64().unwrap();
+    s.window
+        .update(cx, |shell, _, _| shell.mono_test_pin_pane(child))
+        .unwrap();
+    let error = delete(
+        &s,
+        s.session,
+        "pane",
+        json!({"sessionId":child,"providerFiles":true}),
+        cx,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "Close this session's detached file panes before deleting it"
+    );
+    assert!(!dismissed(&s, child, cx), "the flag is back");
+    assert!(stored(&s, child) && shell_has(&s, child, cx));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn a_retry_with_the_same_request_id_does_not_clean_up_twice(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let seen = fake_cleanup(
+        &s,
+        monocode_core::provider_cleanup::CleanupReport {
+            removed: 1,
+            problems: vec![],
+            ..Default::default()
+        },
+        cx,
+    );
+    let id = regular_session(&s, "codex", Some(FILES_CODEX_ID), cx);
+    let input = json!({"sessionId":id,"providerFiles":true});
+    let first = delete(&s, s.session, "same", input.clone(), cx).unwrap();
+    let again = delete(&s, s.session, "same", input.clone(), cx).unwrap();
+    assert_eq!(first, again);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(
+        delete(&s, s.session, "new", input, cx).is_err(),
+        "gone for a new request"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[gpui::test]
+fn filing_into_a_folder_a_delete_removed_recreates_it_with_the_same_id_and_name(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let session = regular_session(&s, "codex", None, cx);
+    assert!(groups_of(&s, cx).folder("f1").is_none());
+    cx.update(|cx| {
+        s.manager.update(cx, |m, cx| {
+            m.file_launch(
+                &s.id,
+                &s.project,
+                session,
+                host::Folder::Existing {
+                    id: "f1".into(),
+                    name: "Ticket 1".into(),
+                },
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    let groups = groups_of(&s, cx);
+    let folder = groups.folder("f1").expect("the folder is back");
+    assert_eq!(folder.name, "Ticket 1");
+    assert_eq!(folder.session_ids, vec![session]);
+    assert_eq!(
+        locked(&s.store).unwrap().groups(&s.project).unwrap(),
+        groups
+    );
+}
+
+#[test]
+fn a_delete_whose_outcome_is_unknown_restores_the_dismissed_launches() {
+    let closed = host::delete_reply(7, Err(async_channel::RecvError));
+    assert!(closed.0.unwrap_err().contains("unknown"));
+    assert!(closed.1, "a closed channel restores the flags");
+    let refused = host::delete_reply(7, Ok(Err("no".into())));
+    assert_eq!((refused.0, refused.1), (Err("no".into()), true));
+    let done = host::delete_reply(7, Ok(Ok(crate::shell::FilesOutcome::Nothing)));
+    assert_eq!(
+        done.0.unwrap(),
+        json!({"sessionId":7,"deleted":true,"providerFiles":"none"})
+    );
+    assert!(!done.1, "a finished delete keeps them dismissed");
+}
+
+#[gpui::test]
+fn folders_move_applies_at_once_saves_and_replies_after_the_save(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let id = regular_session(&s, "codex", None, cx);
+    let reply = call(
+        &s,
+        "move",
+        "folders.move",
+        json!({"project":s.project,"sessionId":id,"newFolderName":"Work"}),
+        cx,
+    )
+    .try_recv()
+    .unwrap();
+    assert_eq!(reply.unwrap(), json!({"moved":true}));
+    let groups = groups_of(&s, cx);
+    assert_eq!(groups.folder_of(id).unwrap().name, "Work");
+    assert_eq!(
+        locked(&s.store).unwrap().groups(&s.project).unwrap(),
+        groups
+    );
+}
+
+#[gpui::test]
+fn a_move_racing_a_delete_cannot_bring_the_deleted_session_back(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let (one, two) = (
+        regular_session(&s, "codex", None, cx),
+        regular_session(&s, "codex", None, cx),
+    );
+    seed_folder(&s, cx, "f", "Ticket", &[one, two]);
+    cx.run_until_parked();
+    let send = |request: &str, action: &str, input: Value, cx: &mut TestAppContext| {
+        let (reply, rx) = mpsc::channel();
+        let call = mono::bridge::Call {
+            session: s.session,
+            request_id: request.into(),
+            action: action.into(),
+            input,
+            reply,
+        };
+        let handle: gpui::AnyWindowHandle = s.window.into();
+        handle
+            .update(cx, |_, w, cx| {
+                s.manager.update(cx, |m, cx| m.app_call(call, w, cx))
+            })
+            .unwrap();
+        rx
+    };
+    // Both are in flight before anything runs.
+    let deleted = send("delete", "sessions.delete", json!({"sessionId":one}), cx);
+    let moved = send(
+        "move",
+        "folders.move",
+        json!({"project":s.project,"sessionId":two,"folderId":"f"}),
+        cx,
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        deleted.try_recv().unwrap().unwrap(),
+        json!({"accepted":true})
+    );
+    assert_eq!(moved.try_recv().unwrap().unwrap(), json!({"moved":true}));
+    let groups = groups_of(&s, cx);
+    assert!(!stored(&s, one));
+    assert_eq!(groups.folder("f").unwrap().session_ids, vec![two]);
+    assert_eq!(
+        locked(&s.store).unwrap().groups(&s.project).unwrap(),
+        groups
+    );
+}

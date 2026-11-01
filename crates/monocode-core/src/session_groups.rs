@@ -101,12 +101,50 @@ impl Groups {
             f.collapsed = false;
         }
     }
+    /// Puts a session that is in no folder into this one, and changes nothing
+    /// else: no other folder is swept and the folder keeps its collapsed state.
+    pub fn push_unfiled(&mut self, folder: &str, session: i64) {
+        if self.folder_of(session).is_some() {
+            return;
+        }
+        if let Some(f) = self.folder_mut(folder) {
+            f.session_ids.push(session);
+        }
+    }
     /// Takes the sessions out of their folders; emptied folders go too.
     pub fn remove_sessions(&mut self, sessions: &[i64]) {
         for f in &mut self.folders {
             f.session_ids.retain(|id| !sessions.contains(id));
         }
         self.remove_empty();
+    }
+    /// A deleted session leaves its folder, and only that folder goes when this
+    /// was its last session. Other empty folders are left alone, unlike
+    /// [`Groups::remove_sessions`], which sweeps every empty folder.
+    pub fn remove_deleted_session(&mut self, session: i64) {
+        let Some(folder) = self.folder_of(session).map(|f| f.id.clone()) else {
+            return;
+        };
+        if let Some(f) = self.folder_mut(&folder) {
+            f.session_ids.retain(|&id| id != session);
+            if f.session_ids.is_empty() {
+                self.dissolve(&folder);
+            }
+        }
+    }
+    /// Like [`Groups::add_to_folder`], but brings back a folder that was removed
+    /// after the caller chose it, keeping the snapshot's id, name and colors.
+    pub fn add_or_restore(&mut self, folder: &Folder, session: i64) {
+        if self.folder(&folder.id).is_none() {
+            self.folders.insert(
+                0,
+                Folder {
+                    session_ids: Vec::new(),
+                    ..folder.clone()
+                },
+            );
+        }
+        self.add_to_folder(&folder.id, session);
     }
     pub fn rename_folder(&mut self, folder: &str, name: &str) {
         let name = name.trim();
@@ -472,6 +510,65 @@ mod tests {
         assert_eq!(groups.folder(&a).unwrap().name, "Work");
         groups.remove_sessions(&[1, 2]);
         assert!(groups.folders.is_empty());
+    }
+
+    #[test]
+    fn deleting_the_last_session_removes_only_its_folder() {
+        let mut groups = Groups::default();
+        groups.create_folder(&[1, 2], "a".into());
+        groups.create_folder(&[3], "b".into());
+        groups.folders.push(Folder {
+            id: "empty".into(),
+            name: "Empty".into(),
+            ..Folder::default()
+        });
+        groups.remove_deleted_session(1);
+        assert_eq!(groups.folder("a").unwrap().session_ids, vec![2]);
+        groups.remove_deleted_session(2);
+        assert!(groups.folder("a").is_none());
+        assert!(groups.folder("b").is_some());
+        assert!(groups.folder("empty").is_some(), "unrelated empty folder");
+        let before = groups.clone();
+        groups.remove_deleted_session(99);
+        assert_eq!(groups, before, "a session in no folder removes nothing");
+    }
+
+    #[test]
+    fn push_unfiled_only_adds_to_the_folder() {
+        let mut groups = Groups::default();
+        groups.create_folder(&[1], "a".into());
+        groups.folders.push(Folder {
+            id: "empty".into(),
+            ..Folder::default()
+        });
+        groups.toggle_folder("a");
+        groups.push_unfiled("a", 2);
+        groups.push_unfiled("a", 1);
+        groups.push_unfiled("missing", 3);
+        let folder = groups.folder("a").unwrap();
+        assert_eq!(folder.session_ids, vec![1, 2]);
+        assert!(folder.collapsed);
+        assert!(groups.folder("empty").is_some());
+        assert!(groups.folder_of(3).is_none());
+    }
+
+    #[test]
+    fn add_or_restore_brings_back_a_removed_folder() {
+        let mut groups = Groups::default();
+        groups.create_folder(&[1], "a".into());
+        groups.rename_folder("a", "Ticket");
+        let snapshot = groups.folder("a").unwrap().clone();
+        groups.remove_deleted_session(1);
+        assert!(groups.folder("a").is_none());
+        groups.add_or_restore(&snapshot, 2);
+        let folder = groups.folder("a").unwrap();
+        assert_eq!(
+            (folder.name.as_str(), &folder.session_ids),
+            ("Ticket", &vec![2])
+        );
+        groups.add_or_restore(&snapshot, 3);
+        assert_eq!(groups.folder("a").unwrap().session_ids, vec![2, 3]);
+        assert_eq!(groups.folders.len(), 1);
     }
 
     #[test]

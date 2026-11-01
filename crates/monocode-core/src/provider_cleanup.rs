@@ -145,10 +145,31 @@ pub fn plan_reset_cleanup(
     (requests, problems)
 }
 
+/// What a cleanup did: how many files, directories and index rows it actually
+/// removed, and whatever could not be removed as short messages. `removed` stays
+/// 0 when nothing was there, so a clean run can tell "removed" from "nothing".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CleanupReport {
+    /// Files and directories removed from disk; index rows do not count.
+    pub removed: usize,
+    /// Codex threads left on purpose because another conversation continues
+    /// from them.
+    pub kept: usize,
+    pub problems: Vec<String>,
+}
+
+impl CleanupReport {
+    fn absorb(&mut self, other: CleanupReport) {
+        self.removed += other.removed;
+        self.kept += other.kept;
+        self.problems.extend(other.problems);
+    }
+}
+
 /// Runs the cleanup against the default home and every account home under
-/// `data_dir`, and returns whatever could not be removed as short messages.
-pub fn run_cleanup(data_dir: &Path, request: &CleanupRequest) -> Vec<String> {
-    run_cleanup_report(data_dir, std::slice::from_ref(request), false)
+/// `data_dir`, and reports what was removed and what could not be.
+pub fn run_cleanup(data_dir: &Path, request: &CleanupRequest) -> CleanupReport {
+    run_report(data_dir, std::slice::from_ref(request), false)
 }
 
 /// Runs the requests like [`run_cleanup`]. `include_mono_stores` adds the
@@ -158,6 +179,14 @@ pub fn run_cleanup_report(
     requests: &[CleanupRequest],
     include_mono_stores: bool,
 ) -> Vec<String> {
+    run_report(data_dir, requests, include_mono_stores).problems
+}
+
+fn run_report(
+    data_dir: &Path,
+    requests: &[CleanupRequest],
+    include_mono_stores: bool,
+) -> CleanupReport {
     report_with_homes(requests, &|kind| {
         let mut homes = provider_homes(data_dir, kind);
         add_mono_stores(&mut homes, data_dir, kind, include_mono_stores);
@@ -193,13 +222,13 @@ fn mono_codex_homes(data_dir: &Path) -> Vec<ProviderHome> {
 fn report_with_homes(
     requests: &[CleanupRequest],
     homes_for: &dyn Fn(Kind) -> Result<Vec<ProviderHome>, String>,
-) -> Vec<String> {
-    let mut problems = Vec::new();
+) -> CleanupReport {
+    let mut report = CleanupReport::default();
     for request in requests {
         let homes = match homes_for(request.provider) {
             Ok(homes) => homes,
             Err(error) => {
-                problems.push(format!(
+                report.problems.push(format!(
                     "skipped {} cleanup: {error}",
                     request.provider.id()
                 ));
@@ -210,7 +239,7 @@ fn report_with_homes(
             Kind::Claude => {
                 for home in &homes {
                     for id in &request.ids {
-                        problems.extend(clean_claude_home(&home.path, id));
+                        report.absorb(clean_claude_home(&home.path, id));
                     }
                 }
             }
@@ -232,12 +261,12 @@ fn report_with_homes(
                         }
                     })
                     .collect();
-                problems.extend(clean_codex_homes(&codex_homes, &request.ids));
+                report.absorb(clean_codex_homes(&codex_homes, &request.ids));
             }
             _ => {}
         }
     }
-    problems
+    report
 }
 
 struct ProviderHome {
@@ -284,13 +313,13 @@ fn account_homes(data_dir: &Path, kind: Kind) -> Vec<ProviderHome> {
     homes
 }
 
-fn clean_claude_home(home: &Path, id: &str) -> Vec<String> {
-    let mut problems = Vec::new();
+fn clean_claude_home(home: &Path, id: &str) -> CleanupReport {
+    let mut report = CleanupReport::default();
     if !is_uuid(id) {
-        return problems;
+        return report;
     }
     let Ok(root) = home.canonicalize() else {
-        return problems;
+        return report;
     };
     let mut targets = Vec::new();
     if let Ok(projects) = std::fs::read_dir(home.join("projects")) {
@@ -306,11 +335,13 @@ fn clean_claude_home(home: &Path, id: &str) -> Vec<String> {
         targets.push(home.join(dir).join(id));
     }
     for target in targets {
-        if let Err(error) = remove_inside(&root, &target) {
-            problems.push(error);
+        match remove_inside(&root, &target) {
+            Ok(true) => report.removed += 1,
+            Ok(false) => {}
+            Err(error) => report.problems.push(error),
         }
     }
-    problems
+    report
 }
 
 struct CodexHome {
@@ -322,8 +353,8 @@ struct CodexHome {
 /// Removes the conversation from every home. The thread set is gathered from
 /// all homes first, because account transfer copies rollouts and not always the
 /// spawn edges, so a child may be recorded in a different home than its parent.
-fn clean_codex_homes(homes: &[CodexHome], roots: &[String]) -> Vec<String> {
-    let mut problems = Vec::new();
+fn clean_codex_homes(homes: &[CodexHome], roots: &[String]) -> CleanupReport {
+    let mut report = CleanupReport::default();
     // Subagent threads belong to the conversation that spawned them. History
     // ancestors are not followed: other conversations may still fork from them.
     let mut doomed: Vec<String> = Vec::new();
@@ -335,13 +366,15 @@ fn clean_codex_homes(homes: &[CodexHome], roots: &[String]) -> Vec<String> {
         for home in homes {
             match descendant_threads(&home.sqlite_home, &id) {
                 Ok(children) => queue.extend(children.into_iter().filter(|c| is_uuid(c))),
-                Err(error) => problems.push(format!("could not list subagent threads: {error}")),
+                Err(error) => report
+                    .problems
+                    .push(format!("could not list subagent threads: {error}")),
             }
         }
         doomed.push(id);
     }
     if doomed.is_empty() {
-        return problems;
+        return report;
     }
 
     let mut rollouts: Vec<(PathBuf, Option<String>)> = Vec::new();
@@ -354,7 +387,9 @@ fn clean_codex_homes(homes: &[CodexHome], roots: &[String]) -> Vec<String> {
                 let base = match history_base(&file) {
                     Ok(base) => base,
                     Err(error) => {
-                        problems.push(format!("could not read {}: {error}", file.display()));
+                        report
+                            .problems
+                            .push(format!("could not read {}: {error}", file.display()));
                         unreadable = true;
                         None
                     }
@@ -366,11 +401,11 @@ fn clean_codex_homes(homes: &[CodexHome], roots: &[String]) -> Vec<String> {
     // Without knowing every rollout's base, a thread another conversation forks
     // from could be deleted, so leave all Codex files and rows alone.
     if unreadable {
-        problems.push(
+        report.problems.push(
             "Codex files were kept because a rollout's history base could not be determined"
                 .to_string(),
         );
-        return problems;
+        return report;
     }
     // A rollout that is not being deleted may continue from a thread in the set.
     // Keep that thread, and then whatever the kept thread itself continues from.
@@ -389,13 +424,14 @@ fn clean_codex_homes(homes: &[CodexHome], roots: &[String]) -> Vec<String> {
         if protected.is_empty() {
             break;
         }
+        report.kept += protected.len();
         for id in &protected {
             eprintln!("Provider session cleanup keeps Codex thread {id}: another conversation continues from it");
         }
         doomed.retain(|id| !protected.contains(id));
     }
     if doomed.is_empty() {
-        return problems;
+        return report;
     }
 
     for home in homes {
@@ -406,15 +442,20 @@ fn clean_codex_homes(homes: &[CodexHome], roots: &[String]) -> Vec<String> {
             if !file.starts_with(&home.path) || !doomed.iter().any(|id| rollout_matches(file, id)) {
                 continue;
             }
-            if let Err(error) = remove_inside(&root, file) {
-                problems.push(error);
+            match remove_inside(&root, file) {
+                Ok(true) => report.removed += 1,
+                Ok(false) => {}
+                Err(error) => report.problems.push(error),
             }
         }
+        // Index rows are bookkeeping, not files: they do not count.
         if let Err(error) = delete_thread_rows(&home.sqlite_home, &doomed) {
-            problems.push(format!("could not clean the thread index: {error}"));
+            report
+                .problems
+                .push(format!("could not clean the thread index: {error}"));
         }
     }
-    problems
+    report
 }
 
 /// Lists rollout files without following directory symlinks, so a link cannot
@@ -486,14 +527,15 @@ fn delete_thread_rows(sqlite_home: &Path, ids: &[String]) -> Result<(), String> 
 }
 
 /// Removes `target` only when its parent directory resolves inside `root`. A
-/// symlink is removed itself and never followed. A missing target is fine.
-fn remove_inside(root: &Path, target: &Path) -> Result<(), String> {
+/// symlink is removed itself and never followed. A missing target is fine and
+/// gives `Ok(false)`; `Ok(true)` means something was actually removed.
+fn remove_inside(root: &Path, target: &Path) -> Result<bool, String> {
     let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
-        return Ok(());
+        return Ok(false);
     };
     let parent = match parent.canonicalize() {
         Ok(parent) => parent,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("{}: {error}", target.display())),
     };
     if !parent.starts_with(root) {
@@ -502,7 +544,7 @@ fn remove_inside(root: &Path, target: &Path) -> Result<(), String> {
     let resolved = parent.join(name);
     let metadata = match std::fs::symlink_metadata(&resolved) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("{}: {error}", resolved.display())),
     };
     let removed = if metadata.is_dir() {
@@ -511,8 +553,8 @@ fn remove_inside(root: &Path, target: &Path) -> Result<(), String> {
         std::fs::remove_file(&resolved)
     };
     match removed {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(format!("{}: {error}", resolved.display())),
     }
 }
@@ -640,7 +682,7 @@ mod tests {
         // Stray files where directories are expected must not raise problems.
         fixture.file(&home.join("projects").join(".DS_Store"));
 
-        let problems = clean_claude_home(&home, &target);
+        let problems = clean_claude_home(&home, &target).problems;
         assert!(problems.is_empty(), "{problems:?}");
 
         assert!(!project.join(format!("{target}.jsonl")).exists());
@@ -661,9 +703,81 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_counts_a_real_file_and_not_a_missing_one() {
+        let fixture = Fixture::new();
+        let home = fixture.home();
+        let target = id(1);
+        fixture.file(
+            &home
+                .join("projects")
+                .join("-app")
+                .join(format!("{target}.jsonl")),
+        );
+
+        let first = clean_claude_home(&home, &target);
+        assert_eq!(first.removed, 1, "{first:?}");
+        assert!(first.problems.is_empty());
+
+        let again = clean_claude_home(&home, &target);
+        assert_eq!(again, CleanupReport::default());
+    }
+
+    #[test]
+    fn remove_inside_says_whether_it_removed_anything() {
+        let fixture = Fixture::new();
+        let root = fixture.home();
+        fixture.file(&root.join("present"));
+        let root = root.canonicalize().unwrap();
+
+        assert_eq!(remove_inside(&root, &root.join("present")), Ok(true));
+        assert_eq!(remove_inside(&root, &root.join("present")), Ok(false));
+        assert_eq!(
+            remove_inside(&root, &root.join("no-dir").join("x")),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn report_sums_removals_across_homes() {
+        let fixture = Fixture::new();
+        let target = id(1);
+        fixture.file(&fixture.home().join("file-history").join(&target).join("v1"));
+        fixture.file(
+            &fixture
+                .other_home()
+                .join("tasks")
+                .join(&target)
+                .join("1.json"),
+        );
+        let request = CleanupRequest {
+            provider: Kind::Claude,
+            ids: vec![target],
+        };
+        let (a, b) = (fixture.home(), fixture.other_home());
+
+        let report = report_with_homes(&[request], &|_| {
+            Ok(vec![
+                ProviderHome {
+                    path: a.clone(),
+                    is_default: false,
+                },
+                ProviderHome {
+                    path: b.clone(),
+                    is_default: false,
+                },
+            ])
+        });
+
+        assert_eq!(report.removed, 2, "{report:?}");
+        assert!(report.problems.is_empty());
+    }
+
+    #[test]
     fn claude_tolerates_a_missing_home() {
         let fixture = Fixture::new();
-        assert!(clean_claude_home(&fixture.home(), &id(1)).is_empty());
+        assert!(clean_claude_home(&fixture.home(), &id(1))
+            .problems
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -681,7 +795,7 @@ mod tests {
         std::fs::create_dir_all(home.join("projects")).unwrap();
         std::os::unix::fs::symlink(&outside, home.join("projects").join("-linked")).unwrap();
 
-        let problems = clean_claude_home(&home, &target);
+        let problems = clean_claude_home(&home, &target).problems;
 
         assert!(!home.join("file-history").join(&target).exists());
         assert!(outside.join("precious").is_file());
@@ -759,7 +873,8 @@ mod tests {
         ];
         fixture.file(&home.join("session_index.jsonl"));
 
-        let problems = clean_codex_homes(&[codex_home(&home)], &[root.clone(), btw.clone()]);
+        let problems =
+            clean_codex_homes(&[codex_home(&home)], &[root.clone(), btw.clone()]).problems;
 
         assert!(problems.is_empty(), "{problems:?}");
         for path in &gone {
@@ -801,7 +916,8 @@ mod tests {
         let problems = clean_codex_homes(
             &[codex_home(&a), codex_home(&b)],
             std::slice::from_ref(&root),
-        );
+        )
+        .problems;
 
         assert!(problems.is_empty(), "{problems:?}");
         for path in &gone {
@@ -832,12 +948,15 @@ mod tests {
         // The fork lives in a different home and is not part of the deletion.
         let fork_file = fixture.rollout(&b, "sessions", &fork, "jsonl", Some(&child));
 
-        let problems = clean_codex_homes(
+        let report = clean_codex_homes(
             &[codex_home(&a), codex_home(&b)],
             std::slice::from_ref(&root),
         );
+        let problems = report.problems.clone();
 
         assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(report.kept, 1, "the protected child is counted");
+        assert_eq!(report.removed, 1, "only the root rollout file");
         assert!(!root_file.exists());
         assert!(child_file.is_file());
         assert!(older_file.is_file());
@@ -851,6 +970,25 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn index_rows_alone_do_not_count_as_removed() {
+        let fixture = Fixture::new();
+        let a = fixture.home();
+        let root = id(1);
+        // A thread row with no rollout file on disk.
+        state_db_with_threads(&a, std::slice::from_ref(&root), &[]);
+
+        let report = clean_codex_homes(&[codex_home(&a)], std::slice::from_ref(&root));
+
+        assert_eq!(
+            count(&a, "SELECT count(*) FROM threads"),
+            0,
+            "row still goes"
+        );
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert!(report.problems.is_empty());
     }
 
     #[test]
@@ -875,7 +1013,8 @@ mod tests {
         let problems = clean_codex_homes(
             &[codex_home(&a), codex_home(&b)],
             std::slice::from_ref(&root),
-        );
+        )
+        .problems;
 
         assert!(problems.iter().any(|p| p.contains("kept")), "{problems:?}");
         for path in &files {
@@ -896,7 +1035,9 @@ mod tests {
             .unwrap();
         let rollout = fixture.rollout(&home, "sessions", &id(1), "jsonl", None);
 
-        assert!(clean_codex_homes(&[codex_home(&home)], &[id(1)]).is_empty());
+        assert!(clean_codex_homes(&[codex_home(&home)], &[id(1)])
+            .problems
+            .is_empty());
 
         assert!(!rollout.exists());
     }
@@ -905,7 +1046,9 @@ mod tests {
     fn codex_works_without_any_state_db() {
         let fixture = Fixture::new();
         let rollout = fixture.rollout(&fixture.home(), "sessions", &id(1), "jsonl", None);
-        assert!(clean_codex_homes(&[codex_home(&fixture.home())], &[id(1)]).is_empty());
+        assert!(clean_codex_homes(&[codex_home(&fixture.home())], &[id(1)])
+            .problems
+            .is_empty());
         assert!(!rollout.exists());
     }
 
@@ -920,8 +1063,10 @@ mod tests {
         fixture.file(&home.join("history.jsonl"));
 
         for bad in ["", "..", "../x", "a/b", "memory", "abc", &"a".repeat(129)] {
-            assert!(clean_claude_home(&home, bad).is_empty());
-            assert!(clean_codex_homes(&[codex_home(&home)], &[bad.to_string()]).is_empty());
+            assert!(clean_claude_home(&home, bad).problems.is_empty());
+            assert!(clean_codex_homes(&[codex_home(&home)], &[bad.to_string()])
+                .problems
+                .is_empty());
         }
 
         assert!(rollout.is_file());
@@ -1024,7 +1169,8 @@ mod tests {
                 path: missing.clone(),
                 is_default: false,
             }])
-        });
+        })
+        .problems;
 
         assert!(problems.is_empty(), "{problems:?}");
         assert!(!missing.exists());
@@ -1037,7 +1183,8 @@ mod tests {
             ids: vec![id(1)],
         }];
 
-        let problems = report_with_homes(&requests, &|_| Err("no app data dir".to_string()));
+        let problems =
+            report_with_homes(&requests, &|_| Err("no app data dir".to_string())).problems;
 
         assert_eq!(problems.len(), 1);
         assert!(problems[0].contains("no app data dir"), "{problems:?}");
@@ -1064,7 +1211,8 @@ mod tests {
                 path: home.clone(),
                 is_default: false,
             }])
-        });
+        })
+        .problems;
 
         assert!(!problems.is_empty());
         assert!(outside.join(format!("{target}.jsonl")).is_file());
@@ -1275,7 +1423,8 @@ mod tests {
                 path: homes[0].path.clone(),
                 is_default: homes[0].is_default,
             }])
-        });
+        })
+        .problems;
 
         assert!(problems.is_empty(), "{problems:?}");
         assert!(!gone.exists());
@@ -1310,7 +1459,8 @@ mod tests {
                 is_default: home.is_default,
             }));
             Ok(homes)
-        });
+        })
+        .problems;
 
         assert!(problems.is_empty(), "{problems:?}");
         assert!(mono_target.is_file(), "the continued thread must stay");

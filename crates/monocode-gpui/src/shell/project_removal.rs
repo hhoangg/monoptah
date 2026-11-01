@@ -4,7 +4,7 @@ use super::*;
 use monocode_core::{
     external_editor::{self, ExternalEditor},
     files::{is_equal_or_inside, path_key},
-    provider_cleanup::{self, CleanupRequest},
+    provider_cleanup::{self, CleanupReport, CleanupRequest},
     store::Store,
 };
 use std::path::Path;
@@ -12,11 +12,14 @@ use std::path::Path;
 /// Removes a deleted session's provider files; `None` means the store has no
 /// data directory (in memory), where there is nothing to find.
 pub(super) type CleanupRunner =
-    Arc<dyn Fn(Option<&Path>, &CleanupRequest) -> Vec<String> + Send + Sync>;
+    Arc<dyn Fn(Option<&Path>, &CleanupRequest) -> CleanupReport + Send + Sync>;
 pub(super) fn default_cleanup() -> CleanupRunner {
     Arc::new(|data_dir, request| match data_dir {
         Some(dir) => provider_cleanup::run_cleanup(dir, request),
-        None => vec!["no data directory, so nothing was removed".into()],
+        None => CleanupReport {
+            problems: vec!["no data directory, so nothing was removed".into()],
+            ..Default::default()
+        },
     })
 }
 
@@ -26,6 +29,20 @@ pub(super) struct DeleteOptions {
     pub provider_files: bool,
     /// An unused worktree to remove once the session is gone.
     pub worktree: Option<String>,
+    /// Receives what became of the provider files once the delete is over, or
+    /// why the session could not be deleted.
+    pub report: Option<async_channel::Sender<Result<FilesOutcome, String>>>,
+}
+
+/// What a delete did about the provider session files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FilesOutcome {
+    /// Something was removed from disk.
+    Removed,
+    /// There was nothing to remove, or the harness has no cleanup.
+    Nothing,
+    /// The session is deleted but these problems may have left files behind.
+    Failed(Vec<String>),
 }
 
 /// Which CLI owns the session files a delete can also remove.
@@ -327,7 +344,7 @@ impl Shell {
     }
     /// The CLI whose files this computer holds for the session. A session on a
     /// remote machine keeps them there, out of reach.
-    fn local_files_kind(&self, id: i64, cx: &App) -> Option<Kind> {
+    pub(super) fn local_files_kind(&self, id: i64, cx: &App) -> Option<Kind> {
         let summary = self.session_metadata(id, cx).summary;
         provider_cleanup::files_kind(summary).filter(|_| !summary.cwd.starts_with("remote://"))
     }
@@ -400,6 +417,7 @@ impl Shell {
                 DeleteOptions {
                     provider_files: provider_files && has_files,
                     worktree,
+                    report: None,
                 },
                 window,
                 cx,
@@ -647,6 +665,7 @@ mod tests {
     use crate::shell::tests::window;
     use gpui::{MouseButton, TestAppContext, VisualTestContext, WindowHandle};
     use monocode_core::provider_cleanup::CleanupRequest;
+    use monocode_core::session_groups::Groups;
     use std::path::PathBuf;
 
     const CODEX_ID: &str = "00000000-0000-4000-8000-00000000000a";
@@ -684,7 +703,7 @@ mod tests {
                         request.ids().to_vec(),
                         present,
                     ));
-                    Vec::new()
+                    CleanupReport::default()
                 });
             })
             .unwrap();
@@ -784,7 +803,7 @@ mod tests {
                 let seen = ran.clone();
                 shell.provider_cleanup = Arc::new(move |_, _| {
                     seen.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Vec::new()
+                    CleanupReport::default()
                 });
                 shell.run_menu(MenuTarget::Session(a), "delete", None, w, cx);
                 shell.confirm_delete_dialog(w, cx);
@@ -1119,6 +1138,431 @@ mod tests {
             })
             .unwrap();
         assert!(repo.exists());
+    }
+
+    const PROJECT: &str = "/work/monocode";
+
+    /// A stored session with no provider files, known to the shell.
+    fn history_row(shell: &mut Shell) -> i64 {
+        let store = locked(&shell.store).unwrap();
+        let session = store.create("claude", PROJECT).unwrap();
+        drop(store);
+        let id = session.id;
+        shell.session_summaries.insert(id, session);
+        id
+    }
+
+    /// Sets the project's folders in memory and in the store.
+    fn put_folders(shell: &mut Shell, folders: &[(&str, &[i64])]) {
+        let groups = Groups {
+            folders: folders
+                .iter()
+                .map(|(id, sessions)| monocode_core::session_groups::Folder {
+                    id: (*id).into(),
+                    name: (*id).into(),
+                    session_ids: sessions.to_vec(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        locked(&shell.store)
+            .unwrap()
+            .save_groups(PROJECT, &groups)
+            .unwrap();
+        shell.groups.insert(PROJECT.into(), groups);
+    }
+
+    fn folder_ids(shell: &Shell) -> (Vec<String>, Vec<String>) {
+        let ids = |groups: &Groups| groups.folders.iter().map(|f| f.id.clone()).collect();
+        (
+            ids(shell.groups.get(PROJECT).unwrap()),
+            ids(&locked(&shell.store).unwrap().groups(PROJECT).unwrap()),
+        )
+    }
+
+    fn members(shell: &Shell, folder: &str) -> Vec<i64> {
+        shell
+            .groups
+            .get(PROJECT)
+            .and_then(|g| g.folder(folder))
+            .map(|f| f.session_ids.clone())
+            .unwrap_or_default()
+    }
+
+    #[gpui::test]
+    fn deleting_the_last_session_of_a_folder_removes_the_folder(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        let one = window
+            .update(cx, |shell, w, cx| {
+                let one = history_row(shell);
+                put_folders(shell, &[("f", &[one])]);
+                shell.delete_session(one, w, cx);
+                one
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(!shell.session_summaries.contains_key(&one));
+                assert_eq!(folder_ids(shell), (vec![], vec![]), "memory and store");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_folder_with_another_live_or_archived_session_stays(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        let (one, live, archived) = window
+            .update(cx, |shell, _, _| {
+                let (one, live, archived) =
+                    (history_row(shell), history_row(shell), history_row(shell));
+                shell.session_summaries.get_mut(&archived).unwrap().archived = true;
+                put_folders(shell, &[("live", &[one, live]), ("kept", &[archived])]);
+                (one, live, archived)
+            })
+            .unwrap();
+        window
+            .update(cx, |shell, w, cx| shell.delete_session(one, w, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(members(shell, "live"), [live]);
+                assert_eq!(members(shell, "kept"), [archived]);
+                assert_eq!(folder_ids(shell).0, folder_ids(shell).1);
+            })
+            .unwrap();
+        // Deleting the live one now empties its folder, but the archived one's stays.
+        window
+            .update(cx, |shell, w, cx| shell.delete_session(live, w, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(folder_ids(shell).0, ["kept"]);
+                assert_eq!(folder_ids(shell).1, ["kept"]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn an_already_empty_folder_survives_another_folders_delete(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        let one = window
+            .update(cx, |shell, w, cx| {
+                let one = history_row(shell);
+                put_folders(shell, &[("empty", &[]), ("other", &[one])]);
+                shell.delete_session(one, w, cx);
+                one
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(!shell.session_summaries.contains_key(&one));
+                assert_eq!(
+                    folder_ids(shell),
+                    (vec!["empty".into()], vec!["empty".into()])
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_refused_delete_leaves_the_folder_and_its_members(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        let one = window
+            .update(cx, |shell, w, cx| {
+                let one = history_row(shell);
+                put_folders(shell, &[("f", &[one])]);
+                shell.workspace.review_owners.insert(9_000_001, one);
+                shell.workspace.tabs.push(9_000_001);
+                shell.delete_session(one, w, cx);
+                one
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(
+                    shell
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .contains("detached file panes")
+                );
+                assert!(shell.session_summaries.contains_key(&one));
+                assert_eq!(members(shell, "f"), [one]);
+                assert_eq!(folder_ids(shell), (vec!["f".into()], vec!["f".into()]));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_bulk_delete_of_every_member_removes_the_folder(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        let ids = window
+            .update(cx, |shell, w, cx| {
+                let ids = vec![history_row(shell), history_row(shell)];
+                put_folders(shell, &[("f", &ids)]);
+                shell.open_delete_dialog(ids.clone(), Vec::new(), w, cx);
+                shell.confirm_delete_dialog(w, cx);
+                ids
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(
+                    ids.iter()
+                        .all(|id| !shell.session_summaries.contains_key(id))
+                );
+                assert_eq!(folder_ids(shell), (vec![], vec![]));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_child_without_a_folder_keeps_its_parents_folder(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        let (parent, child, hidden) = window
+            .update(cx, |shell, w, cx| {
+                let (parent, child, hidden) =
+                    (history_row(shell), history_row(shell), history_row(shell));
+                put_folders(shell, &[("f", &[parent])]);
+                shell.started_by.extend([(child, parent), (hidden, parent)]);
+                shell.sidebar_hidden_sessions.insert(hidden);
+                shell.delete_session(parent, w, cx);
+                (parent, child, hidden)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(!shell.session_summaries.contains_key(&parent));
+                assert_eq!(members(shell, "f"), [child], "filed where it was on screen");
+                assert!(!members(shell, "f").contains(&hidden));
+                assert_eq!(
+                    locked(&shell.store)
+                        .unwrap()
+                        .groups(PROJECT)
+                        .unwrap()
+                        .folder("f")
+                        .map(|f| f.session_ids.clone()),
+                    Some(vec![child])
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn filing_a_child_neither_sweeps_empty_folders_nor_opens_the_folder(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        let child = window
+            .update(cx, |shell, w, cx| {
+                let (parent, child) = (history_row(shell), history_row(shell));
+                put_folders(shell, &[("f", &[parent]), ("empty", &[])]);
+                shell.groups.get_mut(PROJECT).unwrap().toggle_folder("f");
+                assert!(shell.groups[PROJECT].folder("f").unwrap().collapsed);
+                shell.started_by.insert(child, parent);
+                shell.delete_session(parent, w, cx);
+                child
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(members(shell, "f"), [child]);
+                assert!(shell.groups[PROJECT].folder("f").unwrap().collapsed);
+                assert_eq!(folder_ids(shell).0, ["f", "empty"]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_session_started_in_a_folder_a_delete_emptied_brings_it_back(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        let before = window
+            .update(cx, |shell, _, cx| {
+                let one = history_row(shell);
+                put_folders(shell, &[("f", &[one])]);
+                let before: HashSet<i64> = shell.session_summaries.keys().copied().collect();
+                shell.create_in_folder("f".into(), cx);
+                // A delete finishes before the new row exists to be filed.
+                shell
+                    .groups
+                    .get_mut(PROJECT)
+                    .unwrap()
+                    .remove_deleted_session(one);
+                assert!(shell.groups[PROJECT].folder("f").is_none());
+                before
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let new: Vec<i64> = shell
+                    .session_summaries
+                    .keys()
+                    .copied()
+                    .filter(|id| !before.contains(id))
+                    .collect();
+                assert_eq!(new.len(), 1);
+                assert_eq!(members(shell, "f"), new, "same folder id, refilled");
+                assert_eq!(shell.groups[PROJECT].folder("f").unwrap().name, "f");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn kept_threads_make_the_outcome_failed_not_removed_or_none(cx: &mut TestAppContext) {
+        let (window, a, _, _) = setup(cx);
+        let extra = window
+            .update(cx, |shell, _, _| {
+                let id = history_row(shell);
+                locked(&shell.store)
+                    .unwrap()
+                    .provider_id(id, CLAUDE_ID)
+                    .unwrap();
+                shell.session_summaries.get_mut(&id).unwrap().provider_id = Some(CLAUDE_ID.into());
+                id
+            })
+            .unwrap();
+        for (id, removed) in [(a, 0), (extra, 2)] {
+            let (tx, rx) = async_channel::bounded(1);
+            window
+                .update(cx, |shell, w, cx| {
+                    shell.provider_cleanup = Arc::new(move |_, _| CleanupReport {
+                        removed,
+                        kept: 2,
+                        problems: Vec::new(),
+                    });
+                    shell.mono_delete_with_files(id, tx, w, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            match rx.try_recv().unwrap() {
+                Ok(FilesOutcome::Failed(problems)) => assert_eq!(
+                    problems,
+                    ["2 Codex thread(s) kept because another conversation continues from them"]
+                ),
+                other => panic!("removed {removed}: {other:?}"),
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn an_applied_groups_change_is_saved_in_queue_order_with_deletes(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        let (one, rx) = window
+            .update(cx, |shell, w, cx| {
+                let (one, two) = (history_row(shell), history_row(shell));
+                put_folders(shell, &[("f", &[one, two])]);
+                let mut moved = shell.groups[PROJECT].clone();
+                moved.create_folder(&[two], "g".into());
+                let rx = shell.mono_apply_groups(PROJECT.into(), moved, cx);
+                shell.delete_session(one, w, cx);
+                (one, rx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(rx.try_recv(), Ok(Ok(())));
+        window
+            .update(cx, |shell, _, _| {
+                assert!(!shell.session_summaries.contains_key(&one));
+                let memory = shell.groups[PROJECT].clone();
+                assert_eq!(memory.folders.len(), 1, "f went with its last session");
+                assert!(memory.folder("g").is_some());
+                assert_eq!(
+                    locked(&shell.store).unwrap().groups(PROJECT).unwrap(),
+                    memory
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_failed_group_save_reaches_the_receiver_and_the_error_line(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        let rx = window
+            .update(cx, |shell, _, cx| {
+                shell.store_write_reporting("save folders", cx, |_| Err("disk full".into()))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(rx.try_recv(), Ok(Err("disk full".to_string())));
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(
+                    shell.error.as_deref(),
+                    Some("Could not save folders: disk full")
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn an_automation_run_refiles_into_a_folder_removed_since_it_started(cx: &mut TestAppContext) {
+        let (window, _, _, _) = setup(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let (one, run) = (history_row(shell), history_row(shell));
+                put_folders(shell, &[("f", &[one])]);
+                let automation: monocode_core::automations::Automation =
+                    serde_json::from_value(serde_json::json!({
+                        "id": "a", "name": "n", "prompt": "p", "harness": "codex",
+                        "model": "", "cwd": PROJECT, "workspaceMode": "current",
+                        "sessionFolderId": "f", "reuseSession": false,
+                        "runtimeMode": "auto", "scheduleKind": "daily", "minute": 0,
+                        "time": "09:00", "dayOfWeek": 0, "missedRunGraceMinutes": 0,
+                        "enabled": true, "nextRunAt": 0, "createdAt": 0, "updatedAt": 0,
+                    }))
+                    .unwrap();
+                let snapshot = shell.groups[PROJECT].folder("f").cloned();
+                shell
+                    .groups
+                    .get_mut(PROJECT)
+                    .unwrap()
+                    .remove_deleted_session(one);
+                assert!(shell.groups[PROJECT].folder("f").is_none());
+                shell.place_automation_session(run, &automation, snapshot.as_ref(), cx);
+                assert_eq!(members(shell, "f"), [run]);
+                // A folder already gone when the run started stays gone.
+                shell
+                    .groups
+                    .get_mut(PROJECT)
+                    .unwrap()
+                    .remove_deleted_session(run);
+                shell.place_automation_session(run, &automation, None, cx);
+                assert!(shell.groups[PROJECT].folder("f").is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_delete_reports_removed_nothing_or_failed_on_its_channel(cx: &mut TestAppContext) {
+        let (window, a, _, _) = setup(cx);
+        let (tx, rx) = async_channel::bounded(1);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.provider_cleanup = Arc::new(|_, _| CleanupReport {
+                    removed: 1,
+                    ..Default::default()
+                });
+                shell.mono_delete_with_files(a, tx, w, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(rx.try_recv().unwrap(), Ok(FilesOutcome::Removed));
+        // A second delete of the gone session is refused on the channel.
+        let (tx, rx) = async_channel::bounded(1);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.mono_delete_with_files(a, tx, w, cx)
+            })
+            .unwrap();
+        assert!(rx.try_recv().unwrap().is_err());
     }
 
     #[test]

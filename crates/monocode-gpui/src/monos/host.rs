@@ -1,5 +1,6 @@
 //! Capability-checked app actions used by Mono provider subprocesses.
 use super::*;
+use crate::shell::FilesOutcome;
 use monocode_core::mono::workflows::{
     cli::{StoreHost, handle_value},
     store::MonoDir,
@@ -12,7 +13,6 @@ pub(super) enum Effect {
     Card(Value),
     None,
     Start(Box<Started>),
-    Groups(String, Groups),
 }
 pub(super) struct Started {
     pub(super) summary: Session,
@@ -230,6 +230,33 @@ fn flag(v: &Value, key: &str, default: bool) -> bool {
 fn fingerprint(call: &Call) -> String {
     files::content_hash(&format!("{}:{}", call.action, call.input))
 }
+/// What a `sessions.delete` with `providerFiles` answers, and whether the
+/// launches it dismissed must be restored: they must whenever the delete may
+/// not have happened, which includes a channel that closed with no outcome.
+pub(super) fn delete_reply(
+    session: i64,
+    outcome: Result<Result<FilesOutcome, String>, async_channel::RecvError>,
+) -> (Result<Value, String>, bool) {
+    match outcome {
+        Ok(Ok(files)) => {
+            let mut value = json!({"sessionId":session,"deleted":true});
+            match files {
+                FilesOutcome::Removed => value["providerFiles"] = json!("removed"),
+                FilesOutcome::Nothing => value["providerFiles"] = json!("none"),
+                FilesOutcome::Failed(problems) => {
+                    value["providerFiles"] = json!("failed");
+                    value["problems"] = json!(problems);
+                }
+            }
+            (Ok(value), false)
+        }
+        Ok(Err(error)) => (Err(error), true),
+        Err(_) => (
+            Err("The outcome of the delete is unknown. Check sessions.list before retrying".into()),
+            true,
+        ),
+    }
+}
 impl Monos {
     fn app_caller(&self, call: &Call) -> Result<Mono, String> {
         let mono = self
@@ -317,6 +344,51 @@ impl Monos {
             let _ = call.reply.send(reply.and(result));
         }));
     }
+    /// `sessions.delete` with `providerFiles`: the reply waits for the delete
+    /// and the file cleanup, so it can say what became of the files. The launch
+    /// flags dismissed for the delete go back if the delete is refused.
+    fn delete_with_files(
+        &mut self,
+        call: Call,
+        session: i64,
+        flipped: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (report, outcome) = async_channel::bounded(1);
+        let owner = self.owner.clone();
+        let handle = window.window_handle();
+        let app: &mut App = cx;
+        // Deferred like the other removals, to stay clear of the entities that
+        // are being updated right now.
+        app.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = owner.update(cx, |owner, cx| {
+                    owner.mono_delete_with_files(session, report, window, cx)
+                });
+            });
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = outcome.recv().await;
+            let _ = this.update(cx, |this, cx| {
+                let (result, undo) = delete_reply(session, outcome);
+                if undo {
+                    for m in &mut this.roster.monos {
+                        if flipped.contains(&m.id) {
+                            for launch in &mut m.launches {
+                                if launch.session_id == session {
+                                    launch.dismissed = false;
+                                }
+                            }
+                        }
+                    }
+                    this.save(cx);
+                }
+                this.finish_call(call, result, cx);
+            });
+        })
+        .detach();
+    }
     fn call_work(
         &mut self,
         call: Call,
@@ -335,11 +407,6 @@ impl Monos {
                         Effect::Card(value) => {
                             this.hold_card(call.session, &mono_id, value);
                             this.save(cx);
-                        }
-                        Effect::Groups(project, groups) => {
-                            let _ = this.owner.update(cx, |owner, cx| {
-                                owner.mono_apply_groups(project, groups, cx)
-                            });
                         }
                         Effect::Start(started) => {
                             this.apply_started(
@@ -611,6 +678,25 @@ impl Monos {
                         return;
                     }
                 };
+                // Only other regular project sessions can be deleted. Checked before
+                // anything is opened or changed.
+                if action == "sessions.delete"
+                    && (session == call.session
+                        || self.is_mono_session(session)
+                        || self.running.contains_key(&session)
+                        || self.workflow_live.asked_by(session).is_some()
+                        || self
+                            .owner
+                            .upgrade()
+                            .is_some_and(|o| o.read(cx).mono_is_worker(session)))
+                {
+                    self.finish_call(
+                        call,
+                        Err("Only other regular project sessions can be managed here".into()),
+                        cx,
+                    );
+                    return;
+                }
                 let view = self
                     .owner
                     .upgrade()
@@ -691,14 +777,22 @@ impl Monos {
                         Err(e) => Err(e),
                     }
                 } else {
+                    let mut flipped = Vec::new();
                     for m in &mut self.roster.monos {
                         for launch in &mut m.launches {
                             if launch.session_id == session {
+                                if !launch.dismissed {
+                                    flipped.push(m.id.clone());
+                                }
                                 launch.dismissed = true;
                             }
                         }
                     }
                     self.save(cx);
+                    if action == "sessions.delete" && flag(&input, "providerFiles", false) {
+                        self.delete_with_files(call, session, flipped, window, cx);
+                        return;
+                    }
                     if action == "sessions.stop" {
                         view.update(cx, |v, cx| v.stop_if_busy(cx));
                     } else {
@@ -759,15 +853,29 @@ impl Monos {
                 } else {
                     groups.remove_sessions(&[session]);
                 }
-                self.call_work(
-                    call,
-                    target,
-                    move |store| {
-                        locked(&store)?.save_groups(&project, &groups)?;
-                        Ok((json!({"moved":true}), Effect::Groups(project, groups)))
-                    },
-                    cx,
-                );
+                // Apply to the shell now, on this thread, and save through the
+                // shell's queue: a delete finishing while the save runs would
+                // otherwise be overwritten by this snapshot.
+                let saved = self
+                    .owner
+                    .update(cx, |owner, cx| {
+                        owner.mono_apply_groups(project.clone(), groups.clone(), cx)
+                    })
+                    .ok();
+                cx.spawn(async move |this, cx| {
+                    let result = match saved {
+                        Some(saved) => saved
+                            .recv()
+                            .await
+                            .unwrap_or_else(|_| Err("Could not confirm the folder save".into())),
+                        None => Err("The app window is gone".into()),
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        this.finish_call(call, result.map(|()| json!({"moved":true})), cx);
+                        this.changed(cx);
+                    });
+                })
+                .detach();
                 return;
             }
             "artifacts.list" => Ok(json!(
@@ -1239,18 +1347,13 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         }
     }
     fn apply_groups(&mut self, project: String, groups: Groups, cx: &mut Context<Self>) {
-        let _ = self.owner.update(cx, |o, cx| {
-            o.mono_apply_groups(project.clone(), groups.clone(), cx)
-        });
-        let store = self.store.clone();
-        cx.background_executor()
-            .spawn(async move {
-                let _ = locked(&store).and_then(|db| db.save_groups(&project, &groups));
-            })
-            .detach();
+        // A failed save shows in the shell's error line; nobody waits for it here.
+        let _ = self
+            .owner
+            .update(cx, |o, cx| o.mono_apply_groups(project, groups, cx));
     }
     /// Files a launch where the request chose.
-    fn file_launch(
+    pub(super) fn file_launch(
         &mut self,
         mono: &str,
         project: &str,
@@ -1265,8 +1368,12 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             .map(|o| o.read(cx).mono_groups(project))
             .unwrap_or_default();
         match folder {
-            Folder::Existing { id, .. } => groups.add_to_folder(&id, session),
-            Folder::New { id, name } => {
+            Folder::Existing { id, .. } if groups.folder(&id).is_some() => {
+                groups.add_to_folder(&id, session)
+            }
+            // A new folder, or an existing one a delete removed since the start
+            // began: make it again under the same id and name.
+            Folder::Existing { id, name } | Folder::New { id, name } => {
                 if let Some(folder) = groups.create_folder(&[session], id) {
                     groups.rename_folder(&folder, &name);
                     groups.set_color(&folder, color);

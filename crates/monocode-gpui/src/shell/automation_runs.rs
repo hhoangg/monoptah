@@ -426,6 +426,13 @@ impl Shell {
         let store = self.store.clone();
         let launch = due.clone();
         let revision = self.navigation_revision;
+        // The folder as it is when the run starts: a delete may remove it before
+        // the session exists, and the session must still end up in it.
+        let folder = self
+            .groups
+            .get(&due.automation.cwd)
+            .and_then(|groups| groups.folder(&due.automation.session_folder_id))
+            .cloned();
         let work = cx.background_executor().spawn(async move {
             if Kind::parse(&launch.automation.harness).is_none() {
                 return Err("The automation's agent is unavailable".into());
@@ -533,7 +540,15 @@ impl Shell {
                         let id = summary.id;
                         if summary.surface.is_tui() {
                             this.begin_tui_run(
-                                summary, &settings, persisted, &due, reveal, revision, window, cx,
+                                summary,
+                                &settings,
+                                persisted,
+                                &due,
+                                folder.as_ref(),
+                                reveal,
+                                revision,
+                                window,
+                                cx,
                             );
                             return;
                         }
@@ -574,7 +589,7 @@ impl Shell {
                             None,
                             cx,
                         );
-                        this.place_automation_session(id, &due.automation, cx);
+                        this.place_automation_session(id, &due.automation, folder.as_ref(), cx);
                         let prompt = due
                             .run
                             .prompt
@@ -612,17 +627,19 @@ impl Shell {
 
     /// The run's session goes into its folder and gets a tab, without changing
     /// the focused project.
-    fn place_automation_session(
+    pub(super) fn place_automation_session(
         &mut self,
         id: i64,
         automation: &monocode_core::automations::Automation,
+        folder: Option<&monocode_core::session_groups::Folder>,
         cx: &mut Context<Self>,
     ) {
         if !automation.session_folder_id.is_empty() {
-            self.groups
-                .entry(automation.cwd.clone())
-                .or_default()
-                .add_to_folder(&automation.session_folder_id, id);
+            let groups = self.groups.entry(automation.cwd.clone()).or_default();
+            match folder {
+                Some(folder) => groups.add_or_restore(folder, id),
+                None => groups.add_to_folder(&automation.session_folder_id, id),
+            }
             self.persist_automation_folder(&automation.cwd, cx);
         }
         if !self.workspace.tabs.contains(&id) {
