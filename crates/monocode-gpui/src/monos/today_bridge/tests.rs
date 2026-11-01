@@ -1,5 +1,5 @@
 use super::*;
-use crate::monos::tests::{Setup, call_from, setup};
+use crate::monos::tests::{Setup, WORKFLOW_ACTIONS, call_from, setup};
 use gpui::TestAppContext;
 use monocode_core::mono::habits::Schedule;
 use serde_json::{Value, json};
@@ -147,8 +147,8 @@ fn a_run_may_list_and_sync_but_not_hide_tasks_and_workflows_stay_refused(cx: &mu
     let listed = call(&s, run, "today.list", json!({}), cx).unwrap();
     assert_eq!(listed["tasks"][0]["notes"][0]["body"], "seen");
     assert_eq!(
-        call(&s, run, "workflows.list", json!({}), cx),
-        Err("Only a Mono's own conversation can manage its workflows".into())
+        call(&s, run, "workflows.add", json!({}), cx),
+        Err("A habit run can only read and run workflows".into())
     );
     assert_eq!(
         call(&s, run, "habits.run", json!({"id": "h1"}), cx),
@@ -396,4 +396,17 @@ fn a_read_leaves_the_revision_alone_and_a_habit_change_wakes_the_roster(cx: &mut
     cx.run_until_parked();
     let roster = cx.update(|cx| s.manager.read(cx).today_roster(cx).unwrap());
     assert_eq!(roster[0].habits.len(), 1);
+}
+
+#[gpui::test]
+fn a_heartbeat_cannot_use_any_workflows_action(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let beat = fake_run(&s, heartbeat::RUN_ID, cx);
+    for action in WORKFLOW_ACTIONS {
+        assert_eq!(
+            call(&s, beat, action, json!({}), cx),
+            Err("A heartbeat cannot use workflows".into()),
+            "{action}"
+        );
+    }
 }

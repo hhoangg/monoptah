@@ -248,14 +248,34 @@ impl Monos {
             .cloned()
             .ok_or("This Mono no longer owns an active app capability")?;
         // A habit run, or the hidden session of a workflow's question to the Mono.
-        let run_session = self.running.contains_key(&call.session)
-            || self.workflow_live.asked_by(call.session).is_some();
-        if call.action.starts_with("habits.") && call.action != "habits.list" && run_session {
+        let habit_run = self.running.contains_key(&call.session);
+        let question = self.workflow_live.asked_by(call.session).is_some();
+        let heartbeat = self
+            .running
+            .get(&call.session)
+            .is_some_and(|r| r.habit == mono::heartbeat::RUN_ID);
+        if call.action.starts_with("habits.")
+            && call.action != "habits.list"
+            && (habit_run || question)
+        {
             return Err("A habit run cannot schedule more runs".into());
         }
-        // Workflows belong to the Mono's own conversation, not to a habit run.
-        if call.action.starts_with("workflows.") && run_session {
-            return Err("Only a Mono's own conversation can manage its workflows".into());
+        // A workflow must not start workflows through its own question to the Mono.
+        if call.action.starts_with("workflows.") && question {
+            return Err("A workflow's question to its Mono cannot use workflows".into());
+        }
+        if call.action.starts_with("workflows.") && heartbeat {
+            return Err("A heartbeat cannot use workflows".into());
+        }
+        // A habit run reads workflows and starts them; the Mono's chat changes them.
+        if call.action.starts_with("workflows.")
+            && habit_run
+            && !matches!(
+                call.action.as_str(),
+                "workflows.list" | "workflows.get" | "workflows.runs" | "workflows.run"
+            )
+        {
+            return Err("A habit run can only read and run workflows".into());
         }
         Ok(mono)
     }

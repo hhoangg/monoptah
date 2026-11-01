@@ -790,7 +790,7 @@ fn run_sets_run_requested_and_calls_check_now() {
     let result = f.ok("workflows.run", json!({"id": id}));
     assert_eq!(
         text(&result, "note"),
-        "It starts now, on its own. Its report is posted to this chat when it finishes."
+        "It starts now, on its own. Its report is posted to the Mono's chat when it finishes."
     );
     assert!(f.stored()[0].run_requested);
     assert_eq!(f.host.checks, 1);

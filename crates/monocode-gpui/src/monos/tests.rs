@@ -2834,7 +2834,7 @@ pub(super) fn launches_of(s: &Setup, cx: &mut TestAppContext) -> Vec<mono::Launc
     })
 }
 /// A habit run of the Mono, driven through its chat view (nothing is sent).
-fn fake_run(s: &Setup, cx: &mut TestAppContext) -> i64 {
+pub(super) fn fake_run(s: &Setup, cx: &mut TestAppContext) -> i64 {
     let run = locked(&s.store)
         .unwrap()
         .create("codex", &s.project)
@@ -4713,25 +4713,100 @@ fn workflow_actions_work_from_the_mono_chat_and_signal_the_runner(cx: &mut TestA
     assert!(saved_workflows(&s).is_empty());
 }
 
+/// Every `workflows.*` action the app takes.
+pub(super) const WORKFLOW_ACTIONS: [&str; 16] = [
+    "workflows.list",
+    "workflows.guide",
+    "workflows.get",
+    "workflows.stop",
+    "workflows.pause",
+    "workflows.resume",
+    "workflows.remove",
+    "workflows.export",
+    "workflows.run",
+    "workflows.add",
+    "workflows.validate",
+    "workflows.update",
+    "workflows.setInputs",
+    "workflows.resumeRun",
+    "workflows.import",
+    "workflows.runs",
+];
+
+const HABIT_RUN_REFUSAL: &str = "A habit run can only read and run workflows";
+
+fn nothing_found(
+    w: &monocode_core::mono::workflows::model::Workflow,
+) -> monocode_core::mono::workflows::preflight::Preflight {
+    monocode_core::mono::workflows::preflight::Preflight {
+        statuses: w
+            .requires
+            .iter()
+            .map(
+                |requirement| monocode_core::mono::workflows::preflight::RequirementStatus {
+                    requirement: requirement.clone(),
+                    met: false,
+                    detail: Some("Not found".into()),
+                },
+            )
+            .collect(),
+    }
+}
+
+/// Adds a workflow from the Mono's chat and returns its id.
+fn add_workflow(s: &Setup, request: &str, definition: Value, cx: &mut TestAppContext) -> String {
+    let added = call(
+        s,
+        request,
+        "workflows.add",
+        json!({"workflow": definition}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap();
+    added["id"].as_str().unwrap().to_string()
+}
+
+fn from_chat(s: &Setup, request: &str, action: &str, input: Value, cx: &mut TestAppContext) {
+    call(s, request, action, input, cx)
+        .try_recv()
+        .unwrap()
+        .unwrap();
+}
+
 #[gpui::test]
-fn a_habit_run_cannot_manage_workflows(cx: &mut TestAppContext) {
+fn a_habit_run_can_read_and_run_workflows_but_not_change_them(cx: &mut TestAppContext) {
     let s = setup(cx);
     let run = fake_run(&s, cx);
-    for (action, input) in [
-        ("workflows.list", json!({})),
-        ("workflows.guide", json!({})),
-        ("workflows.add", workflow_input("From a habit")),
-    ] {
-        let result = call_from(&s, run, action, action, input, cx)
+    let id = add_workflow(
+        &s,
+        "add-0",
+        workflow_input("Digest")["workflow"].clone(),
+        cx,
+    );
+    from_chat(&s, "resume-0", "workflows.resume", json!({"id": id}), cx);
+    let from_run = |request: &str, action: &str, input: Value, cx: &mut TestAppContext| {
+        call_from(&s, run, request, action, input, cx)
             .try_recv()
-            .unwrap();
-        assert_eq!(
-            result.unwrap_err(),
-            "Only a Mono's own conversation can manage its workflows",
-            "{action}"
-        );
-    }
-    assert!(saved_workflows(&s).is_empty());
+            .unwrap()
+    };
+    let listed = from_run("list", "workflows.list", json!({}), cx).unwrap();
+    assert_eq!(listed["workflows"][0]["id"], id.as_str());
+    assert_eq!(
+        from_run("get", "workflows.get", json!({"id": id}), cx).unwrap()["id"],
+        id.as_str()
+    );
+    assert!(from_run("runs", "workflows.runs", json!({"id": id}), cx).is_ok());
+    let started = from_run("run", "workflows.run", json!({"id": id}), cx).unwrap();
+    assert_eq!(started["id"], id.as_str());
+    // The request was taken by the runner at once, so the run is in the history.
+    let runs = monocode_core::mono::workflows::store::load_runs(
+        &monocode_core::mono::workflows::store::MonoDir::new(&s.root, &s.id),
+        &id,
+    )
+    .unwrap();
+    assert_eq!(runs.len(), 1);
     // A session that holds no capability at all gets no answer from this Mono.
     let outsider = call_from(&s, run + 1000, "x", "workflows.list", json!({}), cx)
         .try_recv()
@@ -4739,6 +4814,147 @@ fn a_habit_run_cannot_manage_workflows(cx: &mut TestAppContext) {
     assert_eq!(
         outsider.unwrap_err(),
         "This Mono no longer owns an active app capability"
+    );
+}
+
+#[gpui::test]
+fn a_habit_run_cannot_change_workflows_and_nothing_changes(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let id = add_workflow(
+        &s,
+        "add-0",
+        workflow_input("Digest")["workflow"].clone(),
+        cx,
+    );
+    from_chat(&s, "resume-0", "workflows.resume", json!({"id": id}), cx);
+    let before = saved_workflows(&s);
+    let refused = [
+        ("workflows.guide", json!({})),
+        ("workflows.validate", workflow_input("Other")),
+        ("workflows.add", workflow_input("From a habit")),
+        (
+            "workflows.update",
+            json!({"id": id, "workflow": workflow_input("Renamed")["workflow"].clone()}),
+        ),
+        ("workflows.setInputs", json!({"id": id, "values": {}})),
+        ("workflows.stop", json!({"id": id})),
+        ("workflows.pause", json!({"id": id})),
+        ("workflows.resume", json!({"id": id})),
+        ("workflows.resumeRun", json!({"id": id, "runId": "r1"})),
+        ("workflows.remove", json!({"id": id})),
+        ("workflows.export", json!({"id": id})),
+        ("workflows.import", json!({"yaml": "name: x"})),
+    ];
+    for (action, input) in refused {
+        let result = call_from(&s, run, action, action, input, cx)
+            .try_recv()
+            .unwrap();
+        assert_eq!(result.unwrap_err(), HABIT_RUN_REFUSAL, "{action}");
+    }
+    assert_eq!(saved_workflows(&s), before);
+}
+
+#[gpui::test]
+fn a_habit_run_cannot_start_a_paused_or_unreviewed_workflow(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let id = add_workflow(
+        &s,
+        "add-0",
+        workflow_input("Digest")["workflow"].clone(),
+        cx,
+    );
+    let paused = call_from(&s, run, "r1", "workflows.run", json!({"id": id}), cx)
+        .try_recv()
+        .unwrap();
+    assert_eq!(
+        paused.unwrap_err(),
+        "Resume the workflow before running it."
+    );
+    // A workflow made from a file waits for the user's review.
+    let dir = monocode_core::mono::workflows::store::MonoDir::new(&s.root, &s.id);
+    monocode_core::mono::workflows::store::update_workflows(&dir, |mut list| {
+        list[0].enabled = true;
+        list[0].needs_review = true;
+        Ok((list, ()))
+    })
+    .unwrap();
+    let review = call_from(&s, run, "r2", "workflows.run", json!({"id": id}), cx)
+        .try_recv()
+        .unwrap()
+        .unwrap_err();
+    assert!(review.contains("has not reviewed it yet"), "{review}");
+    assert!(!saved_workflows(&s)[0].run_requested);
+}
+
+#[gpui::test]
+fn a_habit_run_starts_a_workflow_with_values_for_one_run_and_meets_its_requirements(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let mut definition = workflow_input("Digest")["workflow"].clone();
+    definition["inputs"] = json!({"label": {"type": "string"}});
+    definition["inputValues"] = json!({"label": "saved"});
+    definition["requires"] = json!([{"cli": "gh"}]);
+    let id = add_workflow(&s, "add-0", definition, cx);
+    from_chat(&s, "resume-0", "workflows.resume", json!({"id": id}), cx);
+    cx.update(|cx| {
+        s.manager
+            .update(cx, |m, _| m.workflow_live.set_preflight(nothing_found))
+    });
+    let missing = call_from(&s, run, "r1", "workflows.run", json!({"id": id}), cx)
+        .try_recv()
+        .unwrap()
+        .unwrap_err();
+    assert!(missing.contains("Missing requirements:"), "{missing}");
+    assert!(!saved_workflows(&s)[0].run_requested);
+    // Met again: the per-run value reaches that run only.
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            m.workflow_live.set_preflight(|w| {
+                monocode_core::mono::workflows::preflight::Preflight {
+                    statuses: w
+                        .requires
+                        .iter()
+                        .map(
+                            |r| monocode_core::mono::workflows::preflight::RequirementStatus {
+                                requirement: r.clone(),
+                                met: true,
+                                detail: None,
+                            },
+                        )
+                        .collect(),
+                }
+            })
+        })
+    });
+    call_from(
+        &s,
+        run,
+        "r2",
+        "workflows.run",
+        json!({"id": id, "values": {"label": "once"}}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap();
+    let runs = monocode_core::mono::workflows::store::load_runs(
+        &monocode_core::mono::workflows::store::MonoDir::new(&s.root, &s.id),
+        &id,
+    )
+    .unwrap();
+    assert_eq!(runs.len(), 1);
+    let ran = serde_json::to_value(&runs[0]).unwrap().to_string();
+    assert!(ran.contains("once"), "{ran}");
+    let saved = serde_json::to_value(&saved_workflows(&s)[0])
+        .unwrap()
+        .to_string();
+    assert!(
+        saved.contains("saved") && !saved.contains("once"),
+        "{saved}"
     );
 }
 
