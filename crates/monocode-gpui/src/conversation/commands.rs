@@ -9,7 +9,8 @@ impl Conversation {
     /// A rejected command keeps its draft and attachments intact.
     pub(super) fn handle_local_command(&mut self, cx: &mut Context<Self>) -> bool {
         let text = self.input.read(cx).content.trim().to_owned();
-        if text.eq_ignore_ascii_case("/mcp") {
+        // A Mono composer has no `/` popups, so `/mcp` is an ordinary message there.
+        if self.settings.mono.is_none() && text.eq_ignore_ascii_case("/mcp") {
             if self.input.read(cx).is_composing() {
                 return true;
             }
