@@ -602,7 +602,6 @@ fn ownership_scope_hides_other_tasks_as_not_found() {
     sync(&store, &caller("m1", &["/p1"]), "cu", &["a"], t(14, 10, 0));
     let a = by_key(&store, "a").id;
     let stranger = Actor::Mono(caller("m9", &["/zzz"]));
-    let neighbour = Actor::Mono(caller("m8", &["/P1"]));
     for result in [
         store
             .today_complete(&a, &stranger, t(14, 11, 0))
@@ -624,9 +623,12 @@ fn ownership_scope_hides_other_tasks_as_not_found() {
     assert!(store.today_notes(&a).unwrap().is_empty());
     // Project paths compare exactly on unix; the owner and the user always see it.
     #[cfg(not(windows))]
-    assert!(store
-        .today_note(&a, "hi", &neighbour, t(14, 11, 0))
-        .is_err());
+    {
+        let neighbour = Actor::Mono(caller("m8", &["/P1"]));
+        assert!(store
+            .today_note(&a, "hi", &neighbour, t(14, 11, 0))
+            .is_err());
+    }
     let owner = Actor::Mono(caller("m1", &[]));
     store.today_note(&a, "mine", &owner, t(14, 11, 0)).unwrap();
     store
