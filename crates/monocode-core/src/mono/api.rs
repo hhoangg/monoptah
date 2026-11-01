@@ -17,11 +17,18 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "memory.add"=>"fact topic until","memory.replace"=>"find fact topic until","memory.remove"=>"find topic",
         "habits.add"=>"name instructions schedule","habits.update"=>"id name instructions schedule enabled","habits.run"|"habits.remove"=>"id",
         "chat.card"=>"type repo number note sessionId options name instructions schedule",
-        _=>super::workflows::cli::fields(action).ok_or("Unknown app action. Run app help")?,
+        _=>crate::today::actions::fields(action)
+            .or_else(|| super::workflows::cli::fields(action))
+            .ok_or("Unknown app action. Run app help")?,
     };
+    // today.* takes lists and flags (items, tags); its handler checks every field strictly.
+    let today = action.starts_with("today.");
     for (key, value) in input.as_object().ok_or("Input must be an object")? {
         if !fields.split_whitespace().any(|f| f == key) {
             return Err(format!("{action} does not take {key}"));
+        }
+        if today {
+            continue;
         }
         match key.as_str() {
             "completionDelivery" if !matches!(value.as_str(), Some("group" | "each")) => {
@@ -132,15 +139,17 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     {
         return Err("besideSessionId requires placement right or down".into());
     }
-    if input.get("tags").is_some_and(|v| {
-        v.as_array().is_none_or(|a| {
-            a.len() > crate::notes::MAX_TAGS
-                || a.iter().any(|v| {
-                    v.as_str()
-                        .is_none_or(|s| s.len() > crate::notes::MAX_TAG_LENGTH)
-                })
+    if !today
+        && input.get("tags").is_some_and(|v| {
+            v.as_array().is_none_or(|a| {
+                a.len() > crate::notes::MAX_TAGS
+                    || a.iter().any(|v| {
+                        v.as_str()
+                            .is_none_or(|s| s.len() > crate::notes::MAX_TAG_LENGTH)
+                    })
+            })
         })
-    }) {
+    {
         return Err("tags must be an array of up to 20 short strings".into());
     }
     Ok(())
@@ -159,6 +168,32 @@ mod tests {
             &json!({"prompt":"x","project":"/code","draft":true})
         )
         .is_ok());
+    }
+    #[test]
+    fn today_actions_take_their_own_fields_and_non_text_values() {
+        let ok = |action: &str, input| validate(action, &input);
+        assert!(ok("today.list", json!({})).is_ok());
+        assert!(ok("today.sources", json!({})).is_ok());
+        assert!(ok(
+            "today.sync",
+            json!({"source": "gh", "status": "ok", "items": [{"key": "a", "reopened": true}]})
+        )
+        .is_ok());
+        assert!(ok("today.add", json!({"title": "x", "tags": ["a", "b"]})).is_ok());
+        assert_eq!(
+            ok("today.sync", json!({"source": "gh", "bogus": 1})).unwrap_err(),
+            "today.sync does not take bogus"
+        );
+        assert_eq!(
+            ok("today.sources", json!({"mono": "b"})).unwrap_err(),
+            "today.sources does not take mono"
+        );
+        // Other actions keep wanting text where they did.
+        assert!(ok("habits.add", json!({"items": []})).is_err());
+        assert_eq!(
+            ok("today.nope", json!({})).unwrap_err(),
+            "Unknown app action. Run app help"
+        );
     }
     #[test]
     fn workflows_actions_take_their_own_fields_and_objects() {

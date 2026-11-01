@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum AppView {
+    Today,
     Inbox,
     Notes,
     Automations,
@@ -16,6 +17,7 @@ pub(crate) enum AppView {
 impl AppView {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Today => "Today",
             Self::Inbox => "Inbox",
             Self::Notes => "Notes",
             Self::Automations => "Automations",
@@ -24,6 +26,7 @@ impl AppView {
     }
     pub fn icon(self) -> &'static str {
         match self {
+            Self::Today => "clock",
             Self::Inbox => "inbox",
             Self::Notes => "note",
             Self::Automations => "zap",
@@ -98,6 +101,7 @@ pub(crate) struct Workspace {
     pub sidebar_notes_visible: bool,
     pub sidebar_automations_visible: bool,
     pub sidebar_contributors_visible: bool,
+    pub sidebar_today_visible: bool,
     pub sidebar_inbox_visible: bool,
     pub sidebar_activity_visible: bool,
     /// The inset right panel: open state, tab, width and tab order.
@@ -313,6 +317,7 @@ impl Default for Workspace {
             sidebar_notes_visible: true,
             sidebar_automations_visible: true,
             sidebar_contributors_visible: true,
+            sidebar_today_visible: true,
             sidebar_inbox_visible: true,
             sidebar_activity_visible: true,
             right_panel_open: false,

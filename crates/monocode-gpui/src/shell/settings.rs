@@ -65,6 +65,10 @@ impl Shell {
             }
         }
         SettingsContext {
+            today_rollover_minutes: self
+                .today
+                .as_ref()
+                .and_then(|t| t.read(cx).rollover_minutes()),
             data_dir: self.data_dir.clone(),
             remote: Some(self.remote.clone()),
             mobile: self.mobile_status(),
@@ -155,6 +159,13 @@ impl Shell {
                     if let Some(inbox) = &this.inbox {
                         inbox.update(cx, |inbox, cx| inbox.open_connection(provider.clone(), cx));
                     }
+                }
+                SettingsEvent::TodayRollover(minutes) => {
+                    this.ensure_background_today(window, cx);
+                    if let Some(today) = &this.today {
+                        today.update(cx, |today, cx| today.set_rollover(*minutes, cx));
+                    }
+                    this.sync_settings(cx);
                 }
                 SettingsEvent::WhatsNew => {
                     this.open_whats_new(crate::notifications::updater::version().into(), cx)

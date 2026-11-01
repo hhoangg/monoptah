@@ -24,6 +24,7 @@ mod search;
 mod status;
 #[cfg(test)]
 mod tests;
+mod today_bridge;
 mod work;
 mod workflow_runner;
 mod workflow_schedule;
@@ -105,6 +106,8 @@ pub(crate) struct Monos {
     loading_chats: HashSet<String>,
     work: work::Cache,
     pub(crate) error: Option<String>,
+    /// The roster could not be loaded, so `roster` is empty by default, not by choice.
+    roster_failed: bool,
     reset: Option<reset::ResetDialog>,
     /// Monos a paired phone is resetting; there is no dialog to mark them busy.
     phone_resets: HashSet<String>,
@@ -184,6 +187,8 @@ pub(crate) struct Monos {
     workflow_checks: workflow_schedule::Checks,
     /// The Workflows tab and its pages.
     wf: workflows_ui::WorkflowsUi,
+    /// The Today page's view of the Monos: its revision and every Mono's habits.
+    today: today_bridge::Bridge,
 }
 impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
@@ -378,6 +383,7 @@ impl Monos {
             writes: None,
             loading_chats: HashSet::new(),
             work: work::Cache::default(),
+            roster_failed: roster_error.is_some(),
             error: roster_error,
             reset: None,
             phone_resets: HashSet::new(),
@@ -443,6 +449,7 @@ impl Monos {
             workflow_live: workflow_runner::Live::new(),
             workflow_checks: Default::default(),
             wf: Default::default(),
+            today: Default::default(),
         };
         cx.set_global(workflow_schedule::QuitTarget(this.workflows.clone()));
         this.start_workflow_checks(cx);

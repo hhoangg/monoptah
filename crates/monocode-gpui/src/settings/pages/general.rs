@@ -121,6 +121,41 @@ impl SettingsView {
             ));
         }
         workspace.push(self.row(
+            Some("today-rollover"),
+            false,
+            "Work day starts at",
+            Some("Today counts the hours before this time as the day before.".into()),
+            vec![
+                    self.select(
+                        "today-rollover",
+                        "Work day starts at",
+                        &self
+                            .ctx
+                            .today_rollover_minutes
+                            .unwrap_or(monocode_core::today::DEFAULT_ROLLOVER_MINUTES)
+                            .to_string(),
+                        (0..=24)
+                            .map(|step| {
+                                let minutes = step * 30;
+                                (
+                                    minutes.to_string(),
+                                    format!("{:02}:{:02}", minutes / 60, minutes % 60).into(),
+                                    None,
+                                )
+                            })
+                            .collect(),
+                        Some(96.),
+                        cx,
+                        |this, value, cx| {
+                            if let Ok(minutes) = value.parse::<u32>() {
+                                this.ctx.today_rollover_minutes = Some(minutes);
+                                cx.emit(crate::settings::SettingsEvent::TodayRollover(minutes));
+                            }
+                        },
+                    ),
+                ],
+        ));
+        workspace.push(self.row(
             Some("working-agents"),
             false,
             "Working agents",

@@ -724,6 +724,7 @@ pub(crate) struct Shell {
     _session_clock: gpui::Task<()>,
     notes: Option<Entity<Notes>>,
     inbox: Option<Entity<crate::inbox::Inbox>>,
+    today: Option<Entity<crate::today::Today>>,
     automations: Option<Entity<crate::automations::Automations>>,
     contributors: Option<Entity<crate::contributors::ContributorsPage>>,
     /// The app-wide Contributors job model, fed by the core's sinks.
@@ -1110,6 +1111,7 @@ impl Shell {
             _session_clock: session_clock,
             notes: None,
             inbox: None,
+            today: None,
             automations: None,
             contributors: None,
             sync_jobs: cx.new(crate::contributors::SyncJobs::new),
@@ -11771,9 +11773,15 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
-        assert_eq!(root.read_with(cx, |s, _| s.sidebar_hover), Some("Inbox"));
+        assert_eq!(root.read_with(cx, |s, _| s.sidebar_hover), Some("Today"));
         cx.update_window(window.into(), |_, w, cx| {
             w.simulate_mouse_move(gpui::point(px(40.), px(169.)), cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(root.read_with(cx, |s, _| s.sidebar_hover), Some("Inbox"));
+        cx.update_window(window.into(), |_, w, cx| {
+            w.simulate_mouse_move(gpui::point(px(40.), px(202.)), cx)
         })
         .unwrap();
         cx.run_until_parked();

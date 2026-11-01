@@ -71,6 +71,8 @@ pub(crate) struct SettingsContext {
     pub mobile: Option<monocode_core::mobile::Status>,
     /// The pairing code on show.
     pub mobile_invite: Option<monocode_core::mobile::Invite>,
+    /// Minutes after midnight when the Today work day starts; `None` until Today has loaded it.
+    pub today_rollover_minutes: Option<u32>,
 }
 impl PartialEq for SettingsContext {
     fn eq(&self, other: &Self) -> bool {
@@ -95,6 +97,7 @@ impl PartialEq for SettingsContext {
             && self.inbox_connections == other.inbox_connections
             && self.mobile == other.mobile
             && self.mobile_invite == other.mobile_invite
+            && self.today_rollover_minutes == other.today_rollover_minutes
     }
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -113,6 +116,8 @@ pub(crate) enum SettingsEvent {
     CheckAppUpdates,
     CheckHarnessUpdates,
     ManageInboxProvider(String),
+    /// General's Work day starts at, in minutes after midnight.
+    TodayRollover(u32),
     Changed(Box<Preferences>),
     /// The Appearance page's Layout picker: true for Focused, false for Classic.
     NewLayout(bool),

@@ -606,6 +606,7 @@ impl Shell {
             )
             .children(
                 [
+                    ("Today", "clock"),
                     ("Inbox", "inbox"),
                     ("Notes", "file"),
                     ("Automations", "zap"),
@@ -613,6 +614,7 @@ impl Shell {
                 ]
                 .into_iter()
                 .filter(|(label, _)| match *label {
+                    "Today" => self.workspace.sidebar_today_visible,
                     "Inbox" => self.workspace.sidebar_inbox_visible,
                     "Notes" => {
                         self.workspace.preferences.notes && self.workspace.sidebar_notes_visible
@@ -623,6 +625,11 @@ impl Shell {
                 })
                 .map(|(label, glyph)| {
                     let selected = self.app_view_label() == Some(label);
+                    let open_count = if label == "Today" {
+                        self.today.as_ref().map_or(0, |t| t.read(cx).open_count())
+                    } else {
+                        0
+                    };
                     let unread = label == "Inbox"
                         && self
                             .inbox
@@ -632,7 +639,13 @@ impl Shell {
                         .id(label)
                         .debug_selector(move || format!("sidebar-navigation-{label}"))
                         .role(Role::Button)
-                        .aria_label(if unread { "Inbox, new items" } else { label })
+                        .aria_label(if unread {
+                            "Inbox, new items".to_string()
+                        } else if open_count > 0 {
+                            format!("{label}, {open_count} open")
+                        } else {
+                            label.to_string()
+                        })
                         .aria_selected(selected)
                         .cursor_pointer()
                         .h(px(32.))
@@ -652,10 +665,21 @@ impl Shell {
                             0.35
                         })))
                         .child(div().flex_1().child(label))
+                        .when(open_count > 0, |row| {
+                            row.child(
+                                div()
+                                    .debug_selector(|| "sidebar-today-count".into())
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(content(0.45))
+                                    .child(open_count.to_string()),
+                            )
+                        })
                         .when(unread, |d| {
                             d.child(div().size(px(8.)).rounded_full().bg(accent_color()))
                         })
                         .on_click(cx.listener(move |this, _, w, cx| match label {
+                            "Today" => this.open_today(w, cx),
                             "Inbox" => this.open_inbox(w, cx),
                             "Notes" => this.open_notes(w, cx),
                             "Automations" => this.open_automations(w, cx),
@@ -829,6 +853,10 @@ impl Shell {
             .children(
                 [
                     (
+                        workspace::AppView::Today,
+                        self.workspace.sidebar_today_visible,
+                    ),
+                    (
                         workspace::AppView::Inbox,
                         self.workspace.sidebar_inbox_visible,
                     ),
@@ -855,6 +883,7 @@ impl Shell {
                         view.icon()
                     };
                     let rail_id = match view {
+                        workspace::AppView::Today => "rail-today",
                         workspace::AppView::Inbox => "rail-inbox",
                         workspace::AppView::Notes => "rail-notes",
                         workspace::AppView::Automations => "rail-automations",
@@ -881,6 +910,7 @@ impl Shell {
                                 this.close_app_view(w, cx);
                             } else {
                                 match view {
+                                    workspace::AppView::Today => this.open_today(w, cx),
                                     workspace::AppView::Inbox => this.open_inbox(w, cx),
                                     workspace::AppView::Notes => this.open_notes(w, cx),
                                     workspace::AppView::Automations => this.open_automations(w, cx),

@@ -1,6 +1,6 @@
 //! The three application destinations share one navigation and focus boundary.
 use super::*;
-use crate::{automations, inbox, notes};
+use crate::{automations, inbox, notes, today};
 
 pub(super) use crate::workspace::AppView;
 
@@ -11,6 +11,7 @@ impl Shell {
 
     pub(super) fn app_view_label(&self) -> Option<&'static str> {
         self.active_app_view.map(|view| match view {
+            AppView::Today => "Today",
             AppView::Inbox => "Inbox",
             AppView::Notes => "Notes",
             AppView::Automations => "Automations",
@@ -213,6 +214,7 @@ impl Shell {
     pub(super) fn app_view_body(&self) -> Option<AnyElement> {
         match self.active_app_view? {
             AppView::Notes => self.notes.clone().map(IntoElement::into_any_element),
+            AppView::Today => self.today.clone().map(IntoElement::into_any_element),
             AppView::Inbox => self.inbox.clone().map(IntoElement::into_any_element),
             AppView::Automations => self.automations.clone().map(IntoElement::into_any_element),
             AppView::Contributors => self.contributors.clone().map(IntoElement::into_any_element),
@@ -222,6 +224,7 @@ impl Shell {
     pub(super) fn focus_app_view(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let focus = match self.active_app_view {
             Some(AppView::Notes) => self.notes.as_ref().map(|view| view.focus_handle(cx)),
+            Some(AppView::Today) => self.today.as_ref().map(|view| view.focus_handle(cx)),
             Some(AppView::Inbox) => self.inbox.as_ref().map(|view| view.focus_handle(cx)),
             Some(AppView::Automations) => {
                 self.automations.as_ref().map(|view| view.focus_handle(cx))
@@ -262,6 +265,90 @@ impl Shell {
             });
         }
         self.show_app_view(AppView::Notes, window, cx);
+    }
+
+    pub(super) fn open_today(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prepare_app_view(window, cx);
+        self.ensure_background_today(window, cx);
+        if let Some(today) = &self.today {
+            today.update(cx, |today, cx| today.refresh(cx));
+        }
+        self.show_app_view(AppView::Today, window, cx);
+    }
+
+    /// Creates the page without showing it, so the sidebar count is there
+    /// before the page was ever opened.
+    pub(super) fn ensure_background_today(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.today.is_none() {
+            let view = cx.new(|cx| today::Today::new(self.store.clone(), cx));
+            self.app_view_events.push(cx.subscribe_in(
+                &view,
+                window,
+                |this, _, event: &today::Event, window, cx| match event {
+                    today::Event::Close => this.close_app_view(window, cx),
+                    today::Event::StartSession(task) => {
+                        this.start_today_session(task.as_ref().clone(), cx)
+                    }
+                    today::Event::SyncNow(targets) => {
+                        if let Some(monos) = this.monos.clone() {
+                            monos.update(cx, |monos, cx| {
+                                monos.request_habit_runs(targets.clone(), cx)
+                            });
+                        }
+                    }
+                },
+            ));
+            // The sidebar count lives in chrome that does not observe the page.
+            let mut count = 0;
+            let mut rollover = None;
+            self.app_view_events
+                .push(cx.observe(&view, move |this, today, cx| {
+                    let now = today.read(cx).open_count();
+                    if now != count {
+                        count = now;
+                        this.invalidate_chrome(cx);
+                    }
+                    // Settings shows the saved work day start once it is known.
+                    let minutes = today.read(cx).rollover_minutes();
+                    if minutes != rollover {
+                        rollover = minutes;
+                        this.sync_settings(cx);
+                    }
+                    cx.notify();
+                }));
+            if let Some(monos) = self.monos.clone() {
+                let mut revision = None;
+                self.app_view_events
+                    .push(cx.observe(&monos, move |this, monos, cx| {
+                        let next = monos.read(cx).today_revision();
+                        let Some(today) = this.today.clone() else {
+                            return;
+                        };
+                        let roster = monos.read(cx).today_roster(cx);
+                        let changed = revision != Some(next);
+                        revision = Some(next);
+                        today.update(cx, |today, cx| {
+                            if let Some(roster) = roster {
+                                today.set_roster(roster, cx);
+                            }
+                            if changed {
+                                today.refresh(cx);
+                            }
+                        });
+                    }));
+                // Claim the first habit read now, so it wakes the page when it lands.
+                monos.update(cx, |monos, cx| monos.reload_today_habits(cx));
+                if let Some(roster) = monos.read(cx).today_roster(cx) {
+                    view.update(cx, |today, cx| today.set_roster(roster, cx));
+                }
+            }
+            self.today = Some(view);
+        }
+        if let Some(today) = &self.today {
+            today.update(cx, |today, cx| {
+                today.set_appearances(self.workspace.project_appearance.clone(), cx)
+            });
+        }
     }
 
     pub(super) fn open_inbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -558,24 +645,67 @@ impl Shell {
         } else {
             item.project_path.clone()
         };
+        let title = format!("{} · {}", item.reference(), item.title);
+        let ticket = monocode_core::telegram::forward::inbox_ticket(&item);
+        self.start_work_session(
+            cwd,
+            title,
+            Some(item.work_item()),
+            Some(ticket),
+            prompt,
+            "Choose a project folder before starting work on this item",
+            cx,
+        );
+    }
+
+    /// A session in the task's project with the task as its context. A task
+    /// with no project falls back to the current one, as an Inbox item does.
+    fn start_today_session(&mut self, task: monocode_core::today::Task, cx: &mut Context<Self>) {
+        let cwd = task
+            .project
+            .clone()
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| self.workspace.project.clone());
+        let prompt = today::start_prompt(&task);
+        self.start_work_session(
+            cwd,
+            task.title.clone(),
+            None,
+            None,
+            prompt,
+            "Choose a project folder before starting work on this task",
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_work_session(
+        &mut self,
+        cwd: String,
+        title: String,
+        work_item: Option<monocode_core::session_groups::WorkItem>,
+        ticket: Option<String>,
+        prompt: String,
+        missing_folder: &'static str,
+        cx: &mut Context<Self>,
+    ) {
         let kind = self.default_kind();
         let settings = self.project_session_settings(kind, &cwd, cx);
         // applyInboxStart: the provider's surface, kept as a terminal only when its
         // CLI takes a first prompt (the start prompt becomes it); else a chat.
         let preferred =
             monocode_core::surface::automation_surface(kind, &cwd, self.provider_surface(kind));
-        let ticket = monocode_core::telegram::forward::inbox_ticket(&item);
         let store = self.store.clone();
         self.navigation_revision += 1;
         let revision = self.navigation_revision;
         let work = cx.background_executor().spawn(async move {
             if !std::path::Path::new(&cwd).is_dir() {
-                return Err("Choose a project folder before starting work on this item".into());
+                return Err(missing_folder.into());
             }
             let store = locked(&store)?;
             let mut summary = store.create_with_surface(kind.id(), &cwd, preferred)?;
-            summary.title = format!("{} · {}", item.reference(), item.title);
-            summary.work_item = Some(item.work_item());
+            summary.title = title;
+            summary.work_item = work_item;
             store.title(summary.id, &summary.title)?;
             store.set_work_item(summary.id, summary.work_item.as_ref())?;
             store.save_agent_settings(summary.id, &settings)?;
@@ -587,7 +717,9 @@ impl Shell {
                 Ok((summary, settings, prompt)) => {
                     let id = summary.id;
                     let terminal = summary.surface.is_tui();
-                    this.session_tickets.insert(id, ticket);
+                    if let Some(ticket) = ticket {
+                        this.session_tickets.insert(id, ticket);
+                    }
                     this.add(summary, cx);
                     if terminal {
                         if let Some(tui) = this.tui_sessions.get(&id) {

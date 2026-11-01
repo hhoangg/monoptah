@@ -335,3 +335,24 @@ fn launch_identity_and_unsent_prompt_survive_reopen_without_duplicate_sessions()
             .unwrap();
     }
 }
+
+#[test]
+fn operator_sessions_cannot_use_today_actions() {
+    for action in [
+        "today.list",
+        "today.sync",
+        "today.add",
+        "today.update",
+        "today.note",
+        "today.complete",
+        "today.snooze",
+        "today.dismiss",
+        "today.sources",
+    ] {
+        let error = validate_operator(action, &json!({})).unwrap_err();
+        assert!(
+            error.starts_with("Unknown Operator action"),
+            "{action}: {error}"
+        );
+    }
+}

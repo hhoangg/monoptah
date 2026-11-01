@@ -5,6 +5,7 @@ use gpui::{TestAppContext, VisualTestContext, WindowHandle};
 
 #[derive(Clone, Copy, Debug)]
 enum Surface {
+    Today,
     Inbox,
     Notes,
     Automations,
@@ -15,6 +16,7 @@ enum Surface {
 impl Surface {
     fn open(self, shell: &mut Shell, window: &mut Window, cx: &mut Context<Shell>) {
         match self {
+            Self::Today => shell.open_today(window, cx),
             Self::Inbox => shell.open_inbox(window, cx),
             Self::Notes => shell.open_notes(window, cx),
             Self::Automations => {
@@ -43,7 +45,9 @@ impl Surface {
 
     fn close(self, shell: &mut Shell, session: i64, window: &mut Window, cx: &mut Context<Shell>) {
         match self {
-            Self::Inbox | Self::Notes | Self::Automations => shell.close_app_view(window, cx),
+            Self::Today | Self::Inbox | Self::Notes | Self::Automations => {
+                shell.close_app_view(window, cx)
+            }
             Self::Search => shell.close_app_search(window, cx),
             // Returning to a conversation is the same route used by the
             // original project rail and by opening a Mono's launched session.
@@ -292,6 +296,128 @@ fn assert_original_surface(surface: Surface, cx: &mut TestAppContext) {
             assert_eq!(shell.workspace.tabs, tabs);
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn original_app_surfaces_today_uses_own_header_and_restores_sessions(cx: &mut TestAppContext) {
+    assert_original_surface(Surface::Today, cx);
+}
+
+/// Today sits above Inbox in the sidebar, hides through the options menu and
+/// the choice survives a workspace save.
+fn assert_today_navigation(classic: bool, cx: &mut TestAppContext) {
+    let (window, _) = setup(cx, classic, false);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let today = visual.debug_bounds("sidebar-navigation-Today").unwrap();
+    let inbox = visual.debug_bounds("sidebar-navigation-Inbox").unwrap();
+    assert!(today.bottom() <= inbox.top(), "classic={classic}");
+    if classic {
+        // The original layout reaches the same menu from its own sidebar header.
+        window
+            .update(visual, |shell, _, cx| {
+                shell.change_sidebar_option("sidebar-today", cx)
+            })
+            .unwrap();
+    } else {
+        let options = visual.debug_bounds("sidebar-options").unwrap();
+        visual.simulate_click(options.center(), Default::default());
+        visual.run_until_parked();
+        let first = visual.debug_bounds("menu-action-sidebar-today").unwrap();
+        let notes = visual.debug_bounds("menu-action-sidebar-notes").unwrap();
+        assert!(
+            first.bottom() <= notes.top(),
+            "Today leads the options menu"
+        );
+        visual.simulate_click(first.center(), Default::default());
+    }
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("sidebar-navigation-Today").is_none());
+    assert!(visual.debug_bounds("sidebar-navigation-Inbox").is_some());
+    window
+        .read_with(visual, |shell, _| {
+            assert!(!shell.workspace.sidebar_today_visible);
+            let saved = shell.latest_state.lock().unwrap().clone();
+            let restored = Workspace::restore(Some(&saved), &[], "/work/monocode");
+            assert!(!restored.sidebar_today_visible);
+        })
+        .unwrap();
+    // A workspace saved before this setting existed shows Today.
+    let mut saved: serde_json::Value = serde_json::to_value(Workspace::default()).unwrap();
+    let fields = saved.as_object_mut().unwrap();
+    assert!(
+        fields.contains_key("sidebar_today_visible") || fields.contains_key("sidebarTodayVisible")
+    );
+    fields.remove("sidebar_today_visible");
+    fields.remove("sidebarTodayVisible");
+    assert!(
+        serde_json::from_value::<Workspace>(saved)
+            .unwrap()
+            .sidebar_today_visible
+    );
+}
+
+#[gpui::test]
+fn today_leads_the_sidebar_and_hides_through_the_menu_in_the_new_layout(cx: &mut TestAppContext) {
+    assert_today_navigation(false, cx);
+}
+
+#[gpui::test]
+fn today_leads_the_sidebar_and_hides_through_the_menu_in_the_original_layout(
+    cx: &mut TestAppContext,
+) {
+    assert_today_navigation(true, cx);
+}
+
+#[gpui::test]
+fn opening_today_makes_it_the_active_app_view_and_a_title_tab(cx: &mut TestAppContext) {
+    let (window, _) = setup(cx, false, false);
+    window
+        .update(cx, |shell, window, cx| shell.open_today(window, cx))
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .read_with(cx, |shell, _| {
+            assert_eq!(shell.active_app_view, Some(app_views::AppView::Today));
+            assert!(shell.today.is_some());
+            assert!(
+                shell
+                    .workspace
+                    .title_order
+                    .contains(&TitleTab::App(app_views::AppView::Today))
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_sidebar_shows_the_open_count_only_when_there_is_one(cx: &mut TestAppContext) {
+    let (window, _) = setup(cx, false, false);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |shell, window, cx| {
+            shell.ensure_background_today(window, cx);
+            let today = shell.today.clone().unwrap();
+            let store = shell.store.clone();
+            locked(&store)
+                .unwrap()
+                .today_add(
+                    &monocode_core::today::NewTask {
+                        title: "Ship it".into(),
+                        ..Default::default()
+                    },
+                    &monocode_core::today::Actor::User,
+                    monocode_core::time::now_ms(),
+                )
+                .unwrap();
+            today.update(cx, |today, cx| today.refresh(cx));
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("sidebar-today-count").is_some());
 }
 
 #[gpui::test]

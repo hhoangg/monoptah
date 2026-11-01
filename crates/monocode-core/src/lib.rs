@@ -36,6 +36,7 @@ pub mod store;
 pub mod surface;
 pub mod telegram;
 pub mod time;
+pub mod today;
 pub mod tool;
 pub mod transcript;
 pub mod tui_hook;

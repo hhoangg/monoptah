@@ -318,6 +318,14 @@ pub(crate) fn composer_shadow() -> Vec<gpui::BoxShadow> {
 pub(crate) fn is_light() -> bool {
     TOKENS.with(|tokens| tokens.borrow().as_ref().is_some_and(|t| t.light))
 }
+/// Amber for "needs attention" text: darker on light themes so it stays readable.
+pub(crate) fn warning_color() -> Hsla {
+    rgb(if is_light() { 0xb45309 } else { 0xfbbf24 }).into()
+}
+/// Red for failed or urgent text, darkened on light themes.
+pub(crate) fn danger_color() -> Hsla {
+    rgb(if is_light() { 0xdc2626 } else { 0xf87171 }).into()
+}
 /// The opaque card behind popovers and modals in light themes, and wherever
 /// the renderer has no backdrop blur.
 pub(crate) fn floating_fill() -> Hsla {

@@ -262,6 +262,11 @@ impl Monos {
     fn finish_call(&mut self, call: Call, result: Result<Value, String>, cx: &mut Context<Self>) {
         let key = (call.session, call.request_id.clone());
         self.app_pending.remove(&key);
+        // A read has nothing to replay, and a day's list is large to keep as a receipt.
+        if matches!(call.action.as_str(), "today.list" | "today.sources") {
+            let _ = call.reply.send(result);
+            return;
+        }
         if self.app_results.len() > 1024
             && let Some(key) = self.app_results.keys().next().cloned()
         {
@@ -326,6 +331,15 @@ impl Monos {
                                 cx,
                             );
                         }
+                    }
+                    // Reads change nothing: they must not make the page reload.
+                    if call.action.starts_with("today.")
+                        && !matches!(call.action.as_str(), "today.list" | "today.sources")
+                    {
+                        this.today.bump();
+                    }
+                    if call.action.starts_with("habits.") {
+                        this.reload_today_habits(cx);
                     }
                     this.reload_files(&mono_id, cx);
                     this.refresh_cards(cx);
@@ -904,6 +918,27 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                         _=>unreachable!(),
                     };Ok((value,Effect::None))
                 },cx);
+                return;
+            }
+            today if today.starts_with("today.") => {
+                // The caller comes from the checked session capability, never from the input.
+                let caller = self.today_caller(&call, &mono);
+                let name = action.clone();
+                self.call_work(
+                    call,
+                    target,
+                    move |store| {
+                        let value = monocode_core::today::actions::handle(
+                            &*locked(&store)?,
+                            &caller,
+                            &name,
+                            &input,
+                            now_ms(),
+                        )?;
+                        Ok((value, Effect::None))
+                    },
+                    cx,
+                );
                 return;
             }
             workflow if workflow.starts_with("workflows.") => {
