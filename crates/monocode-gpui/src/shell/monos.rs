@@ -141,14 +141,93 @@ impl Shell {
     pub(crate) fn mono_groups(&self, project: &str) -> monocode_core::session_groups::Groups {
         self.groups.get(project).cloned().unwrap_or_default()
     }
+    /// Shows the groups now and saves them through the same queue as deletes,
+    /// so an older snapshot can never land after a newer one. The receiver says
+    /// how the save went; a failure also shows in the error line.
     pub(crate) fn mono_apply_groups(
         &mut self,
         project: String,
         groups: monocode_core::session_groups::Groups,
         cx: &mut Context<Self>,
-    ) {
-        self.groups.insert(project, groups);
+    ) -> async_channel::Receiver<Result<(), String>> {
+        self.groups.insert(project.clone(), groups.clone());
         self.invalidate_chrome(cx);
+        self.store_write_reporting("save folders", cx, move |store| {
+            store.save_groups(&project, &groups)
+        })
+    }
+    /// Deletes a session for a Mono and answers on `report` once the provider
+    /// files are dealt with. Files are only requested for a session this
+    /// computer holds files for; anything else reports `Nothing`.
+    pub(crate) fn mono_delete_with_files(
+        &mut self,
+        id: i64,
+        report: async_channel::Sender<Result<super::project_removal::FilesOutcome, String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let provider_files =
+            self.session_summaries.contains_key(&id) && self.local_files_kind(id, cx).is_some();
+        self.delete_session_with(
+            id,
+            super::project_removal::DeleteOptions {
+                provider_files,
+                worktree: None,
+                report: Some(report),
+            },
+            window,
+            cx,
+        );
+    }
+    /// Whether an orchestration lead is running this session as a worker.
+    pub(crate) fn mono_is_worker(&self, id: i64) -> bool {
+        self.orchestration_worker(id)
+    }
+    #[cfg(test)]
+    pub(crate) fn mono_set_provider_cleanup(
+        &mut self,
+        cleanup: impl Fn(
+            Option<&std::path::Path>,
+            &monocode_core::provider_cleanup::CleanupRequest,
+        ) -> monocode_core::provider_cleanup::CleanupReport
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.provider_cleanup = Arc::new(cleanup);
+    }
+    /// Test support: makes a stored session known to the shell, as a restart would.
+    #[cfg(test)]
+    pub(crate) fn mono_test_adopt(&mut self, summary: Session) {
+        self.session_summaries.insert(summary.id, summary);
+    }
+    #[cfg(test)]
+    pub(crate) fn mono_test_has_session(&self, id: i64) -> bool {
+        self.session_summaries.contains_key(&id)
+    }
+    /// Test support: `worker` runs as an orchestration worker of `lead`.
+    #[cfg(test)]
+    pub(crate) fn mono_test_make_worker(&mut self, lead: i64, worker: i64) {
+        self.orchestration_summaries.insert(
+            lead,
+            monocode_core::orchestration::Summary {
+                live: false,
+                tasks: vec![monocode_core::orchestration::SummaryTask {
+                    session: Some(worker),
+                    title: "Write the tests".into(),
+                    provider: "codex".into(),
+                    model: None,
+                    status: "completed".into(),
+                }],
+            },
+        );
+    }
+    /// Test support: a detached file pane of the session sits in a tab.
+    #[cfg(test)]
+    pub(crate) fn mono_test_pin_pane(&mut self, session: i64) {
+        let pane = 9_000_001;
+        self.workspace.review_owners.insert(pane, session);
+        self.workspace.tabs.push(pane);
     }
     pub(crate) fn mono_remove(
         &mut self,

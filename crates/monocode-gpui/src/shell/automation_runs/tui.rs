@@ -23,6 +23,7 @@ impl Shell {
         settings: &monocode_core::agent::Settings,
         persisted: String,
         due: &DueAutomationRun,
+        folder: Option<&monocode_core::session_groups::Folder>,
         reveal: bool,
         revision: u64,
         window: &mut Window,
@@ -46,7 +47,7 @@ impl Shell {
             },
         );
         self.update_automation_run(due.run.id.clone(), "running", Some(persisted), None, cx);
-        self.place_automation_session(id, &due.automation, cx);
+        self.place_automation_session(id, &due.automation, folder, cx);
         let prompt = due
             .run
             .prompt

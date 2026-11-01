@@ -224,6 +224,8 @@ impl Shell {
             .cloned()
             .unwrap_or_default()
             .folders;
+        // What the picker showed: a folder removed since then is brought back.
+        let shown = folders.clone();
         let picker = cx.new(|cx| Picker::new(folders, cx));
         let events = cx.subscribe_in(
             &picker,
@@ -232,7 +234,10 @@ impl Shell {
                 if !matches!(target, Target::Dismiss) && this.sessions.contains_key(&id) {
                     let groups = this.groups.entry(project.clone()).or_default();
                     match target {
-                        Target::Existing(folder) => groups.add_to_folder(folder, id),
+                        Target::Existing(folder) => match shown.iter().find(|f| f.id == *folder) {
+                            Some(snapshot) => groups.add_or_restore(snapshot, id),
+                            None => groups.add_to_folder(folder, id),
+                        },
                         Target::New(name) => {
                             let folder = monocode_core::mono::new_id();
                             groups.create_folder(&[id], folder.clone());
@@ -310,6 +315,66 @@ impl Shell {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn choosing_a_folder_removed_while_the_picker_was_open_brings_it_back(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            super::super::bind_keys(cx);
+            crate::input::bind(cx);
+        });
+        let (window, other, id) = super::super::tests::window(cx);
+        let project = window
+            .update(cx, |shell, _, cx| {
+                let project = shell.workspace.project.clone();
+                shell.sessions[&id].update(cx, |view, cx| {
+                    view.summary.cwd = project.clone();
+                    view.input
+                        .update(cx, |i, cx| i.set_text("/add-to-folder ".into(), cx));
+                });
+                shell
+                    .groups
+                    .entry(project.clone())
+                    .or_default()
+                    .create_folder(&[other], "old-id".into());
+                shell
+                    .groups
+                    .get_mut(&project)
+                    .unwrap()
+                    .rename_folder("old-id", "Old");
+                project
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.simulate_input("Old");
+        visual.run_until_parked();
+        // The folder's only session is deleted while the picker is still open.
+        window
+            .update(visual, |shell, _, _| {
+                shell
+                    .groups
+                    .get_mut(&project)
+                    .unwrap()
+                    .remove_deleted_session(other);
+                assert!(shell.groups[&project].folder("old-id").is_none());
+            })
+            .unwrap();
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                let folder = shell.groups[&project].folder("old-id").expect("restored");
+                assert_eq!(
+                    (folder.name.as_str(), &folder.session_ids),
+                    ("Old", &vec![id])
+                );
+                assert_eq!(
+                    locked(&shell.store).unwrap().groups(&project).unwrap(),
+                    shell.groups[&project]
+                );
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     fn folder_command_searches_creates_and_moves_without_sending_or_losing_a_draft(

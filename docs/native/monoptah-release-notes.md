@@ -1,11 +1,14 @@
-# Monoptah Native 0.40.1
+# Monoptah Native 0.40.2
 
 A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.40.0
+## Changes since 0.40.1
 
-- Habits can start workflows. A habit run may now read workflows and call `workflows.run`, with values for that one run. Paused and unreviewed workflows are still refused, requirements are still checked, and the report arrives in the Mono's chat as usual.
-- A habit run still cannot add, change, pause, resume or remove workflows. Heartbeats and a workflow's question to its Mono cannot use workflows at all.
+- A Mono or a habit run can now delete a session together with its provider session files. `sessions.delete` takes an optional `providerFiles` flag, off by default. With it on, the Claude Code or Codex files of that session are removed from disk. This is irreversible, so an agent should use it only for sessions you clearly asked about. Operator threads are refused.
+- The result says what happened to the files: `removed`, `none` when there was nothing to remove, or `failed` with the problems. On `failed` the session is deleted and some files may remain, for example Codex files kept on purpose because another conversation continues from them.
+- `sessions.delete` from a Mono now refuses the calling session, Mono chats, habit runs and orchestration workers, and a refused delete removes nothing.
+- Deleting the last session in a folder now removes the folder too, however the session was deleted, including bulk delete. A folder that still holds an archived session stays, a folder that was already empty is left alone, and a session shown under a deleted session is filed into its folder and keeps it.
+- Fixed folder moves and folder saves that could land out of order with a delete and bring a deleted session back. A session that starts in a folder removed a moment earlier now brings that folder back.
 
 ## What it is
 

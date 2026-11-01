@@ -140,6 +140,25 @@ fn operator_rejects_unknown_fields_and_mono_only_capabilities() {
 }
 
 #[test]
+fn operator_is_refused_provider_file_removal_but_may_keep_them() {
+    let error = validate_operator(
+        "sessions.delete",
+        &json!({"sessionId":1,"providerFiles":true}),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "Removing provider session files is only available to a Mono"
+    );
+    assert!(validate_operator(
+        "sessions.delete",
+        &json!({"sessionId":1,"providerFiles":false})
+    )
+    .is_ok());
+    assert!(validate_operator("sessions.delete", &json!({"sessionId":1})).is_ok());
+}
+
+#[test]
 fn conversation_pages_keep_source_cursors_prose_boundaries_and_character_caps() {
     let blocks = vec![
         json!({"id":"u1","role":"user","text":"/operator First"}),
