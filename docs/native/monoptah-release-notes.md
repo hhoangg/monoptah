@@ -1,10 +1,10 @@
-# Monoptah Native 0.40.3
+# Monoptah Native 0.40.4
 
 A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.40.2
+## Changes since 0.40.3
 
-- The Link field in a Today item's details can now be clicked. It opens an http or https link in the browser, as the Open link action does. Any other link stays plain text.
+- Global search finds text in saved conversations faster. Message text is kept in a search index next to your database (`monocode.db.search.sqlite3`), and only conversations that changed are read again, instead of every conversation on every search. The first search after updating builds the index once. Results, snippets and ranking are the same as before. The index is a cache: deleting it is safe, and it is rebuilt on the next search.
 
 ## What it is
 
