@@ -1495,3 +1495,389 @@ fn a_steer_with_an_earlier_turns_start_still_joins_the_running_turn() {
     assert_eq!(turns[&5].joined_turn, Some(3));
     assert_eq!(turns[&5].started_at, None);
 }
+
+mod transcript_index {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    fn put(store: &Store, id: &str, title: &str, blocks: Value, updated: i64) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions(id,cwd,harness,model,model_settings,runtime_mode,title,blocks_json,created_at,updated_at,has_user_message)
+                 VALUES(?1,'/project','codex','codex:m','{}','auto-accept-edits',?2,?3,100,?4,1)",
+                params![id, title, blocks.to_string(), updated],
+            )
+            .unwrap();
+    }
+    fn run(store: &Store, query: &str) -> Vec<crate::search::Hit> {
+        let (hits, _) = store
+            .search_sessions(query, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        hits
+    }
+    type Summary = (
+        Vec<(String, String, Vec<std::ops::Range<usize>>, i64)>,
+        bool,
+    );
+    /// Hits in returned order, plus the truncation flag.
+    fn summary(store: &Store, query: &str) -> Summary {
+        let (hits, truncated) = store
+            .search_sessions(query, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        (
+            hits.iter()
+                .map(|h| (h.id.clone(), h.title.clone(), h.highlights.clone(), h.score))
+                .collect(),
+            truncated,
+        )
+    }
+    fn loads() -> usize {
+        super::super::index_search::LOADS.with(|l| l.get())
+    }
+    fn fixture(store: &Store) {
+        put(
+            store,
+            "a",
+            "Alpha",
+            json!([
+                {"id":"1","role":"user","text":"deploy the zebra service"},
+                {"id":"2","role":"assistant","text":"Done with ZEBRA, 100%_literal \"quoted\" AND OR *"},
+                {"id":"3","role":"reasoning","text":"zebra private thoughts"},
+                {"id":"4","role":"tool","text":"Run","tool":{"callId":"c","kind":"execute","title":"Run ls","status":"completed","detail":"output mentions giraffe"}}
+            ]),
+            200,
+        );
+        put(
+            store,
+            "b",
+            "Zebra notes",
+            json!([{"id":"1","role":"user","text":"café au lait and zebra"}]),
+            300,
+        );
+    }
+    fn file_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_monocode(&dir.path().join("monocode.db")).unwrap();
+        (dir, store)
+    }
+    fn indexed_rows(dir: &tempfile::TempDir) -> i64 {
+        Connection::open(dir.path().join("monocode.db.search.sqlite3"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM rows", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn transcript_text_is_found_through_the_index_and_titles_rank_first() {
+        let (dir, store) = file_store();
+        fixture(&store);
+        let reader = store.search_reader().unwrap().unwrap();
+        let hits = run(&reader, "zebra");
+        assert!(dir.path().join("monocode.db.search.sqlite3").exists());
+        // Reasoning rows are not searchable: one hit per message that matches.
+        let messages = hits.iter().filter(|h| h.id.starts_with("message:")).count();
+        assert_eq!(messages, 3);
+        let grouped = crate::search::grouped(hits, crate::search::Scope::Conversations);
+        assert!(matches!(
+            grouped[0].target,
+            crate::search::Target::Conversation(_)
+        ));
+        assert!(matches!(
+            grouped[1].target,
+            crate::search::Target::Message { .. }
+        ));
+    }
+
+    #[test]
+    fn tool_output_is_searchable() {
+        let (_dir, store) = file_store();
+        fixture(&store);
+        let hits = run(&store.search_reader().unwrap().unwrap(), "giraffe");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].id.ends_with(":3"));
+    }
+
+    #[test]
+    fn indexed_results_equal_the_direct_scan() {
+        let (_dir, indexed) = file_store();
+        fixture(&indexed);
+        let direct = Store::open_monocode(Path::new(":memory:")).unwrap();
+        fixture(&direct);
+        let reader = indexed.search_reader().unwrap().unwrap();
+        for query in [
+            "zebra",
+            "ZEBRA",
+            "café",
+            "CAFÉ AU",
+            "giraffe",
+            "z",
+            "ze",
+            "100%_literal",
+            "\"quoted\"",
+            "\"",
+            "AND OR *",
+            "zebra svc",
+            "  zebra",
+            "zebra ",
+            "output mentions",
+        ] {
+            assert_eq!(
+                summary(&reader, query),
+                summary(&direct, query),
+                "query {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_and_special_queries_work() {
+        let (_dir, store) = file_store();
+        fixture(&store);
+        let reader = store.search_reader().unwrap().unwrap();
+        assert!(!run(&reader, "ze").is_empty());
+        assert!(!run(&reader, "z").is_empty());
+        assert_eq!(
+            run(&reader, "\"quoted\"")
+                .iter()
+                .filter(|h| h.id.starts_with("message:"))
+                .count(),
+            1
+        );
+        assert!(run(&reader, "NEAR(").is_empty());
+        assert!(run(&reader, "zebra\" OR \"").is_empty());
+    }
+
+    #[test]
+    fn unchanged_sessions_are_not_decoded_again_and_changes_are_picked_up() {
+        let (dir, store) = file_store();
+        fixture(&store);
+        let reader = store.search_reader().unwrap().unwrap();
+        let before = loads();
+        assert!(!run(&reader, "zebra").is_empty());
+        assert_eq!(loads() - before, 2);
+        assert!(!run(&reader, "zebra").is_empty());
+        assert!(!run(&reader, "giraffe").is_empty());
+        assert_eq!(loads() - before, 2);
+        assert_eq!(indexed_rows(&dir), 4);
+
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET blocks_json=?1, updated_at=400 WHERE id='a'",
+                [json!([
+                    {"id":"1","role":"user","text":"now talking about okapi"},
+                    {"id":"2","role":"assistant","text":"sure"}
+                ])
+                .to_string()],
+            )
+            .unwrap();
+        let reader = store.search_reader().unwrap().unwrap();
+        assert_eq!(run(&reader, "okapi").len(), 1);
+        assert_eq!(loads() - before, 3);
+        assert!(run(&reader, "giraffe").is_empty());
+        assert_eq!(
+            run(&reader, "zebra")
+                .iter()
+                .filter(|h| h.id.starts_with("message:"))
+                .count(),
+            1
+        );
+        assert_eq!(loads() - before, 3);
+    }
+
+    #[test]
+    fn deleted_and_archived_sessions_drop_out() {
+        let (dir, store) = file_store();
+        fixture(&store);
+        let reader = store.search_reader().unwrap().unwrap();
+        assert!(!run(&reader, "giraffe").is_empty());
+        store
+            .conn
+            .execute("DELETE FROM sessions WHERE id='a'", [])
+            .unwrap();
+        let reader = store.search_reader().unwrap().unwrap();
+        assert!(run(&reader, "giraffe").is_empty());
+        assert_eq!(indexed_rows(&dir), 1);
+    }
+
+    #[test]
+    fn a_search_cancelled_mid_build_returns_nothing_and_keeps_its_progress() {
+        let (dir, store) = file_store();
+        fixture(&store);
+        put(
+            &store,
+            "c",
+            "Gamma",
+            json!([{"id":"1","role":"user","text":"zebra again"}]),
+            100,
+        );
+        let reader = store.search_reader().unwrap().unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let before = loads();
+        super::super::index_search::CANCEL_AFTER
+            .with(|hook| *hook.borrow_mut() = Some((2, flag.clone())));
+        let (hits, truncated) = reader.search_sessions("zebra", flag).unwrap();
+        super::super::index_search::CANCEL_AFTER.with(|hook| *hook.borrow_mut() = None);
+        assert!(hits.is_empty() && !truncated);
+        assert_eq!(loads() - before, 2);
+        assert!(indexed_rows(&dir) >= 1);
+        // The next search only decodes what the cancelled one did not reach.
+        assert_eq!(run(&reader, "zebra").len(), 5);
+        assert!(loads() - before <= 3);
+        let early = Arc::new(AtomicBool::new(true));
+        assert!(reader.search_sessions("zebra", early).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn dotted_capital_i_matches_like_the_literal_check() {
+        let (_dir, indexed) = file_store();
+        let direct = Store::open_monocode(Path::new(":memory:")).unwrap();
+        for store in [&indexed, &direct] {
+            put(
+                store,
+                "t",
+                "Turkish",
+                json!([{"id":"1","role":"user","text":"the TABİ answer"}]),
+                200,
+            );
+        }
+        let reader = indexed.search_reader().unwrap().unwrap();
+        for query in ["abi", "tabi", "TABİ", "İ ans", "the tab"] {
+            assert_eq!(
+                summary(&reader, query),
+                summary(&direct, query),
+                "query {query:?}"
+            );
+        }
+        assert_eq!(run(&reader, "abi").len(), 1);
+    }
+
+    #[test]
+    fn mono_blocks_changes_are_detected_without_a_timestamp_change() {
+        let (_dir, store) = file_store();
+        let legacy = include_str!("../../../../../src-tauri/src/mono_transcript.rs");
+        let schema = legacy
+            .split("CREATE TABLE IF NOT EXISTS mono_transcripts (")
+            .nth(1)
+            .unwrap()
+            .split("\",")
+            .next()
+            .unwrap();
+        store
+            .conn
+            .execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS mono_transcripts ({schema}"
+            ))
+            .unwrap();
+        let id = store.create("codex", "/project").unwrap().id;
+        let original = store.persisted_session_id(id).unwrap();
+        store
+            .conn
+            .execute("INSERT INTO mono_transcripts VALUES(?1)", [&original])
+            .unwrap();
+        let mut blocks = vec![json!({"id":"a","role":"user","text":"first walrus"})];
+        store.shared_store_blocks(id, &blocks).unwrap();
+        let reader = store.search_reader().unwrap().unwrap();
+        assert_eq!(run(&reader, "walrus").len(), 1);
+        assert!(run(&reader, "narwhal").is_empty());
+        let updated: i64 = store
+            .conn
+            .query_row(
+                "SELECT updated_at FROM sessions WHERE id=?1",
+                [&original],
+                |r| r.get(0),
+            )
+            .unwrap();
+        blocks.push(json!({"id":"b","role":"assistant","text":"then a narwhal"}));
+        store.shared_store_blocks(id, &blocks).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+                params![original, updated],
+            )
+            .unwrap();
+        let reader = store.search_reader().unwrap().unwrap();
+        assert_eq!(run(&reader, "narwhal").len(), 1);
+    }
+
+    #[test]
+    fn searching_never_modifies_the_desktop_database() {
+        let (dir, store) = file_store();
+        fixture(&store);
+        store
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let path = dir.path().join("monocode.db");
+        let before = std::fs::read(&path).unwrap();
+        let reader = store.search_reader().unwrap().unwrap();
+        assert!(!run(&reader, "zebra").is_empty());
+        assert!(!run(&reader, "ze").is_empty());
+        drop(reader);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let tables: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'rows%' OR name='docs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+    }
+
+    #[test]
+    fn archived_and_empty_sessions_are_not_kept_in_the_index() {
+        let (dir, store) = file_store();
+        fixture(&store);
+        put(&store, "e", "Empty", json!([]), 50);
+        store
+            .conn
+            .execute("UPDATE sessions SET has_user_message=0 WHERE id='e'", [])
+            .unwrap();
+        let reader = store.search_reader().unwrap().unwrap();
+        assert!(!run(&reader, "zebra").is_empty());
+        let docs: i64 = Connection::open(dir.path().join("monocode.db.search.sqlite3"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM docs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docs, 2);
+    }
+
+    #[test]
+    fn an_unknown_cache_version_is_rebuilt_and_an_unusable_cache_falls_back() {
+        let (dir, store) = file_store();
+        fixture(&store);
+        let reader = store.search_reader().unwrap().unwrap();
+        assert!(!run(&reader, "giraffe").is_empty());
+        let cache = dir.path().join("monocode.db.search.sqlite3");
+        Connection::open(&cache)
+            .unwrap()
+            .execute_batch("PRAGMA user_version=99;")
+            .unwrap();
+        let before = loads();
+        assert!(!run(&reader, "giraffe").is_empty());
+        assert_eq!(loads() - before, 2);
+        // A cache file that is not a database must not break search.
+        drop(reader);
+        std::fs::remove_file(dir.path().join("monocode.db.search.sqlite3-wal")).ok();
+        std::fs::remove_file(dir.path().join("monocode.db.search.sqlite3-shm")).ok();
+        std::fs::write(&cache, b"not a database at all, just text").unwrap();
+        let reader = store.search_reader().unwrap().unwrap();
+        assert!(!run(&reader, "giraffe").is_empty());
+        // The damaged file was replaced by a working cache, not just bypassed.
+        let before = loads();
+        assert!(!run(&reader, "giraffe").is_empty());
+        assert_eq!(loads(), before);
+        assert_eq!(indexed_rows(&dir), 4);
+    }
+
+    #[test]
+    fn in_memory_stores_search_without_an_index() {
+        let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+        fixture(&store);
+        assert!(!run(&store, "zebra").is_empty());
+    }
+}
