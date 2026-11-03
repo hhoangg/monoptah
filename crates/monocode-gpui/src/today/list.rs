@@ -1,19 +1,24 @@
 //! The Tasks tab: filters, New task field, groups and rows.
 //! Also home to the small pieces `detail` and `sources` share: due and priority
 //! wording, and the menus.
-use super::{Filters, Today, short_day};
+use super::{
+    Filters, Today,
+    menus::{Host, Pick, Rows, Slot},
+    short_day,
+};
 use crate::{
-    inbox::{caption, label_badge, message},
-    popover::{Anchor, AnchorSlot, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle, menu_popover},
+    inbox::{label_badge, message},
+    popover::MenuAction,
     theme::*,
 };
 use gpui::{
-    AnyElement, Context, Div, Entity, FontWeight, Role, SharedString, Stateful, Subscription,
-    Window, div, prelude::*, px,
+    AnyElement, Context, Div, FontWeight, Hsla, Role, SharedString, Stateful, div, prelude::*, px,
 };
 use monocode_core::{
     inbox::Label,
-    today::{AGE_WARNING_DAYS, CheckReason, DayMode, Group, Priority, Row, Task},
+    today::{
+        AGE_WARNING_DAYS, CheckReason, DayMode, Group, Priority, Row, Stage, Task, WorkflowStatus,
+    },
 };
 
 /// `Nov 2` or `Nov 1, 17:00`; `None` without a due date.
@@ -82,111 +87,131 @@ pub(super) fn note_preview(body: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// How much of the round check is filled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Ring {
-    Open,
-    High,
-    Urgent,
-    NeedsCheck,
-    Done,
+pub(super) enum Fill {
+    Empty,
+    Half,
+    Full,
 }
-/// How the round check reads: done and needs check win over priority.
-pub(super) fn ring_state(group: Group, priority: Priority) -> Ring {
-    match (group, priority) {
-        (Group::Done, _) => Ring::Done,
-        (Group::NeedsCheck, _) => Ring::NeedsCheck,
-        (_, Priority::Urgent) => Ring::Urgent,
-        (_, Priority::High) => Ring::High,
-        _ => Ring::Open,
+/// The ring of a status: empty before work starts, half while it is going, full when finished.
+pub(super) fn ring_fill(stage: Stage) -> Fill {
+    match stage {
+        Stage::NotStarted => Fill::Empty,
+        Stage::Started => Fill::Half,
+        Stage::Finished => Fill::Full,
     }
+}
+/// A small round color dot.
+pub(super) fn color_dot(color: u32) -> Div {
+    div()
+        .size(px(8.))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(gpui::rgb(color))
+}
+/// A status's dot, in its own color.
+pub(super) fn status_dot(status: &WorkflowStatus) -> Div {
+    color_dot(status.rgb())
+}
+/// The frame of the card that follows the pointer while something is dragged.
+pub(super) fn drag_ghost() -> Div {
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(accent_color().opacity(0.6))
+        .bg(floating_fill())
+        .px_2()
+        .py_1()
+        .text_color(content(1.))
+}
+/// The statuses to group by and their rows, in the current status order. Rows
+/// whose status no longer exists (a past day, or one deleted since) follow, in
+/// stage order. On a `frozen` day the group takes the name and color the day
+/// recorded, not today's.
+pub(super) fn status_groups<'a>(
+    statuses: &[WorkflowStatus],
+    rows: &[&'a Row],
+    frozen: bool,
+) -> Vec<(WorkflowStatus, Vec<&'a Row>)> {
+    let mut groups: Vec<(WorkflowStatus, Vec<&'a Row>)> = statuses
+        .iter()
+        .map(|status| {
+            let mine = rows
+                .iter()
+                .copied()
+                .filter(|row| row.status.id == status.id)
+                .collect::<Vec<_>>();
+            let shown = match mine.first() {
+                Some(row) if frozen => row.status.clone(),
+                _ => status.clone(),
+            };
+            (shown, mine)
+        })
+        .collect();
+    let mut gone: Vec<(WorkflowStatus, Vec<&'a Row>)> = Vec::new();
+    for row in rows {
+        if statuses.iter().any(|s| s.id == row.status.id) {
+            continue;
+        }
+        match gone.iter_mut().find(|(s, _)| s.id == row.status.id) {
+            Some((_, mine)) => mine.push(row),
+            None => gone.push((row.status.clone(), vec![row])),
+        }
+    }
+    gone.sort_by_key(|(status, _)| status.stage);
+    groups.extend(gone);
+    groups
+}
+/// A status's dot, name and count: the title of a list group and a board column.
+pub(super) fn status_title(status: &WorkflowStatus, count: usize) -> Div {
+    div()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .child(status_dot(status))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(content(0.7))
+                .child(status.name.clone()),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(11.))
+                .text_color(content(0.4))
+                .child(count.to_string()),
+        )
+}
+/// A small flag next to a row's project: needs check, snoozed, dismissed.
+fn flag(text: &'static str, kind: &'static str, key: &str, warn: bool) -> Div {
+    label_badge(
+        &Label {
+            name: text.into(),
+            color: String::new(),
+        },
+        false,
+    )
+    .debug_selector({
+        let key = key.to_string();
+        move || format!("today-badge-{kind}-{key}")
+    })
+    .when(warn, |d| {
+        d.bg(warning_color().opacity(0.1))
+            .text_color(warning_color())
+    })
 }
 
-fn group_title(group: Group) -> &'static str {
-    match group {
-        Group::CarriedOver => "CARRIED OVER",
-        Group::NeedsCheck => "NEEDS CHECK",
-        Group::Today => "TODAY",
-        Group::Done => "DONE",
-        Group::Snoozed => "SNOOZED",
-        Group::Dismissed => "DISMISSED",
-    }
-}
-const CURRENT_GROUPS: [Group; 4] = [
-    Group::CarriedOver,
-    Group::NeedsCheck,
-    Group::Today,
-    Group::Done,
-];
-const PAST_GROUPS: [Group; 6] = [
-    Group::CarriedOver,
-    Group::NeedsCheck,
-    Group::Today,
-    Group::Done,
-    Group::Snoozed,
-    Group::Dismissed,
-];
 /// The New task placeholder: a future day is named, so it is clear where the task lands.
 pub(super) fn new_task_placeholder(mode: DayMode, day: &str) -> String {
     match mode {
         DayMode::Future => format!("New task for {}", short_day(day)),
         _ => "New task".to_string(),
-    }
-}
-
-/// What a picked menu row does.
-#[derive(Clone)]
-pub(super) enum Pick {
-    Filters(Filters),
-    Snooze { id: String, day: String },
-    Priority { id: String, priority: Priority },
-    Project { id: String, project: Option<String> },
-}
-/// Which trigger a menu hangs from; also where its popover is drawn.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Slot {
-    ProjectFilter,
-    SourceFilter,
-    MonoFilter,
-    Snooze,
-    Priority,
-    Project,
-}
-impl Slot {
-    fn in_filters(self) -> bool {
-        matches!(
-            self,
-            Self::ProjectFilter | Self::SourceFilter | Self::MonoFilter
-        )
-    }
-}
-pub(super) struct OpenMenu {
-    menu: Entity<Menu>,
-    slot: Slot,
-    picks: Vec<(SharedString, Pick)>,
-    _events: Subscription,
-}
-/// The one open dropdown, and the anchors the triggers write while they lay out.
-#[derive(Default)]
-pub(crate) struct Menus {
-    open: Option<OpenMenu>,
-    anchors: [AnchorSlot; 6],
-}
-impl Menus {
-    #[cfg(test)]
-    pub(super) fn is_open(&self) -> bool {
-        self.open.is_some()
-    }
-}
-/// Menu rows with what each one does.
-#[derive(Default)]
-pub(super) struct Rows {
-    items: Vec<MenuItem>,
-    picks: Vec<(SharedString, Pick)>,
-}
-impl Rows {
-    pub(super) fn add(&mut self, action: MenuAction, pick: Pick) {
-        self.picks.push((action.id.clone(), pick));
-        self.items.push(action.into());
     }
 }
 
@@ -219,160 +244,6 @@ fn filter_trigger(id: &'static str, label: String, active: bool, open: bool) -> 
 }
 
 impl Today {
-    /// Opens `rows` under the trigger of `slot`, or closes it when it already is.
-    /// Uses the app's `Menu`, so it takes focus, answers the arrow keys, Enter
-    /// and Escape, and scrolls past the popover's height cap.
-    pub(super) fn open_menu(
-        &mut self,
-        slot: Slot,
-        label: &'static str,
-        rows: Rows,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .menus
-            .open
-            .as_ref()
-            .is_some_and(|open| open.slot == slot)
-        {
-            self.menus.open = None;
-            cx.notify();
-            return;
-        }
-        let items = rows.items;
-        let menu = cx.new(|cx| {
-            Menu::new(label, items, window, cx)
-                .style(MenuStyle::Filter)
-                .width(240.)
-        });
-        let events = cx.subscribe(&menu, |this, _, event: &MenuEvent, cx| {
-            let picked = match event {
-                MenuEvent::Picked(id, _) => this.menus.open.as_ref().and_then(|open| {
-                    open.picks
-                        .iter()
-                        .find(|(row, _)| row == id)
-                        .map(|(_, pick)| pick.clone())
-                }),
-                MenuEvent::Dismissed => None,
-            };
-            this.menus.open = None;
-            if let Some(pick) = picked {
-                this.apply_pick(pick, cx);
-            }
-            cx.notify();
-        });
-        self.menus.open = Some(OpenMenu {
-            menu,
-            slot,
-            picks: rows.picks,
-            _events: events,
-        });
-        cx.notify();
-    }
-    fn apply_pick(&mut self, pick: Pick, cx: &mut Context<Self>) {
-        match pick {
-            Pick::Filters(filters) => self.set_filters(filters, cx),
-            Pick::Snooze { id, day } => self.snooze(id, day, cx),
-            Pick::Priority { id, priority } => self.patch(
-                id,
-                monocode_core::today::TaskPatch {
-                    priority: Some(priority),
-                    ..Default::default()
-                },
-                cx,
-            ),
-            Pick::Project { id, project } => self.patch(
-                id,
-                monocode_core::today::TaskPatch {
-                    project: Some(project),
-                    ..Default::default()
-                },
-                cx,
-            ),
-        }
-    }
-    /// The open menu's popover, drawn by whichever of the list or the panel owns its trigger.
-    pub(super) fn menu_view(&self, in_filters: bool, cx: &gpui::App) -> Option<AnyElement> {
-        let open = self
-            .menus
-            .open
-            .as_ref()
-            .filter(|open| open.slot.in_filters() == in_filters)?;
-        let anchor = self.menus.anchors[open.slot as usize].clone();
-        Some(menu_popover(&open.menu, Anchor::Slot(anchor), cx).into_any_element())
-    }
-    pub(super) fn menus_open(&self, slot: Slot) -> bool {
-        self.menus
-            .open
-            .as_ref()
-            .is_some_and(|open| open.slot == slot)
-    }
-    pub(super) fn anchor(&self, slot: Slot) -> AnchorSlot {
-        self.menus.anchors[slot as usize].clone()
-    }
-    /// A project's folder row in a menu, tinted with the project's own color.
-    pub(super) fn project_row(
-        &self,
-        id: String,
-        label: String,
-        path: &str,
-        checked: bool,
-    ) -> MenuAction {
-        let color = self
-            .appearances
-            .get(path)
-            .cloned()
-            .unwrap_or_default()
-            .color(path);
-        MenuAction::new(id, label)
-            .icon("folder")
-            .icon_color(gpui::rgb(color).into())
-            .checked(checked)
-    }
-    /// The project badge of a row or a source: the project's own color, or a stable one.
-    pub(super) fn project_badge(&self, path: &str, compact: bool) -> Div {
-        let color = self
-            .appearances
-            .get(path)
-            .cloned()
-            .unwrap_or_default()
-            .color(path);
-        label_badge(
-            &Label {
-                name: self.project_label(path),
-                color: format!("#{color:06x}"),
-            },
-            compact,
-        )
-    }
-    /// Projects a task can belong to: the Monos' projects, the ones with an
-    /// appearance and the ones on screen, by display name.
-    pub(super) fn project_options(&self) -> Vec<(String, String)> {
-        let mut paths = std::collections::BTreeSet::new();
-        paths.extend(self.roster.iter().flat_map(|mono| mono.projects.clone()));
-        paths.extend(self.appearances.keys().cloned());
-        if let Some(view) = &self.view {
-            paths.extend(view.rows.iter().filter_map(|row| row.task.project.clone()));
-        }
-        let mut options = paths
-            .into_iter()
-            .map(|path| (self.project_label(&path), path))
-            .collect::<Vec<_>>();
-        options.sort_by_key(|(label, _)| label.to_lowercase());
-        options
-    }
-    pub(super) fn mono_mark(&self, id: &str, side: f32) -> Option<AnyElement> {
-        let mono = self.mono(id)?;
-        Some(crate::monos::avatar::avatar(
-            &mono.mascot,
-            mono.color,
-            "idle",
-            side,
-            true,
-        ))
-    }
-
     /// The scrolling list below the page header and warnings.
     pub(super) fn list_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(view) = &self.view else {
@@ -410,37 +281,14 @@ impl Today {
             );
         }
 
-        if mode == DayMode::Future {
-            if rows.is_empty() {
-                body = body.child(empty(if filtered {
-                    "No tasks match these filters."
-                } else {
-                    "Nothing planned yet. Snooze a task or add one here."
-                }));
-            } else {
-                body = body.child(self.group(&rows, None, "PLANNED", readonly, cx));
-            }
-        } else {
-            let groups: &[Group] = if readonly {
-                &PAST_GROUPS
-            } else {
-                &CURRENT_GROUPS
-            };
-            for group in groups {
-                body =
-                    body.child(self.group(&rows, Some(*group), group_title(*group), readonly, cx));
-            }
-            if rows.is_empty() && readonly {
-                if filtered {
-                    body = body.child(empty("No tasks match these filters."));
-                }
-            } else if rows.is_empty() {
-                body = body.child(empty(if filtered {
-                    "No tasks match these filters."
-                } else {
-                    "Nothing here yet. Add a task above or ask a Mono to sync a source."
-                }));
-            }
+        let message_shown = rows.is_empty() && (filtered || mode == DayMode::Future);
+        if rows.is_empty() && filtered {
+            body = body.child(empty("No tasks match these filters."));
+        } else if rows.is_empty() && mode == DayMode::Future {
+            body = body.child(empty("Nothing planned yet. Snooze a task or add one here."));
+        }
+        for (status, mine) in status_groups(&self.statuses, &rows, readonly) {
+            body = body.child(self.group(&status, &mine, readonly, !message_shown, cx));
         }
 
         div()
@@ -461,44 +309,50 @@ impl Today {
                     .pb(px(16.))
                     .child(body),
             )
-            .children(self.menu_view(true, cx))
+            .children(self.menu_view(Host::Filters, cx))
             .into_any_element()
     }
 
-    /// A caption with its count, then the rows. `group` `None` takes every row.
+    /// One status: its title, then its rows, or a quiet line when it has none.
     fn group(
         &self,
+        status: &WorkflowStatus,
         rows: &[&Row],
-        group: Option<Group>,
-        title: &'static str,
         readonly: bool,
+        say_empty: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rows = rows
-            .iter()
-            .filter(|row| group.is_none_or(|g| row.group == g))
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
-            return div().into_any_element();
-        }
+        let id = status.id.clone();
+        let empty_id = status.id.clone();
         div()
+            .debug_selector(move || format!("today-group-{id}"))
             .flex()
             .flex_col()
             .gap(px(1.))
             .child(
-                caption(title)
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(rows.len().to_string()),
+                status_title(status, rows.len())
+                    .px(px(8.))
+                    .pt(px(10.))
+                    .pb(px(4.)),
             )
             .children(rows.iter().map(|row| self.row_view(row, readonly, cx)))
+            .when(rows.is_empty() && say_empty, |d| {
+                d.child(
+                    div()
+                        .debug_selector(move || format!("today-group-empty-{empty_id}"))
+                        .px(px(8.))
+                        .py(px(4.))
+                        .text_size(px(12.))
+                        .text_color(content(0.35))
+                        .child("Nothing here"),
+                )
+            })
             .into_any_element()
     }
 
-    fn filters_row(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn filters_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let filters = self.filters.clone();
-        let open = |slot: Slot| self.menus.open.as_ref().is_some_and(|o| o.slot == slot);
+        let open = |slot: Slot| self.menus_open(slot);
         let project_label = match &filters.project {
             None => "All projects".to_string(),
             Some(None) => "No project".to_string(),
@@ -614,34 +468,36 @@ impl Today {
         rows
     }
 
-    /// The round check. A past day's is static: nothing there can be changed.
+    /// The round check, drawn in the status color. A past day's is static: nothing there can be changed.
     fn check_view(&self, row: &Row, readonly: bool, cx: &mut Context<Self>) -> AnyElement {
-        let ring = ring_state(row.group, row.task.priority);
+        let fill = ring_fill(row.status.stage);
+        let color: Hsla = gpui::rgb(row.status.rgb()).into();
         let key = row.task.key.clone();
-        let done = ring == Ring::Done;
-        let glyph = match ring {
-            Ring::NeedsCheck => icon("circle-dashed-hi", 16.)
-                .text_color(warning_color())
-                .into_any_element(),
-            _ => div()
-                .size_full()
-                .rounded_full()
-                .border_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .border_color(match ring {
-                    Ring::High => warning_color(),
-                    Ring::Urgent => danger_color(),
-                    Ring::Done => content(0.),
-                    _ => content(0.3),
-                })
-                .when(done, |d| {
-                    d.bg(content(0.6))
-                        .child(icon("check", 10.).text_color(background_base()))
-                })
-                .into_any_element(),
+        let done = fill == Fill::Full;
+        let mark = match fill {
+            Fill::Empty => "empty",
+            Fill::Half => "half",
+            Fill::Full => "full",
         };
+        let glyph = div()
+            .debug_selector({
+                let key = key.clone();
+                move || format!("today-ring-{key}-{mark}")
+            })
+            .size_full()
+            .rounded_full()
+            .border_1()
+            .border_color(color)
+            .flex()
+            .items_center()
+            .when(fill == Fill::Half, |d| {
+                d.child(div().w(px(7.)).h_full().rounded_l(px(7.)).bg(color))
+            })
+            .when(done, |d| {
+                d.bg(color)
+                    .justify_center()
+                    .child(icon("check", 10.).text_color(background_base()))
+            });
         let frame = div()
             .size(px(16.))
             .mt(px(2.))
@@ -673,14 +529,13 @@ impl Today {
             .into_any_element()
     }
 
-    fn row_view(&self, row: &Row, readonly: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// The chips under a row's or card's title: project, Mono, flags, age, due,
+    /// priority and the latest note. Rows and board cards both draw these.
+    pub(super) fn chips(&self, row: &Row) -> Div {
         let task = &row.task;
         let key = task.key.clone();
-        let done = row.group == Group::Done;
-        let selected = self.selected.as_deref() == Some(task.id.as_str());
-        let id = task.id.clone();
+        let done = row.group == Group::Done || row.status.stage == Stage::Finished;
         let warns = age_warns(row.age_days, row.group);
-
         let project = match task.project.as_deref() {
             Some(path) => self.project_badge(path, false),
             None => label_badge(
@@ -704,7 +559,7 @@ impl Today {
                 .text_color(content(0.5))
                 .child(text)
         };
-        let badges = div()
+        div()
             .mt(px(3.))
             .min_h(px(18.))
             .flex()
@@ -718,6 +573,28 @@ impl Today {
                     .and_then(|id| self.mono_mark(id, 16.)),
                 |d, mark| d.child(mark),
             )
+            .when(row.group == Group::NeedsCheck, |d| {
+                d.child(flag("Needs check", "needs-check", &key, true))
+            })
+            .when(row.group == Group::Snoozed, |d| {
+                d.child(flag("Snoozed", "snoozed", &key, false))
+            })
+            .when(row.group == Group::Dismissed, |d| {
+                d.child(flag("Dismissed", "dismissed", &key, false))
+            })
+            .when_some(age_label(row.age_days).filter(|_| !done), |d, age| {
+                d.child(
+                    div()
+                        .debug_selector({
+                            let key = key.clone();
+                            move || format!("today-age-{key}")
+                        })
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(if warns { warning_color() } else { content(0.4) })
+                        .child(age),
+                )
+            })
             .when_some(due_text(task), |d, due| d.child(meta(format!("Due {due}"))))
             .when(task.priority != Priority::Normal, |d| {
                 d.child(
@@ -742,7 +619,15 @@ impl Today {
                         .text_color(content(0.4))
                         .child(format!("Note: {}", note_preview(&note.body))),
                 )
-            });
+            })
+    }
+
+    fn row_view(&self, row: &Row, readonly: bool, cx: &mut Context<Self>) -> AnyElement {
+        let task = &row.task;
+        let key = task.key.clone();
+        let done = row.group == Group::Done || row.status.stage == Stage::Finished;
+        let selected = self.selected.as_deref() == Some(task.id.as_str());
+        let id = task.id.clone();
 
         div()
             .id(SharedString::from(format!("today-row-{key}")))
@@ -766,37 +651,12 @@ impl Today {
                     .min_w_0()
                     .child(
                         div()
-                            .flex()
-                            .items_baseline()
-                            .gap(px(8.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(content(if done { 0.5 } else { 1. }))
-                                    .when(done, |d| d.line_through())
-                                    .child(task.title.clone()),
-                            )
-                            .when_some(age_label(row.age_days).filter(|_| !done), |d, age| {
-                                d.child(
-                                    div()
-                                        .debug_selector({
-                                            let key = task.key.clone();
-                                            move || format!("today-age-{key}")
-                                        })
-                                        .flex_shrink_0()
-                                        .text_size(px(11.))
-                                        .text_color(if warns {
-                                            warning_color()
-                                        } else {
-                                            content(0.4)
-                                        })
-                                        .child(age),
-                                )
-                            }),
+                            .truncate()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(content(if done { 0.5 } else { 1. }))
+                            .when(done, |d| d.line_through())
+                            .child(task.title.clone()),
                     )
                     .child(
                         div()
@@ -805,7 +665,7 @@ impl Today {
                             .text_color(content(if done { 0.35 } else { 0.5 }))
                             .child(source_line(task)),
                     )
-                    .child(badges),
+                    .child(self.chips(row)),
             )
             .on_click(cx.listener(move |this, _, _, cx| this.select(Some(id.clone()), cx)))
             .into_any_element()
@@ -817,8 +677,8 @@ impl Today {
 pub(super) mod testkit {
     use super::*;
     use gpui::{
-        Bounds, Entity, Render, TestAppContext, VisualTestContext, WindowBounds, WindowHandle,
-        WindowOptions, point, size,
+        Bounds, Entity, Render, TestAppContext, VisualTestContext, Window, WindowBounds,
+        WindowHandle, WindowOptions, point, size,
     };
     use monocode_core::today::{DayView, Summary};
     use std::sync::{Arc, Mutex};
@@ -826,6 +686,7 @@ pub(super) mod testkit {
     #[derive(Clone, Copy)]
     pub(in crate::today) enum Show {
         List,
+        Board,
         Detail,
         Sources,
     }
@@ -839,6 +700,7 @@ pub(super) mod testkit {
             self.today.update(cx, |today, cx| {
                 div().size_full().child(match show {
                     Show::List => today.list_view(cx),
+                    Show::Board => today.board_view(cx),
                     Show::Detail => today.detail_view(cx),
                     Show::Sources => today.sources_view(),
                 })
@@ -903,9 +765,33 @@ pub(super) mod testkit {
         }
     }
     pub(in crate::today) fn row(group: Group, task: Task, age_days: u32) -> Row {
+        let status = monocode_core::today::statuses::default_statuses().remove(match group {
+            Group::Done => 2,
+            _ => 0,
+        });
         Row {
             task,
             group,
+            status,
+            age_days,
+            latest_note: None,
+        }
+    }
+    /// A row in the default status `id` (`todo`, `in_progress` or `done`).
+    pub(in crate::today) fn row_in(id: &str, task: Task, age_days: u32) -> Row {
+        let status = monocode_core::today::statuses::default_statuses()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap();
+        let group = if status.stage == Stage::Finished {
+            Group::Done
+        } else {
+            Group::Today
+        };
+        Row {
+            task,
+            group,
+            status,
             age_days,
             latest_note: None,
         }
@@ -933,15 +819,130 @@ mod tests {
     use gpui::TestAppContext;
 
     #[test]
-    fn the_ring_follows_state_then_priority() {
-        use Group::*;
-        assert_eq!(ring_state(Done, Priority::Urgent), Ring::Done);
-        assert_eq!(ring_state(NeedsCheck, Priority::High), Ring::NeedsCheck);
-        assert_eq!(ring_state(Today, Priority::Urgent), Ring::Urgent);
-        assert_eq!(ring_state(CarriedOver, Priority::High), Ring::High);
-        assert_eq!(ring_state(Today, Priority::Normal), Ring::Open);
-        assert_eq!(ring_state(Snoozed, Priority::Normal), Ring::Open);
+    fn the_ring_follows_the_stage() {
+        assert_eq!(ring_fill(Stage::NotStarted), Fill::Empty);
+        assert_eq!(ring_fill(Stage::Started), Fill::Half);
+        assert_eq!(ring_fill(Stage::Finished), Fill::Full);
     }
+    #[test]
+    fn groups_follow_the_status_order_and_a_deleted_status_comes_last() {
+        let statuses = monocode_core::today::statuses::default_statuses();
+        let mut gone = statuses[1].clone();
+        gone.id = "gone".into();
+        gone.name = "Gone".into();
+        let mut gone_early = statuses[0].clone();
+        gone_early.id = "gone-early".into();
+        let rows = [
+            Row {
+                status: gone.clone(),
+                ..row_in("todo", task("a", "A"), 0)
+            },
+            row_in("done", task("b", "B"), 0),
+            Row {
+                status: gone_early.clone(),
+                ..row_in("todo", task("c", "C"), 0)
+            },
+            row_in("todo", task("d", "D"), 0),
+        ];
+        let refs = rows.iter().collect::<Vec<_>>();
+        let groups = status_groups(&statuses, &refs, true);
+        let ids = groups
+            .iter()
+            .map(|(s, _)| s.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            ["todo", "in_progress", "done", "gone-early", "gone"],
+            "current order first, then the vanished ones in stage order"
+        );
+        let counts = groups.iter().map(|(_, r)| r.len()).collect::<Vec<_>>();
+        assert_eq!(counts, [1, 0, 1, 1, 1]);
+    }
+    #[test]
+    fn a_past_group_keeps_the_name_the_day_froze() {
+        let statuses = monocode_core::today::statuses::default_statuses();
+        let mut old = statuses[0].clone();
+        old.name = "Old name".into();
+        let rows = [Row {
+            status: old,
+            ..row_in("todo", task("a", "A"), 0)
+        }];
+        let refs = rows.iter().collect::<Vec<_>>();
+        assert_eq!(status_groups(&statuses, &refs, true)[0].0.name, "Old name");
+        assert_eq!(status_groups(&statuses, &refs, false)[0].0.name, "To do");
+    }
+    #[gpui::test]
+    fn the_list_groups_by_status_and_an_empty_group_says_nothing_here(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(cx, Show::List, |today| {
+            today.view = Some(view(
+                DayMode::Current,
+                "2026-11-01",
+                vec![
+                    row_in("done", task("fin", "Finished"), 1),
+                    row_in("todo", task("first", "First"), 0),
+                ],
+            ));
+        });
+        let mut last = f32::MIN;
+        for id in ["todo", "in_progress", "done"] {
+            let selector: &'static str = Box::leak(format!("today-group-{id}").into_boxed_str());
+            let bounds = visual.debug_bounds(selector).expect(selector);
+            assert!(
+                f32::from(bounds.origin.y) > last,
+                "{id} follows the group before it"
+            );
+            last = f32::from(bounds.origin.y);
+        }
+        assert!(!has(&mut visual, "today-group-empty-todo"));
+        assert!(has(&mut visual, "today-group-empty-in_progress"));
+        assert!(!has(&mut visual, "today-group-empty-done"));
+        // The row sits under its own status, not under the lifecycle group.
+        let todo = visual.debug_bounds("today-group-todo").unwrap();
+        let row = visual.debug_bounds("today-row-first").unwrap();
+        assert!(todo.contains(&row.center()));
+    }
+    #[gpui::test]
+    fn a_past_day_lists_every_status_too(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(cx, Show::List, |today| {
+            today.view = Some(view(DayMode::Past, "2026-10-31", Vec::new()));
+            today.day = Some("2026-10-31".into());
+        });
+        for id in ["todo", "in_progress", "done"] {
+            let selector: &'static str =
+                Box::leak(format!("today-group-empty-{id}").into_boxed_str());
+            assert!(has(&mut visual, selector), "{selector}");
+        }
+    }
+    #[gpui::test]
+    fn the_ring_is_empty_half_or_full_by_stage_and_shows_the_flags_as_badges(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, mut visual) = page(cx, Show::List, |today| {
+            let mut check = row_in("todo", task("chk", "Check"), 0);
+            check.group = Group::NeedsCheck;
+            let mut snoozed = row_in("todo", task("snz", "Snoozed"), 0);
+            snoozed.group = Group::Snoozed;
+            today.view = Some(view(
+                DayMode::Past,
+                "2026-10-31",
+                vec![
+                    row_in("todo", task("a", "A"), 0),
+                    row_in("in_progress", task("b", "B"), 0),
+                    row_in("done", task("c", "C"), 0),
+                    check,
+                    snoozed,
+                ],
+            ));
+            today.day = Some("2026-10-31".into());
+        });
+        assert!(has(&mut visual, "today-ring-a-empty"));
+        assert!(has(&mut visual, "today-ring-b-half"));
+        assert!(has(&mut visual, "today-ring-c-full"));
+        assert!(has(&mut visual, "today-badge-needs-check-chk"));
+        assert!(has(&mut visual, "today-badge-snoozed-snz"));
+        assert!(!has(&mut visual, "today-badge-needs-check-a"));
+    }
+
     #[test]
     fn age_turns_to_a_warning_at_two_days_and_never_for_done() {
         assert_eq!(AGE_WARNING_DAYS, 2);
@@ -1049,13 +1050,17 @@ mod tests {
         });
         assert!(has(&mut visual, "today-empty"));
         assert!(has(&mut visual, "today-new-task"));
+        assert!(
+            !has(&mut visual, "today-group-empty-todo"),
+            "one message, not one per group"
+        );
     }
     #[gpui::test]
     fn an_empty_current_day_has_an_empty_state(cx: &mut TestAppContext) {
         let (_, mut visual) = page(cx, Show::List, |today| {
             today.view = Some(view(DayMode::Current, "2026-11-01", Vec::new()));
         });
-        assert!(has(&mut visual, "today-empty"));
+        assert!(has(&mut visual, "today-group-empty-todo"));
         assert!(!has(&mut visual, "today-row-carried"));
     }
     #[gpui::test]
@@ -1200,8 +1205,12 @@ mod tests {
     fn today_files_hold_no_theme_color_literals() {
         for (name, source) in [
             ("list.rs", include_str!("list.rs")),
+            ("board.rs", include_str!("board.rs")),
             ("detail.rs", include_str!("detail.rs")),
             ("sources.rs", include_str!("sources.rs")),
+            ("statuses.rs", include_str!("statuses.rs")),
+            ("menus.rs", include_str!("menus.rs")),
+            ("../today.rs", include_str!("../today.rs")),
         ] {
             let code = source.split("#[cfg(test)]").next().unwrap();
             for banned in ["rgb(0x", "rgba(", "hsla(", "Hsla { h", "0xf8", "0xfb"] {
