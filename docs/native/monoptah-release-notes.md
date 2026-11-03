@@ -1,10 +1,16 @@
-# Monoptah Native 0.40.3
+# Monoptah Native 0.41.0
 
 A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.40.2
+## Changes since 0.40.3
 
-- The Link field in a Today item's details can now be clicked. It opens an http or https link in the browser, as the Open link action does. Any other link stays plain text.
+Today now works like a small task board.
+
+- **Workflow statuses.** Every task has a status: To do, In progress and Done by default. The new Statuses dialog (header button, or Edit statuses in any status menu) adds, renames, recolors and reorders statuses, and moves your own statuses between the Not started, Started and Finished stages. Built-in statuses can be renamed and recolored but not deleted. Deleting a status moves its tasks to the built-in status of the same stage. Existing Today tasks are migrated in place.
+- **List and Board.** A List / Board switch in the header, remembered between launches. The list groups tasks by status. The board has one column per status: drag a card to another column to change its status, add a task to a column, or add a status at the end. Filters, the date strip and read-only past days work in both. Past days keep the status names and colors they had that day.
+- **Detail panel.** A new layout with a breadcrumb, a status pill with a menu, priority and due, a Needs check callout with direct actions (Keep done, Move back to To do, Mark done, Dismiss), Details, a Context section with the source's summary, and one Activity timeline of status changes, sync findings, your actions and notes.
+- **Start session** no longer sends a prompt. It opens a new chat in the task's project (asking for a project first when the task has none) with an `@today/<task>` mention in the composer. On send, the mention adds the task's context; delete the mention to leave it out.
+- **Monos and syncing.** A sync maps a source's own status (open, in progress, in review, merged, done and similar) to a stage, and a Mono can state the stage and a short summary per item. A status you change by hand is never overwritten by a sync. Monos can read the statuses with `today.statuses`, and their instructions now explain how a habit should fill each field.
 
 ## What it is
 

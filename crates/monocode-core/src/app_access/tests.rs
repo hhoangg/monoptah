@@ -367,6 +367,7 @@ fn operator_sessions_cannot_use_today_actions() {
         "today.snooze",
         "today.dismiss",
         "today.sources",
+        "today.statuses",
     ] {
         let error = validate_operator(action, &json!({})).unwrap_err();
         assert!(

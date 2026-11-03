@@ -652,7 +652,7 @@ impl Shell {
             title,
             Some(item.work_item()),
             Some(ticket),
-            prompt,
+            Start::Send(prompt),
             "Choose a project folder before starting work on this item",
             cx,
         );
@@ -666,13 +666,16 @@ impl Shell {
             .clone()
             .filter(|path| !path.is_empty())
             .unwrap_or_else(|| self.workspace.project.clone());
-        let prompt = today::start_prompt(&task);
+        let start = Start::Draft {
+            text: format!("{} ", monocode_core::today::mention::token(&task.key)),
+            today_key: task.key.clone(),
+        };
         self.start_work_session(
             cwd,
             task.title.clone(),
             None,
             None,
-            prompt,
+            start,
             "Choose a project folder before starting work on this task",
             cx,
         );
@@ -685,7 +688,7 @@ impl Shell {
         title: String,
         work_item: Option<monocode_core::session_groups::WorkItem>,
         ticket: Option<String>,
-        prompt: String,
+        start: Start,
         missing_folder: &'static str,
         cx: &mut Context<Self>,
     ) {
@@ -693,8 +696,13 @@ impl Shell {
         let settings = self.project_session_settings(kind, &cwd, cx);
         // applyInboxStart: the provider's surface, kept as a terminal only when its
         // CLI takes a first prompt (the start prompt becomes it); else a chat.
-        let preferred =
-            monocode_core::surface::automation_surface(kind, &cwd, self.provider_surface(kind));
+        // A draft is always a chat: a terminal could not show the attachment.
+        let draft = matches!(start, Start::Draft { .. });
+        let preferred = if draft {
+            monocode_core::surface::Surface::Chat
+        } else {
+            monocode_core::surface::automation_surface(kind, &cwd, self.provider_surface(kind))
+        };
         let store = self.store.clone();
         self.navigation_revision += 1;
         let revision = self.navigation_revision;
@@ -709,29 +717,42 @@ impl Shell {
             store.title(summary.id, &summary.title)?;
             store.set_work_item(summary.id, summary.work_item.as_ref())?;
             store.save_agent_settings(summary.id, &settings)?;
-            Ok::<_, String>((summary, settings, prompt))
+            Ok::<_, String>((summary, settings, start))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok((summary, settings, prompt)) => {
+                Ok((summary, settings, start)) => {
                     let id = summary.id;
                     let terminal = summary.surface.is_tui();
                     if let Some(ticket) = ticket {
                         this.session_tickets.insert(id, ticket);
                     }
                     this.add(summary, cx);
-                    if terminal {
-                        if let Some(tui) = this.tui_sessions.get(&id) {
-                            tui.update(cx, |tui, _| tui.set_initial_prompt(prompt));
+                    let activate = match start {
+                        Start::Send(prompt) => {
+                            if terminal {
+                                if let Some(tui) = this.tui_sessions.get(&id) {
+                                    tui.update(cx, |tui, _| tui.set_initial_prompt(prompt));
+                                }
+                            } else {
+                                this.sessions[&id]
+                                    .update(cx, |view, cx| view.quick_submit(prompt, settings, cx));
+                            }
+                            // A terminal only runs while shown, so it is always opened; a
+                            // chat runs in the background if the user has moved on.
+                            terminal || this.navigation_revision == revision
                         }
-                    } else {
-                        this.sessions[&id]
-                            .update(cx, |view, cx| view.quick_submit(prompt, settings, cx));
-                    }
-                    // A terminal only runs while shown, so it is always opened; a chat
-                    // runs in the background if the user has moved on.
-                    if terminal || this.navigation_revision == revision {
+                        Start::Draft { text, today_key } => {
+                            this.sessions[&id].update(cx, |view, cx| {
+                                view.seed_new_settings(settings, cx);
+                                view.set_draft(text, Some(&today_key), cx);
+                            });
+                            // The user asked to look at this draft, so it always opens.
+                            true
+                        }
+                    };
+                    if activate {
                         this.activate_session(id, window, cx);
                     }
                     this.persist(cx);
@@ -744,6 +765,15 @@ impl Shell {
         })
         .detach();
     }
+}
+
+/// How a session started from a work item begins.
+enum Start {
+    /// Send this prompt (a terminal takes it as the CLI's first prompt).
+    Send(String),
+    /// Leave `text` unsent in a chat composer; `today_key` names the Today task
+    /// its `@today/<key>` token points at.
+    Draft { text: String, today_key: String },
 }
 
 #[cfg(test)]
@@ -925,6 +955,43 @@ mod tests {
                 assert_eq!(tickets, ["#7", "ENG-42"]);
                 // Sessions that did not start from an inbox item have none.
                 assert_eq!(shell.session_tickets.len(), 2);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn start_today_opens_a_chat_with_an_unsent_mention(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let project = dir();
+        let before = window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.preferences.default_provider = Some("claude".into());
+                all_terminal(shell);
+                let before = known(shell);
+                let task = monocode_core::today::Task {
+                    key: "clickup:42".into(),
+                    title: "Ship it".into(),
+                    project: Some(project.to_string_lossy().into_owned()),
+                    ..Default::default()
+                };
+                shell.start_today_session(task, cx);
+                before
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let ids = since(shell, &before);
+                assert_eq!(ids.len(), 1);
+                let id = ids[0];
+                assert_chat(shell, id);
+                assert!(shell.tui_sessions.is_empty());
+                assert_eq!(shell.workspace.active, Some(id));
+                assert_eq!(shell.session_summaries[&id].title, "Ship it");
+                let view = shell.sessions[&id].read(cx);
+                assert_eq!(view.input.read(cx).content, "@today/clickup:42 ");
+                // Nothing was sent: the session has no turns.
+                assert!(!shell.session_summaries[&id].has_messages);
             })
             .unwrap();
     }

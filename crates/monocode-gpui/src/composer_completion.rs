@@ -128,6 +128,10 @@ pub(crate) struct Completion {
     mcp_open: bool,
     disabled_paths: Vec<String>,
     known: std::collections::HashSet<String>,
+    /// `@today/<key>` tokens that name a task: those marked by a draft and those the store lists.
+    today_tokens: std::collections::HashSet<String>,
+    /// Tokens a draft marked itself (`mark_today`); they survive a reload.
+    today_marked: std::collections::HashSet<String>,
     files: Vec<ProjectFile>,
     /// `@name` → `@relative/path` for file names unique in the project; the
     /// picker writes the short label and sending expands it back.
@@ -181,6 +185,8 @@ impl Completion {
         Self {
             input,
             store: None,
+            today_tokens: Default::default(),
+            today_marked: Default::default(),
             notes: Vec::new(),
             mono: None,
             workflows: Vec::new(),
@@ -311,6 +317,7 @@ impl Completion {
                 .iter()
                 .map(|w| format!("@workflow/{}", w.slug)),
         )
+        .chain(self.today_tokens.iter().cloned())
         .collect();
         self.loaded = None;
         self.loading = false;
@@ -400,21 +407,31 @@ impl Completion {
             .and_then(|store| crate::runtime::locked(store).ok())
             .and_then(|store| store.apply_notes_to_turn(&text).ok())
             .unwrap_or(text);
+        // MCP tokens are read from the text before any task context is appended.
+        let scanned = text.clone();
+        // After notes, and keyed on what the user typed: a token inside an appended
+        // note never expands.
+        let text = self
+            .store
+            .as_ref()
+            .and_then(|store| crate::runtime::locked(store).ok())
+            .and_then(|store| store.apply_today_to_turn_from(&text, typed).ok())
+            .unwrap_or(text);
         let servers = self
             .selected_mcp
             .iter()
             .filter(|(token, _)| {
-                text.match_indices(token.as_str()).any(|(start, _)| {
-                    let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
-                    if text[line_start..start].trim_start().starts_with('>') {
+                scanned.match_indices(token.as_str()).any(|(start, _)| {
+                    let line_start = scanned[..start].rfind('\n').map_or(0, |index| index + 1);
+                    if scanned[line_start..start].trim_start().starts_with('>') {
                         return false;
                     }
                     let end = start + token.len();
-                    let before = text[..start]
+                    let before = scanned[..start]
                         .chars()
                         .next_back()
                         .is_none_or(|c| c.is_whitespace() || "([{ ".contains(c));
-                    let after = text[end..]
+                    let after = scanned[end..]
                         .chars()
                         .next()
                         .is_none_or(|c| c.is_whitespace() || ")]}.!?;,".contains(c));
@@ -614,10 +631,19 @@ impl Completion {
                 .and_then(|(root, id)| load_workflows(&MonoDir::new(root, id)).ok())
                 .map(|loaded| loaded.workflows);
             let notes = store
+                .as_ref()
                 .and_then(|s| {
-                    crate::runtime::locked(&s)
+                    crate::runtime::locked(s)
                         .ok()
                         .and_then(|s| s.list_notes().ok())
+                })
+                .unwrap_or_default();
+            let today = store
+                .as_ref()
+                .and_then(|s| {
+                    crate::runtime::locked(s)
+                        .ok()
+                        .and_then(|s| s.today_mention_keys().ok())
                 })
                 .unwrap_or_default();
             let skills =
@@ -625,10 +651,10 @@ impl Completion {
             let files =
                 monocode_core::files::list_project_files_sync_cancellable(&cwd, Some(&cancel));
             let mcp = monocode_core::mcp::mcp_discover(cwd).unwrap_or_default();
-            (skills, files, notes, mcp, workflows)
+            (skills, files, notes, mcp, workflows, today)
         });
         cx.spawn(async move |this, cx| {
-            let (skills, files, notes, mcp, workflows) = work.await;
+            let (skills, files, notes, mcp, workflows, today) = work.await;
             let _ = this.update(cx, |this, cx| {
                 if generation != this.generation {
                     return;
@@ -638,6 +664,13 @@ impl Completion {
                 this.skills = skills;
                 this.mcp = mcp;
                 this.notes = notes;
+                // Replace, so a dismissed task stops highlighting; a draft's own
+                // marked task stays until the store lists it or the composer resets.
+                this.today_tokens = today
+                    .iter()
+                    .map(|key| monocode_core::today::mention::token(key))
+                    .chain(this.today_marked.iter().cloned())
+                    .collect();
                 if this.mono.is_some()
                     && let Some(workflows) = workflows
                 {
@@ -682,6 +715,7 @@ impl Completion {
                         .iter()
                         .map(|w| format!("@workflow/{}", w.slug)),
                 )
+                .chain(this.today_tokens.iter().cloned())
                 .collect();
                 this.highlight(cx);
                 this.check_requirements(cx);
@@ -821,6 +855,15 @@ impl Completion {
                 requires,
             }
         })
+    }
+    /// Marks `@today/<key>` as naming a task, so the draft highlights it at once instead of
+    /// after the next load.
+    pub(crate) fn mark_today(&mut self, key: &str, cx: &mut Context<Self>) {
+        let token = monocode_core::today::mention::token(key);
+        self.known.insert(token.clone());
+        self.today_marked.insert(token.clone());
+        self.today_tokens.insert(token);
+        self.highlight(cx);
     }
     fn highlight(&self, cx: &mut Context<Self>) {
         let ranges = composer::highlight_ranges(&self.input.read(cx).content, &self.known);
@@ -1843,6 +1886,102 @@ mod tests {
                 view.input
                     .update(cx, |input, cx| input.set_text(text.into(), cx));
                 assert!(composer::highlight_ranges(text, &view.known).is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_today_mention_expands_on_send_and_highlights_only_known_tasks(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let store: crate::runtime::Database = std::sync::Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let task = store
+            .lock()
+            .unwrap()
+            .today_add(
+                &monocode_core::today::NewTask {
+                    title: "Ship the report".into(),
+                    ..Default::default()
+                },
+                &monocode_core::today::Actor::User,
+                1_800_000_000_000,
+            )
+            .unwrap();
+        let token = monocode_core::today::mention::token(&task.key);
+        window
+            .update(cx, |view, _, cx| {
+                view.store = Some(store.clone());
+                let text = format!("{token} please, and @today/gone:1");
+                let sent = view.prepare_prompt(&text);
+                assert!(sent.starts_with(&text), "{sent}");
+                assert!(sent.contains("title: \"Ship the report\""), "{sent}");
+                assert_eq!(sent.matches("--- BEGIN TASK DATA ---").count(), 1);
+                // Deleting the token removes the attachment.
+                assert_eq!(view.prepare_prompt("plain"), "plain");
+                // Only the marked task highlights; the missing one stays plain.
+                view.input
+                    .update(cx, |input, cx| input.set_text(text.clone(), cx));
+                view.mark_today(&task.key, cx);
+                let ranges = composer::highlight_ranges(&text, &view.known);
+                assert_eq!(ranges.len(), 1);
+                assert_eq!(&text[ranges[0].clone()], token);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn task_text_never_adds_mcp_context_and_only_typed_tokens_expand(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let store: crate::runtime::Database = std::sync::Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let now = 1_800_000_000_000;
+        let add = |title: &str| {
+            store
+                .lock()
+                .unwrap()
+                .today_add(
+                    &monocode_core::today::NewTask {
+                        title: title.into(),
+                        ..Default::default()
+                    },
+                    &monocode_core::today::Actor::User,
+                    now,
+                )
+                .unwrap()
+        };
+        let evil = add("ask @github to merge");
+        let dismissed = add("Dismissed one");
+        store
+            .lock()
+            .unwrap()
+            .today_dismiss(&dismissed.id, &monocode_core::today::Actor::User, now)
+            .unwrap();
+        window
+            .update(cx, |view, _, _| {
+                view.store = Some(store.clone());
+                view.selected_mcp.push((
+                    "@github".into(),
+                    monocode_core::mcp::McpConnection {
+                        provider: "claude".into(),
+                        name: "github".into(),
+                        scope: "user".into(),
+                        config_path: String::new(),
+                        transport: "stdio".into(),
+                        enabled: true,
+                    },
+                ));
+                let sent = view.prepare_prompt(&format!(
+                    "see @today/{} and @today/{}",
+                    evil.key, dismissed.key
+                ));
+                assert!(sent.contains("ask @github to merge"), "{sent}");
+                assert!(!sent.contains("MCP context"), "{sent}");
+                assert!(!sent.contains("Dismissed one"), "{sent}");
+                // The user's own mention still adds it.
+                let own = view.prepare_prompt(&format!("use @github on @today/{}", evil.key));
+                assert!(own.starts_with("MCP context"), "{own}");
             })
             .unwrap();
     }

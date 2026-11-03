@@ -841,6 +841,21 @@ impl Conversation {
             self.add_attachments(paths, cx);
         }
     }
+    /// Puts `text` in the composer without sending it; the caret goes to the end.
+    /// `today_key` is the task a leading `@today/<key>` names, so the token shows
+    /// highlighted at once.
+    pub(crate) fn set_draft(
+        &mut self,
+        text: String,
+        today_key: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+        if let Some(key) = today_key {
+            self.completion
+                .update(cx, |completion, cx| completion.mark_today(key, cx));
+        }
+    }
     pub(crate) fn quick_submit(
         &mut self,
         prompt: String,

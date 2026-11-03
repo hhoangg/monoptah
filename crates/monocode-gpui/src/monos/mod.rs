@@ -3,7 +3,7 @@
 pub(crate) mod avatar;
 pub(crate) mod cards;
 mod changes;
-mod color_picker;
+pub(crate) mod color_picker;
 mod dashboard;
 mod files;
 mod filters;

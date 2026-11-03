@@ -310,7 +310,10 @@ impl Monos {
         let key = (call.session, call.request_id.clone());
         self.app_pending.remove(&key);
         // A read has nothing to replay, and a day's list is large to keep as a receipt.
-        if matches!(call.action.as_str(), "today.list" | "today.sources") {
+        if matches!(
+            call.action.as_str(),
+            "today.list" | "today.sources" | "today.statuses"
+        ) {
             let _ = call.reply.send(result);
             return;
         }
@@ -421,7 +424,10 @@ impl Monos {
                     }
                     // Reads change nothing: they must not make the page reload.
                     if call.action.starts_with("today.")
-                        && !matches!(call.action.as_str(), "today.list" | "today.sources")
+                        && !matches!(
+                            call.action.as_str(),
+                            "today.list" | "today.sources" | "today.statuses"
+                        )
                     {
                         this.today.bump();
                     }
