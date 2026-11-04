@@ -410,8 +410,9 @@ pub(super) fn js_number(typed: &str) -> f64 {
     digits.parse::<f64>().map_or(f64::NAN, |n| sign * n)
 }
 
-/// A file name for the workflow: lowercase words joined by hyphens.
-pub(super) fn workflow_file_name(name: &str) -> String {
+/// A file name for a shared file: lowercase words of `name` joined by hyphens (at most 60
+/// characters), `fallback` when nothing is left, then `suffix`.
+pub(in crate::monos) fn slug_file_name(name: &str, fallback: &str, suffix: &str) -> String {
     let mut slug = String::new();
     for c in name.to_lowercase().chars() {
         if c.is_ascii_lowercase() || c.is_ascii_digit() {
@@ -421,8 +422,10 @@ pub(super) fn workflow_file_name(name: &str) -> String {
         }
     }
     let slug: String = slug.trim_matches('-').chars().take(60).collect();
-    format!(
-        "{}.monoptah-workflow.yaml",
-        if slug.is_empty() { "workflow" } else { &slug }
-    )
+    format!("{}{suffix}", if slug.is_empty() { fallback } else { &slug })
+}
+
+/// A file name for the workflow: lowercase words joined by hyphens.
+pub(super) fn workflow_file_name(name: &str) -> String {
+    slug_file_name(name, "workflow", ".monoptah-workflow.yaml")
 }

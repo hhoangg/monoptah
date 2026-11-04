@@ -5,6 +5,9 @@ pub mod bridge;
 pub mod cards;
 mod desktop;
 pub mod files;
+pub mod habit_yaml;
+#[cfg(test)]
+mod habit_yaml_tests;
 pub mod habits;
 pub mod heartbeat;
 pub mod memory;
