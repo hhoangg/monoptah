@@ -1,5 +1,6 @@
 //! SearchView.tsx/appSearch.ts: fuzzy titles and paths, literal message/content
 //! matches, stable identities, and the same per-scope ordering and limits.
+pub mod index;
 pub mod project;
 use crate::{files::ProjectFile, store::Session, transcript::Row};
 use std::{
@@ -291,21 +292,16 @@ pub fn snippet(text: &str, query: &str) -> String {
         if end < compact.len() { "…" } else { "" }
     )
 }
-pub fn message_hit(
-    session: &Session,
-    row: usize,
-    role: &str,
-    text: &str,
-    query: &str,
-    live: bool,
-) -> Option<Hit> {
+/// The text `message_hit` compares a query against, or None for roles that are
+/// not searchable. Tool rows are searched through their summary, input and output.
+pub fn searchable_text(role: &str, text: &str) -> Option<String> {
     if !matches!(
         role,
         "user" | "assistant" | "tool" | "tasks" | "plan" | "image"
     ) {
         return None;
     }
-    let text = if role == "tool" {
+    Some(if role == "tool" {
         serde_json::from_str::<crate::tool::ToolCall>(text)
             .ok()
             .map(|t| {
@@ -315,11 +311,20 @@ pub fn message_hit(
             .unwrap_or_else(|| text.to_owned())
     } else {
         text.to_owned()
-    };
+    })
+}
+/// Build a hit from text already derived by `searchable_text`.
+pub fn message_hit_text(
+    session: &Session,
+    row: usize,
+    text: &str,
+    query: &str,
+    live: bool,
+) -> Option<Hit> {
     if !text.to_lowercase().contains(&query.to_lowercase()) {
         return None;
     }
-    let title = snippet(&text, query);
+    let title = snippet(text, query);
     Some(Hit {
         id: format!("message:{}:{row}", session.id),
         target: Target::Message {
@@ -333,6 +338,39 @@ pub fn message_hit(
         score: if live { 20 } else { 16 } + recency(session.updated_at),
         updated_at: session.updated_at,
     })
+}
+pub fn message_hit(
+    session: &Session,
+    row: usize,
+    role: &str,
+    text: &str,
+    query: &str,
+    live: bool,
+) -> Option<Hit> {
+    message_hit_text(session, row, &searchable_text(role, text)?, query, live)
+}
+/// The most text one message contributes to a search.
+const MESSAGE_CAP: usize = 2 * 1024 * 1024;
+/// Join the fragment rows of the message starting at `from`, capped at
+/// `MESSAGE_CAP`. Returns the text, the index after the message and whether
+/// the cap cut it.
+pub fn join_message(rows: &[Row], from: usize) -> (String, usize, bool) {
+    let mut text = String::new();
+    let mut capped = false;
+    let mut ix = from;
+    loop {
+        let body = &rows[ix].text;
+        let mut end = body.len().min(MESSAGE_CAP.saturating_sub(text.len()));
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.push_str(&body[..end]);
+        capped |= end < body.len();
+        ix += 1;
+        if ix == rows.len() || rows[ix].first {
+            return (text, ix, capped);
+        }
+    }
 }
 pub fn messages(session: &Session, rows: &[Row], query: &str, cancel: &AtomicBool) -> Vec<Hit> {
     let mut hits = vec![];

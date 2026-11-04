@@ -3,6 +3,7 @@
 mod accounts;
 pub(super) mod blocks;
 mod edit;
+mod index_search;
 mod settings;
 #[cfg(test)]
 mod tests;
@@ -1646,6 +1647,27 @@ impl Store {
             .progress_handler(2000, Some(move || flag.load(Ordering::Acquire))))?;
         let result = (|| {
             let summaries = self.shared_sessions()?;
+            if self.path != Path::new(":memory:") {
+                match self.shared_indexed_search(query, &cancel, &summaries) {
+                    Ok((mut hits, truncated)) => {
+                        if cancel.load(Ordering::Acquire) {
+                            return Ok((Vec::new(), false));
+                        }
+                        hits.extend(crate::search::titles(&summaries, query));
+                        return Ok((hits, truncated));
+                    }
+                    // A cancelled search interrupts the index connection too; any other
+                    // failure falls back to scanning the desktop schema.
+                    Err(_) if cancel.load(Ordering::Acquire) => {
+                        return Ok((Vec::new(), false));
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "monoptah: search index unavailable ({error}); scanning directly"
+                        );
+                    }
+                }
+            }
             let mut hits = Vec::new();
             let mut truncated = false;
             'sessions: for summary in summaries.iter().filter(|s| !s.archived && s.has_messages) {
@@ -1659,25 +1681,9 @@ impl Store {
                         return Ok((Vec::new(), false));
                     }
                     let from = ix;
-                    let mut text = String::new();
-                    loop {
-                        let body = &rows[ix].text;
-                        let mut end = body
-                            .len()
-                            .min((2 * 1024 * 1024usize).saturating_sub(text.len()));
-                        while !body.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        text.push_str(&body[..end]);
-                        truncated |= end < body.len();
-                        ix += 1;
-                        if ix == rows.len() || rows[ix].first {
-                            break;
-                        }
-                        if cancel.load(Ordering::Acquire) {
-                            return Ok((Vec::new(), false));
-                        }
-                    }
+                    let (text, next, capped) = crate::search::join_message(&rows, from);
+                    ix = next;
+                    truncated |= capped;
                     if let Some(hit) = crate::search::message_hit(
                         summary,
                         from,
