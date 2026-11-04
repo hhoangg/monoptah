@@ -166,8 +166,17 @@ fn apply_fields(task: &mut Task, item: &SyncItem) {
     if let (Some(value), false) = (item.priority, task.priority_pinned) {
         task.priority = value;
     }
+    // Tags the item names are added; a sync never takes a tag off a task.
     if let Some(value) = &item.tags {
-        task.tags = value.clone();
+        // Existing tags are never cut; only new ones stop at the limit.
+        for id in value {
+            if task.tags.len() >= super::tags::MAX_PER_TASK {
+                break;
+            }
+            if !task.tags.contains(id) {
+                task.tags.push(id.clone());
+            }
+        }
     }
     if let Some(value) = &item.summary {
         task.summary = value.clone();

@@ -1,7 +1,7 @@
 // Anchored popovers and menus, ported from src/shared/ui/Popover.tsx, its
 // placement math in src/shared/lib/popover.ts, and the row/keyboard model of
 // src/features/files/ui/ExplorerMenu.tsx.
-use crate::theme::*;
+use crate::{input::Input, theme::*};
 use gpui::{
     AnyElement, AnyView, App, Bounds, BoxShadow, Context, Corners, DispatchPhase, Display, Element,
     ElementId, Entity, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
@@ -904,6 +904,47 @@ impl From<MenuAction> for MenuItem {
     }
 }
 
+/// The search field a searchable menu shows as its first row: render it as
+/// `MenuItem::Custom` (see [`MenuSearch::item`]), build the menu with
+/// `Menu::search_navigation()` and `replace_items` on its `input::Changed`.
+pub(crate) struct MenuSearch {
+    pub(crate) input: Entity<Input>,
+}
+impl MenuSearch {
+    pub(crate) fn new(placeholder: &'static str, cx: &mut App) -> Entity<Self> {
+        let input = cx.new(|cx| Input::field(placeholder, placeholder, content(0.35), cx));
+        cx.new(|_| Self { input })
+    }
+    /// What is typed, as typed.
+    pub(crate) fn query(&self, cx: &App) -> String {
+        self.input.read(cx).content.to_string()
+    }
+    /// The menu row holding the field.
+    pub(crate) fn item(this: &Entity<Self>, cx: &App) -> MenuItem {
+        MenuItem::Custom(
+            this.clone().into(),
+            this.read(cx).input.read(cx).focus_handle(cx),
+        )
+    }
+}
+impl Render for MenuSearch {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h(px(44.))
+            .mx(px(-4.))
+            .mt(px(-4.))
+            .mb(px(4.))
+            .px(px(12.))
+            .border_b_1()
+            .border_color(content(0.1))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(icon("search", 14.).text_color(content(0.45)))
+            .child(div().flex_1().min_w_0().child(self.input.clone()))
+    }
+}
+
 pub(crate) enum MenuEvent {
     /// The picked action, and where its row was, for menus opened from it.
     Picked(SharedString, Option<Bounds<Pixels>>),
@@ -1076,6 +1117,19 @@ impl Menu {
         self.submenu = None;
         self.sub_active = None;
         cx.notify();
+    }
+    /// Highlights the first enabled action, wherever the highlight was.
+    pub(crate) fn highlight_first(&mut self, cx: &mut Context<Self>) {
+        self.active = None;
+        self.ensure_active(cx);
+    }
+    /// Highlights the first enabled action when no row is highlighted.
+    pub(crate) fn ensure_active(&mut self, cx: &mut Context<Self>) {
+        if self.active.is_none() {
+            self.active =
+                (0..self.items.len()).find(|&ix| self.action(ix).is_some_and(|a| !a.disabled));
+            cx.notify();
+        }
     }
     /// Refresh a live toggle without resetting keyboard focus or its flyout.
     pub(crate) fn set_toggle(&mut self, id: &str, on: bool, cx: &mut Context<Self>) {

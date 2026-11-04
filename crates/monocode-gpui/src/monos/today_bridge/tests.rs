@@ -388,6 +388,7 @@ fn a_read_leaves_the_revision_alone_and_a_habit_change_wakes_the_roster(cx: &mut
     call(&s, s.session, "today.list", json!({}), cx).unwrap();
     call(&s, s.session, "today.sources", json!({}), cx).unwrap();
     call(&s, s.session, "today.statuses", json!({}), cx).unwrap();
+    call(&s, s.session, "today.tags", json!({}), cx).unwrap();
     assert_eq!(revision(cx), before);
     // Reads leave no receipt behind; the sync above left one.
     assert_eq!(cx.update(|cx| s.manager.read(cx).app_results.len()), 1);

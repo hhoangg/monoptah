@@ -312,7 +312,7 @@ impl Monos {
         // A read has nothing to replay, and a day's list is large to keep as a receipt.
         if matches!(
             call.action.as_str(),
-            "today.list" | "today.sources" | "today.statuses"
+            "today.list" | "today.sources" | "today.statuses" | "today.tags"
         ) {
             let _ = call.reply.send(result);
             return;
@@ -426,7 +426,7 @@ impl Monos {
                     if call.action.starts_with("today.")
                         && !matches!(
                             call.action.as_str(),
-                            "today.list" | "today.sources" | "today.statuses"
+                            "today.list" | "today.sources" | "today.statuses" | "today.tags"
                         )
                     {
                         this.today.bump();

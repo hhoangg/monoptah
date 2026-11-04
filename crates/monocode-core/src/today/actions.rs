@@ -20,6 +20,8 @@ const MAX_LIST: usize = 500;
 const MAX_TEXT: usize = 1000;
 const MAX_SUMMARY: usize = 4000;
 const MAX_KEY: usize = 200;
+/// A tag name is at most `tags::MAX_NAME` characters; this bounds the bytes.
+const MAX_TAG_BYTES: usize = super::tags::MAX_NAME * 4;
 const MAX_SOURCE: usize = 64;
 const MAX_ITEMS: usize = 500;
 const LISTED_NOTES: usize = 20;
@@ -37,7 +39,7 @@ pub fn fields(action: &str) -> Option<&'static str> {
         "today.note" => "id body",
         "today.complete" | "today.dismiss" => "id",
         "today.snooze" => "id until",
-        "today.sources" | "today.statuses" => "",
+        "today.sources" | "today.statuses" | "today.tags" => "",
         _ => return None,
     })
 }
@@ -70,15 +72,24 @@ pub fn handle(
             Ok(json!({ "sources": own }))
         }
         "today.statuses" => Ok(json!({ "statuses": store.today_statuses()? })),
+        "today.tags" => Ok(json!({ "tags": store.today_tags()? })),
         "today.sync" => sync(store, caller, input, now),
         "today.add" => {
-            let new = new_task(caller, input)?;
-            Ok(json!({ "task": store.today_add(&new, &actor, now)? }))
+            let mut new = new_task(caller, input)?;
+            let defs = store.today_tags()?;
+            new.tags = tag_ids(&new.tags, &defs)?;
+            let task = store.today_add(&new, &actor, now)?;
+            Ok(json!({ "task": task_json(&task, &defs)? }))
         }
         "today.update" => {
             let task = resolve(store, caller, input)?;
-            let patch = patch_of(caller, input, &task)?;
-            Ok(json!({ "task": store.today_update(&task.id, &patch, &actor, now)? }))
+            let mut patch = patch_of(caller, input, &task)?;
+            let defs = store.today_tags()?;
+            if let Some(names) = &patch.tags {
+                patch.tags = Some(tag_ids(names, &defs)?);
+            }
+            let task = store.today_update(&task.id, &patch, &actor, now)?;
+            Ok(json!({ "task": task_json(&task, &defs)? }))
         }
         "today.note" => {
             let task = resolve(store, caller, input)?;
@@ -110,7 +121,7 @@ pub fn handle(
                     store.today_snooze(&task.id, &until, &actor, now)?
                 }
             };
-            Ok(json!({ "task": task }))
+            Ok(json!({ "task": task_json(&task, &store.today_tags()?)? }))
         }
         _ => Err("Unknown today action".into()),
     }
@@ -143,6 +154,7 @@ fn list(
             as usize,
     };
     let current = store.today_roll(now)?;
+    let defs = store.today_tags()?;
     let keep = |task: &Task| {
         visible_to(task, caller)
             && status.is_none_or(|s| task.status == s)
@@ -190,7 +202,7 @@ fn list(
             .collect();
         let skip = listed.len().saturating_sub(LISTED_NOTES);
         listed.drain(..skip);
-        let mut value = serde_json::to_value(&task).map_err(|e| e.to_string())?;
+        let mut value = task_json(&task, &defs)?;
         value["group"] = json!(group);
         value["ageDays"] = json!(age);
         value["workflowStatus"] = workflow_json(&workflow);
@@ -207,6 +219,41 @@ fn list(
         "tasks": tasks,
         "notice": NOTICE,
     }))
+}
+
+/// A task as an agent reads it: `tags` holds the tag names, not ids. An entry
+/// that names no tag (a deleted one) is left out.
+fn task_json(task: &Task, defs: &[super::Tag]) -> Result<Value, String> {
+    let mut value = serde_json::to_value(task).map_err(|e| e.to_string())?;
+    let names: Vec<String> = super::tags::resolve(&task.tags, defs)
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    value["tags"] = json!(names);
+    Ok(value)
+}
+
+/// The ids of the tags an agent names, ignoring case. An agent cannot create
+/// tags, so an unknown name is refused with the names it could use.
+fn tag_ids(names: &[String], defs: &[super::Tag]) -> Result<Vec<String>, String> {
+    let mut ids: Vec<String> = Vec::new();
+    for name in names {
+        let Some(def) = defs.iter().find(|d| super::tags::same_name(&d.name, name)) else {
+            let known: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+            let known = if known.is_empty() {
+                "none yet".to_string()
+            } else {
+                known.join(", ")
+            };
+            return Err(format!(
+                "Unknown tag \"{name}\"; known tags: {known} (only the user can add tags)"
+            ));
+        };
+        if !ids.contains(&def.id) {
+            ids.push(def.id.clone());
+        }
+    }
+    Ok(ids)
 }
 
 /// The workflow status as `today.list` shows it.
@@ -630,11 +677,8 @@ fn tags_of(map: &Map<String, Value>) -> Result<Option<Vec<String>>, String> {
     for tag in list {
         let tag = tag.as_str().ok_or("tags must be an array of strings")?;
         let tag = tag.split_whitespace().collect::<Vec<_>>().join(" ");
-        if tag.is_empty() || tag.len() > notes::MAX_TAG_LENGTH {
-            return Err(format!(
-                "each tag must be 1 to {} bytes",
-                notes::MAX_TAG_LENGTH
-            ));
+        if tag.is_empty() || tag.len() > MAX_TAG_BYTES {
+            return Err(format!("each tag must be 1 to {MAX_TAG_BYTES} bytes"));
         }
         if !out.iter().any(|t| t.eq_ignore_ascii_case(&tag)) {
             out.push(tag);
@@ -804,6 +848,7 @@ mod tests {
             "today.dismiss",
             "today.sources",
             "today.statuses",
+            "today.tags",
         ] {
             assert!(fields(action).is_some(), "{action}");
         }
@@ -1424,5 +1469,127 @@ mod tests {
         let (_dir, store) = store();
         let a = run_of(&mono("a", &[]));
         assert!(call(&store, &a, "today.statuses", json!({})).is_ok());
+    }
+
+    fn user_tag(store: &Store, name: &str) -> crate::today::Tag {
+        store.today_add_tag(name, "#112233").unwrap()
+    }
+
+    #[test]
+    fn today_tags_lists_the_definitions_and_takes_no_input() {
+        let (_dir, store) = store();
+        let a = mono("a", &[]);
+        user_tag(&store, "Bug");
+        let got = call(&store, &a, "today.tags", json!({})).unwrap();
+        assert_eq!(got["tags"][0]["name"], "Bug");
+        assert_eq!(got["tags"][0]["color"], "#112233");
+        assert!(got["tags"][0]["id"].as_str().unwrap().starts_with("tag-"));
+        assert!(call(&store, &a, "today.tags", json!({"x": 1})).is_err());
+        assert!(call(&store, &run_of(&a), "today.tags", json!({})).is_ok());
+    }
+
+    #[test]
+    fn an_agent_cannot_create_tags_and_unknown_names_are_named() {
+        let (_dir, store) = store();
+        let a = mono("a", &[]);
+        user_tag(&store, "Bug");
+        user_tag(&store, "UI");
+        let err = call(
+            &store,
+            &a,
+            "today.add",
+            json!({"title": "x", "tags": ["foo"]}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Unknown tag \"foo\"; known tags: Bug, UI (only the user can add tags)"
+        );
+        assert_eq!(store.today_tags().unwrap().len(), 2);
+        let added = call(&store, &a, "today.add", json!({"title": "x"})).unwrap();
+        let id = added["task"]["id"].as_str().unwrap().to_string();
+        let err = call(
+            &store,
+            &a,
+            "today.update",
+            json!({"id": id, "tags": ["Bug", "nope"]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("Unknown tag \"nope\""), "{err}");
+        assert!(task(&store, &id).tags.is_empty());
+    }
+
+    #[test]
+    fn agent_tags_match_ignoring_case_and_come_back_as_names() {
+        let (_dir, store) = store();
+        let a = mono("a", &[]);
+        let bug = user_tag(&store, "Bug");
+        user_tag(&store, "UI");
+        let added = call(
+            &store,
+            &a,
+            "today.add",
+            json!({"title": "x", "tags": ["bUG"]}),
+        )
+        .unwrap();
+        assert_eq!(added["task"]["tags"], json!(["Bug"]));
+        let id = added["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(task(&store, &id).tags, vec![bug.id.clone()]);
+        let updated = call(
+            &store,
+            &a,
+            "today.update",
+            json!({"id": id, "tags": ["ui", "BUG"]}),
+        )
+        .unwrap();
+        assert_eq!(updated["task"]["tags"], json!(["Bug", "UI"]));
+        let listed = call(&store, &a, "today.list", json!({})).unwrap();
+        assert_eq!(listed["tasks"][0]["tags"], json!(["Bug", "UI"]));
+        let cleared = call(&store, &a, "today.update", json!({"id": id, "tags": []})).unwrap();
+        assert_eq!(cleared["task"]["tags"], json!([]));
+    }
+
+    #[test]
+    fn sync_adds_matching_tags_never_removes_and_lists_rejected() {
+        let (_dir, store) = store();
+        let a = mono("a", &[]);
+        let bug = user_tag(&store, "Bug");
+        let ui = user_tag(&store, "UI");
+        let mut first = item("gh:1");
+        first["tags"] = json!(["bug", "Ghost", "ghost", "Other"]);
+        let summary = sync_ok(&store, &a, "gh", json!([first]));
+        assert_eq!(summary["rejectedTags"], json!(["Ghost", "Other"]));
+        assert_eq!(task(&store, "gh:1").tags, vec![bug.id.clone()]);
+        // The user adds UI by hand; later syncs never take it off.
+        let id = task(&store, "gh:1").id;
+        store
+            .today_update(
+                &id,
+                &TaskPatch {
+                    tags: Some(vec![bug.id.clone(), ui.id.clone()]),
+                    ..Default::default()
+                },
+                &Actor::User,
+                NOW,
+            )
+            .unwrap();
+        let mut fewer = item("gh:1");
+        fewer["tags"] = json!([]);
+        let summary = sync_ok(&store, &a, "gh", json!([fewer]));
+        assert_eq!(summary["rejectedTags"], json!([]));
+        assert_eq!(
+            task(&store, "gh:1").tags,
+            vec![bug.id.clone(), ui.id.clone()]
+        );
+        sync_ok(&store, &a, "gh", json!([item("gh:1")]));
+        assert_eq!(
+            task(&store, "gh:1").tags,
+            vec![bug.id.clone(), ui.id.clone()]
+        );
+        let mut other = item("gh:1");
+        other["tags"] = json!(["ui"]);
+        sync_ok(&store, &a, "gh", json!([other]));
+        assert_eq!(task(&store, "gh:1").tags, vec![bug.id, ui.id]);
+        assert_eq!(store.today_tags().unwrap().len(), 2);
     }
 }

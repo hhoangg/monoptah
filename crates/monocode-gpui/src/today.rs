@@ -3,6 +3,7 @@
 //! `menus` holds the one open dropdown they share.
 mod board;
 mod detail;
+mod filter;
 mod list;
 mod menus;
 mod sources;
@@ -24,7 +25,7 @@ use monocode_core::{
     time::now_ms,
     today::{
         Activity, Actor, Day, DayMode, DayView, NewTask, Source, Stage, StatusPatch, SyncStatus,
-        Task, WorkflowStatus, workday::add_days,
+        Tag, TagPatch, Task, WorkflowStatus, workday::add_days,
     },
 };
 use std::{cell::Cell, collections::HashMap, rc::Rc, time::Duration};
@@ -36,6 +37,8 @@ const PANEL_MAX: f32 = 560.;
 const PANEL_WIDTH_KEY: &str = "today.panelWidth";
 /// `list` or `board`.
 const LAYOUT_KEY: &str = "today.layout";
+/// The filters (status, tag, project, source and Mono), as JSON (see `filter::Saved`).
+const FILTERS_KEY: &str = "today.filters";
 
 pub(crate) enum Event {
     Close,
@@ -100,12 +103,21 @@ pub(super) enum Tab {
 }
 
 /// `None` shows everything. `project: Some(None)` is the No project rows and
-/// `source: Some(None)` the manual ones.
+/// `source: Some(None)` the manual ones. `statuses` and `tags` are multi-select:
+/// empty shows everything. See `filter` for how they match.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Filters {
     pub project: Option<Option<String>>,
     pub source: Option<Option<String>>,
     pub mono: Option<String>,
+    /// Workflow status ids.
+    pub statuses: std::collections::BTreeSet<String>,
+    /// Tag ids.
+    pub tags: std::collections::BTreeSet<String>,
+    /// Also match tasks that have no tag.
+    pub no_tag: bool,
+    /// Tags: a task needs all the selected ones, not any of them.
+    pub match_all: bool,
 }
 
 pub(crate) struct Today {
@@ -126,9 +138,13 @@ pub(crate) struct Today {
     pub(super) activity: Vec<Activity>,
     /// The workflow statuses in order: list groups and board columns.
     pub(super) statuses: Vec<WorkflowStatus>,
+    /// The app wide tag definitions in order: chips, the Tags menu and filter.
+    pub(super) tags: Vec<Tag>,
     pub(super) layout: Layout,
     /// The Statuses dialog, while open.
     pub(super) statuses_dialog: Option<statuses::Dialog>,
+    /// The Tags dialog, while open. Never open together with the Statuses one.
+    pub(super) tags_dialog: Option<statuses::Dialog>,
     /// Board-only state (drag, column menu, per-column new task).
     pub(super) board: board::Board,
     pub(super) new_task: Entity<Input>,
@@ -150,6 +166,13 @@ pub(crate) struct Today {
     width_loaded: bool,
     /// Set once the layout was picked here, so the stored one no longer applies.
     layout_chosen: bool,
+    /// Set once the filters were changed here, so the stored ones no longer apply.
+    filters_chosen: bool,
+    /// A filters save is running; a newer value waits in `filters_pending`.
+    filters_saving: bool,
+    filters_pending: Option<String>,
+    /// A task was just added that the filters hide: say so, with a way out.
+    added_hidden: bool,
     /// Measured by the page itself, read by the next render.
     page_width: Rc<Cell<f32>>,
     _subscriptions: Vec<Subscription>,
@@ -160,10 +183,12 @@ struct Loaded {
     view: DayView,
     sources: Vec<Source>,
     statuses: Vec<WorkflowStatus>,
+    tags: Vec<Tag>,
     open_count: usize,
     rollover: u32,
     panel_width: Option<f32>,
     layout: Option<Layout>,
+    filters: Option<filter::Saved>,
 }
 
 impl EventEmitter<Event> for Today {}
@@ -217,8 +242,10 @@ impl Today {
             selected: None,
             activity: Vec::new(),
             statuses: monocode_core::today::statuses::default_statuses(),
+            tags: Vec::new(),
             layout: Layout::default(),
             statuses_dialog: None,
+            tags_dialog: None,
             board: board::Board::default(),
             new_task,
             note,
@@ -234,6 +261,10 @@ impl Today {
             rollover: None,
             width_loaded: false,
             layout_chosen: false,
+            filters_chosen: false,
+            filters_saving: false,
+            filters_pending: None,
+            added_hidden: false,
             page_width: Rc::new(Cell::new(f32::MAX)),
             _subscriptions: subscriptions,
         }
@@ -258,6 +289,7 @@ impl Today {
                 view: db.today_view(&day, now)?,
                 sources: db.today_sources()?,
                 statuses: db.today_statuses()?,
+                tags: db.today_tags()?,
                 open_count: db.today_open_count(now)?,
                 rollover: db.today_rollover_minutes()?,
                 panel_width: if load_width {
@@ -268,6 +300,12 @@ impl Today {
                 // Loaded with the width: once, and skipped when a pick was made meanwhile.
                 layout: if load_width {
                     db.setting(LAYOUT_KEY)?.and_then(|v| Layout::parse(&v))
+                } else {
+                    None
+                },
+                filters: if load_width {
+                    db.setting(FILTERS_KEY)?
+                        .and_then(|v| filter::Saved::parse(&v))
                 } else {
                     None
                 },
@@ -300,8 +338,27 @@ impl Today {
         self.width_loaded = true;
         self.rollover = Some(loaded.rollover);
         self.statuses = loaded.statuses;
-        self.open_count = loaded.open_count;
+        self.tags = loaded.tags;
+        if let Some(saved) = loaded.filters.filter(|_| !self.filters_chosen) {
+            self.filters = saved.apply(std::mem::take(&mut self.filters));
+        }
+        let before_prune = self.filters.clone();
+        // A status or tag deleted since is no longer a filter.
+        self.filters = filter::pruned(
+            std::mem::take(&mut self.filters),
+            &self.statuses,
+            &self.tags,
+        );
         self.sources = loaded.sources;
+        self.filters = filter::pruned_source(std::mem::take(&mut self.filters), &self.sources);
+        if self.roster_loaded {
+            self.filters = filter::pruned_mono(std::mem::take(&mut self.filters), &self.roster);
+        }
+        // A pruned filter may have been the one hiding a task just added.
+        if self.filters != before_prune {
+            self.added_hidden = false;
+        }
+        self.open_count = loaded.open_count;
         self.error = None;
         // Viewing "today" by date once it is the current day goes back to following it.
         if self.day.as_deref() == Some(loaded.view.current_day.as_str()) {
@@ -318,6 +375,8 @@ impl Today {
         } else if self.selected.is_some() {
             self.load_activity(cx);
         }
+        self.refresh_tags_menu(cx);
+        self.refresh_filter_menu(cx);
         cx.notify();
     }
     fn load_activity(&mut self, cx: &mut Context<Self>) {
@@ -375,6 +434,11 @@ impl Today {
         self.roster_loaded = true;
         if first || self.roster != roster {
             self.roster = roster;
+            let before = self.filters.clone();
+            self.filters = filter::pruned_mono(std::mem::take(&mut self.filters), &self.roster);
+            if self.filters != before {
+                self.added_hidden = false;
+            }
             cx.notify();
         }
     }
@@ -408,26 +472,7 @@ impl Today {
         };
         view.rows
             .iter()
-            .filter(|row| {
-                let task = &row.task;
-                let project = match &self.filters.project {
-                    None => true,
-                    Some(None) => task.project.is_none(),
-                    Some(Some(path)) => task.project.as_ref().is_some_and(|p| {
-                        monocode_core::files::path_key(p) == monocode_core::files::path_key(path)
-                    }),
-                };
-                let source = match &self.filters.source {
-                    None => true,
-                    Some(wanted) => &task.source_id == wanted,
-                };
-                let mono = self
-                    .filters
-                    .mono
-                    .as_ref()
-                    .is_none_or(|id| task.mono_id.as_ref() == Some(id));
-                project && source && mono
-            })
+            .filter(|row| filter::matches(&self.filters, row, &self.statuses))
             .collect()
     }
     pub(super) fn selected_row(&self) -> Option<&monocode_core::today::Row> {
@@ -444,6 +489,14 @@ impl Today {
         work: impl FnOnce(&Store, u64) -> Result<(), String> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        self.act_inner(None, work, cx);
+    }
+    fn act_inner(
+        &mut self,
+        added_in: Option<String>,
+        work: impl FnOnce(&Store, u64) -> Result<(), String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
         let store = self.store.clone();
         let task = cx
             .background_executor()
@@ -451,7 +504,10 @@ impl Today {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                this.action_error = result.err();
+                this.action_error = result.as_ref().err().cloned();
+                if let (Ok(()), Some(status_id)) = (&result, &added_in) {
+                    this.added_hidden = filter::hides_new_task(&this.filters, status_id);
+                }
                 this.refresh(cx);
             });
         })
@@ -500,12 +556,56 @@ impl Today {
             return;
         }
         self.day = day;
+        self.added_hidden = false;
         self.refresh(cx);
         cx.notify();
     }
     pub(super) fn set_filters(&mut self, filters: Filters, cx: &mut Context<Self>) {
+        let saved = filter::Saved::of(&filters);
+        let changed = saved != filter::Saved::of(&self.filters);
         self.filters = filters;
+        self.added_hidden = false;
+        if changed {
+            self.filters_chosen = true;
+            self.save_filters(saved.to_json(), cx);
+        }
         cx.notify();
+    }
+    /// Writes the filters setting off the UI thread, one write at a time: a value
+    /// that arrives meanwhile waits and replaces any older waiting one, so the
+    /// newest is always the last stored.
+    fn save_filters(&mut self, json: String, cx: &mut Context<Self>) {
+        if self.filters_saving {
+            self.filters_pending = Some(json);
+            return;
+        }
+        self.filters_saving = true;
+        let store = self.store.clone();
+        let work = cx.background_executor().spawn(async move {
+            let _ = locked(&store).and_then(|db| db.save_setting(FILTERS_KEY, &json));
+        });
+        cx.spawn(async move |this, cx| {
+            work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.filters_saving = false;
+                if let Some(next) = this.filters_pending.take() {
+                    this.save_filters(next, cx);
+                }
+            });
+        })
+        .detach();
+    }
+    /// Like [`Self::act`] for work that adds a task in `status_id`: once the add
+    /// succeeded, remembers whether the filters hide the new task. A failed add
+    /// leaves nothing to explain.
+    pub(super) fn act_add(
+        &mut self,
+        status_id: &str,
+        work: impl FnOnce(&Store, u64) -> Result<(), String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let status_id = status_id.to_string();
+        self.act_inner(Some(status_id), work, cx);
     }
     /// Enter in the New task field: adds to the day on screen.
     pub(super) fn add_task(&mut self, cx: &mut Context<Self>) {
@@ -523,7 +623,8 @@ impl Today {
             day: Some(day),
             ..Default::default()
         };
-        self.act(
+        self.act_add(
+            monocode_core::today::statuses::TODO_ID,
             move |store, now| store.today_add(&new, &Actor::User, now).map(|_| ()),
             cx,
         );
@@ -743,11 +844,23 @@ impl Today {
     }
     pub(super) fn open_statuses(&mut self, cx: &mut Context<Self>) {
         self.menus.close();
-        self.statuses_dialog = Some(statuses::Dialog::new(&self.statuses, cx));
+        self.tags_dialog = None;
+        self.statuses_dialog = Some(self.new_dialog(statuses::Kind::Statuses, cx));
         cx.notify();
     }
     pub(super) fn close_statuses(&mut self, cx: &mut Context<Self>) {
         if self.statuses_dialog.take().is_some() {
+            cx.notify();
+        }
+    }
+    pub(super) fn open_tags(&mut self, cx: &mut Context<Self>) {
+        self.menus.close();
+        self.statuses_dialog = None;
+        self.tags_dialog = Some(self.new_dialog(statuses::Kind::Tags, cx));
+        cx.notify();
+    }
+    pub(super) fn close_tags(&mut self, cx: &mut Context<Self>) {
+        if self.tags_dialog.take().is_some() {
             cx.notify();
         }
     }
@@ -788,6 +901,33 @@ impl Today {
         );
     }
 
+    // --- tags --------------------------------------------------------------------------------
+
+    pub(super) fn add_tag(&mut self, name: String, color: String, cx: &mut Context<Self>) {
+        self.act(
+            move |store, _| store.today_add_tag(&name, &color).map(|_| ()),
+            cx,
+        );
+    }
+    pub(super) fn update_tag(&mut self, id: String, patch: TagPatch, cx: &mut Context<Self>) {
+        self.act(
+            move |store, _| store.today_update_tag(&id, &patch).map(|_| ()),
+            cx,
+        );
+    }
+    pub(super) fn move_tag(&mut self, id: String, index: usize, cx: &mut Context<Self>) {
+        self.act(
+            move |store, _| store.today_move_tag(&id, index).map(|_| ()),
+            cx,
+        );
+    }
+    /// Deletes a tag outright; the confirmation is the caller's.
+    pub(super) fn delete_tag(&mut self, id: String, cx: &mut Context<Self>) {
+        self.act(
+            move |store, now| store.today_delete_tag(&id, now).map(|_| ()),
+            cx,
+        );
+    }
     fn narrow(&self) -> bool {
         self.page_width.get() < NARROW_WIDTH
     }
@@ -870,11 +1010,17 @@ impl Today {
                     ),
             )
             .when(self.tab == Tab::Tasks, |d| {
-                d.child(self.layout_switch(cx)).child(
-                    icon_action("today-statuses", "Statuses", "sliders")
-                        .debug_selector(|| "today-statuses".into())
-                        .on_click(cx.listener(|this, _, _, cx| this.open_statuses(cx))),
-                )
+                d.child(self.layout_switch(cx))
+                    .child(
+                        icon_action("today-statuses", "Statuses", "sliders")
+                            .debug_selector(|| "today-statuses".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.open_statuses(cx))),
+                    )
+                    .child(
+                        icon_action("today-tags", "Tags", "tag")
+                            .debug_selector(|| "today-tags".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.open_tags(cx))),
+                    )
             })
             .child(
                 crate::modal::disabled(
@@ -1018,7 +1164,11 @@ impl Today {
         let mut out = Vec::new();
         match view.mode {
             DayMode::Current => {
-                let s = view.summary;
+                let s = if filter::active_count(&self.filters) == 0 {
+                    view.summary
+                } else {
+                    filter::summary(&self.visible_rows())
+                };
                 let dot = || div().text_color(content(0.3)).child("·");
                 out.push(
                     div()
@@ -1129,6 +1279,26 @@ impl Today {
             ),
             DayMode::Future => {}
         }
+        if self.added_hidden && view.mode != DayMode::Past {
+            out.push(
+                band()
+                    .debug_selector(|| "today-added-hidden".into())
+                    .child(
+                        message("Added. Hidden by the current filters.")
+                            .p_0()
+                            .flex_1()
+                            .min_w_0(),
+                    )
+                    .child(
+                        action("today-added-clear", "Clear filters")
+                            .debug_selector(|| "today-added-clear".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_filters(Filters::default(), cx)
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
         out
     }
 
@@ -1221,6 +1391,7 @@ impl Today {
 impl Render for Today {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dialog = self.statuses_dialog_view(window, cx);
+        let tags_dialog = self.tags_dialog_view(window, cx);
         let narrow = self.narrow();
         let tasks = self.tab == Tab::Tasks;
         let body = if narrow && tasks && self.selected.is_some() {
@@ -1252,6 +1423,8 @@ impl Render for Today {
                     // keeps the page), then the narrow detail, then the page itself.
                     if this.statuses_dialog.is_some() {
                         this.finish_statuses(window, cx);
+                    } else if this.tags_dialog.is_some() {
+                        this.finish_tags(window, cx);
                     } else if !this.focus.is_focused(window) {
                         window.focus(&this.focus, cx);
                         cx.notify();
@@ -1313,6 +1486,7 @@ impl Render for Today {
                 |d, text| d.child(message(text).text_color(danger_color())),
             )
             .children(dialog)
+            .children(tags_dialog)
     }
 }
 
@@ -1776,6 +1950,229 @@ mod tests {
         );
         let (today, visual) = page(cx, &store);
         today.read_with(visual, |today, _| assert_eq!(today.layout, Layout::Board));
+    }
+
+    #[gpui::test]
+    fn the_filters_are_remembered_by_a_new_page_on_the_same_store(cx: &mut TestAppContext) {
+        let store = database();
+        let tag = locked(&store)
+            .unwrap()
+            .today_add_tag("Urgent", "#4da3f5")
+            .unwrap();
+        {
+            let (today, visual) = page(cx, &store);
+            let tag_id = tag.id.clone();
+            today.update(visual, |today, cx| {
+                let mut next = today.filters.clone();
+                next.statuses.insert("done".into());
+                next.statuses.insert("ghost".into());
+                next.tags.insert(tag_id);
+                next.no_tag = true;
+                next.match_all = true;
+                next.mono = Some("m".into());
+                today.set_filters(next, cx);
+            });
+            visual.run_until_parked();
+        }
+        let saved = locked(&store)
+            .unwrap()
+            .setting(FILTERS_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(saved.contains("\"noTag\":true"), "{saved}");
+        let (today, visual) = page(cx, &store);
+        today.read_with(visual, |today, _| {
+            // The unknown status is dropped; the Mono filter comes back (no roster yet to judge it).
+            assert_eq!(today.filters.statuses.len(), 1);
+            assert!(today.filters.statuses.contains("done"));
+            assert!(today.filters.tags.contains(&tag.id));
+            assert!(today.filters.no_tag && today.filters.match_all);
+            assert_eq!(today.filters.mono.as_deref(), Some("m"));
+        });
+    }
+
+    #[gpui::test]
+    fn a_stored_mono_filter_is_dropped_only_once_the_roster_is_known(cx: &mut TestAppContext) {
+        let store = database();
+        locked(&store)
+            .unwrap()
+            .save_setting(FILTERS_KEY, r#"{"mono":"m1","project":"/p"}"#)
+            .unwrap();
+        let (today, visual) = page(cx, &store);
+        today.read_with(visual, |today, _| {
+            assert_eq!(today.filters.mono.as_deref(), Some("m1"));
+            assert_eq!(today.filters.project, Some(Some("/p".to_string())));
+        });
+        today.update(visual, |today, cx| today.set_roster(Vec::new(), cx));
+        today.read_with(visual, |today, _| {
+            assert_eq!(today.filters.mono, None);
+            assert_eq!(today.filters.project, Some(Some("/p".to_string())));
+        });
+    }
+
+    #[gpui::test]
+    fn quick_filter_changes_store_the_newest_value_last(cx: &mut TestAppContext) {
+        let store = database();
+        let (today, visual) = page(cx, &store);
+        today.update(visual, |today, cx| {
+            for (ix, id) in ["todo", "in_progress", "done", "todo", "in_progress"]
+                .into_iter()
+                .enumerate()
+            {
+                let mut next = today.filters.clone();
+                if ix == 3 {
+                    next.statuses.clear();
+                }
+                next.statuses.insert(id.into());
+                today.set_filters(next, cx);
+            }
+        });
+        visual.run_until_parked();
+        let expected = today.read_with(visual, |today, _| filter::Saved::of(&today.filters));
+        let stored = locked(&store)
+            .unwrap()
+            .setting(FILTERS_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filter::Saved::parse(&stored), Some(expected));
+    }
+
+    #[gpui::test]
+    fn match_all_alone_is_not_a_filter_on_screen(cx: &mut TestAppContext) {
+        let store = database();
+        let (today, visual) = page(cx, &store);
+        today.update(visual, |today, cx| {
+            let mut next = today.filters.clone();
+            next.match_all = true;
+            today.set_filters(next, cx);
+        });
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("today-filters-clear").is_none());
+        assert!(visual.debug_bounds("today-filter-count").is_none());
+    }
+
+    #[gpui::test]
+    fn a_task_added_under_a_filter_that_hides_it_says_so(cx: &mut TestAppContext) {
+        let store = database();
+        let (today, visual) = page(cx, &store);
+        today.update(visual, |today, cx| {
+            let mut next = today.filters.clone();
+            next.statuses.insert("done".into());
+            today.set_filters(next, cx);
+            today
+                .new_task
+                .update(cx, |input, cx| input.set_text("Hidden one".into(), cx));
+            today.add_task(cx);
+        });
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("today-added-hidden").is_some());
+        click(visual, "today-added-clear");
+        today.read_with(visual, |today, _| {
+            assert_eq!(today.filters, Filters::default());
+            assert!(!today.added_hidden);
+        });
+        assert!(visual.debug_bounds("today-added-hidden").is_none());
+        // A task that passes the filters says nothing.
+        today.update(visual, |today, cx| {
+            today
+                .new_task
+                .update(cx, |input, cx| input.set_text("Visible".into(), cx));
+            today.add_task(cx);
+        });
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("today-added-hidden").is_none());
+    }
+
+    #[gpui::test]
+    fn a_failed_add_does_not_say_it_was_hidden(cx: &mut TestAppContext) {
+        let store = database();
+        let (today, visual) = page(cx, &store);
+        today.update(visual, |today, cx| {
+            let mut next = today.filters.clone();
+            next.statuses.insert("done".into());
+            today.set_filters(next, cx);
+            today.act_add("todo", |_, _| Err("nope".into()), cx);
+        });
+        visual.run_until_parked();
+        today.read_with(visual, |today, _| {
+            assert!(!today.added_hidden);
+            assert_eq!(today.action_error.as_deref(), Some("nope"));
+        });
+    }
+
+    #[gpui::test]
+    fn pruning_the_filters_clears_the_hidden_flag(cx: &mut TestAppContext) {
+        let store = database();
+        let (today, visual) = page(cx, &store);
+        today.update(visual, |today, cx| {
+            let mut next = today.filters.clone();
+            next.mono = Some("gone".into());
+            today.set_filters(next, cx);
+            today.added_hidden = true;
+            // The roster does not hold that Mono: the filter goes, and the flag with it.
+            today.set_roster(Vec::new(), cx);
+            assert_eq!(today.filters.mono, None);
+            assert!(!today.added_hidden);
+        });
+    }
+
+    #[gpui::test]
+    fn a_load_rebuilds_an_open_filter_menu(cx: &mut TestAppContext) {
+        let store = database();
+        let (today, visual) = page(cx, &store);
+        click(visual, "today-filter-tag");
+        let before = today.read_with(visual, |today, _| today.menus.pick_count());
+        assert!(before > 0);
+        locked(&store)
+            .unwrap()
+            .today_add_tag("Fresh", "#4da3f5")
+            .unwrap();
+        today.update(visual, |today, cx| today.refresh(cx));
+        visual.run_until_parked();
+        today.read_with(visual, |today, _| {
+            assert!(today.menus.is_open());
+            assert_eq!(today.menus.pick_count(), before + 1);
+        });
+    }
+
+    #[gpui::test]
+    fn filters_picked_before_the_first_load_lands_are_kept(cx: &mut TestAppContext) {
+        let store = database();
+        locked(&store)
+            .unwrap()
+            .save_setting(FILTERS_KEY, r#"{"statuses":["done"]}"#)
+            .unwrap();
+        let (today, visual) = cx.add_window_view(|_, cx| Today::new_quiet(store.clone(), cx));
+        today.update(visual, |today, cx| {
+            today.refresh(cx);
+            let mut next = today.filters.clone();
+            next.statuses.insert("todo".into());
+            today.set_filters(next, cx);
+        });
+        visual.run_until_parked();
+        today.read_with(visual, |today, _| {
+            assert_eq!(today.filters.statuses.iter().collect::<Vec<_>>(), ["todo"]);
+        });
+    }
+
+    #[gpui::test]
+    fn a_stored_filter_for_a_deleted_status_is_dropped(cx: &mut TestAppContext) {
+        let store = database();
+        locked(&store)
+            .unwrap()
+            .save_setting(
+                FILTERS_KEY,
+                r#"{"statuses":["gone","todo"],"tags":["tag-x"]}"#,
+            )
+            .unwrap();
+        let (today, visual) = page(cx, &store);
+        today.read_with(visual, |today, _| {
+            assert_eq!(today.filters.statuses.iter().collect::<Vec<_>>(), ["todo"]);
+            assert!(today.filters.tags.is_empty());
+        });
     }
 
     #[gpui::test]

@@ -12,9 +12,11 @@ pub mod actions;
 pub mod mention;
 pub mod reconcile;
 pub mod statuses;
+pub mod tags;
 pub mod workday;
 
 pub use statuses::{Stage, StatusPatch, WorkflowStatus};
+pub use tags::{Tag, TagPatch};
 
 /// A work day, `YYYY-MM-DD`. Sorts as text.
 pub type Day = String;
@@ -103,6 +105,9 @@ pub struct Task {
     /// `HH:MM`, only with `due`.
     pub due_time: Option<String>,
     pub priority: Priority,
+    /// Ids of the task's tags ([`tags::Tag::id`]). A task saved before tags had
+    /// definitions holds free text names here until the store migrates it;
+    /// [`tags::resolve`] reads both.
     pub tags: Vec<String>,
     pub status: Status,
     pub snoozed_until: Option<Day>,
@@ -181,6 +186,9 @@ pub enum EventKind {
     Dismissed,
     /// The user answered a Done-but-source-open check with Keep done.
     KeptDone,
+    /// Tags were added or removed; `added_tags` and `removed_tags` hold them
+    /// as they were then.
+    TagsChanged,
 }
 
 /// One entry of a task's activity. Append-only, like notes. Who: `mono_id` for a
@@ -199,11 +207,18 @@ pub struct TaskEvent {
     pub to: Option<WorkflowStatus>,
     pub check_reason: Option<CheckReason>,
     pub detail: Option<String>,
+    /// [`EventKind::TagsChanged`] only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_tags: Vec<Tag>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_tags: Vec<Tag>,
 }
 
 /// The detail panel's timeline: events and notes merged, oldest first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Boxing the event would change every match on it; the list is short.
+#[allow(clippy::large_enum_variant)]
 pub enum Activity {
     Event(TaskEvent),
     Note(Note),
@@ -275,6 +290,8 @@ pub struct SyncItem {
     pub due: Option<String>,
     pub due_time: Option<String>,
     pub priority: Option<Priority>,
+    /// Tag names from the Mono; the store turns them into ids before reconcile,
+    /// where they are added to the task's tags, never replacing them.
     pub tags: Option<Vec<String>>,
     /// The stage the Mono states for this item. Without it the stage is mapped
     /// from `source_status` ([`statuses::stage_of_source_status`]).
@@ -309,6 +326,8 @@ pub struct SyncSummary {
     pub conflicts: Vec<String>,
     /// Projects a Mono may not set; the item stays with no project.
     pub rejected_projects: Vec<String>,
+    /// Tag names no tag definition has; ignored, a sync never creates tags.
+    pub rejected_tags: Vec<String>,
 }
 
 /// A Mono calling through the app bridge, resolved from its session
@@ -340,6 +359,7 @@ pub struct NewTask {
     pub due_time: Option<String>,
     pub link: Option<String>,
     pub reason: Option<String>,
+    /// Tag ids. `actions` turns an agent's names into ids and refuses unknown ones.
     pub tags: Vec<String>,
 }
 
@@ -351,6 +371,7 @@ pub struct TaskPatch {
     pub project: Option<Option<String>>,
     pub due: Option<Option<String>>,
     pub due_time: Option<Option<String>>,
+    /// Replaces the task's tags; ids, like [`NewTask::tags`].
     pub tags: Option<Vec<String>>,
     pub reason: Option<String>,
 }
@@ -373,6 +394,9 @@ pub struct Row {
     /// The task's workflow status as it was on the viewed day: a past day shows
     /// the name and color frozen in its record, even if later renamed or deleted.
     pub status: WorkflowStatus,
+    /// The task's tags, resolved through the current tag list in its order
+    /// (a past day too: a renamed tag shows its new name, a deleted one is gone).
+    pub tags: Vec<Tag>,
     pub age_days: u32,
     pub latest_note: Option<Note>,
 }

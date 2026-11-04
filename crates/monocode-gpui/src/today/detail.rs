@@ -21,7 +21,7 @@ use monocode_core::{
     store::Store,
     today::{
         AGE_WARNING_DAYS, Activity, Actor, CheckReason, DayMode, EventKind, Group, Kind, Note,
-        Priority, Status, Task, TaskEvent, TaskPatch, statuses::TODO_ID,
+        Priority, Status, Tag, Task, TaskEvent, TaskPatch, statuses::TODO_ID,
     },
 };
 use std::cell::RefCell;
@@ -129,6 +129,24 @@ fn event_text(event: &TaskEvent, mono: Option<&str>) -> String {
         },
         EventKind::Dismissed => "Dismissed".to_string(),
         EventKind::KeptDone => "Kept done".to_string(),
+        EventKind::TagsChanged => tags_text(event),
+    }
+}
+/// "Tag added: Bug", "Tags removed: Bug, UI", or "Tags: added Bug, removed UI"
+/// when one event did both; "Tags changed" when it names none.
+fn tags_text(event: &TaskEvent) -> String {
+    let names = |tags: &[Tag]| {
+        tags.iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let plural = |tags: &[Tag]| if tags.len() == 1 { "Tag" } else { "Tags" };
+    match (event.added_tags.as_slice(), event.removed_tags.as_slice()) {
+        ([], []) => "Tags changed".to_string(),
+        (added, []) => format!("{} added: {}", plural(added), names(added)),
+        ([], removed) => format!("{} removed: {}", plural(removed), names(removed)),
+        (added, removed) => format!("Tags: added {}, removed {}", names(added), names(removed)),
     }
 }
 fn event_icon(kind: EventKind) -> &'static str {
@@ -141,6 +159,7 @@ fn event_icon(kind: EventKind) -> &'static str {
         EventKind::ReopenedBySource => "rotate-ccw",
         EventKind::Snoozed => "clock",
         EventKind::Dismissed => "close",
+        EventKind::TagsChanged => "tag",
     }
 }
 
@@ -193,11 +212,17 @@ fn detail_row(glyph: &'static str, name: &'static str, value: impl IntoElement) 
 }
 /// A detail value that opens a menu: quiet until hovered.
 fn menu_value(id: &'static str, text: String, open: bool) -> Stateful<Div> {
+    menu_trigger(id, text.clone(), open)
+        .child(div().min_w_0().truncate().child(text))
+        .child(icon("chevron-down", 12.).text_color(content(0.4)))
+}
+/// The frame of [`menu_value`], for a value that is not plain text.
+fn menu_trigger(id: &'static str, label: String, open: bool) -> Stateful<Div> {
     div()
         .id(id)
         .debug_selector(|| id.to_string())
         .role(Role::Button)
-        .aria_label(text.clone())
+        .aria_label(label)
         .aria_expanded(open)
         .relative()
         .ml(px(-4.))
@@ -208,8 +233,6 @@ fn menu_value(id: &'static str, text: String, open: bool) -> Stateful<Div> {
         .gap(px(4.))
         .cursor_pointer()
         .hover(|s| s.bg(content(0.07)))
-        .child(div().min_w_0().truncate().child(text))
-        .child(icon("chevron-down", 12.).text_color(content(0.4)))
 }
 
 /// The title field of a manual task. Enter commits it through [`Today::patch`].
@@ -644,6 +667,52 @@ impl Today {
         } else {
             project_text.into_any_element()
         };
+        let tag_chips = self.tag_chips("today-detail-tag", &task.id, &row.tags, false, None);
+        let tags_value: AnyElement = if editable {
+            let id = id.clone();
+            let names = row
+                .tags
+                .iter()
+                .map(|tag| tag.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            menu_trigger(
+                "today-tags-value",
+                format!("Tags: {}", if names.is_empty() { "None" } else { &names }),
+                open(Slot::Tags),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(4.))
+                    .when(tag_chips.is_empty(), |d| d.child("None"))
+                    .children(tag_chips),
+            )
+            .child(icon("chevron-down", 12.).text_color(content(0.4)))
+            .child(self.anchor(Slot::Tags).probe())
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.open_tags_menu(id.clone(), window, cx)),
+            )
+            .into_any_element()
+        } else if tag_chips.is_empty() {
+            div()
+                .debug_selector(|| "today-tags-record".into())
+                .child("None")
+                .into_any_element()
+        } else {
+            div()
+                .debug_selector(|| "today-tags-record".into())
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.))
+                .children(tag_chips)
+                .into_any_element()
+        };
         let mono_value: AnyElement = match task.mono_id.as_deref() {
             Some(mono_id) => div()
                 .flex()
@@ -703,9 +772,7 @@ impl Today {
                 "Open for",
                 open_for_text(row.age_days, &task.first_day, current),
             ))
-            .when(!task.tags.is_empty(), |d| {
-                d.child(detail_row("note", "Tags", task.tags.join(", ")))
-            });
+            .child(detail_row("tag", "Tags", tags_value));
 
         // --- activity --------------------------------------------------------------
         // `load_activity` already cut a past day's timeline at that day.
@@ -1005,6 +1072,8 @@ mod tests {
             to: None,
             check_reason: None,
             detail: None,
+            added_tags: Vec::new(),
+            removed_tags: Vec::new(),
         }
     }
     #[test]
@@ -1044,6 +1113,30 @@ mod tests {
         assert_eq!(event_text(&e, None), "Snoozed until Nov 3");
         assert_eq!(event_text(&event(EventKind::Dismissed), None), "Dismissed");
         assert_eq!(event_text(&event(EventKind::KeptDone), None), "Kept done");
+    }
+    fn tag(id: &str, name: &str) -> Tag {
+        Tag {
+            id: id.into(),
+            name: name.into(),
+            color: "#4da3f5".into(),
+        }
+    }
+    #[test]
+    fn a_tags_event_reads_as_a_short_line() {
+        let mut e = event(EventKind::TagsChanged);
+        assert_eq!(event_text(&e, None), "Tags changed");
+        e.added_tags = vec![tag("a", "Bug")];
+        assert_eq!(event_text(&e, None), "Tag added: Bug");
+        e.added_tags = vec![tag("a", "Bug"), tag("b", "UI")];
+        assert_eq!(event_text(&e, None), "Tags added: Bug, UI");
+        e.added_tags.clear();
+        e.removed_tags = vec![tag("a", "Bug")];
+        assert_eq!(event_text(&e, None), "Tag removed: Bug");
+        e.removed_tags = vec![tag("a", "Bug"), tag("b", "UI")];
+        assert_eq!(event_text(&e, None), "Tags removed: Bug, UI");
+        e.added_tags = vec![tag("c", "Docs")];
+        e.removed_tags = vec![tag("b", "UI")];
+        assert_eq!(event_text(&e, None), "Tags: added Docs, removed UI");
     }
 
     fn selected(
@@ -1639,5 +1732,184 @@ mod tests {
         ] {
             assert!(!has(&mut visual, selector), "{selector} on a past day");
         }
+    }
+
+    /// A store backed page with tags Bug and UI and one manual task, selected.
+    fn tagged(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<super::super::list::testkit::Page>,
+        gpui::VisualTestContext,
+        Entity<Today>,
+        Arc<Mutex<Store>>,
+        String,
+    ) {
+        let (window, mut visual) = page(cx, Show::Detail, |_| {});
+        let (today, store) = window
+            .update(&mut visual, |page, _, cx| {
+                (page.today.clone(), page.today.read(cx).store.clone())
+            })
+            .unwrap();
+        let id = {
+            let db = crate::runtime::locked(&store).unwrap();
+            db.today_add_tag("Bug", "#4da3f5").unwrap();
+            db.today_add_tag("UI", "#10b981").unwrap();
+            db.today_add(
+                &monocode_core::today::NewTask {
+                    title: "Tag me".into(),
+                    ..Default::default()
+                },
+                &Actor::User,
+                monocode_core::time::now_ms(),
+            )
+            .unwrap()
+            .id
+        };
+        today.update(&mut visual, |today, cx| {
+            today.selected = Some(id.clone());
+            today.refresh(cx);
+        });
+        visual.run_until_parked();
+        (window, visual, today, store, id)
+    }
+    fn tags_of(
+        store: &Arc<Mutex<Store>>,
+        today: &Entity<Today>,
+        visual: &gpui::VisualTestContext,
+    ) -> Vec<String> {
+        let day = today.read_with(visual, |t, _| t.view.as_ref().unwrap().day.clone());
+        let view = crate::runtime::locked(store)
+            .unwrap()
+            .today_view(&day, monocode_core::time::now_ms())
+            .unwrap();
+        view.rows[0].tags.iter().map(|t| t.name.clone()).collect()
+    }
+    fn pick_ids(today: &Entity<Today>, visual: &mut gpui::VisualTestContext) -> Vec<String> {
+        today.read_with(visual, |t, _| t.menus.pick_ids())
+    }
+    fn type_in_search(today: &Entity<Today>, text: &str, visual: &mut gpui::VisualTestContext) {
+        let input = today.read_with(visual, |t, cx| t.menus.search_input(cx).unwrap());
+        input.update(visual, |input, cx| input.set_text(text.into(), cx));
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+    }
+
+    #[gpui::test]
+    fn the_tags_row_opens_a_menu_that_toggles_in_place(cx: &mut TestAppContext) {
+        let (_, mut visual, today, store, task_id) = tagged(cx);
+        assert!(has(&mut visual, "today-tags-value"));
+        click(&mut visual, "today-tags-value");
+        assert!(today.read_with(&visual, |t, _| t.menus.is_open()));
+        let ids = pick_ids(&today, &mut visual);
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_eq!(ids.last().map(String::as_str), Some("tag-edit"));
+        // Toggle the first tag with the keyboard: Enter on the first action.
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert_eq!(tags_of(&store, &today, &visual), ["Bug"]);
+        assert!(
+            today.read_with(&visual, |t, _| t.menus.is_open()),
+            "stays open"
+        );
+        let bug = crate::runtime::locked(&store)
+            .unwrap()
+            .today_tags()
+            .unwrap()[0]
+            .id
+            .clone();
+        let chip: &'static str =
+            Box::leak(format!("today-detail-tag-{task_id}-{bug}").into_boxed_str());
+        assert!(
+            has(&mut visual, chip),
+            "the chip shows behind the open menu"
+        );
+    }
+    #[gpui::test]
+    fn typing_filters_the_tag_rows_and_offers_create_for_a_new_name(cx: &mut TestAppContext) {
+        let (_, mut visual, today, _, _) = tagged(cx);
+        click(&mut visual, "today-tags-value");
+        type_in_search(&today, "ui", &mut visual);
+        let ids = pick_ids(&today, &mut visual);
+        assert_eq!(ids.len(), 2, "UI and Edit tags only: {ids:?}");
+        assert!(ids[0].starts_with("tag-tag-"));
+        // An existing name ignoring case offers no Create row.
+        type_in_search(&today, "  bUg ", &mut visual);
+        assert!(!pick_ids(&today, &mut visual).contains(&"tag-create".to_string()));
+        type_in_search(&today, "Docs", &mut visual);
+        assert_eq!(pick_ids(&today, &mut visual), ["tag-create", "tag-edit"]);
+    }
+    #[gpui::test]
+    fn create_tag_adds_the_definition_and_puts_it_on_the_task(cx: &mut TestAppContext) {
+        let (_, mut visual, today, store, _) = tagged(cx);
+        click(&mut visual, "today-tags-value");
+        type_in_search(&today, "Docs", &mut visual);
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let names: Vec<String> = crate::runtime::locked(&store)
+            .unwrap()
+            .today_tags()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, ["Bug", "UI", "Docs"]);
+        assert_eq!(tags_of(&store, &today, &visual), ["Docs"]);
+        assert!(today.read_with(&visual, |t, _| t.menus.is_open()));
+    }
+    #[gpui::test]
+    fn quick_toggles_keep_each_others_changes(cx: &mut TestAppContext) {
+        let (_, mut visual, today, store, _) = tagged(cx);
+        click(&mut visual, "today-tags-value");
+        // Bug, then UI, before the store answers anything.
+        visual.simulate_keystrokes("enter down enter");
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert_eq!(tags_of(&store, &today, &visual), ["Bug", "UI"]);
+    }
+    #[gpui::test]
+    fn create_reuses_a_tag_made_meanwhile(cx: &mut TestAppContext) {
+        let (_, mut visual, today, store, _) = tagged(cx);
+        click(&mut visual, "today-tags-value");
+        // Made elsewhere; the page has not loaded it yet.
+        crate::runtime::locked(&store)
+            .unwrap()
+            .today_add_tag("Docs", "#e5a23c")
+            .unwrap();
+        type_in_search(&today, "docs", &mut visual);
+        assert!(pick_ids(&today, &mut visual).contains(&"tag-create".to_string()));
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let count = crate::runtime::locked(&store)
+            .unwrap()
+            .today_tags()
+            .unwrap()
+            .len();
+        assert_eq!(count, 3);
+        assert_eq!(tags_of(&store, &today, &visual), ["Docs"]);
+        assert!(today.read_with(&visual, |t, _| t.action_error.is_none()));
+    }
+    #[gpui::test]
+    fn edit_tags_closes_the_menu_and_opens_the_dialog(cx: &mut TestAppContext) {
+        let (_, mut visual, today, _, _) = tagged(cx);
+        click(&mut visual, "today-tags-value");
+        visual.simulate_keystrokes("up enter");
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(!today.read_with(&visual, |t, _| t.menus.is_open()));
+        assert!(today.read_with(&visual, |t, _| t.tags_dialog.is_some()));
+    }
+    #[gpui::test]
+    fn a_past_day_shows_the_tags_without_a_menu(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(cx, Show::Detail, |today| {
+            selected(DayMode::Past, 0, Vec::new(), None)(today);
+            let tags = vec![tag("tag-1", "Renamed")];
+            today.view.as_mut().unwrap().rows[0].tags = tags;
+        });
+        assert!(has(&mut visual, "today-tags-record"));
+        assert!(has(&mut visual, "today-detail-tag-id-a-tag-1"));
+        assert!(!has(&mut visual, "today-tags-value"));
     }
 }
