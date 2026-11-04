@@ -12082,12 +12082,14 @@ mod tests {
         visual.run_until_parked();
         visual.refresh().unwrap();
         let root = window.root(visual).unwrap();
-        let transcript =
-            root.read_with(visual, |s, cx| s.sessions[&active].read(cx).transcript.clone());
+        let transcript = root.read_with(visual, |s, cx| {
+            s.sessions[&active].read(cx).transcript.clone()
+        });
         let before = transcript.read_with(visual, |t, _| t.render_passes);
         for label in ["Today", "Inbox", "Notes"] {
+            let selector = format!("sidebar-navigation-{label}");
             let row = visual
-                .debug_bounds(&format!("sidebar-navigation-{label}"))
+                .debug_bounds(&selector)
                 .expect("navigation row is rendered");
             visual.simulate_mouse_move(row.center(), None, Default::default());
             visual.run_until_parked();
