@@ -1074,6 +1074,13 @@ impl Conversation {
             },
         )
     }
+    /// The chat's chosen account was removed from the accounts book.
+    pub(crate) fn account_missing(&self, cx: &gpui::App) -> bool {
+        let kind = Kind::from_id(&self.summary.provider);
+        self.settings.account.id != monocode_core::accounts::DEFAULT
+            && crate::accounts::get(cx)
+                .is_some_and(|center| !center.read(cx).book.exists(kind, &self.settings.account.id))
+    }
     fn launch_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
         if self.stopping {
             let mode = if self.settings.orchestrator {
@@ -1107,11 +1114,7 @@ impl Conversation {
         if self.account_switching {
             return;
         }
-        let kind = Kind::from_id(&self.summary.provider);
-        if self.settings.account.id != monocode_core::accounts::DEFAULT
-            && crate::accounts::get(cx)
-                .is_some_and(|center| !center.read(cx).book.exists(kind, &self.settings.account.id))
-        {
+        if self.account_missing(cx) {
             self.account_unavailable(cx);
             return;
         }

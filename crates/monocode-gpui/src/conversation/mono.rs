@@ -1,3 +1,4 @@
+use super::accounts::ACCOUNT_UNAVAILABLE;
 use super::*;
 use gpui::{App, EntityInputHandler};
 use monocode_core::mono::{Message, Mono};
@@ -243,6 +244,16 @@ impl Conversation {
             }) {
                 self.mono_ui.sending = Some(message.id.clone());
                 return true;
+            }
+            return false;
+        }
+        // Launching would only report the missing account and return, yet
+        // report success; the chat observer would then dispatch again forever.
+        // Say it once, keep the message queued, and let a later account
+        // change (which notifies the chat) dispatch it.
+        if self.account_missing(cx) {
+            if !self.status.starts_with(ACCOUNT_UNAVAILABLE) {
+                self.account_unavailable(cx);
             }
             return false;
         }

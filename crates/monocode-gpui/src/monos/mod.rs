@@ -172,6 +172,10 @@ pub(crate) struct Monos {
     scheduling: bool,
     persisted_messages: HashSet<String>,
     failed_reports: HashSet<String>,
+    #[cfg(test)]
+    dispatch_calls: usize,
+    #[cfg(test)]
+    dispatch_limit: Option<usize>,
     inflight: HashMap<String, Message>,
     card_refresh: HashMap<String, u64>,
     session_filters: filters::Filters,
@@ -442,6 +446,10 @@ impl Monos {
             scheduling: false,
             persisted_messages,
             failed_reports: HashSet::new(),
+            #[cfg(test)]
+            dispatch_calls: 0,
+            #[cfg(test)]
+            dispatch_limit: None,
             inflight: HashMap::new(),
             card_refresh: HashMap::new(),
             session_filters,
@@ -1116,18 +1124,36 @@ impl Monos {
             return;
         };
         let busy = view.read(cx).busy;
-        let Some(message) = self
-            .roster
-            .get(id)
-            .and_then(|m| m.outbox.iter().find(|message| !busy || !message.internal))
-            .cloned()
-            .filter(|m| m.error.is_none() && self.persisted_messages.contains(&m.id))
-        else {
+        #[cfg(test)]
+        {
+            if let Some(limit) = self.dispatch_limit {
+                self.dispatch_calls += 1;
+                assert!(
+                    self.dispatch_calls < limit,
+                    "dispatch is re-entering forever"
+                );
+            }
+        }
+        let Some(message) = self.next_message(id, busy) else {
             return;
         };
         if view.update(cx, |v, cx| v.mono_dispatch(&message, cx)) && !busy {
             self.inflight.insert(id.into(), message);
         }
+    }
+    /// The message `dispatch` sends next.
+    fn next_message(&self, id: &str, busy: bool) -> Option<Message> {
+        self.roster
+            .get(id)
+            .and_then(|m| {
+                // A failed report waits for Retry or Discard without holding
+                // back the user's messages; a failed user message still does.
+                m.outbox.iter().find(|message| {
+                    (!busy || !message.internal) && !(message.internal && message.error.is_some())
+                })
+            })
+            .cloned()
+            .filter(|m| m.error.is_none() && self.persisted_messages.contains(&m.id))
     }
     fn chat_changed(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(view) = self.chats.get(id) else {
