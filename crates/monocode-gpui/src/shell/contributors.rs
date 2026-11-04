@@ -148,7 +148,7 @@ impl Shell {
                 &hidden,
                 self.installed_providers.as_deref(),
             ),
-            default: Some(self.default_kind_in(project)),
+            default: Some(self.new_chat_choice(project).kind),
         }
     }
 
@@ -221,7 +221,7 @@ impl Shell {
         }
         let kind = request
             .harness
-            .unwrap_or_else(|| self.default_kind_in(&project));
+            .unwrap_or_else(|| self.new_chat_choice(&project).kind);
         let settings = self.project_session_settings(kind, &project, cx);
         let store = self.store.clone();
         let work = cx

@@ -267,10 +267,10 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "actions commands run script dock background",
     ),
     (
-        "terminal-in-panel",
+        "terminal-placement",
         Section::General,
-        "Terminal in side panel",
-        "terminal dock right panel tab shell focused layout",
+        "Terminal",
+        "terminal placement dock bottom side right panel title bar tab shell focused layout",
     ),
     (
         "file-tabs",
@@ -392,6 +392,18 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         Section::Chat,
         "Smooth text reveal",
         "streaming pacing immediate latency performance animation",
+    ),
+    (
+        "collapse-tool-groups",
+        Section::Chat,
+        "Collapse tool groups",
+        "tool calls commands steps expand closed mobile compact activity",
+    ),
+    (
+        "fold-finished-work",
+        Section::Chat,
+        "Fold finished work",
+        "worked for collapse tool calls reply inline expanded history turns",
     ),
     (
         "follow-up",

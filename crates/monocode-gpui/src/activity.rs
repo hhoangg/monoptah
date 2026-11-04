@@ -318,11 +318,35 @@ pub(crate) fn rail_branch_tinted(
     offset: f32,
     tint: Option<gpui::Hsla>,
 ) -> gpui::Div {
+    rail_from(6., last, branch, offset, tint)
+}
+/// The rail under a work phase's tile, dropping from the tile's centre.
+pub(crate) fn tile_rail(last: bool) -> impl IntoElement {
+    rail_from(TILE_RAIL_X, last, true, 0., None)
+}
+/// Where a 1px line under an activity tile starts so it is centred on the
+/// tile: half a pixel either side of its middle, which lands on whole device
+/// pixels on a 2x screen.
+pub(crate) const TILE_RAIL_X: f32 = crate::tab_tile::ACTIVITY_TILE.w / 2. - 0.5;
+/// [`tile_rail`] for a step that may not branch off it.
+pub(crate) fn tile_rail_branch(last: bool, branch: bool) -> impl IntoElement {
+    rail_from(TILE_RAIL_X, last, branch, 0., None)
+}
+/// Children of a [`tile_rail`] start where the group's title does: past the
+/// tile and its gap.
+pub(crate) const TILE_RAIL_INDENT: f32 = crate::tab_tile::ACTIVITY_TILE.w + 8.;
+fn rail_from(
+    left: f32,
+    last: bool,
+    branch: bool,
+    offset: f32,
+    tint: Option<gpui::Hsla>,
+) -> gpui::Div {
     let color = tint.unwrap_or_else(crate::theme::rail_color);
     gpui::div()
         .absolute()
         .top_0()
-        .left(gpui::px(6.))
+        .left(gpui::px(left))
         .w(gpui::px(9.))
         .h_full()
         .child(

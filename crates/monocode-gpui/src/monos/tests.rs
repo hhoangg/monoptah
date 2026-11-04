@@ -2069,6 +2069,89 @@ fn sessions_a_mono_makes_are_chats_whatever_the_preference(cx: &mut TestAppConte
     });
 }
 
+#[gpui::test]
+fn subsessions_fill_a_start_that_names_no_model_and_yield_to_one_that_does(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let provider_of = |id: i64| {
+        locked(&s.store)
+            .unwrap()
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .unwrap()
+            .provider
+    };
+    let source = cx.update(|cx| {
+        s.manager
+            .read(cx)
+            .chats
+            .get(&s.id)
+            .map(|chat| chat.read(cx).summary.provider.clone())
+    });
+    let other = if source.as_deref() == Some("claude") {
+        "codex"
+    } else {
+        "claude"
+    };
+    edit_mono(&s, cx, |m| {
+        m.subsessions = Some(mono::Subsessions {
+            harness: Some(other.into()),
+            model: None,
+            effort: None,
+        });
+    });
+    // Names no harness, model or effort: the Mono's subsessions apply.
+    let filled = start(
+        &s,
+        "filled",
+        json!({"project":s.project,"prompt":"Review the project","draft":true}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(provider_of(filled["sessionId"].as_i64().unwrap()), other);
+    // Names its own harness, unlike the subsessions': kept as is, not overridden.
+    let mine = if other == "codex" { "claude" } else { "codex" };
+    let own = start(
+        &s,
+        "own",
+        json!({"project":s.project,"prompt":"Review the project","draft":true,"harness":mine}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(provider_of(own["sessionId"].as_i64().unwrap()), mine);
+    // The filled harness reaches the start's checks (no provider has this name), while a
+    // start that names its own harness is left alone and is not judged by it. No model is
+    // filled, so no provider CLI is asked for its catalog.
+    edit_mono(&s, cx, |m| {
+        m.subsessions = Some(mono::Subsessions {
+            harness: Some("no-such-harness".into()),
+            model: None,
+            effort: None,
+        });
+    });
+    let before = session_count(&s);
+    assert!(
+        start(
+            &s,
+            "bad-harness",
+            json!({"project":s.project,"prompt":"Review the project","draft":true}),
+            cx,
+        )
+        .is_err()
+    );
+    assert_eq!(session_count(&s), before, "a rejected start leaves no row");
+    start(
+        &s,
+        "own-harness",
+        json!({"project":s.project,"prompt":"Review the project","draft":true,"harness":"claude"}),
+        cx,
+    )
+    .unwrap();
+}
+
 // sessions.start: folders, parent sessions and the no-commit worktree check
 // (ports of agentApp.test.ts's folder, parent and "no commits" cases).
 fn start(s: &Setup, request: &str, input: Value, cx: &mut TestAppContext) -> Result<Value, String> {

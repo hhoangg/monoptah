@@ -600,8 +600,15 @@ impl Monos {
             self.finish_call(call, Err("Input must be a JSON object".into()), cx);
             return;
         }
-        let input = call.input.clone();
+        let mut input = call.input.clone();
         let action = call.action.clone();
+        // A session it starts without naming a model takes the one set for
+        // its sessions, if any; the receipt still keys on what it sent.
+        if action == "sessions.start"
+            && let Some(subsessions) = &mono.subsessions
+        {
+            subsessions.fill(&mut input);
+        }
         let root = self.root.clone();
         let target = mono.id.clone();
         let project = if action.starts_with("sessions.")
@@ -651,7 +658,7 @@ impl Monos {
                 return;
             }
             "sessions.start" => {
-                self.start_call(call, mono, project, source, cx);
+                self.start_call(call, &input, mono, project, source, cx);
                 return;
             }
             "sessions.list" | "sessions.read" => {
@@ -1104,10 +1111,12 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         };
         self.finish_call(call, result, cx);
     }
-    /// sessions.start. Every check runs before the session row exists.
+    /// sessions.start. Every check runs before the session row exists. `input` is the call's
+    /// input with the Mono's subsession defaults filled in; the receipt keys on `call.input`.
     fn start_call(
         &mut self,
         call: Call,
+        input: &Value,
         mono: mono::Mono,
         project: String,
         source: Option<Entity<Conversation>>,
@@ -1117,7 +1126,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         let placement = self
             .owner
             .update(cx, |owner, cx| {
-                owner.app_placement(&call.input, call.session, &project, cx)
+                owner.app_placement(input, call.session, &project, cx)
             })
             .map_err(|e| e.to_string())
             .and_then(|placement| placement);
@@ -1126,7 +1135,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                 &mono,
                 project,
                 source,
-                &call.input,
+                input,
                 StartContext {
                     request: call.request_id.clone(),
                     placement,
