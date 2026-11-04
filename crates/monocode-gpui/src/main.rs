@@ -10,6 +10,7 @@ mod arcade;
 mod assets;
 mod automations;
 mod changes;
+mod composer_box;
 mod composer_completion;
 mod composer_motion;
 mod composer_runner;

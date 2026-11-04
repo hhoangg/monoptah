@@ -23,6 +23,7 @@ mod response_menu;
 mod submission_tests;
 mod title;
 mod worktree_naming;
+use crate::composer_box::COMPOSER_RADIUS;
 use crate::{
     composer_motion::ComposerMotion,
     git_picker::{GitPicker, Mode as GitMode, Picked as GitPicked},
@@ -66,7 +67,6 @@ use std::{
 // Keep empty and docked composers aligned with the transcript column. Below
 // this width the empty session drops its title.
 const COMPOSER_COLUMN: f32 = COLUMN;
-const COMPOSER_RADIUS: f32 = 12.;
 // RUNTIME_MODE_LABEL and RUNTIME_MODE_HINT from the React session model,
 // with AccessPicker's icons; Full access is amber.
 const ACCESS_MODES: &[(&str, &str, &str, &str)] = &[
@@ -3926,9 +3926,7 @@ fn send_button(
     let accent = primary_action(enabled);
     // Without an accent the button is the inverse of the surface: white with
     // black ink on dark, black with white ink on light.
-    let light = crate::theme::is_light();
-    let solid: fn(f32) -> gpui::Hsla = if light { black } else { white };
-    let ink: fn(f32) -> gpui::Hsla = if light { white } else { black };
+    let (solid, ink) = crate::composer_box::inverse_ink();
     div()
         .id(id)
         .debug_selector(|| id.into())

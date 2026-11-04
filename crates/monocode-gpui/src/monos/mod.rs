@@ -8,6 +8,9 @@ mod dashboard;
 mod files;
 mod filters;
 mod floating;
+mod habit_share;
+#[cfg(test)]
+mod habit_share_tests;
 mod habit_stop;
 mod host;
 mod html;
@@ -137,6 +140,7 @@ pub(crate) struct Monos {
     files: Option<AgentFiles>,
     habits: Vec<Habit>,
     habit_ui: scheduler::HabitUi,
+    habit_share: habit_share::HabitShare,
     picker: Option<OpenPicker>,
     settings_anchor: AnchorSlot,
     model_anchor: AnchorSlot,
@@ -417,6 +421,7 @@ impl Monos {
             files: None,
             habits: Vec::new(),
             habit_ui: scheduler::HabitUi::default(),
+            habit_share: habit_share::HabitShare::default(),
             picker: None,
             settings_anchor: AnchorSlot::default(),
             model_anchor: AnchorSlot::default(),

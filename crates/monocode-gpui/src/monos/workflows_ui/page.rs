@@ -466,35 +466,67 @@ impl Monos {
             );
             return;
         }
+        self.save_text_file(
+            actions::workflow_file_name(&w.name),
+            export_workflow(w),
+            "workflow",
+            |this, saved, cx| {
+                let notice = matches!(saved, Saved::Failed)
+                    .then(|| "Could not save the workflow file.".to_string());
+                this.workflow_said(notice, true, cx);
+            },
+            cx,
+        );
+    }
+
+    /// Asks where to save `text` as `file_name` and writes it off the UI thread. `done` hears how
+    /// it went; `what` names the file in the log when the write failed.
+    pub(in crate::monos) fn save_text_file(
+        &mut self,
+        file_name: String,
+        text: String,
+        what: &'static str,
+        done: impl FnOnce(&mut Self, Saved, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
         let directory = monocode_core::accounts::home().unwrap_or_default();
-        let prompt =
-            cx.prompt_for_new_path(&directory, Some(&actions::workflow_file_name(&w.name)));
-        let w = w.clone();
+        let prompt = cx.prompt_for_new_path(&directory, Some(&file_name));
         cx.spawn(async move |this, cx| {
-            let failed = Some("Could not save the workflow file.".to_string());
             let path = match prompt.await {
                 Ok(Ok(Some(path))) => path,
                 Ok(Ok(None)) => {
-                    let _ = this.update(cx, |this, cx| this.workflow_said(None, true, cx));
+                    let _ = this.update(cx, |this, cx| done(this, Saved::Cancelled, cx));
                     return;
                 }
                 _ => {
-                    let _ = this.update(cx, |this, cx| this.workflow_said(failed, true, cx));
+                    let _ = this.update(cx, |this, cx| done(this, Saved::Failed, cx));
                     return;
                 }
             };
+            let target = path.clone();
             let wrote = cx
                 .background_executor()
-                .spawn(async move { std::fs::write(path, export_workflow(&w)) })
+                .spawn(async move { std::fs::write(target, text) })
                 .await;
-            let notice = wrote.err().map(|error| {
-                eprintln!("Could not export the workflow: {error}");
-                "Could not save the workflow file.".to_string()
-            });
-            let _ = this.update(cx, |this, cx| this.workflow_said(notice, true, cx));
+            let saved = match wrote {
+                Ok(()) => Saved::To(path),
+                Err(error) => {
+                    eprintln!("Could not export the {what}: {error}");
+                    Saved::Failed
+                }
+            };
+            let _ = this.update(cx, |this, cx| done(this, saved, cx));
         })
         .detach();
     }
+}
+
+/// How saving a shared file went.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::monos) enum Saved {
+    To(std::path::PathBuf),
+    Cancelled,
+    Failed,
 }
 
 pub(in crate::monos) fn basename(path: &str) -> String {

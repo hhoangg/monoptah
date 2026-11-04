@@ -31,6 +31,8 @@ pub(super) enum Route {
     Document(String),
     Habit(String),
     NewHabit,
+    ImportHabit,
+    HabitReview(String),
     Workflow(String),
     WorkflowRun(String, String),
     WorkflowBoard(String),
@@ -46,6 +48,8 @@ impl Route {
             Self::Document(id) => format!("document:{id}"),
             Self::Habit(id) => format!("habit:{id}"),
             Self::NewHabit => "new-habit".into(),
+            Self::ImportHabit => "import-habit".into(),
+            Self::HabitReview(id) => format!("habit-review:{id}"),
             Self::Workflow(id) => format!("workflow:{id}"),
             Self::WorkflowRun(id, run) => format!("workflow-run:{id}:{run}"),
             Self::WorkflowBoard(id) => format!("workflow-board:{id}"),
@@ -1110,6 +1114,11 @@ impl Monos {
             .child(crate::shell::titlebar_drag_area().flex_1().min_w_0())
             .when(self.overview_tab == OverviewTab::Habits, |d| {
                 d.child(
+                    icon_button("mono-import-habit", "Import habit", "arrow-down-circle")
+                        .debug_selector(|| "mono-import-habit".into())
+                        .on_click(cx.listener(|this, _, _, cx| this.open_habit_import(cx))),
+                )
+                .child(
                     icon_button("mono-new-habit", "New habit", "plus")
                         .debug_selector(|| "mono-new-habit".into())
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1548,6 +1557,8 @@ impl Monos {
             }
             Route::Habit(id) => self.habit_page(mono, Some(&id), window, cx),
             Route::NewHabit => self.habit_page(mono, None, window, cx),
+            Route::ImportHabit => self.import_habit_page(cx),
+            Route::HabitReview(id) => self.habit_review_page(&id, cx),
             Route::Workflow(id) => self.workflow_page(mono, &id, window, cx),
             Route::WorkflowReview(id, intent) => self.workflow_review_page(&id, intent, cx),
             Route::ImportWorkflow => self.import_workflow_page(mono, cx),

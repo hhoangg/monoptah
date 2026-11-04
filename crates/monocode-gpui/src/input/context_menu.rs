@@ -40,12 +40,18 @@ impl Input {
                 MenuItem::Separator,
             ]);
         }
-        items.extend([
-            action("cut", "Cut", "X", selected && !self.read_only),
-            action("copy", "Copy", "C", selected),
+        // Prose has nothing to cut or paste into, so it omits both.
+        let prose = self.read_only && self.links;
+        if !prose {
+            items.push(action("cut", "Cut", "X", selected && !self.read_only));
+        }
+        items.push(action("copy", "Copy", "C", selected));
+        if !prose {
             // Dispatch Paste through the focused field's ancestors, just as
             // the shortcut does: composers also accept clipboard images.
-            action("paste", "Paste", "V", clipboard && !self.read_only),
+            items.push(action("paste", "Paste", "V", clipboard && !self.read_only));
+        }
+        items.extend([
             MenuItem::Separator,
             action("select-all", "Select All", "A", !self.content.is_empty()),
         ]);
@@ -138,6 +144,49 @@ mod tests {
                 input.secret = false;
                 input.selection = 5..5;
                 assert_eq!(enabled(input, false), ["select-all"]);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn read_only_text_offers_no_cut_or_paste(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let input = cx.new(|cx| Input::read_only_text("Note", cx));
+            input.update(cx, |input, _| {
+                input.content = "hello".into();
+                let ids = input
+                    .editing_menu_items(true)
+                    .iter()
+                    .filter_map(|item| match item {
+                        MenuItem::Action(action) => Some(action.id.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(ids, ["copy", "select-all"]);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn a_plain_read_only_field_keeps_disabled_cut_and_paste(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let input = cx.new(Input::new);
+            input.update(cx, |input, _| {
+                input.content = "hello".into();
+                input.selection = 0..5;
+                input.read_only = true;
+                let items = input.editing_menu_items(true);
+                let state = |id: &str| {
+                    items.iter().find_map(|item| match item {
+                        MenuItem::Action(action) if action.id.as_ref() == id => {
+                            Some(action.disabled)
+                        }
+                        _ => None,
+                    })
+                };
+                assert_eq!(state("cut"), Some(true));
+                assert_eq!(state("paste"), Some(true));
+                assert_eq!(state("copy"), Some(false));
             });
         });
     }
