@@ -303,7 +303,12 @@ mod tests {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')));
             let stored = data.path().join(&attachment.file);
-            assert_eq!(attachment.path.as_deref(), Some(stored.to_str().unwrap()));
+            // Compare as paths: on Windows the stored path uses `\` while the
+            // portable relative `file` joined here keeps its `/` separators.
+            assert_eq!(
+                attachment.path.as_deref().map(std::path::Path::new),
+                Some(stored.as_path())
+            );
             assert!(stored.is_file());
         }
         assert_eq!(
