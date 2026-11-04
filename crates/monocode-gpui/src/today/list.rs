@@ -2,12 +2,12 @@
 //! Also home to the small pieces `detail` and `sources` share: due and priority
 //! wording, and the menus.
 use super::{
-    Filters, Today,
+    Filters, Today, filter,
     menus::{Host, Pick, Rows, Slot},
     short_day,
 };
 use crate::{
-    inbox::{label_badge, message},
+    inbox::{label_badge, message, plain_action},
     popover::MenuAction,
     theme::*,
 };
@@ -243,6 +243,9 @@ fn filter_trigger(id: &'static str, label: String, active: bool, open: bool) -> 
         .child(icon("chevron-down", 12.))
 }
 
+/// Tag chips on a row or card before the rest fold into "+N".
+const TAG_CHIPS_SHOWN: usize = 3;
+
 impl Today {
     /// The scrolling list below the page header and warnings.
     pub(super) fn list_view(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -256,7 +259,7 @@ impl Today {
         self.new_task
             .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
         let rows = self.visible_rows();
-        let filtered = self.filters != Filters::default();
+        let filtered = filter::active_count(&self.filters) > 0;
 
         let mut body = div().flex().flex_col().gap(px(1.));
         if !readonly {
@@ -287,7 +290,7 @@ impl Today {
         } else if rows.is_empty() && mode == DayMode::Future {
             body = body.child(empty("Nothing planned yet. Snooze a task or add one here."));
         }
-        for (status, mine) in status_groups(&self.statuses, &rows, readonly) {
+        for (status, mine) in self.shown_groups(&rows, readonly) {
             body = body.child(self.group(&status, &mine, readonly, !message_shown, cx));
         }
 
@@ -311,6 +314,18 @@ impl Today {
             )
             .children(self.menu_view(Host::Filters, cx))
             .into_any_element()
+    }
+
+    /// The groups or columns to draw: all statuses, or only the ones the status filter selects.
+    pub(super) fn shown_groups<'a>(
+        &self,
+        rows: &[&'a Row],
+        frozen: bool,
+    ) -> Vec<(WorkflowStatus, Vec<&'a Row>)> {
+        status_groups(&self.statuses, rows, frozen)
+            .into_iter()
+            .filter(|(status, _)| filter::status_passes(&self.filters, status, &self.statuses))
+            .collect()
     }
 
     /// One status: its title, then its rows, or a quiet line when it has none.
@@ -370,6 +385,9 @@ impl Today {
         let mono_label = filters.mono.as_ref().map_or("All Monos".to_string(), |id| {
             self.mono(id).map_or_else(|| id.clone(), |m| m.name.clone())
         });
+        let status_label = filter::status_summary(&filters, &self.statuses);
+        let tag_label = filter::tag_summary(&filters, &self.tags);
+        let active = filter::active_count(&filters);
         let trigger = |slot: Slot, id: &'static str, label: String, active: bool| {
             filter_trigger(id, label, active, open(slot))
                 .child(self.anchor(slot).probe())
@@ -386,6 +404,18 @@ impl Today {
             .flex_wrap()
             .items_center()
             .gap(px(6.))
+            .child(trigger(
+                Slot::StatusFilter,
+                "today-filter-status",
+                status_label,
+                !filters.statuses.is_empty(),
+            ))
+            .child(trigger(
+                Slot::TagFilter,
+                "today-filter-tag",
+                tag_label,
+                !filters.tags.is_empty() || filters.no_tag,
+            ))
             .child(trigger(
                 Slot::ProjectFilter,
                 "today-filter-project",
@@ -404,6 +434,25 @@ impl Today {
                 mono_label,
                 filters.mono.is_some(),
             ))
+            .when(active > 0, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "today-filter-count".into())
+                        .text_size(px(12.))
+                        .text_color(content(0.5))
+                        .child(filter::count_label(active)),
+                )
+                .child(
+                    plain_action("today-filters-clear", "Clear filters")
+                        .debug_selector(|| "today-filters-clear".into())
+                        .text_color(content(0.7))
+                        .hover(|s| s.text_color(content(1.)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.menus.close();
+                            this.set_filters(Filters::default(), cx);
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -448,6 +497,99 @@ impl Today {
                         MenuAction::new(format!("source-{ix}"), source.name.clone())
                             .checked(f.source == Some(Some(source.id.clone()))),
                         with(&|n| n.source = Some(Some(source.id.clone()))),
+                    );
+                }
+            }
+            Slot::StatusFilter => {
+                let toggle = |id: &str| {
+                    let mut next = f.clone();
+                    if !next.statuses.remove(id) {
+                        next.statuses.insert(id.to_string());
+                    }
+                    Pick::FilterToggle(next)
+                };
+                for stage in Stage::ALL {
+                    let mine = self
+                        .statuses
+                        .iter()
+                        .filter(|s| s.stage == stage)
+                        .collect::<Vec<_>>();
+                    if mine.is_empty() {
+                        continue;
+                    }
+                    rows.header(match stage {
+                        Stage::NotStarted => "Not started",
+                        Stage::Started => "Started",
+                        Stage::Finished => "Finished",
+                    });
+                    for status in mine {
+                        rows.add(
+                            MenuAction::new(format!("status-{}", status.id), &status.name)
+                                .icon("circle-dot")
+                                .icon_color(gpui::rgb(status.rgb()).into())
+                                .checked(f.statuses.contains(&status.id))
+                                .keep_open(),
+                            toggle(&status.id),
+                        );
+                    }
+                }
+                if !f.statuses.is_empty() {
+                    rows.separator();
+                    let mut cleared = f.clone();
+                    cleared.statuses.clear();
+                    rows.add(
+                        MenuAction::new("status-clear", "Clear").keep_open(),
+                        Pick::FilterToggle(cleared),
+                    );
+                }
+            }
+            Slot::TagFilter => {
+                let with_toggle = |change: &dyn Fn(&mut Filters)| {
+                    let mut next = f.clone();
+                    change(&mut next);
+                    Pick::FilterToggle(next)
+                };
+                rows.add(
+                    MenuAction::new("tag-none", "No tag")
+                        .checked(f.no_tag)
+                        .keep_open(),
+                    with_toggle(&|n| n.no_tag = !n.no_tag),
+                );
+                for tag in &self.tags {
+                    rows.add(
+                        MenuAction::new(format!("tag-{}", tag.id), &tag.name)
+                            .icon("circle-dot")
+                            .icon_color(gpui::rgb(tag.rgb()).into())
+                            .checked(f.tags.contains(&tag.id))
+                            .keep_open(),
+                        with_toggle(&|n| {
+                            if !n.tags.remove(&tag.id) {
+                                n.tags.insert(tag.id.clone());
+                            }
+                        }),
+                    );
+                }
+                rows.separator();
+                rows.add(
+                    MenuAction::new("tag-match-any", "Match any")
+                        .checked(!f.match_all)
+                        .keep_open(),
+                    with_toggle(&|n| n.match_all = false),
+                );
+                rows.add(
+                    MenuAction::new("tag-match-all", "Match all")
+                        .checked(f.match_all)
+                        .keep_open(),
+                    with_toggle(&|n| n.match_all = true),
+                );
+                if !f.tags.is_empty() || f.no_tag {
+                    rows.separator();
+                    rows.add(
+                        MenuAction::new("tag-clear", "Clear").keep_open(),
+                        with_toggle(&|n| {
+                            n.tags.clear();
+                            n.no_tag = false;
+                        }),
                     );
                 }
             }
@@ -529,8 +671,8 @@ impl Today {
             .into_any_element()
     }
 
-    /// The chips under a row's or card's title: project, Mono, flags, age, due,
-    /// priority and the latest note. Rows and board cards both draw these.
+    /// The chips under a row's or card's title: project, tags, Mono, flags, age,
+    /// due, priority and the latest note. Rows and board cards both draw these.
     pub(super) fn chips(&self, row: &Row) -> Div {
         let task = &row.task;
         let key = task.key.clone();
@@ -567,6 +709,13 @@ impl Today {
             .items_center()
             .gap(px(6.))
             .child(project)
+            .children(self.tag_chips(
+                "today-tag-chip",
+                &task.id,
+                &row.tags,
+                true,
+                Some(TAG_CHIPS_SHOWN),
+            ))
             .when_some(
                 task.mono_id
                     .as_deref()
@@ -773,6 +922,7 @@ pub(super) mod testkit {
             task,
             group,
             status,
+            tags: Vec::new(),
             age_days,
             latest_note: None,
         }
@@ -792,6 +942,7 @@ pub(super) mod testkit {
             task,
             group,
             status,
+            tags: Vec::new(),
             age_days,
             latest_note: None,
         }
@@ -1201,6 +1352,151 @@ mod tests {
             "Escape must not close Today while a menu is open"
         );
     }
+    fn set_of(ids: &[&str]) -> std::collections::BTreeSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+    fn status_rows() -> Vec<Row> {
+        vec![
+            row_in("todo", task("a", "A"), 0),
+            row_in("in_progress", task("b", "B"), 0),
+            row_in("done", task("c", "C"), 0),
+        ]
+    }
+    #[gpui::test]
+    fn a_status_filter_shows_only_the_selected_groups(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(cx, Show::List, |today| {
+            today.view = Some(view(DayMode::Current, "2026-11-01", status_rows()));
+            today.filters.statuses = set_of(&["todo", "done"]);
+        });
+        assert!(has(&mut visual, "today-group-todo"));
+        assert!(has(&mut visual, "today-group-done"));
+        assert!(!has(&mut visual, "today-group-in_progress"));
+        assert!(has(&mut visual, "today-row-a"));
+        assert!(!has(&mut visual, "today-row-b"));
+        assert!(has(&mut visual, "today-filter-count"));
+    }
+    #[gpui::test]
+    fn a_status_filter_with_no_rows_says_so(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(cx, Show::List, |today| {
+            today.view = Some(view(DayMode::Current, "2026-11-01", status_rows()));
+            today.filters.statuses = set_of(&["todo"]);
+            today.filters.mono = Some("nobody".into());
+        });
+        assert!(has(&mut visual, "today-empty"));
+        assert!(!has(&mut visual, "today-group-in_progress"));
+    }
+    #[gpui::test]
+    fn clear_filters_resets_every_kind(cx: &mut TestAppContext) {
+        let (window, mut visual) = page(cx, Show::List, |today| {
+            today.view = Some(view(DayMode::Current, "2026-11-01", status_rows()));
+            today.filters = Filters {
+                project: Some(None),
+                mono: Some("m".into()),
+                statuses: set_of(&["todo"]),
+                tags: set_of(&["x"]),
+                no_tag: true,
+                match_all: true,
+                ..Default::default()
+            };
+        });
+        let bounds = visual.debug_bounds("today-filters-clear").unwrap();
+        visual.simulate_click(bounds.center(), Default::default());
+        visual.refresh().unwrap();
+        let filters = window
+            .update(&mut visual, |page, _, cx| {
+                page.today.read(cx).filters.clone()
+            })
+            .unwrap();
+        assert_eq!(filters, Filters::default());
+        assert!(!has(&mut visual, "today-filters-clear"));
+    }
+    #[gpui::test]
+    fn the_status_menu_stays_open_while_options_are_toggled(cx: &mut TestAppContext) {
+        let (window, mut visual) = page(cx, Show::List, |today| {
+            today.view = Some(view(DayMode::Current, "2026-11-01", status_rows()));
+        });
+        let read = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |page, _, cx| {
+                    let today = page.today.read(cx);
+                    (today.menus.is_open(), today.filters.statuses.clone())
+                })
+                .unwrap()
+        };
+        visual.refresh().unwrap();
+        let trigger = visual.debug_bounds("today-filter-status").unwrap();
+        visual.simulate_click(trigger.center(), Default::default());
+        visual.refresh().unwrap();
+        // The menu opens on its first action ("To do"; headers are skipped).
+        visual.simulate_keystrokes("enter");
+        visual.refresh().unwrap();
+        assert_eq!(read(&mut visual), (true, set_of(&["todo"])));
+        visual.simulate_keystrokes("down enter");
+        visual.refresh().unwrap();
+        let (open, statuses) = read(&mut visual);
+        assert!(open, "a keep-open pick leaves the menu open");
+        assert_eq!(statuses, set_of(&["todo", "in_progress"]));
+        // Picking the same row again turns it off.
+        visual.simulate_keystrokes("enter");
+        visual.refresh().unwrap();
+        assert_eq!(read(&mut visual), (true, set_of(&["todo"])));
+    }
+    #[gpui::test]
+    fn clear_in_a_filter_menu_keeps_a_row_highlighted(cx: &mut TestAppContext) {
+        let (window, mut visual) = page(cx, Show::List, |today| {
+            today.view = Some(view(DayMode::Current, "2026-11-01", status_rows()));
+        });
+        let trigger = visual.debug_bounds("today-filter-status").unwrap();
+        visual.simulate_click(trigger.center(), Default::default());
+        visual.refresh().unwrap();
+        // To do on, then down to Clear (after In progress and Done) and pick it.
+        visual.simulate_keystrokes("enter down down down enter");
+        visual.refresh().unwrap();
+        // The menu was rebuilt without Clear: Enter still acts on a highlighted row.
+        visual.simulate_keystrokes("enter");
+        visual.refresh().unwrap();
+        let statuses = window
+            .update(&mut visual, |page, _, cx| {
+                page.today.read(cx).filters.statuses.clone()
+            })
+            .unwrap();
+        assert_eq!(statuses, set_of(&["todo"]));
+    }
+    #[gpui::test]
+    fn the_tag_menu_toggles_in_place_and_switches_to_match_all(cx: &mut TestAppContext) {
+        let (window, mut visual) = page(cx, Show::List, |today| {
+            today.view = Some(view(DayMode::Current, "2026-11-01", status_rows()));
+            today.tags = vec![
+                monocode_core::today::Tag {
+                    id: "tag-1".into(),
+                    name: "One".into(),
+                    color: "#4da3f5".into(),
+                },
+                monocode_core::today::Tag {
+                    id: "tag-2".into(),
+                    name: "Two".into(),
+                    color: "#10b981".into(),
+                },
+            ];
+        });
+        let trigger = visual.debug_bounds("today-filter-tag").unwrap();
+        visual.simulate_click(trigger.center(), Default::default());
+        visual.refresh().unwrap();
+        // No tag, One, then Two, Match any and Match all.
+        visual.simulate_keystrokes("enter down enter down down down enter");
+        visual.refresh().unwrap();
+        let (open, filters) = window
+            .update(&mut visual, |page, _, cx| {
+                let today = page.today.read(cx);
+                (today.menus.is_open(), today.filters.clone())
+            })
+            .unwrap();
+        assert!(open);
+        assert!(filters.no_tag);
+        assert_eq!(filters.tags, set_of(&["tag-1"]));
+        assert!(filters.match_all, "the third pick lands on Match all");
+    }
+
     #[test]
     fn today_files_hold_no_theme_color_literals() {
         for (name, source) in [
@@ -1210,6 +1506,7 @@ mod tests {
             ("sources.rs", include_str!("sources.rs")),
             ("statuses.rs", include_str!("statuses.rs")),
             ("menus.rs", include_str!("menus.rs")),
+            ("filter.rs", include_str!("filter.rs")),
             ("../today.rs", include_str!("../today.rs")),
         ] {
             let code = source.split("#[cfg(test)]").next().unwrap();
@@ -1217,5 +1514,47 @@ mod tests {
                 assert!(!code.contains(banned), "{name} hardcodes a color: {banned}");
             }
         }
+    }
+
+    fn tagged_row(count: usize) -> Row {
+        let mut r = row(Group::Today, task("a", "Tagged"), 0);
+        r.tags = (1..=count)
+            .map(|n| monocode_core::today::Tag {
+                id: format!("t{n}"),
+                name: format!("Tag {n}"),
+                color: "#4da3f5".into(),
+            })
+            .collect();
+        r
+    }
+    #[gpui::test]
+    fn a_row_shows_its_tags_in_order_and_folds_the_rest(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(cx, Show::List, |today| {
+            today.view = Some(view(DayMode::Current, "2026-11-01", vec![tagged_row(5)]));
+        });
+        let x = |visual: &mut gpui::VisualTestContext, s: &'static str| {
+            visual
+                .debug_bounds(s)
+                .unwrap_or_else(|| panic!("{s}"))
+                .origin
+                .x
+        };
+        assert!(has(&mut visual, "today-tag-chip-id-a-t1"));
+        let (a, b, c) = (
+            x(&mut visual, "today-tag-chip-id-a-t1"),
+            x(&mut visual, "today-tag-chip-id-a-t2"),
+            x(&mut visual, "today-tag-chip-id-a-t3"),
+        );
+        assert!(a < b && b < c);
+        assert!(!has(&mut visual, "today-tag-chip-id-a-t4"));
+        assert!(has(&mut visual, "today-tag-chip-id-a-more"));
+    }
+    #[gpui::test]
+    fn a_row_with_three_tags_shows_them_all(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(cx, Show::List, |today| {
+            today.view = Some(view(DayMode::Current, "2026-11-01", vec![tagged_row(3)]));
+        });
+        assert!(has(&mut visual, "today-tag-chip-id-a-t3"));
+        assert!(!has(&mut visual, "today-tag-chip-id-a-more"));
     }
 }

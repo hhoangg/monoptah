@@ -2,7 +2,7 @@
 //! columns to change status.
 use super::{
     Today,
-    list::{drag_ghost, source_line, status_groups, status_title},
+    list::{drag_ghost, source_line, status_title},
     menus::{Host, Pick, Rows, Slot},
 };
 use crate::{
@@ -65,7 +65,8 @@ impl Today {
         };
         let readonly = view.mode == DayMode::Past;
         let rows = self.visible_rows();
-        let columns = status_groups(&self.statuses, &rows, readonly)
+        let columns = self
+            .shown_groups(&rows, readonly)
             .into_iter()
             .map(|(status, mine)| self.column(&status, &mine, readonly, cx))
             .collect::<Vec<_>>();
@@ -75,6 +76,15 @@ impl Today {
             .flex()
             .flex_col()
             .child(self.filters_row(cx))
+            .when(
+                rows.is_empty() && super::filter::active_count(&self.filters) > 0,
+                |d| {
+                    d.child(
+                        message("No tasks match these filters.")
+                            .debug_selector(|| "today-empty".into()),
+                    )
+                },
+            )
             .child(
                 div()
                     .id("today-board-scroll")
@@ -404,7 +414,9 @@ impl Today {
             return;
         };
         let status_id = adding.status_id.clone();
-        self.act(
+        let added_in = status_id.clone();
+        self.act_add(
+            &added_in,
             move |store, now| {
                 let new = NewTask {
                     title: title.trim().to_string(),
@@ -479,6 +491,25 @@ mod tests {
         assert!(has(&mut visual, "today-no-project-chk"));
         assert!(has(&mut visual, "today-badge-needs-check-chk"));
         assert!(has(&mut visual, "today-age-chk"));
+    }
+    #[gpui::test]
+    fn a_card_shows_its_tags_in_order(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(cx, Show::Board, |today| {
+            let mut tagged = row_in("todo", task("tg", "Tagged"), 0);
+            tagged.tags = ["t1", "t2"]
+                .map(|id| monocode_core::today::Tag {
+                    id: id.into(),
+                    name: id.to_uppercase(),
+                    color: "#10b981".into(),
+                })
+                .to_vec();
+            today.view = Some(view(DayMode::Current, "2026-11-01", vec![tagged]));
+        });
+        assert!(has(&mut visual, "today-tag-chip-id-tg-t1"));
+        let first = visual.debug_bounds("today-tag-chip-id-tg-t1").unwrap();
+        assert!(has(&mut visual, "today-tag-chip-id-tg-t2"));
+        let second = visual.debug_bounds("today-tag-chip-id-tg-t2").unwrap();
+        assert!(first.origin.x < second.origin.x);
     }
     #[gpui::test]
     fn dropping_a_card_on_another_column_changes_the_status_in_the_store(cx: &mut TestAppContext) {
@@ -646,6 +677,27 @@ mod tests {
             assert_eq!(rows[0].status.id, "in_progress");
             assert!(today.board.adding.is_none());
         });
+    }
+
+    #[gpui::test]
+    fn a_status_filter_hides_the_other_columns(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(cx, Show::Board, |today| {
+            today.view = Some(view(DayMode::Current, "2026-11-01", cards_by_column()));
+            today.filters.statuses = ["in_progress".to_string()].into_iter().collect();
+        });
+        assert!(has(&mut visual, "today-column-in_progress"));
+        assert!(!has(&mut visual, "today-column-todo"));
+        assert!(!has(&mut visual, "today-column-done"));
+        assert!(has(&mut visual, "today-filter-status"));
+    }
+    #[gpui::test]
+    fn a_board_with_no_matching_cards_says_so(cx: &mut TestAppContext) {
+        let (_, mut visual) = page(cx, Show::Board, |today| {
+            today.view = Some(view(DayMode::Current, "2026-11-01", cards_by_column()));
+            today.filters.statuses = ["done".to_string()].into_iter().collect();
+        });
+        assert!(has(&mut visual, "today-column-done"));
+        assert!(has(&mut visual, "today-empty"));
     }
 
     #[gpui::test]

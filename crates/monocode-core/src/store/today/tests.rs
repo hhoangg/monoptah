@@ -2232,3 +2232,630 @@ fn a_rename_right_after_the_rollover_does_not_touch_yesterdays_record() {
     let now = store.today_view("2026-07-15", t(15, 5, 0)).unwrap();
     assert_eq!(now.rows[0].status.name, "Backlog");
 }
+
+// --- tags ------------------------------------------------------------------------------------
+
+fn tag(store: &Store, name: &str) -> Tag {
+    store.today_add_tag(name, "#112233").unwrap()
+}
+
+fn tag_names(list: &[Tag]) -> Vec<String> {
+    list.iter().map(|t| t.name.clone()).collect()
+}
+
+fn with_tags(store: &Store, task: &Task, tags: &[&str]) {
+    let patch = TaskPatch {
+        tags: Some(tags.iter().map(|t| t.to_string()).collect()),
+        ..TaskPatch::default()
+    };
+    store
+        .today_update(&task.id, &patch, &Actor::User, at(14, 10))
+        .unwrap();
+}
+
+/// Writes free text tags straight into a task, as a build before definitions did.
+fn legacy_tags(store: &Store, key: &str, tags: &[&str]) {
+    let mut task = by_key(store, key);
+    task.tags = tags.iter().map(|t| t.to_string()).collect();
+    save_task(&store.conn, &task).unwrap();
+}
+
+/// Forgets that the migration ran, as a store from before tags had definitions.
+fn unmigrate(store: &Store) {
+    store
+        .conn
+        .execute(
+            "DELETE FROM native_settings WHERE key = 'today.tagsMigrated'",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn tag_names_are_trimmed_unique_ignoring_case_and_bounded() {
+    let store = store();
+    let bug = store.today_add_tag("  Bug ", "#AABBCC").unwrap();
+    assert_eq!(bug.name, "Bug");
+    assert_eq!(bug.color, "#aabbcc");
+    assert!(bug.id.starts_with("tag-"));
+    assert_eq!(
+        store.today_add_tag("bUg", "#112233").unwrap_err(),
+        "Another tag already has that name"
+    );
+    assert_eq!(
+        store.today_add_tag("   ", "#112233").unwrap_err(),
+        "A tag needs a name"
+    );
+    assert!(store
+        .today_add_tag(&"x".repeat(41), "#112233")
+        .unwrap_err()
+        .contains("at most 40"));
+    assert!(store.today_add_tag(&"x".repeat(40), "#112233").is_ok());
+    assert!(store.today_add_tag("Ok", "red").is_err());
+    assert_eq!(store.today_tags().unwrap().len(), 2);
+}
+
+#[test]
+fn renaming_and_recoloring_a_tag_shows_on_rows_and_keeps_names_unique() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let ui = tag(&store, "UI");
+    let task = manual(&store, "a", at(14, 10));
+    with_tags(&store, &task, &[&bug.id]);
+    let patch = TagPatch {
+        name: Some("Defect".into()),
+        color: Some("#ff0000".into()),
+    };
+    let got = store.today_update_tag(&bug.id, &patch).unwrap();
+    assert_eq!(
+        (got.name.as_str(), got.color.as_str()),
+        ("Defect", "#ff0000")
+    );
+    let view = store.today_view("2026-07-14", at(14, 11)).unwrap();
+    assert_eq!(view.rows[0].tags, vec![got.clone()]);
+    // Its own name is fine, another tag's is not, and a missing tag is an error.
+    let same = TagPatch {
+        name: Some("defect".into()),
+        color: None,
+    };
+    assert!(store.today_update_tag(&bug.id, &same).is_ok());
+    let clash = TagPatch {
+        name: Some(" ui ".into()),
+        color: None,
+    };
+    assert!(store.today_update_tag(&bug.id, &clash).is_err());
+    assert!(store.today_update_tag("tag-none", &same).is_err());
+    assert_eq!(store.today_tags().unwrap()[1], ui);
+}
+
+#[test]
+fn a_past_day_shows_a_renamed_tag_by_its_new_name_and_a_deleted_one_not_at_all() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let ui = tag(&store, "UI");
+    let task = manual(&store, "a", at(14, 10));
+    with_tags(&store, &task, &[&bug.id, &ui.id]);
+    store.today_view("2026-07-15", t(15, 10, 0)).unwrap();
+    let patch = TagPatch {
+        name: Some("Defect".into()),
+        color: None,
+    };
+    store.today_update_tag(&bug.id, &patch).unwrap();
+    store.today_delete_tag(&ui.id, t(15, 11, 0)).unwrap();
+    let past = store.today_view("2026-07-14", t(15, 12, 0)).unwrap();
+    assert_eq!(tag_names(&past.rows[0].tags), ["Defect"]);
+}
+
+#[test]
+fn moving_a_tag_reorders_and_clamps() {
+    let store = store();
+    let a = tag(&store, "A");
+    let b = tag(&store, "B");
+    let c = tag(&store, "C");
+    let list = store.today_move_tag(&c.id, 0).unwrap();
+    assert_eq!(tag_names(&list), ["C", "A", "B"]);
+    let list = store.today_move_tag(&c.id, 99).unwrap();
+    assert_eq!(tag_names(&list), ["A", "B", "C"]);
+    assert_eq!(store.today_tags().unwrap(), list);
+    assert!(store.today_move_tag("tag-none", 0).is_err());
+    let _ = (a, b);
+}
+
+#[test]
+fn deleting_a_tag_takes_it_off_tasks_with_an_event_and_usage_counts_them() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let ui = tag(&store, "UI");
+    let one = manual(&store, "one", at(14, 10));
+    let two = manual(&store, "two", at(14, 10));
+    let three = manual(&store, "three", at(14, 10));
+    with_tags(&store, &one, &[&bug.id, &ui.id]);
+    with_tags(&store, &two, &[&bug.id]);
+    with_tags(&store, &three, &[&ui.id]);
+    assert_eq!(store.today_tag_usage(&bug.id).unwrap(), 2);
+    assert_eq!(store.today_tag_usage(&ui.id).unwrap(), 2);
+    assert_eq!(store.today_tag_usage("tag-none").unwrap(), 0);
+    let list = store.today_delete_tag(&bug.id, at(14, 12)).unwrap();
+    assert_eq!(tag_names(&list), ["UI"]);
+    assert_eq!(by_key(&store, &one.key).tags, vec![ui.id.clone()]);
+    assert!(by_key(&store, &two.key).tags.is_empty());
+    assert_eq!(store.today_tag_usage(&bug.id).unwrap(), 0);
+    let event = store
+        .today_activity(&two.id)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find_map(|a| match a {
+            Activity::Event(e) if e.kind == EventKind::TagsChanged => Some(e),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(event.removed_tags, vec![bug.clone()]);
+    assert!(event.added_tags.is_empty());
+    assert!(event.mono_id.is_none() && event.source_id.is_none());
+    assert_eq!(event.at, at(14, 12));
+    // Today's record no longer lists it either.
+    let view = store.today_view("2026-07-14", at(14, 13)).unwrap();
+    let row = view.rows.iter().find(|r| r.task.id == one.id).unwrap();
+    assert_eq!(row.tags, vec![ui]);
+    assert!(store.today_delete_tag(&bug.id, at(14, 12)).is_err());
+}
+
+#[test]
+fn updating_task_tags_records_added_and_removed_and_refuses_unknown_ids() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let ui = tag(&store, "UI");
+    let task = manual(&store, "a", at(14, 10));
+    with_tags(&store, &task, &[&ui.id, &bug.id, &ui.id]);
+    // Stored in definition order, without duplicates.
+    assert_eq!(
+        by_key(&store, &task.key).tags,
+        vec![bug.id.clone(), ui.id.clone()]
+    );
+    with_tags(&store, &task, &[&bug.id]);
+    let events: Vec<TaskEvent> = store
+        .today_activity(&task.id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|a| match a {
+            Activity::Event(e) if e.kind == EventKind::TagsChanged => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].added_tags, vec![bug.clone(), ui.clone()]);
+    assert_eq!(events[1].removed_tags, vec![ui.clone()]);
+    assert!(events[1].added_tags.is_empty());
+    // The same set again is no change and no event.
+    with_tags(&store, &task, &[&bug.id]);
+    let count = store
+        .today_activity(&task.id)
+        .unwrap()
+        .iter()
+        .filter(|a| matches!(a, Activity::Event(e) if e.kind == EventKind::TagsChanged))
+        .count();
+    assert_eq!(count, 2);
+    let patch = TaskPatch {
+        tags: Some(vec!["tag-missing".into()]),
+        ..TaskPatch::default()
+    };
+    let err = store
+        .today_update(&task.id, &patch, &Actor::User, at(14, 11))
+        .unwrap_err();
+    assert_eq!(err, "Unknown tag: tag-missing");
+    assert_eq!(by_key(&store, &task.key).tags, vec![bug.id.clone()]);
+    // A new task is validated the same way, and a plain name is not an id.
+    let bad = NewTask {
+        title: "x".into(),
+        tags: vec!["Bug".into()],
+        ..NewTask::default()
+    };
+    assert!(store.today_add(&bad, &Actor::User, at(14, 11)).is_err());
+    let good = NewTask {
+        title: "y".into(),
+        tags: vec![ui.id.clone(), bug.id.clone()],
+        ..NewTask::default()
+    };
+    let added = store.today_add(&good, &Actor::User, at(14, 11)).unwrap();
+    assert_eq!(added.tags, vec![bug.id, ui.id]);
+}
+
+#[test]
+fn a_task_holds_at_most_twenty_tags() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    let ids: Vec<String> = (0..21).map(|n| tag(&store, &format!("t{n}")).id).collect();
+    let patch = TaskPatch {
+        tags: Some(ids.clone()),
+        ..TaskPatch::default()
+    };
+    assert!(store
+        .today_update(&task.id, &patch, &Actor::User, at(14, 11))
+        .unwrap_err()
+        .contains("at most 20"));
+    let patch = TaskPatch {
+        tags: Some(ids[..20].to_vec()),
+        ..TaskPatch::default()
+    };
+    assert!(store
+        .today_update(&task.id, &patch, &Actor::User, at(14, 11))
+        .is_ok());
+}
+
+#[test]
+fn free_text_tags_become_definitions_once_and_tasks_hold_ids() {
+    let store = store();
+    let a = manual(&store, "a", at(14, 10));
+    let b = manual(&store, "b", at(14, 10));
+    let c = manual(&store, "c", at(14, 10));
+    let d = manual(&store, "d", at(14, 10));
+    legacy_tags(&store, &a.key, &["Bug", "UI"]);
+    legacy_tags(&store, &b.key, &["bug ", "", "  "]);
+    legacy_tags(&store, &c.key, &["BUG", "ui"]);
+    legacy_tags(&store, &d.key, &[]);
+    unmigrate(&store);
+    let updated = by_key(&store, &a.key).updated_at;
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["Bug", "UI"]);
+    assert_eq!(list[0].color, format_color(tags::preset_for(0)));
+    assert_eq!(list[1].color, format_color(tags::preset_for(1)));
+    assert_eq!(
+        by_key(&store, &a.key).tags,
+        vec![list[0].id.clone(), list[1].id.clone()]
+    );
+    assert_eq!(by_key(&store, &b.key).tags, vec![list[0].id.clone()]);
+    assert_eq!(
+        by_key(&store, &c.key).tags,
+        vec![list[0].id.clone(), list[1].id.clone()]
+    );
+    assert!(by_key(&store, &d.key).tags.is_empty());
+    // Nothing a user did: no timestamp change, no event.
+    assert_eq!(by_key(&store, &a.key).updated_at, updated);
+    assert!(!store
+        .today_activity(&a.id)
+        .unwrap()
+        .iter()
+        .any(|x| matches!(x, Activity::Event(e) if e.kind == EventKind::TagsChanged)));
+    assert_eq!(
+        store.setting("today.tagsMigrated").unwrap().as_deref(),
+        Some("1")
+    );
+    // A second call does nothing, even when a task gets a free text tag again.
+    legacy_tags(&store, &d.key, &["New"]);
+    assert_eq!(store.today_tags().unwrap(), list);
+    assert_eq!(by_key(&store, &d.key).tags, vec!["New".to_string()]);
+}
+
+#[test]
+fn migration_reuses_existing_definitions_and_repeats_safely_after_a_stop() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    legacy_tags(&store, &task.key, &["UI", "Bug"]);
+    // The state a crash leaves after the definitions were saved: one exists, the
+    // tasks still hold names and the marker is missing.
+    let ui = Tag {
+        id: format!("tag-{}", uuid::Uuid::new_v4()),
+        name: "ui".into(),
+        color: "#112233".into(),
+    };
+    store
+        .save_setting("today.tags", &serde_json::to_string(&[&ui]).unwrap())
+        .unwrap();
+    unmigrate(&store);
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["ui", "Bug"]);
+    assert_eq!(list[0], ui);
+    assert_eq!(
+        by_key(&store, &task.key).tags,
+        vec![ui.id.clone(), list[1].id.clone()]
+    );
+    // Running it again after another stop changes nothing.
+    unmigrate(&store);
+    assert_eq!(store.today_tags().unwrap(), list);
+    assert_eq!(
+        by_key(&store, &task.key).tags,
+        vec![ui.id, list[1].id.clone()]
+    );
+}
+
+#[test]
+fn migration_leaves_past_day_records_alone_and_they_still_resolve_by_name() {
+    let store = store();
+    let task = manual(&store, "a", t(14, 10, 0));
+    // Day 14's record, frozen with free text tags before definitions existed.
+    legacy_tags(&store, &task.key, &["Bug"]);
+    unmigrate(&store);
+    let frozen = by_key(&store, &task.key);
+    write_record(&store.conn, "2026-07-14", &frozen, &default_statuses()).unwrap();
+    let json_before: String = store
+        .conn
+        .query_row(
+            "SELECT json FROM today_days WHERE day = '2026-07-14'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let view = store.today_view("2026-07-15", t(15, 10, 0)).unwrap();
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["Bug"]);
+    assert_eq!(view.rows[0].tags, list);
+    let json_after: String = store
+        .conn
+        .query_row(
+            "SELECT json FROM today_days WHERE day = '2026-07-14'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(json_before, json_after);
+    let past = store.today_view("2026-07-14", t(15, 11, 0)).unwrap();
+    assert_eq!(past.rows[0].tags, list);
+    assert_eq!(past.rows[0].task.tags, vec!["Bug".to_string()]);
+}
+
+#[test]
+fn a_view_and_a_sync_migrate_before_using_tags() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    legacy_tags(&store, &task.key, &["Bug"]);
+    unmigrate(&store);
+    let view = store.today_view("2026-07-14", at(14, 11)).unwrap();
+    assert_eq!(tag_names(&view.rows[0].tags), ["Bug"]);
+    assert!(by_key(&store, &task.key).tags[0].starts_with("tag-"));
+}
+
+#[test]
+fn sync_adds_tag_ids_for_known_names_and_reports_the_rest() {
+    let store = store();
+    let me = caller("m1", &[]);
+    let bug = tag(&store, "Bug");
+    let mut first = item("a");
+    first.tags = Some(vec!["BUG".into(), "Nope".into(), "nope".into()]);
+    let summary = sync_items(&store, &me, vec![first], at(14, 10));
+    assert_eq!(summary.rejected_tags, vec!["Nope".to_string()]);
+    assert_eq!(by_key(&store, "a").tags, vec![bug.id.clone()]);
+    let events = store
+        .today_activity(&by_key(&store, "a").id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|x| match x {
+            Activity::Event(e) if e.kind == EventKind::TagsChanged => Some(e),
+            _ => None,
+        })
+        .count();
+    assert_eq!(events, 0, "a new task has only its Added event");
+    let ui = tag(&store, "UI");
+    let mut next = item("a");
+    next.tags = Some(vec!["ui".into()]);
+    sync_items(&store, &me, vec![next], at(14, 11));
+    assert_eq!(by_key(&store, "a").tags, vec![bug.id, ui.id.clone()]);
+    let added = store
+        .today_activity(&by_key(&store, "a").id)
+        .unwrap()
+        .into_iter()
+        .find_map(|x| match x {
+            Activity::Event(e) if e.kind == EventKind::TagsChanged => Some(e),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(added.added_tags, vec![ui]);
+    assert_eq!(added.source_id.as_deref(), Some("cu"));
+}
+
+#[test]
+fn migration_keeps_entries_it_cannot_resolve() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    // The definitions were lost (a restored settings database) but tasks hold ids.
+    let gone = format!("tag-{}", uuid::Uuid::new_v4());
+    legacy_tags(&store, &task.key, &[&gone, "Bug"]);
+    unmigrate(&store);
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["Bug"]);
+    assert_eq!(
+        by_key(&store, &task.key).tags,
+        vec![gone, list[0].id.clone()]
+    );
+}
+
+#[test]
+fn a_legacy_name_that_starts_with_tag_dash_is_a_name_not_an_id() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    legacy_tags(&store, &task.key, &["tag-cleanup"]);
+    unmigrate(&store);
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["tag-cleanup"]);
+    assert_eq!(by_key(&store, &task.key).tags, vec![list[0].id.clone()]);
+}
+
+#[test]
+fn a_read_only_store_shows_legacy_names_as_in_memory_tags_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("monocode.db");
+    {
+        let writer = Store::open_monocode(&path).unwrap();
+        writer.today_ready().unwrap();
+        let task = Task {
+            id: "task-1".into(),
+            key: "manual:task-1".into(),
+            title: "a".into(),
+            tags: vec!["Bug".into(), "bug".into(), "UI".into()],
+            first_day: "2026-07-14".into(),
+            ..Task::default()
+        };
+        save_task(&writer.conn, &task).unwrap();
+    }
+    let store = Store::read_monocode(&path).unwrap();
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["Bug", "UI"]);
+    assert_eq!(store.today_tags().unwrap(), list);
+    let view = store.today_view("2026-07-14", t(14, 10, 0)).unwrap();
+    assert_eq!(view.rows[0].tags, list);
+    assert_eq!(store.setting("today.tagsMigrated").unwrap(), None);
+    assert_eq!(store.setting("today.tags").unwrap(), None);
+    assert_eq!(by_key(&store, "manual:task-1").tags[0], "Bug");
+}
+
+#[test]
+fn tags_over_the_limit_are_never_cut_by_a_sync_and_can_be_removed_one_by_one() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync(&store, &me, "cu", &["a"], at(14, 10));
+    let names: Vec<String> = (0..25).map(|n| format!("t{n}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    legacy_tags(&store, "a", &refs);
+    unmigrate(&store);
+    let list = store.today_tags().unwrap();
+    assert_eq!(by_key(&store, "a").tags.len(), 25);
+    let mut empty = item("a");
+    empty.tags = Some(Vec::new());
+    sync_items(&store, &me, vec![empty], at(14, 11));
+    assert_eq!(by_key(&store, "a").tags.len(), 25);
+    let id = by_key(&store, "a").id;
+    let keep: Vec<String> = list[..24].iter().map(|t| t.id.clone()).collect();
+    let patch = TaskPatch {
+        tags: Some(keep),
+        ..TaskPatch::default()
+    };
+    store
+        .today_update(&id, &patch, &Actor::User, at(14, 12))
+        .unwrap();
+    assert_eq!(by_key(&store, "a").tags.len(), 24);
+    // It may not grow while over the limit.
+    let all: Vec<String> = list.iter().map(|t| t.id.clone()).collect();
+    let patch = TaskPatch {
+        tags: Some(all),
+        ..TaskPatch::default()
+    };
+    assert!(store
+        .today_update(&id, &patch, &Actor::User, at(14, 13))
+        .is_err());
+}
+
+#[test]
+fn sending_the_same_tags_again_is_not_a_change_and_added_ones_join_in_definition_order() {
+    let store = store();
+    let me = caller("m1", &[]);
+    let a = tag(&store, "A");
+    let b = tag(&store, "B");
+    let c = tag(&store, "C");
+    let mut first = item("k");
+    first.tags = Some(vec!["C".into(), "A".into()]);
+    sync_items(&store, &me, vec![first.clone()], at(14, 10));
+    assert_eq!(by_key(&store, "k").tags, vec![a.id.clone(), c.id.clone()]);
+    let stamp = by_key(&store, "k").updated_at;
+    // The user moved C first; resending changes nothing, not even the order.
+    store.today_move_tag(&c.id, 0).unwrap();
+    sync_items(&store, &me, vec![first], at(14, 11));
+    assert_eq!(by_key(&store, "k").updated_at, stamp);
+    let mut more = item("k");
+    more.tags = Some(vec!["b".into()]);
+    sync_items(&store, &me, vec![more], at(14, 12));
+    assert_eq!(by_key(&store, "k").tags, vec![c.id, a.id, b.id]);
+}
+
+#[test]
+fn toggling_one_tag_changes_only_that_tag_and_keeps_definition_order() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let ui = tag(&store, "UI");
+    let docs = tag(&store, "Docs");
+    let task = manual(&store, "a", at(14, 10));
+    // Two toggles from stale callers each keep the other's change.
+    store
+        .today_toggle_tag(&task.id, &docs.id, true, &Actor::User, at(14, 11))
+        .unwrap();
+    store
+        .today_toggle_tag(&task.id, &bug.id, true, &Actor::User, at(14, 11))
+        .unwrap();
+    assert_eq!(
+        by_key(&store, &task.key).tags,
+        vec![bug.id.clone(), docs.id.clone()]
+    );
+    store
+        .today_toggle_tag(&task.id, &bug.id, false, &Actor::User, at(14, 12))
+        .unwrap();
+    assert_eq!(by_key(&store, &task.key).tags, vec![docs.id.clone()]);
+    // Already in the wanted state: no change, no new event.
+    let events = |store: &Store| {
+        store
+            .today_activity(&task.id)
+            .unwrap()
+            .into_iter()
+            .filter(|a| matches!(a, Activity::Event(e) if e.kind == EventKind::TagsChanged))
+            .count()
+    };
+    let before = events(&store);
+    store
+        .today_toggle_tag(&task.id, &docs.id, true, &Actor::User, at(14, 13))
+        .unwrap();
+    assert_eq!(events(&store), before);
+    assert!(store
+        .today_toggle_tag(&task.id, "tag-unknown", true, &Actor::User, at(14, 13))
+        .is_err());
+    let _ = ui;
+}
+
+#[test]
+fn toggling_a_tag_on_respects_the_twenty_tag_limit() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    let ids: Vec<String> = (0..21).map(|n| tag(&store, &format!("t{n}")).id).collect();
+    for id in &ids[..20] {
+        store
+            .today_toggle_tag(&task.id, id, true, &Actor::User, at(14, 11))
+            .unwrap();
+    }
+    assert!(store
+        .today_toggle_tag(&task.id, &ids[20], true, &Actor::User, at(14, 11))
+        .unwrap_err()
+        .contains("at most 20"));
+}
+
+fn seed_raw_tags(store: &Store, id: &str, raw: &[&str], now: u64) {
+    let raw: Vec<String> = raw.iter().map(|t| t.to_string()).collect();
+    store
+        .today_mutate(id, &Actor::User, now, false, |task, _, _| {
+            task.tags = raw;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn toggling_a_tag_on_a_task_holding_an_orphan_id_drops_the_orphan() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let task = manual(&store, "a", at(14, 10));
+    let orphan = format!("tag-{}", uuid::Uuid::new_v4());
+    seed_raw_tags(&store, &task.id, &[orphan.as_str()], at(14, 11));
+    store
+        .today_toggle_tag(&task.id, &bug.id, true, &Actor::User, at(14, 12))
+        .unwrap();
+    assert_eq!(by_key(&store, &task.key).tags, vec![bug.id.clone()]);
+    // An id the caller names that has no definition is still refused.
+    assert!(store
+        .today_toggle_tag(&task.id, &orphan, true, &Actor::User, at(14, 13))
+        .is_err());
+}
+
+#[test]
+fn toggling_off_a_tag_held_as_a_legacy_name_removes_it() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    seed_raw_tags(&store, &task.id, &["New", "Other"], at(14, 11));
+    let new = tag(&store, "New");
+    store
+        .today_toggle_tag(&task.id, &new.id, false, &Actor::User, at(14, 12))
+        .unwrap();
+    assert!(by_key(&store, &task.key).tags.is_empty());
+    // Toggling on converts a legacy name to its id without duplicating it.
+    seed_raw_tags(&store, &task.id, &["new"], at(14, 13));
+    let bug = tag(&store, "Bug");
+    store
+        .today_toggle_tag(&task.id, &bug.id, true, &Actor::User, at(14, 14))
+        .unwrap();
+    assert_eq!(by_key(&store, &task.key).tags, vec![new.id, bug.id]);
+}
