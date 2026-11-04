@@ -7,15 +7,16 @@ use super::{
     short_day,
 };
 use crate::{
+    composer_box,
     inbox::{action, caption, message},
     input::{self, Input},
     popover::MenuAction,
-    settings::widgets::primary_button,
     theme::*,
 };
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use gpui::{
-    AnyElement, Context, Div, Entity, FontWeight, Role, Stateful, Subscription, div, prelude::*, px,
+    AnyElement, Context, Div, Entity, Focusable, FontWeight, Role, Stateful, Subscription, div,
+    prelude::*, px,
 };
 use monocode_core::{
     store::Store,
@@ -782,10 +783,11 @@ impl Today {
                 div().mt(px(4.)).flex().flex_col().gap(px(4.)).children(
                     entries.iter().enumerate().map(|(ix, entry)| match entry {
                         Activity::Event(event) => self.event_view(ix, event),
-                        Activity::Note(note) => self.note_view(ix, note),
+                        Activity::Note(note) => self.note_view(ix, note, cx),
                     }),
                 )
             };
+        let ready = !self.note.read(cx).content.trim().is_empty();
         let needs_hint = editable
             && note_count == 0
             && row.age_days >= AGE_WARNING_DAYS
@@ -812,7 +814,12 @@ impl Today {
                         .text_size(px(12.))
                         .line_height(px(18.))
                         .text_color(content(0.7))
-                        .child(task.summary.trim().to_string()),
+                        .child(self.texts.view(
+                            &format!("context:{}", task.id),
+                            "Context",
+                            task.summary.trim(),
+                            cx,
+                        )),
                 )
             })
             .child(self.sessions_section(&task.id, cx))
@@ -867,25 +874,26 @@ impl Today {
                         .py(px(10.))
                         .border_t_1()
                         .border_color(content(0.07))
-                        .child(
-                            div()
-                                .debug_selector(|| "today-note-box".into())
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(content(0.08))
-                                .bg(content(0.05))
-                                .px(px(8.))
-                                .py(px(6.))
-                                .child(self.note.clone()),
-                        )
-                        .child(
-                            div().mt(px(8.)).flex().justify_end().child(
-                                primary_button("today-add-note", "Add note", false)
-                                    .child("Add note")
-                                    .debug_selector(|| "today-add-note".into())
+                        .child({
+                            let focus = self.note.focus_handle(cx);
+                            composer_box::frame(move |window, cx| {
+                                content(if focus.contains_focused(window, cx) {
+                                    0.2
+                                } else {
+                                    0.1
+                                })
+                            })
+                            .debug_selector(|| "today-note-box".into())
+                            .on_mouse_down(gpui::MouseButton::Left, {
+                                let note = self.note.clone();
+                                move |_, window, cx| window.focus(&note.focus_handle(cx), cx)
+                            })
+                            .child(composer_box::field_row(
+                                self.note.clone(),
+                                composer_box::send_button("today-add-note", ready)
                                     .on_click(cx.listener(|this, _, _, cx| this.add_note(cx))),
-                            ),
-                        ),
+                            ))
+                        }),
                 )
             })
             .children(self.menu_view(Host::Panel, cx))
@@ -941,7 +949,7 @@ impl Today {
     }
 
     /// A note bubble: author, day, body.
-    fn note_view(&self, ix: usize, note: &Note) -> Div {
+    fn note_view(&self, ix: usize, note: &Note, cx: &mut Context<Self>) -> Div {
         let author = note
             .mono_id
             .as_deref()
@@ -977,7 +985,14 @@ impl Today {
                             .child(short_day(&note.day)),
                     ),
             )
-            .child(div().text_color(content(0.8)).child(note.body.clone()))
+            .child(
+                div().text_color(content(0.8)).child(self.texts.view(
+                    &format!("note:{}", note.id),
+                    "Note",
+                    &note.body,
+                    cx,
+                )),
+            )
     }
 }
 

@@ -9,6 +9,7 @@ mod list;
 mod menus;
 mod sources;
 mod statuses;
+mod texts;
 
 pub(crate) use detail_sessions::SessionRow;
 
@@ -160,6 +161,8 @@ pub(crate) struct Today {
     pub(super) board: board::Board,
     pub(super) new_task: Entity<Input>,
     pub(super) note: Entity<Input>,
+    /// Selectable read-only fields for the detail's note bodies and context.
+    pub(super) texts: texts::Texts,
     /// The detail's title field, for manual tasks.
     pub(super) title: detail::TitleEdit,
     /// The selected task's sessions (see `detail_sessions`).
@@ -233,13 +236,23 @@ impl Today {
     }
     fn new_inner(store: Database, cx: &mut Context<Self>) -> Self {
         let new_task = cx.new(|cx| Input::field("New task", "New task", content(0.4), cx));
-        let note = cx.new(Input::inbox_comment);
+        // The Mono chat composer's field: Enter adds, Shift+Enter is a newline.
+        let note = cx.new(|cx| {
+            let mut input = Input::new(cx);
+            input.mono_composer("note", cx);
+            input.set_label("Add note");
+            input.set_alternate_submit(true);
+            input
+        });
         let title = detail::TitleEdit::new(cx);
         let subscriptions = vec![
             cx.subscribe(&new_task, |this, _, _: &input::Submitted, cx| {
                 this.add_task(cx)
             }),
             cx.subscribe(&note, |this, _, _: &input::Submitted, cx| this.add_note(cx)),
+            cx.subscribe(&note, |this, _, _: &input::AlternateSubmitted, cx| {
+                this.add_note(cx)
+            }),
         ];
         Self {
             store,
@@ -262,6 +275,7 @@ impl Today {
             board: board::Board::default(),
             new_task,
             note,
+            texts: texts::Texts::default(),
             title,
             sessions: Default::default(),
             panel_width: 360.,
@@ -534,6 +548,7 @@ impl Today {
         }
         self.selected = id;
         self.activity.clear();
+        self.texts.clear();
         // A draft belongs to the task it was typed on.
         self.note
             .update(cx, |input, cx| input.set_text(String::new(), cx));
@@ -2332,5 +2347,146 @@ mod tests {
             assert!(today.action_error.as_deref().unwrap().contains("project"));
             assert!(!today.menus.is_open());
         });
+    }
+
+    /// A store backed page with one task selected and the note field focused.
+    fn composing(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Today>, &mut VisualTestContext, Database, Task) {
+        cx.update(input::bind);
+        let store = database();
+        let task = add(&store, "Write it up");
+        let (today, visual) = page(cx, &store);
+        today.update_in(visual, |today, window, cx| {
+            today.select(Some(task.id.clone()), cx);
+            window.focus(&today.note.focus_handle(cx), cx);
+        });
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        (today, visual, store, task)
+    }
+    fn stored_notes(store: &Database, id: &str) -> Vec<String> {
+        locked(store)
+            .unwrap()
+            .today_activity(id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Activity::Note(note) => Some(note.body),
+                _ => None,
+            })
+            .collect()
+    }
+    fn draft(today: &Entity<Today>, cx: &VisualTestContext) -> String {
+        today.read_with(cx, |today, cx| today.note.read(cx).content.to_string())
+    }
+
+    #[gpui::test]
+    fn enter_adds_the_note_like_the_chat_composer(cx: &mut TestAppContext) {
+        let (today, visual, store, task) = composing(cx);
+        visual.simulate_input("remember the milk");
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        assert_eq!(stored_notes(&store, &task.id), ["remember the milk"]);
+        assert_eq!(draft(&today, visual), "");
+        today.read_with(visual, |today, _| {
+            assert!(matches!(today.activity.last(), Some(Activity::Note(_))));
+        });
+    }
+
+    #[gpui::test]
+    fn shift_enter_is_a_newline_and_cmd_enter_adds_the_note(cx: &mut TestAppContext) {
+        let (today, visual, store, task) = composing(cx);
+        visual.simulate_input("first");
+        visual.simulate_keystrokes("shift-enter");
+        visual.simulate_input("second");
+        visual.run_until_parked();
+        assert_eq!(draft(&today, visual), "first\nsecond");
+        assert!(stored_notes(&store, &task.id).is_empty());
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        visual.simulate_keystrokes(&format!("{modifier}-enter"));
+        visual.run_until_parked();
+        assert_eq!(stored_notes(&store, &task.id), ["first\nsecond"]);
+        assert_eq!(draft(&today, visual), "");
+    }
+
+    #[gpui::test]
+    fn an_empty_or_blank_note_is_not_added(cx: &mut TestAppContext) {
+        let (_, visual, store, task) = composing(cx);
+        visual.simulate_keystrokes("enter");
+        visual.simulate_input("   ");
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        assert!(stored_notes(&store, &task.id).is_empty());
+    }
+
+    #[gpui::test]
+    fn the_send_button_is_ready_only_with_text_and_adds_the_note(cx: &mut TestAppContext) {
+        let (_, visual, store, task) = composing(cx);
+        let send = |visual: &mut VisualTestContext| {
+            visual.refresh().unwrap();
+            let at = visual
+                .debug_bounds("today-add-note")
+                .expect("send is drawn");
+            visual.simulate_click(at.center(), Default::default());
+            visual.run_until_parked();
+        };
+        send(visual);
+        assert!(stored_notes(&store, &task.id).is_empty());
+        visual.simulate_input("via the button");
+        send(visual);
+        assert_eq!(stored_notes(&store, &task.id), ["via the button"]);
+    }
+
+    #[gpui::test]
+    fn a_note_with_a_link_is_selectable_text_whose_link_opens(cx: &mut TestAppContext) {
+        let store = database();
+        let task = add(&store, "Review");
+        locked(&store)
+            .unwrap()
+            .today_note(
+                &task.id,
+                "see https://example.com/a, thanks",
+                &Actor::User,
+                now_ms(),
+            )
+            .unwrap();
+        let (today, visual) = page(cx, &store);
+        today.update(visual, |today, cx| today.select(Some(task.id.clone()), cx));
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let key = today.read_with(visual, |today, _| {
+            let Some(Activity::Note(note)) = today
+                .activity
+                .iter()
+                .find(|a| matches!(a, Activity::Note(_)))
+            else {
+                panic!("the note loaded");
+            };
+            format!("note:{}", note.id)
+        });
+        let field = today
+            .read_with(visual, |today, _| today.texts.get(&key))
+            .expect("the note body is a field");
+        let (read_only, links, at) = field.read_with(visual, |input, _| {
+            (
+                input.is_read_only(),
+                input.link_ranges(),
+                input.link_point(0),
+            )
+        });
+        assert!(read_only);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1, "https://example.com/a");
+        assert_eq!(visual.opened_url(), None);
+        visual.simulate_click(at, Default::default());
+        assert_eq!(
+            visual.opened_url().as_deref(),
+            Some("https://example.com/a")
+        );
     }
 }
