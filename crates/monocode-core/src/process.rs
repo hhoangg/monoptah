@@ -320,7 +320,10 @@ mod tests {
     // `retire_pid` reaps the child with waitpid.
     #[allow(clippy::zombie_processes)]
     fn retire_escalates_when_a_child_ignores_stdin_and_sigterm() {
-        let mut child = spawn("trap '' TERM; while :; do sleep 0.05; done");
+        // Keep one process: a shell loop leaves killed sleep grandchildren
+        // whose reaping can keep the group visible briefly on Linux. SIG_IGN
+        // survives exec, so this child still requires escalation to SIGKILL.
+        let mut child = spawn("trap '' TERM; exec sleep 60");
         let pid = child.id();
         drop(child.stdin.take());
         let started = Instant::now();
