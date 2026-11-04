@@ -135,7 +135,7 @@ fn trigger_label(preview: &ImportPreview) -> String {
 }
 
 /// Text exactly as the file has it, in the monospace the app uses for code.
-fn verbatim(text: &str) -> Div {
+pub(in crate::monos) fn verbatim(text: &str) -> Div {
     div()
         .w_full()
         .min_w_0()
@@ -150,7 +150,7 @@ fn verbatim(text: &str) -> Div {
         .child(visible(text))
 }
 
-fn labelled(label: impl Into<SharedString>, body: impl IntoElement) -> Div {
+pub(in crate::monos) fn labelled(label: impl Into<SharedString>, body: impl IntoElement) -> Div {
     div()
         .w_full()
         .min_w_0()

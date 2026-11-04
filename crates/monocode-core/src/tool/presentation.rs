@@ -405,6 +405,8 @@ pub fn app_activity(action: &str, running: bool) -> (&'static str, &'static str)
         "notes.list" | "notes.read" => ("Reading", "Read", "notes"),
         "habits.list" => ("Checking", "Checked", "habits"),
         "habits.run" => ("Running", "Ran", "a habit"),
+        "habits.export" => ("Exporting", "Exported", "a habit"),
+        "habits.import" => ("Importing", "Imported", "a habit"),
         a if a.starts_with("habits.") => ("Updating", "Updated", "habits"),
         "soul.update" => ("Updating", "Updated", "instructions"),
         "soul.read" => ("Checking", "Checked", "instructions"),

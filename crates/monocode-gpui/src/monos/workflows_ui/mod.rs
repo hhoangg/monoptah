@@ -8,7 +8,7 @@
 //! tab or a workflow page is shown, on a short clock that also notices a run starting or ending
 //! in the runner. All file access and model probing runs off the UI thread. Actions go through
 //! `actions`, which follows the same rules as the `workflows.*` CLI actions.
-mod actions;
+pub(in crate::monos) mod actions;
 mod board;
 #[cfg(test)]
 mod board_canvas_tests;
@@ -24,11 +24,11 @@ mod inspector_parts;
 #[cfg(test)]
 mod inspector_tests;
 mod list;
-mod page;
+pub(in crate::monos) mod page;
 #[cfg(test)]
 mod page_tests;
 mod requirements;
-mod review;
+pub(in crate::monos) mod review;
 #[cfg(test)]
 mod review_tests;
 mod run_details;
@@ -42,10 +42,11 @@ mod run_page;
 #[cfg(test)]
 mod run_tests;
 #[cfg(test)]
-mod tests;
-mod view;
+pub(in crate::monos) mod tests;
+pub(in crate::monos) mod view;
 
 pub(crate) use actions::ReviewIntent;
+pub(in crate::monos) use import::{apply_picked_file, pick_text_file, preview_later};
 
 use super::*;
 use crate::popover::{Align, MenuAction};
