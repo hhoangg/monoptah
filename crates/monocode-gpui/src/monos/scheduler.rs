@@ -1,4 +1,5 @@
 use super::panels::{button, empty_state, matches_query, search_bar};
+use super::workflows_ui::view::{needs_review_badge, notice_line};
 use super::*;
 use monocode_core::mono::habits::{Run, Schedule};
 use monocode_core::mono::heartbeat;
@@ -152,9 +153,11 @@ pub(super) fn when(at: u64, now: u64) -> String {
         at.format("%b %-d, %H:%M").to_string()
     }
 }
-fn habit_subtitle(h: &Habit, since: Option<u64>, busy: bool, now: u64) -> String {
+pub(super) fn habit_subtitle(h: &Habit, since: Option<u64>, busy: bool, now: u64) -> String {
     if let Some(since) = since {
         format!("Running now · {}", duration(now.saturating_sub(since)))
+    } else if h.needs_review {
+        format!("Imported, needs review · {}", h.schedule.label())
     } else if busy {
         "Starting…".into()
     } else if h.enabled {
@@ -325,8 +328,8 @@ impl Monos {
     }
     fn habit_busy(&self, habit: &Habit) -> bool {
         self.habit_running_since(habit).is_some()
-            || habit.run_requested
-            || habit.enabled && habit.next_run_at <= now_ms()
+            || !habit.needs_review
+                && (habit.run_requested || habit.enabled && habit.next_run_at <= now_ms())
     }
     pub(super) fn habits_list(&mut self, mono: &Mono, cx: &mut Context<Self>) -> AnyElement {
         let filter = self.field(
@@ -427,15 +430,24 @@ impl Monos {
                             .min_w_0()
                             .child(
                                 div()
-                                    .text_size(px(12.))
-                                    .line_height(px(20.))
-                                    .truncate()
-                                    .text_color(content(if h.enabled || since.is_some() {
-                                        0.85
-                                    } else {
-                                        0.45
-                                    }))
-                                    .child(h.name.clone()),
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_size(px(12.))
+                                            .line_height(px(20.))
+                                            .truncate()
+                                            .text_color(content(if h.enabled || since.is_some() {
+                                                0.85
+                                            } else {
+                                                0.45
+                                            }))
+                                            .child(h.name.clone()),
+                                    )
+                                    .when(h.needs_review, |d| d.child(needs_review_badge())),
                             )
                             .child(
                                 div()
@@ -469,6 +481,7 @@ impl Monos {
         } else {
             format!("-{}", h.id)
         };
+        let export = h.clone();
         div()
             .when(!page, |d| {
                 d.opacity(0.).group_hover("mono-habit", |s| s.opacity(1.))
@@ -476,6 +489,15 @@ impl Monos {
             .flex_shrink_0()
             .flex()
             .items_center()
+            .when(page, |d| {
+                d.child(
+                    habit_icon_button(SharedString::from("mono-habit-export"), "Export", "share")
+                        .debug_selector(|| "mono-habit-export".into())
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.habit_export(&export, cx)),
+                        ),
+                )
+            })
             .child(
                 habit_icon_button(
                     SharedString::from(format!("mono-habit-run{suffix}")),
@@ -521,7 +543,13 @@ impl Monos {
             .child(
                 habit_icon_button(
                     SharedString::from(format!("mono-habit-toggle{suffix}")),
-                    if h.enabled { "Pause" } else { "Resume" },
+                    if h.needs_review {
+                        "Review to enable"
+                    } else if h.enabled {
+                        "Pause"
+                    } else {
+                        "Resume"
+                    },
                     if h.enabled {
                         "queue-pause"
                     } else {
@@ -547,12 +575,18 @@ impl Monos {
     pub(super) fn clear_habit_fields(&mut self) {
         self.fields.retain(|key, _| !key.starts_with("habit-"));
         self.habit_ui.error = None;
+        self.habit_share.notice = None;
         self.habit_ui.revision = self.habit_ui.revision.wrapping_add(1);
     }
     pub(super) fn habit_toggle(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(mono) = self.active.clone() else {
             return;
         };
+        // An imported habit stays off until the user has read and approved it.
+        if self.habits.iter().any(|h| h.id == id && h.needs_review) {
+            self.open_habit_review(id, cx);
+            return;
+        }
         let root = self.root.clone();
         let target = mono.clone();
         let id = id.to_string();
@@ -564,11 +598,7 @@ impl Monos {
                         .iter_mut()
                         .find(|h| h.id == id)
                         .ok_or("Habit not found")?;
-                    h.enabled = !h.enabled;
-                    if h.enabled {
-                        h.next_run_at = h.schedule.next(now_ms())?;
-                    }
-                    Ok(())
+                    h.set_enabled(!h.enabled, now_ms())
                 })
             },
             cx,
@@ -617,6 +647,8 @@ impl Monos {
                 "Runs",
                 if h.enabled {
                     h.schedule.label()
+                } else if h.needs_review {
+                    format!("Needs review · {}", h.schedule.label())
                 } else {
                     "Paused".into()
                 },
@@ -626,6 +658,7 @@ impl Monos {
         } else if h.enabled {
             info = info.child(property("Next", when(h.next_run_at, now_ms())));
         }
+        let prompt = h.needs_review.then(|| self.habit_review_prompt(&h.id, cx));
         let mut history = section("Recent runs");
         if let Some(since) = since {
             history = history.child(
@@ -690,6 +723,11 @@ impl Monos {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
+                    .children(notice_line(
+                        "mono-habit-notice",
+                        self.habit_share.notice.as_deref(),
+                    ))
+                    .children(prompt)
                     .child(info)
                     .child(
                         section("What it does").child(
@@ -1303,6 +1341,11 @@ impl Monos {
         cx.notify();
     }
     fn request_habit(&mut self, id: &str, cx: &mut Context<Self>) {
+        // An imported habit cannot run until the user has read and approved it.
+        if self.habits.iter().any(|h| h.id == id && h.needs_review) {
+            self.open_habit_review(id, cx);
+            return;
+        }
         if self
             .habits
             .iter()
@@ -1325,8 +1368,7 @@ impl Monos {
                 all.iter_mut()
                     .find(|h| h.id == id)
                     .ok_or("Habit not found")?
-                    .run_requested = true;
-                Ok(())
+                    .request_run()
             })
         });
         cx.spawn(async move |this, cx| {

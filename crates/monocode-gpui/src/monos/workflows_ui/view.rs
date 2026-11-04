@@ -104,6 +104,23 @@ pub(in crate::monos) fn alert(text: impl Into<SharedString>) -> gpui::Stateful<D
         .child(text.into())
 }
 
+/// The "Choose file" link at the end of a file section's title.
+pub(in crate::monos) fn choose_file_link(id: &'static str) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .role(gpui::Role::Button)
+        .aria_label("Choose file")
+        .cursor_pointer()
+        .rounded_sm()
+        .px_1p5()
+        .py_0p5()
+        .text_size(px(11.))
+        .text_color(content(0.6))
+        .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+        .child("Choose file")
+}
+
 /// The small label on a workflow whose commands and prompts nobody has read yet.
 pub(in crate::monos) fn needs_review_badge() -> Div {
     div()
