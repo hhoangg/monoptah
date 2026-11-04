@@ -3,11 +3,14 @@
 //! `menus` holds the one open dropdown they share.
 mod board;
 mod detail;
+mod detail_sessions;
 mod filter;
 mod list;
 mod menus;
 mod sources;
 mod statuses;
+
+pub(crate) use detail_sessions::SessionRow;
 
 use crate::{
     inbox::{action, icon_action, message, plain_action},
@@ -45,6 +48,14 @@ pub(crate) enum Event {
     /// Open a new chat session in the task's project with an unsent
     /// `@today/<key>` mention in its composer. The task always has a project.
     StartSession(Box<Task>),
+    /// Open a session listed in a task's SESSIONS section.
+    OpenSession(i64),
+    /// Link `session` to the task, open it and leave an unsent `@today/<key>`
+    /// mention in its composer (after any text already there).
+    ContinueInSession {
+        task: Box<Task>,
+        session: i64,
+    },
     /// Run these (Mono id, habit id) through the normal habit path.
     SyncNow(Vec<(String, String)>),
 }
@@ -151,6 +162,8 @@ pub(crate) struct Today {
     pub(super) note: Entity<Input>,
     /// The detail's title field, for manual tasks.
     pub(super) title: detail::TitleEdit,
+    /// The selected task's sessions (see `detail_sessions`).
+    pub(super) sessions: detail_sessions::TaskSessions,
     pub(super) panel_width: f32,
     pub(super) resize_start: Option<(f32, f32)>,
     pub(super) error: Option<String>,
@@ -250,6 +263,7 @@ impl Today {
             new_task,
             note,
             title,
+            sessions: Default::default(),
             panel_width: 360.,
             resize_start: None,
             error: None,
@@ -275,6 +289,7 @@ impl Today {
     }
     /// Reloads off the UI thread; also what picks up a rollover and agent syncs.
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.load_session_links(cx);
         self.generation += 1;
         let generation = self.generation;
         let store = self.store.clone();
@@ -1421,7 +1436,9 @@ impl Render for Today {
                 if event.keystroke.key == "escape" {
                     // Innermost first: the dialog, then a field (Escape leaves it and
                     // keeps the page), then the narrow detail, then the page itself.
-                    if this.statuses_dialog.is_some() {
+                    if this.asking_to_move() {
+                        this.cancel_move(cx);
+                    } else if this.statuses_dialog.is_some() {
                         this.finish_statuses(window, cx);
                     } else if this.tags_dialog.is_some() {
                         this.finish_tags(window, cx);

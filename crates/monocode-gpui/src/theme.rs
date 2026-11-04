@@ -579,6 +579,45 @@ fn chrome_button(
                 }),
         )
 }
+/// One part of a split button (the main action or the chevron): the whole
+/// button lights up on hover, the part under the pointer more. `group` names
+/// the frame from [`split_frame`]; `outer` is the frame's corner radius, and
+/// each part rounds fully inside the frame's 2px inset.
+pub(crate) fn split_segment(id: &'static str, group: &'static str, outer: f32) -> Stateful<Div> {
+    div()
+        .id(id)
+        .role(Role::Button)
+        .h_full()
+        .flex()
+        .items_center()
+        .rounded(px(outer - 2.))
+        .cursor_pointer()
+        .text_color(content(0.4))
+        .group_hover(group, |s| s.text_color(content(0.8)))
+        .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+}
+/// The frame around a split button's parts; the caller sets its height.
+pub(crate) fn split_frame(
+    id: &'static str,
+    label: &'static str,
+    outer: f32,
+    menu_open: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .group(id)
+        .role(Role::Group)
+        .aria_label(label)
+        .p(px(2.))
+        .gap(px(1.))
+        .flex()
+        .flex_shrink_0()
+        .items_stretch()
+        .whitespace_nowrap()
+        .rounded(px(outer))
+        .when(menu_open, |d| d.bg(content(0.06)))
+        .hover(|s| s.bg(content(0.06)))
+}
 // `.primary-action` paints with literal white and black, not theme ink.
 pub(crate) fn white(alpha: f32) -> Hsla {
     gpui::hsla(0., 0., 1., alpha)

@@ -19,6 +19,7 @@ mod side_threads;
 mod thread_files;
 mod today;
 mod today_mention;
+mod today_sessions;
 use crate::surface::Surface;
 use crate::transcript::{Row, Transcript};
 pub use edit::EditSnapshot;
@@ -1170,6 +1171,8 @@ impl Store {
         // Resolve the folder first; the persisted id is gone after deletion.
         let dir = self.thread_dir(id).ok().flatten();
         self.delete_rows(id)?;
+        // Best effort: a stale link is filtered out by the UI, and the delete is done.
+        let _ = self.today_drop_session_link(id);
         thread_files::remove_dir(dir);
         Ok(())
     }

@@ -295,6 +295,10 @@ impl Shell {
                     today::Event::StartSession(task) => {
                         this.start_today_session(task.as_ref().clone(), cx)
                     }
+                    today::Event::OpenSession(id) => this.activate_session(*id, window, cx),
+                    today::Event::ContinueInSession { task, session } => {
+                        this.continue_in_session(task.as_ref().clone(), *session, window, cx)
+                    }
                     today::Event::SyncNow(targets) => {
                         if let Some(monos) = this.monos.clone() {
                             monos.update(cx, |monos, cx| {
@@ -320,6 +324,7 @@ impl Shell {
                         rollover = minutes;
                         this.sync_settings(cx);
                     }
+                    this.sync_today_sessions(cx);
                     cx.notify();
                 }));
             if let Some(monos) = self.monos.clone() {
@@ -660,7 +665,11 @@ impl Shell {
 
     /// A session in the task's project with the task as its context. A task
     /// with no project falls back to the current one, as an Inbox item does.
-    fn start_today_session(&mut self, task: monocode_core::today::Task, cx: &mut Context<Self>) {
+    pub(super) fn start_today_session(
+        &mut self,
+        task: monocode_core::today::Task,
+        cx: &mut Context<Self>,
+    ) {
         let cwd = task
             .project
             .clone()
@@ -720,6 +729,12 @@ impl Shell {
             store.title(summary.id, &summary.title)?;
             store.set_work_item(summary.id, summary.work_item.as_ref())?;
             store.save_agent_settings(summary.id, &settings)?;
+            // A session started from a Today task belongs to it. A task the store
+            // no longer has leaves the session unlinked; it still starts.
+            if let Start::Draft { today_key, .. } = &start {
+                let _ =
+                    store.today_link_session(summary.id, today_key, monocode_core::time::now_ms());
+            }
             Ok::<_, String>((summary, settings, start))
         });
         cx.spawn(async move |this, cx| {
@@ -747,6 +762,7 @@ impl Shell {
                             terminal || this.navigation_revision == revision
                         }
                         Start::Draft { text, today_key } => {
+                            this.refresh_today_sessions(cx);
                             this.sessions[&id].update(cx, |view, cx| {
                                 view.seed_new_settings(settings, cx);
                                 view.set_draft(text, Some(&today_key), cx);

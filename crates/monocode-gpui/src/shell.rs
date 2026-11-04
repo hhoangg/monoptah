@@ -62,6 +62,7 @@ mod terminal_dock;
 mod terminal_panes;
 use terminal_panes::terminal_drag_ghost;
 mod title_tabs;
+mod today_sessions;
 mod tui_busy;
 mod tui_sessions;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1629,6 +1630,7 @@ impl Shell {
         self.session_marks[&id].update(cx, |mark, cx| mark.set(&provider, state, cx));
         self.tab_marks[&id].update(cx, |mark, cx| mark.set(&provider, tab_state, cx));
         self.push_inbox_busy(cx);
+        self.sync_today_sessions(cx);
     }
     /// Tells the Inbox which sessions are running, for its row and chip spinners.
     fn push_inbox_busy(&self, cx: &mut Context<Self>) {
@@ -1736,6 +1738,7 @@ impl Shell {
     }
     fn invalidate_chrome(&self, cx: &mut Context<Self>) {
         self.notify_sidebar(cx);
+        self.sync_today_sessions(cx);
         self.tabs_frame.update(cx, |_, cx| cx.notify());
         if self.workspace.classic_layout {
             self.projects_frame.update(cx, |_, cx| cx.notify());

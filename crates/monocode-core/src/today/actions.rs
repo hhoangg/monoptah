@@ -192,6 +192,11 @@ fn list(
         (view.day, view.mode, view.recorded, rows)
     };
     let total = rows.len();
+    // One read of every link, grouped by task; the store lists them newest first.
+    let mut sessions: std::collections::HashMap<String, Vec<i64>> = Default::default();
+    for (session, task) in store.today_session_links()? {
+        sessions.entry(task).or_default().push(session);
+    }
     let mut tasks = Vec::with_capacity(total.min(limit));
     for (task, group, age, workflow) in rows.into_iter().take(limit) {
         // Notes are append-only; one written after the viewed day is not part of it.
@@ -207,6 +212,8 @@ fn list(
         value["ageDays"] = json!(age);
         value["workflowStatus"] = workflow_json(&workflow);
         value["notes"] = json!(listed);
+        // Always present: ids of the sessions the user linked to this task.
+        value["sessionIds"] = json!(sessions.get(&task.id).cloned().unwrap_or_default());
         tasks.push(value);
     }
     Ok(json!({
@@ -1283,6 +1290,27 @@ mod tests {
         let listed = call(&store, &a, "today.list", json!({})).unwrap();
         assert_eq!(listed["count"], 1);
         assert_eq!(listed["tasks"][0]["notes"][0]["body"], "ok");
+    }
+
+    #[test]
+    fn list_returns_each_tasks_linked_session_ids() {
+        let (_dir, store) = store();
+        let a = mono("a", &[]);
+        sync_ok(&store, &a, "gh", json!([item("gh:1"), item("gh:2")]));
+        store.today_link_session(11, "gh:1", NOW).unwrap();
+        store.today_link_session(12, "gh:1", NOW + 1).unwrap();
+        let listed = call(&store, &a, "today.list", json!({})).unwrap();
+        let ids = |key: &str| {
+            let task = listed["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["key"] == key)
+                .unwrap();
+            task["sessionIds"].clone()
+        };
+        assert_eq!(ids("gh:1"), json!([12, 11]));
+        assert_eq!(ids("gh:2"), json!([]));
     }
 
     #[test]

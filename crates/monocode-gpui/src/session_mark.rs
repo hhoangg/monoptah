@@ -78,7 +78,6 @@ impl SessionMark {
             ..Self::new(provider)
         }
     }
-    #[cfg(test)]
     pub(crate) fn state(&self) -> State {
         self.state
     }
@@ -97,32 +96,38 @@ impl SessionMark {
         cx.notify();
     }
 }
+/// The mark for `state` at `side`: the provider's icon when idle, else the
+/// working spinner, the done check or the approval alert. Shared by the
+/// sidebar and tab marks and any row that shows a session's state.
+pub(crate) fn mark_element(provider: &str, state: State, side: f32) -> AnyElement {
+    match state {
+        State::Idle => provider_icon(provider, side).into_any_element(),
+        // Its own small view, so the clock repaints only the mark.
+        State::Working => div()
+            .id("session-working")
+            .child(spinner("session-working-spinner", Rate::Smooth))
+            .role(Role::Image)
+            .aria_label("Working")
+            .into_any_element(),
+        // Tailwind teal-400 and amber-400, as TitleBar.tsx.
+        State::Done => div()
+            .id("session-done")
+            .role(Role::Image)
+            .aria_label("Done")
+            .child(icon("check-circle-2", 14.).text_color(rgb(0x2dd4bf)))
+            .into_any_element(),
+        State::Attention => div()
+            .id("session-attention")
+            .role(Role::Image)
+            .aria_label("Needs approval")
+            .child(icon("alert-circle", 14.).text_color(rgb(0xfbbf24)))
+            .into_any_element(),
+    }
+}
 impl Render for SessionMark {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let side = self.side;
-        let mark: AnyElement = match self.state {
-            State::Idle => provider_icon(&self.provider, side).into_any_element(),
-            // Its own small view, so the clock repaints only the mark.
-            State::Working => div()
-                .id("session-working")
-                .child(spinner("session-working-spinner", Rate::Smooth))
-                .role(Role::Image)
-                .aria_label("Working")
-                .into_any_element(),
-            // Tailwind teal-400 and amber-400, as TitleBar.tsx.
-            State::Done => div()
-                .id("session-done")
-                .role(Role::Image)
-                .aria_label("Done")
-                .child(icon("check-circle-2", 14.).text_color(rgb(0x2dd4bf)))
-                .into_any_element(),
-            State::Attention => div()
-                .id("session-attention")
-                .role(Role::Image)
-                .aria_label("Needs approval")
-                .child(icon("alert-circle", 14.).text_color(rgb(0xfbbf24)))
-                .into_any_element(),
-        };
+        let mark = mark_element(&self.provider, self.state, side);
         div()
             .debug_selector(|| "session-provider-mark".into())
             .size(px(side))
