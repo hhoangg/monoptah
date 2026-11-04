@@ -42,8 +42,8 @@ use crate::{
 };
 pub(crate) use accounts::UsageResumed;
 use gpui::{
-    AnyElement, Context, CursorStyle, Entity, EventEmitter, Focusable, MouseButton, Role,
-    SharedString, StyleRefinement, Subscription, Window, canvas, div, prelude::*, px,
+    AnyElement, Context, Entity, EventEmitter, Focusable, MouseButton, Role, SharedString,
+    StyleRefinement, Subscription, Window, canvas, div, prelude::*, px,
 };
 pub(crate) use mobile::{
     Waiting as MobileWaiting, mobile_access_modes, usage_state as mobile_usage_state,
@@ -1178,6 +1178,7 @@ impl Conversation {
             started_at: Some(monocode_core::time::now_ms()),
             ..Default::default()
         });
+        let fresh_prompt = settings.prepared_prompt.is_none();
         if !self.is_remote() && settings.prepared_prompt.is_none() {
             let prepared = self
                 .completion
@@ -1201,6 +1202,16 @@ impl Conversation {
             settings
                 .attachments
                 .extend(std::mem::take(&mut self.attachments));
+            // Images from the notes of an `@today/<key>` mention ride along as
+            // real attachments, after the user's own.
+            if fresh_prompt && !self.is_remote() && !self.editing_last_turn.resending {
+                let images = self.completion.read(cx).today_turn_images(
+                    &prompt,
+                    &settings.attachments,
+                    !settings.internal_message,
+                );
+                settings.attachments.extend(images);
+            }
         }
         if settings
             .remote_action

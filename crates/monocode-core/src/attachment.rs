@@ -23,10 +23,20 @@ pub fn write_attachment(name: &str, data: &[u8]) -> Result<PathBuf, String> {
 
 /// `write_attachment` with the directory chosen by the caller.
 pub fn write_attachment_into(dir: &Path, name: &str, data: &[u8]) -> Result<PathBuf, String> {
-    if data.len() as u64 > MAX_EMBED_BYTES {
+    write_attachment_limited(dir, name, data, MAX_EMBED_BYTES)
+}
+
+/// `write_attachment_into` with the size limit chosen by the caller.
+pub fn write_attachment_limited(
+    dir: &Path,
+    name: &str,
+    data: &[u8],
+    max_bytes: u64,
+) -> Result<PathBuf, String> {
+    if data.len() as u64 > max_bytes {
         return Err(format!(
             "File is too large to attach (maximum {} MB).",
-            MAX_EMBED_BYTES / 1024 / 1024
+            max_bytes / 1024 / 1024
         ));
     }
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -141,6 +151,19 @@ mod tests {
         // exactly the limit still goes through
         let ok = vec![0u8; MAX_EMBED_BYTES as usize];
         assert!(write_attachment_into(dir.path(), "edge.bin", &ok).is_ok());
+    }
+
+    #[test]
+    fn a_caller_limit_replaces_the_embed_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![0u8; MAX_EMBED_BYTES as usize + 1];
+        assert!(
+            write_attachment_limited(dir.path(), "big.bin", &data, MAX_EMBED_BYTES * 2).is_ok()
+        );
+        assert_eq!(
+            write_attachment_limited(dir.path(), "x.bin", &[0; 3], 2).unwrap_err(),
+            "File is too large to attach (maximum 0 MB)."
+        );
     }
 
     #[test]

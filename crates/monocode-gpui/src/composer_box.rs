@@ -88,3 +88,29 @@ pub(crate) fn send_button(id: &'static str, ready: bool) -> Stateful<Div> {
         .child(icon("mono-arrow-up", 14.).text_color(ink(if ready { 1. } else { 0.4 })))
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
+
+/// A 26px round tool button under the field (attach, emoji...). `id` is also
+/// its hover group.
+pub(crate) fn tool(id: &'static str, label: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label)
+        .group(id)
+        .flex_shrink_0()
+        .size(px(26.))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .hover(|s| s.bg(content(0.08)))
+}
+
+/// The paperclip tool; `id` is also its debug selector. The caller adds the click.
+pub(crate) fn attach_tool(id: &'static str) -> Stateful<Div> {
+    tool(id, "Attach files").debug_selector(|| id.into()).child(
+        icon("mono-attach", 17.)
+            .text_color(content(0.55))
+            .group_hover(id, |s| s.text_color(content(1.))),
+    )
+}

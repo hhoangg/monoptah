@@ -160,47 +160,24 @@ impl Conversation {
         text
     }
     pub(super) fn choose_attachments(&mut self, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Attach files".into()),
-        });
+        let paths = crate::attachment_tray::pick_files(cx);
         cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = paths.await {
+            if let Some(paths) = paths.await {
                 let _ = this.update(cx, |this, cx| this.add_attachments(paths, cx));
             }
         })
         .detach();
     }
     pub(super) fn paste_attachments(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(clipboard) = cx.read_from_clipboard() else {
-            return false;
+        use crate::attachment_tray::Pasted;
+        let images = match crate::attachment_tray::pasted(cx) {
+            None => return false,
+            Some(Pasted::Paths(paths)) => {
+                self.add_attachments(paths, cx);
+                return true;
+            }
+            Some(Pasted::Images(images)) => images,
         };
-        let paths: Vec<_> = clipboard
-            .entries()
-            .iter()
-            .filter_map(|entry| match entry {
-                gpui::ClipboardEntry::ExternalPaths(paths) => Some(paths.paths().to_vec()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        if !paths.is_empty() {
-            self.add_attachments(paths, cx);
-            return true;
-        }
-        let images: Vec<_> = clipboard
-            .entries()
-            .iter()
-            .filter_map(|entry| match entry {
-                gpui::ClipboardEntry::Image(image) => Some(image.clone()),
-                _ => None,
-            })
-            .collect();
-        if images.is_empty() {
-            return false;
-        }
         if self.attaching {
             return true;
         }
@@ -293,131 +270,45 @@ impl Conversation {
         cx.notify();
     }
     pub(super) fn attachment_chips(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // Removed chips release their thumbnail sprites with the entity.
-        let attachments = &self.attachments;
-        self.attachment_photos
-            .retain(|path, _| attachments.contains(path));
-        if self.attachments.is_empty() && self.attachment_error.is_none() && !self.attaching {
-            return None;
-        }
-        for path in &self.attachments {
-            if let Some(mime) = monocode_core::composer::image_mime(path)
-                && !self.attachment_photos.contains_key(path)
-            {
-                let origin = crate::transcript::attachments::Origin::Path(path.clone());
-                let photo = cx
-                    .new(|cx| crate::transcript::attachments::Photo::new(origin, mime.into(), cx));
-                self.attachment_photos.insert(path.clone(), photo);
-            }
-        }
-        Some(
-            div()
-                .debug_selector(|| "composer-attachments".into())
-                .px_3()
-                .pt_3()
-                .flex()
-                .flex_wrap()
-                .gap_1p5()
-                .children(self.attachments.iter().enumerate().map(|(ix, path)| {
-                    let label = path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    let photo = self.attachment_photos.get(path).cloned();
-                    let image = monocode_core::composer::image_mime(path).is_some();
-                    let remove = div()
-                        .id(("remove-attachment", ix))
-                        .role(Role::Button)
-                        .aria_label(format!("Remove {label}"))
-                        .cursor_pointer()
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(image, |d| {
-                            d.absolute()
-                                .top(px(-4.))
-                                .right(px(-4.))
-                                .size(px(20.))
-                                .rounded_full()
-                                .bg(content(0.2))
-                                .text_color(content(0.7))
-                                .hover(|s| s.bg(content(0.3)).text_color(content(1.)))
-                        })
-                        .when(!image, |d| {
-                            d.h(px(26.))
-                                .px(px(6.))
-                                .rounded_md()
-                                .bg(content(0.1))
-                                .text_color(content(1.))
-                                .hover(|s| s.bg(content(0.15)))
-                        })
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(icon("close", if image { 12. } else { 10. }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            if ix < this.attachments.len() {
-                                this.attachments.remove(ix);
-                                cx.notify();
-                            }
-                        }));
-                    if image {
-                        let preview = crate::image_lightbox::Open {
-                            source: crate::image_lightbox::Source::Path(path.clone()),
-                            alt: label.clone().into(),
-                        };
-                        return div()
-                            .id(("attachment", ix))
-                            .relative()
-                            .size(px(36.))
-                            .flex_shrink_0()
-                            .role(Role::Button)
-                            .focusable()
-                            .debug_selector(move || format!("composer-image-{ix}"))
-                            .aria_label(format!("Open {label} full screen"))
-                            .cursor(CursorStyle::PointingHand)
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(move |_, window, cx| {
-                                cx.stop_propagation();
-                                window.dispatch_action(Box::new(preview.clone()), cx);
-                            })
-                            .children(photo)
-                            .child(remove)
-                            .into_any_element();
-                    }
-                    div()
-                        .id(("attachment", ix))
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(content(0.06))
-                        .text_size(px(11.))
-                        .child(crate::file_icons::file_type_icon(&label, false, false, 14.))
-                        .child(div().max_w(px(190.)).truncate().child(label))
-                        .child(remove)
-                        .into_any_element()
-                }))
-                .when(self.attaching, |d| {
-                    d.child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(content(0.5))
-                            .child("Attaching…"),
-                    )
-                })
-                .when_some(self.attachment_error.clone(), |d, error| {
-                    d.child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(tint(AMBER_400, 0.9))
-                            .child(error),
-                    )
-                })
-                .into_any_element(),
+        use crate::attachment_tray::{Ids, Tray, sync_photos, tray};
+        sync_photos(&self.attachments, &mut self.attachment_photos, cx);
+        let this = cx.entity().downgrade();
+        let remove: crate::attachment_tray::OnRemove = std::rc::Rc::new(move |ix, _, cx| {
+            let _ = this.update(cx, |this, cx| {
+                if ix < this.attachments.len() {
+                    this.attachments.remove(ix);
+                    cx.notify();
+                }
+            });
+        });
+        let open: crate::attachment_tray::OnOpen = std::rc::Rc::new(|path, window, cx| {
+            let preview = crate::image_lightbox::Open {
+                source: crate::image_lightbox::Source::Path(path.to_path_buf()),
+                alt: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+                    .into(),
+            };
+            window.dispatch_action(Box::new(preview), cx);
+        });
+        tray(
+            Tray {
+                paths: &self.attachments,
+                photos: &self.attachment_photos,
+                attaching: self.attaching,
+                error: self.attachment_error.as_deref(),
+                ids: Ids {
+                    tray: "composer-attachments",
+                    image: "composer-image",
+                    file: "composer-file",
+                    remove: "remove-attachment",
+                },
+                open_label: |label| format!("Open {label} full screen"),
+            },
+            remove,
+            open,
         )
     }
     pub(super) fn finish_orchestration_plan(&mut self, cx: &mut Context<Self>) {

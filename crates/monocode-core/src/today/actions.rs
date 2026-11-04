@@ -1286,6 +1286,33 @@ mod tests {
     }
 
     #[test]
+    fn a_listed_note_exposes_its_attachments_with_the_stored_path() {
+        let (dir, store) = store();
+        let a = mono("a", &[]);
+        sync_ok(&store, &a, "gh", json!([item("gh:1")]));
+        let shot = dir.path().join("shot.png");
+        image::RgbaImage::new(2, 2)
+            .save_with_format(&shot, image::ImageFormat::Png)
+            .unwrap();
+        let id = task(&store, "gh:1").id;
+        store
+            .today_note_with_files(&id, "look", &[shot], &Actor::User, NOW)
+            .unwrap();
+        let listed = call(&store, &a, "today.list", json!({})).unwrap();
+        let attachment = &listed["tasks"][0]["notes"][0]["attachments"][0];
+        assert_eq!(attachment["name"], "shot.png");
+        assert_eq!(attachment["kind"], "image");
+        assert_eq!(attachment["mime"], "image/png");
+        let path = attachment["path"].as_str().expect("absolute path");
+        assert!(std::path::Path::new(path).is_absolute());
+        assert!(std::path::Path::new(path).is_file());
+        assert!(attachment["file"]
+            .as_str()
+            .unwrap()
+            .starts_with("today-attachments/"));
+    }
+
+    #[test]
     fn a_run_may_note_and_update_but_not_hide() {
         let (_dir, store) = store();
         let a = mono("a", &[]);

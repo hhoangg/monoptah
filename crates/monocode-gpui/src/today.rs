@@ -6,6 +6,8 @@ mod detail;
 mod filter;
 mod list;
 mod menus;
+mod note_attachments;
+mod note_composer;
 mod sources;
 mod statuses;
 mod texts;
@@ -150,6 +152,10 @@ pub(crate) struct Today {
     pub(super) board: board::Board,
     pub(super) new_task: Entity<Input>,
     pub(super) note: Entity<Input>,
+    /// Open/reveal seam, thumbnails and menu of the files attached to notes.
+    pub(super) note_files: note_attachments::NoteFiles,
+    /// Pending files, paste and drop state of the note composer.
+    pub(super) attach: note_composer::Attach,
     /// Selectable read-only fields for the detail's note bodies and context.
     pub(super) texts: texts::Texts,
     /// The detail's title field, for manual tasks.
@@ -262,6 +268,8 @@ impl Today {
             board: board::Board::default(),
             new_task,
             note,
+            note_files: note_attachments::NoteFiles::default(),
+            attach: Default::default(),
             texts: texts::Texts::default(),
             title,
             panel_width: 360.,
@@ -537,6 +545,7 @@ impl Today {
         // A draft belongs to the task it was typed on.
         self.note
             .update(cx, |input, cx| input.set_text(String::new(), cx));
+        self.reset_note_files(cx);
         self.load_activity(cx);
         cx.notify();
     }
@@ -680,23 +689,7 @@ impl Today {
         );
     }
     pub(super) fn add_note(&mut self, cx: &mut Context<Self>) {
-        if self.view.as_ref().is_none_or(|v| v.mode == DayMode::Past) {
-            return;
-        }
-        let Some(id) = self.selected.clone() else {
-            return;
-        };
-        let Some(body) = self.note.update(cx, |input, cx| input.take(cx)) else {
-            return;
-        };
-        self.act(
-            move |store, now| {
-                store
-                    .today_note(&id, body.trim(), &Actor::User, now)
-                    .map(|_| ())
-            },
-            cx,
-        );
+        self.send_note(cx);
     }
     /// A source whose Mono is gone, or whose habit is absent from habits that were really
     /// read: nothing can sync it any more, so it raises no band. The Sources tab still

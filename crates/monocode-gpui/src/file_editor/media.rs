@@ -69,7 +69,7 @@ pub(super) struct MediaPreview {
     _source: Option<Arc<document::TemporaryMedia>>,
 }
 impl EventEmitter<MediaEvent> for MediaPreview {}
-fn file_size(bytes: u64) -> String {
+pub(crate) fn file_size(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{bytes} B");
     }
