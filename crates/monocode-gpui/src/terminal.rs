@@ -1,5 +1,8 @@
 //! Port of TerminalView.tsx: a login shell on a PTY, emulated by
 //! alacritty_terminal and painted as a grid of cell-snapped text runs.
+mod shell;
+use shell::default_shell;
+
 use crate::theme::*;
 use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, WindowSize},
@@ -38,6 +41,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+mod context_menu;
 
 actions!(
     terminal,
@@ -143,6 +148,7 @@ struct Marked {
 }
 
 pub(crate) struct Terminal {
+    context_menu: Option<context_menu::EditingMenu>,
     term: Arc<FairMutex<Term<Listener>>>,
     sender: Option<EventLoopSender>,
     focus: FocusHandle,
@@ -222,13 +228,13 @@ struct Plan {
 }
 impl Plan {
     fn shell() -> Self {
-        let (program, args) = default_shell();
+        let (program, args) = default_shell(&monocode_core::scm::terminal_search_path());
         Self {
+            label: format!("the shell ({program})"),
             program,
             args,
             env: Vec::new(),
             drain: false,
-            label: "the shell".into(),
             verify: None,
         }
     }
@@ -344,7 +350,10 @@ fn spawn(cwd: &str, size: GridSize, id: u64, plan: Plan) -> Spawned {
         .as_deref()
         .and_then(|program| program_problem(program, &env["PATH"], &workdir));
     let options = tty::Options {
-        shell: Some(tty::Shell::new(plan.program, plan.args)),
+        shell: Some(tty::Shell::new(
+            shell::pty_program(&plan.program),
+            plan.args,
+        )),
         working_directory: Some(workdir),
         drain_on_exit: false,
         env,
@@ -541,6 +550,7 @@ impl Terminal {
             })
         });
         Self {
+            context_menu: None,
             term,
             sender,
             focus: cx.focus_handle(),
@@ -1118,13 +1128,21 @@ impl Render for Terminal {
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event, window, cx| this.mouse_down(event, window, cx)),
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    if cfg!(target_os = "macos") && event.modifiers.control {
+                        this.open_context_menu(event, window, cx);
+                    } else {
+                        this.mouse_down(event, window, cx);
+                    }
+                }),
             )
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::open_context_menu))
             .on_scroll_wheel(cx.listener(|this, event, _, cx| this.scroll(event, cx)))
             .child(Grid {
                 terminal: cx.entity(),
                 focused,
             })
+            .children(self.editing_menu(cx))
     }
 }
 
@@ -2141,29 +2159,6 @@ fn working_dir(cwd: &str) -> std::path::PathBuf {
         home().unwrap_or(path)
     }
 }
-fn default_shell() -> (String, Vec<String>) {
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "macos") {
-                "/bin/zsh".into()
-            } else {
-                "/bin/bash".into()
-            }
-        });
-    let stem = std::path::Path::new(&shell)
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .to_owned();
-    let args = match stem.as_str() {
-        "zsh" | "bash" | "sh" | "fish" => vec!["-l".to_owned()],
-        _ => Vec::new(),
-    };
-    (shell, args)
-}
-
 /// pty.rs's foreground_label: the command holding the terminal, unless it
 /// is the shell itself.
 #[cfg(unix)]

@@ -140,6 +140,7 @@ describe("BinaryFileView video playback", () => {
     const video = container.querySelector("video")!;
     const pause = vi.spyOn(video, "pause");
     const play = vi.spyOn(video, "play");
+    vi.spyOn(video, "paused", "get").mockReturnValue(false);
 
     await renderViewer("/repo/clip.mp4", false);
     expect(pause).toHaveBeenCalledOnce();
@@ -189,6 +190,7 @@ describe("BinaryFileView video playback", () => {
     await renderViewer("/repo/clip.mp4");
     const video = container.querySelector("video")!;
     const pause = vi.spyOn(video, "pause");
+    vi.spyOn(video, "paused", "get").mockReturnValue(false);
     act(() => root.render(null));
     expect(pause).toHaveBeenCalledOnce();
     expect(container.querySelector("video")).toBeNull();
@@ -210,11 +212,20 @@ describe("BinaryFileView video playback", () => {
         return removeAttribute.call(this, name);
       },
     );
+    const pause = vi.spyOn(HTMLMediaElement.prototype, "pause");
     await renderViewer("/repo/clip.mp4", true, true);
     await act(() => new Promise((resolve) => setTimeout(resolve)));
     expect(container.querySelector("video")?.src).toBe("blob:image-preview");
     expect(removed).toEqual([]);
     expect(loadedSources).toEqual([]);
+    expect(pause).not.toHaveBeenCalled();
+  });
+
+  it("does not interrupt metadata loading in an initially hidden tab", async () => {
+    const pause = vi.spyOn(HTMLMediaElement.prototype, "pause");
+    await renderViewer("/repo/clip.mp4", false, true);
+    expect(container.querySelector("video")?.paused).toBe(true);
+    expect(pause).not.toHaveBeenCalled();
   });
 
   it("shows file read errors and allows retry", async () => {

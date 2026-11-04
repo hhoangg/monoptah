@@ -16,6 +16,7 @@ pub mod external_editor;
 pub mod files;
 pub mod follow_up;
 pub mod git;
+pub mod github_star;
 pub mod harness_updates;
 pub mod inbox;
 pub mod mobile;

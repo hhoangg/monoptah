@@ -204,7 +204,7 @@ function VideoView({
   useEffect(() => {
     const video = videoRef.current;
     const pauseWhenHidden = () => {
-      if (!visible || document.hidden) video?.pause();
+      if (video && !video.paused && (!visible || document.hidden)) video.pause();
     };
     pauseWhenHidden();
     document.addEventListener("visibilitychange", pauseWhenHidden);
@@ -217,7 +217,11 @@ function VideoView({
   // a blob the loader revokes, so a detached player holds no connection open.
   useEffect(() => {
     const video = videoRef.current;
-    return () => video?.pause();
+    // A paused player may still be loading metadata. Leave that load alone,
+    // including during StrictMode's cleanup replay.
+    return () => {
+      if (video && !video.paused) video.pause();
+    };
   }, [url, failed]);
 
   if (failed) {
