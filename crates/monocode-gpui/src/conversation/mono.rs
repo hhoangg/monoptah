@@ -976,6 +976,7 @@ impl Conversation {
                 }),
             )
             .child(self.composer_anchor.probe())
+            .child(self.completion.read(cx).composer_probe())
             .child(composer_surface(radius))
             .children(self.attachment_chips(cx))
             .child(
@@ -983,7 +984,7 @@ impl Conversation {
                     .px_3()
                     .pt(px(10.))
                     .pb(px(14.))
-                    .child(self.input.clone()),
+                    .child(self.completion.clone()),
             )
             .child(
                 div()
