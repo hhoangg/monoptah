@@ -256,6 +256,10 @@ struct Protocol {
     interrupt_id: Option<String>,
     claude_prompt_sent: bool,
     claude_result_seen: bool,
+    /// Steers written to stdin that the CLI has not replayed back yet. It takes
+    /// one at the next tool boundary, or else runs it after the current request
+    /// with a result of its own, so a result does not end the turn while any wait.
+    claude_unstarted_steers: std::collections::HashSet<String>,
     claude_usage_limit: Option<crate::usage::Limit>,
     claude_resume_at: Option<Instant>,
     follow_up_ready: bool,
@@ -297,6 +301,7 @@ impl Protocol {
             interrupt_id: None,
             claude_prompt_sent: false,
             claude_result_seen: false,
+            claude_unstarted_steers: Default::default(),
             claude_usage_limit: None,
             claude_resume_at: None,
             follow_up_ready: false,
@@ -404,6 +409,12 @@ impl Protocol {
                     && matches!(v["subtype"].as_str(), Some("init" | "initialized")))
             {
                 self.claude_prompt(stdin)?;
+            }
+            if v["type"] == "user" && v["isReplay"] == true {
+                if let Some(uuid) = v["uuid"].as_str() {
+                    self.claude_unstarted_steers.remove(uuid);
+                }
+                return Ok(Vec::new());
             }
             let starts_message = v["parent_tool_use_id"].is_null()
                 && (v["type"] == "assistant"
@@ -905,6 +916,12 @@ impl Protocol {
                         }
                     }
                     "result" => {
+                        // A resume re-reports unfinished background tasks and answers
+                        // each with an empty zero-turn result that belongs to no prompt.
+                        if v["origin"]["kind"] == "task-notification" && v["num_turns"] == 0 {
+                            self.claude_usage_limit = None;
+                            return Ok(events);
+                        }
                         if self.compact && !self.compact_confirmed && v["is_error"] != true {
                             return Err("Claude Code did not confirm context compaction".into());
                         }
@@ -958,13 +975,18 @@ impl Protocol {
                             );
                         }
                         self.claude_result_seen = true;
+                        // The queued prompt's run starts right after this result. The
+                        // deadline only guards against a steer the CLI never picks up.
+                        if !self.claude_unstarted_steers.is_empty() {
+                            self.claude_resume_at = Some(Instant::now() + Duration::from_secs(15));
+                        }
                         if self.activities.claude_background.is_empty()
                             && self.activities.claude_pending.is_empty()
                             && self.claude_resume_at.is_none()
                         {
                             events.push(Event::Done);
                             self.done = true;
-                        } else {
+                        } else if self.claude_unstarted_steers.is_empty() {
                             events.push(Event::Status("Waiting for background tasks…".into()));
                         }
                     }
@@ -1429,6 +1451,7 @@ fn run_operation(
                 "--output-format",
                 "stream-json",
                 "--include-partial-messages",
+                "--replay-user-messages",
                 "--permission-prompt-tool",
                 "stdio",
             ]);
