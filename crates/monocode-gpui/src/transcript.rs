@@ -5412,28 +5412,25 @@ impl TranscriptView {
                             d.child(
                                 div()
                                     .when(clamp, |d| d.line_clamp(4).text_ellipsis())
-                                    .child({
-                                        let styled = gpui::StyledText::new(text.clone())
-                                            .with_highlights(markdown::mark_styles(
-                                                &text,
-                                                vec![],
-                                                self.search_match
-                                                    .as_ref()
-                                                    .map_or("", |(_, q)| q.as_str()),
-                                                self.search_match.as_ref().is_some_and(
-                                                    |(start, _)| *start == message_start,
-                                                ),
-                                            ));
-                                        let layout = styled.layout().clone();
-                                        let child = styled.into_any_element();
-                                        if let Some(selection) =
-                                            self.text_selection(row.key, message_start, false, cx)
-                                        {
-                                            selection.wrap(text.clone(), layout, child)
-                                        } else {
-                                            child
-                                        }
-                                    }),
+                                    .child(markdown::linked_text(
+                                        format!("user-text-{message_start}-{}", row.key.1).into(),
+                                        text.clone(),
+                                        markdown::mark_styles(
+                                            &text,
+                                            vec![],
+                                            self.search_match
+                                                .as_ref()
+                                                .map_or("", |(_, q)| q.as_str()),
+                                            self.search_match
+                                                .as_ref()
+                                                .is_some_and(|(start, _)| *start == message_start),
+                                        ),
+                                        monocode_core::user_links::find_web_links(&text)
+                                            .into_iter()
+                                            .map(|found| (found.range, found.link.url))
+                                            .collect(),
+                                        self.text_selection(row.key, message_start, false, cx),
+                                    )),
                             )
                         })
                     })

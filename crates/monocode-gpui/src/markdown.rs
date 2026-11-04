@@ -32,6 +32,110 @@ pub(crate) fn link_menu(url: &str, position: Point<Pixels>, window: &mut Window,
     );
 }
 
+// Test hook: the layout of every link `linked_text` drew, newest last.
+#[cfg(test)]
+thread_local! {
+    static LINK_LAYOUTS: std::cell::RefCell<Vec<(String, Range<usize>, gpui::TextLayout)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_links(links: impl Iterator<Item = (Range<usize>, String)>, layout: &gpui::TextLayout) {
+    LINK_LAYOUTS.with(|layouts| {
+        layouts
+            .borrow_mut()
+            .extend(links.map(|(range, url)| (url, range, layout.clone())));
+    });
+}
+
+// Test hook: a window point inside the most recently drawn link to `url`.
+#[cfg(test)]
+pub(crate) fn rendered_link_point(url: &str) -> Option<Point<Pixels>> {
+    LINK_LAYOUTS.with(|layouts| {
+        let layouts = layouts.borrow();
+        let (_, range, layout) = layouts.iter().rev().find(|(u, ..)| u == url)?;
+        let mut at = layout.position_for_index(range.start + 1)?;
+        at.y += layout.line_height() / 2.;
+        Some(at)
+    })
+}
+
+/// Plain text whose `links` (byte ranges and addresses) are drawn in the
+/// accent colour and open on a plain click, as markdown links do. `highlights`
+/// (search marks) keep applying underneath. `selection` is already offset to
+/// `text`.
+pub(crate) fn linked_text(
+    id: SharedString,
+    text: SharedString,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    links: Vec<(Range<usize>, String)>,
+    selection: Option<TextSelection>,
+) -> AnyElement {
+    if links.is_empty() {
+        let styled = StyledText::new(text.clone()).with_highlights(highlights);
+        let layout = styled.layout().clone();
+        let child = styled.into_any_element();
+        return match selection {
+            Some(selection) => selection.wrap(text, layout, child),
+            None => child,
+        };
+    }
+    let accent = HighlightStyle {
+        color: Some(accent_color()),
+        ..Default::default()
+    };
+    let colored = links.iter().map(|(range, _)| (range.clone(), accent));
+    let styled = StyledText::new(text.clone())
+        .with_highlights(gpui::combine_highlights(highlights, colored));
+    let layout = styled.layout().clone();
+    #[cfg(test)]
+    record_links(links.iter().cloned(), &layout);
+    let (ranges, urls): (Vec<_>, Vec<_>) = links.into_iter().unzip();
+    let clicked_selection = selection.clone();
+    let clicked_layout = layout.clone();
+    let menu_layout = layout.clone();
+    let clicked_ranges = ranges.clone();
+    let menu_ranges = ranges.clone();
+    let clicked_urls = urls.clone();
+    let text_id: SharedString = format!("{id}-text").into();
+    let child = div()
+        .id(id)
+        .child(InteractiveText::new(text_id, styled).on_click(ranges, |_, _, _| {}))
+        .on_click(move |event, window, cx| {
+            if !activate_link(event, clicked_selection.as_ref()) {
+                return;
+            }
+            let Ok(byte) = clicked_layout.index_for_position(event.position()) else {
+                return;
+            };
+            if let Some(ix) = clicked_ranges.iter().position(|r| r.contains(&byte)) {
+                // A drag starting on another link must not activate this one.
+                if let ClickEvent::Mouse(mouse) = event {
+                    let Ok(down) = clicked_layout.index_for_position(mouse.down.position) else {
+                        return;
+                    };
+                    if !clicked_ranges[ix].contains(&down) {
+                        return;
+                    }
+                }
+                open_link(&clicked_urls[ix], window, cx);
+            }
+        })
+        .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+            if let Ok(byte) = menu_layout.index_for_position(event.position)
+                && let Some(ix) = menu_ranges.iter().position(|r| r.contains(&byte))
+            {
+                link_menu(&urls[ix], event.position, window, cx);
+                cx.stop_propagation();
+            }
+        })
+        .into_any_element();
+    match selection {
+        Some(selection) => selection.wrap(text, layout, child),
+        None => child,
+    }
+}
+
 fn activate_link(event: &ClickEvent, selection: Option<&TextSelection>) -> bool {
     event.click_count() == 1
         && !event.modifiers().shift
@@ -444,6 +548,8 @@ fn inline_selected(
         .with_highlights(highlights)
         .with_font_family_overrides(prepared.fonts.clone());
     let layout = styled.layout().clone();
+    #[cfg(test)]
+    record_links(links.iter().cloned().zip(urls.iter().cloned()), &layout);
     let clicked_selection = selection.clone();
     let clicked_layout = layout.clone();
     let menu_layout = layout.clone();
