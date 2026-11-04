@@ -1,16 +1,16 @@
-# Monoptah Native 0.41.0
+# Monoptah Native 0.41.1
 
 A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.40.3
+## Changes since 0.41.0
 
-Today now works like a small task board.
+Today tasks can now carry tags, and the filters can pick several values at once.
 
-- **Workflow statuses.** Every task has a status: To do, In progress and Done by default. The new Statuses dialog (header button, or Edit statuses in any status menu) adds, renames, recolors and reorders statuses, and moves your own statuses between the Not started, Started and Finished stages. Built-in statuses can be renamed and recolored but not deleted. Deleting a status moves its tasks to the built-in status of the same stage. Existing Today tasks are migrated in place.
-- **List and Board.** A List / Board switch in the header, remembered between launches. The list groups tasks by status. The board has one column per status: drag a card to another column to change its status, add a task to a column, or add a status at the end. Filters, the date strip and read-only past days work in both. Past days keep the status names and colors they had that day.
-- **Detail panel.** A new layout with a breadcrumb, a status pill with a menu, priority and due, a Needs check callout with direct actions (Keep done, Move back to To do, Mark done, Dismiss), Details, a Context section with the source's summary, and one Activity timeline of status changes, sync findings, your actions and notes.
-- **Start session** no longer sends a prompt. It opens a new chat in the task's project (asking for a project first when the task has none) with an `@today/<task>` mention in the composer. On send, the mention adds the task's context; delete the mention to leave it out.
-- **Monos and syncing.** A sync maps a source's own status (open, in progress, in review, merged, done and similar) to a stage, and a Mono can state the stage and a short summary per item. A status you change by hand is never overwritten by a sync. Monos can read the statuses with `today.statuses`, and their instructions now explain how a habit should fill each field.
+- **Tags.** One tag list for the whole app, managed from the new Tags button next to Statuses, or Edit tags in a task's Tags menu. Add, rename, recolor (a few preset swatches plus a custom color) and drag to reorder. Names are unique ignoring case. Deleting a tag first says how many tasks use it, then removes it from all of them. A rename or a new color shows everywhere at once.
+- **Tags on tasks.** List rows and board cards show a task's tags as colored chips after the project. The detail panel has a Tags row with a searchable menu: check tags on or off, create a tag from what you typed, or open Edit tags. Tag changes appear in the Activity timeline. Past days are read only and show tags with their current names and colors.
+- **Existing tags migrated.** Free text tags already on Today tasks become tag definitions with default colors, merged when they differ only in case, and every task keeps its tags.
+- **Multi-select filters.** Status and Tag filters let you check several options. The Status menu is grouped by stage, and on the Board a status filter hides the columns you did not pick. The Tag filter matches any of the chosen tags by default, can switch to all of them, and has a No tag option. Filters combine, the row shows how many are active with Clear filters, and the filters are remembered between launches.
+- **Monos.** `today.add` and `today.update` take tag names and refuse names that are not in your tag list, so agents cannot create tags. `today.tags` lists the tags. A sync adds matching tags and never removes tags you set.
 
 ## What it is
 
