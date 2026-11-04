@@ -910,40 +910,12 @@ impl Conversation {
         } else {
             content(if focused { 0.2 } else { 0.1 })
         };
-        div()
+        crate::composer_box::frame(move |_, _| border)
             .id("mono-composer")
             .debug_selector(|| "mono-composer".into())
-            .relative()
-            .p(px(1.))
-            .flex()
-            .flex_col()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| window.focus(&this.input.focus_handle(cx), cx)),
-            )
-            .child(
-                canvas(
-                    |_, _, _| {},
-                    move |bounds, _, window, _| {
-                        // One line is 18px plus 8px field padding, 10px row
-                        // padding and 2px border. Decide after text wraps.
-                        let radius = if bounds.size.height <= px(38.) {
-                            bounds.size.height / 2.
-                        } else {
-                            px(COMPOSER_RADIUS)
-                        };
-                        window.paint_quad(
-                            gpui::fill(bounds, content(0.03))
-                                .corner_radii(radius)
-                                .border_widths(px(1.))
-                                .border_color(border),
-                        );
-                    },
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
             )
             .child(self.composer_anchor.probe())
             .child(
@@ -957,50 +929,16 @@ impl Conversation {
             )
             .children(runner)
             .children(self.attachment_chips(cx))
-            .child(
-                // Even padding centres send beside one line, and keeps it at
-                // the bottom as the text grows.
-                div()
-                    .flex()
-                    .items_end()
-                    .gap_1p5()
-                    .p(px(5.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .self_center()
-                            .px_1p5()
-                            .py_1()
-                            .child(self.completion.clone()),
-                    )
-                    .child(
-                        div()
-                            .id("mono-send")
-                            .debug_selector(|| "mono-send".into())
-                            .role(Role::Button)
-                            .aria_label("Send")
-                            .flex_shrink_0()
-                            .size(px(26.))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(white(if ready { 1. } else { 0.3 }))
-                            .when(ready, |d| d.hover(|s| s.bg(white(0.9))))
-                            .child(icon("mono-arrow-up", 14.).text_color(black(if ready {
-                                1.
-                            } else {
-                                0.4
-                            })))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if ready {
-                                    this.send(cx)
-                                }
-                            })),
-                    ),
-            )
+            .child(crate::composer_box::field_row(
+                self.completion.clone(),
+                crate::composer_box::send_button("mono-send", ready).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        if ready {
+                            this.send(cx)
+                        }
+                    },
+                )),
+            ))
             .children(self.attachment_drop_overlay(8.))
             .into_any_element()
     }
