@@ -767,6 +767,11 @@ impl Shell {
                     } else {
                         self.app_view_label() == Some(label)
                     };
+                    let open_count = if label == "Today" {
+                        self.today.as_ref().map_or(0, |t| t.read(cx).open_count())
+                    } else {
+                        0
+                    };
                     let unread = label == "Inbox"
                         && self
                             .inbox
@@ -810,6 +815,9 @@ impl Shell {
                         .when_some(
                             match label {
                                 "New" => Some(format!("{MOD}T").into_any_element()),
+                                "Today" if open_count > 0 => {
+                                    Some(open_count.to_string().into_any_element())
+                                }
                                 "Notes" => self
                                     .note_count
                                     .map(|count| count.to_string().into_any_element()),
