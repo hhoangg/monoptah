@@ -215,7 +215,10 @@ fn copy_files(
                     .unwrap_or_default();
                 let (kind, mime, size_px) = describe(&name, &path);
                 attachments.push(NoteAttachment {
-                    file: relative.join(leaf).to_string_lossy().into_owned(),
+                    file: relative
+                        .join(leaf)
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/"),
                     name,
                     size,
                     kind,
