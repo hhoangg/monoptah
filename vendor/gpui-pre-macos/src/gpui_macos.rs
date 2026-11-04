@@ -46,6 +46,8 @@ pub(crate) use platform::*;
 pub(crate) use window::*;
 
 pub use platform::MacPlatform;
+// Monocode: frame counters for the UI stall watchdog.
+pub use window::{FrameDiagnostics, frame_diagnostics};
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;

@@ -4,6 +4,8 @@ use monocode_core::{
     accounts::Profile,
     usage::{self, Limit},
 };
+pub(super) const ACCOUNT_UNAVAILABLE: &str =
+    "This provider account is no longer signed in. Choose another account to continue.";
 pub(crate) struct UsageResumed;
 impl EventEmitter<UsageResumed> for Conversation {}
 impl Conversation {
@@ -338,9 +340,7 @@ impl Conversation {
         self.save_follow_ups(cx);
         self.catalog_epoch += 1;
         self.catalog.clear();
-        self.status =
-            "This provider account is no longer signed in. Choose another account to continue."
-                .into();
+        self.status = ACCOUNT_UNAVAILABLE.into();
         cx.notify();
     }
     pub(crate) fn account_authenticated(&mut self, cx: &mut Context<Self>) {

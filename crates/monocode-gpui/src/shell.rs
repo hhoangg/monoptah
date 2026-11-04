@@ -12078,29 +12078,27 @@ mod tests {
     #[gpui::test]
     fn sidebar_hover_updates_labels_without_rebuilding_the_chat(cx: &mut TestAppContext) {
         let (window, _, active) = window(cx);
-        let root = window.root(cx).unwrap();
-        let transcript =
-            root.read_with(cx, |s, cx| s.sessions[&active].read(cx).transcript.clone());
-        let before = transcript.read_with(cx, |t, _| t.render_passes);
-        cx.update_window(window.into(), |_, w, cx| {
-            w.simulate_mouse_move(gpui::point(px(40.), px(133.)), cx)
-        })
-        .unwrap();
-        cx.run_until_parked();
-        assert_eq!(root.read_with(cx, |s, _| s.sidebar_hover), Some("Today"));
-        cx.update_window(window.into(), |_, w, cx| {
-            w.simulate_mouse_move(gpui::point(px(40.), px(166.)), cx)
-        })
-        .unwrap();
-        cx.run_until_parked();
-        assert_eq!(root.read_with(cx, |s, _| s.sidebar_hover), Some("Inbox"));
-        cx.update_window(window.into(), |_, w, cx| {
-            w.simulate_mouse_move(gpui::point(px(40.), px(202.)), cx)
-        })
-        .unwrap();
-        cx.run_until_parked();
-        assert_eq!(root.read_with(cx, |s, _| s.sidebar_hover), Some("Notes"));
-        assert_eq!(transcript.read_with(cx, |t, _| t.render_passes), before);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let root = window.root(visual).unwrap();
+        let transcript = root.read_with(visual, |s, cx| {
+            s.sessions[&active].read(cx).transcript.clone()
+        });
+        let before = transcript.read_with(visual, |t, _| t.render_passes);
+        for (label, selector) in [
+            ("Today", "sidebar-navigation-Today"),
+            ("Inbox", "sidebar-navigation-Inbox"),
+            ("Notes", "sidebar-navigation-Notes"),
+        ] {
+            let row = visual
+                .debug_bounds(selector)
+                .expect("navigation row is rendered");
+            visual.simulate_mouse_move(row.center(), None, Default::default());
+            visual.run_until_parked();
+            assert_eq!(root.read_with(visual, |s, _| s.sidebar_hover), Some(label));
+        }
+        assert_eq!(transcript.read_with(visual, |t, _| t.render_passes), before);
     }
     #[gpui::test]
     fn many_blank_tabs_fit_without_creating_sidebar_conversations(cx: &mut TestAppContext) {

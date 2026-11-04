@@ -1,3 +1,4 @@
+use super::accounts::ACCOUNT_UNAVAILABLE;
 use super::*;
 use gpui::{App, EntityInputHandler};
 use monocode_core::mono::{Message, Mono};
@@ -243,6 +244,16 @@ impl Conversation {
             }) {
                 self.mono_ui.sending = Some(message.id.clone());
                 return true;
+            }
+            return false;
+        }
+        // Launching would only report the missing account and return, yet
+        // report success; the chat observer would then dispatch again forever.
+        // Say it once, keep the message queued, and let a later account
+        // change (which notifies the chat) dispatch it.
+        if self.account_missing(cx) {
+            if !self.status.starts_with(ACCOUNT_UNAVAILABLE) {
+                self.account_unavailable(cx);
             }
             return false;
         }
@@ -666,86 +677,110 @@ impl Conversation {
                     .pb_1p5()
                     .flex()
                     .flex_col()
-                    .children(
-                        self.mono_ui
-                            .pending
-                            .iter()
-                            .filter(|m| m.internal && m.error.is_some())
-                            .map(|message| {
-                                let retry = message.id.clone();
-                                let remove = retry.clone();
-                                div()
-                                    .id(SharedString::from(format!("mono-queued-{}", message.id)))
-                                    .debug_selector(|| "mono-internal-queue".into())
-                                    .mb_1()
-                                    .flex()
-                                    .justify_end()
-                                    .child(
+                    .child(
+                        div()
+                            .id("mono-queue-scroll")
+                            .max_h(px(180.))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .flex_shrink_0()
+                            .children(
+                                self.mono_ui
+                                    .pending
+                                    .iter()
+                                    .filter(|m| m.internal && m.error.is_some())
+                                    .map(|message| {
+                                        let retry = message.id.clone();
+                                        let remove = retry.clone();
                                         div()
-                                            .max_w(px(440.))
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_xl()
-                                            .border_1()
-                                            .border_color(content(0.15))
-                                            .bg(content(0.04))
-                                            .text_size(px(13.))
-                                            .text_color(content(0.6))
-                                            .child(if message.internal {
-                                                "Completion update".into()
-                                            } else {
-                                                message.text.clone()
-                                            })
+                                            .id(SharedString::from(format!(
+                                                "mono-queued-{}",
+                                                message.id
+                                            )))
+                                            .debug_selector(|| "mono-internal-queue".into())
+                                            .mb_1()
+                                            .flex()
+                                            .justify_end()
                                             .child(
                                                 div()
-                                                    .text_size(px(11.))
-                                                    .text_color(content(0.4))
+                                                    .max_w(px(440.))
+                                                    .px_3()
+                                                    .py_2()
+                                                    .rounded_xl()
+                                                    .border_1()
+                                                    .border_color(content(0.15))
+                                                    .bg(content(0.04))
+                                                    .text_size(px(13.))
+                                                    .text_color(content(0.6))
+                                                    .child(if message.internal {
+                                                        "Completion update".into()
+                                                    } else {
+                                                        message.text.clone()
+                                                    })
                                                     .child(
-                                                        message
-                                                            .error
-                                                            .clone()
-                                                            .unwrap_or_else(|| "Pending".into()),
-                                                    ),
-                                            )
-                                            .when(message.error.is_some(), |d| {
-                                                d.child(
-                                                    div()
-                                                        .flex()
-                                                        .gap_2()
-                                                        .child(
-                                                            icon_button(
-                                                                "mono-queue-retry",
-                                                                "Retry queued message",
-                                                                "refresh-cw",
-                                                            )
-                                                            .on_click(cx.listener(
-                                                                move |_, _, _, cx| {
-                                                                    cx.emit(QueueChanged {
-                                                                        id: retry.clone(),
-                                                                        remove: false,
+                                                        div()
+                                                            .text_size(px(11.))
+                                                            .text_color(content(0.4))
+                                                            .line_clamp(2)
+                                                            .text_ellipsis()
+                                                            .child(
+                                                                message
+                                                                    .error
+                                                                    .as_deref()
+                                                                    .and_then(|e| {
+                                                                        e.lines()
+                                                                            .map(str::trim)
+                                                                            .find(|l| !l.is_empty())
                                                                     })
-                                                                },
-                                                            )),
+                                                                    .unwrap_or("Pending")
+                                                                    .to_string(),
+                                                            ),
+                                                    )
+                                                    .when(message.error.is_some(), |d| {
+                                                        d.child(
+                                                            div()
+                                                                .flex()
+                                                                .gap_2()
+                                                                .child(
+                                                                    icon_button(
+                                                                        "mono-queue-retry",
+                                                                        "Retry queued message",
+                                                                        "refresh-cw",
+                                                                    )
+                                                                    .on_click(cx.listener(
+                                                                        move |_, _, _, cx| {
+                                                                            cx.emit(QueueChanged {
+                                                                                id: retry.clone(),
+                                                                                remove: false,
+                                                                            })
+                                                                        },
+                                                                    ))
+                                                                    .debug_selector(|| {
+                                                                        "mono-queue-retry-bounds"
+                                                                            .into()
+                                                                    }),
+                                                                )
+                                                                .child(
+                                                                    icon_button(
+                                                                        "mono-queue-discard",
+                                                                        "Discard queued message",
+                                                                        "close",
+                                                                    )
+                                                                    .on_click(cx.listener(
+                                                                        move |_, _, _, cx| {
+                                                                            cx.emit(QueueChanged {
+                                                                                id: remove.clone(),
+                                                                                remove: true,
+                                                                            })
+                                                                        },
+                                                                    )),
+                                                                ),
                                                         )
-                                                        .child(
-                                                            icon_button(
-                                                                "mono-queue-discard",
-                                                                "Discard queued message",
-                                                                "close",
-                                                            )
-                                                            .on_click(cx.listener(
-                                                                move |_, _, _, cx| {
-                                                                    cx.emit(QueueChanged {
-                                                                        id: remove.clone(),
-                                                                        remove: true,
-                                                                    })
-                                                                },
-                                                            )),
-                                                        ),
-                                                )
-                                            }),
-                                    )
-                            }),
+                                                    }),
+                                            )
+                                    }),
+                            ),
                     )
                     .children(self.usage_notice(true, cx))
                     .children(self.auth_notice(cx))
@@ -941,6 +976,7 @@ impl Conversation {
                 }),
             )
             .child(self.composer_anchor.probe())
+            .child(self.completion.read(cx).composer_probe())
             .child(composer_surface(radius))
             .children(self.attachment_chips(cx))
             .child(
@@ -948,7 +984,7 @@ impl Conversation {
                     .px_3()
                     .pt(px(10.))
                     .pb(px(14.))
-                    .child(self.input.clone()),
+                    .child(self.completion.clone()),
             )
             .child(
                 div()
