@@ -218,6 +218,41 @@ mod tests {
     }
 
     #[test]
+    fn several_pull_request_urls_are_each_found_in_every_layout() {
+        let pr = |n: u32| format!("https://github.com/a/b/pull/{n}");
+        assert_eq!(
+            spans(&format!("{} {}", pr(1), pr(2))),
+            [pr(1).as_str(), pr(2).as_str()]
+        );
+        assert_eq!(
+            spans(&format!("{}\n{}", pr(1), pr(2))),
+            [pr(1).as_str(), pr(2).as_str()]
+        );
+        assert_eq!(
+            spans("see https://github.com/a/b/pull/1, and https://github.com/a/b/pull/2."),
+            [
+                "https://github.com/a/b/pull/1",
+                "https://github.com/a/b/pull/2"
+            ]
+        );
+        let text = "https://github.com/a/b/pull/3/ https://github.com/a/b/pull/4/files";
+        assert_eq!(
+            spans(text),
+            [
+                "https://github.com/a/b/pull/3/",
+                "https://github.com/a/b/pull/4/files"
+            ]
+        );
+        let found = find_web_links(text);
+        assert!(found.iter().all(|f| f.link.github_work_item.is_some()));
+        let repos = find_web_links("https://github.com/a/b/pull/1 https://github.com/c/d/issues/2");
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[1].link.github_work_item.as_ref().unwrap().repo, "c/d");
+        assert_eq!(spans("https://example.com/x"), ["https://example.com/x"]);
+        assert_eq!(spans("ftp://x mailto:a@b.c"), Vec::<&str>::new());
+    }
+
+    #[test]
     fn the_first_link_is_the_first_found_link() {
         let text = "x https://a.com y https://b.com";
         assert_eq!(

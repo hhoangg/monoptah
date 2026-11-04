@@ -745,6 +745,8 @@ pub(crate) struct Shell {
     pending_folder: Option<(i64, AnchorSlot)>,
     _session_clock: gpui::Task<()>,
     notes: Option<Entity<Notes>>,
+    /// The sidebar's Notes count; `None` until the store has answered.
+    note_count: Option<usize>,
     inbox: Option<Entity<crate::inbox::Inbox>>,
     today: Option<Entity<crate::today::Today>>,
     automations: Option<Entity<crate::automations::Automations>>,
@@ -1155,6 +1157,7 @@ impl Shell {
             pending_folder: None,
             _session_clock: session_clock,
             notes: None,
+            note_count: None,
             inbox: None,
             today: None,
             automations: None,
@@ -1278,6 +1281,7 @@ impl Shell {
             this.scan_external_editors(cx);
         }
         this.observe_accounts(cx);
+        this.load_note_count(cx);
         this.observe_picker_preferences(cx);
         this.watch_tui_hooks(cx);
         this.probe_installed_providers(cx);
@@ -4643,8 +4647,7 @@ impl Shell {
         })
         .detach();
     }
-    /// A new chat with the default choice, without the provider prompt.
-    fn new_chat(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn new_chat(&mut self, cx: &mut Context<Self>) {
         self.create_session(self.default_choice(), false, cx);
     }
     /// A new session the user asked for: it opens as the provider's preferred surface.
@@ -7064,6 +7067,20 @@ impl Shell {
                                             })),
                                     ),
                                 )
+                                .when(self.workspace.sidebar_search_visible, |d| {
+                                    d.child(
+                                        icon_button("sidebar-search", "Search", "search")
+                                            .debug_selector(|| "sidebar-search-button".into())
+                                            .when(self.app_search.is_some(), |d| d.bg(content(0.1)))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                if this.app_search.is_some() {
+                                                    this.close_app_search(window, cx)
+                                                } else {
+                                                    this.focus_search(window, cx)
+                                                }
+                                            })),
+                                    )
+                                })
                                 .child(
                                     icon_button(
                                         "sidebar-options",
@@ -8842,6 +8859,9 @@ impl Render for Shell {
                     } else {
                         this.resume_git(cx);
                         this.check_github_star(true, cx);
+                        if let Some(center) = crate::accounts::get(cx) {
+                            center.update(cx, |center, cx| center.app_reactivated(cx));
+                        }
                     }
                 }));
             self.observations
@@ -12063,13 +12083,13 @@ mod tests {
             root.read_with(cx, |s, cx| s.sessions[&active].read(cx).transcript.clone());
         let before = transcript.read_with(cx, |t, _| t.render_passes);
         cx.update_window(window.into(), |_, w, cx| {
-            w.simulate_mouse_move(gpui::point(px(40.), px(136.)), cx)
+            w.simulate_mouse_move(gpui::point(px(40.), px(133.)), cx)
         })
         .unwrap();
         cx.run_until_parked();
         assert_eq!(root.read_with(cx, |s, _| s.sidebar_hover), Some("Today"));
         cx.update_window(window.into(), |_, w, cx| {
-            w.simulate_mouse_move(gpui::point(px(40.), px(169.)), cx)
+            w.simulate_mouse_move(gpui::point(px(40.), px(166.)), cx)
         })
         .unwrap();
         cx.run_until_parked();
