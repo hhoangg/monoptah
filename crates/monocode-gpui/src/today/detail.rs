@@ -185,7 +185,7 @@ fn pill(id: &'static str, live: bool) -> Stateful<Div> {
                 .hover(|s| s.bg(content(0.07)))
         })
 }
-fn section(title: &'static str) -> Div {
+pub(super) fn section(title: &'static str) -> Div {
     caption(title).px(px(0.)).pt(px(18.))
 }
 fn detail_row(glyph: &'static str, name: &'static str, value: impl IntoElement) -> Div {
@@ -356,17 +356,7 @@ impl Today {
             );
         }
         if editable {
-            let started = task.clone();
-            bar = bar.child(
-                icon_button("today-start-session", "Start session", "play")
-                    .debug_selector(|| "today-start-session".into())
-                    .aria_expanded(open(Slot::StartProject))
-                    .relative()
-                    .child(self.anchor(Slot::StartProject).probe())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.start_session(started.clone(), window, cx)
-                    })),
-            );
+            bar = bar.child(self.start_split_button(task, cx));
         }
         // Only an open task can be snoozed or dismissed; the store refuses a done one.
         let snoozable = current && not_done;
@@ -832,6 +822,7 @@ impl Today {
                         )),
                 )
             })
+            .child(self.sessions_section(&task.id, cx))
             .child(
                 div()
                     .flex()
@@ -906,6 +897,7 @@ impl Today {
                 )
             })
             .children(self.menu_view(Host::Panel, cx))
+            .children(self.move_confirmation(cx))
             .into_any_element()
     }
 

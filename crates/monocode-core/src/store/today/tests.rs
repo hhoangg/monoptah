@@ -915,10 +915,11 @@ fn count(path: &std::path::Path, table: &str) -> i64 {
         .unwrap()
 }
 
-const TODAY_TABLES: [&str; 5] = [
+const TODAY_TABLES: [&str; 6] = [
     "today_days",
     "today_events",
     "today_notes",
+    "today_session_links",
     "today_sources",
     "today_tasks",
 ];

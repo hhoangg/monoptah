@@ -78,7 +78,14 @@ fn ensure_today_tables(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS today_sources (
            id TEXT PRIMARY KEY,
            json TEXT NOT NULL
-         );",
+         );
+         CREATE TABLE IF NOT EXISTS today_session_links (
+           session_id INTEGER PRIMARY KEY,
+           task_id TEXT NOT NULL,
+           linked_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS today_session_links_task_idx
+           ON today_session_links (task_id, linked_at);",
     )?;
     // A table made before statuses existed lacks the frozen status column.
     if !has_column(conn, "today_days", "status_json")? {
@@ -555,21 +562,24 @@ fn check_due(due: &Option<String>, due_time: &Option<String>) -> Result<(), Stri
 impl Store {
     /// Today's tables need a writable database. A read-only shared store never
     /// creates them, so reads there see an empty ledger until the app has.
-    fn today_writable(&self) -> Result<(), String> {
+    pub(super) fn today_writable(&self) -> Result<(), String> {
         if self.shared.is_some() {
             self.shared_writable().map_err(|_| READ_ONLY.to_string())?;
         }
         Ok(())
     }
     /// `true` when the tables exist (creating them where the store can write).
-    fn today_ready(&self) -> Result<bool, String> {
+    pub(super) fn today_ready(&self) -> Result<bool, String> {
         if self.today_writable().is_ok() {
             ensure_today_tables(&self.conn).map_err(sql)?;
             return Ok(true);
         }
         super::shared::has_table(&self.conn, "today_tasks")
     }
-    fn today_tx<T>(&self, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+    pub(super) fn today_tx<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
         // Immediate: take the write lock up front so the busy timeout applies.
         let tx = rusqlite::Transaction::new_unchecked(
             &self.conn,
