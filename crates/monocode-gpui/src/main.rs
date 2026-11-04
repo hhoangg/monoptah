@@ -53,6 +53,8 @@ mod metal_tests;
 mod mobile;
 mod modal;
 mod monos;
+#[cfg(target_os = "macos")]
+mod native_log;
 mod notes;
 mod notifications;
 mod pane_layout;
@@ -430,6 +432,9 @@ fn main() {
     }
     let sidebar_metadata = db.session_sidebar_metadata(&projects);
     let db = Arc::new(Mutex::new(db));
+    // GPUI reports frame stalls through `log`; keep warnings where a Finder launch can't lose them.
+    #[cfg(target_os = "macos")]
+    native_log::install(&database.with_file_name("gpui-hangs"));
     let platform = gpui_platform::current_platform(false);
     let title_raster = particle_text::GlyphRaster(platform.text_system());
     gpui::Application::with_platform(platform)

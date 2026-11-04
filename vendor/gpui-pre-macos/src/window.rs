@@ -894,6 +894,8 @@ impl MacWindowState {
     fn subscribe_frames(&mut self) -> bool {
         let Some(display_id) = display_id_for_screen(unsafe { self.native_window.screen() }) else {
             // AppKit can temporarily report no screen while displays are being reconfigured.
+            // Monocode: count for the UI stall watchdog.
+            NO_SCREEN.fetch_add(1, Ordering::Relaxed);
             log::warn!("window has no screen; keeping its current frame source");
             return self
                 .frame_source
@@ -937,6 +939,8 @@ impl MacWindowState {
     /// Resubscribes a window whose frames stopped arriving. Returns false
     /// when the window should not be drawing at all.
     fn restart_stalled_frames(&mut self) -> bool {
+        // Monocode: count for the UI stall watchdog.
+        STALLED_RESTARTS.fetch_add(1, Ordering::Relaxed);
         // The key window of the active app is on screen whatever the occlusion
         // state says, and is exactly the window the user is waiting on.
         let frontmost = unsafe {
@@ -2872,6 +2876,10 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                 return NO;
             }
 
+            // Monocode: count each key press once (the duplicate key-down of a key
+            // equivalent returned above) for the UI stall watchdog.
+            INPUT_EVENTS.fetch_add(1, Ordering::Relaxed);
+
             drop(lock);
 
             let is_composing =
@@ -2979,6 +2987,35 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     }
 }
 
+// Monocode: process-wide counters read by the UI stall watchdog. Relaxed atomics only.
+static VSYNC_TICKS: AtomicU64 = AtomicU64::new(0);
+static INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
+static STALLED_RESTARTS: AtomicU64 = AtomicU64::new(0);
+static NO_SCREEN: AtomicU64 = AtomicU64::new(0);
+
+/// Monocode: frame delivery counters, for diagnosing UI stalls.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameDiagnostics {
+    /// Vsync `step` callbacks delivered to any window.
+    pub vsync_ticks: u64,
+    /// Key presses and mouse button presses delivered to a window.
+    pub input_events: u64,
+    /// Times a window with stalled frames resubscribed its display link.
+    pub stalled_restarts: u64,
+    /// Times AppKit reported no screen for a window.
+    pub no_screen: u64,
+}
+
+/// Monocode: reads the process-wide frame counters.
+pub fn frame_diagnostics() -> FrameDiagnostics {
+    FrameDiagnostics {
+        vsync_ticks: VSYNC_TICKS.load(Ordering::Relaxed),
+        input_events: INPUT_EVENTS.load(Ordering::Relaxed),
+        stalled_restarts: STALLED_RESTARTS.load(Ordering::Relaxed),
+        no_screen: NO_SCREEN.load(Ordering::Relaxed),
+    }
+}
+
 extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
@@ -3000,6 +3037,11 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
+        // Monocode: count deliberate clicks for the UI stall watchdog. Motion,
+        // scrolling and modifier changes can legitimately draw nothing.
+        if matches!(event, PlatformInput::MouseDown(_)) {
+            INPUT_EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
         if matches!(
             event,
@@ -3536,6 +3578,8 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
 }
 
 extern "C" fn step(view: *mut c_void) {
+    // Monocode: count for the UI stall watchdog.
+    VSYNC_TICKS.fetch_add(1, Ordering::Relaxed);
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();

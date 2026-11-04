@@ -832,7 +832,9 @@ impl Platform for MacPlatform {
         unsafe {
             let ns_url = NSURL::alloc(nil).initWithString_(ns_string(url));
             if ns_url.is_null() {
-                log::error!("Failed to create NSURL from string: {}", url);
+                // Monocode: the URL can come from message text or carry a
+                // token, and warnings are written to the app's log file.
+                log::error!("Failed to create NSURL from string ({} bytes)", url.len());
                 return;
             }
             let url = ns_url.autorelease();

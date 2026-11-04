@@ -19,7 +19,7 @@ impl Accounts {
             complete: false,
             error: None,
             adding: None,
-            started: std::time::Instant::now(),
+            started: Instant::now(),
         });
         cx.notify();
     }

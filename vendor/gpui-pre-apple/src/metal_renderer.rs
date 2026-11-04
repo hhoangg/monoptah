@@ -77,6 +77,30 @@ static INSTANCE_BUFFER_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_INSTANCE_BUFFER
 static TRIM_GENERATION: AtomicU64 = AtomicU64::new(0);
 static RENDERERS: AtomicU64 = AtomicU64::new(0);
 static DRAWABLE_PIXELS: AtomicU64 = AtomicU64::new(0);
+// Monocode: draw counters read by the UI stall watchdog.
+static FRAMES_PRESENTED: AtomicU64 = AtomicU64::new(0);
+static DRAWABLE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static NEXT_DRAWABLE_MAX_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Monocode: draw counters, for diagnosing UI stalls.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrawDiagnostics {
+    /// Frames committed for presentation.
+    pub presented: u64,
+    /// `next_drawable` calls that returned nothing.
+    pub drawable_failures: u64,
+    /// Longest single `next_drawable` call since the previous read.
+    pub next_drawable_max_ms: u64,
+}
+
+/// Monocode: reads the draw counters and resets the longest-wait gauge.
+pub fn draw_diagnostics() -> DrawDiagnostics {
+    DrawDiagnostics {
+        presented: FRAMES_PRESENTED.load(Ordering::Relaxed),
+        drawable_failures: DRAWABLE_FAILURES.load(Ordering::Relaxed),
+        next_drawable_max_ms: NEXT_DRAWABLE_MAX_MS.swap(0, Ordering::Relaxed),
+    }
+}
 
 /// GPU memory, for diagnostics.
 #[derive(Clone, Copy, Debug, Default)]
@@ -689,9 +713,14 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = if let Some(drawable) = layer.next_drawable() {
+        // Monocode: time the call; it blocks up to about a second when no drawable frees up.
+        let waited = Instant::now();
+        let next = layer.next_drawable();
+        NEXT_DRAWABLE_MAX_MS.fetch_max(waited.elapsed().as_millis() as u64, Ordering::Relaxed);
+        let drawable = if let Some(drawable) = next {
             drawable
         } else {
+            DRAWABLE_FAILURES.fetch_add(1, Ordering::Relaxed);
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
@@ -715,6 +744,7 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        FRAMES_PRESENTED.fetch_add(1, Ordering::Relaxed);
     }
 
     fn render_frame(

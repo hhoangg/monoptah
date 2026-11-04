@@ -417,7 +417,11 @@ fn the_sidebar_shows_the_open_count_only_when_there_is_one(cx: &mut TestAppConte
         .unwrap();
     visual.run_until_parked();
     visual.refresh().unwrap();
-    assert!(visual.debug_bounds("sidebar-today-count").is_some());
+    assert!(
+        visual
+            .debug_bounds("sidebar-navigation-trailing-Today")
+            .is_some()
+    );
 }
 
 #[gpui::test]
