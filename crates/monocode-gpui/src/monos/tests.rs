@@ -917,6 +917,89 @@ fn internal_completion_queue_stays_hidden_until_delivery_fails(cx: &mut TestAppC
     );
 }
 
+#[test]
+fn report_error_keeps_only_the_first_status_line() {
+    let long = format!(
+        "Claude Code reached its usage limit.\n{}",
+        "A paragraph of the assistant reply.\n\n".repeat(60)
+    );
+    assert_eq!(report_error(&long), "Claude Code reached its usage limit.");
+    assert_eq!(report_error("\n\n  Codex exited \nrest"), "Codex exited");
+    assert_eq!(report_error("Codex exited"), "Codex exited");
+    assert_eq!(report_error(""), "");
+}
+
+#[gpui::test]
+fn huge_queued_report_error_keeps_composer_and_retry_on_screen(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let handle: gpui::AnyWindowHandle = s.window.into();
+    let error = format!(
+        "Claude Code reached its usage limit. Choose another available model or retry when the limit resets.\n{}",
+        "A long paragraph of the assistant reply that should never be shown in the chip.\n\n"
+            .repeat(60)
+    );
+    handle
+        .update(cx, |_, window, cx| {
+            s.manager.update(cx, |m, cx| {
+                m.dismiss_settings(window, cx);
+                for n in 0..3 {
+                    m.roster.get_mut(&s.id).unwrap().outbox.push(Message {
+                        id: format!("completion-{n}"),
+                        text: "[Delegated work completed]".into(),
+                        internal: true,
+                        sent_at: None,
+                        error: Some(error.clone()),
+                        attachments: Vec::new(),
+                    });
+                }
+                m.configure_chat(&s.id, cx);
+            });
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let viewport = s
+        .window
+        .update(visual, |_, w, _| w.viewport_size())
+        .unwrap();
+    let inside = |b: gpui::Bounds<gpui::Pixels>| {
+        b.top() >= px(0.)
+            && b.left() >= px(0.)
+            && b.bottom() <= viewport.height
+            && b.right() <= viewport.width
+    };
+    let composer = visual
+        .debug_bounds("mono-composer")
+        .expect("the composer is rendered");
+    assert!(
+        inside(composer),
+        "composer {composer:?} outside {viewport:?}"
+    );
+    let chip = visual.debug_bounds("mono-internal-queue").unwrap();
+    assert!(
+        chip.size.height < px(120.),
+        "chip is {:?} tall",
+        chip.size.height
+    );
+    // A single errored report keeps its Retry control on screen.
+    s.manager.update(visual, |m, cx| {
+        m.roster.get_mut(&s.id).unwrap().outbox.truncate(1);
+        m.configure_chat(&s.id, cx);
+    });
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let retry = visual
+        .debug_bounds("mono-queue-retry-bounds")
+        .expect("retry button is rendered");
+    assert!(inside(retry), "retry {retry:?} outside {viewport:?}");
+    let composer = visual.debug_bounds("mono-composer").unwrap();
+    assert!(
+        inside(composer),
+        "composer {composer:?} outside {viewport:?}"
+    );
+}
+
 #[gpui::test]
 fn errored_completion_report_does_not_block_later_user_messages(cx: &mut TestAppContext) {
     let s = setup(cx);

@@ -1067,7 +1067,7 @@ impl Monos {
             changed = before != mono.outbox.len();
             for (id, error) in failures {
                 if let Some(message) = mono.outbox.iter_mut().find(|m| m.id == id) {
-                    message.error = Some(error);
+                    message.error = Some(report_error(&error));
                     changed = true;
                 }
             }
@@ -1189,10 +1189,10 @@ impl Monos {
                 if !ok && !status.starts_with("Stopped") {
                     if let Some(mono) = self.roster.get_mut(id) {
                         if let Some(queued) = mono.outbox.iter_mut().find(|m| m.id == sent.id) {
-                            queued.error = Some(status);
+                            queued.error = Some(report_error(&status));
                         } else {
                             sent.id = mono::new_id();
-                            sent.error = Some(status);
+                            sent.error = Some(report_error(&status));
                             mono.outbox.insert(0, sent);
                         }
                     }
@@ -1825,4 +1825,15 @@ impl gpui::Render for Monos {
             )
             .into_any_element()
     }
+}
+
+/// A queued report keeps only the status line of a failed turn, never the reply text
+/// that `external_outcome` appends after it.
+pub(super) fn report_error(status_and_text: &str) -> String {
+    status_and_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
 }
