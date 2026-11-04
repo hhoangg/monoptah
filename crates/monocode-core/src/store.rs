@@ -18,6 +18,7 @@ mod shared;
 mod side_threads;
 mod thread_files;
 mod today;
+mod today_mention;
 use crate::surface::Surface;
 use crate::transcript::{Row, Transcript};
 pub use edit::EditSnapshot;

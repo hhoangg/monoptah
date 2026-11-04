@@ -16,7 +16,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "artifacts.list"=>"kind limit offset","artifacts.read"=>"id","artifacts.write"=>"id kind title body summary",
         "soul.update"=>"text expectedHash","memory.read"=>"topic","memory.search"=>"query since",
         "memory.add"=>"fact topic until","memory.replace"=>"find fact topic until","memory.remove"=>"find topic",
-        "habits.add"=>"name instructions schedule","habits.update"=>"id name instructions schedule enabled","habits.run"|"habits.remove"=>"id",
+        "habits.add"=>"name instructions schedule","habits.update"=>"id name instructions schedule enabled","habits.run"|"habits.remove"|"habits.export"=>"id","habits.import"=>"yaml",
         "chat.card"=>"type repo number note sessionId options name instructions schedule",
         _=>crate::today::actions::fields(action)
             .or_else(|| super::workflows::cli::fields(action))

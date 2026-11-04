@@ -69,10 +69,12 @@ impl Protocol {
                 } else {
                     request.prompt.clone()
                 };
+                let uuid = uuid::Uuid::new_v4().to_string();
                 write_json(
                     stdin,
-                    json!({"type":"user","session_id":"","parent_tool_use_id":null,"message":{"role":"user","content":request.claude_content(&prompt)?}}),
+                    json!({"type":"user","uuid":uuid,"session_id":"","parent_tool_use_id":null,"message":{"role":"user","content":request.claude_content(&prompt)?}}),
                 )?;
+                self.claude_unstarted_steers.insert(uuid);
                 self.text_key = None;
                 return Ok(vec![Event::FollowUp(message)]);
             }
@@ -338,5 +340,272 @@ for line in sys.stdin:
         .unwrap();
         assert!(delivered);
         assert_eq!(output, "BeforeAfter");
+    }
+
+    fn claude_steer(p: &mut Protocol) -> String {
+        let mut stdin = Vec::new();
+        let message = Message {
+            id: "queued".into(),
+            text: "second question".into(),
+            ..Default::default()
+        };
+        p.steer(message, &mut stdin).unwrap();
+        let frame: Value = serde_json::from_slice(&stdin).unwrap();
+        frame["uuid"].as_str().unwrap_or_default().to_owned()
+    }
+    fn claude_frame(p: &mut Protocol, frame: Value) -> Vec<Event> {
+        p.frame(frame, &mut Vec::new()).unwrap()
+    }
+    fn claude_replay(uuid: &str) -> Value {
+        json!({"type":"user","isReplay":true,"uuid":uuid,"parent_tool_use_id":null,
+            "message":{"role":"user","content":[{"type":"text","text":"second question"}]}})
+    }
+    fn claude_answer(id: &str, text: &str) -> Value {
+        json!({"type":"assistant","parent_tool_use_id":null,
+            "message":{"id":id,"content":[{"type":"text","text":text}]}})
+    }
+
+    #[test]
+    fn claude_turn_stays_open_for_a_prompt_queued_before_end_turn() {
+        let mut p = protocol(Kind::Claude);
+        let uuid = claude_steer(&mut p);
+        // The CLI finishes the running request first and only then starts the
+        // queued prompt, as a separate run with its own result.
+        let first = claude_frame(
+            &mut p,
+            json!({"type":"result","num_turns":2,"result":"first"}),
+        );
+        assert!(
+            !first.contains(&Event::Done),
+            "the queued prompt is unanswered"
+        );
+        assert!(!p.done);
+        assert!(p
+            .lifecycle_tick(Instant::now(), &mut Vec::new())
+            .unwrap()
+            .iter()
+            .all(|e| *e != Event::Done));
+
+        claude_frame(
+            &mut p,
+            json!({"type":"system","subtype":"init","session_id":"s"}),
+        );
+        claude_frame(&mut p, claude_replay(&uuid));
+        let answer = claude_frame(&mut p, claude_answer("second", "BRAVO"));
+        assert!(answer.contains(&Event::Text("BRAVO".into())));
+        let last = claude_frame(
+            &mut p,
+            json!({"type":"result","num_turns":1,"result":"BRAVO"}),
+        );
+        assert!(last.contains(&Event::Done));
+        assert!(p.done);
+    }
+
+    #[test]
+    fn claude_steer_taken_into_the_running_request_needs_no_second_result() {
+        let mut p = protocol(Kind::Claude);
+        let uuid = claude_steer(&mut p);
+        assert!(
+            !uuid.is_empty(),
+            "the steer must be identifiable when replayed"
+        );
+        // Delivered at a tool boundary: the CLI replays it and reports one result.
+        claude_frame(&mut p, claude_replay(&uuid));
+        let events = claude_frame(
+            &mut p,
+            json!({"type":"result","num_turns":2,"result":"both"}),
+        );
+        assert!(events.contains(&Event::Done));
+    }
+
+    #[test]
+    fn claude_replay_of_the_opening_prompt_does_not_count_for_a_queued_steer() {
+        let mut p = protocol(Kind::Claude);
+        claude_steer(&mut p);
+        // The opening prompt can be replayed after the steer was already written.
+        claude_frame(&mut p, claude_replay("opening-prompt"));
+        let events = claude_frame(
+            &mut p,
+            json!({"type":"result","num_turns":1,"result":"first"}),
+        );
+        assert!(!events.contains(&Event::Done));
+    }
+
+    #[test]
+    fn claude_replayed_task_notification_result_does_not_end_the_turn() {
+        let mut p = protocol(Kind::Claude);
+        // A resume re-reports an unfinished background task and answers it
+        // with an empty zero-turn result, before running the real prompt.
+        claude_frame(
+            &mut p,
+            json!({"type":"system","subtype":"task_notification","task_id":"bash","status":"stopped"}),
+        );
+        claude_frame(
+            &mut p,
+            json!({"type":"system","subtype":"init","session_id":"s"}),
+        );
+        let replayed = claude_frame(
+            &mut p,
+            json!({"type":"result","subtype":"success","num_turns":0,"result":"","origin":{"kind":"task-notification"}}),
+        );
+        assert!(!replayed.contains(&Event::Done));
+        assert!(!p.done);
+        assert!(!p.claude_result_seen);
+
+        claude_frame(
+            &mut p,
+            json!({"type":"system","subtype":"init","session_id":"s"}),
+        );
+        claude_frame(&mut p, claude_answer("real", "GAMMA"));
+        let real = claude_frame(
+            &mut p,
+            json!({"type":"result","num_turns":1,"result":"GAMMA"}),
+        );
+        assert!(real.contains(&Event::Done));
+    }
+
+    #[test]
+    fn claude_turn_with_a_real_task_notification_run_still_ends() {
+        let mut p = protocol(Kind::Claude);
+        let events = claude_frame(
+            &mut p,
+            json!({"type":"result","num_turns":1,"result":"woke","origin":{"kind":"task-notification"}}),
+        );
+        assert!(events.contains(&Event::Done), "this run did real work");
+    }
+
+    #[test]
+    fn claude_turn_ends_when_a_queued_prompt_never_starts() {
+        let mut p = protocol(Kind::Claude);
+        claude_steer(&mut p);
+        claude_frame(
+            &mut p,
+            json!({"type":"result","num_turns":1,"result":"first"}),
+        );
+        assert!(!p.done);
+        assert!(
+            p.claude_resume_at
+                .is_some_and(|at| at <= Instant::now() + Duration::from_secs(60)),
+            "the wait for a queued prompt must be bounded"
+        );
+        p.claude_resume_at = Some(Instant::now() - Duration::from_secs(1));
+        let events = p.lifecycle_tick(Instant::now(), &mut Vec::new()).unwrap();
+        assert!(events.contains(&Event::Done));
+        assert!(p.done);
+    }
+
+    #[cfg(unix)]
+    fn fake_claude(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join("claude");
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, sys
+assert '--replay-user-messages' in sys.argv, 'steers cannot be acknowledged without replay'
+def send(value):
+    print(json.dumps(value), flush=True)
+def text(id, value):
+    send({{'type': 'assistant', 'parent_tool_use_id': None, 'message': {{'id': id, 'content': [{{'type': 'text', 'text': value}}]}}}})
+def result(turns=1, **rest):
+    send({{'type': 'result', 'subtype': 'success', 'num_turns': turns, **rest}})
+def init():
+    send({{'type': 'system', 'subtype': 'init', 'session_id': 's'}})
+def replay(frame):
+    send({{'type': 'user', 'isReplay': True, 'uuid': frame.get('uuid'), 'parent_tool_use_id': None, 'message': frame['message']}})
+prompts = 0
+for line in sys.stdin:
+    frame = json.loads(line)
+    if frame['type'] == 'control_request' and frame['request']['subtype'] == 'initialize':
+        send({{'type': 'control_response', 'response': {{'subtype': 'success', 'request_id': frame['request_id']}}}})
+    elif frame['type'] == 'user':
+        prompts += 1
+{body}
+"#
+        );
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        binary
+    }
+    #[cfg(unix)]
+    fn run_fake_claude(
+        binary: std::path::PathBuf,
+        cwd: &std::path::Path,
+    ) -> (Result<(), String>, String) {
+        let (controls, receive) = mpsc::channel();
+        let mut output = String::new();
+        let mut steered = false;
+        let result = run_with_controls(
+            Request {
+                kind: Kind::Claude,
+                binary,
+                cwd: cwd.into(),
+                prompt: "first question".into(),
+                provider_id: None,
+                model: None,
+                settings: Default::default(),
+            },
+            Arc::new(AtomicBool::new(false)),
+            Some(receive),
+            |events| {
+                for event in events {
+                    match event {
+                        Event::Ready if !steered => {
+                            steered = true;
+                            controls
+                                .send(Control {
+                                    id: "queued".into(),
+                                    decision: Decision::Steer(Message {
+                                        id: "queued".into(),
+                                        text: "second question".into(),
+                                        ..Default::default()
+                                    }),
+                                })
+                                .unwrap();
+                        }
+                        Event::Text(text) => output.push_str(&text),
+                        _ => {}
+                    }
+                }
+                Ok(())
+            },
+        );
+        (result, output)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_process_streams_the_reply_to_a_prompt_queued_before_end_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_claude(
+            dir.path(),
+            r#"        if prompts == 2:
+            text('first', 'ALPHA ')
+            result()
+            init()
+            replay(frame)
+            text('second', 'BRAVO')
+            result()"#,
+        );
+        let (result, output) = run_fake_claude(binary, dir.path());
+        result.unwrap();
+        assert_eq!(output, "ALPHA BRAVO");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_process_exit_during_the_wait_reports_an_error_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_claude(
+            dir.path(),
+            r#"        if prompts == 2:
+            text('first', 'ALPHA')
+            result()
+            sys.exit(0)"#,
+        );
+        let started = Instant::now();
+        let (result, output) = run_fake_claude(binary, dir.path());
+        assert_eq!(output, "ALPHA");
+        assert!(result.unwrap_err().contains("Provider exited"));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

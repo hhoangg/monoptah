@@ -422,7 +422,7 @@ fn a_clean_exit_never_replaces_the_last_tab_with_another_terminal(cx: &mut TestA
                 "the one-shot flag does not outlive the close"
             );
             // A later, unrelated session follows the preference again.
-            shell.create_session(Kind::Claude, false, cx);
+            shell.create_session(shell.explicit_choice(Kind::Claude), false, cx);
         })
         .unwrap();
     cx.run_until_parked();

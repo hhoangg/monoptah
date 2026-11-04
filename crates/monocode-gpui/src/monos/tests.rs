@@ -2069,6 +2069,89 @@ fn sessions_a_mono_makes_are_chats_whatever_the_preference(cx: &mut TestAppConte
     });
 }
 
+#[gpui::test]
+fn subsessions_fill_a_start_that_names_no_model_and_yield_to_one_that_does(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let provider_of = |id: i64| {
+        locked(&s.store)
+            .unwrap()
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .unwrap()
+            .provider
+    };
+    let source = cx.update(|cx| {
+        s.manager
+            .read(cx)
+            .chats
+            .get(&s.id)
+            .map(|chat| chat.read(cx).summary.provider.clone())
+    });
+    let other = if source.as_deref() == Some("claude") {
+        "codex"
+    } else {
+        "claude"
+    };
+    edit_mono(&s, cx, |m| {
+        m.subsessions = Some(mono::Subsessions {
+            harness: Some(other.into()),
+            model: None,
+            effort: None,
+        });
+    });
+    // Names no harness, model or effort: the Mono's subsessions apply.
+    let filled = start(
+        &s,
+        "filled",
+        json!({"project":s.project,"prompt":"Review the project","draft":true}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(provider_of(filled["sessionId"].as_i64().unwrap()), other);
+    // Names its own harness, unlike the subsessions': kept as is, not overridden.
+    let mine = if other == "codex" { "claude" } else { "codex" };
+    let own = start(
+        &s,
+        "own",
+        json!({"project":s.project,"prompt":"Review the project","draft":true,"harness":mine}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(provider_of(own["sessionId"].as_i64().unwrap()), mine);
+    // The filled harness reaches the start's checks (no provider has this name), while a
+    // start that names its own harness is left alone and is not judged by it. No model is
+    // filled, so no provider CLI is asked for its catalog.
+    edit_mono(&s, cx, |m| {
+        m.subsessions = Some(mono::Subsessions {
+            harness: Some("no-such-harness".into()),
+            model: None,
+            effort: None,
+        });
+    });
+    let before = session_count(&s);
+    assert!(
+        start(
+            &s,
+            "bad-harness",
+            json!({"project":s.project,"prompt":"Review the project","draft":true}),
+            cx,
+        )
+        .is_err()
+    );
+    assert_eq!(session_count(&s), before, "a rejected start leaves no row");
+    start(
+        &s,
+        "own-harness",
+        json!({"project":s.project,"prompt":"Review the project","draft":true,"harness":"claude"}),
+        cx,
+    )
+    .unwrap();
+}
+
 // sessions.start: folders, parent sessions and the no-commit worktree check
 // (ports of agentApp.test.ts's folder, parent and "no commits" cases).
 fn start(s: &Setup, request: &str, input: Value, cx: &mut TestAppContext) -> Result<Value, String> {
@@ -5478,4 +5561,164 @@ fn a_move_racing_a_delete_cannot_bring_the_deleted_session_back(cx: &mut TestApp
         locked(&s.store).unwrap().groups(&s.project).unwrap(),
         groups
     );
+}
+
+const HABIT_FILE: &str = "kind: habit\nversion: 1\nname: Digest\nschedule:\n  kind: weekdays\n  time: \"09:00\"\ninstructions: Check https://example.com/feed and /Users/alice/notes\n";
+
+fn ask_habit(
+    s: &Setup,
+    request: &str,
+    action: &str,
+    input: Value,
+    cx: &mut TestAppContext,
+) -> Result<Value, String> {
+    call(s, request, action, input, cx).try_recv().unwrap()
+}
+
+#[gpui::test]
+fn a_mono_imports_a_habit_file_saved_off_and_waiting_for_review(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let result = ask_habit(
+        &s,
+        "imp-1",
+        "habits.import",
+        json!({"yaml": HABIT_FILE}),
+        cx,
+    )
+    .unwrap();
+    assert!(result["note"].as_str().unwrap().contains("review"));
+    assert_eq!(result["warnings"].as_array().unwrap().len(), 2);
+    let saved = habits::load(&s.root, &s.id).unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!(!saved[0].enabled && saved[0].needs_review);
+    assert_eq!(result["habit"]["id"], json!(saved[0].id));
+    let bad = ask_habit(
+        &s,
+        "imp-2",
+        "habits.import",
+        json!({"yaml": "kind: nope\n"}),
+        cx,
+    );
+    assert_eq!(bad.unwrap_err(), "Unsupported kind: nope (expected habit)");
+    assert_eq!(habits::load(&s.root, &s.id).unwrap().len(), 1);
+    let big = "x".repeat(monocode_core::mono::workflows::yaml::MAX_FILE_BYTES + 1);
+    assert!(ask_habit(&s, "imp-3", "habits.import", json!({"yaml": big}), cx).is_err());
+}
+
+#[gpui::test]
+fn a_mono_cannot_enable_or_run_an_imported_habit(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    ask_habit(
+        &s,
+        "imp-1",
+        "habits.import",
+        json!({"yaml": HABIT_FILE}),
+        cx,
+    )
+    .unwrap();
+    let id = habits::load(&s.root, &s.id).unwrap()[0].id.clone();
+    let enable = ask_habit(
+        &s,
+        "en-1",
+        "habits.update",
+        json!({"id": id, "enabled": true}),
+        cx,
+    );
+    assert!(enable.unwrap_err().contains("needs review"));
+    let run = ask_habit(&s, "run-1", "habits.run", json!({"id": id}), cx);
+    assert!(run.unwrap_err().contains("needs review"));
+    let saved = &habits::load(&s.root, &s.id).unwrap()[0];
+    assert!(!saved.enabled && !saved.run_requested && saved.needs_review);
+    // Turning it off or renaming it stays allowed.
+    ask_habit(
+        &s,
+        "ren-1",
+        "habits.update",
+        json!({"id": id, "name": "Renamed", "enabled": false}),
+        cx,
+    )
+    .unwrap();
+}
+
+#[gpui::test]
+fn exported_habit_yaml_imports_back(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let added = ask_habit(&s, "add-1", "habits.add", json!({"name": "Digest", "instructions": "Check the news", "schedule": {"kind": "weekly", "dayOfWeek": 3, "time": "08:15"}}), cx).unwrap();
+    let yaml =
+        ask_habit(&s, "exp-1", "habits.export", json!({"id": added["id"]}), cx).unwrap()["yaml"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    assert!(!yaml.contains(added["id"].as_str().unwrap()));
+    ask_habit(&s, "imp-1", "habits.import", json!({"yaml": yaml}), cx).unwrap();
+    let all = habits::load(&s.root, &s.id).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(
+        (&all[1].name, &all[1].instructions, &all[1].schedule),
+        (&all[0].name, &all[0].instructions, &all[0].schedule)
+    );
+    assert!(all[1].needs_review && !all[0].needs_review);
+    assert!(ask_habit(&s, "exp-2", "habits.export", json!({"id": "missing"}), cx).is_err());
+}
+
+#[gpui::test]
+fn a_habit_run_can_export_but_not_import(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let added = ask_habit(
+        &s,
+        "add-1",
+        "habits.add",
+        json!({"name": "Digest", "instructions": "Check", "schedule": {"kind": "daily"}}),
+        cx,
+    )
+    .unwrap();
+    let run = fake_run(&s, cx);
+    let refused = call_from(
+        &s,
+        run,
+        "i1",
+        "habits.import",
+        json!({"yaml": HABIT_FILE}),
+        cx,
+    )
+    .try_recv()
+    .unwrap();
+    assert_eq!(refused, Err("A habit run cannot schedule more runs".into()));
+    assert_eq!(habits::load(&s.root, &s.id).unwrap().len(), 1);
+    for (request, action, input) in [
+        ("e1", "habits.export", json!({"id": added["id"]})),
+        ("l1", "habits.list", json!({})),
+    ] {
+        assert!(
+            call_from(&s, run, request, action, input, cx)
+                .try_recv()
+                .unwrap()
+                .is_ok(),
+            "{action}"
+        );
+    }
+}
+
+#[gpui::test]
+fn imports_respect_the_habit_limit(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    for i in 0..habits::MAX {
+        ask_habit(
+            &s,
+            &format!("imp-{i}"),
+            "habits.import",
+            json!({"yaml": HABIT_FILE}),
+            cx,
+        )
+        .unwrap();
+    }
+    let over = ask_habit(
+        &s,
+        "imp-over",
+        "habits.import",
+        json!({"yaml": HABIT_FILE}),
+        cx,
+    );
+    assert!(over.is_err());
+    assert_eq!(habits::load(&s.root, &s.id).unwrap().len(), habits::MAX);
 }

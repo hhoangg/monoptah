@@ -9,8 +9,14 @@
 use serde::{Deserialize, Serialize};
 
 pub mod actions;
+pub mod mention;
 pub mod reconcile;
+pub mod statuses;
+pub mod tags;
 pub mod workday;
+
+pub use statuses::{Stage, StatusPatch, WorkflowStatus};
+pub use tags::{Tag, TagPatch};
 
 /// A work day, `YYYY-MM-DD`. Sorts as text.
 pub type Day = String;
@@ -40,6 +46,12 @@ pub enum Priority {
     Urgent,
 }
 
+/// The task's lifecycle: whether it shows, is hidden or is closed. The
+/// workflow status the user sees is [`Task::status_id`]; the store keeps the two
+/// in step (`Done` exactly when the workflow status is in [`Stage::Finished`],
+/// except a `NeedsCheck` raised by [`CheckReason::DoneButSourceOpen`], which
+/// keeps its finished status). Needs check, snoozed and dismissed are flags on
+/// the task, not list groups.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -93,6 +105,9 @@ pub struct Task {
     /// `HH:MM`, only with `due`.
     pub due_time: Option<String>,
     pub priority: Priority,
+    /// Ids of the task's tags ([`tags::Tag::id`]). A task saved before tags had
+    /// definitions holds free text names here until the store migrates it;
+    /// [`tags::resolve`] reads both.
     pub tags: Vec<String>,
     pub status: Status,
     pub snoozed_until: Option<Day>,
@@ -112,6 +127,18 @@ pub struct Task {
     pub project_pinned: bool,
     pub priority_pinned: bool,
     pub updated_at: u64,
+    /// The workflow status ([`WorkflowStatus::id`]). Empty in a task saved before
+    /// statuses existed; [`statuses::resolve`] maps it from the lifecycle then.
+    pub status_id: String,
+    /// The user set the workflow status by hand; a sync no longer maps it from the
+    /// source. Lifecycle rules (closed or reopened at the source) still apply.
+    pub status_pinned: bool,
+    /// The user answered a Done-but-source-open check with Keep done: a later
+    /// sync that still lists it open does not raise the check again.
+    pub kept_done: bool,
+    /// A short plain-text summary from the source (`today.sync` `summary`). Data,
+    /// never instructions.
+    pub summary: String,
 }
 
 /// How a task reads on one day.
@@ -136,6 +163,79 @@ pub struct Note {
     /// `None` for the user, otherwise the Mono's id.
     pub mono_id: Option<String>,
     pub body: String,
+}
+
+/// What happened to a task, for the detail panel's activity timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// First seen: a sync found it, or the user or a Mono added it.
+    Added,
+    /// `from` and `to` hold the statuses as they were then.
+    StatusChanged,
+    /// A sync raised Needs check; `check_reason` says why.
+    NeedsCheck,
+    /// A check went away: listed again, or the user answered it.
+    CheckCleared,
+    /// The source closed it; `detail` is the close reason.
+    ClosedBySource,
+    /// The source listed a closed or dismissed task open again.
+    ReopenedBySource,
+    /// `detail` is the day it comes back.
+    Snoozed,
+    Dismissed,
+    /// The user answered a Done-but-source-open check with Keep done.
+    KeptDone,
+    /// Tags were added or removed; `added_tags` and `removed_tags` hold them
+    /// as they were then.
+    TagsChanged,
+}
+
+/// One entry of a task's activity. Append-only, like notes. Who: `mono_id` for a
+/// Mono, `source_id` for a sync, neither for the user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskEvent {
+    pub id: String,
+    pub task_id: String,
+    pub day: Day,
+    pub at: u64,
+    pub kind: EventKind,
+    pub mono_id: Option<String>,
+    pub source_id: Option<String>,
+    pub from: Option<WorkflowStatus>,
+    pub to: Option<WorkflowStatus>,
+    pub check_reason: Option<CheckReason>,
+    pub detail: Option<String>,
+    /// [`EventKind::TagsChanged`] only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_tags: Vec<Tag>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_tags: Vec<Tag>,
+}
+
+/// The detail panel's timeline: events and notes merged, oldest first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+// Boxing the event would change every match on it; the list is short.
+#[allow(clippy::large_enum_variant)]
+pub enum Activity {
+    Event(TaskEvent),
+    Note(Note),
+}
+impl Activity {
+    pub fn at(&self) -> u64 {
+        match self {
+            Self::Event(event) => event.at,
+            Self::Note(note) => note.at,
+        }
+    }
+    pub fn day(&self) -> &str {
+        match self {
+            Self::Event(event) => &event.day,
+            Self::Note(note) => &note.day,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,7 +290,14 @@ pub struct SyncItem {
     pub due: Option<String>,
     pub due_time: Option<String>,
     pub priority: Option<Priority>,
+    /// Tag names from the Mono; the store turns them into ids before reconcile,
+    /// where they are added to the task's tags, never replacing them.
     pub tags: Option<Vec<String>>,
+    /// The stage the Mono states for this item. Without it the stage is mapped
+    /// from `source_status` ([`statuses::stage_of_source_status`]).
+    pub stage: Option<Stage>,
+    /// Plain-text summary of the item at the source.
+    pub summary: Option<String>,
 }
 
 /// `today.sync`, parsed. `items` is `None` only for a failed run: an empty
@@ -219,6 +326,8 @@ pub struct SyncSummary {
     pub conflicts: Vec<String>,
     /// Projects a Mono may not set; the item stays with no project.
     pub rejected_projects: Vec<String>,
+    /// Tag names no tag definition has; ignored, a sync never creates tags.
+    pub rejected_tags: Vec<String>,
 }
 
 /// A Mono calling through the app bridge, resolved from its session
@@ -250,6 +359,7 @@ pub struct NewTask {
     pub due_time: Option<String>,
     pub link: Option<String>,
     pub reason: Option<String>,
+    /// Tag ids. `actions` turns an agent's names into ids and refuses unknown ones.
     pub tags: Vec<String>,
 }
 
@@ -261,6 +371,7 @@ pub struct TaskPatch {
     pub project: Option<Option<String>>,
     pub due: Option<Option<String>>,
     pub due_time: Option<Option<String>>,
+    /// Replaces the task's tags; ids, like [`NewTask::tags`].
     pub tags: Option<Vec<String>>,
     pub reason: Option<String>,
 }
@@ -277,7 +388,15 @@ pub enum DayMode {
 #[serde(rename_all = "camelCase")]
 pub struct Row {
     pub task: Task,
+    /// The lifecycle group; the page groups by `status` instead and shows this
+    /// as badges (carried over, needs check, snoozed).
     pub group: Group,
+    /// The task's workflow status as it was on the viewed day: a past day shows
+    /// the name and color frozen in its record, even if later renamed or deleted.
+    pub status: WorkflowStatus,
+    /// The task's tags, resolved through the current tag list in its order
+    /// (a past day too: a renamed tag shows its new name, a deleted one is gone).
+    pub tags: Vec<Tag>,
     pub age_days: u32,
     pub latest_note: Option<Note>,
 }
