@@ -14,6 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod code;
 mod command;
 mod context_menu;
+mod links;
 mod mention;
 mod spelling;
 pub(crate) use command::{Command, CommandRemoved};
@@ -228,6 +229,11 @@ pub struct Input {
     secondary_submit: bool,
     /// Emit [`AlternateSubmitted`] on Cmd/Ctrl+Enter instead of ignoring it.
     alternate_submit: bool,
+    /// Opt-in: http(s) links in `content` are accent coloured and open on click.
+    links: bool,
+    /// The url pressed by a plain click, opened if the release is still on it.
+    link_press: Option<String>,
+    hovered_link: Option<Range<usize>>,
     pub content: SharedString,
     selection: Range<usize>,
     reversed: bool,
@@ -293,6 +299,9 @@ impl Input {
             max_height: MAX_HEIGHT,
             secondary_submit: false,
             alternate_submit: false,
+            links: false,
+            link_press: None,
+            hovered_link: None,
             content: "".into(),
             selection: 0..0,
             reversed: false,
@@ -445,6 +454,21 @@ impl Input {
         self.height = self.height.clamp(self.min_height, self.max_height);
         cx.notify();
     }
+    /// Selectable, copyable text with clickable http(s) links, drawn like
+    /// prose: it grows to fit, has no placeholder and cannot be edited.
+    pub(crate) fn read_only_text(label: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        let mut input = Self::new(cx);
+        input.label = label.into();
+        input.placeholder = "".into();
+        input.read_only = true;
+        input.links = true;
+        input.font_size = 12.;
+        input.line_height = 18.;
+        input.height = 18.;
+        input.min_height = 18.;
+        input.max_height = f32::MAX;
+        input
+    }
     /// NewHabitPage's three-row AutoTextarea, capped like React's AutoTextarea.
     pub(crate) fn habit_instructions(cx: &mut Context<Self>) -> Self {
         let mut input = Self::commit_message(cx);
@@ -466,6 +490,9 @@ impl Input {
         input.max_height = 2000.;
         input.height = 120.;
         input
+    }
+    pub(crate) fn set_label(&mut self, label: impl Into<SharedString>) {
+        self.label = label.into();
     }
     pub(crate) fn set_placeholder(
         &mut self,
@@ -568,6 +595,7 @@ impl Input {
         self.selection = self.content.len()..self.content.len();
         self.reversed = false;
         self.marked = None;
+        self.hovered_link = None;
         self.scroll_x = px(0.);
         self.scroll_y = px(0.);
         cx.emit(Changed);
@@ -1100,6 +1128,7 @@ impl Input {
         w.focus(&self.focus, cx);
         self.selecting = true;
         self.drag_position = Some(e.position);
+        self.link_press = self.pressed_link(e);
         let ix = self.mouse_index(e.position);
         if e.modifiers.shift {
             self.select_to(ix, cx)
@@ -1123,13 +1152,15 @@ impl Input {
             self.move_to(ix, cx)
         }
     }
-    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn mouse_up(&mut self, e: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_pressed_link(e, cx);
         self.end_drag();
         self.code_scrollbar_up();
     }
     fn mouse_move(&mut self, e: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.code_hover(e, cx);
         self.blame_hover(e, cx);
+        self.link_hover(e, cx);
         self.code_scrollbar_move(e, cx);
     }
     fn end_drag(&mut self) {
@@ -1594,11 +1625,24 @@ impl Element for InputElement {
             .marked
             .as_ref()
             .map(|range| to_display(range.start)..to_display(range.end));
+        let links: Vec<_> = if placeholder {
+            Vec::new()
+        } else {
+            i.link_ranges()
+                .into_iter()
+                .map(|(range, _)| to_display(range.start)..to_display(range.end))
+                .collect()
+        };
+        let hovered_link = i
+            .hovered_link
+            .as_ref()
+            .map(|range| to_display(range.start)..to_display(range.end));
         let mut boundaries = vec![0, text.len()];
         for range in highlights
             .iter()
             .map(|(range, _)| range)
             .chain(marked.iter())
+            .chain(links.iter())
         {
             boundaries.extend([range.start, range.end]);
         }
@@ -1624,6 +1668,8 @@ impl Element for InputElement {
                     } else {
                         crate::theme::accent_color()
                     }
+                } else if links.iter().any(|range| range.contains(&at)) {
+                    crate::theme::accent_color()
                 } else {
                     run.color
                 };
@@ -1637,6 +1683,16 @@ impl Element for InputElement {
                             color: Some(style.color),
                             thickness: px(1.),
                             wavy: false,
+                        })
+                        .or_else(|| {
+                            hovered_link
+                                .as_ref()
+                                .filter(|range| range.contains(&at))
+                                .map(|_| UnderlineStyle {
+                                    color: Some(color),
+                                    thickness: px(1.),
+                                    wavy: false,
+                                })
                         }),
                     ..run.clone()
                 }
@@ -1729,6 +1785,7 @@ impl Element for InputElement {
         let selection = to_display(i.selection.start)..to_display(i.selection.end);
         let cursor = to_display(i.cursor());
         let line_height = i.line_height();
+        let read_only = i.read_only && i.links;
         let center_offset = if i.centered && i.single_line {
             (bounds.size.width
                 - state
@@ -1831,6 +1888,7 @@ impl Element for InputElement {
                         }
                     }
                     if focus.is_focused(w)
+                        && !read_only
                         && selection.is_empty()
                         && cursor >= base
                         && cursor <= base + line.len()
@@ -1907,6 +1965,8 @@ impl Render for Input {
             .track_focus(&self.focus)
             .cursor(if self.code_rail_hovered() {
                 CursorStyle::Arrow
+            } else if self.hovered_link.is_some() {
+                CursorStyle::PointingHand
             } else {
                 CursorStyle::IBeam
             })
@@ -1962,6 +2022,7 @@ impl Render for Input {
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if !*hovered {
                     this.blame_leave(cx);
+                    this.link_leave(cx);
                 }
             }))
             .child(if self.code.is_some() {
@@ -2560,6 +2621,232 @@ mod native_input_tests {
                 assert!(input.content.is_empty());
                 input.replace_text_in_range(None, "line one\nline two", w, cx);
                 assert_eq!(input.take(cx).as_deref(), Some("line one\nline two"));
+            })
+            .unwrap();
+    }
+
+    fn link_field(text: &str, cx: &mut TestAppContext) -> WindowHandle<Input> {
+        let window = cx.update(|cx| {
+            bind(cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(400.), px(200.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|cx| Input::read_only_text("Note", cx)),
+            )
+            .unwrap()
+        });
+        window
+            .update(cx, |input, _, cx| input.set_text(text.into(), cx))
+            .unwrap();
+        cx.refresh().unwrap();
+        window
+    }
+    fn mouse(window: WindowHandle<Input>, cx: &mut TestAppContext, event: gpui::PlatformInput) {
+        cx.update_window(window.into(), |_, w, cx| w.dispatch_event(event, cx))
+            .unwrap();
+        cx.refresh().unwrap();
+    }
+    fn press(window: WindowHandle<Input>, cx: &mut TestAppContext, at: Point<Pixels>) {
+        mouse(
+            window,
+            cx,
+            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                position: at,
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+        );
+    }
+    fn release(window: WindowHandle<Input>, cx: &mut TestAppContext, at: Point<Pixels>) {
+        mouse(
+            window,
+            cx,
+            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                position: at,
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+        );
+    }
+    fn link_point(
+        window: WindowHandle<Input>,
+        nth: usize,
+        cx: &mut TestAppContext,
+    ) -> Point<Pixels> {
+        window
+            .update(cx, |input, _, _| input.link_point(nth))
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn link_mode_finds_every_http_link_and_nothing_else(cx: &mut TestAppContext) {
+        let text = "see https://a.com/x, and (http://b.org/y). ftp://c.net mailto:me@d.io";
+        let window = link_field(text, cx);
+        let found = window
+            .update(cx, |input, _, _| input.link_ranges())
+            .unwrap();
+        let spans: Vec<_> = found
+            .iter()
+            .map(|(range, url)| (&text[range.clone()], url.as_str()))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                ("https://a.com/x", "https://a.com/x"),
+                ("http://b.org/y", "http://b.org/y"),
+            ]
+        );
+        // Links are opt-in: an ordinary field has none.
+        let plain = field(cx, false);
+        replace(plain, text, cx);
+        assert!(
+            plain
+                .update(cx, |input, _, _| input.link_ranges())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    fn a_plain_click_on_a_link_opens_it(cx: &mut TestAppContext) {
+        let window = link_field("first https://a.com/x then https://b.org/y", cx);
+        for (nth, url) in [(0, "https://a.com/x"), (1, "https://b.org/y")] {
+            let at = link_point(window, nth, cx);
+            let before = cx.opened_url();
+            press(window, cx, at);
+            assert_eq!(cx.opened_url(), before, "opens on release, not press");
+            release(window, cx, at);
+            assert_eq!(cx.opened_url().as_deref(), Some(url));
+        }
+    }
+
+    #[gpui::test]
+    fn clicking_text_or_a_non_http_scheme_opens_nothing(cx: &mut TestAppContext) {
+        let window = link_field("plain words then ftp://c.net/x", cx);
+        let origin = window
+            .update(cx, |input, _, _| input.bounds.unwrap().origin)
+            .unwrap();
+        let line = window
+            .update(cx, |input, _, _| input.line_height())
+            .unwrap();
+        let words = origin + point(px(10.), line / 2.);
+        press(window, cx, words);
+        release(window, cx, words);
+        let scheme = window
+            .update(cx, |input, _, _| {
+                let at = input.content.find("ftp").unwrap() + 6;
+                input.bounds.unwrap().origin
+                    + input.position(at)
+                    + point(px(0.), input.line_height() / 2.)
+            })
+            .unwrap();
+        press(window, cx, scheme);
+        release(window, cx, scheme);
+        assert_eq!(cx.opened_url(), None);
+    }
+
+    #[gpui::test]
+    fn dragging_a_selection_over_a_link_does_not_open_it(cx: &mut TestAppContext) {
+        let window = link_field("go https://a.com/x now", cx);
+        let origin = window
+            .update(cx, |input, _, _| input.bounds.unwrap().origin)
+            .unwrap();
+        let line = window
+            .update(cx, |input, _, _| input.line_height())
+            .unwrap();
+        let from = link_point(window, 0, cx);
+        press(window, cx, from);
+        let to = origin + point(px(1.), line / 2.);
+        mouse(
+            window,
+            cx,
+            gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                position: to,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }),
+        );
+        release(window, cx, to);
+        window
+            .update(cx, |input, _, _| assert!(!input.selection.is_empty()))
+            .unwrap();
+        assert_eq!(cx.opened_url(), None);
+        // A fresh click on the link afterwards still opens it.
+        press(window, cx, from);
+        release(window, cx, from);
+        assert_eq!(cx.opened_url().as_deref(), Some("https://a.com/x"));
+    }
+
+    #[gpui::test]
+    fn hovering_a_link_shows_the_pointing_hand(cx: &mut TestAppContext) {
+        let window = link_field("go https://a.com/x now", cx);
+        let at = link_point(window, 0, cx);
+        mouse(
+            window,
+            cx,
+            gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                position: at,
+                pressed_button: None,
+                modifiers: Default::default(),
+            }),
+        );
+        window
+            .update(cx, |input, _, _| assert!(input.hovered_link.is_some()))
+            .unwrap();
+        let away = window
+            .update(cx, |input, _, _| {
+                input.bounds.unwrap().origin + point(px(1.), px(1.))
+            })
+            .unwrap();
+        mouse(
+            window,
+            cx,
+            gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                position: away,
+                pressed_button: None,
+                modifiers: Default::default(),
+            }),
+        );
+        window
+            .update(cx, |input, _, _| assert!(input.hovered_link.is_none()))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_read_only_selection_copies_and_cannot_be_edited(cx: &mut TestAppContext) {
+        let window = link_field("copy me please", cx);
+        window
+            .update(cx, |input, w, cx| {
+                w.focus(&input.focus, cx);
+                input.select_range(0..7, cx);
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(window.into(), &format!("{modifier}-c"));
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("copy me")
+        );
+        cx.simulate_input(window.into(), "x");
+        cx.simulate_keystrokes(window.into(), "backspace");
+        window
+            .update(cx, |input, _, _| {
+                assert_eq!(input.content.as_ref(), "copy me please")
             })
             .unwrap();
     }

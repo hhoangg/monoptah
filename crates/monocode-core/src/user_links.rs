@@ -28,15 +28,24 @@ pub struct UserMessageLink {
 
 /// Find the first web URL and preserve the rest of the user's message.
 pub fn parse_user_message_link(text: &str) -> Option<UserMessageLink> {
+    find_web_links(text).into_iter().next()
+}
+
+/// Every http(s) link in `text`, in order, with the bytes each one occupies.
+/// Surrounding punctuation is left out of the range.
+pub fn find_web_links(text: &str) -> Vec<UserMessageLink> {
     static URL: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r#"(?i)https?://[^\s<>"']+"#).unwrap());
-    let found = URL.find(text)?;
-    let value = trim_url_punctuation(found.as_str());
-    let link = parse_http_url(value)?;
-    Some(UserMessageLink {
-        link,
-        range: found.start()..found.start() + value.len(),
-    })
+    URL.find_iter(text)
+        .filter_map(|found| {
+            let value = trim_url_punctuation(found.as_str());
+            let link = parse_http_url(value)?;
+            Some(UserMessageLink {
+                link,
+                range: found.start()..found.start() + value.len(),
+            })
+        })
+        .collect()
 }
 
 fn parse_http_url(value: &str) -> Option<UserLink> {
@@ -156,6 +165,66 @@ pub fn plain_text_summary(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spans(text: &str) -> Vec<&str> {
+        find_web_links(text)
+            .iter()
+            .map(|found| &text[found.range.clone()])
+            .collect()
+    }
+
+    #[test]
+    fn every_link_in_a_text_is_found_in_order() {
+        let text = "a https://a.com/x then http://b.org, and https://c.net/y?q=1!";
+        assert_eq!(
+            spans(text),
+            ["https://a.com/x", "http://b.org", "https://c.net/y?q=1"]
+        );
+        assert_eq!(find_web_links("no links here"), []);
+    }
+
+    #[test]
+    fn links_drop_trailing_punctuation() {
+        for punct in [".", ",", "!", ";", ":"] {
+            let text = format!("see https://a.com/x{punct} next");
+            assert_eq!(spans(&text), ["https://a.com/x"], "{punct}");
+        }
+    }
+
+    #[test]
+    fn parentheses_are_balanced_around_links() {
+        assert_eq!(spans("(see https://a.com/x)"), ["https://a.com/x"]);
+        assert_eq!(
+            spans("https://en.wikipedia.org/wiki/Foo_(bar)"),
+            ["https://en.wikipedia.org/wiki/Foo_(bar)"]
+        );
+        assert_eq!(
+            spans("(https://en.wikipedia.org/wiki/Foo_(bar))."),
+            ["https://en.wikipedia.org/wiki/Foo_(bar)"]
+        );
+    }
+
+    #[test]
+    fn only_http_and_https_are_links() {
+        for text in [
+            "ftp://a.com/x",
+            "mailto:me@a.com",
+            "javascript:alert(1)",
+            "file:///etc/hosts",
+        ] {
+            assert_eq!(spans(text), Vec::<&str>::new(), "{text}");
+        }
+        assert_eq!(spans("HTTPS://A.com/X"), ["HTTPS://A.com/X"]);
+    }
+
+    #[test]
+    fn the_first_link_is_the_first_found_link() {
+        let text = "x https://a.com y https://b.com";
+        assert_eq!(
+            parse_user_message_link(text),
+            find_web_links(text).into_iter().next()
+        );
+    }
 
     #[test]
     fn the_first_link_keeps_the_text_around_it() {
