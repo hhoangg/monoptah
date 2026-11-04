@@ -214,11 +214,16 @@ fn copy_files(
                     .map(|leaf| leaf.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let (kind, mime, size_px) = describe(&name, &path);
+                let file = relative
+                    .join(leaf)
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                // Resolve like a later read does, so the path is the same
+                // string either way (on Windows the copy's own path can mix
+                // separators).
+                let path = resolve(root, &file).unwrap_or(path);
                 attachments.push(NoteAttachment {
-                    file: relative
-                        .join(leaf)
-                        .to_string_lossy()
-                        .replace(std::path::MAIN_SEPARATOR, "/"),
+                    file,
                     name,
                     size,
                     kind,
