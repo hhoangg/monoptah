@@ -12086,10 +12086,13 @@ mod tests {
             s.sessions[&active].read(cx).transcript.clone()
         });
         let before = transcript.read_with(visual, |t, _| t.render_passes);
-        for label in ["Today", "Inbox", "Notes"] {
-            let selector = format!("sidebar-navigation-{label}");
+        for (label, selector) in [
+            ("Today", "sidebar-navigation-Today"),
+            ("Inbox", "sidebar-navigation-Inbox"),
+            ("Notes", "sidebar-navigation-Notes"),
+        ] {
             let row = visual
-                .debug_bounds(&selector)
+                .debug_bounds(selector)
                 .expect("navigation row is rendered");
             visual.simulate_mouse_move(row.center(), None, Default::default());
             visual.run_until_parked();
