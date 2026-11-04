@@ -72,6 +72,18 @@ pub(super) enum Pick {
         id: String,
         project: String,
     },
+    /// Start session menu: a new session (asks for a project first when the
+    /// task has none).
+    StartNew(Box<monocode_core::today::Task>),
+    /// Start session menu: continue in an existing session of the task's project.
+    ContinueIn {
+        task: Box<monocode_core::today::Task>,
+        session: i64,
+    },
+    /// Takes a session off its task.
+    Unlink {
+        session: i64,
+    },
 }
 /// Which trigger a menu hangs from; also where its popover is drawn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,8 +105,12 @@ pub(super) enum Slot {
     Column,
     /// Start session on a task with no project: pick one first.
     StartProject,
+    /// The Start session split button's chevron.
+    StartMenu,
+    /// A row of the detail's SESSIONS section; only the open row's trigger writes the anchor.
+    SessionMore,
 }
-const SLOTS: usize = 12;
+const SLOTS: usize = 14;
 /// Which part of the page draws a slot's popover.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Host {
@@ -122,6 +138,8 @@ pub(super) struct OpenMenu {
     picks: Vec<(SharedString, Pick)>,
     /// Set on the Tags menu: what it edits and what it searches with.
     tags: Option<TagsMenu>,
+    /// Set on the Start session menu: the task and the search field.
+    start: Option<super::detail_sessions::ContinueMenu>,
     _events: Subscription,
 }
 /// The state behind the Tags menu: the task, the field, and the ids the task
@@ -177,11 +195,16 @@ impl Menus {
             .flat_map(|open| open.picks.iter().map(|(id, _)| id.to_string()))
             .collect()
     }
-    /// The Tags menu's search field.
+    /// The open menu's search field: the Tags menu's or the Start session menu's.
     #[cfg(test)]
     pub(super) fn search_input(&self, cx: &gpui::App) -> Option<Entity<input::Input>> {
-        let menu = self.open.as_ref()?.tags.as_ref()?;
-        Some(menu.search.read(cx).input.clone())
+        let open = self.open.as_ref()?;
+        let search = match (&open.tags, &open.start) {
+            (Some(menu), _) => &menu.search,
+            (None, Some(menu)) => &menu.search,
+            (None, None) => return None,
+        };
+        Some(search.read(cx).input.clone())
     }
 }
 /// Menu rows with what each one does.
@@ -204,6 +227,10 @@ impl Rows {
     pub(super) fn note(&mut self, text: impl Into<SharedString>) {
         self.items.push(MenuItem::Note(text.into()));
     }
+    /// A search field row, for a menu opened with a search field.
+    pub(super) fn search(&mut self, search: &Entity<MenuSearch>, cx: &gpui::App) {
+        self.items.push(MenuSearch::item(search, cx));
+    }
 }
 
 impl Today {
@@ -218,14 +245,28 @@ impl Today {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_menu_with(slot, label, rows, None, window, cx);
+        self.open_menu_with(slot, label, rows, None, None, window, cx);
     }
+    /// Opens the Start session menu, which has a search field.
+    pub(super) fn open_menu_for(
+        &mut self,
+        slot: Slot,
+        label: &'static str,
+        rows: Rows,
+        start: super::detail_sessions::ContinueMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_menu_with(slot, label, rows, None, Some(start), window, cx);
+    }
+    #[allow(clippy::too_many_arguments)]
     fn open_menu_with(
         &mut self,
         slot: Slot,
         label: &'static str,
         rows: Rows,
         tags: Option<TagsMenu>,
+        start: Option<super::detail_sessions::ContinueMenu>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -240,7 +281,7 @@ impl Today {
             return;
         }
         let items = rows.items;
-        let searchable = tags.is_some();
+        let searchable = tags.is_some() || start.is_some();
         let menu = cx.new(|cx| {
             let menu = Menu::new(label, items, window, cx)
                 .style(MenuStyle::Filter)
@@ -261,6 +302,13 @@ impl Today {
                 }),
                 MenuEvent::Dismissed => None,
             };
+            // A new session may have to ask for a project, which needs the window.
+            if let Some(Pick::StartNew(task)) = picked.clone() {
+                this.menus.open = None;
+                this.start_session(*task, window, cx);
+                cx.notify();
+                return;
+            }
             if let Some(pick) = picked.as_ref().filter(|p| p.keeps_open()).cloned() {
                 this.apply_pick(pick, cx);
                 this.rebuild_open_menu(cx);
@@ -283,21 +331,25 @@ impl Today {
             slot,
             picks: rows.picks,
             tags,
+            start,
             _events: events,
         });
         cx.notify();
     }
     /// Rebuilds the open menu's rows from the current filters or tags, in place.
-    fn rebuild_open_menu(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn rebuild_open_menu(&mut self, cx: &mut Context<Self>) {
         let Some(open) = self.menus.open.as_ref() else {
             return;
         };
-        let rows = match &open.tags {
-            Some(menu) => self.tag_rows(&menu.task, &menu.selected, &menu.search, &menu.track, cx),
-            None => self.filter_rows(open.slot),
+        let rows = match (&open.tags, &open.start) {
+            (Some(menu), _) => {
+                self.tag_rows(&menu.task, &menu.selected, &menu.search, &menu.track, cx)
+            }
+            (None, Some(menu)) => self.start_rows(&menu.task, &menu.search, cx),
+            (None, None) => self.filter_rows(open.slot),
         };
         if let Some(open) = self.menus.open.as_mut() {
-            let filter_menu = open.tags.is_none();
+            let filter_menu = open.tags.is_none() && open.start.is_none();
             open.menu.update(cx, |menu, cx| {
                 menu.replace_items(rows.items, cx);
                 // The filter menus have no search field: keep a row highlighted for the keys.
@@ -361,11 +413,7 @@ impl Today {
         let search = MenuSearch::new("Search or create tags", cx);
         let input = search.read(cx).input.clone();
         let changed = cx.subscribe(&input, |this, _, _: &input::Changed, cx| {
-            this.rebuild_open_menu(cx);
-            // The typed text picks the rows: Enter acts on the first one.
-            if let Some(open) = this.menus.open.as_ref() {
-                open.menu.update(cx, |menu, cx| menu.highlight_first(cx));
-            }
+            this.menu_search_changed(cx)
         });
         let track = Rc::new(Track::default());
         let rows = self.tag_rows(&id, &selected, &search, &track, cx);
@@ -376,7 +424,15 @@ impl Today {
             track,
             _changed: changed,
         };
-        self.open_menu_with(Slot::Tags, "Tags", rows, Some(menu), window, cx);
+        self.open_menu_with(Slot::Tags, "Tags", rows, Some(menu), None, window, cx);
+    }
+    /// The typed text of an open menu's search field picks the rows: rebuild
+    /// them, and Enter acts on the first one.
+    pub(super) fn menu_search_changed(&mut self, cx: &mut Context<Self>) {
+        self.rebuild_open_menu(cx);
+        if let Some(open) = self.menus.open.as_ref() {
+            open.menu.update(cx, |menu, cx| menu.highlight_first(cx));
+        }
     }
     /// The Tags menu's rows: the search field, a row per tag that matches it,
     /// a Create row when it names no tag, then Edit tags.
@@ -568,6 +624,10 @@ impl Today {
             Pick::EditTags => self.open_tags(cx),
             Pick::Dismiss { id } => self.dismiss(id, cx),
             Pick::StartWithProject { id, project } => self.start_with_project(id, project, cx),
+            // Needs the window: handled where the menu reports the pick.
+            Pick::StartNew(_) => {}
+            Pick::ContinueIn { task, session } => self.continue_in(*task, session, cx),
+            Pick::Unlink { session } => self.unlink_session(session, cx),
         }
     }
     /// The open menu's popover, drawn by the part of the page that owns its trigger.
