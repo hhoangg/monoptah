@@ -1,16 +1,19 @@
-# Monoptah Native 0.41.1
+# Monoptah Native 0.42.0
 
 A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
 
-## Changes since 0.41.0
+## Changes since 0.41.1
 
-Today tasks can now carry tags, and the filters can pick several values at once.
+This release brings in upstream MonoCode native preview 13. Today, Contributors, Mono workflows and the other Monoptah features work as before.
 
-- **Tags.** One tag list for the whole app, managed from the new Tags button next to Statuses, or Edit tags in a task's Tags menu. Add, rename, recolor (a few preset swatches plus a custom color) and drag to reorder. Names are unique ignoring case. Deleting a tag first says how many tasks use it, then removes it from all of them. A rename or a new color shows everywhere at once.
-- **Tags on tasks.** List rows and board cards show a task's tags as colored chips after the project. The detail panel has a Tags row with a searchable menu: check tags on or off, create a tag from what you typed, or open Edit tags. Tag changes appear in the Activity timeline. Past days are read only and show tags with their current names and colors.
-- **Existing tags migrated.** Free text tags already on Today tasks become tag definitions with default colors, merged when they differ only in case, and every task keeps its tags.
-- **Multi-select filters.** Status and Tag filters let you check several options. The Status menu is grouped by stage, and on the Board a status filter hides the columns you did not pick. The Tag filter matches any of the chosen tags by default, can switch to all of them, and has a No tag option. Filters combine, the row shows how many are active with Clear filters, and the filters are remembered between launches.
-- **Monos.** `today.add` and `today.update` take tag names and refuse names that are not in your tag list, so agents cannot create tags. `today.tags` lists the tags. A sync adds matching tags and never removes tags you set.
+- **Tabs and terminals.** Pin title tabs from their context menu to keep them at the left of the tab strip. Up to three sit in a row, and more stack into a deck that fans out on hover. Drag a terminal out of the dock onto a pane edge to split it beside your chat, or onto the title strip to give it its own tab. The shell keeps running. Settings can place terminals in the title bar, and its New tab button then offers a session or a terminal. Inputs, the file editor and terminals have right-click editing menus.
+- **Changes pill.** A pill above the composer, beside Commit, shows the session's added and removed lines and opens its review card with Keep, Undo and file review. Unresolved changes carry forward across turns until you keep, undo or commit them.
+- **Tool groups.** Settings > Chat > Collapse tool groups keeps groups closed while they run. Fold finished work chooses whether finished work folds under the "worked for" header. The composer button turns into a labelled Send, Queue, Steer, Save draft or Stop pill.
+- **Settings and search.** Settings has a collapsible navigation sidebar with search at the top. Long dropdowns have a filter field. Settings > General > Search as command panel opens search as a floating panel over your work. Model picker rows have a favorite star.
+- **New chats.** New chats pick their provider and model the same way everywhere: project default, app default, then your last choice. When the default provider opens as a terminal, you are still asked which provider to use first.
+- **Monos.** A Mono's settings can choose a separate model and effort for the sessions it starts. New Mono chats start at low effort. Claude and Codex get a Mono's standing rules as system instructions, and a resumed Codex thread gets updated rules in the message. Monos can reach the app through an MCP app tool, with the app CLI as fallback.
+- **Reliability.** Smoother mouse-wheel scrolling, the reading position kept when rows fold away or a transcript reopens, windows that recover after a stalled display link, and provider starts that retry a brief "Text file busy" error. Dismissing an update notice no longer opens What's new.
+- **Star on GitHub.** A dismissible sidebar prompt offers to star this fork for GitHub CLI accounts that have not starred it yet. It stays hidden when GitHub CLI is missing, signed out or offline.
 
 ## What it is
 
