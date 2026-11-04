@@ -303,6 +303,31 @@ fn a_requested_run_goes_through_the_habit_path_and_a_busy_habit_is_skipped(
     );
 }
 
+#[gpui::test]
+fn a_requested_run_never_queues_a_habit_that_needs_review(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    no_provider(&s, cx);
+    let habit = add_habit(&s, now_ms() + 3_600_000);
+    habits::update(&s.root, &s.id, |all| {
+        all[0].needs_review = true;
+        all[0].enabled = false;
+        Ok(())
+    })
+    .unwrap();
+    s.manager.update(cx, |m, cx| m.reload_today_habits(cx));
+    cx.run_until_parked();
+    let target = vec![(s.id.clone(), habit.clone())];
+    s.manager
+        .update(cx, |m, cx| m.request_habit_runs(target, cx));
+    cx.run_until_parked();
+    assert!(!habit_of(&s, &habit).run_requested);
+    cx.update(|cx| {
+        let m = s.manager.read(cx);
+        assert!(m.error.is_none(), "{:?}", m.error);
+        assert!(m.running.is_empty());
+    });
+}
+
 // --- catch-up: a habit only runs within GRACE_MS of its time ----------------------------------
 
 #[gpui::test]

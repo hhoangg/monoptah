@@ -46,7 +46,7 @@ fn number(n: impl Into<f64>) -> Doc {
 /// The file writes a schedule the way the spec does, `{ kind, time, ... }`; fields a schedule
 /// keeps at their defaults are left out. The time is always quoted, because a YAML 1.1 reader
 /// takes a bare 09:00 for a number.
-fn export_schedule(s: &Schedule) -> Doc {
+pub(crate) fn export_schedule(s: &Schedule) -> Doc {
     let mut out = vec![
         ("kind".to_string(), text(&s.schedule_kind)),
         ("time".to_string(), Doc::Quoted(s.time.clone())),
@@ -435,11 +435,19 @@ pub fn review_of(w: &Workflow, catalog: &ModelCatalog) -> ImportPreview {
 
 /// The parsed file, or the message to show when it cannot be read.
 fn parse_file(text: &str) -> Result<Json, String> {
+    parse_file_as(text, "workflow")
+}
+
+/// `parse_file` for any shared file; `what` names it in the messages ("workflow", "habit").
+pub(crate) fn parse_file_as(text: &str, what: &str) -> Result<Json, String> {
     if text.len() > MAX_FILE_BYTES {
-        return fail("Workflow file is too large (over 512 KiB)");
+        return fail(format!(
+            "{} file is too large (over 512 KiB)",
+            capitalized(what)
+        ));
     }
     if js_trim(text).is_empty() {
-        return fail("Workflow file is empty");
+        return fail(format!("{} file is empty", capitalized(what)));
     }
     if text.trim_start_matches(js_space).starts_with('{') {
         if let Some(value) = Json::parse(text) {
@@ -448,12 +456,20 @@ fn parse_file(text: &str) -> Result<Json, String> {
         // Not JSON after all; the YAML reader reports what is wrong.
     }
     parse_yaml(text).map_err(|err| match err {
-        ReadError::TooDeep => TOO_DEEP.to_string(),
+        ReadError::TooDeep => format!("The {what} file is nested too deeply"),
         ReadError::Message(m) => format!(
-            "Could not read the workflow file: {}",
+            "Could not read the {what} file: {}",
             m.lines().next().unwrap_or("")
         ),
     })
+}
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// The first string anywhere in `value` that reads as an absolute path, with where it sits.
@@ -481,7 +497,7 @@ fn find_path_field(value: &Json, label: &str, depth: usize) -> Option<String> {
     }
 }
 
-fn describe_version(v: Option<&Json>) -> String {
+pub(crate) fn describe_version(v: Option<&Json>) -> String {
     match v {
         Some(Json::Number(n)) => super::ordered::js_number_text(*n),
         Some(Json::String(s)) => s.clone(),

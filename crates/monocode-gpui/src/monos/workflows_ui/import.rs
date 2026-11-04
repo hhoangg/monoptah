@@ -3,7 +3,7 @@
 //! the shell is shown as the file has it.
 use super::super::*;
 use super::actions::js_number;
-use super::view::{alert, header_button, hint, property, section};
+use super::view::{alert, choose_file_link, header_button, hint, property, section};
 use super::{super::scheduler::habit_field, Pick};
 use monocode_core::mono::workflows::{
     cli::WorkflowHost,
@@ -130,9 +130,12 @@ pub(in crate::monos) fn make_preview(
 }
 
 /// The file at `path` as text, or why it cannot be one and whether the page empties its box. Only
-/// a file over the limit does (it gives the model's own refusal); one that cannot be read leaves
-/// what was pasted.
-fn read_file(path: &std::path::Path) -> Result<String, (bool, String)> {
+/// a file over the limit does (it gives the model's own refusal, `refusal` of the text); one
+/// that cannot be read leaves what was pasted.
+pub(in crate::monos) fn read_text_file(
+    path: &std::path::Path,
+    refusal: impl Fn(&str) -> String,
+) -> Result<String, (bool, String)> {
     let reason = |error: String| (false, format!("Could not read the file: {error}"));
     let meta = std::fs::metadata(path).map_err(|e| reason(e.to_string()))?;
     if meta.len() > READ_MAX {
@@ -143,15 +146,92 @@ fn read_file(path: &std::path::Path) -> Result<String, (bool, String)> {
         String::from_utf8(bytes).map_err(|_| reason("File is not valid UTF-8 text.".into()))?;
     if text.len() > MAX_FILE_BYTES {
         // The model's own refusal; the text itself stays out of the page.
-        return Err((
-            true,
-            match preview_import(&text, &ModelCatalog::unprobed()) {
-                Err(refused) => refused,
-                Ok(_) => "Workflow file is too large".into(),
-            },
-        ));
+        return Err((true, refusal(&text)));
     }
     Ok(text)
+}
+
+/// "Choose file": lets the user pick a file and reads it off the UI thread. `done` gets its text,
+/// or the reason it was refused (see `read_text_file`). Nothing happens when the dialog is
+/// cancelled.
+pub(in crate::monos) fn pick_text_file(
+    prompt: &'static str,
+    refusal: impl Fn(&str) -> String + Send + 'static,
+    done: impl FnOnce(&mut Monos, Result<String, (bool, String)>, &mut Context<Monos>) + 'static,
+    cx: &mut Context<Monos>,
+) {
+    let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: Some(prompt.into()),
+    });
+    cx.spawn(async move |this, cx| {
+        let Ok(Ok(Some(paths))) = picked.await else {
+            return;
+        };
+        let Some(path) = paths.into_iter().next() else {
+            return;
+        };
+        let read = cx
+            .background_executor()
+            .spawn(async move { read_text_file(&path, refusal) })
+            .await;
+        let _ = this.update(cx, |this, cx| done(this, read, cx));
+    })
+    .detach();
+}
+
+/// What a picked file does to the page: its text goes into `field`; a refusal becomes
+/// `file_error`, and when the file was over the limit the box is emptied and the refusal kept.
+pub(in crate::monos) fn apply_picked_file(
+    field: &Entity<Input>,
+    read: Result<String, (bool, String)>,
+    file_error: &mut Option<String>,
+    keep_file_error: &mut bool,
+    cx: &mut App,
+) {
+    match read {
+        Ok(text) => field.update(cx, |f, cx| f.set_text(text, cx)),
+        Err((clear, error)) => {
+            *file_error = Some(error);
+            if clear {
+                *keep_file_error = true;
+                field.update(cx, |f, cx| f.set_text(String::new(), cx));
+            }
+        }
+    }
+}
+
+/// Makes a preview once typing pauses for `pause`, off the UI thread. `apply` gets it only if
+/// `current` still reads `revision`: a newer edit has made this one stale.
+pub(in crate::monos) fn preview_later<T: Send + 'static>(
+    pause: Option<Duration>,
+    revision: u64,
+    current: fn(&Monos) -> u64,
+    make: impl FnOnce() -> T + Send + 'static,
+    apply: impl FnOnce(&mut Monos, T, &mut Context<Monos>) + 'static,
+    cx: &mut Context<Monos>,
+) {
+    let pause = pause.unwrap_or(DEBOUNCE);
+    cx.spawn(async move |this, cx| {
+        if !pause.is_zero() {
+            cx.background_executor().timer(pause).await;
+        }
+        let live = this
+            .update(cx, |this, _| current(this) == revision)
+            .unwrap_or(false);
+        if !live {
+            return;
+        }
+        let made = cx.background_executor().spawn(async move { make() }).await;
+        let _ = this.update(cx, |this, cx| {
+            if current(this) == revision {
+                apply(this, made, cx);
+            }
+        });
+    })
+    .detach();
 }
 
 fn limit_message() -> String {
@@ -202,69 +282,45 @@ impl Monos {
             cx.notify();
             return;
         }
-        let pause = imp.debounce.unwrap_or(DEBOUNCE);
+        let pause = imp.debounce;
         let probe = self.workflow_live.probe();
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            if !pause.is_zero() {
-                cx.background_executor().timer(pause).await;
-            }
-            let current = this
-                .update(cx, |this, _| this.wf.import.revision == revision)
-                .unwrap_or(false);
-            if !current {
-                return;
-            }
-            let read = cx
-                .background_executor()
-                .spawn(async move { make_preview(&text, probe) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.wf.import.revision == revision {
-                    this.wf.import.read = Some(read);
-                    this.wf.import.shown = revision;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        preview_later(
+            pause,
+            revision,
+            |this| this.wf.import.revision,
+            move || make_preview(&text, probe),
+            move |this, read, cx| {
+                this.wf.import.read = Some(read);
+                this.wf.import.shown = revision;
+                cx.notify();
+            },
+            cx,
+        );
     }
 
     /// "Choose file": reads a picked workflow file into the same preview.
     fn import_choose_file(&mut self, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Import workflow".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = picked.await else {
-                return;
-            };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            let read = cx
-                .background_executor()
-                .spawn(async move { read_file(&path) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
+        pick_text_file(
+            "Import workflow",
+            |text| match preview_import(text, &ModelCatalog::unprobed()) {
+                Err(refused) => refused,
+                Ok(_) => "Workflow file is too large".into(),
+            },
+            |this, read, cx| {
                 let field = this.import_text_field(cx);
-                match read {
-                    Ok(text) => field.update(cx, |f, cx| f.set_text(text, cx)),
-                    Err((clear, error)) => {
-                        this.wf.import.file_error = Some(error);
-                        if clear {
-                            this.wf.import.keep_file_error = true;
-                            field.update(cx, |f, cx| f.set_text(String::new(), cx));
-                        }
-                    }
-                }
+                let imp = &mut this.wf.import;
+                apply_picked_file(
+                    &field,
+                    read,
+                    &mut imp.file_error,
+                    &mut imp.keep_file_error,
+                    cx,
+                );
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+            cx,
+        );
     }
 
     /// A project or a switch chosen for an input of the file.
@@ -505,19 +561,7 @@ impl Monos {
             }
             None => Vec::new(),
         };
-        let choose = div()
-            .id("mono-import-choose-file")
-            .debug_selector(|| "mono-import-choose-file".into())
-            .role(Role::Button)
-            .aria_label("Choose file")
-            .cursor_pointer()
-            .rounded_sm()
-            .px_1p5()
-            .py_0p5()
-            .text_size(px(11.))
-            .text_color(content(0.6))
-            .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
-            .child("Choose file")
+        let choose = choose_file_link("mono-import-choose-file")
             .on_click(cx.listener(|this, _, _, cx| this.import_choose_file(cx)))
             .into_any_element();
         div()
