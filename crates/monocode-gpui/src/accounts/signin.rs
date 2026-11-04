@@ -19,6 +19,7 @@ impl Accounts {
             complete: false,
             error: None,
             adding: None,
+            started: Instant::now(),
         });
         cx.notify();
     }
