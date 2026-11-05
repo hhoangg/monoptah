@@ -5,7 +5,10 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "models.list"|"soul.read"|"habits.list"=>"",
         "sessions.list"|"folders.list"|"worktrees.list"=>"project",
         "sessions.read"=>"sessionId project before limit maxChars",
-        "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId",
+        "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId target",
+        "codespaces.list"|"codespaces.secretsStatus"=>"project",
+        "codespaces.create"=>"branch machine displayName project",
+        "codespaces.stop"|"codespaces.delete"=>"name project",
         "sessions.send"=>"sessionId prompt project notifyOnComplete completionDelivery",
         "sessions.draft"=>"sessionId prompt project",
         "sessions.stop"|"sessions.archive"=>"sessionId project",
@@ -78,9 +81,12 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         if key == "before" && !value.is_string() && value.as_u64().is_none() {
             return Err("before must be a turn ID".into());
         }
+        // A cloud session lives in the remote store, whose IDs are negative numbers.
+        let session = matches!(key.as_str(), "sessionId" | "besideSessionId");
         if matches!(key.as_str(), "id" | "sessionId" | "besideSessionId")
             && !value.is_string()
             && value.as_u64().is_none()
+            && !(session && value.as_i64().is_some_and(|n| n < 0))
         {
             return Err(format!("{key} must be an ID"));
         }
@@ -104,6 +110,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "tags",
             "options",
             "parentSessionId",
+            // sessions.start target; checked by validate_target.
+            "target",
             // A workflow definition and its input values are objects.
             "workflow",
             "values",
@@ -120,6 +128,12 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             .is_none_or(|values| values.values().any(|v| !v.is_string()))
     }) {
         return Err("modelSettings must be an object of strings".into());
+    }
+    if let Some(target) = input.get("target") {
+        validate_target(target, input)?;
+    }
+    if action.starts_with("codespaces.") {
+        validate_codespace_fields(input)?;
     }
     if input["draft"] == true && input["notifyOnComplete"] == true {
         return Err("An unsent draft cannot send a completion notification".into());
@@ -164,6 +178,119 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Valid codespace names are letters, digits and hyphens (they become `gh` argv).
+fn codespace_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+fn branch_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 250
+        && !value.starts_with('-')
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+fn machine_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// `target` of sessions.start: `{codespace:"new"|"<name>", branch?, machine?}`. A cloud session
+/// is a Claude chat in a codespace of the project's GitHub repository, so options that only make
+/// sense for a local checkout are refused here, before anything is created.
+fn validate_target(target: &Value, input: &Value) -> Result<(), String> {
+    let target = target.as_object().ok_or(
+        "target must be an object like {\"codespace\":\"new\"} or {\"codespace\":\"<name>\"}",
+    )?;
+    for key in target.keys() {
+        if !["codespace", "branch", "machine"].contains(&key.as_str()) {
+            return Err(format!("target does not take {key}"));
+        }
+    }
+    let name = target
+        .get("codespace")
+        .and_then(Value::as_str)
+        .ok_or("target.codespace must be \"new\" or the name of an existing codespace")?;
+    if name != "new" && !codespace_name(name) {
+        return Err(
+            "target.codespace must be \"new\" or a codespace name (letters, digits and hyphens)"
+                .into(),
+        );
+    }
+    for (key, valid) in [
+        ("branch", branch_name as fn(&str) -> bool),
+        ("machine", machine_name),
+    ] {
+        if let Some(value) = target.get(key) {
+            if !value.as_str().is_some_and(valid) {
+                return Err(format!("target.{key} is not a valid {key} name"));
+            }
+            if name != "new" {
+                return Err(format!(
+                    "target.{key} only applies when creating a codespace (codespace \"new\")"
+                ));
+            }
+        }
+    }
+    if input
+        .get("harness")
+        .is_some_and(|h| h.as_str() != Some("claude"))
+    {
+        return Err("Cloud sessions support Claude only for now (harness \"claude\")".into());
+    }
+    if input["draft"] == true {
+        return Err("A cloud session cannot be started as a draft".into());
+    }
+    if input
+        .get("workspaceMode")
+        .is_some_and(|v| v.as_str() != Some("current"))
+        || input.get("worktreeBase").is_some()
+        || input.get("worktreeCwd").is_some()
+    {
+        return Err("A cloud session runs in its codespace; workspaceMode, worktreeBase and worktreeCwd do not apply".into());
+    }
+    Ok(())
+}
+
+fn validate_codespace_fields(input: &Value) -> Result<(), String> {
+    if let Some(name) = input.get("name").and_then(Value::as_str) {
+        if !codespace_name(name) {
+            return Err("name must be a codespace name (letters, digits and hyphens)".into());
+        }
+    }
+    if input
+        .get("branch")
+        .and_then(Value::as_str)
+        .is_some_and(|b| !branch_name(b))
+    {
+        return Err("branch is not a valid branch name".into());
+    }
+    if input
+        .get("machine")
+        .and_then(Value::as_str)
+        .is_some_and(|m| !machine_name(m))
+    {
+        return Err("machine is not a valid machine type name".into());
+    }
+    if input
+        .get("displayName")
+        .and_then(Value::as_str)
+        .is_some_and(|d| {
+            d.trim().is_empty() || d.chars().count() > 48 || d.chars().any(char::is_control)
+        })
+    {
+        return Err("displayName must be 1 to 48 characters".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +489,126 @@ mod tests {
                 error.starts_with(&format!("{key} must be a non-empty string")),
                 "{error}"
             );
+        }
+    }
+    #[test]
+    fn cloud_target_is_validated_before_anything_is_created() {
+        let ok = |input| validate("sessions.start", &input);
+        assert!(ok(json!({"prompt":"x","target":{"codespace":"new"}})).is_ok());
+        assert!(ok(json!({"prompt":"x","harness":"claude","target":{"codespace":"new","branch":"feat/x","machine":"standardLinux32gb"}})).is_ok());
+        assert!(ok(json!({"prompt":"x","target":{"codespace":"octo-abc123"}})).is_ok());
+        assert!(
+            ok(json!({"prompt":"x","workspaceMode":"current","target":{"codespace":"new"}}))
+                .is_ok()
+        );
+        for (bad, why) in [
+            (json!("new"), "must be an object"),
+            (json!({}), "target.codespace must be"),
+            (json!({"codespace":5}), "target.codespace must be"),
+            (json!({"codespace":"-x"}), "letters, digits and hyphens"),
+            (json!({"codespace":"a b"}), "letters, digits and hyphens"),
+            (json!({"codespace":"a;rm"}), "letters, digits and hyphens"),
+            (json!({"codespace":"new","extra":1}), "does not take extra"),
+            (
+                json!({"codespace":"new","branch":"--force"}),
+                "target.branch",
+            ),
+            (json!({"codespace":"new","branch":"a b"}), "target.branch"),
+            (json!({"codespace":"new","branch":3}), "target.branch"),
+            (
+                json!({"codespace":"new","machine":"bad machine"}),
+                "target.machine",
+            ),
+            (
+                json!({"codespace":"octo-abc","branch":"main"}),
+                "only applies when creating",
+            ),
+            (
+                json!({"codespace":"octo-abc","machine":"basicLinux32gb"}),
+                "only applies when creating",
+            ),
+        ] {
+            let error = ok(json!({"prompt":"x","target":bad})).unwrap_err();
+            assert!(error.contains(why), "{error}");
+        }
+    }
+    #[test]
+    fn cloud_target_rejects_options_that_need_a_local_checkout() {
+        let target = json!({"codespace":"new"});
+        for (extra, why) in [
+            (json!({"harness":"codex"}), "Claude only"),
+            (json!({"draft":true}), "cannot be started as a draft"),
+            (json!({"workspaceMode":"worktree"}), "workspaceMode"),
+            (json!({"workspaceMode":"checkout"}), "workspaceMode"),
+            (json!({"worktreeBase":"main"}), "workspaceMode"),
+            (json!({"worktreeCwd":"/x"}), "workspaceMode"),
+        ] {
+            let mut input = json!({"prompt":"x","target":target});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let error = validate("sessions.start", &input).unwrap_err();
+            assert!(error.contains(why), "{error}");
+        }
+        // Only sessions.start takes a target.
+        assert_eq!(
+            validate(
+                "sessions.send",
+                &json!({"sessionId":1,"prompt":"x","target":target})
+            )
+            .unwrap_err(),
+            "sessions.send does not take target"
+        );
+    }
+    #[test]
+    fn session_ids_may_be_negative_because_cloud_sessions_are_remote() {
+        assert!(validate("sessions.read", &json!({"sessionId":-123456})).is_ok());
+        assert!(validate("sessions.send", &json!({"sessionId":-5,"prompt":"x"})).is_ok());
+        assert!(validate("sessions.stop", &json!({"sessionId":"-5"})).is_ok());
+        assert!(validate("sessions.read", &json!({"sessionId":1.5})).is_err());
+        assert!(validate("sessions.read", &json!({"sessionId":null})).is_err());
+        // Note IDs and parents stay as they were.
+        assert!(validate("notes.read", &json!({"id":-1})).is_err());
+        assert!(validate(
+            "sessions.start",
+            &json!({"prompt":"x","parentSessionId":-4})
+        )
+        .is_err());
+    }
+    #[test]
+    fn codespace_actions_take_exactly_their_fields() {
+        assert!(validate("codespaces.list", &json!({})).is_ok());
+        assert!(validate("codespaces.list", &json!({"project":"/p"})).is_ok());
+        assert!(validate("codespaces.secretsStatus", &json!({})).is_ok());
+        assert!(validate(
+            "codespaces.create",
+            &json!({"branch":"main","machine":"basicLinux32gb","displayName":"mine"})
+        )
+        .is_ok());
+        assert!(validate("codespaces.create", &json!({})).is_ok());
+        assert!(validate("codespaces.stop", &json!({"name":"octo-abc"})).is_ok());
+        assert!(validate("codespaces.delete", &json!({"name":"octo-abc"})).is_ok());
+        for (action, input) in [
+            ("codespaces.list", json!({"name":"x"})),
+            ("codespaces.secretsStatus", json!({"value":"s"})),
+            ("codespaces.create", json!({"name":"x"})),
+            ("codespaces.stop", json!({"branch":"main"})),
+            ("codespaces.delete", json!({"force":true})),
+            ("codespaces.nope", json!({})),
+        ] {
+            assert!(validate(action, &input).is_err(), "{action}");
+        }
+        for (action, input) in [
+            ("codespaces.stop", json!({"name":"a b"})),
+            ("codespaces.delete", json!({"name":"-rf"})),
+            ("codespaces.delete", json!({"name":5})),
+            ("codespaces.create", json!({"branch":"--x"})),
+            ("codespaces.create", json!({"machine":"a;b"})),
+            ("codespaces.create", json!({"displayName":""})),
+            ("codespaces.create", json!({"displayName":"x".repeat(49)})),
+        ] {
+            assert!(validate(action, &input).is_err(), "{action} {input}");
         }
     }
 }

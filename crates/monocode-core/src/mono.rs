@@ -3,6 +3,7 @@
 pub mod api;
 pub mod bridge;
 pub mod cards;
+pub mod cloud_api;
 mod desktop;
 pub mod files;
 pub mod habits;
