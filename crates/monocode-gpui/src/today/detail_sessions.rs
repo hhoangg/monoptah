@@ -136,6 +136,16 @@ impl Today {
         .detach();
     }
 
+    /// The name a note written by session `id` shows: its title when the shell
+    /// pushed the session, else "Session".
+    pub(super) fn session_author(&self, id: i64) -> String {
+        self.sessions
+            .linked
+            .iter()
+            .chain(&self.sessions.candidates)
+            .find(|row| row.id == id)
+            .map_or_else(|| "Session".to_string(), |row| row.title.clone())
+    }
     /// The rows the shell last pushed: (linked, candidates).
     #[cfg(test)]
     pub(crate) fn session_rows(&self) -> (&[SessionRow], &[SessionRow]) {
@@ -562,6 +572,15 @@ mod tests {
         });
         visual.run_until_parked();
         visual.refresh().unwrap();
+    }
+    #[gpui::test]
+    fn a_session_note_is_authored_by_the_session_title(cx: &mut TestAppContext) {
+        let (_window, mut visual, today, _store, _task) = rig(cx);
+        settle(&today, vec![session(7, "Fix the build")], &mut visual);
+        today.read_with(&visual, |today, _| {
+            assert_eq!(today.session_author(7), "Fix the build");
+            assert_eq!(today.session_author(8), "Session");
+        });
     }
     fn click(visual: &mut gpui::VisualTestContext, selector: String) {
         visual.refresh().unwrap();

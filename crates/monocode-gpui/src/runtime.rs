@@ -565,6 +565,23 @@ fn run_turn_using(
                 shlex_quote(&cli.to_string_lossy())
             );
         }
+        if !raw_native_command
+            && settings.mono.is_none()
+            && let Some(task) = {
+                let guard = locked(&store)?;
+                guard
+                    .today_session_task(summary.id)?
+                    .map(|id| guard.today_task(&id))
+                    .transpose()?
+                    .flatten()
+            }
+        {
+            let cli = std::env::current_exe().map_err(|e| e.to_string())?;
+            prompt = format!(
+                "{}\n\n{prompt}",
+                today_task_preamble(&task.key, &task.title, &shlex_quote(&cli.to_string_lossy()))
+            );
+        }
         // Every foreground session receives an independent visual capability.
         // This happens after configuration was persisted, and Settings' env is
         // transport-only, so credentials never enter saved conversation settings.
@@ -1143,6 +1160,13 @@ pub(crate) fn edited_paths(rows: &[Row]) -> Vec<String> {
     paths
 }
 
+/// The per-turn line that tells a plain coding session about its linked Today task.
+fn today_task_preamble(key: &str, title: &str, cli: &str) -> String {
+    format!(
+        "This session is linked to the internal Today task {key} \"{title}\". Only when the user asks, you can read it and add, edit or delete your notes on it with the CLI: {cli} app ACTION --json JSON. Actions: today.current {{}}, today.note {{body?, files?: [absolute paths]}}, today.editNote {{note, body, removeAttachments?}}, today.deleteNote {{note}}. Files are copied into the note; attach reports as .md or self-contained .html. App credentials are in the environment; never print them."
+    )
+}
+
 fn shlex_quote(text: &str) -> String {
     format!(
         "\"{}\"",
@@ -1151,6 +1175,20 @@ fn shlex_quote(text: &str) -> String {
             .replace('$', "\\$")
             .replace('`', "\\`")
     )
+}
+
+#[cfg(test)]
+mod today_preamble_tests {
+    use super::*;
+
+    #[test]
+    fn preamble_names_the_task_and_the_cli() {
+        let line = today_task_preamble("T-7", "Fix login", "\"/bin/monoptah\"");
+        assert_eq!(
+            line,
+            "This session is linked to the internal Today task T-7 \"Fix login\". Only when the user asks, you can read it and add, edit or delete your notes on it with the CLI: \"/bin/monoptah\" app ACTION --json JSON. Actions: today.current {}, today.note {body?, files?: [absolute paths]}, today.editNote {note, body, removeAttachments?}, today.deleteNote {note}. Files are copied into the note; attach reports as .md or self-contained .html. App credentials are in the environment; never print them."
+        );
+    }
 }
 
 #[cfg(test)]

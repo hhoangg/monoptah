@@ -827,3 +827,96 @@ fn a_session_an_agent_starts_is_a_chat_whatever_the_preference(cx: &mut TestAppC
         })
         .unwrap();
 }
+
+fn plain_session(cx: &mut TestAppContext) -> (WindowHandle<Shell>, i64) {
+    let (window, _, caller) = crate::shell::tests::window(cx);
+    (window, caller)
+}
+fn link_to_task(window: WindowHandle<Shell>, session: i64, cx: &mut TestAppContext) {
+    window
+        .update(cx, |shell, _, _| {
+            let store = locked(&shell.store).unwrap();
+            let task = store
+                .today_add(
+                    &monocode_core::today::NewTask {
+                        title: "Ship it".into(),
+                        ..Default::default()
+                    },
+                    &monocode_core::today::Actor::User,
+                    monocode_core::time::now_ms(),
+                )
+                .unwrap();
+            store
+                .today_link_session(session, &task.id, monocode_core::time::now_ms())
+                .unwrap();
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn an_unlinked_session_cannot_use_today_notes(cx: &mut TestAppContext) {
+    let (window, caller) = plain_session(cx);
+    let error = call(window, caller, "cur-1", "today.current", json!({}), cx).unwrap_err();
+    assert!(error.contains("not linked"), "{error}");
+}
+
+#[gpui::test]
+fn a_remote_session_is_refused_today_notes(cx: &mut TestAppContext) {
+    let (window, caller) = plain_session(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&caller].update(cx, |view, _| {
+                view.summary.cwd = "remote://host/project".into();
+            });
+        })
+        .unwrap();
+    let error = call(window, caller, "cur-2", "today.current", json!({}), cx).unwrap_err();
+    assert!(error.contains("remote"), "{error}");
+}
+
+#[gpui::test]
+fn a_read_only_session_reads_its_task_but_cannot_write(cx: &mut TestAppContext) {
+    let (window, caller) = plain_session(cx);
+    link_to_task(window, caller, cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&caller].update(cx, |view, _| view.app_read_only = true);
+        })
+        .unwrap();
+    let current = call(window, caller, "cur-3", "today.current", json!({}), cx).unwrap();
+    assert_eq!(current["task"]["title"], "Ship it");
+    let error = call(
+        window,
+        caller,
+        "note-3",
+        "today.note",
+        json!({"body": "hello"}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(error.contains("read-only"), "{error}");
+}
+
+#[gpui::test]
+fn a_linked_session_writes_a_note_on_its_task(cx: &mut TestAppContext) {
+    let (window, caller) = plain_session(cx);
+    link_to_task(window, caller, cx);
+    call(
+        window,
+        caller,
+        "note-4",
+        "today.note",
+        json!({"body": "from the session"}),
+        cx,
+    )
+    .unwrap();
+    let current = call(window, caller, "cur-4", "today.current", json!({}), cx).unwrap();
+    assert_eq!(current["notes"][0]["body"], "from the session");
+}
+
+#[gpui::test]
+fn a_non_operator_thread_still_cannot_use_other_app_actions(cx: &mut TestAppContext) {
+    let (window, caller) = plain_session(cx);
+    let error = call(window, caller, "list-5", "sessions.list", json!({}), cx).unwrap_err();
+    assert_eq!(error, "Operator is not enabled for this thread.");
+}

@@ -973,10 +973,11 @@ impl Today {
 
     /// A note bubble: author, day, an edited marker, the Edit and Delete actions, body.
     fn note_view(&self, ix: usize, note: &Note, cx: &mut Context<Self>) -> Div {
-        let author = note
-            .mono_id
-            .as_deref()
-            .map_or_else(|| "You".to_string(), |id| self.mono_name(id));
+        let author = match (note.mono_id.as_deref(), note.session_id) {
+            (Some(id), _) => self.mono_name(id),
+            (None, Some(session)) => self.session_author(session),
+            (None, None) => "You".to_string(),
+        };
         let editing = self.editing_note(note);
         div()
             .debug_selector(move || format!("today-activity-{ix}"))

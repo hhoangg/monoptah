@@ -7,6 +7,7 @@ use monocode_core::{
     mono::bridge::{Call, Server},
 };
 use serde_json::{Value, json};
+use std::path::PathBuf;
 
 #[cfg(test)]
 mod tests;
@@ -17,6 +18,8 @@ enum Effect {
     Start(Box<(Session, Settings, bool, bool, Placement)>),
     /// The sessions an archive covered, those the store saved, and why it stopped.
     Archive(Vec<i64>, Vec<i64>, Option<String>),
+    /// A session wrote to its Today task: the page reloads to show it.
+    Today,
 }
 impl Shell {
     pub(super) fn init_app_bridge(&mut self, cx: &mut Context<Self>) {
@@ -109,6 +112,11 @@ impl Shell {
                             }
                             this.app_place_launch(id, placement, reveal, window, cx);
                         }
+                        Effect::Today => {
+                            if let Some(today) = this.today.clone() {
+                                today.update(cx, |today, cx| today.refresh(cx));
+                            }
+                        }
                         Effect::Archive(family, written, error) => {
                             this.finish_archive(
                                 &family,
@@ -132,8 +140,7 @@ impl Shell {
         })
         .detach();
     }
-    fn authorize_app_call(&self, call: &Call, cx: &App) -> Result<(), String> {
-        app::validate_operator(&call.action, &call.input)?;
+    fn check_request_id(call: &Call) -> Result<(), String> {
         if call.request_id.is_empty()
             || call.request_id.len() > 128
             || !call
@@ -143,6 +150,37 @@ impl Shell {
         {
             return Err("request ID must use letters, digits, underscores or hyphens".into());
         }
+        Ok(())
+    }
+    /// A plain coding session's Today task actions. Operator need not be enabled; the
+    /// session only has to exist, be local, and (for writes) not be read-only. Returns the
+    /// roots its attached files must live in.
+    fn authorize_session_today(&self, call: &Call, cx: &App) -> Result<Vec<PathBuf>, String> {
+        Self::check_request_id(call)?;
+        let caller = self
+            .sessions
+            .get(&call.session)
+            .map(|v| v.read(cx))
+            .ok_or("Unknown session.")?;
+        if caller.summary.cwd.starts_with("remote://") {
+            return Err("Today task notes are not available on remote projects".into());
+        }
+        if (caller.app_read_only
+            || caller.settings.plan
+            || caller.settings.access == monocode_core::agent::AccessMode::ReadOnly)
+            && call.action != "today.current"
+        {
+            return Err("This thread's access policy allows read-only app actions.".into());
+        }
+        let mut roots = vec![PathBuf::from(&caller.summary.cwd)];
+        if let Some(tree) = &caller.settings.worktree_cwd {
+            roots.push(PathBuf::from(tree));
+        }
+        Ok(roots)
+    }
+    fn authorize_app_call(&self, call: &Call, cx: &App) -> Result<(), String> {
+        app::validate_operator(&call.action, &call.input)?;
+        Self::check_request_id(call)?;
         let caller = self
             .sessions
             .get(&call.session)
@@ -182,7 +220,12 @@ impl Shell {
         Ok(())
     }
     fn handle_app_call(&mut self, call: Call, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = self.authorize_app_call(&call, cx) {
+        let allowed = if monocode_core::today::actions::session_action(&call.action) {
+            self.authorize_session_today(&call, cx).map(drop)
+        } else {
+            self.authorize_app_call(&call, cx)
+        };
+        if let Err(error) = allowed {
             let _ = call.reply.send(Err(error));
             return;
         }
@@ -351,6 +394,33 @@ impl Shell {
         self.persist(cx);
     }
     fn dispatch_app_call(&mut self, call: Call, window: &mut Window, cx: &mut Context<Self>) {
+        if monocode_core::today::actions::session_action(&call.action) {
+            match self.authorize_session_today(&call, cx) {
+                Ok(roots) => {
+                    let session = call.session;
+                    let action = call.action.clone();
+                    let input = call.input.clone();
+                    let write = mutating(&action);
+                    self.app_background(
+                        call,
+                        move |store| {
+                            let value = monocode_core::today::actions::handle_session(
+                                &*locked(&store)?,
+                                session,
+                                &roots,
+                                &action,
+                                &input,
+                                monocode_core::time::now_ms(),
+                            )?;
+                            Ok((value, if write { Effect::Today } else { Effect::None }))
+                        },
+                        cx,
+                    );
+                }
+                Err(error) => self.finish_app_call(call, Err(error), cx),
+            }
+            return;
+        }
         if let Err(error) = self.authorize_app_call(&call, cx) {
             self.finish_app_call(call, Err(error), cx);
             return;
@@ -700,6 +770,7 @@ fn mutating(action: &str) -> bool {
     !matches!(
         action,
         "models.list"
+            | "today.current"
             | "sessions.list"
             | "sessions.read"
             | "folders.list"
