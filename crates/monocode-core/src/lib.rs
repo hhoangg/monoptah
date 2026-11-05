@@ -8,6 +8,7 @@ pub mod automations;
 pub mod brand;
 pub mod catalog;
 pub mod checkpoint;
+pub mod codespaces;
 pub mod context;
 pub mod contributors;
 pub mod desktop_preferences;
