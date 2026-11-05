@@ -104,6 +104,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Select Xcode for the macOS fallback runner
+        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -156,7 +160,7 @@ jobs:
     name: Package ${{ matrix.kind }}
     needs: plan
     if: needs.plan.outputs.matrix != '[]'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.kind == 'macos' && vars.MONOPTAH_MACOS_RUNNER || matrix.os }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -166,6 +170,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Select Xcode for the macOS fallback runner
+        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
 
       - uses: actions/setup-node@v4
         with:
@@ -286,6 +294,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Select Xcode for the macOS fallback runner
+        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
       - name: Install native rpm build dependencies
         run: |
           dnf install -y dnf-plugins-core
@@ -320,7 +332,7 @@ jobs:
     name: Sign and publish Monoptah Native
     needs: [plan, package, package-rpm]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
-    runs-on: macos-latest
+    runs-on: ${{ vars.MONOPTAH_MACOS_RUNNER || 'macos-latest' }}
     timeout-minutes: 90
     permissions:
       contents: write
@@ -330,6 +342,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Select Xcode for the macOS fallback runner
+        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
 
       - name: Configure version
         run: |
@@ -562,6 +578,10 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         with:
           persist-credentials: false
+
+      - name: Select Xcode for the macOS fallback runner
+        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
 
       - name: Read published sha256
         id: sha

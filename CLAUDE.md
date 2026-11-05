@@ -147,3 +147,12 @@ Two things to keep true after merging from upstream or changing repo settings:
   and R2 secrets), so give it the same `if:`.
 - The rolling feed is replaced with `gh release upload --clobber`. Do not enable GitHub
   immutable releases for this repository, or the feed can never be updated.
+
+### macOS runner capacity fallback
+
+Native CI and Monoptah release jobs accept the repository variable
+`MONOPTAH_MACOS_RUNNER` (default `macos-latest`). If GitHub cannot acquire its
+macOS 26 arm64 runners, set it to `macos-15`; the workflows select the installed
+Xcode 26.3 on that image. The release still requires macOS SDK 26 or newer and
+packages only arm64. Clear the variable to return to the default image. The
+variable affects new jobs, so re-run CI after changing it before tagging a release.
