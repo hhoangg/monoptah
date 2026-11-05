@@ -29,6 +29,7 @@ mod picker_preferences;
 mod project_rail;
 mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
+mod codespaces;
 mod project_settings;
 mod provider_prompt;
 mod quick_composer;
@@ -618,6 +619,7 @@ pub(crate) struct Shell {
     /// Ticket id of the inbox item a session was started from, which Telegram questions name.
     session_tickets: HashMap<i64, String>,
     telegram: telegram::Telegram,
+    codespaces: Option<codespaces::OpenCodespaces>,
     /// The sidebar rails under orchestrators and /operator threads.
     rails: rails::Rails,
     usage_footer: Entity<UsageFooter>,
@@ -1028,6 +1030,7 @@ impl Shell {
             started_by: sidebar_metadata.started_by,
             session_tickets: HashMap::new(),
             telegram: telegram::Telegram::new(),
+            codespaces: None,
             rails: Default::default(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
@@ -5770,6 +5773,11 @@ impl Shell {
                             .icon("paper-plane")
                             .into(),
                     );
+                    items.push(
+                        MenuAction::new("codespaces", "Codespaces setup…")
+                            .icon("cloud-upload")
+                            .into(),
+                    );
                 }
                 if *rail {
                     let mut groups = vec![MenuAction::new("project-group:new", "New group…")];
@@ -5966,6 +5974,8 @@ impl Shell {
                     self.open_background_dialog(path, window, cx);
                 } else if action == "telegram" {
                     self.open_telegram_dialog(path, window, cx);
+                } else if action == "codespaces" {
+                    self.open_codespaces_dialog(path, window, cx);
                 } else if action == "archive" {
                     self.archive_project(&path, window, cx);
                 } else if action == "delete" {
@@ -8896,6 +8906,10 @@ impl Render for Shell {
                     this.close_telegram_topic(window, cx);
                     return;
                 }
+                if this.codespaces.is_some() {
+                    this.close_codespaces_dialog(window, cx);
+                    return;
+                }
                 if this.action_dialog.is_some() {
                     this.close_action_dialog(window, cx);
                     return;
@@ -9110,6 +9124,7 @@ impl Render for Shell {
             .children(self.link_modal(window, cx))
             .children(self.telegram_modal(window, cx))
             .children(self.telegram_topic_modal(window, cx))
+            .children(self.codespaces_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))
