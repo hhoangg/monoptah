@@ -65,6 +65,12 @@ on:
   push:
     tags:
       - "native-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing native-vX.Y.Z tag to release
+        required: true
+        type: string
 
 # Only the publish job writes, so only it gets write access.
 permissions:
@@ -77,6 +83,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   # The update feed the app polls, and the key it verifies the feed with.
   # The key is the public updater key from src-tauri/tauri.conf.json.
   NATIVE_FEED_URL: https://github.com/hhoangg/monoptah/releases/download/native-latest/latest.json
@@ -103,6 +110,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Select Xcode for the macOS fallback runner
         if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
@@ -115,9 +123,13 @@ jobs:
       - name: Check the tag is a plain native release version
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#native-v}"
+          if [[ "$RELEASE_TAG" != native-v* ]]; then
+            echo "Release tag must start with native-v" >&2
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#native-v}"
           if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "Tag $GITHUB_REF_NAME must look like native-vX.Y.Z (pre-release tags are not supported)" >&2
+            echo "Tag $RELEASE_TAG must look like native-vX.Y.Z (pre-release tags are not supported)" >&2
             exit 1
           fi
           echo "MONOCODE_NATIVE_VERSION=$VERSION" >> "$GITHUB_ENV"
@@ -135,10 +147,10 @@ jobs:
         run: |
           set -euo pipefail
           : > "$RUNNER_TEMP/published.txt"
-          if out=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" 2>&1); then
-            echo "::notice::Release $GITHUB_REF_NAME already exists; its published assets are reused and none is replaced."
+          if out=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>&1); then
+            echo "::notice::Release $RELEASE_TAG already exists; its published assets are reused and none is replaced."
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/published.txt"
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/published.txt"
           elif grep -q "HTTP 404" <<<"$out"; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
           else
@@ -170,6 +182,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Select Xcode for the macOS fallback runner
         if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
@@ -203,7 +216,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "MONOCODE_NATIVE_VERSION=${GITHUB_REF_NAME#native-v}" >> "$GITHUB_ENV"
+          echo "MONOCODE_NATIVE_VERSION=${RELEASE_TAG#native-v}" >> "$GITHUB_ENV"
           echo "MONOCODE_NATIVE_UPDATER_ENDPOINT=$NATIVE_FEED_URL" >> "$GITHUB_ENV"
           echo "MONOCODE_NATIVE_UPDATER_PUBKEY=$NATIVE_UPDATER_PUBKEY" >> "$GITHUB_ENV"
           # The macOS runner is memory-bound; the release-cache job in native.yml
@@ -294,6 +307,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Select Xcode for the macOS fallback runner
         if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
@@ -311,7 +325,7 @@ jobs:
       - name: Configure version and update feed
         run: |
           set -euo pipefail
-          echo "MONOCODE_NATIVE_VERSION=${GITHUB_REF_NAME#native-v}" >> "$GITHUB_ENV"
+          echo "MONOCODE_NATIVE_VERSION=${RELEASE_TAG#native-v}" >> "$GITHUB_ENV"
           echo "MONOCODE_NATIVE_UPDATER_ENDPOINT=$NATIVE_FEED_URL" >> "$GITHUB_ENV"
           echo "MONOCODE_NATIVE_UPDATER_PUBKEY=$NATIVE_UPDATER_PUBKEY" >> "$GITHUB_ENV"
       - run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --release
@@ -342,6 +356,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Select Xcode for the macOS fallback runner
         if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
@@ -350,7 +365,7 @@ jobs:
       - name: Configure version
         run: |
           set -euo pipefail
-          echo "MONOCODE_NATIVE_VERSION=${GITHUB_REF_NAME#native-v}" >> "$GITHUB_ENV"
+          echo "MONOCODE_NATIVE_VERSION=${RELEASE_TAG#native-v}" >> "$GITHUB_ENV"
           echo "MONOCODE_NATIVE_UPDATER_ENDPOINT=$NATIVE_FEED_URL" >> "$GITHUB_ENV"
           echo "MONOCODE_NATIVE_UPDATER_PUBKEY=$NATIVE_UPDATER_PUBKEY" >> "$GITHUB_ENV"
 
@@ -396,7 +411,7 @@ jobs:
           set -f
           mkdir -p native-dist
           for name in $REUSE; do
-            gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir native-dist
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir native-dist
           done
           SUM="native-dist/MonoptahNative_${MONOCODE_NATIVE_VERSION}_aarch64.zip.sha256"
           if [[ -f "$SUM" ]]; then
@@ -462,7 +477,7 @@ jobs:
             exit 1
           fi
           if [[ "$EXISTS" == "true" ]]; then
-            PUBLISHED=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            PUBLISHED=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
             # Only files taken from the release may already be on it. A freshly
             # built file (or its .sig) that is already published would be
             # silently skipped below while the feed signs the new bytes.
@@ -470,7 +485,7 @@ jobs:
               name=$(basename "$file")
               base="${name%.sig}"
               if grep -Fxq "$name" <<<"$PUBLISHED" && ! grep -Fxq "$base" <<<"$(tr ' ' '\n' <<<"$REUSE")"; then
-                echo "$name was built by this run but is already published on $GITHUB_REF_NAME; refusing to publish different bytes. Delete that platform's assets from the release by hand and re-run." >&2
+                echo "$name was built by this run but is already published on $RELEASE_TAG; refusing to publish different bytes. Delete that platform's assets from the release by hand and re-run." >&2
                 exit 1
               fi
             done
@@ -481,10 +496,10 @@ jobs:
               fi
             done
             if (( ${#MISSING[@]} > 0 )); then
-              gh release upload "$GITHUB_REF_NAME" "${MISSING[@]}" --repo "$GITHUB_REPOSITORY"
+              gh release upload "$RELEASE_TAG" "${MISSING[@]}" --repo "$GITHUB_REPOSITORY"
             fi
           else
-            gh release create "$GITHUB_REF_NAME" \
+            gh release create "$RELEASE_TAG" \
               "${FILES[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
@@ -578,6 +593,7 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Select Xcode for the macOS fallback runner
         if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
@@ -590,10 +606,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          V="${GITHUB_REF_NAME#native-v}"
+          V="${RELEASE_TAG#native-v}"
           DIR="$RUNNER_TEMP/tap-sha"
           mkdir -p "$DIR"
-          gh release download "$GITHUB_REF_NAME" \
+          gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "MonoptahNative_${V}_aarch64.zip.sha256" \
             --dir "$DIR"
@@ -621,7 +637,7 @@ jobs:
           SHA: ${{ steps.sha.outputs.sha }}
         run: |
           set -euo pipefail
-          V="${GITHUB_REF_NAME#native-v}"
+          V="${RELEASE_TAG#native-v}"
           bash scripts/update-homebrew-cask.sh homebrew-tap/Casks/monoptah-native.rb "$V" "$SHA"
           cd homebrew-tap
           if git diff --quiet; then
