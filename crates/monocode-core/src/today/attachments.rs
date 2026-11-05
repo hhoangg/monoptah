@@ -121,13 +121,15 @@ pub fn agent_files(
     if paths.len() > MAX_PER_NOTE {
         return Err(format!("A note holds at most {MAX_PER_NOTE} attachments"));
     }
+    // Fail closed: a data folder that cannot be resolved cannot be excluded.
     let data_dir = data_dir
         .canonicalize()
-        .unwrap_or_else(|_| data_dir.to_path_buf());
+        .map_err(|_| "The app's data folder could not be resolved.".to_string())?;
+    // A root that cannot be resolved allows nothing.
     let roots: Option<Vec<PathBuf>> = roots.map(|roots| {
         roots
             .iter()
-            .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+            .filter_map(|root| root.canonicalize().ok())
             .collect()
     });
     let hidden = |path: &Path| {

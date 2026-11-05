@@ -178,6 +178,7 @@ pub fn handle_session(
     {
         return Err(format!("{action} does not take {key}"));
     }
+    store.today_roll(now)?;
     let linked = store
         .today_session_task(session_id)?
         .ok_or(SESSION_UNLINKED)?;
@@ -191,7 +192,6 @@ pub fn handle_session(
     let actor = Actor::Session(session_id);
     match action {
         "today.current" => {
-            store.today_roll(now)?;
             let defs = store.today_tags()?;
             let workflow = statuses::resolve(&task, &store.today_statuses()?).clone();
             let mut value = task_json(&task, &defs)?;
@@ -237,10 +237,19 @@ fn write_note(
         .ok_or("Attachment storage is unavailable")?;
     let paths = agent_files(&files, roots, data_dir)?;
     let plan = store.today_note_plan(task_id, &body, paths.len(), actor, now)?;
-    let (attachments, skipped) = plan.copy(&paths)?;
+    let (attachments, skipped) = plan.copy_agent(&paths)?;
     if !skipped.is_empty() {
         plan.discard();
-        return Err(skipped.join("\n"));
+        // Name each file by the path the agent gave, not its resolved form.
+        let named = skipped.iter().map(|message| {
+            paths
+                .iter()
+                .zip(&files)
+                .fold(message.clone(), |text, (resolved, given)| {
+                    text.replace(resolved.to_string_lossy().as_ref(), given)
+                })
+        });
+        return Err(named.collect::<Vec<_>>().join("\n"));
     }
     Ok(store
         .today_note_commit(plan, attachments, skipped, actor, now)?
@@ -2088,8 +2097,12 @@ mod tests {
             .today_note_plan(&id, "hi", validated.len(), &Actor::Mono(a.clone()), NOW)
             .unwrap();
         std::fs::remove_file(&doomed).unwrap();
-        let (_, skipped) = plan.copy(&validated).unwrap();
+        let (_, skipped) = plan.copy_agent(&validated).unwrap();
         assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].contains(validated[1].to_str().unwrap()),
+            "{skipped:?}"
+        );
         plan.discard();
         assert!(store.today_notes(&id).unwrap().is_empty());
         assert!(
@@ -2282,5 +2295,52 @@ mod tests {
             .map(|n| n.body)
             .collect();
         assert_eq!(left, ["user", "mono"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_swapped_for_a_symlink_after_validation_is_refused_at_copy_time() {
+        let (dir, store) = store();
+        let a = mono("a", &[]);
+        sync_ok(&store, &a, "gh", json!([item("gh:1")]));
+        let src = named_dir();
+        let target = file_in(src.path(), "target.md");
+        let victim = file_in(src.path(), "victim.md");
+        let validated =
+            crate::today::attachments::agent_files(std::slice::from_ref(&victim), None, dir.path())
+                .unwrap();
+        std::fs::remove_file(&victim).unwrap();
+        std::os::unix::fs::symlink(&target, &victim).unwrap();
+        let id = task(&store, "gh:1").id;
+        let plan = store
+            .today_note_plan(&id, "hi", 1, &Actor::Mono(a), NOW)
+            .unwrap();
+        let (attached, skipped) = plan.copy_agent(&validated).unwrap();
+        assert!(attached.is_empty());
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].contains(validated[0].to_str().unwrap()));
+        plan.discard();
+        // The plain copy used by the composer is unchanged and follows links.
+        let plan = store
+            .today_note_plan(&id, "hi", 1, &Actor::User, NOW)
+            .unwrap();
+        assert_eq!(plan.copy(&validated).unwrap().0.len(), 1);
+    }
+
+    #[test]
+    fn unresolvable_roots_and_data_dir_fail_closed() {
+        let (dir, _store) = store();
+        let src = named_dir();
+        let file = file_in(src.path(), "a.md");
+        let gone = src.path().join("no-such-root");
+        let roots = [gone];
+        assert!(crate::today::attachments::agent_files(
+            std::slice::from_ref(&file),
+            Some(&roots),
+            dir.path()
+        )
+        .is_err());
+        let no_data = src.path().join("no-such-data");
+        assert!(crate::today::attachments::agent_files(&[file], None, &no_data).is_err());
     }
 }

@@ -40,7 +40,24 @@ impl NotePlan {
             .root
             .as_deref()
             .ok_or("Attachment storage is unavailable")?;
-        Ok(copy_files(root, &self.relative, files))
+        Ok(copy_files(root, &self.relative, files, false))
+    }
+
+    /// Like [`copy`](Self::copy) for files an agent named: each is opened once
+    /// without following a symlink and read from that handle, so a file swapped
+    /// for a link after validation is refused. Messages carry the full path.
+    pub fn copy_agent(
+        &self,
+        files: &[PathBuf],
+    ) -> Result<(Vec<NoteAttachment>, Vec<String>), String> {
+        if files.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let root = self
+            .root
+            .as_deref()
+            .ok_or("Attachment storage is unavailable")?;
+        Ok(copy_files(root, &self.relative, files, true))
     }
     /// Removes the plan's note folder and any copies in it. Call it when the
     /// plan will not be committed.
@@ -197,24 +214,83 @@ impl Store {
     }
 }
 
+/// Reads `path` through one handle opened without following a symlink, after
+/// checking that handle is a regular file within the size limit. Errors read
+/// as the end of a sentence about the file.
+fn read_no_follow(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(true)
+    {
+        return Err("is not a plain file.".into());
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| "could not be read (it may be a link).".to_string())?;
+    let meta = file
+        .metadata()
+        .map_err(|_| "could not be read.".to_string())?;
+    if !meta.is_file() {
+        return Err("is not a file.".into());
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "is larger than {} MB.",
+            MAX_FILE_BYTES / 1024 / 1024
+        ));
+    }
+    let mut data = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| "could not be read.".to_string())?;
+    if data.len() as u64 > MAX_FILE_BYTES {
+        return Err("grew past the size limit.".into());
+    }
+    // No directory on the way may have become a link since it was validated.
+    if path.canonicalize().ok().as_deref() != Some(path) {
+        return Err("changed while it was being attached.".into());
+    }
+    Ok(data)
+}
+
 /// Copies each file into `root/relative`, each under a unique safe name.
 fn copy_files(
     root: &Path,
     relative: &Path,
     files: &[PathBuf],
+    no_follow: bool,
 ) -> (Vec<NoteAttachment>, Vec<String>) {
     let dir = root.join(relative);
     let mut attachments = Vec::new();
     let mut skipped = Vec::new();
     for source in files {
         let name = display_name(source);
-        let copied = check_file(source)
-            .and_then(|_| std::fs::read(source).map_err(|_| format!("{name} could not be read.")))
-            .and_then(|data| {
-                write_attachment_limited(&dir, &name, &data, MAX_FILE_BYTES)
-                    .map(|path| (path, data.len() as u64))
-                    .map_err(|_| format!("{name} could not be saved."))
-            });
+        let shown = if no_follow {
+            source.to_string_lossy().into_owned()
+        } else {
+            name.clone()
+        };
+        let read = if no_follow {
+            read_no_follow(source).map_err(|why| format!("{shown} {why}"))
+        } else {
+            check_file(source).and_then(|_| {
+                std::fs::read(source).map_err(|_| format!("{name} could not be read."))
+            })
+        };
+        let copied = read.and_then(|data| {
+            write_attachment_limited(&dir, &name, &data, MAX_FILE_BYTES)
+                .map(|path| (path, data.len() as u64))
+                .map_err(|_| format!("{name} could not be saved."))
+        });
         match copied {
             Ok((path, size)) => {
                 let leaf = path
