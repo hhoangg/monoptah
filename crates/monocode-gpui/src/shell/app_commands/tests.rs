@@ -830,94 +830,39 @@ fn a_session_an_agent_starts_is_a_chat_whatever_the_preference(cx: &mut TestAppC
 
 mod cloud {
     use super::*;
-    use monocode_core::{
-        cloud_sessions::{CodespaceChoice, Host, Target},
-        codespaces::{GhOutput, GhRunner},
-        remote::Machine,
+    use crate::cloud_wake::fakes::{
+        AUTH_NO_SCOPE, AUTH_OK, Dir, FakeHost, Gh, github_project, install,
     };
-    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use monocode_core::cloud_sessions::{CodespaceChoice, Target};
+    use std::sync::Arc;
 
-    /// The cloud service is process-wide (`CloudApi::install`), so these tests run one at a time.
-    static SERIAL: Mutex<()> = Mutex::new(());
-    /// A scratch directory removed on drop, holding the serial lock.
-    struct Dir(
-        std::path::PathBuf,
-        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
-    );
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    const AUTH_OK: &str = "github.com\n  ✓ Logged in to github.com account me (keyring)\n  - Token scopes: 'codespace', 'repo'\n";
-    const LIST: &str = r#"[{"name":"octo-run","displayName":"run","state":"Shutdown","repository":"octo/widgets"}]"#;
-
-    struct Gh {
+    /// Operator whose project is a real git repo with a GitHub origin, with fake gh and host
+    /// (`state` is what gh reports for the codespace).
+    fn setup_cloud_in(
+        cx: &mut TestAppContext,
         auth: &'static str,
-        calls: Mutex<Vec<String>>,
-    }
-    impl GhRunner for Gh {
-        fn run(&self, args: &[String], _: Option<&str>) -> Result<GhOutput, String> {
-            let line = args.join(" ");
-            self.calls.lock().unwrap().push(line.clone());
-            let stdout = if line.contains("auth status") {
-                self.auth
-            } else if line.contains("codespace list") {
-                LIST
-            } else if line.contains("codespace view") {
-                r#"{"state":"Shutdown"}"#
-            } else if line.contains("codespace stop") || line.contains("codespace delete") {
-                ""
-            } else if line.contains("secrets") {
-                r#"{"secrets":[]}"#
-            } else {
-                panic!("unexpected gh call: {line}")
-            };
-            Ok(GhOutput {
-                success: true,
-                stdout: stdout.into(),
-                stderr: String::new(),
+        state: &'static str,
+    ) -> (
+        WindowHandle<Shell>,
+        i64,
+        String,
+        Arc<FakeHost>,
+        Arc<Gh>,
+        Dir,
+    ) {
+        let (window, _, caller) = setup(cx);
+        let dir = github_project();
+        let path = dir.0.to_str().unwrap().to_owned();
+        let store = window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&caller].update(cx, |v, _| v.summary.cwd = path.clone());
+                shell.session_summaries.get_mut(&caller).unwrap().cwd = path.clone();
+                shell.store.clone()
             })
-        }
+            .unwrap();
+        let (gh, host) = install(store, auth, state);
+        (window, caller, path, host, gh, dir)
     }
-    struct FakeHost(Mutex<Vec<String>>);
-    fn machine(name: &str) -> Machine {
-        Machine {
-            id: format!("m-{name}"),
-            name: name.into(),
-            endpoint: format!("codespace://{name}"),
-            environment_id: format!("env-{name}"),
-            ssh: None,
-            codespace: Some(name.into()),
-        }
-    }
-    impl Host for FakeHost {
-        fn machines(&self) -> Result<Vec<Machine>, String> {
-            Ok(vec![machine("octo-run")])
-        }
-        fn connect(&self, name: &str, _: &str, _: &mut dyn FnMut(&str)) -> Result<Machine, String> {
-            Ok(machine(name))
-        }
-        fn ensure(&self, id: &str, _: &AtomicBool, _: &mut dyn FnMut(&str)) -> Result<(), String> {
-            self.0.lock().unwrap().push(format!("ensure {id}"));
-            Ok(())
-        }
-        fn request(&self, id: &str, method: &str, params: Value) -> Result<Value, String> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("request {id} {method}"));
-            Ok(json!({"id":"project-1","cwd":params["cwd"]}))
-        }
-        fn disconnect(&self, id: &str) -> Result<(), String> {
-            self.0.lock().unwrap().push(format!("disconnect {id}"));
-            Ok(())
-        }
-    }
-
-    /// Operator whose project is a real git repo with a GitHub origin, with fake gh and host.
-    /// Returns the project path, the host log and the gh double.
     fn setup_cloud(
         cx: &mut TestAppContext,
         auth: &'static str,
@@ -929,50 +874,7 @@ mod cloud {
         Arc<Gh>,
         Dir,
     ) {
-        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let (window, _, caller) = setup(cx);
-        let dir = Dir(
-            std::env::temp_dir().join(format!(
-                "monoptah-cloud-api-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )),
-            serial,
-        );
-        std::fs::create_dir_all(&dir.0).unwrap();
-        let path = dir.0.to_str().unwrap().to_owned();
-        for args in [
-            vec!["init", "-q", "-b", "trunk"],
-            vec!["remote", "add", "origin", "https://github.com/octo/widgets"],
-        ] {
-            assert!(
-                std::process::Command::new("git")
-                    .args(["-C", &path])
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        let (store, gh, host) = window
-            .update(cx, |shell, _, cx| {
-                shell.sessions[&caller].update(cx, |v, _| v.summary.cwd = path.clone());
-                shell.session_summaries.get_mut(&caller).unwrap().cwd = path.clone();
-                (
-                    shell.store.clone(),
-                    Arc::new(Gh {
-                        auth,
-                        calls: Mutex::new(vec![]),
-                    }),
-                    Arc::new(FakeHost(Mutex::new(vec![]))),
-                )
-            })
-            .unwrap();
-        CloudApi::install(Arc::new(CloudApi::new(gh.clone(), host.clone(), store)));
-        (window, caller, path, host, gh, dir)
+        setup_cloud_in(cx, auth, "Shutdown")
     }
     /// A cloud session of `path` on the fake codespace, added to the shell.
     fn add_cloud_session(window: WindowHandle<Shell>, path: &str, cx: &mut TestAppContext) -> i64 {
@@ -1046,14 +948,25 @@ mod cloud {
     fn cloud_sessions_accept_the_session_actions_of_their_local_project(cx: &mut TestAppContext) {
         let (window, caller, path, host, _, _dir) = setup_cloud(cx, AUTH_OK);
         let cloud = add_cloud_session(window, &path, cx);
-        // A session whose history cannot load (its codespace is not connected) is woken,
-        // then the caller is asked to retry; nothing is sent meanwhile.
+        // A draft never wakes a codespace.
         host.0.lock().unwrap().clear();
         let error = call(
             window,
             caller,
             "d1",
             "sessions.draft",
+            json!({"sessionId":cloud,"prompt":"look at the failing test"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(error.contains("busy, loading"), "{error}");
+        assert!(host.0.lock().unwrap().is_empty());
+        // A send to a session on a stopped codespace wakes it, then asks for a retry.
+        let error = call(
+            window,
+            caller,
+            "d2",
+            "sessions.send",
             json!({"sessionId":cloud,"prompt":"look at the failing test"}),
             cx,
         )
@@ -1102,6 +1015,27 @@ mod cloud {
     }
 
     #[gpui::test]
+    fn a_send_to_a_cloud_session_that_is_still_loading_does_not_wake_an_available_codespace(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, caller, path, host, _, _dir) = setup_cloud_in(cx, AUTH_OK, "Available");
+        let cloud = add_cloud_session(window, &path, cx);
+        host.0.lock().unwrap().clear();
+        let error = call(
+            window,
+            caller,
+            "a1",
+            "sessions.send",
+            json!({"sessionId":cloud,"prompt":"hello"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(error.contains("busy, loading"), "{error}");
+        assert!(!error.contains("woken"), "{error}");
+        assert!(host.0.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
     fn codespace_actions_list_stop_and_report_secrets(cx: &mut TestAppContext) {
         let (window, caller, _, _, gh, _dir) = setup_cloud(cx, AUTH_OK);
         let list = call(window, caller, "c1", "codespaces.list", json!({}), cx).unwrap();
@@ -1136,7 +1070,9 @@ mod cloud {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|c| c.contains("codespace stop -c octo-run"))
+                .any(|c| c.contains("codespace stop -c octo-run")),
+            "{:?}",
+            gh.calls.lock().unwrap()
         );
         // A codespace of another repository is refused before gh is asked to stop it.
         let error = call(
@@ -1219,10 +1155,7 @@ mod cloud {
     fn starting_a_cloud_session_fails_cleanly_without_the_scope_or_a_github_origin(
         cx: &mut TestAppContext,
     ) {
-        let (window, caller, path, _, gh, _dir) = setup_cloud(
-            cx,
-            "github.com\n  ✓ Logged in to github.com account me (keyring)\n  - Token scopes: 'repo'\n",
-        );
+        let (window, caller, path, _, gh, _dir) = setup_cloud(cx, AUTH_NO_SCOPE);
         let before = window
             .update(cx, |s, _, _| s.session_summaries.len())
             .unwrap();

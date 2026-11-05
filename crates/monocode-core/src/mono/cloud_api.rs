@@ -74,6 +74,13 @@ pub fn is_cloud_session_of(store: &Store, id: i64, project: &str) -> bool {
     })
 }
 
+/// Error text for a start that failed after its codespace was created.
+pub fn created_note(codespace: &str, error: &str) -> String {
+    format!(
+        "{error} (codespace {codespace} was created and kept; retry with target {{\"codespace\":\"{codespace}\"}} or remove it with codespaces.delete)"
+    )
+}
+
 fn current_branch(project: &str) -> Result<String, String> {
     let out = std::process::Command::new("git")
         .args(["-C", project, "rev-parse", "--abbrev-ref", "HEAD"])
@@ -230,16 +237,50 @@ impl CloudApi {
 
     /// Prepares the codespace for `sessions.start`: creating one needs a branch (default: the
     /// project's current branch). BLOCKS for minutes when creating or booting.
+    ///
+    /// A codespace created here is never deleted on failure (it may hold the user's work and
+    /// billing stops by itself when it idles). When preparing fails after it was created, the
+    /// error names it so the caller retries with `target {codespace:"<name>"}` instead of
+    /// creating a second one.
     pub fn prepare(
         &self,
         project: &str,
         mut target: Target,
         progress: &mut dyn FnMut(&str),
     ) -> Result<CloudBinding, String> {
-        if target.codespace == CodespaceChoice::New && target.branch.is_none() {
+        let creating = target.codespace == CodespaceChoice::New;
+        if creating && target.branch.is_none() {
             target.branch = Some(current_branch(project)?);
         }
-        self.cloud.prepare_target(project, target, progress)
+        let before = creating.then(|| self.codespace_names(project)).flatten();
+        match self.cloud.prepare_target(project, target, progress) {
+            Ok(binding) => {
+                // The state cache may still say Shutdown/Starting for a reused codespace.
+                self.cloud.invalidate(&binding.codespace);
+                Ok(binding)
+            }
+            Err(error) => {
+                let created = before.and_then(|before| {
+                    self.codespace_names(project)?
+                        .into_iter()
+                        .find(|name| !before.contains(name))
+                });
+                Err(match created {
+                    Some(name) => created_note(&name, &error),
+                    None => error,
+                })
+            }
+        }
+    }
+    fn codespace_names(&self, project: &str) -> Option<Vec<String>> {
+        let repo = self.cloud.repo_for(project).ok()?;
+        Some(
+            codespaces::list(&*self.gh, &repo)
+                .ok()?
+                .into_iter()
+                .map(|c| c.name)
+                .collect(),
+        )
     }
     /// A blank session on the binding (Claude only).
     pub fn create_session(

@@ -364,6 +364,7 @@ fn secrets_status_without_the_scope_explains_instead_of_failing() {
 fn preparing_a_new_target_uses_the_current_branch_by_default() {
     let gh = FakeGh::new(vec![
         ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok("[]")),
         ("codespace create", ok("octo-new1\n")),
         ("codespace view", ok(r#"{"state":"Available"}"#)),
     ]);
@@ -470,4 +471,78 @@ fn waking_a_cloud_session_ensures_its_machine_and_ignores_local_sessions() {
         *fx.host.log.lock().unwrap(),
         vec!["ensure m-octo-abc".to_string()]
     );
+}
+
+#[test]
+fn a_failed_new_start_names_the_codespace_it_created() {
+    // gh creates the codespace, then it never becomes available.
+    struct Flaky(FakeGh, Mutex<usize>);
+    impl GhRunner for Flaky {
+        fn run(&self, args: &[String], stdin: Option<&str>) -> Result<GhOutput, String> {
+            let line = args.join(" ");
+            if line.contains("codespace list") {
+                let mut n = self.1.lock().unwrap();
+                *n += 1;
+                // First listing: nothing. Later ones: the new codespace.
+                return ok(if *n == 1 {
+                    "[]"
+                } else {
+                    r#"[{"name":"octo-new1","state":"Provisioning"}]"#
+                });
+            }
+            if line.contains("codespace view") {
+                return ok(r#"{"state":"Failed"}"#);
+            }
+            self.0.run(args, stdin)
+        }
+    }
+    let gh: Arc<dyn GhRunner> = Arc::new(Flaky(
+        Arc::try_unwrap(FakeGh::new(vec![
+            ("auth status", ok(AUTH_OK)),
+            ("codespace create", ok("octo-new1\n")),
+        ]))
+        .ok()
+        .unwrap(),
+        Mutex::new(0),
+    ));
+    let fx = fixture(&FakeGh::new(vec![]));
+    let api = CloudApi::new(gh, fx.host.clone(), fx.store.clone());
+    let error = api
+        .prepare(
+            &fx.path(),
+            Target {
+                codespace: CodespaceChoice::New,
+                branch: None,
+                machine: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("codespace octo-new1 was created and kept"),
+        "{error}"
+    );
+    assert!(
+        error.contains(r#"target {"codespace":"octo-new1"}"#),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_named_start_error_is_not_decorated() {
+    let gh = FakeGh::new(vec![("auth status", ok(AUTH_NO_SCOPE))]);
+    let fx = fixture(&gh);
+    let error = fx
+        .api
+        .prepare(
+            &fx.path(),
+            Target {
+                codespace: CodespaceChoice::Named("octo-abc".into()),
+                branch: None,
+                machine: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+    assert!(!error.contains("was created"), "{error}");
 }

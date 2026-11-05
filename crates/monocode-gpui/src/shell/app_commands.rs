@@ -463,6 +463,14 @@ impl Shell {
                     // Creating or waking a codespace takes minutes; this runs off the UI thread and
                     // no session row exists until it is ready. A retry with the same request ID
                     // waits for it (the app answers "still running", then replays the result).
+                    let models=if input.get("model").is_some() || input.get("modelSettings").is_some() || input.get("effort").is_some() {
+                        monocode_core::catalog::models_for(kind,&settings.account)?
+                    }else{monocode_core::catalog::cached_models_for(kind,&settings.account).unwrap_or_default()};
+                    let mut settings=app::launch_settings(&input,&provider,settings,kind,&models)?;
+                    settings.revision=0;
+                    let title=app::optional_text(&input,"title",160)?.unwrap_or_else(||prompt.chars().take(160).collect());
+                    // Everything cheap is validated above; only now is a codespace created (minutes).
+                    let creating = matches!(&cloud, Some(t) if t.codespace == monocode_core::cloud_sessions::CodespaceChoice::New);
                     let binding = match cloud {
                         Some(target) => {
                             let api = CloudApi::shared(&store)?;
@@ -470,12 +478,7 @@ impl Shell {
                         }
                         None => None,
                     };
-                    let models=if input.get("model").is_some() || input.get("modelSettings").is_some() || input.get("effort").is_some() {
-                        monocode_core::catalog::models_for(kind,&settings.account)?
-                    }else{monocode_core::catalog::cached_models_for(kind,&settings.account).unwrap_or_default()};
-                    let mut settings=app::launch_settings(&input,&provider,settings,kind,&models)?;
-                    settings.revision=0;
-                    let title=app::optional_text(&input,"title",160)?.unwrap_or_else(||prompt.chars().take(160).collect());
+                    let built=(||{
                     // Always a chat: the app drives this session, whatever the surface preference.
                     let mut store=locked(&store)?;
                     let cwd=binding.as_ref().map_or(project.as_str(),|b|b.project_key.as_str());
@@ -497,6 +500,9 @@ impl Shell {
                         value["codespaceState"]=json!("available");
                     }
                     Ok((value,if fresh {Effect::Start(Box::new((summary,settings,draft,reveal,placement)))}else{Effect::None}))
+                    })();
+                    // A codespace created for this start is kept: say so, so a retry targets it.
+                    built.map_err(|e| match &binding { Some(b) if creating => cloud_api::created_note(&b.codespace,&e), _ => e })
                 },cx);
                 return;
             }
@@ -621,33 +627,35 @@ impl Shell {
                             Ok(json!({"sessionId":id,"stopped":true}))
                         } else {
                             view.update(cx, |v, cx| v.load(cx));
-                            // A cloud session whose history cannot load is usually on a stopped
-                            // codespace: wake it (off the UI thread), reload, and ask for a retry.
-                            if self
-                                .session_metadata(id, cx)
-                                .summary
-                                .cwd
-                                .starts_with("remote://")
+                            // A cloud session whose history cannot load is on a codespace that may be
+                            // stopped: wake it (a draft never does) and ask for a retry.
+                            if action == "sessions.send"
+                                && self
+                                    .session_metadata(id, cx)
+                                    .summary
+                                    .cwd
+                                    .starts_with("remote://")
                                 && view.read(cx).needs_history_restore()
                                 && locked(&self.store)
                                     .is_ok_and(|s| cloud_api::is_cloud_session_of(&s, id, &project))
                             {
                                 let store = self.store.clone();
-                                let view = view.clone();
-                                let wake = cx.background_executor().spawn(async move {
-                                    CloudApi::shared(&store)?.wake(id, &store)
-                                });
-                                cx.spawn(async move |_, cx| {
-                                    if wake.await.is_ok() {
-                                        view.update(cx, |v, cx| v.load(cx));
-                                    }
+                                cx.spawn(async move |this, cx| {
+                                    let woke = crate::cloud_wake::wake_if_stopped(store, id, view, cx).await;
+                                    let _ = this.update(cx, |this, cx| {
+                                        this.finish_app_call(
+                                            call,
+                                            Err(if woke {
+                                                "The session's codespace was stopped and is being woken. Retry in a minute (with a new request ID)."
+                                            } else {
+                                                "Session is busy, loading, or has an unsent draft. Its draft was preserved."
+                                            }
+                                            .into()),
+                                            cx,
+                                        )
+                                    });
                                 })
                                 .detach();
-                                self.finish_app_call(
-                                    call,
-                                    Err("The session's codespace is not connected. It is being woken; retry in a minute (with a new request ID).".into()),
-                                    cx,
-                                );
                                 return;
                             }
                             if !view.read(cx).ready_for_external(cx)

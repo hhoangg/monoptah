@@ -227,7 +227,7 @@ fn id(v: &Value, key: &str) -> Result<i64, String> {
     v.get(key)
         .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
         // Cloud sessions live in the remote store, whose session IDs are negative.
-        .filter(|n| *n > 0 || (key == "sessionId" && *n != 0))
+        .filter(|n| *n > 0 || (matches!(key, "sessionId" | "besideSessionId") && *n != 0))
         .ok_or_else(|| format!("Provide {key}"))
 }
 fn flag(v: &Value, key: &str, default: bool) -> bool {
@@ -754,6 +754,17 @@ impl Monos {
                             if let Err(e) = sent {
                                 self.finish_call(call, Err(e), cx);
                                 return;
+                            }
+                            // The send is queued until the history loads, which a stopped codespace
+                            // never allows: wake it (a draft never does), and the queue flushes.
+                            if action == "sessions.send" && !view.read(cx).ready_for_external(cx) {
+                                let store = self.store.clone();
+                                let view = view.clone();
+                                cx.spawn(async move |_, cx| {
+                                    crate::cloud_wake::wake_if_stopped(store, session, view, cx)
+                                        .await;
+                                })
+                                .detach();
                             }
                             if flag(&input, "notifyOnComplete", false) {
                                 if let Some(m) = self.roster.get_mut(&mono.id) {
@@ -1292,39 +1303,48 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             settings.revision = 0;
             let title = app::optional_text(&input, "title", 160)?
                 .unwrap_or_else(|| prompt.chars().take(160).collect());
-            // A cloud session needs its codespace first (minutes: this runs off the UI thread and
-            // no row exists until it is ready); the store is not locked meanwhile.
+            // Every check that needs the store runs before a codespace is created.
+            let mut parent = parent;
+            {
+                let db = locked(&store)?;
+                if let Some(candidate) = parent {
+                    let key = monocode_core::files::path_key(&project);
+                    let known = db.sessions()?.iter().any(|s| {
+                        s.id == candidate && monocode_core::files::path_key(&s.cwd) == key
+                    });
+                    let child = is_child_launch(&db.started_links()?, &launches, candidate);
+                    if !known || child {
+                        if !options.lenient_parent {
+                            return Err(if !known {
+                                "Session was not found in this project"
+                            } else {
+                                "parentSessionId cannot be a session started under another one; a child of a child is not allowed"
+                            }.into());
+                        }
+                        parent = None;
+                    }
+                }
+            }
+            // A cloud session needs its codespace (minutes: this runs off the UI thread and no row
+            // exists until it is ready); the store is not locked meanwhile. A codespace created for
+            // a start that then fails is kept, and the error names it so a retry can target it.
+            let creating = matches!(&cloud, Some(t) if t.codespace == monocode_core::cloud_sessions::CodespaceChoice::New);
             let binding = match cloud {
                 Some(target) => {
                     Some(CloudApi::shared(&store)?.prepare(&project, target, &mut |_| {})?)
                 }
                 None => None,
             };
-            let mut db = locked(&store)?;
-            let mut parent = parent;
-            if let Some(candidate) = parent {
-                let key = monocode_core::files::path_key(&project);
-                let known = db
-                    .sessions()?
-                    .iter()
-                    .any(|s| s.id == candidate && monocode_core::files::path_key(&s.cwd) == key);
-                let child = is_child_launch(&db.started_links()?, &launches, candidate);
-                if !known || child {
-                    if !options.lenient_parent {
-                        return Err(if !known {
-                                "Session was not found in this project"
-                            } else {
-                                "parentSessionId cannot be a session started under another one; a child of a child is not allowed"
-                            }.into());
-                    }
-                    parent = None;
-                }
-            }
+            let note = |e: String| match &binding {
+                Some(b) if creating => cloud_api::created_note(&b.codespace, &e),
+                _ => e,
+            };
+            let mut db = locked(&store).map_err(note)?;
             // Always a chat: the app drives this session, whatever the surface preference.
             let cwd = binding
                 .as_ref()
                 .map_or(project.as_str(), |b| b.project_key.as_str());
-            let mut summary = db.create(&provider, cwd)?;
+            let mut summary = db.create(&provider, cwd).map_err(note)?;
             let mut made = None;
             let built = (|| {
                 // A cloud session has no local checkout to prepare.
@@ -1361,7 +1381,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                     ),
                     _ => e,
                 };
-                return Err(e);
+                return Err(note(e));
             }
             let mut result = json!({"sessionId":summary.id,"accepted":true,"project":project});
             if let Some(binding) = &binding {

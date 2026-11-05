@@ -134,6 +134,15 @@ impl Shell {
         self.started_by.insert(child, parent);
         self.invalidate_chrome(cx);
     }
+    /// Puts a session made in the store into the shell, as the sidebar does for a cloud session.
+    #[cfg(test)]
+    pub(crate) fn mono_add_session(
+        &mut self,
+        summary: monocode_core::store::Session,
+        cx: &mut Context<Self>,
+    ) {
+        self.add(summary, cx);
+    }
     #[cfg(test)]
     pub(crate) fn mono_started_by(&self, id: i64) -> Option<i64> {
         self.started_by.get(&id).copied()
