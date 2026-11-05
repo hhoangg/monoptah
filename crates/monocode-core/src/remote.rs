@@ -10,7 +10,8 @@ pub use ssh::{JobView, Prompt, SshTarget};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,7 +21,13 @@ pub struct Connections {
     store: Mutex<()>,
     tunnels: Tunnels,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
+    /// In-flight codespace wakes by machine id, so concurrent callers share one.
+    wakes: Mutex<HashMap<String, WakeSlot>>,
 }
+
+type WakeSlot = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
+/// Error returned when a wake was cancelled by its caller.
+pub const WAKE_CANCELLED: &str = "Wake cancelled";
 
 impl Connections {
     /// Uses the same connection store as the Tauri desktop.
@@ -30,6 +37,7 @@ impl Connections {
             store: Mutex::new(()),
             tunnels: Tunnels::default(),
             jobs: Mutex::new(HashMap::new()),
+            wakes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -815,24 +823,101 @@ impl Connections {
     }
 
     /// Make sure a codespace machine is connected, waking the codespace if
-    /// needed. No-op when the tunnel already answers `environment.describe`;
-    /// otherwise runs `codespace_reconnect` and waits for it. BLOCKS for as
-    /// long as the codespace takes to start (minutes): call it from a
-    /// background thread, never the UI thread. Only user-initiated actions
-    /// should call it; background polling must not.
+    /// needed. See `ensure_codespace_with`; no cancel, no progress.
     pub fn ensure_codespace(self: &Arc<Self>, machine_id: &str) -> Result<(), String> {
-        match self.request(machine_id, "environment.describe", json!({})) {
-            Ok(_) => return Ok(()),
-            Err(error) if error.starts_with("Codespace is not connected") => {}
-            Err(error) => return Err(error),
-        }
-        let job = self.codespace_reconnect(machine_id)?;
-        loop {
-            let view = self.ssh_poll(&job)?;
-            if view.done {
-                return view.error.map_or(Ok(()), Err);
+        self.ensure_codespace_with(machine_id, &AtomicBool::new(false), &mut |_| {})
+    }
+
+    /// No-op when the tunnel already answers `environment.describe`; otherwise
+    /// runs `codespace_reconnect` and waits for it. BLOCKS for as long as the
+    /// codespace takes to start (minutes): call it from a background thread,
+    /// never the UI thread. Only user-initiated actions should call it.
+    ///
+    /// * `progress` fires (once) only when a wake actually starts or is joined.
+    /// * Concurrent callers for the same machine share one reconnect job.
+    /// * Setting `cancel` aborts this caller's wait with `WAKE_CANCELLED` and,
+    ///   if it owns the job, cancels the job.
+    pub fn ensure_codespace_with(
+        self: &Arc<Self>,
+        machine_id: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(), String> {
+        self.run_coalesced(machine_id, cancel, progress, |progress| {
+            match self.request(machine_id, "environment.describe", json!({})) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.starts_with("Codespace is not connected") => {}
+                Err(error) => return Err(error),
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            progress("Waking codespace…");
+            let job = self.codespace_reconnect(machine_id)?;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = self.ssh_cancel(&job);
+                    return Err(WAKE_CANCELLED.into());
+                }
+                let view = self.ssh_poll(&job)?;
+                if view.done {
+                    return view.error.map_or(Ok(()), Err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+    }
+
+    fn run_coalesced(
+        &self,
+        key: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+        work: impl FnOnce(&mut dyn FnMut(&str)) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut work = Some(work);
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(WAKE_CANCELLED.into());
+            }
+            let (slot, leader) = {
+                let mut wakes = self.wakes.lock().map_err(|_| "Wake state is unavailable")?;
+                match wakes.get(key) {
+                    Some(slot) => (slot.clone(), false),
+                    None => {
+                        let slot: WakeSlot = Arc::new((Mutex::new(None), Condvar::new()));
+                        wakes.insert(key.into(), slot.clone());
+                        (slot, true)
+                    }
+                }
+            };
+            if leader {
+                let result = work.take().expect("leader runs once")(progress);
+                if let Ok(mut wakes) = self.wakes.lock() {
+                    wakes.remove(key);
+                }
+                *slot.0.lock().unwrap() = Some(result.clone());
+                slot.1.notify_all();
+                return result;
+            }
+            progress("Waking codespace…");
+            let mut guard = slot.0.lock().unwrap();
+            let result = loop {
+                if let Some(result) = guard.clone() {
+                    break result;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(WAKE_CANCELLED.into());
+                }
+                guard = slot
+                    .1
+                    .wait_timeout(guard, std::time::Duration::from_millis(100))
+                    .unwrap()
+                    .0;
+            };
+            drop(guard);
+            // The leader's caller gave up; this caller did not.
+            if result.as_ref().err().is_some_and(|e| e == WAKE_CANCELLED) {
+                continue;
+            }
+            return result;
         }
     }
 
@@ -1366,5 +1451,83 @@ else:
         let value = serde_json::to_string(&stored.public()).unwrap();
         assert!(!value.contains("secret"));
         assert!(!value.contains("token"));
+    }
+
+    #[test]
+    fn concurrent_wakes_share_one_job_and_cancel_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let waking = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let cancel = AtomicBool::new(false);
+                    connections
+                        .run_coalesced(
+                            "m",
+                            &cancel,
+                            &mut |_| {
+                                waking.fetch_add(1, Ordering::SeqCst);
+                            },
+                            |_| {
+                                runs.fetch_add(1, Ordering::SeqCst);
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        // Callers that arrived during the job joined it; late ones ran again.
+        assert!(
+            runs.load(Ordering::SeqCst) < 4,
+            "{}",
+            runs.load(Ordering::SeqCst)
+        );
+        assert!(waking.load(Ordering::SeqCst) >= 1);
+        assert!(connections.wakes.lock().unwrap().is_empty());
+
+        // Pre-cancelled: no work at all.
+        let cancel = AtomicBool::new(true);
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let error = connections
+            .run_coalesced("m", &cancel, &mut |_| {}, |_| {
+                ran.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error, WAKE_CANCELLED);
+        assert!(!ran.load(Ordering::SeqCst));
+
+        // A follower whose leader was cancelled retries instead of failing.
+        let leader_cancel = Arc::new(AtomicBool::new(false));
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let c = leader_cancel.clone();
+            let conn = &connections;
+            let leader = scope.spawn(move || {
+                conn.run_coalesced("m", &c, &mut |_| {}, |_| {
+                    while !c.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(WAKE_CANCELLED.into())
+                })
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let follower = scope.spawn(|| {
+                let cancel = AtomicBool::new(false);
+                connections.run_coalesced("m", &cancel, &mut |_| {}, |_| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            leader_cancel.store(true, Ordering::SeqCst);
+            assert_eq!(leader.join().unwrap().unwrap_err(), WAKE_CANCELLED);
+            follower.join().unwrap().unwrap();
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

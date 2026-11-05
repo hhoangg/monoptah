@@ -500,6 +500,7 @@ pub(crate) fn run_with_client(
     tx: async_channel::Sender<Update>,
 ) {
     let mut latest_rows = Vec::new();
+    let mut attaching_run = false;
     let result = (|| -> Result<(), String> {
         if tx.is_closed() {
             return Ok(());
@@ -516,6 +517,7 @@ pub(crate) fn run_with_client(
             .take()
             .unwrap_or_else(|| json!({"type":"send"}));
         let attaching = action["type"] == "attach";
+        attaching_run = attaching;
         let retrying = action["type"] == "retry";
         if !attaching
             && let Some(recovery) = binding
@@ -536,11 +538,20 @@ pub(crate) fn run_with_client(
             // blocking for the boot is fine. Attaching never wakes.
             if binding.project.codespace.is_some() {
                 monocode_core::cloud_sessions::require_claude(&binding.summary.provider)?;
-                let mut waking = update("Waking codespace…", false);
-                waking.start = latest_rows.len();
-                let _ = tx.send_blocking(waking);
+                // Stop cancels the wake; the status line shows it only when a
+                // reconnect actually starts (a connected codespace is instant).
+                let start = latest_rows.len();
+                monocode_core::cloud_sessions::ensure_before_send(
+                    &client,
+                    &binding,
+                    &cancel,
+                    &mut |message| {
+                        let mut waking = update(message, false);
+                        waking.start = start;
+                        let _ = tx.send_blocking(waking);
+                    },
+                )?;
             }
-            monocode_core::cloud_sessions::ensure_before_send(&client, &binding)?;
         }
         if !attaching && !retrying {
             if !binding.outbox.is_empty() {
@@ -797,7 +808,13 @@ pub(crate) fn run_with_client(
         // A stopped or unreachable codespace is a state of the cloud session,
         // not a failure: say so plainly instead of surfacing the transport error.
         let error = if monocode_core::cloud_sessions::is_not_connected(&error) {
-            "Codespace is stopped. Send a message to wake it.".to_string()
+            if attaching_run {
+                "Codespace is stopped. Send a message to wake it.".to_string()
+            } else {
+                "Could not reach the codespace. Try sending again.".to_string()
+            }
+        } else if error == monocode_core::remote::WAKE_CANCELLED {
+            "Ready".to_string()
         } else {
             error
         };

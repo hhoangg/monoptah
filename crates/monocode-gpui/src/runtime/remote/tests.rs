@@ -844,7 +844,7 @@ fn cloud_sessions_reject_other_harnesses_before_any_transport() {
 }
 
 #[test]
-fn cloud_send_reports_waking_before_the_host_is_asked_anything_else() {
+fn cloud_send_on_a_connected_codespace_does_not_flash_waking() {
     let dir = Directory::new();
     let store = dir.store();
     let binding = cloud_binding(&store, "claude");
@@ -864,9 +864,11 @@ fn cloud_send_reports_waking_before_the_host_is_asked_anything_else() {
         Arc::new(AtomicBool::new(false)),
         tx,
     );
-    let first = receive(&rx);
-    assert_eq!(first.status, "Waking codespace…");
-    assert!(!first.finished);
-    let last = receive(&rx);
-    assert!(last.finished);
+    loop {
+        let update = receive(&rx);
+        assert_ne!(update.status, "Waking codespace…");
+        if update.finished {
+            break;
+        }
+    }
 }

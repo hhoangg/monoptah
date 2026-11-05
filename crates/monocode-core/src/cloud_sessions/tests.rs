@@ -94,7 +94,16 @@ impl Host for FakeHost {
         self.machines.lock().unwrap().push(m.clone());
         Ok(m)
     }
-    fn ensure(&self, machine_id: &str) -> Result<(), String> {
+    fn ensure(
+        &self,
+        machine_id: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(), String> {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(remote::WAKE_CANCELLED.into());
+        }
+        progress("Waking codespace…");
         self.log
             .lock()
             .unwrap()
@@ -311,31 +320,183 @@ fn cloud_session(provider: &str, environment: &str, codespace: Option<&str>) -> 
     session
 }
 
+fn ensure(host: &FakeHost, session: &RemoteSession) -> Result<Vec<String>, String> {
+    let mut lines = vec![];
+    ensure_before_send(host, session, &AtomicBool::new(false), &mut |l| {
+        lines.push(l.to_string())
+    })
+    .map(|_| lines)
+}
+
 #[test]
 fn ensure_before_send_wakes_only_cloud_sessions_and_only_for_claude() {
     let host = FakeHost::with_machine("octo-abc");
-    // Ordinary remote session: untouched.
-    ensure_before_send(&*host, &cloud_session("codex", "env-octo-abc", None)).unwrap();
-    assert!(host.log().is_empty());
-    // Cloud + claude: wakes the matching machine.
-    ensure_before_send(
-        &*host,
+    // Ordinary remote session: untouched, no progress.
+    let lines = ensure(&host, &cloud_session("codex", "env-octo-abc", None)).unwrap();
+    assert!(lines.is_empty() && host.log().is_empty());
+    // Cloud + claude: wakes the matching machine and reports progress.
+    let lines = ensure(
+        &host,
         &cloud_session("claude", "env-octo-abc", Some("octo-abc")),
     )
     .unwrap();
     assert_eq!(host.log(), vec!["ensure m-octo-abc".to_string()]);
+    assert_eq!(lines, vec!["Waking codespace…".to_string()]);
     // Cloud + other harness: rejected before any wake.
-    let error = ensure_before_send(
-        &*host,
+    let error = ensure(
+        &host,
         &cloud_session("codex", "env-octo-abc", Some("octo-abc")),
     )
     .unwrap_err();
     assert!(error.contains("Claude only"), "{error}");
     // Machine forgotten: clear error, no wake.
-    let error =
-        ensure_before_send(&*host, &cloud_session("claude", "env-gone", Some("gone"))).unwrap_err();
+    let error = ensure(&host, &cloud_session("claude", "env-gone", Some("gone"))).unwrap_err();
     assert!(error.contains("no longer connected"), "{error}");
     assert_eq!(host.log().len(), 1);
+}
+
+#[test]
+fn ensure_before_send_honours_cancel() {
+    let host = FakeHost::with_machine("octo-abc");
+    let cancel = AtomicBool::new(true);
+    let error = ensure_before_send(
+        &*host,
+        &cloud_session("claude", "env-octo-abc", Some("octo-abc")),
+        &cancel,
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(error, remote::WAKE_CANCELLED);
+    assert!(host.log().is_empty());
+}
+
+#[test]
+fn session_target_uses_the_current_binding_and_state() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+        ("codespace view", ok(r#"{"state":"Shutdown"}"#)),
+    ]);
+    let host = FakeHost::with_machine("octo-abc");
+    let svc = service(&gh, &host);
+    // A plain remote session on the same project key, created before binding.
+    let plain = svc
+        .store()
+        .unwrap()
+        .remember_remote_project(
+            "env-octo-abc",
+            &json!({"id":"project-1","cwd":"/workspaces/widgets"}),
+        )
+        .unwrap();
+    let early = svc.store().unwrap().create("claude", &plain.key).unwrap();
+    assert_eq!(svc.target_for_session(early.id), None);
+    let binding = svc
+        .prepare_target("/p", named("octo-abc"), &mut |_| {})
+        .unwrap();
+    let target = svc.target_for_session(early.id).unwrap();
+    assert_eq!(target.codespace, "octo-abc");
+    assert_eq!(target.state, CloudState::Stopped);
+    // The run hook resolves the same binding for that early session.
+    let stored = svc
+        .store()
+        .unwrap()
+        .remote_session(early.id)
+        .unwrap()
+        .unwrap();
+    ensure(&host, &stored).unwrap();
+    assert!(
+        host.log()
+            .iter()
+            .filter(|l| l.starts_with("ensure"))
+            .count()
+            >= 2
+    );
+    // Delete forgets it too.
+    gh.rules
+        .lock()
+        .unwrap()
+        .push(("codespace delete".to_string(), ok("")));
+    svc.delete_codespace("octo-abc").unwrap();
+    assert_eq!(svc.target_for_session(early.id), None);
+    let _ = binding;
+}
+
+#[test]
+fn unavailable_named_codespace_is_a_clear_error() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        (
+            "codespace list",
+            ok(r#"[{"name":"octo-abc","displayName":"x","state":"Failed"}]"#),
+        ),
+    ]);
+    let error = service(&gh, &Arc::new(FakeHost::default()))
+        .prepare_target("/p", named("octo-abc"), &mut |_| {})
+        .unwrap_err();
+    assert!(error.contains("unavailable"), "{error}");
+}
+
+#[test]
+fn delete_forgets_bindings_even_when_disconnect_fails() {
+    struct Failing(FakeHost);
+    impl Host for Failing {
+        fn machines(&self) -> Result<Vec<Machine>, String> {
+            self.0.machines()
+        }
+        fn connect(&self, c: &str, d: &str, p: &mut dyn FnMut(&str)) -> Result<Machine, String> {
+            self.0.connect(c, d, p)
+        }
+        fn ensure(&self, m: &str, c: &AtomicBool, p: &mut dyn FnMut(&str)) -> Result<(), String> {
+            self.0.ensure(m, c, p)
+        }
+        fn request(&self, m: &str, method: &str, params: Value) -> Result<Value, String> {
+            self.0.request(m, method, params)
+        }
+        fn disconnect(&self, _: &str) -> Result<(), String> {
+            Err("boom".into())
+        }
+    }
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+        ("codespace delete", ok("")),
+    ]);
+    let inner = FakeHost::default();
+    inner.machines.lock().unwrap().push(machine("octo-abc"));
+    let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+    let svc = CloudSessions::new(gh, Arc::new(Failing(inner)), store)
+        .with_origin(|_| Ok("git@github.com:octo/widgets.git".into()));
+    let binding = svc
+        .prepare_target("/p", named("octo-abc"), &mut |_| {})
+        .unwrap();
+    svc.create_session(&binding, "claude").unwrap();
+    let error = svc.delete_codespace("octo-abc").unwrap_err();
+    assert!(error.contains("disconnecting failed"), "{error}");
+    assert!(svc.cloud_sessions_for("/p").unwrap().is_empty());
+}
+
+#[test]
+fn new_codespaces_get_the_monoptah_display_name() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace create", ok("octo-new1\n")),
+        ("codespace view", ok(r#"{"state":"Available"}"#)),
+    ]);
+    let svc = service(&gh, &Arc::new(FakeHost::default()));
+    svc.prepare_target(
+        "/p",
+        Target {
+            codespace: CodespaceChoice::New,
+            branch: Some("main".into()),
+            machine: None,
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(gh
+        .calls()
+        .iter()
+        .any(|c| c.contains("--display-name monoptah-main")));
 }
 
 #[test]

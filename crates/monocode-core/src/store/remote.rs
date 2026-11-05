@@ -72,6 +72,12 @@ impl RemoteSession {
             })
     }
 }
+fn overlay_binding(session: &mut RemoteSession, projects: &BTreeMap<String, RemoteProject>) {
+    if let Some(current) = projects.get(&session.project.key) {
+        session.project.local_project = current.local_project.clone();
+        session.project.codespace = current.codespace.clone();
+    }
+}
 fn host_settings(project: &RemoteProject, host: &Value) -> Settings {
     let mut settings = Settings::default();
     settings.model = host["model"].as_str().map(str::to_owned);
@@ -193,14 +199,10 @@ impl Store {
     }
     /// Remote sessions bound to codespaces of `local_project`, newest first.
     pub fn cloud_sessions(&self, local_project: &str) -> Result<Vec<RemoteSession>, String> {
-        let projects = self.remote_projects()?;
         let mut found: Vec<_> = self
             .remote_sessions()?
             .into_values()
-            .filter_map(|mut session| {
-                if let Some(current) = projects.get(&session.project.key) {
-                    session.project = current.clone();
-                }
+            .filter_map(|session| {
                 (session.project.codespace.is_some()
                     && session.project.local_project.as_deref() == Some(local_project))
                 .then_some(session)
@@ -217,12 +219,6 @@ impl Store {
     /// Drop every project and session bound to `codespace` (local records
     /// only; the host is gone or about to be).
     pub fn forget_codespace(&self, codespace: &str) -> Result<(), String> {
-        let mut projects = self.remote_projects()?;
-        projects.retain(|_, p| p.codespace.as_deref() != Some(codespace));
-        self.save_setting(
-            PROJECTS,
-            &serde_json::to_string(&projects).map_err(|e| e.to_string())?,
-        )?;
         let mut sessions = self.remote_sessions()?;
         let gone: Vec<i64> = sessions
             .iter()
@@ -233,6 +229,12 @@ impl Store {
             sessions.remove(id);
         }
         self.hide_legacy_remote_sessions(gone)?;
+        let mut projects = self.remote_projects()?;
+        projects.retain(|_, p| p.codespace.as_deref() != Some(codespace));
+        self.save_setting(
+            PROJECTS,
+            &serde_json::to_string(&projects).map_err(|e| e.to_string())?,
+        )?;
         self.save_setting(
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
@@ -265,9 +267,23 @@ impl Store {
             saved.summary.id = canonical;
             sessions.insert(canonical, saved);
         }
+        let projects = self.remote_projects()?;
+        for session in sessions.values_mut() {
+            overlay_binding(session, &projects);
+        }
         Ok(sessions)
     }
+    /// The session with its project's *current* cloud binding. Every reader
+    /// (run hook, listings, forget) goes through here or `remote_sessions`, so a
+    /// project bound after the session was created is seen the same everywhere.
     pub fn remote_session(&self, id: i64) -> Result<Option<RemoteSession>, String> {
+        let Some(mut session) = self.remote_session_stored(id)? else {
+            return Ok(None);
+        };
+        overlay_binding(&mut session, &self.remote_projects()?);
+        Ok(Some(session))
+    }
+    fn remote_session_stored(&self, id: i64) -> Result<Option<RemoteSession>, String> {
         let mut stored = self.stored_remote_sessions()?;
         if let Some(remote) = stored.remove(&id) {
             if remote
@@ -956,5 +972,34 @@ mod configuration_tests {
             1
         );
         assert_eq!(store.sessions().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn binding_added_after_a_session_exists_is_seen_by_every_reader() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let plain = store
+            .remember_remote_project("env", &json!({"id":"project","cwd":"/workspaces/repo"}))
+            .unwrap();
+        let session = store.create("claude", &plain.key).unwrap();
+        assert!(store
+            .remote_session(session.id)
+            .unwrap()
+            .unwrap()
+            .project
+            .codespace
+            .is_none());
+        store
+            .remember_cloud_project(
+                "env",
+                &json!({"id":"project","cwd":"/workspaces/repo"}),
+                "/Users/me/repo",
+                "octo-abc",
+            )
+            .unwrap();
+        let bound = store.remote_session(session.id).unwrap().unwrap();
+        assert_eq!(bound.project.codespace.as_deref(), Some("octo-abc"));
+        assert_eq!(store.cloud_sessions("/Users/me/repo").unwrap().len(), 1);
+        store.forget_codespace("octo-abc").unwrap();
+        assert!(store.remote_session(session.id).unwrap().is_none());
     }
 }

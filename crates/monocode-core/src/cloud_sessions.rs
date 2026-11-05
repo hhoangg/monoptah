@@ -47,6 +47,7 @@ use crate::remote::{self, Connections, Machine};
 use crate::store::{RemoteSession, Store};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -150,8 +151,16 @@ pub trait Host: Send + Sync {
         display: &str,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String>;
-    /// Wake the codespace and reconnect if needed (blocking, no-op when connected).
-    fn ensure(&self, machine_id: &str) -> Result<(), String>;
+    /// Wake the codespace and reconnect if needed (blocking, no-op when
+    /// connected). `progress` fires only when a wake actually starts; `cancel`
+    /// aborts the wait with `remote::WAKE_CANCELLED`. Concurrent calls for one
+    /// machine share a single reconnect.
+    fn ensure(
+        &self,
+        machine_id: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(), String>;
     fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String>;
     fn disconnect(&self, machine_id: &str) -> Result<(), String>;
 }
@@ -188,8 +197,13 @@ impl Host for Arc<Connections> {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    fn ensure(&self, machine_id: &str) -> Result<(), String> {
-        self.ensure_codespace(machine_id)
+    fn ensure(
+        &self,
+        machine_id: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(), String> {
+        self.ensure_codespace_with(machine_id, cancel, progress)
     }
     fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String> {
         Connections::request(self, machine_id, method, params)
@@ -200,7 +214,12 @@ impl Host for Arc<Connections> {
 }
 
 /// Wake hook for the remote run path; see the module docs.
-pub fn ensure_before_send(host: &dyn Host, session: &RemoteSession) -> Result<(), String> {
+pub fn ensure_before_send(
+    host: &dyn Host,
+    session: &RemoteSession,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
     if session.project.codespace.is_none() {
         return Ok(());
     }
@@ -210,7 +229,7 @@ pub fn ensure_before_send(host: &dyn Host, session: &RemoteSession) -> Result<()
         .into_iter()
         .find(|m| m.environment_id == session.project.environment_id)
         .ok_or("Codespace machine is no longer connected. Start a new cloud session.")?;
-    host.ensure(&machine.id)
+    host.ensure(&machine.id, cancel, progress)
 }
 
 /// Phase 1 rule: cloud sessions run Claude only.
@@ -324,6 +343,20 @@ impl CloudSessions {
                     .iter()
                     .find(|c| c.name == name)
                     .ok_or_else(|| format!("Codespace {name} does not belong to {repo}"))?;
+                match CloudState::from_gh(&found.state) {
+                    CloudState::Unavailable => {
+                        return Err(format!(
+                            "Codespace {name} is unavailable ({}). Pick another or create a new one.",
+                            found.state
+                        ));
+                    }
+                    CloudState::Stopping => {
+                        return Err(format!(
+                            "Codespace {name} is shutting down. Try again in a moment."
+                        ));
+                    }
+                    _ => {}
+                }
                 let display = if found.display_name.is_empty() {
                     name.clone()
                 } else {
@@ -341,7 +374,8 @@ impl CloudSessions {
         {
             Some(machine) => {
                 progress("Connecting to the codespace");
-                self.host.ensure(&machine.id)?;
+                self.host
+                    .ensure(&machine.id, &AtomicBool::new(false), progress)?;
                 machine
             }
             None => self.host.connect(&name, &display, progress)?,
@@ -437,13 +471,47 @@ impl CloudSessions {
     pub fn delete_codespace(&self, name: &str) -> Result<(), String> {
         codespaces::delete(&*self.gh, name)?;
         self.invalidate(name);
-        for machine in self.host.machines()? {
-            if machine.codespace.as_deref() == Some(name) {
-                self.host.disconnect(&machine.id)?;
+        let mut disconnect_error = None;
+        match self.host.machines() {
+            Ok(machines) => {
+                for machine in machines {
+                    if machine.codespace.as_deref() == Some(name) {
+                        if let Err(e) = self.host.disconnect(&machine.id) {
+                            disconnect_error.get_or_insert(e);
+                        }
+                    }
+                }
             }
+            Err(e) => disconnect_error = Some(e),
         }
-        self.store()?.forget_codespace(name)
+        self.store()?.forget_codespace(name)?;
+        match disconnect_error {
+            Some(e) => Err(format!("Codespace deleted, but disconnecting failed: {e}")),
+            None => Ok(()),
+        }
     }
+
+    /// Codespace binding of one session (desktop session id), with its cached
+    /// state. `None` for non-cloud sessions. May run `gh codespace view` on a
+    /// cache miss; never wakes anything.
+    pub fn target_for_session(&self, session_id: i64) -> Option<SessionTarget> {
+        let codespace = self
+            .store()
+            .ok()?
+            .remote_session(session_id)
+            .ok()??
+            .project
+            .codespace?;
+        let state = self.cloud_state(&codespace);
+        Some(SessionTarget { codespace, state })
+    }
+}
+
+/// A session's codespace and its (cached) state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionTarget {
+    pub codespace: String,
+    pub state: CloudState,
 }
 
 #[cfg(test)]
