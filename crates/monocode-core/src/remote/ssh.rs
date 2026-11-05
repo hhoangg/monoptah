@@ -183,7 +183,28 @@ impl Job {
 }
 
 #[cfg(test)]
-pub(super) static GH_OVERRIDE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+static GH_OVERRIDE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static GH_LOCK: Mutex<()> = Mutex::new(());
+
+/// Points codespace commands at a fake `gh` for the life of the guard. The
+/// guard also serializes tests, because the override is process-global.
+#[cfg(test)]
+pub(super) struct GhOverride(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+#[cfg(test)]
+impl GhOverride {
+    pub(super) fn set(path: std::path::PathBuf) -> Self {
+        let guard = GH_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        *GH_OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner) = Some(path);
+        Self(guard)
+    }
+}
+#[cfg(test)]
+impl Drop for GhOverride {
+    fn drop(&mut self) {
+        *GH_OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
 
 fn gh_program() -> std::ffi::OsString {
     #[cfg(test)]
@@ -280,6 +301,14 @@ fn command_with_program(
         command.creation_flags(0x08000000);
     }
     command
+}
+
+/// A codespace name read back from the store is re-checked before it reaches argv.
+pub(super) fn check_codespace(target: &SshTarget) -> Result<(), String> {
+    match &target.codespace {
+        Some(name) => validate_codespace(name).map(|_| ()),
+        None => Ok(()),
+    }
 }
 
 /// Error for a transport process that could not be spawned.
@@ -414,6 +443,7 @@ fn run_remote_command(
     mut command: Command,
     remote: &[&str],
 ) -> Result<String, String> {
+    check_codespace(target)?;
     if job.cancelled.load(Ordering::Relaxed) {
         return Err("Connection cancelled".into());
     }
@@ -492,6 +522,18 @@ fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> Str
     }
 }
 
+/// Bootstrap for a codespace. Codespace user secrets (CLAUDE_CODE_OAUTH_TOKEN)
+/// reach the login shell's environment, and the host's agents only inherit what
+/// the host process itself was started with. The script restarts the host once
+/// when that token differs from the one the running host was started with
+/// (tracked as a hash, never the token itself).
+pub fn codespace_bootstrap_script() -> String {
+    format!(
+        "MONOCODE_HOST_TRACK_TOKEN=1\n{}",
+        bootstrap_script(HostPlatform::Unix)
+    )
+}
+
 pub fn upgrade_script(platform: HostPlatform, port: u16) -> String {
     let script = bootstrap_script(platform);
     match platform {
@@ -540,6 +582,7 @@ impl Tunnel {
         askpass: Option<&Askpass>,
         mut command: Command,
     ) -> Result<Self, String> {
+        check_codespace(target)?;
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         if let Some(askpass) = askpass {
@@ -622,7 +665,9 @@ pub struct TunnelLease {
 }
 
 /// Each machine has its own lock: restarting one machine's tunnel (up to
-/// 20 seconds) must not block requests to other machines.
+/// 20 seconds for plain SSH) must not block requests to other machines.
+/// Codespace machines never restart lazily (that would wake the codespace):
+/// they use `existing`, which only looks, and are reconnected explicitly.
 #[derive(Default)]
 pub struct Tunnels {
     slots: Mutex<HashMap<String, Arc<Mutex<Slot>>>>,
@@ -645,6 +690,25 @@ impl Tunnels {
     pub fn remove(&self, id: &str) {
         let old = self.slots().remove(id);
         drop(old);
+    }
+    /// A live tunnel for `id`, or None. Never spawns a process and holds the
+    /// machine lock only for a liveness check.
+    pub fn existing(&self, id: &str) -> Option<TunnelLease> {
+        let slot = self.slots().get(id).cloned()?;
+        let mut current = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        let port = {
+            let tunnel = current.tunnel.as_mut()?;
+            if !tunnel.alive() {
+                current.tunnel = None;
+                return None;
+            }
+            tunnel.port
+        };
+        Some(TunnelLease {
+            endpoint: format!("http://127.0.0.1:{port}"),
+            slot: slot.clone(),
+            generation: current.generation,
+        })
     }
     pub fn endpoint(&self, id: &str, target: &SshTarget) -> Result<TunnelLease, String> {
         let slot = self.slots().entry(id.into()).or_default().clone();
@@ -981,6 +1045,93 @@ mod tests {
         assert_eq!(
             detect_platform(&codespace_target("x"), &job, &askpass).unwrap(),
             HostPlatform::Unix
+        );
+    }
+    #[test]
+    fn codespace_bootstrap_tracks_the_token_without_exposing_it() {
+        let script = codespace_bootstrap_script();
+        assert!(script.starts_with("MONOCODE_HOST_TRACK_TOKEN=1\nset -eu\n"));
+        assert!(!bootstrap_script(HostPlatform::Unix).contains("MONOCODE_HOST_TRACK_TOKEN=1\n"));
+        assert!(script.contains("host-token.sha256"));
+        assert!(!script.contains("echo \"$CLAUDE_CODE_OAUTH_TOKEN"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn codespace_bootstrap_restarts_the_host_once_when_the_token_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".monocode-host/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = home.path().join("calls.log");
+        let entry = bin.join("monocode-host");
+        std::fs::write(
+            &entry,
+            format!(
+                "#!/bin/sh\necho \"$1 $2\" >> {}\n[ \"$1\" = connection-info ] && echo '{{\"port\":3774}}'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |script: String, token: Option<&str>| {
+            let mut command = Command::new("sh");
+            command
+                .arg("-s")
+                .env("HOME", home.path())
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+            if let Some(token) = token {
+                command.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("secret-token"));
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        let uninstalls =
+            |calls: &[String]| calls.iter().filter(|c| *c == "service uninstall").count();
+        // No token in the shell: never restart.
+        assert_eq!(uninstalls(&run(codespace_bootstrap_script(), None)), 0);
+        // Token appears: restart once, store a hash only.
+        let calls = run(codespace_bootstrap_script(), Some("secret-token"));
+        assert_eq!(uninstalls(&calls), 1, "{calls:?}");
+        let marker =
+            std::fs::read_to_string(home.path().join(".monocode-host/host-token.sha256")).unwrap();
+        assert_eq!(marker.trim().len(), 64);
+        assert!(!marker.contains("secret-token"));
+        // Same token: no further restart.
+        assert_eq!(
+            uninstalls(&run(codespace_bootstrap_script(), Some("secret-token"))),
+            1
+        );
+        // Changed token: restart again.
+        assert_eq!(
+            uninstalls(&run(codespace_bootstrap_script(), Some("other-token"))),
+            2
+        );
+        // Plain ssh bootstrap ignores the token entirely.
+        assert_eq!(
+            uninstalls(&run(bootstrap_script(HostPlatform::Unix), Some("third"))),
+            2
         );
     }
     #[test]

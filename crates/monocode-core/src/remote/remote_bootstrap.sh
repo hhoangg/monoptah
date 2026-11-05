@@ -65,5 +65,21 @@ fi
 if [ "$EXISTED" = 1 ] && [ "$FORCE_UPGRADE" = 1 ]; then
   "$ENTRY" service uninstall >/dev/null
 fi
+TOKEN_MARKER="$BASE/host-token.sha256"
+TOKEN_HASH=
+if [ "${MONOCODE_HOST_TRACK_TOKEN:-0}" = 1 ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    TOKEN_HASH=$(printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" | sha256sum | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    TOKEN_HASH=$(printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" | shasum -a 256 | awk '{print $1}')
+  fi
+  # A host started without (or with another) token keeps its old environment.
+  if [ -n "$TOKEN_HASH" ] && [ "$(cat "$TOKEN_MARKER" 2>/dev/null || true)" != "$TOKEN_HASH" ]; then
+    "$ENTRY" service uninstall >/dev/null 2>&1 || true
+  else
+    TOKEN_HASH=
+  fi
+fi
 "$ENTRY" service install --port "$HOST_PORT" >/dev/null
+[ -z "$TOKEN_HASH" ] || printf '%s\n' "$TOKEN_HASH" > "$TOKEN_MARKER"
 "$ENTRY" connection-info

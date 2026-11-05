@@ -241,6 +241,20 @@ fn rpc(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
+    rpc_with(endpoint, token, environment_id, method, params, false)
+}
+
+/// `closed_is_dead`: a connection reset or closed without a reply also means
+/// the route is gone. Behind a codespace tunnel that is what a stopped host
+/// looks like: the local forward accepts, then the remote side hangs up.
+fn rpc_with(
+    endpoint: &str,
+    token: &str,
+    environment_id: Option<&str>,
+    method: &str,
+    params: Value,
+    closed_is_dead: bool,
+) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
         .timeout_connect(std::time::Duration::from_secs(5))
@@ -255,7 +269,9 @@ fn rpc(
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(_, response)) => response,
-        Err(ureq::Error::Transport(error)) if connection_refused(&error) => {
+        Err(ureq::Error::Transport(error))
+            if connection_refused(&error) || (closed_is_dead && connection_closed(&error)) =>
+        {
             return Err(
                 "Machine is unreachable. Check the host and SSH tunnel, then reconnect.".into(),
             )
@@ -289,6 +305,23 @@ fn rpc(
 
 // Only a refused connection proves the local forwarding listener is gone.
 // A slow request or an interrupted response says nothing about SSH health.
+fn connection_closed(error: &ureq::Transport) -> bool {
+    use std::io::ErrorKind::*;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof
+            )
+        }) {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
 fn connection_refused(error: &ureq::Transport) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = source {
@@ -414,8 +447,19 @@ impl Connections {
                 .find(|m| m.id == machine_id)
                 .ok_or("Machine is no longer connected")?
         };
+        let codespace = machine.ssh.as_ref().is_some_and(|t| t.codespace.is_some());
         let tunnel_lease = if let Some(target) = &machine.ssh {
-            Some(self.tunnels.endpoint(&machine.id, target)?)
+            if codespace {
+                // Background work must never wake a codespace (that is what
+                // `gh codespace ssh` does), so only a live tunnel is used.
+                Some(
+                    self.tunnels
+                        .existing(&machine.id)
+                        .ok_or(CODESPACE_NOT_CONNECTED)?,
+                )
+            } else {
+                Some(self.tunnels.endpoint(&machine.id, target)?)
+            }
         } else {
             None
         };
@@ -423,12 +467,13 @@ impl Connections {
             .as_ref()
             .map(|lease| lease.endpoint.as_str())
             .unwrap_or(&machine.endpoint);
-        let response = rpc(
+        let response = rpc_with(
             endpoint,
             &machine.token,
             Some(&machine.environment_id),
             method,
             params,
+            codespace,
         );
         if response
             .as_ref()
@@ -437,6 +482,9 @@ impl Connections {
         {
             if let Some(lease) = &tunnel_lease {
                 self.tunnels.invalidate(&machine.id, lease);
+            }
+            if codespace {
+                return Err(CODESPACE_NOT_CONNECTED.into());
             }
         }
         let result = response?;
@@ -449,6 +497,11 @@ impl Connections {
         Ok(result)
     }
 }
+
+/// Returned instead of waking a codespace. Callers that act on a user's
+/// request answer it with `ensure_codespace`/`codespace_reconnect`.
+pub const CODESPACE_NOT_CONNECTED: &str =
+    "Codespace is not connected. Reconnect to start it and restore the connection.";
 
 fn supported_remote_method(method: &str) -> bool {
     matches!(
@@ -495,6 +548,7 @@ impl Connections {
         existing: Option<StoredMachine>,
         upgrade: bool,
     ) -> Result<String, String> {
+        ssh::check_codespace(&target)?;
         let job = Job::new();
         let id = job.view().id;
         {
@@ -530,6 +584,8 @@ impl Connections {
                         });
                         let script = if upgrade {
                             ssh::upgrade_script(platform, target.remote_port)
+                        } else if codespace {
+                            ssh::codespace_bootstrap_script()
                         } else {
                             ssh::bootstrap_script(platform)
                         };
@@ -553,7 +609,11 @@ impl Connections {
                     let output = ssh::run_script(
                         &target,
                         platform,
-                        ssh::bootstrap_script(platform),
+                        if codespace {
+                            ssh::codespace_bootstrap_script()
+                        } else {
+                            ssh::bootstrap_script(platform)
+                        },
                         &job,
                         &askpass,
                     )?;
@@ -754,6 +814,28 @@ impl Connections {
         self.start_ssh_job(target, machine.name.clone(), Some(machine), upgrade)
     }
 
+    /// Make sure a codespace machine is connected, waking the codespace if
+    /// needed. No-op when the tunnel already answers `environment.describe`;
+    /// otherwise runs `codespace_reconnect` and waits for it. BLOCKS for as
+    /// long as the codespace takes to start (minutes): call it from a
+    /// background thread, never the UI thread. Only user-initiated actions
+    /// should call it; background polling must not.
+    pub fn ensure_codespace(self: &Arc<Self>, machine_id: &str) -> Result<(), String> {
+        match self.request(machine_id, "environment.describe", json!({})) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.starts_with("Codespace is not connected") => {}
+            Err(error) => return Err(error),
+        }
+        let job = self.codespace_reconnect(machine_id)?;
+        loop {
+            let view = self.ssh_poll(&job)?;
+            if view.done {
+                return view.error.map_or(Ok(()), Err);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     pub fn ssh_poll(&self, job_id: &str) -> Result<JobView, String> {
         Ok(self.job(job_id)?.view())
     }
@@ -949,14 +1031,19 @@ mod tests {
         ]
         .into_iter()
         .find(|p| Path::new(p).exists()) else {
+            eprintln!(
+                "SKIPPED codespace_begin_reconnect_and_tunnel_restart_use_gh: python3 not found"
+            );
             return;
         };
         let describe =
             json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host" }});
         let (url, _requests, server) = host_fixture(vec![
             describe.clone(),
-            describe,
+            describe.clone(),
+            describe.clone(),
             json!({ "result": { "projects": [] } }),
+            describe,
         ]);
         let fixture_port = url.rsplit(':').next().unwrap().to_string();
         let dir = tempfile::tempdir().unwrap();
@@ -1009,7 +1096,7 @@ else:
         )
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        *ssh::GH_OVERRIDE.lock().unwrap() = Some(gh);
+        let _gh_guard = ssh::GhOverride::set(gh);
 
         let connections = Arc::new(Connections::new(dir.path()));
         let wait = |job: String| {
@@ -1065,25 +1152,73 @@ else:
         assert!(after[3].ends_with("sh -l -s"), "{}", after[3]);
         assert!(after[4].contains("-N -L 127.0.0.1:"), "{}", after[4]);
 
-        // A dead tunnel is restarted through gh on the next request.
+        // With no live tunnel a request must not wake the codespace.
         connections.tunnels.clear();
+        let error = connections
+            .request(&machine.id, "projects.list", json!({}))
+            .unwrap_err();
+        assert!(error.starts_with("Codespace is not connected"), "{error}");
+        assert_eq!(lines().len(), after.len(), "request spawned gh");
+
+        // Waking is explicit: bootstrap, then tunnel.
+        connections.ensure_codespace(&machine.id).unwrap();
+        let woke = lines();
+        assert_eq!(woke.len(), after.len() + 2, "{woke:?}");
+        assert!(woke[5].ends_with("sh -l -s"), "{}", woke[5]);
+        assert!(woke[6].contains("-N -L 127.0.0.1:"), "{}", woke[6]);
         assert_eq!(
             connections
                 .request(&machine.id, "projects.list", json!({}))
                 .unwrap(),
             json!({ "projects": [] })
         );
-        let last = lines();
-        assert_eq!(last.len(), after.len() + 1);
-        assert!(
-            last[5].starts_with("codespace ssh -c octo-abc123 -- "),
-            "{}",
-            last[5]
-        );
-        assert!(last[5].contains("-N -L 127.0.0.1:"));
-        *ssh::GH_OVERRIDE.lock().unwrap() = None;
+        // Already connected: a no-op that does not run gh again.
+        connections.ensure_codespace(&machine.id).unwrap();
+        assert_eq!(lines().len(), woke.len());
         connections.tunnels.clear();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn closed_connections_count_as_a_dead_route_only_when_asked() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer);
+            }
+        });
+        let call = |dead| rpc_with(&endpoint, "t", None, "projects.list", json!({}), dead);
+        assert!(call(true)
+            .unwrap_err()
+            .starts_with("Machine is unreachable"));
+        assert!(call(false)
+            .unwrap_err()
+            .starts_with("The host request did not complete"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tunnels_existing_never_starts_anything() {
+        let tunnels = Tunnels::default();
+        assert!(tunnels.existing("none").is_none());
+    }
+
+    #[test]
+    fn a_tampered_codespace_name_in_the_store_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("remote-machines.json"),
+            r#"[{"id":"a","name":"x","endpoint":"codespace://x","environmentId":"env","token":"t","ssh":{"target":"x","port":null,"remotePort":3774,"codespace":"-oProxyCommand=evil"}}]"#,
+        )
+        .unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        assert!(connections
+            .codespace_reconnect("a")
+            .unwrap_err()
+            .contains("valid codespace name"));
     }
     #[test]
     fn incompatible_pairing_does_not_create_a_machine() {
