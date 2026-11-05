@@ -192,7 +192,8 @@ pub(super) fn save(runner: &dyn GhRunner, repo: &str, entries: &[(String, String
 
 /// `git remote get-url origin` for the project, if it has one.
 pub(super) fn git_origin(project: &Path) -> Option<String> {
-    let mut command = std::process::Command::new("git");
+    let program = monocode_core::scm::resolve_gui_binary("git")?;
+    let mut command = std::process::Command::new(program);
     command
         .args(["remote", "get-url", "origin"])
         .current_dir(project)

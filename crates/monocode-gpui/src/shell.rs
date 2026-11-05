@@ -8906,6 +8906,11 @@ impl Render for Shell {
                     this.close_telegram_topic(window, cx);
                     return;
                 }
+                if let Some(open) = &this.codespaces
+                    && open.view.read(cx).terminal_focused(window, cx)
+                {
+                    return;
+                }
                 if this.codespaces.is_some() {
                     this.close_codespaces_dialog(window, cx);
                     return;

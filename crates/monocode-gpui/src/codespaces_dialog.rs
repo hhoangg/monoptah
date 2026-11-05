@@ -277,6 +277,14 @@ impl CodespacesDialog {
         cx.notify();
     }
 
+    /// The embedded terminal has the keyboard: Escape belongs to it (`claude setup-token`
+    /// may need it), never to the dialog.
+    pub(crate) fn terminal_focused(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(|t| t.read(cx).focus_handle(cx).contains_focused(window, cx))
+    }
+
     fn close_terminal(&mut self, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminal.take() {
             terminal.read(cx).kill();
@@ -497,8 +505,8 @@ impl Render for CodespacesDialog {
             .flex()
             .flex_col()
             .text_color(content(1.))
-            .on_key_down(cx.listener(|_, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && !this.terminal_focused(window, cx) {
                     cx.emit(Event::Close);
                     window.prevent_default();
                     cx.stop_propagation();

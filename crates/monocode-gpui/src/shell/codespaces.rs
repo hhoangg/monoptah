@@ -3,7 +3,7 @@ use super::*;
 use crate::codespaces_dialog::{self, CodespacesDialog};
 
 pub(super) struct OpenCodespaces {
-    view: Entity<CodespacesDialog>,
+    pub(super) view: Entity<CodespacesDialog>,
     _events: Subscription,
 }
 

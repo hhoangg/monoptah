@@ -319,7 +319,7 @@ fn an_unready_gh_or_a_missing_repo_reads_no_secrets() {
 }
 
 #[gpui::test]
-fn the_dialog_loads_status_off_the_ui_thread_and_renders_rows(cx: &mut TestAppContext) {
+fn the_dialog_loads_status_and_renders_rows(cx: &mut TestAppContext) {
     let gh = FakeGh::new(Ok(AUTH_OK)).with_secret("CLAUDE_CODE_OAUTH_TOKEN", &[REPO]);
     let window = open(cx, env(&gh, origin));
     assert_eq!(
@@ -457,4 +457,52 @@ fn closing_the_dialog_drops_typed_values(cx: &mut TestAppContext) {
     type_in(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN", "tok");
     act(&window, cx, |dialog, cx| dialog.shutdown(cx));
     read(&window, cx, |dialog, cx| assert!(!dialog.has_input(cx)));
+}
+
+#[gpui::test]
+fn escape_in_the_terminal_never_closes_the_dialog(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    let closed: std::rc::Rc<std::cell::Cell<u32>> = Default::default();
+    let seen = closed.clone();
+    window
+        .update(cx, |_, _, cx| {
+            cx.subscribe(&cx.entity(), move |_, _, _: &Event, _| {
+                seen.set(seen.get() + 1)
+            })
+            .detach()
+        })
+        .unwrap();
+    act(&window, cx, |dialog, cx| dialog.generate_token(cx));
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        let handle = window
+            .root::<CodespacesDialog>()
+            .flatten()
+            .unwrap()
+            .read(cx)
+            .terminal
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        let dialog = window.root::<CodespacesDialog>().flatten().unwrap();
+        assert!(dialog.read(cx).terminal_focused(window, cx));
+    });
+    visual.simulate_keystrokes("escape");
+    assert_eq!(closed.get(), 0);
+    visual.update(|window, cx| {
+        let dialog = window.root::<CodespacesDialog>().flatten().unwrap();
+        assert!(dialog.read(cx).terminal.is_some());
+        // With the dialog itself focused, Escape still closes it.
+        let focus = dialog.read(cx).focus.clone();
+        window.focus(&focus, cx);
+    });
+    visual.simulate_keystrokes("escape");
+    assert_eq!(closed.get(), 1);
 }
