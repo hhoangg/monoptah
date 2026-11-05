@@ -1,8 +1,9 @@
 //! The files attached to a note, drawn inside its bubble: images inline (one
 //! at its own shape, several as a grid of square thumbnails) and other files
 //! as rows. Everything opens the stored copy with the system default app, as
-//! if it were opened from Finder; there is no in-app viewer. A right-click (or
-//! the row's "..." button) offers Open, Show in Finder and Copy.
+//! if it were opened from Finder, except Markdown and HTML files, which open
+//! in the in-app document lightbox. A right-click (or the row's "..." button)
+//! offers Open, Show in Finder and Copy, plus "Open in Monoptah" for those.
 use super::Today;
 use crate::{
     file_icons::file_type_icon,
@@ -62,6 +63,8 @@ fn system_actions() -> Actions {
 /// A choice in the attachment menu.
 #[derive(Clone, Copy)]
 enum Act {
+    /// The in-app document lightbox; only for Markdown and HTML.
+    View,
     Open,
     Reveal,
     Copy,
@@ -270,7 +273,7 @@ impl Today {
         if let Some(path) = path.clone() {
             tile = tile.cursor_pointer().on_click(cx.listener({
                 let path = path.clone();
-                move |this, _, _, cx| this.attachment_act(Act::Open, path.clone(), cx)
+                move |this, _, window, cx| this.attachment_act(Act::Open, path.clone(), window, cx)
             }));
             let note_id = note.id.clone();
             tile = tile.on_mouse_down(
@@ -392,7 +395,14 @@ impl Today {
                 .hover(|s| s.bg(content(0.09)))
                 .on_click(cx.listener({
                     let path = path.clone();
-                    move |this, _, _, cx| this.attachment_act(Act::Open, path.clone(), cx)
+                    move |this, _, window, cx| {
+                        let act = if crate::document_lightbox::kind_of(&path).is_some() {
+                            Act::View
+                        } else {
+                            Act::Open
+                        };
+                        this.attachment_act(act, path.clone(), window, cx)
+                    }
                 }))
                 .on_mouse_down(
                     MouseButton::Right,
@@ -447,27 +457,39 @@ impl Today {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let items = vec![
+        let mut items = Vec::new();
+        if crate::document_lightbox::kind_of(&path).is_some() {
+            items.push(MenuItem::from(MenuAction::new(
+                "today-attachment-view",
+                "Open in Monoptah",
+            )));
+        }
+        items.extend([
             MenuItem::from(MenuAction::new("today-attachment-open", "Open")),
             MenuItem::from(MenuAction::new("today-attachment-reveal", "Show in Finder")),
             MenuItem::from(MenuAction::new("today-attachment-copy", "Copy")),
-        ];
+        ]);
         let menu = cx.new(|cx| Menu::new("Attachment actions", items, window, cx));
-        let events = cx.subscribe_in(&menu, window, move |this, _, event: &MenuEvent, _, cx| {
-            this.note_files.menu = None;
-            if let MenuEvent::Picked(id, _) = event {
-                let act = match id.as_ref() {
-                    "today-attachment-open" => Some(Act::Open),
-                    "today-attachment-reveal" => Some(Act::Reveal),
-                    "today-attachment-copy" => Some(Act::Copy),
-                    _ => None,
-                };
-                if let Some(act) = act {
-                    this.attachment_act(act, path.clone(), cx);
+        let events = cx.subscribe_in(
+            &menu,
+            window,
+            move |this, _, event: &MenuEvent, window, cx| {
+                this.note_files.menu = None;
+                if let MenuEvent::Picked(id, _) = event {
+                    let act = match id.as_ref() {
+                        "today-attachment-view" => Some(Act::View),
+                        "today-attachment-open" => Some(Act::Open),
+                        "today-attachment-reveal" => Some(Act::Reveal),
+                        "today-attachment-copy" => Some(Act::Copy),
+                        _ => None,
+                    };
+                    if let Some(act) = act {
+                        this.attachment_act(act, path.clone(), window, cx);
+                    }
                 }
-            }
-            cx.notify();
-        });
+                cx.notify();
+            },
+        );
         self.note_files.menu = Some(OpenMenu {
             menu,
             note,
@@ -478,7 +500,13 @@ impl Today {
     }
 
     /// Does `act` to a stored copy, or says why it cannot.
-    fn attachment_act(&mut self, act: Act, path: PathBuf, cx: &mut Context<Self>) {
+    fn attachment_act(
+        &mut self,
+        act: Act,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // A fresh look: the copy may have gone since the last frame.
         if !path.is_file() {
             self.note_files.present.borrow_mut().remove(&path);
@@ -491,6 +519,20 @@ impl Today {
             return;
         }
         let action = match act {
+            Act::View => {
+                let title = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                window.dispatch_action(
+                    Box::new(crate::document_lightbox::Open {
+                        path,
+                        title: title.into(),
+                    }),
+                    cx,
+                );
+                return;
+            }
             Act::Copy => {
                 cx.write_to_clipboard(ClipboardItem {
                     entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
@@ -600,6 +642,7 @@ mod tests {
             body: body.into(),
             attachments,
             edited_at: None,
+            session_id: None,
         }
     }
     /// A selected task with these notes, and a recorder in place of the system.
@@ -791,6 +834,56 @@ mod tests {
             [ClipboardEntry::ExternalPaths(paths)] => assert_eq!(paths.paths(), [path]),
             other => panic!("expected the file itself, got {other:?}"),
         }
+    }
+    /// Records every lightbox Open that reaches the app (the Shell handles it
+    /// in the real window).
+    fn record_lightbox(cx: &mut TestAppContext) -> Rc<RefCell<Vec<PathBuf>>> {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let log = seen.clone();
+        cx.update(|cx| {
+            cx.on_action(move |open: &crate::document_lightbox::Open, _| {
+                log.borrow_mut().push(open.path.clone())
+            });
+        });
+        seen
+    }
+    #[gpui::test]
+    fn clicking_a_markdown_or_html_file_opens_the_lightbox_not_the_default_app(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = scratch("doc-click");
+        let (md, html) = (file(&dir, "report.md"), file(&dir, "result.HTML"));
+        let expected = [stored(&md), stored(&html)];
+        let notes = vec![note("n1", "", vec![md, html])];
+        let calls = Calls::default();
+        let seen = record_lightbox(cx);
+        let (_, mut visual) = page(cx, Show::Detail, show(DayMode::Current, notes, &calls));
+        click(&mut visual, "today-note-file-0");
+        click(&mut visual, "today-note-file-1");
+        assert_eq!(*seen.borrow(), expected);
+        assert!(calls.borrow().is_empty(), "the default app is not used");
+    }
+    #[gpui::test]
+    fn the_menu_leads_with_open_in_monoptah_for_documents_only(cx: &mut TestAppContext) {
+        let dir = scratch("doc-menu");
+        let (md, pdf) = (file(&dir, "report.md"), file(&dir, "report.pdf"));
+        let md_path = stored(&md);
+        let notes = vec![note("n1", "", vec![md, pdf])];
+        let calls = Calls::default();
+        let seen = record_lightbox(cx);
+        let (_, mut visual) = page(cx, Show::Detail, show(DayMode::Current, notes, &calls));
+        right_click(&mut visual, "today-note-file-1");
+        assert!(!has(&mut visual, "menu-action-today-attachment-view"));
+        assert!(has(&mut visual, "menu-action-today-attachment-open"));
+        visual.simulate_keystrokes("escape");
+        right_click(&mut visual, "today-note-file-0");
+        assert!(has(&mut visual, "menu-action-today-attachment-view"));
+        click(&mut visual, "menu-action-today-attachment-view");
+        assert_eq!(*seen.borrow(), vec![md_path.clone()]);
+        // Open still goes to the default app.
+        right_click(&mut visual, "today-note-file-0");
+        click(&mut visual, "menu-action-today-attachment-open");
+        assert_eq!(*calls.borrow(), vec![(AttachmentAction::Open, md_path)]);
     }
     #[gpui::test]
     fn right_clicking_a_file_row_opens_the_menu(cx: &mut TestAppContext) {

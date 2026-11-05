@@ -13,7 +13,7 @@ mod habit_share;
 mod habit_share_tests;
 mod habit_stop;
 mod host;
-mod html;
+pub(crate) mod html;
 mod memory_ui;
 mod mobile;
 mod notifications;
@@ -152,6 +152,9 @@ pub(crate) struct Monos {
     menu_anchor: Anchor,
     documents: HashMap<String, Entity<crate::transcript::TranscriptView>>,
     html_documents: HashMap<String, Entity<html::Html>>,
+    /// Set while an app-level modal sits above the Mono page: a native web
+    /// view would draw over it, so HTML documents stay hidden.
+    suppress_html: bool,
     /// Native visuals the Mono published in its chat, opened as documents.
     visual_documents: HashMap<String, Entity<crate::visuals::VisualView>>,
     project_changes: changes::ProjectChanges,
@@ -308,6 +311,9 @@ impl Monos {
             }
         }
     }
+    pub(crate) fn set_suppress_html(&mut self, suppress: bool) {
+        self.suppress_html = suppress;
+    }
     pub(crate) fn hide_html(&self, cx: &App) {
         for view in self.html_documents.values() {
             view.read(cx).hide();
@@ -433,6 +439,7 @@ impl Monos {
             menu_anchor: Anchor::Point(gpui::Point::default()),
             documents: HashMap::new(),
             html_documents: HashMap::new(),
+            suppress_html: false,
             visual_documents: HashMap::new(),
             project_changes: Default::default(),
             review: None,

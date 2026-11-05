@@ -11,6 +11,8 @@ mod classic_surfaces;
 mod contributors;
 #[cfg(test)]
 mod contributors_tests;
+#[cfg(test)]
+mod document_lightbox_tests;
 mod escape;
 #[cfg(test)]
 mod escape_tests;
@@ -625,6 +627,10 @@ pub(crate) struct Shell {
     monos: Option<Entity<crate::monos::Monos>>,
     quick_open: Option<quick_open::Open>,
     image_lightbox: Option<(Entity<crate::image_lightbox::ImageLightbox>, Subscription)>,
+    document_lightbox: Option<(
+        Entity<crate::document_lightbox::DocumentLightbox>,
+        Subscription,
+    )>,
     app_bridge: Option<monocode_core::mono::bridge::Server>,
     mobile: mobile_host::Mobile,
     app_results: HashMap<(i64, String), (String, Result<serde_json::Value, String>)>,
@@ -1065,6 +1071,7 @@ impl Shell {
             monos: None,
             quick_open: None,
             image_lightbox: None,
+            document_lightbox: None,
             app_bridge: None,
             mobile: mobile_host::Mobile::default(),
             app_results: HashMap::new(),
@@ -8719,7 +8726,15 @@ impl Render for Shell {
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
-            m.update(cx, |m, cx| m.bind_window(window, cx));
+            let covered = self.document_lightbox.is_some();
+            m.update(cx, |m, cx| {
+                m.set_suppress_html(covered);
+                m.bind_window(window, cx)
+            });
+        }
+        if let Some((lightbox, _)) = &self.document_lightbox {
+            let covered = self.overlay_above_lightbox(cx);
+            lightbox.update(cx, |lightbox, _| lightbox.set_covered(covered));
         }
         self.render_passes += 1;
         if let Some((id, tab)) = self.pending_review.take()
@@ -8979,6 +8994,22 @@ impl Render for Shell {
                             cx.notify();
                         });
                     this.image_lightbox = Some((view, closed));
+                    cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, open: &crate::document_lightbox::Open, window, cx| {
+                    let view = cx.new(|cx| {
+                        crate::document_lightbox::DocumentLightbox::new(open.clone(), window, cx)
+                    });
+                    let closed = cx.subscribe(
+                        &view,
+                        |this, _, _: &crate::document_lightbox::Closed, cx| {
+                            this.document_lightbox = None;
+                            cx.notify();
+                        },
+                    );
+                    this.document_lightbox = Some((view, closed));
                     cx.notify();
                 }),
             )
@@ -9487,6 +9518,11 @@ impl Render for Shell {
                 self.image_lightbox
                     .as_ref()
                     .map(|(view, _)| crate::image_lightbox::overlay(view)),
+            )
+            .children(
+                self.document_lightbox
+                    .as_ref()
+                    .map(|(view, _)| crate::document_lightbox::overlay(view)),
             )
             .map(|root| {
                 #[cfg(target_os = "linux")]

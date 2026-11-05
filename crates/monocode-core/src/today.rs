@@ -163,7 +163,7 @@ pub struct Note {
     pub task_id: String,
     pub day: Day,
     pub at: u64,
-    /// `None` for the user, otherwise the Mono's id.
+    /// `None` for the user and for a session, otherwise the Mono's id.
     pub mono_id: Option<String>,
     /// Empty when the note holds only attachments.
     pub body: String,
@@ -174,6 +174,10 @@ pub struct Note {
     /// for a note never edited. `at`, `day` and `mono_id` never change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edited_at: Option<u64>,
+    /// The plain coding session that wrote the note (its app-level session id);
+    /// `None` for the user and for a Mono, whose `mono_id` is set instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<i64>,
 }
 
 /// What happened to a task, for the detail panel's activity timeline.
@@ -357,6 +361,9 @@ pub struct MonoCaller {
 pub enum Actor {
     User,
     Mono(MonoCaller),
+    /// A plain coding session (its app-level session id) acting on the one task
+    /// it is linked to; it sees no other task.
+    Session(i64),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

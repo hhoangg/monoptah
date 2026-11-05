@@ -8,6 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 const NOTE_NOT_FOUND: &str = "Note not found";
 const NOT_YOURS: &str = "A Mono can only edit or delete its own notes";
+const NOT_YOUR_SESSION: &str = "A session can only edit or delete its own notes";
 
 /// The note `note_id` of the task `task_id_or_key`, if `actor` may change it.
 /// A note of another task reads as not found.
@@ -18,7 +19,7 @@ fn writable_note(
     actor: &Actor,
 ) -> Result<Note, String> {
     let task = load_task(conn, task_id_or_key)?
-        .filter(|task| actor_sees(actor, task))
+        .filter(|task| actor_sees(conn, actor, task))
         .ok_or_else(|| NOT_FOUND.to_string())?;
     let note = conn
         .query_row(
@@ -29,9 +30,18 @@ fn writable_note(
         .optional()
         .map_err(sql)?
         .ok_or_else(|| NOTE_NOT_FOUND.to_string())?;
-    if let Actor::Mono(caller) = actor {
-        if note.mono_id.as_deref() != Some(caller.id.as_str()) {
-            return Err(NOT_YOURS.to_string());
+    match actor {
+        Actor::User => {}
+        // Not a session's note either: those belong to the session alone.
+        Actor::Mono(caller) => {
+            if note.mono_id.as_deref() != Some(caller.id.as_str()) || note.session_id.is_some() {
+                return Err(NOT_YOURS.to_string());
+            }
+        }
+        Actor::Session(id) => {
+            if note.session_id != Some(*id) {
+                return Err(NOT_YOUR_SESSION.to_string());
+            }
         }
     }
     Ok(note)
@@ -43,7 +53,7 @@ impl Store {
     /// day, time and author. `edited_at` is set only when something changed, and
     /// a no-op edit writes nothing. The stored copies of dropped files are
     /// removed after the database write succeeded. A Mono may change only its
-    /// own notes; the user any.
+    /// own notes, a session only its own; the user any.
     pub fn today_edit_note(
         &self,
         task_id_or_key: &str,
@@ -112,7 +122,7 @@ impl Store {
     }
 
     /// Deletes a note and, after the row is gone, its stored files. A Mono may
-    /// delete only its own notes; the user any.
+    /// delete only its own notes, a session only its own; the user any.
     pub fn today_delete_note(
         &self,
         task_id_or_key: &str,
@@ -554,5 +564,105 @@ mod tests {
         assert!(super::super::has_column(&store.conn, "today_notes", "edited_at").unwrap());
         let edited = edit(&store, &id, &note_id, "after").unwrap();
         assert_eq!(edited.edited_at, Some(NOW + 5));
+    }
+
+    #[test]
+    fn a_session_note_stores_its_session_and_no_mono() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let id = task(&store);
+        store.today_link_session(7, &id, NOW).unwrap();
+        let note = store
+            .today_note(&id, "from a session", &Actor::Session(7), NOW)
+            .unwrap();
+        assert_eq!((note.session_id, note.mono_id.as_deref()), (Some(7), None));
+        let read = &store.today_notes(&id).unwrap()[0];
+        assert_eq!(read, &note);
+        let json = serde_json::to_value(read).unwrap();
+        assert_eq!(json["sessionId"], 7);
+        let user = store.today_note(&id, "mine", &Actor::User, NOW).unwrap();
+        assert!(serde_json::to_value(&user)
+            .unwrap()
+            .get("sessionId")
+            .is_none());
+        assert_eq!(user.session_id, None);
+    }
+
+    #[test]
+    fn a_session_sees_only_its_linked_task() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let (one, two) = (task_titled(&store, "One"), task_titled(&store, "Two"));
+        store.today_link_session(7, &one, NOW).unwrap();
+        let session = Actor::Session(7);
+        assert!(store.today_note(&one, "ok", &session, NOW).is_ok());
+        assert_eq!(
+            store.today_note(&two, "no", &session, NOW).unwrap_err(),
+            "Task not found"
+        );
+        let unlinked = Actor::Session(9);
+        assert!(store.today_note(&one, "no", &unlinked, NOW).is_err());
+    }
+
+    #[test]
+    fn sessions_and_monos_and_the_user_edit_by_ownership() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let id = task(&store);
+        store.today_link_session(7, &id, NOW).unwrap();
+        store.today_link_session(8, &id, NOW).unwrap();
+        let session = Actor::Session(7);
+        let theirs = store.today_note(&id, "s", &session, NOW).unwrap();
+        let users = store.today_note(&id, "u", &Actor::User, NOW).unwrap();
+        let monos = store.today_note(&id, "m", &mono("m1"), NOW).unwrap();
+        let change = |actor: &Actor, note: &Note| {
+            store.today_edit_note(&id, &note.id, "changed", &[], actor, NOW + 1)
+        };
+        assert!(change(&session, &theirs).is_ok());
+        assert!(change(&session, &users).is_err());
+        assert!(change(&session, &monos).is_err());
+        assert!(change(&Actor::Session(8), &theirs).is_err());
+        assert!(change(&mono("m1"), &theirs).is_err());
+        assert!(change(&Actor::User, &theirs).is_ok());
+        assert!(store
+            .today_delete_note(&id, &users.id, &session, NOW)
+            .is_err());
+        assert!(store
+            .today_delete_note(&id, &theirs.id, &mono("m1"), NOW)
+            .is_err());
+        assert!(store
+            .today_delete_note(&id, &theirs.id, &session, NOW)
+            .is_ok());
+    }
+
+    #[test]
+    fn an_old_notes_table_gains_the_session_column_and_keeps_its_notes() {
+        let data = tempfile::tempdir().unwrap();
+        let (id, note_id) = {
+            let store = store_in(data.path());
+            let id = task(&store);
+            let note = store.today_note(&id, "before", &Actor::User, NOW).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "CREATE TABLE old_notes AS SELECT id, task_id, day, at, mono_id, body, attachments_json, edited_at FROM today_notes;
+                     DROP TABLE today_notes;
+                     ALTER TABLE old_notes RENAME TO today_notes;",
+                )
+                .unwrap();
+            assert!(!super::super::has_column(&store.conn, "today_notes", "session_id").unwrap());
+            (id, note.id)
+        };
+        let store = store_in(data.path());
+        let notes = store.today_notes(&id).unwrap();
+        assert_eq!(
+            (notes[0].body.as_str(), notes[0].session_id),
+            ("before", None)
+        );
+        assert!(super::super::has_column(&store.conn, "today_notes", "session_id").unwrap());
+        store.today_link_session(3, &id, NOW).unwrap();
+        let written = store
+            .today_note(&id, "after", &Actor::Session(3), NOW + 1)
+            .unwrap();
+        assert_eq!(store.today_notes(&id).unwrap()[1].session_id, Some(3));
+        assert!(edit(&store, &id, &note_id, "kept").is_ok());
+        assert_eq!(written.session_id, Some(3));
     }
 }

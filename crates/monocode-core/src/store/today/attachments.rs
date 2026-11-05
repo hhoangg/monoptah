@@ -40,9 +40,28 @@ impl NotePlan {
             .root
             .as_deref()
             .ok_or("Attachment storage is unavailable")?;
-        Ok(copy_files(root, &self.relative, files))
+        Ok(copy_files(root, &self.relative, files, false))
     }
-    fn discard(&self) {
+
+    /// Like [`copy`](Self::copy) for files an agent named: each is opened once
+    /// without following a symlink and read from that handle, so a file swapped
+    /// for a link after validation is refused. Messages carry the full path.
+    pub fn copy_agent(
+        &self,
+        files: &[PathBuf],
+    ) -> Result<(Vec<NoteAttachment>, Vec<String>), String> {
+        if files.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let root = self
+            .root
+            .as_deref()
+            .ok_or("Attachment storage is unavailable")?;
+        Ok(copy_files(root, &self.relative, files, true))
+    }
+    /// Removes the plan's note folder and any copies in it. Call it when the
+    /// plan will not be committed.
+    pub fn discard(&self) {
         if let Some(root) = &self.root {
             let _ = std::fs::remove_dir_all(root.join(&self.relative));
         }
@@ -93,7 +112,7 @@ impl Store {
         self.today_roll(now)?;
         self.today_ready()?;
         let task = load_task(&self.conn, id)?
-            .filter(|task| actor_sees(actor, task))
+            .filter(|task| actor_sees(&self.conn, actor, task))
             .ok_or_else(|| NOT_FOUND.to_string())?;
         let note_id = format!("note-{}", uuid::Uuid::new_v4());
         Ok(NotePlan {
@@ -130,7 +149,7 @@ impl Store {
             let day = self.today_roll(now)?;
             self.today_tx(|conn| {
                 let task = load_task(conn, &plan.task_id)?
-                    .filter(|task| actor_sees(actor, task))
+                    .filter(|task| actor_sees(conn, actor, task))
                     .ok_or_else(|| NOT_FOUND.to_string())?;
                 let note = Note {
                     id: plan.note_id.clone(),
@@ -138,16 +157,20 @@ impl Store {
                     day,
                     at: now,
                     mono_id: match actor {
-                        Actor::User => None,
+                        Actor::User | Actor::Session(_) => None,
                         Actor::Mono(caller) => Some(caller.id.clone()),
                     },
                     body: plan.body.clone(),
                     attachments,
                     edited_at: None,
+                    session_id: match actor {
+                        Actor::Session(id) => Some(*id),
+                        _ => None,
+                    },
                 };
                 conn.execute(
-                    "INSERT INTO today_notes (id, task_id, day, at, mono_id, body, attachments_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO today_notes (id, task_id, day, at, mono_id, body, attachments_json, session_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         note.id,
                         note.task_id,
@@ -155,7 +178,8 @@ impl Store {
                         note.at.min(i64::MAX as u64) as i64,
                         note.mono_id,
                         note.body,
-                        json
+                        json,
+                        note.session_id
                     ],
                 )
                 .map_err(sql)?;
@@ -190,24 +214,85 @@ impl Store {
     }
 }
 
+/// Reads `path` through one handle opened without following a symlink, after
+/// checking that handle is a regular file within the size limit. Errors read
+/// as the end of a sentence about the file.
+fn read_no_follow(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK keeps open() from waiting forever on a FIFO swapped in
+        // after validation; the is_file() check below then refuses it.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(true)
+    {
+        return Err("is not a plain file.".into());
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| "could not be read (it may be a link).".to_string())?;
+    let meta = file
+        .metadata()
+        .map_err(|_| "could not be read.".to_string())?;
+    if !meta.is_file() {
+        return Err("is not a file.".into());
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "is larger than {} MB.",
+            MAX_FILE_BYTES / 1024 / 1024
+        ));
+    }
+    let mut data = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| "could not be read.".to_string())?;
+    if data.len() as u64 > MAX_FILE_BYTES {
+        return Err("grew past the size limit.".into());
+    }
+    // No directory on the way may have become a link since it was validated.
+    if path.canonicalize().ok().as_deref() != Some(path) {
+        return Err("changed while it was being attached.".into());
+    }
+    Ok(data)
+}
+
 /// Copies each file into `root/relative`, each under a unique safe name.
 fn copy_files(
     root: &Path,
     relative: &Path,
     files: &[PathBuf],
+    no_follow: bool,
 ) -> (Vec<NoteAttachment>, Vec<String>) {
     let dir = root.join(relative);
     let mut attachments = Vec::new();
     let mut skipped = Vec::new();
     for source in files {
         let name = display_name(source);
-        let copied = check_file(source)
-            .and_then(|_| std::fs::read(source).map_err(|_| format!("{name} could not be read.")))
-            .and_then(|data| {
-                write_attachment_limited(&dir, &name, &data, MAX_FILE_BYTES)
-                    .map(|path| (path, data.len() as u64))
-                    .map_err(|_| format!("{name} could not be saved."))
-            });
+        let shown = if no_follow {
+            source.to_string_lossy().into_owned()
+        } else {
+            name.clone()
+        };
+        let read = if no_follow {
+            read_no_follow(source).map_err(|why| format!("{shown} {why}"))
+        } else {
+            check_file(source).and_then(|_| {
+                std::fs::read(source).map_err(|_| format!("{name} could not be read."))
+            })
+        };
+        let copied = read.and_then(|data| {
+            write_attachment_limited(&dir, &name, &data, MAX_FILE_BYTES)
+                .map(|path| (path, data.len() as u64))
+                .map_err(|_| format!("{name} could not be saved."))
+        });
         match copied {
             Ok((path, size)) => {
                 let leaf = path
@@ -547,5 +632,23 @@ mod tests {
             .unwrap()
             .get("attachments")
             .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_no_follow_refuses_a_fifo_without_hanging() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::Builder::new().prefix("fifo").tempdir().unwrap();
+        let fifo = dir.path().join("pipe.md");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_no_follow(&fifo));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("open() on a FIFO must not block");
+        assert_eq!(result.unwrap_err(), "is not a file.");
     }
 }

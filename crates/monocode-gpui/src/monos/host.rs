@@ -1073,7 +1073,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                     target,
                     move |store| {
                         let value = monocode_core::today::actions::handle(
-                            &*locked(&store)?,
+                            &*store,
                             &caller,
                             &name,
                             &input,

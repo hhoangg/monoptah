@@ -66,7 +66,8 @@ fn ensure_today_tables(conn: &Connection) -> rusqlite::Result<()> {
            mono_id TEXT,
            body TEXT NOT NULL,
            attachments_json TEXT,
-           edited_at INTEGER
+           edited_at INTEGER,
+           session_id INTEGER
          );
          CREATE INDEX IF NOT EXISTS today_notes_task_idx ON today_notes (task_id, at);
          CREATE TABLE IF NOT EXISTS today_events (
@@ -103,6 +104,10 @@ fn ensure_today_tables(conn: &Connection) -> rusqlite::Result<()> {
     // A table made before notes could be edited lacks the edit time.
     if !has_column(conn, "today_notes", "edited_at")? {
         conn.execute("ALTER TABLE today_notes ADD COLUMN edited_at INTEGER", [])?;
+    }
+    // A table made before sessions could write notes lacks the author session.
+    if !has_column(conn, "today_notes", "session_id")? {
+        conn.execute("ALTER TABLE today_notes ADD COLUMN session_id INTEGER", [])?;
     }
     Ok(())
 }
@@ -281,7 +286,7 @@ struct Who {
 
 fn who_of(actor: &Actor) -> Who {
     match actor {
-        Actor::User => Who::default(),
+        Actor::User | Actor::Session(_) => Who::default(),
         Actor::Mono(caller) => Who {
             mono_id: Some(caller.id.clone()),
             source_id: None,
@@ -489,10 +494,12 @@ fn note_from_row(row: &rusqlite::Row) -> rusqlite::Result<Note> {
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default(),
         edited_at: row.get::<_, Option<i64>>(7)?.map(|at| at.max(0) as u64),
+        session_id: row.get(8)?,
     })
 }
 
-const NOTE_COLUMNS: &str = "id, task_id, day, at, mono_id, body, attachments_json, edited_at";
+const NOTE_COLUMNS: &str =
+    "id, task_id, day, at, mono_id, body, attachments_json, edited_at, session_id";
 
 fn latest_note(conn: &Connection, task_id: &str, day: &str) -> Result<Option<Note>, String> {
     conn.query_row(
@@ -525,10 +532,21 @@ fn json_rows<T: DeserializeOwned>(
     Ok(out)
 }
 
-fn actor_sees(actor: &Actor, task: &Task) -> bool {
+/// Whether `actor` may see `task`. A session sees only the task it is linked
+/// to (the same link `Store::today_session_task` reads).
+fn actor_sees(conn: &Connection, actor: &Actor, task: &Task) -> bool {
     match actor {
         Actor::User => true,
         Actor::Mono(caller) => today::visible_to(task, caller),
+        Actor::Session(id) => conn
+            .query_row(
+                "SELECT 1 FROM today_session_links WHERE session_id = ?1 AND task_id = ?2",
+                params![id, task.id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .unwrap_or(false),
     }
 }
 
@@ -1020,6 +1038,7 @@ impl Store {
         let task_tags = check_task_tags(&new.tags, &defs, 0)?;
         let (mono_id, project) = match actor {
             Actor::User => (None, new.project.clone()),
+            Actor::Session(_) => return Err("A session cannot add tasks".into()),
             Actor::Mono(caller) => (
                 Some(caller.id.clone()),
                 new.project
@@ -1095,7 +1114,7 @@ impl Store {
         let defs = self.today_tags()?;
         self.today_tx(|conn| {
             let original = load_task(conn, id)?
-                .filter(|task| actor_sees(actor, task))
+                .filter(|task| actor_sees(conn, actor, task))
                 .ok_or_else(|| NOT_FOUND.to_string())?;
             if let Actor::Mono(caller) = actor {
                 if refuse_in_run && caller.in_run {
