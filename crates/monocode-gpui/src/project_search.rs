@@ -122,6 +122,19 @@ impl ProjectSearch {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_filters(&mut self, query: &str, include: &str, cx: &mut Context<Self>) {
+        self.query
+            .update(cx, |input, cx| input.set_text(query.to_owned(), cx));
+        self.include
+            .update(cx, |input, cx| input.set_text(include.to_owned(), cx));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_group_paths(&self) -> Vec<String> {
+        self.groups.iter().map(|g| g.relative.clone()).collect()
+    }
+
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
         self.query.update(cx, |input, cx| {
             let length = input.content.len();
@@ -606,6 +619,7 @@ impl Render for ProjectSearch {
             .child(
                 div()
                     .id("project-search-results")
+                    .debug_selector(|| "project-search-results".into())
                     .min_h_0()
                     .min_w_0()
                     .flex_1()
