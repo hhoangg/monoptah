@@ -936,6 +936,24 @@ impl Shell {
         cx.notify();
     }
 
+    /// Whether the quit notice, a toast or an approval is up. They draw above
+    /// the document lightbox (priority 110 and 120 against its 100), but a
+    /// native web view sits above all of GPUI, so the lightbox hides it.
+    pub(super) fn overlay_above_lightbox(&self, cx: &App) -> bool {
+        let state = &self.notification_state;
+        self.quit_gate.expires_at().is_some()
+            || self.error.is_some()
+            || self
+                .monos
+                .as_ref()
+                .is_some_and(|monos| monos.read(cx).error.is_some())
+            || state.file_error.read(cx).is_visible()
+            || !state.reminders.read(cx).is_empty()
+            || state.harness.read(cx).is_visible()
+            || state.layout.read(cx).is_visible()
+            || !state.approvals.read(cx).is_empty()
+    }
+
     pub(super) fn notices_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.notification_state;
         let mono_error = self.monos.as_ref().and_then(|monos| {

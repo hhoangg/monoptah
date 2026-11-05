@@ -16,6 +16,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// A native web view draws above every GPUI overlay, so it is only shown while
+/// nothing with a higher priority than the lightbox is up.
+fn shows_web_view(kind: Option<Kind>, covered: bool) -> bool {
+    kind == Some(Kind::Html) && !covered
+}
+
 /// Files above this size are not read; the user is offered the default app.
 pub(crate) const MAX_BYTES: u64 = 5 * 1024 * 1024;
 
@@ -41,7 +47,7 @@ pub(crate) struct Open {
     pub title: SharedString,
 }
 
-actions!(document_lightbox, [Close, CopyText, OpenExternal]);
+actions!(document_lightbox, [Close]);
 
 pub(crate) fn bind(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("escape", Close, Some("DocumentLightbox"))]);
@@ -88,6 +94,8 @@ pub(crate) struct DocumentLightbox {
     text: Option<String>,
     body: Body,
     error: Option<String>,
+    /// A higher-priority overlay is up, so a native web view must not show.
+    covered: bool,
     focus: FocusHandle,
     restore: Option<FocusHandle>,
 }
@@ -106,6 +114,7 @@ impl DocumentLightbox {
             text: None,
             body: Body::Loading,
             error: None,
+            covered: false,
             focus,
             restore,
         };
@@ -156,12 +165,21 @@ impl DocumentLightbox {
                         "HTML preview needs a web view, which this platform doesn't have here."
                             .into(),
                     ),
-                    None => Body::Loading,
+                    None => Body::Message("This file type can't be previewed here.".into()),
                 };
                 self.text = Some(text);
                 body
             }
         };
+    }
+
+    pub(crate) fn set_covered(&mut self, covered: bool) {
+        self.covered = covered;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn covered(&self) -> bool {
+        self.covered
     }
 
     pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -245,6 +263,10 @@ impl Render for DocumentLightbox {
                 .size_full()
                 .child(view.clone())
                 .into_any_element(),
+            Body::Html(view) if !shows_web_view(self.kind, self.covered) => {
+                view.read(cx).hide();
+                div().size_full().into_any_element()
+            }
             Body::Html(view) => div()
                 .id("document-lightbox-html")
                 .debug_selector(|| "document-lightbox-html".into())
@@ -288,8 +310,6 @@ impl Render for DocumentLightbox {
             .justify_center()
             .bg(black(0.7))
             .on_action(cx.listener(|this, _: &Close, window, cx| this.close(window, cx)))
-            .on_action(cx.listener(|this, _: &CopyText, _, cx| this.copy_text(cx)))
-            .on_action(cx.listener(|this, _: &OpenExternal, _, cx| this.open_external(cx)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.close(window, cx)),
@@ -299,8 +319,8 @@ impl Render for DocumentLightbox {
                 div()
                     .id("document-lightbox-panel")
                     .debug_selector(|| "document-lightbox-panel".into())
-                    .w(viewport.width.min(px(960.)) - px(48.))
-                    .h(viewport.height - px(48.))
+                    .w((viewport.width.min(px(960.)) - px(48.)).max(px(0.)))
+                    .h((viewport.height - px(48.)).max(px(0.)))
                     .flex()
                     .flex_col()
                     .overflow_hidden()
@@ -402,6 +422,14 @@ mod tests {
     }
 
     #[test]
+    fn the_web_view_shows_only_for_html_and_only_when_nothing_covers_it() {
+        assert!(shows_web_view(Some(Kind::Html), false));
+        assert!(!shows_web_view(Some(Kind::Html), true));
+        assert!(!shows_web_view(Some(Kind::Markdown), false));
+        assert!(!shows_web_view(None, false));
+    }
+
+    #[test]
     fn small_files_are_read_and_oversized_ones_are_refused() {
         let dir = scratch("read");
         let small = dir.join("a.md");
@@ -414,5 +442,6 @@ mod tests {
         std::fs::write(&edge, vec![b'x'; MAX_BYTES as usize]).unwrap();
         assert!(matches!(read_text(&edge), Ok(Loaded::Text(_))));
         assert!(read_text(&dir.join("missing.md")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

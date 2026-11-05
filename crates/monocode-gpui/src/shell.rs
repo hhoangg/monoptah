@@ -8726,7 +8726,15 @@ impl Render for Shell {
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
-            m.update(cx, |m, cx| m.bind_window(window, cx));
+            let covered = self.document_lightbox.is_some();
+            m.update(cx, |m, cx| {
+                m.set_suppress_html(covered);
+                m.bind_window(window, cx)
+            });
+        }
+        if let Some((lightbox, _)) = &self.document_lightbox {
+            let covered = self.overlay_above_lightbox(cx);
+            lightbox.update(cx, |lightbox, _| lightbox.set_covered(covered));
         }
         self.render_passes += 1;
         if let Some((id, tab)) = self.pending_review.take()

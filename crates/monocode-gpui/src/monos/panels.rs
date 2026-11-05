@@ -1479,7 +1479,8 @@ impl Monos {
                     });
                 };
                 let view: AnyElement = if document.kind == "html"
-                    && (self.settings.is_some()
+                    && (self.suppress_html
+                        || self.settings.is_some()
                         || self.menu.is_some()
                         || self.picker.is_some()
                         || self.background.is_some())

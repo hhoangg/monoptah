@@ -168,7 +168,7 @@ impl Html {
             self.interactive = interactive;
         }
     }
-    pub(super) fn hide(&self) {
+    pub(crate) fn hide(&self) {
         #[cfg(target_os = "macos")]
         if let Some(view) = self.view.borrow().as_ref() {
             view.clip.setHidden(true);
