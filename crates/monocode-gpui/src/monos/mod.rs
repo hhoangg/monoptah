@@ -13,7 +13,7 @@ mod habit_share;
 mod habit_share_tests;
 mod habit_stop;
 mod host;
-mod html;
+pub(crate) mod html;
 mod memory_ui;
 mod mobile;
 mod notifications;

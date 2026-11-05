@@ -23,6 +23,7 @@ mod conversation;
 #[cfg(debug_assertions)]
 mod dev_reload;
 mod diff_view;
+mod document_lightbox;
 mod editor_analysis;
 mod editor_scrollbar;
 mod editor_syntax;
@@ -457,6 +458,7 @@ fn main() {
             hang_watchdog::start(database.with_file_name("gpui-hangs"), cx);
             input::bind(cx);
             image_lightbox::bind(cx);
+            document_lightbox::bind(cx);
             composer_completion::bind(cx);
             file_editor::bind(cx);
             popover::bind(cx);
