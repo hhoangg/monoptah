@@ -42,6 +42,21 @@ pub(crate) async fn wake_for_send(
     stopped
 }
 
+/// Reconnects the codespace of cloud session `id` for a send or an explicit "Reconnect" from the
+/// conversation view and waits for it. `Ok(false)` means nothing was done (local session or the
+/// codespace is Unavailable). Runs gh and the SSH bootstrap on the background executor.
+pub(crate) async fn reconnect(store: Database, id: i64, cx: &mut AsyncApp) -> Result<bool, String> {
+    cx.background_executor()
+        .spawn(async move {
+            let api = CloudApi::shared(&store)?;
+            match api.target_of(id) {
+                Some(target) if should_wake(target.state) => api.wake(id, &store).map(|()| true),
+                _ => Ok(false),
+            }
+        })
+        .await
+}
+
 /// Doubles for tests of the dispatchers: a git project with a GitHub origin, a fake `gh`
 /// and a fake machine host, installed as the shared cloud service.
 #[cfg(test)]

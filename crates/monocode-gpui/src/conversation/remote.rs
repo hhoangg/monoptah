@@ -9,6 +9,7 @@ pub(super) struct State {
     pub(super) refreshing: bool,
     pub(super) pending: bool,
     pub(super) online: bool,
+    waking: bool,
     error: Option<String>,
     rejected: Option<Value>,
     snapshot: Option<Value>,
@@ -39,6 +40,43 @@ impl Conversation {
             self.status = error.into();
             cx.notify();
         }
+    }
+    /// Reconnects the codespace of a cloud session off the UI thread, then reloads. Background
+    /// loads never open a tunnel, so after an app restart the history stays unloaded until a
+    /// user action (send or "Reconnect") comes through here. Returns whether this is a cloud
+    /// session (a wake is running or was started).
+    pub(super) fn reconnect_cloud(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.is_cloud_session() {
+            return false;
+        }
+        if self.remote_state.waking {
+            return true;
+        }
+        self.remote_state.waking = true;
+        self.status = "Reconnecting the codespace...".into();
+        cx.notify();
+        let store = self.store.clone();
+        let id = self.summary.id;
+        cx.spawn(async move |this, cx| {
+            let result = crate::cloud_wake::reconnect(store, id, cx).await;
+            let _ = this.update(cx, |this, cx| {
+                this.remote_state.waking = false;
+                match result {
+                    Ok(true) => {
+                        this.remote_state.error = None;
+                        this.load_remote(cx);
+                    }
+                    Ok(false) => this.remote_connection_error(
+                        "This codespace is unavailable. It may have been deleted.",
+                        cx,
+                    ),
+                    Err(error) => this.remote_connection_error(&error, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        true
     }
     pub(super) fn load_remote(&mut self, cx: &mut Context<Self>) {
         if self.remote_state.clock.is_none() && !cfg!(test) {
@@ -235,20 +273,34 @@ impl Conversation {
     }
     pub(super) fn remote_send_guard(&mut self, cx: &mut Context<Self>) -> bool {
         let error = if !self.loaded {
-            Some("Wait for this remote conversation to load.")
+            Some("Wait for this remote conversation to load.".to_owned())
         } else if !self.remote_state.online {
-            Some("The machine is offline. Reconnect in Settings → Connections, then Retry.")
+            Some(
+                "The machine is offline. Reconnect in Settings → Connections, then Retry."
+                    .to_owned(),
+            )
         } else if self.remote_state.pending {
-            Some(self.remote_state.legacy_recovery_error().unwrap_or(
-                "A remote command needs confirmation. Choose Retry before sending another message.",
-            ))
+            Some(
+                self.remote_state
+                    .legacy_recovery_error()
+                    .unwrap_or(
+                        "A remote command needs confirmation. Choose Retry before sending another message.",
+                    )
+                    .to_owned(),
+            )
         } else if self.busy || self.stopping {
-            Some("Wait for this remote turn to finish before sending another message.")
+            Some("Wait for this remote turn to finish before sending another message.".to_owned())
         } else {
             None
         };
         if let Some(error) = error {
-            self.status = error.into();
+            let unreachable = !self.loaded || !self.remote_state.online;
+            if unreachable && self.reconnect_cloud(cx) {
+                self.status = "Reconnecting the codespace. Send again when it is ready.".into();
+                cx.notify();
+                return true;
+            }
+            self.status = error;
             cx.notify();
             return true;
         }
@@ -349,6 +401,8 @@ impl Conversation {
         let legacy = self.remote_state.legacy_recovery_error();
         Some(div().mx_2().my_2().p_3().rounded_lg().bg(content(0.04)).flex().items_center().gap_2()
             .child(div().flex_1().text_size(px(12.)).child(if let Some(error) = legacy {error.to_owned()} else if self.remote_state.pending {"A remote command needs confirmation. Retry uses its original command ID.".to_owned()} else {self.remote_state.error.clone().unwrap_or_default()}))
+            .when(legacy.is_none() && !self.remote_state.pending && self.is_cloud_session(), |d| d
+            .child(crate::settings::widgets::secondary_button("remote-reconnect","Reconnect",!self.remote_state.waking,false).debug_selector(|| "remote-reconnect".into()).child("Reconnect").on_click(cx.listener(|this,_,_,cx| { this.reconnect_cloud(cx); }))))
             .when(legacy.is_none(), |d| d
             .child(crate::settings::widgets::secondary_button("remote-retry",if self.remote_state.rejected.is_some() {"Restore message"} else {"Retry"},true,false).debug_selector(|| "remote-retry".into()).child(if self.remote_state.rejected.is_some() {"Restore message"} else {"Retry"}).on_click(cx.listener(|this,_,_,cx| {
                 if this.remote_state.rejected.is_some() { this.restore_remote_message(cx); } else {this.retry_remote(cx);}

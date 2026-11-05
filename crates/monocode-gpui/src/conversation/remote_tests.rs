@@ -435,3 +435,60 @@ fn ambiguous_legacy_requests_block_send_retry_and_restore_without_consuming_draf
         })
     });
 }
+
+/// After an app restart a cloud session has no live tunnel and its history never loads in the
+/// background; a send (and the Reconnect button) must wake the codespace off the UI thread.
+#[gpui::test]
+fn sending_to_an_unloaded_cloud_session_reconnects_its_codespace(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
+    use monocode_core::cloud_sessions::{CodespaceChoice, Target};
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (_gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let api = monocode_core::mono::cloud_api::CloudApi::shared(&store).unwrap();
+    let binding = api
+        .prepare(
+            dir.0.to_str().unwrap(),
+            Target {
+                codespace: CodespaceChoice::Named("octo-run".into()),
+                branch: None,
+                machine: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    let summary = api.create_session(&binding, "claude").unwrap();
+    host.0.lock().unwrap().clear();
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, store.clone(), cx);
+            view.loaded = false;
+            view.remote_state.online = false;
+            // The reload that follows a wake is not under test (it would open real connections).
+            view.remote_state.refreshing = true;
+            view.input
+                .update(cx, |input, cx| input.set_text("Reply with PONG".into(), cx));
+            view
+        })
+    });
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.send(cx);
+            assert!(view.status.contains("Reconnecting"), "{}", view.status);
+            assert!(view.remote_state.waking);
+            // A second send while waking does not start another wake.
+            view.send(cx);
+            assert_eq!(view.input.read(cx).content, "Reply with PONG");
+        })
+    });
+    cx.run_until_parked();
+    let calls = host.0.lock().unwrap().clone();
+    assert_eq!(
+        calls.iter().filter(|c| *c == "ensure m-octo-run").count(),
+        1,
+        "{calls:?}"
+    );
+    cx.update(|cx| view.update(cx, |view, _| assert!(!view.remote_state.waking)));
+}
