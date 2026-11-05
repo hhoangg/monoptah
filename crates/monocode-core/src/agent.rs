@@ -93,6 +93,10 @@ pub struct Settings {
     pub remote_action: Option<serde_json::Value>,
     pub account: crate::accounts::Profile,
     pub usage_limit: Option<crate::usage::Limit>,
+    /// The user turned automatic resume off for this session while the global
+    /// "auto resume at usage limit reset" preference was on. The global switch
+    /// never arms an opted-out session again; arming it by hand clears this.
+    pub auto_resume_opt_out: bool,
     /// Isolated background text jobs; never persisted as conversation settings.
     #[serde(skip)]
     pub text_only: bool,

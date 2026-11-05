@@ -21,6 +21,10 @@ impl Metadata<'_> {
     pub(super) fn responding(&self) -> bool {
         self.live.is_some_and(Conversation::responding) || self.terminal_busy
     }
+    /// Set while a loaded local session waits to resume by itself at its limit reset.
+    pub(super) fn auto_resume(&self, now: i64) -> Option<monocode_core::usage::AutoResume> {
+        self.live.and_then(|chat| chat.auto_resume_state(now))
+    }
     pub(super) fn has_saved_draft(&self) -> bool {
         self.live.map_or(self.draft, Conversation::has_saved_draft)
     }
