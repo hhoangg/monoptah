@@ -9,6 +9,7 @@ mod list;
 mod menus;
 mod note_attachments;
 mod note_composer;
+mod note_edit;
 mod sources;
 mod statuses;
 mod texts;
@@ -167,6 +168,8 @@ pub(crate) struct Today {
     pub(super) note_files: note_attachments::NoteFiles,
     /// Pending files, paste and drop state of the note composer.
     pub(super) attach: note_composer::Attach,
+    /// The note open for editing and the delete awaiting an answer.
+    pub(super) note_edit: note_edit::NoteEdit,
     /// Selectable read-only fields for the detail's note bodies and context.
     pub(super) texts: texts::Texts,
     /// The detail's title field, for manual tasks.
@@ -283,6 +286,7 @@ impl Today {
             note,
             note_files: note_attachments::NoteFiles::default(),
             attach: Default::default(),
+            note_edit: Default::default(),
             texts: texts::Texts::default(),
             title,
             sessions: Default::default(),
@@ -405,10 +409,14 @@ impl Today {
             .selected
             .as_ref()
             .is_some_and(|id| !loaded.view.rows.iter().any(|row| &row.task.id == id));
+        if loaded.view.mode == DayMode::Past {
+            self.note_edit = Default::default();
+        }
         self.view = Some(loaded.view);
         if vanished {
             self.selected = None;
             self.activity.clear();
+            self.note_edit = Default::default();
         } else if self.selected.is_some() {
             self.load_activity(cx);
         }
@@ -442,6 +450,7 @@ impl Today {
                             activity.retain(|entry| entry.day() <= view.day.as_str());
                         }
                         this.activity = activity;
+                        this.prune_note_edit();
                     }
                     Err(error) => this.error = Some(error),
                 }
@@ -561,6 +570,7 @@ impl Today {
         self.note
             .update(cx, |input, cx| input.set_text(String::new(), cx));
         self.reset_note_files(cx);
+        self.note_edit = Default::default();
         self.load_activity(cx);
         cx.notify();
     }
@@ -596,6 +606,8 @@ impl Today {
         }
         self.day = day;
         self.added_hidden = false;
+        // A note belongs to the day it is edited on.
+        self.note_edit = Default::default();
         self.refresh(cx);
         cx.notify();
     }
@@ -1446,6 +1458,8 @@ impl Render for Today {
                     // keeps the page), then the narrow detail, then the page itself.
                     if this.asking_to_move() {
                         this.cancel_move(cx);
+                    } else if this.escape_note_edit(cx) {
+                        // The delete question or the open editor took it.
                     } else if this.statuses_dialog.is_some() {
                         this.finish_statuses(window, cx);
                     } else if this.tags_dialog.is_some() {

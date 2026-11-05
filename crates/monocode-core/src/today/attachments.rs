@@ -1,7 +1,8 @@
 //! Files attached to a Today note. Each file is copied into the app data
 //! directory at `today-attachments/<task id>/<note id>/<unique safe name>`, so a
-//! note never points at the user's original path. Notes are append-only, so the
-//! copies are too: nothing here deletes them.
+//! note never points at the user's original path. The copies live as long as the
+//! note: editing a note away from a file, or deleting the note, removes them
+//! (see `Store::today_edit_note` and `today_delete_note`).
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -268,6 +269,7 @@ mod tests {
             mono_id: None,
             body: String::new(),
             attachments,
+            edited_at: None,
         }
     }
 

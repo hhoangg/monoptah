@@ -64,7 +64,9 @@ fn ensure_today_tables(conn: &Connection) -> rusqlite::Result<()> {
            day TEXT NOT NULL,
            at INTEGER NOT NULL,
            mono_id TEXT,
-           body TEXT NOT NULL
+           body TEXT NOT NULL,
+           attachments_json TEXT,
+           edited_at INTEGER
          );
          CREATE INDEX IF NOT EXISTS today_notes_task_idx ON today_notes (task_id, at);
          CREATE TABLE IF NOT EXISTS today_events (
@@ -97,6 +99,10 @@ fn ensure_today_tables(conn: &Connection) -> rusqlite::Result<()> {
             "ALTER TABLE today_notes ADD COLUMN attachments_json TEXT",
             [],
         )?;
+    }
+    // A table made before notes could be edited lacks the edit time.
+    if !has_column(conn, "today_notes", "edited_at")? {
+        conn.execute("ALTER TABLE today_notes ADD COLUMN edited_at INTEGER", [])?;
     }
     Ok(())
 }
@@ -482,10 +488,11 @@ fn note_from_row(row: &rusqlite::Row) -> rusqlite::Result<Note> {
             .get::<_, Option<String>>(6)?
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default(),
+        edited_at: row.get::<_, Option<i64>>(7)?.map(|at| at.max(0) as u64),
     })
 }
 
-const NOTE_COLUMNS: &str = "id, task_id, day, at, mono_id, body, attachments_json";
+const NOTE_COLUMNS: &str = "id, task_id, day, at, mono_id, body, attachments_json, edited_at";
 
 fn latest_note(conn: &Connection, task_id: &str, day: &str) -> Result<Option<Note>, String> {
     conn.query_row(
@@ -1954,6 +1961,7 @@ fn status_color(color: &str) -> Result<String, String> {
 }
 
 mod attachments;
+mod note_edit;
 pub use attachments::{NotePlan, NoteSaved};
 
 #[cfg(test)]
