@@ -93,6 +93,20 @@ impl SettingsView {
                 )],
             ),
             self.row(
+                Some("auto-resume-usage-limit"),
+                false,
+                "Auto resume at usage limit reset",
+                Some("When a session hits its usage limit, resume it automatically once the limit resets. You can still turn it off per session from the usage notice.".into()),
+                vec![self.toggle(
+                    "auto-resume-usage-limit",
+                    "Auto resume at usage limit reset",
+                    p.auto_resume_usage_limit,
+                    false,
+                    cx,
+                    |this, on, cx| this.update(cx, |p| p.auto_resume_usage_limit = on),
+                )],
+            ),
+            self.row(
                 Some("model-controls"),
                 false,
                 "Model controls",

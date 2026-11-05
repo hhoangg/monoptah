@@ -6678,6 +6678,32 @@ impl Shell {
             .into_any()
     }
 
+    /// A clock for a session that resumes by itself once its usage limit resets.
+    /// Amber like the clock in the composer's usage notice, so it reads apart
+    /// from a limited session that is not armed (which shows no clock).
+    pub(super) fn auto_resume_badge(
+        &self,
+        id: i64,
+        state: monocode_core::usage::AutoResume,
+        label: bool,
+        icon_size: f32,
+    ) -> AnyElement {
+        let tip = crate::conversation::auto_resume_tooltip(state, monocode_core::usage::now_ms());
+        div()
+            .id(("session-auto-resume", id as usize))
+            .debug_selector(move || format!("session-auto-resume-{id}"))
+            .role(Role::Image)
+            .aria_label(tip.clone())
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_color(gpui::rgb(crate::right_panel::AMBER_400))
+            .child(icon("clock", icon_size))
+            .when(label, |d| d.child("Auto resume"))
+            .tooltip(move |_, cx| cx.new(|_| project_rail::ProjectTooltip(tip.clone())).into())
+            .into_any()
+    }
+
     fn session_suffix(
         &self,
         id: i64,
@@ -6716,6 +6742,10 @@ impl Shell {
                     .children(self.session_marks.get(&id).cloned())
                     .child("Working…")
                     .into_any()
+            } else if let Some(state) = session.auto_resume(monocode_core::usage::now_ms()) {
+                // Before "Done": a limit ends the turn, so the session is
+                // usually unseen-finished as well.
+                self.auto_resume_badge(id, state, detailed, 14.)
             } else if detailed && self.unseen_finished.contains(&id) {
                 div()
                     .flex()

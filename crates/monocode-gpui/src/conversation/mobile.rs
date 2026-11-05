@@ -91,6 +91,11 @@ impl Conversation {
     pub(super) fn set_usage_resume_at_reset(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if let Some(limit) = &mut self.settings.usage_limit {
             limit.resume_at_reset = enabled;
+            // Any manual disarm (desktop button or phone) opts the session out
+            // of the global switch, even while the switch is off, so turning
+            // it on later does not re-arm a session the user cancelled.
+            // Arming by hand clears the opt-out.
+            self.settings.auto_resume_opt_out = !enabled;
             self.save_settings(cx);
             cx.emit(SessionChanged);
             cx.notify();

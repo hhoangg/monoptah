@@ -312,6 +312,7 @@ impl SettingsView {
                     | "show-remaining-usage"
                     | "mask-emails"
                     | "claude-hooks"
+                    | "auto-resume-usage-limit"
                     | "claude-entrypoint"
                     | "monos-enabled"
                     | "rail-monos-pinned"

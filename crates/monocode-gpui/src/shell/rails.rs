@@ -753,6 +753,10 @@ impl Shell {
                 .children(self.session_marks.get(&id).cloned())
                 .child("Working...")
                 .into_any_element()
+        } else if let Some(state) = session.auto_resume(monocode_core::usage::now_ms()) {
+            status
+                .child(self.auto_resume_badge(id, state, true, 12.))
+                .into_any_element()
         } else if self.unseen_finished.contains(&id) {
             status
                 .text_color(rgb(0x34d399))

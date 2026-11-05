@@ -78,6 +78,8 @@ pub(crate) struct Preferences {
     /// text and tool groups inline.
     pub fold_finished_work: bool,
     pub follow_up: String,
+    /// A session that hits a usage limit resumes by itself once it resets.
+    pub auto_resume_usage_limit: bool,
     pub model_controls: String,
     pub autocorrect: bool,
     pub format_on_save: bool,
@@ -176,6 +178,7 @@ impl Default for Preferences {
             collapse_tool_groups: false,
             fold_finished_work: true,
             follow_up: "steer".into(),
+            auto_resume_usage_limit: false,
             model_controls: "menu".into(),
             autocorrect: false,
             format_on_save: true,
@@ -316,6 +319,20 @@ impl Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_resume_usage_limit_is_off_by_default_and_survives_old_files() {
+        assert!(!Preferences::default().auto_resume_usage_limit);
+        let old: Preferences = serde_json::from_str(r#"{"sounds":false}"#).unwrap();
+        assert!(!old.auto_resume_usage_limit);
+        let prefs = Preferences {
+            auto_resume_usage_limit: true,
+            ..Default::default()
+        };
+        let saved = serde_json::to_string(&prefs).unwrap();
+        let loaded: Preferences = serde_json::from_str(&saved).unwrap();
+        assert!(loaded.auto_resume_usage_limit);
+    }
 
     #[test]
     fn surfaces_round_trip_and_default_to_none() {

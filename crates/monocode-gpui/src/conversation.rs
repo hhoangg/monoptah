@@ -40,7 +40,7 @@ use crate::{
     theme::*,
     transcript::TranscriptView,
 };
-pub(crate) use accounts::UsageResumed;
+pub(crate) use accounts::{UsageResumed, auto_resume_tooltip};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, Focusable, MouseButton, Role, SharedString,
     StyleRefinement, Subscription, Window, canvas, div, prelude::*, px,
@@ -203,6 +203,8 @@ pub(crate) struct Conversation {
     account_switching: bool,
     _usage_clock: gpui::Task<()>,
     _account_usage: Option<Subscription>,
+    /// What the sidebar last heard about this session's automatic resume.
+    auto_resume_shown: Option<monocode_core::usage::AutoResume>,
     approvals: std::collections::VecDeque<Approval>,
     approval_ui: approvals::State,
     questions:
@@ -663,6 +665,7 @@ impl Conversation {
             account_switching: false,
             _usage_clock: usage_clock,
             _account_usage: account_usage,
+            auto_resume_shown: None,
             approvals: Default::default(),
             approval_ui: Default::default(),
             questions: Default::default(),
@@ -819,6 +822,8 @@ impl Conversation {
                     this.attach_account(cx);
                     this.settings.mono = mono;
                     this.settings.environment = environment;
+                    // A limit saved before the global switch was on is armed now.
+                    this.sweep_auto_resume(cx);
                 }
                 match result {
                     Ok((history, edits)) => {

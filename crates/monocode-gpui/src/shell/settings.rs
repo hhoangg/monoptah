@@ -367,6 +367,20 @@ impl Shell {
         })
         .detach();
     }
+    /// With "auto resume at usage limit reset" on, every loaded local session
+    /// still waiting on a limit is armed. Sessions that exist only on disk are
+    /// armed when they load. Turning the switch off arms and cancels nothing.
+    fn sweep_auto_resume(&mut self, cx: &mut Context<Self>) {
+        if !self.workspace.preferences.auto_resume_usage_limit {
+            return;
+        }
+        for view in self.sessions.values() {
+            view.update(cx, |view, cx| view.sweep_auto_resume(cx));
+        }
+        if let Some(monos) = &self.monos {
+            monos.update(cx, |monos, cx| monos.sweep_auto_resume(cx));
+        }
+    }
     pub(super) fn apply_preferences(&mut self, cx: &mut Context<Self>) {
         self.refresh_notification_permission();
         self.configure_quick_composer(cx);
@@ -396,6 +410,7 @@ impl Shell {
         // After the keymap, so the menu shows rebound shortcuts.
         crate::app_menu::install(&self.workspace.preferences, cx);
         cx.set_global(self.workspace.preferences.clone());
+        self.sweep_auto_resume(cx);
         self.sync_right_panel(cx);
         if let Some(center) = crate::accounts::get(cx) {
             center.update(cx, |center, cx| {
@@ -571,6 +586,52 @@ mod tests {
     use super::*;
     use crate::shell::tests::window;
     use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn the_global_auto_resume_switch_arms_waiting_sessions_and_off_leaves_them_armed(
+        cx: &mut TestAppContext,
+    ) {
+        use monocode_core::usage::{AutoResume, Limit, now_ms};
+        let (window, a, b) = window(cx);
+        let reset = Some(now_ms() + 3_600_000);
+        window
+            .update(cx, |shell, _, cx| {
+                for (id, opt_out) in [(a, false), (b, true)] {
+                    let view = shell.ensure_session(id, cx).unwrap();
+                    view.update(cx, |v, _| {
+                        v.settings.usage_limit = Some(Limit {
+                            resets_at: reset,
+                            resume_at_reset: false,
+                        });
+                        v.settings.auto_resume_opt_out = opt_out;
+                    });
+                    assert_eq!(shell.session_metadata(id, cx).auto_resume(now_ms()), None);
+                }
+                shell.workspace.preferences.auto_resume_usage_limit = true;
+                shell.apply_preferences(cx);
+                let armed = |shell: &Shell, id: i64, cx: &gpui::App| {
+                    shell.sessions[&id]
+                        .read(cx)
+                        .settings
+                        .usage_limit
+                        .as_ref()
+                        .is_some_and(|l| l.resume_at_reset)
+                };
+                assert!(armed(shell, a, cx));
+                assert!(!armed(shell, b, cx));
+                // The sidebar indicator follows the armed state only.
+                assert_eq!(
+                    shell.session_metadata(a, cx).auto_resume(now_ms()),
+                    reset.map(AutoResume::At)
+                );
+                assert_eq!(shell.session_metadata(b, cx).auto_resume(now_ms()), None);
+                shell.workspace.preferences.auto_resume_usage_limit = false;
+                shell.apply_preferences(cx);
+                assert!(armed(shell, a, cx));
+                assert!(!armed(shell, b, cx));
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     fn pairing_dialog_is_a_window_overlay_and_updates_from_settings_notifications(

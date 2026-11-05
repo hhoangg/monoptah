@@ -114,6 +114,9 @@ impl Conversation {
                 pending.skip_outgoing_recap = true;
             }
             self.settings.usage_limit = Some(limit);
+            // Each limit is recorded here once, when its turn finishes, so this
+            // is the single place a new occurrence is armed by the global switch.
+            self.arm_auto_resume(cx);
             self.save_settings(cx);
             self.follow_ups.state.paused = true;
             self.save_follow_ups(cx);
@@ -126,6 +129,50 @@ impl Conversation {
                 );
                 center.update(cx, |center, cx| center.refresh(key, true, cx));
             }
+            self.tick_usage(cx);
+        }
+    }
+    /// Arms the current limit to resume at its reset when the global "auto
+    /// resume" preference is on, the session is local and the user has not
+    /// opted it out. Returns whether anything changed; the caller saves.
+    pub(super) fn arm_auto_resume(&mut self, cx: &App) -> bool {
+        if self.is_remote()
+            || self.settings.auto_resume_opt_out
+            || !cx
+                .try_global::<crate::settings::Preferences>()
+                .is_some_and(|p| p.auto_resume_usage_limit)
+        {
+            return false;
+        }
+        match &mut self.settings.usage_limit {
+            Some(limit) if !limit.resume_at_reset => {
+                limit.resume_at_reset = true;
+                true
+            }
+            _ => false,
+        }
+    }
+    /// What this local session's armed usage limit is waiting for, for the
+    /// sidebar. Remote sessions report none: their limit lives on the host.
+    pub(crate) fn auto_resume_state(&self, now: i64) -> Option<usage::AutoResume> {
+        if self.is_remote() {
+            return None;
+        }
+        self.settings.usage_limit.as_ref()?.auto_resume(now)
+    }
+    /// Applies the global switch to a limit that was already recorded: when
+    /// the switch is turned on, or when a saved session is loaded.
+    pub(crate) fn sweep_auto_resume(&mut self, cx: &mut Context<Self>) {
+        // Only a limit that is waiting right now: a stale one (its reset
+        // passed, or an unknown reset on an account that is not exhausted) is
+        // left alone, or arming it would resume the session at once.
+        let waiting = self.settings.usage_limit.as_ref().is_some_and(|l| {
+            l.waiting(usage::now_ms())
+                || (l.resets_at.is_none() && self.account_exhausted_reset(cx).is_some())
+        });
+        if waiting && self.arm_auto_resume(cx) {
+            self.save_settings(cx);
+            cx.emit(SessionChanged);
             self.tick_usage(cx);
         }
     }
@@ -148,32 +195,48 @@ impl Conversation {
                 Limit::from_error(&text)
             })
     }
+    fn usage_key(&self) -> crate::accounts::Key {
+        crate::accounts::Key::new(
+            Kind::from_id(&self.summary.provider),
+            self.settings.account.clone(),
+            self.account_model(),
+        )
+    }
+    /// The reset the account's usage snapshot reports while it is exhausted.
+    fn account_exhausted_reset(&self, cx: &App) -> Option<i64> {
+        let center = crate::accounts::get(cx)?;
+        center
+            .read(cx)
+            .usage
+            .get(&self.usage_key())
+            .and_then(|state| state.snapshot.as_ref())
+            .and_then(|s| s.exhausted_reset())
+    }
     pub(super) fn tick_usage(&mut self, cx: &mut Context<Self>) {
         let Some(limit) = self.settings.usage_limit.clone() else {
+            self.auto_resume_shown = None;
             return;
         };
         if limit.resets_at.is_none() {
-            let kind = Kind::from_id(&self.summary.provider);
-            let key = crate::accounts::Key::new(
-                kind,
-                self.settings.account.clone(),
-                self.account_model(),
-            );
             if let Some(center) = crate::accounts::get(cx) {
-                center.update(cx, |center, cx| center.refresh(key.clone(), false, cx));
+                let key = self.usage_key();
+                center.update(cx, |center, cx| center.refresh(key, false, cx));
             }
-            let reset = crate::accounts::get(cx).and_then(|center| {
-                center
-                    .read(cx)
-                    .usage
-                    .get(&key)
-                    .and_then(|state| state.snapshot.as_ref())
-                    .and_then(|s| s.exhausted_reset())
-            });
-            if let Some(at) = reset {
+            if let Some(at) = self.account_exhausted_reset(cx) {
                 self.settings.usage_limit.as_mut().unwrap().resets_at = Some(at);
                 self.save_settings(cx);
             }
+        }
+        // The sidebar badge shows this state, so its row re-renders only when
+        // the state really changes (reset time learned, or the reset passed).
+        let state = self
+            .settings
+            .usage_limit
+            .as_ref()
+            .and_then(|l| l.auto_resume(usage::now_ms()));
+        if state != self.auto_resume_shown {
+            self.auto_resume_shown = state;
+            cx.emit(SessionChanged);
         }
         if self
             .settings
@@ -601,6 +664,29 @@ fn usage_button(
         })
 }
 
+/// The sidebar tooltip of a session that is waiting to resume by itself.
+pub(crate) fn auto_resume_tooltip(state: usage::AutoResume, now: i64) -> String {
+    match state {
+        usage::AutoResume::Unknown => "Auto resume when the limit resets".to_owned(),
+        usage::AutoResume::Due => "Auto resuming now".to_owned(),
+        usage::AutoResume::At(at) => {
+            let when = chrono::DateTime::from_timestamp_millis(at)
+                .map(|d| {
+                    let local = d.with_timezone(&chrono::Local);
+                    let today = chrono::DateTime::from_timestamp_millis(now)
+                        .map(|n| n.with_timezone(&chrono::Local).date_naive())
+                        .unwrap_or_else(|| chrono::Local::now().date_naive())
+                        == local.date_naive();
+                    local
+                        .format(if today { "%H:%M" } else { "%b %-d, %H:%M" })
+                        .to_string()
+                })
+                .unwrap_or_default();
+            format!("Auto resume at {when}")
+        }
+    }
+}
+
 /// Shared reset wording for desktop and its paired phone.
 pub(super) fn usage_reset_label(limit: &Limit, now: i64) -> Option<String> {
     limit.resets_at.map(|at| {
@@ -870,5 +956,269 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(resumed.get(), 1);
+    }
+
+    fn auto_resume_view(
+        cx: &mut gpui::TestAppContext,
+        global: bool,
+    ) -> (Entity<Conversation>, Database, i64) {
+        let store = Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let summary = locked(&store)
+            .unwrap()
+            .create("claude", "/fixture")
+            .unwrap();
+        let id = summary.id;
+        cx.update(|cx| {
+            cx.set_global(crate::settings::Preferences {
+                auto_resume_usage_limit: global,
+                ..Default::default()
+            })
+        });
+        let view = cx.new(|cx| Conversation::new(summary, store.clone(), cx));
+        (view, store, id)
+    }
+
+    fn armed(view: &Entity<Conversation>, cx: &mut gpui::TestAppContext) -> bool {
+        view.read_with(cx, |v, _| {
+            v.settings
+                .usage_limit
+                .as_ref()
+                .is_some_and(|l| l.resume_at_reset)
+        })
+    }
+
+    #[gpui::test]
+    fn a_new_limit_is_armed_only_while_the_global_switch_is_on(cx: &mut gpui::TestAppContext) {
+        let (view, _, _) = auto_resume_view(cx, true);
+        view.update(cx, |v, cx| {
+            v.status = "rate_limit".into();
+            v.detect_usage_limit(cx);
+        });
+        assert!(armed(&view, cx));
+        let (view, _, _) = auto_resume_view(cx, false);
+        view.update(cx, |v, cx| {
+            v.status = "rate_limit".into();
+            v.detect_usage_limit(cx);
+        });
+        assert!(view.read_with(cx, |v, _| v.settings.usage_limit.is_some()));
+        assert!(!armed(&view, cx));
+    }
+
+    #[gpui::test]
+    fn a_runtime_reported_limit_is_armed_with_its_reset_kept(cx: &mut gpui::TestAppContext) {
+        let (view, _, _) = auto_resume_view(cx, true);
+        let at = usage::now_ms() + 3_600_000;
+        view.update(cx, |v, cx| {
+            v.settings.usage_limit = Some(Limit {
+                resets_at: Some(at),
+                resume_at_reset: false,
+            });
+            v.detect_usage_limit(cx);
+            let limit = v.settings.usage_limit.as_ref().unwrap();
+            assert!(limit.resume_at_reset);
+            assert_eq!(limit.resets_at, Some(at));
+        });
+    }
+
+    #[gpui::test]
+    fn disarming_with_the_global_switch_on_opts_the_session_out(cx: &mut gpui::TestAppContext) {
+        let (view, store, id) = auto_resume_view(cx, true);
+        view.update(cx, |v, cx| {
+            v.status = "rate_limit".into();
+            v.detect_usage_limit(cx);
+            v.set_usage_resume_at_reset(false, cx);
+            assert!(!v.settings.usage_limit.as_ref().unwrap().resume_at_reset);
+            assert!(v.settings.auto_resume_opt_out);
+            // A later limit is not armed for an opted-out session.
+            v.settings.usage_limit = Some(Limit::default());
+            v.detect_usage_limit(cx);
+            assert!(!v.settings.usage_limit.as_ref().unwrap().resume_at_reset);
+        });
+        cx.run_until_parked();
+        let saved = locked(&store).unwrap().agent_settings(id).unwrap().unwrap();
+        assert!(saved.auto_resume_opt_out);
+        view.update(cx, |v, cx| {
+            v.set_usage_resume_at_reset(true, cx);
+            assert!(v.settings.usage_limit.as_ref().unwrap().resume_at_reset);
+            assert!(!v.settings.auto_resume_opt_out);
+        });
+    }
+
+    #[gpui::test]
+    fn any_manual_disarm_opts_out_even_while_the_global_switch_is_off(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, _, _) = auto_resume_view(cx, false);
+        view.update(cx, |v, cx| {
+            v.settings.usage_limit = Some(Limit {
+                resets_at: Some(usage::now_ms() + 3_600_000),
+                resume_at_reset: false,
+            });
+            v.set_usage_resume_at_reset(true, cx);
+            v.set_usage_resume_at_reset(false, cx);
+            assert!(v.settings.auto_resume_opt_out);
+        });
+        cx.update(|cx| {
+            cx.set_global(crate::settings::Preferences {
+                auto_resume_usage_limit: true,
+                ..Default::default()
+            })
+        });
+        view.update(cx, |v, cx| v.sweep_auto_resume(cx));
+        assert!(!armed(&view, cx));
+    }
+
+    #[gpui::test]
+    fn the_sidebar_hears_about_a_changed_auto_resume_state_only_once(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, _, _) = auto_resume_view(cx, false);
+        let heard = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.update(|cx| {
+            let count = heard.clone();
+            cx.subscribe(&view, move |_, _: &SessionChanged, _| {
+                count.set(count.get() + 1)
+            })
+            .detach();
+        });
+        view.update(cx, |v, cx| {
+            v.settings.usage_limit = Some(Limit {
+                resets_at: Some(usage::now_ms() + 3_600_000),
+                resume_at_reset: true,
+            });
+            v.tick_usage(cx);
+            v.tick_usage(cx);
+        });
+        assert_eq!(heard.get(), 1);
+        view.update(cx, |v, cx| {
+            // The reset passed less than 30s ago: Due, not yet resumed.
+            v.settings.usage_limit.as_mut().unwrap().resets_at = Some(usage::now_ms() - 1_000);
+            v.tick_usage(cx);
+            v.tick_usage(cx);
+        });
+        assert_eq!(heard.get(), 2);
+    }
+
+    #[gpui::test]
+    fn the_sweep_leaves_stale_limits_alone(cx: &mut gpui::TestAppContext) {
+        let (past, _, _) = auto_resume_view(cx, true);
+        let (unknown, _, _) = auto_resume_view(cx, true);
+        past.update(cx, |v, _| {
+            v.settings.usage_limit = Some(Limit {
+                resets_at: Some(usage::now_ms() - 3_600_000),
+                resume_at_reset: false,
+            });
+        });
+        unknown.update(cx, |v, _| v.settings.usage_limit = Some(Limit::default()));
+        for view in [&past, &unknown] {
+            view.update(cx, |v, cx| v.sweep_auto_resume(cx));
+            assert!(!armed(view, cx));
+            // Nothing resumed either: the limit is still recorded.
+            assert!(view.read_with(cx, |v, _| v.settings.usage_limit.is_some()));
+        }
+    }
+
+    #[gpui::test]
+    fn loading_a_saved_session_arms_a_waiting_limit_but_not_a_past_one(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for (offset, expect) in [(3_600_000, true), (-3_600_000, false)] {
+            let (_, store, id) = auto_resume_view(cx, true);
+            let summary = locked(&store).unwrap().sessions().unwrap().remove(0);
+            let settings = monocode_core::agent::Settings {
+                revision: 1,
+                usage_limit: Some(Limit {
+                    resets_at: Some(usage::now_ms() + offset),
+                    resume_at_reset: false,
+                }),
+                ..Default::default()
+            };
+            locked(&store)
+                .unwrap()
+                .configure_agent(id, "claude", &settings)
+                .unwrap();
+            let view = cx.new(|cx| Conversation::new(summary, store.clone(), cx));
+            view.update(cx, |v, cx| v.load(cx));
+            cx.run_until_parked();
+            assert_eq!(armed(&view, cx), expect, "offset {offset}");
+        }
+    }
+
+    #[gpui::test]
+    fn the_sweep_arms_waiting_sessions_and_skips_opted_out_and_unlimited_ones(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (waiting, _, _) = auto_resume_view(cx, true);
+        let (opted_out, _, _) = auto_resume_view(cx, true);
+        let (idle, _, _) = auto_resume_view(cx, true);
+        let reset = Some(usage::now_ms() + 3_600_000);
+        for (view, optout) in [(&waiting, false), (&opted_out, true)] {
+            view.update(cx, |v, _| {
+                v.settings.usage_limit = Some(Limit {
+                    resets_at: reset,
+                    resume_at_reset: false,
+                });
+                v.settings.auto_resume_opt_out = optout;
+            });
+        }
+        for view in [&waiting, &opted_out, &idle] {
+            view.update(cx, |v, cx| v.sweep_auto_resume(cx));
+        }
+        assert!(armed(&waiting, cx));
+        assert!(!armed(&opted_out, cx));
+        assert!(idle.read_with(cx, |v, _| v.settings.usage_limit.is_none()));
+    }
+
+    #[gpui::test]
+    fn the_sweep_does_nothing_while_the_global_switch_is_off(cx: &mut gpui::TestAppContext) {
+        let (view, _, _) = auto_resume_view(cx, false);
+        view.update(cx, |v, cx| {
+            v.settings.usage_limit = Some(Limit {
+                resets_at: Some(usage::now_ms() + 3_600_000),
+                resume_at_reset: false,
+            });
+            v.sweep_auto_resume(cx);
+        });
+        assert!(!armed(&view, cx));
+        // Turning it off later leaves an already armed session armed.
+        view.update(cx, |v, cx| v.set_usage_resume_at_reset(true, cx));
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        view.update(cx, |v, cx| v.sweep_auto_resume(cx));
+        assert!(armed(&view, cx));
+    }
+
+    #[test]
+    fn the_opt_out_defaults_to_false_in_saved_settings_and_round_trips() {
+        let old: monocode_core::agent::Settings = serde_json::from_str("{}").unwrap();
+        assert!(!old.auto_resume_opt_out);
+        let settings = monocode_core::agent::Settings {
+            auto_resume_opt_out: true,
+            ..Default::default()
+        };
+        let back: monocode_core::agent::Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(back.auto_resume_opt_out);
+    }
+
+    #[test]
+    fn the_sidebar_tooltip_names_the_reset_or_says_it_is_unknown() {
+        let now = usage::now_ms();
+        assert_eq!(
+            auto_resume_tooltip(usage::AutoResume::Unknown, now),
+            "Auto resume when the limit resets"
+        );
+        assert_eq!(
+            auto_resume_tooltip(usage::AutoResume::Due, now),
+            "Auto resuming now"
+        );
+        let at = now + 600_000;
+        let local = chrono::DateTime::from_timestamp_millis(at)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let tip = auto_resume_tooltip(usage::AutoResume::At(at), now);
+        assert!(tip.starts_with("Auto resume at "), "{tip}");
+        assert!(tip.contains(&local.format("%H:%M").to_string()), "{tip}");
     }
 }

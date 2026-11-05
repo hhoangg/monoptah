@@ -532,6 +532,12 @@ impl Monos {
         }
         cx.notify();
     }
+    /// Arms the Mono chats that are waiting on a usage limit.
+    pub(crate) fn sweep_auto_resume(&mut self, cx: &mut Context<Self>) {
+        for chat in self.chats.values() {
+            chat.update(cx, |chat, cx| chat.sweep_auto_resume(cx));
+        }
+    }
     pub(crate) fn set_original_chrome(&mut self, original: bool, cx: &mut Context<Self>) {
         if self.original_chrome == original {
             return;
