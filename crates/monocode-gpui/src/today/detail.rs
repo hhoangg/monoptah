@@ -920,6 +920,7 @@ impl Today {
             })
             .children(self.menu_view(Host::Panel, cx))
             .children(self.move_confirmation(cx))
+            .children(self.note_delete_confirmation(cx))
             .into_any_element()
     }
 
@@ -970,12 +971,13 @@ impl Today {
             )
     }
 
-    /// A note bubble: author, day, body.
+    /// A note bubble: author, day, an edited marker, the Edit and Delete actions, body.
     fn note_view(&self, ix: usize, note: &Note, cx: &mut Context<Self>) -> Div {
         let author = note
             .mono_id
             .as_deref()
             .map_or_else(|| "You".to_string(), |id| self.mono_name(id));
+        let editing = self.editing_note(note);
         div()
             .debug_selector(move || format!("today-activity-{ix}"))
             .my(px(3.))
@@ -1002,12 +1004,24 @@ impl Today {
                     .child(
                         div()
                             .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
                             .text_size(px(11.))
                             .text_color(content(0.4))
-                            .child(short_day(&note.day)),
+                            .child(short_day(&note.day))
+                            .when(note.edited_at.is_some(), |d| {
+                                d.child(
+                                    div()
+                                        .debug_selector(|| "today-note-edited".into())
+                                        .child("edited"),
+                                )
+                            })
+                            .when(!editing, |d| d.children(self.note_actions(ix, note, cx))),
                     ),
             )
-            .when(!note.body.trim().is_empty(), |bubble| {
+            .when(editing, |bubble| bubble.children(self.note_edit_view(cx)))
+            .when(!editing && !note.body.trim().is_empty(), |bubble| {
                 bubble.child(
                     div()
                         .debug_selector(|| "today-note-body".into())
@@ -1020,7 +1034,9 @@ impl Today {
                         )),
                 )
             })
-            .children(self.note_attachments_view(note, cx))
+            .when(!editing, |bubble| {
+                bubble.children(self.note_attachments_view(note, cx))
+            })
     }
 }
 
@@ -1219,6 +1235,7 @@ mod tests {
             mono_id: None,
             body: body.into(),
             attachments: Vec::new(),
+            edited_at: None,
         }
     }
     fn click(visual: &mut gpui::VisualTestContext, selector: &'static str) {

@@ -599,6 +599,7 @@ mod tests {
             mono_id: None,
             body: body.into(),
             attachments,
+            edited_at: None,
         }
     }
     /// A selected task with these notes, and a recorder in place of the system.

@@ -143,6 +143,7 @@ impl Store {
                     },
                     body: plan.body.clone(),
                     attachments,
+                    edited_at: None,
                 };
                 conn.execute(
                     "INSERT INTO today_notes (id, task_id, day, at, mono_id, body, attachments_json)

@@ -363,6 +363,8 @@ fn operator_sessions_cannot_use_today_actions() {
         "today.add",
         "today.update",
         "today.note",
+        "today.editNote",
+        "today.deleteNote",
         "today.complete",
         "today.snooze",
         "today.dismiss",

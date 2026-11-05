@@ -4,8 +4,9 @@
 //! secret is stored here.
 //!
 //! Layers: [`Task`] is the current state, a day record freezes a task's state
-//! on one work day (past days are never rewritten) and [`Note`] is an
-//! append-only timeline attached to a task and a work day.
+//! on one work day (past days are never rewritten) and [`Note`] is a
+//! timeline entry attached to a task and a work day: written once, then only
+//! edited or deleted by hand (an edit stamps `edited_at`).
 use serde::{Deserialize, Serialize};
 
 pub mod actions;
@@ -169,6 +170,10 @@ pub struct Note {
     /// Copies of the files attached when the note was written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<NoteAttachment>,
+    /// When the note was last edited (its body or attachments changed); `None`
+    /// for a note never edited. `at`, `day` and `mono_id` never change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<u64>,
 }
 
 /// What happened to a task, for the detail panel's activity timeline.
@@ -197,7 +202,7 @@ pub enum EventKind {
     TagsChanged,
 }
 
-/// One entry of a task's activity. Append-only, like notes. Who: `mono_id` for a
+/// One entry of a task's activity. Append-only. Who: `mono_id` for a
 /// Mono, `source_id` for a sync, neither for the user.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

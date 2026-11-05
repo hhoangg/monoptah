@@ -37,6 +37,8 @@ pub fn fields(action: &str) -> Option<&'static str> {
         "today.add" => "title day project priority due dueTime link reason tags",
         "today.update" => "id title priority project due dueTime tags reason",
         "today.note" => "id body",
+        "today.editNote" => "id note body",
+        "today.deleteNote" => "id note",
         "today.complete" | "today.dismiss" => "id",
         "today.snooze" => "id until",
         "today.sources" | "today.statuses" | "today.tags" => "",
@@ -93,14 +95,21 @@ pub fn handle(
         }
         "today.note" => {
             let task = resolve(store, caller, input)?;
-            let body = string(input, "body")?.ok_or("Provide body")?;
-            if body.trim().is_empty() {
-                return Err("body must not be empty".into());
-            }
-            if body.trim().chars().count() > MAX_NOTE_CHARS {
-                return Err(format!("body must be at most {MAX_NOTE_CHARS} characters"));
-            }
-            Ok(json!({ "note": store.today_note(&task.id, body.trim(), &actor, now)? }))
+            let body = note_body(input)?;
+            Ok(json!({ "note": store.today_note(&task.id, &body, &actor, now)? }))
+        }
+        "today.editNote" => {
+            let task = resolve(store, caller, input)?;
+            let note = note_id(input)?;
+            let body = note_body(input)?;
+            let note = store.today_edit_note(&task.id, &note, &body, &[], &actor, now)?;
+            Ok(json!({ "note": note }))
+        }
+        "today.deleteNote" => {
+            let task = resolve(store, caller, input)?;
+            let note = note_id(input)?;
+            store.today_delete_note(&task.id, &note, &actor, now)?;
+            Ok(json!({ "deleted": true }))
         }
         "today.complete" | "today.snooze" | "today.dismiss" => {
             // No user is present in a run, and agents never hide a user's tasks.
@@ -199,7 +208,7 @@ fn list(
     }
     let mut tasks = Vec::with_capacity(total.min(limit));
     for (task, group, age, workflow) in rows.into_iter().take(limit) {
-        // Notes are append-only; one written after the viewed day is not part of it.
+        // A note written after the viewed day is not part of it.
         let mut listed: Vec<_> = store
             .today_notes(&task.id)?
             .into_iter()
@@ -286,6 +295,29 @@ fn resolve(store: &Store, caller: &MonoCaller, input: &Map<String, Value>) -> Re
         .today_task(&id)?
         .filter(|t| visible_to(t, caller))
         .ok_or_else(|| "Task not found".into())
+}
+
+/// The trimmed `body` of a note, not empty and within the limit.
+fn note_body(input: &Map<String, Value>) -> Result<String, String> {
+    let body = string(input, "body")?.ok_or("Provide body")?;
+    let body = body.trim();
+    if body.is_empty() {
+        return Err("body must not be empty".into());
+    }
+    if body.chars().count() > MAX_NOTE_CHARS {
+        return Err(format!("body must be at most {MAX_NOTE_CHARS} characters"));
+    }
+    Ok(body.to_string())
+}
+
+/// The `note` id an edit or delete addresses (from a listed note's `id`).
+fn note_id(input: &Map<String, Value>) -> Result<String, String> {
+    match input.get("note") {
+        Some(Value::String(s)) if !s.trim().is_empty() && s.len() <= MAX_KEY => {
+            Ok(s.trim().to_string())
+        }
+        _ => Err("Provide note (the id of a note from today.list)".into()),
+    }
 }
 
 // --- writing ---------------------------------------------------------------------------------
@@ -850,6 +882,8 @@ mod tests {
             "today.add",
             "today.update",
             "today.note",
+            "today.editNote",
+            "today.deleteNote",
             "today.complete",
             "today.snooze",
             "today.dismiss",
@@ -1365,6 +1399,146 @@ mod tests {
         assert_eq!(task(&store, "gh:1").status, Status::Open);
         assert!(call(&store, &a, "today.dismiss", json!({"id": "gh:1"})).is_ok());
         assert_eq!(task(&store, "gh:1").status, Status::Dismissed);
+    }
+
+    #[test]
+    fn a_mono_edits_and_deletes_its_own_note_by_id() {
+        let (_dir, store) = store();
+        let a = mono("a", &[]);
+        sync_ok(&store, &a, "gh", json!([item("gh:1")]));
+        let added = call(
+            &store,
+            &a,
+            "today.note",
+            json!({"id": "gh:1", "body": "v1"}),
+        )
+        .unwrap();
+        let note = added["note"]["id"].as_str().unwrap().to_string();
+        let listed = call(&store, &a, "today.list", json!({})).unwrap();
+        assert_eq!(listed["tasks"][0]["notes"][0]["id"], note.as_str());
+        let edited = call(
+            &store,
+            &a,
+            "today.editNote",
+            json!({"id": "gh:1", "note": note, "body": " v2 "}),
+        )
+        .unwrap();
+        assert_eq!(edited["note"]["body"], "v2");
+        assert_eq!(edited["note"]["editedAt"], NOW);
+        assert_eq!(edited["note"]["id"], note.as_str());
+        let deleted = call(
+            &store,
+            &a,
+            "today.deleteNote",
+            json!({"id": "gh:1", "note": note}),
+        )
+        .unwrap();
+        assert_eq!(deleted, json!({"deleted": true}));
+        let listed = call(&store, &a, "today.list", json!({})).unwrap();
+        assert_eq!(listed["tasks"][0]["notes"], json!([]));
+    }
+
+    #[test]
+    fn a_mono_cannot_edit_or_delete_a_note_it_did_not_write() {
+        let (_dir, store) = store();
+        let a = mono("a", &[]);
+        sync_ok(&store, &a, "gh", json!([item("gh:1")]));
+        let id = task(&store, "gh:1").id;
+        let users = store.today_note(&id, "user", &Actor::User, NOW).unwrap();
+        let edit = call(
+            &store,
+            &a,
+            "today.editNote",
+            json!({"id": "gh:1", "note": users.id, "body": "x"}),
+        )
+        .unwrap_err();
+        assert_eq!(edit, "A Mono can only edit or delete its own notes");
+        let delete = call(
+            &store,
+            &a,
+            "today.deleteNote",
+            json!({"id": "gh:1", "note": users.id}),
+        )
+        .unwrap_err();
+        assert_eq!(delete, "A Mono can only edit or delete its own notes");
+        assert_eq!(store.today_notes(&id).unwrap()[0].body, "user");
+    }
+
+    #[test]
+    fn a_mono_cannot_edit_or_delete_a_note_on_a_task_it_cannot_see() {
+        let (_dir, store) = store();
+        let a = mono("a", &["/work/a"]);
+        let b = mono("b", &["/work/b"]);
+        sync_ok(&store, &b, "gh", json!([item("gh:2")]));
+        let hidden = call(
+            &store,
+            &b,
+            "today.note",
+            json!({"id": "gh:2", "body": "b's"}),
+        )
+        .unwrap();
+        let note = hidden["note"]["id"].as_str().unwrap().to_string();
+        let id = task(&store, "gh:2").id;
+        for action in ["today.editNote", "today.deleteNote"] {
+            let input = if action == "today.editNote" {
+                json!({"id": "gh:2", "note": note, "body": "x"})
+            } else {
+                json!({"id": "gh:2", "note": note})
+            };
+            assert_eq!(
+                call(&store, &a, action, input).unwrap_err(),
+                "Task not found",
+                "{action}"
+            );
+        }
+        let notes = store.today_notes(&id).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].body, "b's");
+    }
+
+    #[test]
+    fn edit_and_delete_note_validate_their_fields() {
+        let (_dir, store) = store();
+        let a = mono("a", &[]);
+        sync_ok(&store, &a, "gh", json!([item("gh:1")]));
+        let added = call(
+            &store,
+            &a,
+            "today.note",
+            json!({"id": "gh:1", "body": "v1"}),
+        )
+        .unwrap();
+        let note = added["note"]["id"].as_str().unwrap().to_string();
+        let call = |action: &str, input: Value| super::handle(&store, &a, action, &input, NOW);
+        assert!(call("today.editNote", json!({"id": "gh:1", "note": note})).is_err());
+        assert!(call("today.editNote", json!({"id": "gh:1", "body": "x"})).is_err());
+        assert!(call(
+            "today.editNote",
+            json!({"id": "gh:1", "note": note, "body": " "})
+        )
+        .is_err());
+        assert!(call(
+            "today.editNote",
+            json!({"id": "gh:1", "note": note, "body": "x".repeat(5001)})
+        )
+        .unwrap_err()
+        .contains("5000"));
+        assert!(call(
+            "today.editNote",
+            json!({"id": "gh:1", "note": note, "body": "x", "removeAttachments": []})
+        )
+        .unwrap_err()
+        .contains("does not take removeAttachments"));
+        assert!(call("today.deleteNote", json!({"id": "gh:1"})).is_err());
+        assert!(call("today.deleteNote", json!({"id": "gh:1", "note": 5})).is_err());
+        assert_eq!(
+            call("today.deleteNote", json!({"id": "gh:1", "note": "nope"})).unwrap_err(),
+            "Note not found"
+        );
+        assert_eq!(
+            call("today.deleteNote", json!({"id": "gh:9", "note": note})).unwrap_err(),
+            "Task not found"
+        );
     }
 
     #[test]

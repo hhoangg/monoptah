@@ -1,13 +1,9 @@
-# Monoptah Native 0.45.0
+# Monoptah Native 0.45.1
 
-## Changes since 0.44.0
+## Changes since 0.45.0
 
-- Linux and Windows installs now update themselves. The AppImage, Debian package, Enterprise Linux rpm and Windows x64 installer are signed and listed in the update feed next to the macOS updater, and an rpm package is new in this release.
-- Split terminals to the right, drag dock terminals out into splits or title tabs, and keep the Terminal panel open with a fresh shell after dragging one out. Title tabs show when a session has an unsent draft.
-- Split sessions start with your default access mode.
-- Model pickers show fast mode.
-- Keep retrying frames until a window's redraw is answered, and stop the macOS window freezing after a screenshot is dropped onto it. The freeze log now also records window occlusion, resize and file drop state.
-- Include upstream changes through 9ee7b3dd.
+- Edit and delete notes on internal tasks. Edit a note in place, change its text or remove attachments, then save or cancel; an edited note shows "edited". Deleting a note asks first and also removes its stored attachment files. Notes on past days stay read-only.
+- Monos can edit and delete their own task notes with `today.editNote` and `today.deleteNote`.
 
 ## Known limits
 
