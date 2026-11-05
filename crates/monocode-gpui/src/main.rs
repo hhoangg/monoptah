@@ -10,6 +10,7 @@ mod arcade;
 mod assets;
 mod automations;
 mod changes;
+mod cloud_wake;
 mod codespaces_dialog;
 mod composer_completion;
 mod composer_motion;

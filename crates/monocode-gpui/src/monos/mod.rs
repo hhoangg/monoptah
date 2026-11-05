@@ -3,6 +3,8 @@
 pub(crate) mod avatar;
 pub(crate) mod cards;
 mod changes;
+#[cfg(test)]
+mod cloud_tests;
 mod color_picker;
 mod dashboard;
 mod files;

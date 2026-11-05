@@ -31,7 +31,14 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
             | "notes.write"
             | "worktrees.list"
             | "worktrees.create"
+            | "codespaces.list"
+            | "codespaces.create"
+            | "codespaces.stop"
+            | "codespaces.secretsStatus"
     ) {
+        if action == "codespaces.delete" {
+            return Err("Deleting a codespace is only available to a Mono".into());
+        }
         return Err("Unknown Operator action. Run app help for project actions; memory, habits and artifacts require a Mono.".into());
     }
     crate::mono::api::validate(action, input)?;

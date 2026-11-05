@@ -375,3 +375,31 @@ fn operator_sessions_cannot_use_today_actions() {
         );
     }
 }
+
+#[test]
+fn operator_may_use_codespaces_except_delete() {
+    for (action, input) in [
+        ("codespaces.list", json!({})),
+        ("codespaces.secretsStatus", json!({})),
+        ("codespaces.create", json!({"branch":"main"})),
+        ("codespaces.stop", json!({"name":"octo-abc"})),
+        (
+            "sessions.start",
+            json!({"prompt":"x","target":{"codespace":"new"}}),
+        ),
+    ] {
+        assert!(validate_operator(action, &input).is_ok(), "{action}");
+    }
+    assert_eq!(
+        validate_operator("codespaces.delete", &json!({"name":"octo-abc"})).unwrap_err(),
+        "Deleting a codespace is only available to a Mono"
+    );
+    // Invalid input is still refused for the allowed ones.
+    assert!(validate_operator("codespaces.stop", &json!({"name":"a b"})).is_err());
+    // A completion notification stays Mono-only for cloud sessions too.
+    assert!(validate_operator(
+        "sessions.start",
+        &json!({"prompt":"x","notifyOnComplete":true,"target":{"codespace":"new"}})
+    )
+    .is_err());
+}
