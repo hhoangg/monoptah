@@ -18,6 +18,7 @@ mod shared;
 mod side_threads;
 mod thread_files;
 mod today;
+pub use today::{NotePlan, NoteSaved};
 mod today_mention;
 mod today_sessions;
 use crate::surface::Surface;

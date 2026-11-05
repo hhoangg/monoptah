@@ -1220,20 +1220,7 @@ impl Conversation {
     /// Under the box: attach and emoji on the left, the context meter on the
     /// right.
     fn mono_composer_tools(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let tool = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .role(Role::Button)
-                .aria_label(label)
-                .group(id)
-                .flex_shrink_0()
-                .size(px(26.))
-                .rounded_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .hover(|s| s.bg(content(0.08)))
-        };
+        let tool = crate::composer_box::tool;
         let ratio = self.context.and_then(|usage| usage.ratio());
         let headline = ratio
             .map(|r| format!("{:.0}% context used", r * 100.))
@@ -1256,13 +1243,7 @@ impl Conversation {
             // straight under send.
             .pr(px(9.))
             .child(
-                tool("mono-attach", "Attach files")
-                    .debug_selector(|| "mono-attach".into())
-                    .child(
-                        icon("mono-attach", 17.)
-                            .text_color(content(0.55))
-                            .group_hover("mono-attach", |s| s.text_color(content(1.))),
-                    )
+                crate::composer_box::attach_tool("mono-attach")
                     .on_click(cx.listener(|this, _, _, cx| this.choose_attachments(cx))),
             )
             .child(

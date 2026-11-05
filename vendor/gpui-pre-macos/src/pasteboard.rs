@@ -10,7 +10,7 @@ use cocoa::{
     base::{id, nil},
     foundation::{NSArray, NSData, NSFastEnumeration, NSString},
 };
-use objc::{msg_send, rc::StrongPtr, runtime::Object, sel, sel_impl};
+use objc::{class, msg_send, rc::StrongPtr, runtime::Object, sel, sel_impl};
 use smallvec::SmallVec;
 use strum::IntoEnumIterator as _;
 
@@ -169,7 +169,9 @@ impl Pasteboard {
                 [ClipboardEntry::Image(image)] => {
                     self.write_image(image);
                 }
-                [ClipboardEntry::ExternalPaths(_)] => {}
+                [ClipboardEntry::ExternalPaths(paths)] => {
+                    self.write_file_urls(paths.paths());
+                }
                 _ => {
                     // Agus NB: We're currently only writing string entries to the clipboard when we have more than one.
                     //
@@ -230,6 +232,25 @@ impl Pasteboard {
                 self.inner
                     .setData_forType(metadata_bytes, *self.metadata_type);
             }
+        }
+    }
+
+    /// Puts the files themselves on the pasteboard, as file URLs, so Finder and
+    /// other apps can paste them. Fork-local: upstream ignores this entry.
+    unsafe fn write_file_urls(&self, paths: &[PathBuf]) {
+        unsafe {
+            self.inner.clearContents();
+            let urls: id = msg_send![class!(NSMutableArray), array];
+            for path in paths {
+                let url: id = msg_send![
+                    class!(NSURL),
+                    fileURLWithPath: ns_string(&path.to_string_lossy())
+                ];
+                if url != nil {
+                    let _: () = msg_send![urls, addObject: url];
+                }
+            }
+            let _: bool = msg_send![*self.inner, writeObjects: urls];
         }
     }
 
@@ -461,6 +482,26 @@ mod tests {
             ClipboardEntry::ExternalPaths(ep) => {
                 assert_eq!(ep.paths(), &[PathBuf::from("/some file with spaces.txt")]);
             }
+            other => panic!("expected ExternalPaths, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_write_external_paths_round_trips() {
+        let pasteboard = Pasteboard::unique();
+        let paths = vec![
+            PathBuf::from("/tmp/some file.txt"),
+            PathBuf::from("/tmp/image.png"),
+        ];
+        pasteboard.write(ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                paths.iter().cloned().collect(),
+            ))],
+        });
+
+        let item = pasteboard.read().expect("should read clipboard item");
+        match &item.entries[0] {
+            ClipboardEntry::ExternalPaths(ep) => assert_eq!(ep.paths(), paths.as_slice()),
             other => panic!("expected ExternalPaths, got {:?}", other),
         }
     }

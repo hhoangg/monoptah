@@ -8,6 +8,7 @@ mod activity;
 mod app_menu;
 mod arcade;
 mod assets;
+mod attachment_tray;
 mod automations;
 mod changes;
 mod composer_box;

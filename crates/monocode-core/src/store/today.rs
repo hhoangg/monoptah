@@ -91,6 +91,13 @@ fn ensure_today_tables(conn: &Connection) -> rusqlite::Result<()> {
     if !has_column(conn, "today_days", "status_json")? {
         conn.execute("ALTER TABLE today_days ADD COLUMN status_json TEXT", [])?;
     }
+    // A table made before note attachments existed lacks their column.
+    if !has_column(conn, "today_notes", "attachments_json")? {
+        conn.execute(
+            "ALTER TABLE today_notes ADD COLUMN attachments_json TEXT",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -470,10 +477,15 @@ fn note_from_row(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         at: row.get::<_, i64>(3)?.max(0) as u64,
         mono_id: row.get(4)?,
         body: row.get(5)?,
+        // Unreadable metadata reads as none rather than hiding the note.
+        attachments: row
+            .get::<_, Option<String>>(6)?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
     })
 }
 
-const NOTE_COLUMNS: &str = "id, task_id, day, at, mono_id, body";
+const NOTE_COLUMNS: &str = "id, task_id, day, at, mono_id, body, attachments_json";
 
 fn latest_note(conn: &Connection, task_id: &str, day: &str) -> Result<Option<Note>, String> {
     conn.query_row(
@@ -1192,43 +1204,8 @@ impl Store {
         actor: &Actor,
         now: u64,
     ) -> Result<Note, String> {
-        self.today_writable()?;
-        let body = clean_text(body, "note")?;
-        if body.chars().count() > NOTE_MAX {
-            return Err(format!("A note is at most {NOTE_MAX} characters"));
-        }
-        let day = self.today_roll(now)?;
-        self.today_ready()?;
-        self.today_tx(|conn| {
-            let task = load_task(conn, id)?
-                .filter(|task| actor_sees(actor, task))
-                .ok_or_else(|| NOT_FOUND.to_string())?;
-            let note = Note {
-                id: format!("note-{}", uuid::Uuid::new_v4()),
-                task_id: task.id,
-                day,
-                at: now,
-                mono_id: match actor {
-                    Actor::User => None,
-                    Actor::Mono(caller) => Some(caller.id.clone()),
-                },
-                body,
-            };
-            conn.execute(
-                "INSERT INTO today_notes (id, task_id, day, at, mono_id, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    note.id,
-                    note.task_id,
-                    note.day,
-                    note.at.min(i64::MAX as u64) as i64,
-                    note.mono_id,
-                    note.body
-                ],
-            )
-            .map_err(sql)?;
-            Ok(note)
-        })
+        self.today_note_with_files(id, body, &[], actor, now)
+            .map(|saved| saved.note)
     }
     /// Oldest first.
     pub fn today_notes(&self, id: &str) -> Result<Vec<Note>, String> {
@@ -1249,7 +1226,7 @@ impl Store {
             .map_err(sql)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sql)?;
-        Ok(notes)
+        Ok(self.with_attachment_paths(notes))
     }
     pub fn today_complete(&self, id: &str, actor: &Actor, now: u64) -> Result<Task, String> {
         self.today_mutate(id, actor, now, true, |task, day, statuses| {
@@ -1975,6 +1952,9 @@ fn status_color(color: &str) -> Result<String, String> {
         .map(format_color)
         .ok_or_else(|| "A color looks like #rrggbb".to_string())
 }
+
+mod attachments;
+pub use attachments::{NotePlan, NoteSaved};
 
 #[cfg(test)]
 mod tests;

@@ -9,12 +9,14 @@
 use serde::{Deserialize, Serialize};
 
 pub mod actions;
+pub mod attachments;
 pub mod mention;
 pub mod reconcile;
 pub mod statuses;
 pub mod tags;
 pub mod workday;
 
+pub use attachments::{AttachmentKind, NoteAttachment};
 pub use statuses::{Stage, StatusPatch, WorkflowStatus};
 pub use tags::{Tag, TagPatch};
 
@@ -162,7 +164,11 @@ pub struct Note {
     pub at: u64,
     /// `None` for the user, otherwise the Mono's id.
     pub mono_id: Option<String>,
+    /// Empty when the note holds only attachments.
     pub body: String,
+    /// Copies of the files attached when the note was written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<NoteAttachment>,
 }
 
 /// What happened to a task, for the detail panel's activity timeline.

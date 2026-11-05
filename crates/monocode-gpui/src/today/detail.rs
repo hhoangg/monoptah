@@ -787,7 +787,8 @@ impl Today {
                     }),
                 )
             };
-        let ready = !self.note.read(cx).content.trim().is_empty();
+        let ready = (!self.note.read(cx).content.trim().is_empty() || self.note_has_attachments())
+            && !self.note_busy();
         let needs_hint = editable
             && note_count == 0
             && row.age_days >= AGE_WARNING_DAYS
@@ -868,7 +869,7 @@ impl Today {
             .child(body)
             .when(editable, |d| {
                 d.child(
-                    div()
+                    self.note_drop_target(cx)
                         .flex_shrink_0()
                         .px(px(16.))
                         .py(px(10.))
@@ -876,23 +877,44 @@ impl Today {
                         .border_color(content(0.07))
                         .child({
                             let focus = self.note.focus_handle(cx);
+                            let over = self.note_drag_over(cx);
                             composer_box::frame(move |window, cx| {
-                                content(if focus.contains_focused(window, cx) {
-                                    0.2
+                                if over {
+                                    accent_color().opacity(0.6)
                                 } else {
-                                    0.1
-                                })
+                                    content(if focus.contains_focused(window, cx) {
+                                        0.2
+                                    } else {
+                                        0.1
+                                    })
+                                }
                             })
                             .debug_selector(|| "today-note-box".into())
                             .on_mouse_down(gpui::MouseButton::Left, {
                                 let note = self.note.clone();
                                 move |_, window, cx| window.focus(&note.focus_handle(cx), cx)
                             })
+                            .capture_action(cx.listener(|this, _: &input::Paste, _, cx| {
+                                if this.paste_note_files(cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .children(self.note_attachment_tray(cx))
                             .child(composer_box::field_row(
                                 self.note.clone(),
-                                composer_box::send_button("today-add-note", ready)
-                                    .on_click(cx.listener(|this, _, _, cx| this.add_note(cx))),
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(2.))
+                                    .child(self.note_paperclip(cx))
+                                    .child(
+                                        composer_box::send_button("today-add-note", ready)
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.add_note(cx)),
+                                            ),
+                                    ),
                             ))
+                            .children(Self::note_drop_overlay(over))
                         }),
                 )
             })
@@ -985,14 +1007,20 @@ impl Today {
                             .child(short_day(&note.day)),
                     ),
             )
-            .child(
-                div().text_color(content(0.8)).child(self.texts.view(
-                    &format!("note:{}", note.id),
-                    "Note",
-                    &note.body,
-                    cx,
-                )),
-            )
+            .when(!note.body.trim().is_empty(), |bubble| {
+                bubble.child(
+                    div()
+                        .debug_selector(|| "today-note-body".into())
+                        .text_color(content(0.8))
+                        .child(self.texts.view(
+                            &format!("note:{}", note.id),
+                            "Note",
+                            &note.body,
+                            cx,
+                        )),
+                )
+            })
+            .children(self.note_attachments_view(note, cx))
     }
 }
 
@@ -1190,6 +1218,7 @@ mod tests {
             at: 0,
             mono_id: None,
             body: body.into(),
+            attachments: Vec::new(),
         }
     }
     fn click(visual: &mut gpui::VisualTestContext, selector: &'static str) {

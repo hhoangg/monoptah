@@ -462,6 +462,46 @@ impl Completion {
             text
         }
     }
+    /// The images of the notes of every `@today/<key>` in `typed`, to send with
+    /// the message as real image attachments. Nothing for a remote project or an
+    /// app-written prompt. The chat's own limits apply to the message as a
+    /// whole: what is already in `existing` counts against them, and a path
+    /// already there is not added twice.
+    pub(crate) fn today_turn_images(
+        &self,
+        typed: &str,
+        existing: &[std::path::PathBuf],
+        typed_by_user: bool,
+    ) -> Vec<std::path::PathBuf> {
+        if !typed_by_user || self.cwd.starts_with("remote://") {
+            return Vec::new();
+        }
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        let used: u64 = existing
+            .iter()
+            .filter_map(|path| path.metadata().ok())
+            .map(|meta| meta.len())
+            .sum();
+        let count = composer::MAX_ATTACHMENTS.saturating_sub(existing.len());
+        let bytes = composer::MAX_EMBED_BYTES.saturating_sub(used);
+        crate::runtime::locked(store)
+            .ok()
+            .and_then(|store| store.today_turn_images(typed, count, bytes).ok())
+            .unwrap_or_default()
+            .into_iter()
+            // A queued message keeps renamed copies of its files, so a path alone
+            // does not tell that an image is already there; stored names are
+            // unique, so the file name does.
+            .filter(|path| {
+                !existing.iter().any(|have| {
+                    have == path
+                        || (have.file_name().is_some() && have.file_name() == path.file_name())
+                })
+            })
+            .collect()
+    }
     /// The bare file name when no other project file shares it.
     fn mention_label(&self, file: &ProjectFile) -> String {
         let full = composer::mention_text(&file.relative);
@@ -2189,5 +2229,99 @@ mod tests {
                 assert!(view.generation > before && !view.workflows_loading);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn today_turn_images_respect_the_chat_limits(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let root = std::env::temp_dir().join(format!(
+            "today-turn-images-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = &root;
+        let store = monocode_core::store::Store::open(&dir.join("monocode.db")).unwrap();
+        let task = store
+            .today_add(
+                &monocode_core::today::NewTask {
+                    title: "Pics".into(),
+                    ..Default::default()
+                },
+                &monocode_core::today::Actor::User,
+                1_800_000_000_000,
+            )
+            .unwrap();
+        let files: Vec<_> = (0..3)
+            .map(|i| {
+                let path = dir.join(format!("p{i}.png"));
+                image::RgbaImage::new(2, 2)
+                    .save_with_format(&path, image::ImageFormat::Png)
+                    .unwrap();
+                path
+            })
+            .collect();
+        let saved = store
+            .today_note_with_files(
+                &task.id,
+                "x",
+                &files,
+                &monocode_core::today::Actor::User,
+                1_800_000_000_000,
+            )
+            .unwrap();
+        let stored: Vec<_> = saved
+            .note
+            .attachments
+            .iter()
+            .map(|a| std::path::PathBuf::from(a.path.clone().unwrap()))
+            .collect();
+        let size = stored[0].metadata().unwrap().len();
+        let store: crate::runtime::Database = std::sync::Arc::new(std::sync::Mutex::new(store));
+        let typed = format!("see @today/{}", task.key);
+        window
+            .update(cx, |view, _, _| {
+                // Without a store or a mention nothing is attached.
+                assert!(view.today_turn_images(&typed, &[], true).is_empty());
+                view.store = Some(store.clone());
+                assert!(view.today_turn_images("nothing", &[], true).is_empty());
+                assert_eq!(view.today_turn_images(&typed, &[], true).len(), 3);
+                // App-written prompts never attach.
+                assert!(view.today_turn_images(&typed, &[], false).is_empty());
+                // Room for the remaining count only.
+                let full: Vec<_> = (0..composer::MAX_ATTACHMENTS - 1)
+                    .map(|i| std::path::PathBuf::from(format!("/missing/{i}.png")))
+                    .collect();
+                assert_eq!(view.today_turn_images(&typed, &full, true).len(), 1);
+                let full: Vec<_> = (0..composer::MAX_ATTACHMENTS)
+                    .map(|i| std::path::PathBuf::from(format!("/missing/{i}.png")))
+                    .collect();
+                assert!(view.today_turn_images(&typed, &full, true).is_empty());
+                // Room for the remaining bytes only: an existing file uses them up.
+                let big = dir.join("big.bin");
+                std::fs::File::create(&big)
+                    .unwrap()
+                    .set_len(composer::MAX_EMBED_BYTES - size)
+                    .unwrap();
+                assert_eq!(
+                    view.today_turn_images(&typed, std::slice::from_ref(&big), true)
+                        .len(),
+                    1
+                );
+                // A path already attached is not added twice.
+                let again = view.today_turn_images(&typed, &stored[..1], true);
+                assert_eq!(again.len(), 2);
+                assert!(!again.contains(&stored[0]));
+                // A queued message keeps renamed copies: the file name matches too.
+                let queued = std::path::PathBuf::from("/queue/composer-messages/m1")
+                    .join(stored[0].file_name().unwrap());
+                let again = view.today_turn_images(&typed, &[queued], true);
+                assert_eq!(again.len(), 2);
+                assert!(!again.contains(&stored[0]));
+                // A remote project attaches nothing.
+                view.cwd = "remote://host/project".into();
+                assert!(view.today_turn_images(&typed, &[], true).is_empty());
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
