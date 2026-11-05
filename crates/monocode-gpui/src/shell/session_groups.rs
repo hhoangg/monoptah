@@ -511,6 +511,11 @@ impl Shell {
                 )
                 .into(),
             ]);
+            if self.is_cloud(id) {
+                items.push(
+                    MenuAction::new("codespace-terminal", "Open terminal in codespace").into(),
+                );
+            }
             items.extend(self.telegram_topic_item(id, cx));
         }
         items.extend([
@@ -576,6 +581,11 @@ impl Shell {
         let summary = self.session_metadata(id, cx).summary.clone();
         let ids = self.session_menu_ids(id, cx);
         match action {
+            "codespace-terminal" => {
+                if let Some(codespace) = self.cloud_marks.get(&id).map(|m| m.codespace.clone()) {
+                    self.new_codespace_terminal(codespace, window, cx);
+                }
+            }
             "copy-harness-session-id" | "copy-monocode-session-id" => {
                 let text = if action == "copy-harness-session-id" {
                     summary.provider_id
@@ -970,7 +980,7 @@ impl Shell {
         })
         .detach();
     }
-    fn forget_session(&mut self, id: i64, cx: &mut Context<Self>) {
+    pub(super) fn forget_session(&mut self, id: i64, cx: &mut Context<Self>) {
         // A tab opened on it while the store was deleting keeps it alive.
         if self.workspace.tab_of(id).is_some() {
             return;

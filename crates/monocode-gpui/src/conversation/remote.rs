@@ -24,6 +24,14 @@ impl Conversation {
     pub(super) fn is_remote(&self) -> bool {
         self.summary.cwd.starts_with("remote://")
     }
+    /// A remote session that lives in a codespace: Claude only, so the model
+    /// picker offers no other harness.
+    pub(super) fn is_cloud_session(&self) -> bool {
+        self.is_remote()
+            && locked(&self.store)
+                .and_then(|store| store.remote_session(self.summary.id))
+                .is_ok_and(|session| session.is_some_and(|s| s.project.codespace.is_some()))
+    }
     pub(crate) fn remote_connection_error(&mut self, error: &str, cx: &mut Context<Self>) {
         if self.is_remote() && !self.busy {
             self.remote_state.online = false;

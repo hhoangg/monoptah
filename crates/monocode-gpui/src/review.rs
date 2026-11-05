@@ -1298,9 +1298,10 @@ impl ReviewPane {
                                 .and_then(|l| l.unified.clone())
                                 .unwrap_or_else(|| Arc::new(Vec::new()))
                         },
-                        can_stage: !kind,
-                        can_discard: !kind,
+                        can_stage: !kind && crate::git_gate::writes_allowed(),
+                        can_discard: !kind && crate::git_gate::writes_allowed(),
                         can_stage_hunk: !kind
+                            && crate::git_gate::writes_allowed()
                             && !loaded.is_some_and(|l| l.diff.binary || l.diff.too_large),
                     }
                 })
@@ -1397,6 +1398,9 @@ impl ReviewPane {
             }
             return;
         };
+        if !crate::git_gate::writes_allowed() {
+            return;
+        }
         let cwd = PathBuf::from(cwd);
         let (id, work): (SharedString, Box<dyn FnOnce() -> Result<(), String> + Send>) = match event
         {
@@ -2098,6 +2102,48 @@ mod tests {
         assert_eq!(
             input.read_with(cx, |input, _| input.content.to_string()),
             "edit1\n"
+        );
+    }
+
+    #[gpui::test]
+    fn discarding_a_file_is_refused_in_the_review_view_while_a_cloud_session_is_in_view(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = Repo::new();
+        let cwd = repo.cwd();
+        let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+        cx.run_until_parked();
+        let pane = cx.new(|cx| ReviewPane::new(git, Default::default(), cx));
+        pane.update(cx, |pane, cx| {
+            pane.open(
+                ReviewTab::Changes {
+                    cwd: cwd.clone(),
+                    path: None,
+                    staged: None,
+                },
+                cx,
+            );
+            pane.set_visible(true, cx);
+        });
+        cx.run_until_parked();
+        let discard = |file: &str, cx: &mut gpui::TestAppContext| {
+            let event = DiffEvent::DiscardFile(format!("unstaged:{file}").into());
+            pane.update(cx, |pane, cx| pane.diff_event(0, &event, cx));
+            cx.run_until_parked();
+        };
+        crate::git_gate::set(Some("octo-abc".into()));
+        discard("a.txt", cx);
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("a.txt")).unwrap(),
+            "edit1\n",
+            "the local file must survive"
+        );
+        // Control: with the gate open the same event does discard.
+        crate::git_gate::set(None);
+        discard("b.txt", cx);
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("b.txt")).unwrap(),
+            "base\n"
         );
     }
 

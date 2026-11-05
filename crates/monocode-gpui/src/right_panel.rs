@@ -260,6 +260,8 @@ pub(crate) struct RightPanel {
     /// Classic reserves the title bar's height; rounded content starts at
     /// the card's top edge, below the window-wide title bar.
     top_inset: f32,
+    /// Set while a cloud session is in view: what the panel shows is local.
+    cloud_banner: Option<String>,
     tab_width: f32,
     drag: Option<TabDrag>,
     reveal: Option<TabReveal>,
@@ -306,6 +308,7 @@ impl RightPanel {
             sidebar_tab: None,
             terminal_tab: false,
             top_inset: 0.,
+            cloud_banner: None,
             tab_width: tabs_width(3),
             drag: None,
             reveal: None,
@@ -313,6 +316,16 @@ impl RightPanel {
             tab_bounds: (0..4).map(|_| Default::default()).collect(),
             _subscriptions: subscriptions,
         }
+    }
+    pub(crate) fn set_cloud_banner(&mut self, banner: Option<String>, cx: &mut Context<Self>) {
+        if self.cloud_banner != banner {
+            self.cloud_banner = banner;
+            cx.notify();
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn cloud_banner(&self) -> Option<&str> {
+        self.cloud_banner.as_deref()
     }
     pub(crate) fn tab(&self) -> RightTab {
         self.tab
@@ -627,6 +640,22 @@ impl Render for RightPanel {
                         .border_b_1()
                         .border_color(stroke()),
                 )
+            })
+            .when(self.tab != RightTab::Terminal, |d| {
+                d.children(self.cloud_banner.clone().map(|text| {
+                    div()
+                        .id("cloud-files-banner")
+                        .role(Role::Status)
+                        .flex_shrink_0()
+                        .px_3()
+                        .py(px(6.))
+                        .border_b_1()
+                        .border_color(stroke())
+                        .text_size(px(11.))
+                        .line_height(px(15.))
+                        .text_color(content(0.6))
+                        .child(text)
+                }))
             })
             .child(pane)
     }

@@ -79,6 +79,11 @@ impl FileEditor {
             .into_any_element()
     }
     pub(super) fn apply_change(&mut self, stage: bool, cx: &mut Context<Self>) {
+        if !crate::git_gate::writes_allowed() {
+            self.error = Some(crate::git_gate::REFUSED.into());
+            cx.notify();
+            return;
+        }
         if stage && self.git_staged {
             return;
         }

@@ -241,7 +241,7 @@ impl Shell {
         } else if self.session_summaries.contains_key(&id)
             && !self.session_metadata(id, cx).summary.archived
         {
-            self.toggle_archive(id, cx);
+            self.toggle_archive_now(id, cx);
         }
     }
 }
