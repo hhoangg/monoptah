@@ -10,7 +10,8 @@ pub use ssh::{JobView, Prompt, SshTarget};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,7 +21,16 @@ pub struct Connections {
     store: Mutex<()>,
     tunnels: Tunnels,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
+    /// In-flight codespace wakes by machine id, so concurrent callers share one.
+    wakes: Mutex<HashMap<String, WakeSlot>>,
 }
+
+type WakeSlot = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
+const SSH_BUSY: &str = "Another SSH connection is being set up. Finish or cancel it first.";
+/// How long a wake waits for the single SSH job slot before giving up.
+const JOB_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Error returned when a wake was cancelled by its caller.
+pub const WAKE_CANCELLED: &str = "Wake cancelled";
 
 impl Connections {
     /// Uses the same connection store as the Tauri desktop.
@@ -30,6 +40,7 @@ impl Connections {
             store: Mutex::new(()),
             tunnels: Tunnels::default(),
             jobs: Mutex::new(HashMap::new()),
+            wakes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -557,9 +568,7 @@ impl Connections {
                 .lock()
                 .map_err(|_| "Connection setup is unavailable")?;
             if jobs.values().any(|job| !job.view().done) {
-                return Err(
-                    "Another SSH connection is being set up. Finish or cancel it first.".into(),
-                );
+                return Err(SSH_BUSY.into());
             }
             jobs.retain(|_, job| !job.view().done);
             jobs.insert(id.clone(), job.clone());
@@ -815,24 +824,157 @@ impl Connections {
     }
 
     /// Make sure a codespace machine is connected, waking the codespace if
-    /// needed. No-op when the tunnel already answers `environment.describe`;
-    /// otherwise runs `codespace_reconnect` and waits for it. BLOCKS for as
-    /// long as the codespace takes to start (minutes): call it from a
-    /// background thread, never the UI thread. Only user-initiated actions
-    /// should call it; background polling must not.
+    /// needed. See `ensure_codespace_with`; no cancel, no progress.
     pub fn ensure_codespace(self: &Arc<Self>, machine_id: &str) -> Result<(), String> {
-        match self.request(machine_id, "environment.describe", json!({})) {
-            Ok(_) => return Ok(()),
-            Err(error) if error.starts_with("Codespace is not connected") => {}
-            Err(error) => return Err(error),
-        }
-        let job = self.codespace_reconnect(machine_id)?;
+        self.ensure_codespace_with(machine_id, &AtomicBool::new(false), &mut |_| {})
+    }
+
+    /// No-op when the tunnel already answers `environment.describe`; otherwise
+    /// runs `codespace_reconnect` and waits for it. BLOCKS for as long as the
+    /// codespace takes to start (minutes): call it from a background thread,
+    /// never the UI thread. Only user-initiated actions should call it.
+    ///
+    /// * `progress` fires (once) only when a wake actually starts or is joined.
+    /// * Concurrent callers for the same machine share one reconnect job.
+    /// * Setting `cancel` aborts this caller's wait with `WAKE_CANCELLED` and,
+    ///   if it owns the job, cancels the job.
+    pub fn ensure_codespace_with(
+        self: &Arc<Self>,
+        machine_id: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(), String> {
+        self.run_coalesced(machine_id, cancel, progress, |progress| {
+            match self.request(machine_id, "environment.describe", json!({})) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.starts_with("Codespace is not connected") => {}
+                Err(error) => return Err(error),
+            }
+            progress("Waking codespace…");
+            let job = self.start_when_free(cancel, JOB_SLOT_WAIT, || {
+                self.codespace_reconnect(machine_id)
+            })?;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = self.ssh_cancel(&job);
+                    // The job thread stops within moments; let it finish so an
+                    // immediate re-send does not find the slot busy.
+                    for _ in 0..20 {
+                        if self.ssh_poll(&job).map_or(true, |view| view.done) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    return Err(WAKE_CANCELLED.into());
+                }
+                let view = self.ssh_poll(&job)?;
+                if view.done {
+                    return view.error.map_or(Ok(()), Err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+    }
+
+    /// SSH setup runs one job at a time. Instead of failing while another
+    /// job (a pairing, a wake of another machine, a just-cancelled wake) holds
+    /// the slot, wait for it, bounded and cancellable.
+    fn start_when_free(
+        &self,
+        cancel: &AtomicBool,
+        limit: std::time::Duration,
+        mut start: impl FnMut() -> Result<String, String>,
+    ) -> Result<String, String> {
+        let deadline = std::time::Instant::now() + limit;
         loop {
-            let view = self.ssh_poll(&job)?;
-            if view.done {
-                return view.error.map_or(Ok(()), Err);
+            match start() {
+                Err(error) if error == SSH_BUSY => {}
+                other => return other,
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err(WAKE_CANCELLED.into());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SSH_BUSY.into());
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    fn run_coalesced(
+        &self,
+        key: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+        work: impl FnOnce(&mut dyn FnMut(&str)) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut work = Some(work);
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(WAKE_CANCELLED.into());
+            }
+            let (slot, leader) = {
+                let mut wakes = self.wakes.lock().map_err(|_| "Wake state is unavailable")?;
+                match wakes.get(key) {
+                    Some(slot) => (slot.clone(), false),
+                    None => {
+                        let slot: WakeSlot = Arc::new((Mutex::new(None), Condvar::new()));
+                        wakes.insert(key.into(), slot.clone());
+                        (slot, true)
+                    }
+                }
+            };
+            if leader {
+                // Fills and clears the slot even if `work` panics.
+                struct Finish<'a> {
+                    wakes: &'a Mutex<HashMap<String, WakeSlot>>,
+                    key: &'a str,
+                    slot: WakeSlot,
+                    result: Option<Result<(), String>>,
+                }
+                impl Drop for Finish<'_> {
+                    fn drop(&mut self) {
+                        if let Ok(mut wakes) = self.wakes.lock() {
+                            wakes.remove(self.key);
+                        }
+                        let result = self.result.take().unwrap_or_else(|| {
+                            Err("Waking the codespace failed unexpectedly".into())
+                        });
+                        *self.slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                        self.slot.1.notify_all();
+                    }
+                }
+                let mut finish = Finish {
+                    wakes: &self.wakes,
+                    key,
+                    slot,
+                    result: None,
+                };
+                let result = work.take().expect("leader runs once")(progress);
+                finish.result = Some(result.clone());
+                return result;
+            }
+            progress("Waking codespace…");
+            let mut guard = slot.0.lock().unwrap();
+            let result = loop {
+                if let Some(result) = guard.clone() {
+                    break result;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(WAKE_CANCELLED.into());
+                }
+                guard = slot
+                    .1
+                    .wait_timeout(guard, std::time::Duration::from_millis(100))
+                    .unwrap()
+                    .0;
+            };
+            drop(guard);
+            // The leader's caller gave up; this caller did not.
+            if result.as_ref().err().is_some_and(|e| e == WAKE_CANCELLED) {
+                continue;
+            }
+            return result;
         }
     }
 
@@ -1366,5 +1508,163 @@ else:
         let value = serde_json::to_string(&stored.public()).unwrap();
         assert!(!value.contains("secret"));
         assert!(!value.contains("token"));
+    }
+
+    #[test]
+    fn concurrent_wakes_share_one_job_and_cancel_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let waking = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let cancel = AtomicBool::new(false);
+                    connections
+                        .run_coalesced(
+                            "m",
+                            &cancel,
+                            &mut |_| {
+                                waking.fetch_add(1, Ordering::SeqCst);
+                            },
+                            |_| {
+                                runs.fetch_add(1, Ordering::SeqCst);
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        // Callers that arrived during the job joined it; late ones ran again.
+        assert!(
+            runs.load(Ordering::SeqCst) < 4,
+            "{}",
+            runs.load(Ordering::SeqCst)
+        );
+        assert!(waking.load(Ordering::SeqCst) >= 1);
+        assert!(connections.wakes.lock().unwrap().is_empty());
+
+        // Pre-cancelled: no work at all.
+        let cancel = AtomicBool::new(true);
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let error = connections
+            .run_coalesced("m", &cancel, &mut |_| {}, |_| {
+                ran.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error, WAKE_CANCELLED);
+        assert!(!ran.load(Ordering::SeqCst));
+
+        // A follower whose leader was cancelled retries instead of failing.
+        let leader_cancel = Arc::new(AtomicBool::new(false));
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let c = leader_cancel.clone();
+            let conn = &connections;
+            let leader = scope.spawn(move || {
+                conn.run_coalesced("m", &c, &mut |_| {}, |_| {
+                    while !c.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(WAKE_CANCELLED.into())
+                })
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let follower = scope.spawn(|| {
+                let cancel = AtomicBool::new(false);
+                connections.run_coalesced("m", &cancel, &mut |_| {}, |_| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            leader_cancel.store(true, Ordering::SeqCst);
+            assert_eq!(leader.join().unwrap().unwrap_err(), WAKE_CANCELLED);
+            follower.join().unwrap().unwrap();
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_panicking_leader_clears_the_wake_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Connections::new(dir.path());
+        let cancel = AtomicBool::new(false);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = connections.run_coalesced("m", &cancel, &mut |_| {}, |_| panic!("boom"));
+        }));
+        assert!(panicked.is_err());
+        assert!(connections.wakes.lock().unwrap().is_empty());
+        connections
+            .run_coalesced("m", &cancel, &mut |_| {}, |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn wakes_wait_for_the_job_slot_instead_of_failing_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        // A pairing job (or a just-cancelled wake) holds the single slot.
+        let busy = Job::new();
+        connections
+            .jobs
+            .lock()
+            .unwrap()
+            .insert("pairing".into(), busy.clone());
+        // Same busy rule as start_ssh_job, without spawning a real gh job.
+        let try_start = |c: &Connections| {
+            if c.jobs.lock().unwrap().values().any(|j| !j.view().done) {
+                Err(SSH_BUSY.to_string())
+            } else {
+                Ok("job".to_string())
+            }
+        };
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let releaser = {
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(350));
+                busy.complete(|| Err("done".into()));
+            })
+        };
+        let id = connections
+            .start_when_free(&cancel, std::time::Duration::from_secs(10), || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                try_start(&connections)
+            })
+            .unwrap();
+        releaser.join().unwrap();
+        assert!(attempts.load(Ordering::SeqCst) > 1);
+        assert_eq!(id, "job");
+        // Cancel while waiting.
+        let hold = Job::new();
+        connections.jobs.lock().unwrap().insert("hold".into(), hold);
+        let cancelled = AtomicBool::new(true);
+        let error = connections
+            .start_when_free(&cancelled, std::time::Duration::from_secs(10), || {
+                try_start(&connections)
+            })
+            .unwrap_err();
+        assert_eq!(error, WAKE_CANCELLED);
+        // The wait is bounded.
+        let error = connections
+            .start_when_free(&cancel, std::time::Duration::from_millis(250), || {
+                try_start(&connections)
+            })
+            .unwrap_err();
+        assert_eq!(error, SSH_BUSY);
+        // Other errors are not retried.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let error = connections
+            .start_when_free(&cancel, std::time::Duration::from_secs(10), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("nope".into())
+            })
+            .unwrap_err();
+        assert_eq!((error.as_str(), calls.load(Ordering::SeqCst)), ("nope", 1));
     }
 }
