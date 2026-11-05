@@ -77,34 +77,62 @@ jobs:
       - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui --profile native-dev -- --test-threads=1
       - run: cargo build --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui --profile native-dev
 
-  # Tag runs restore this, which is what makes a native release fast. Keep the
-  # toolchain, Metal step and build command in step with native-release-monoptah.yml.
+  # Tag runs restore these, which is what makes a native release fast. Keep the
+  # toolchain, per-OS setup and build command in step with the package job in
+  # native-release-monoptah.yml, and the shared keys equal to the ones it reads.
+  # The rpm job (AlmaLinux container) has no seeded cache.
   release-cache:
-    name: Seed the release build cache
+    name: Seed the release build cache (${{ matrix.kind }})
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     continue-on-error: true
-    env:
-      TARGET: aarch64-apple-darwin
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            kind: macos
+            target: aarch64-apple-darwin
+            key: native-monoptah-release
+          - os: ubuntu-22.04
+            kind: linux
+            target: x86_64-unknown-linux-gnu
+            key: native-monoptah-release-x86_64-unknown-linux-gnu
+          - os: windows-latest
+            kind: windows
+            target: x86_64-pc-windows-msvc
+            key: native-monoptah-release-x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
+      - name: Link the Windows C runtime statically
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          'RUSTFLAGS=-C target-feature=+crt-static' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - id: cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/monocode-gpui
-          shared-key: native-monoptah-release
+          shared-key: ${{ matrix.key }}
           lookup-only: true
-      - if: steps.cache.outputs.cache-hit != 'true'
+      - name: Install native Linux build dependencies
+        if: matrix.kind == 'linux' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils
+      - if: matrix.kind == 'macos' && steps.cache.outputs.cache-hit != 'true'
         run: |
           if ! xcrun metal --version >/dev/null 2>&1; then
             xcodebuild -downloadComponent MetalToolchain
           fi
-      - if: steps.cache.outputs.cache-hit != 'true'
+      - if: matrix.kind == 'macos' && steps.cache.outputs.cache-hit != 'true'
         env:
           CARGO_BUILD_JOBS: 2
-        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --target "$TARGET" --release
-      - if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --target ${{ matrix.target }} --release
+      - if: matrix.kind != 'macos' && steps.cache.outputs.cache-hit != 'true'
+        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --target ${{ matrix.target }} --release
+      - if: matrix.kind == 'macos' && steps.cache.outputs.cache-hit != 'true'
         run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-core --example verify_monoptah_native_update --profile native-dev

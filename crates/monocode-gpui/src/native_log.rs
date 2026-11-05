@@ -126,7 +126,7 @@ impl Sink {
 struct NativeLog(Mutex<Sink>);
 impl log::Log for NativeLog {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Warn && recorded_target(metadata.target())
+        wanted(metadata.level(), metadata.target())
     }
 
     fn log(&self, record: &log::Record) {
@@ -154,6 +154,15 @@ fn recorded_target(target: &str) -> bool {
     RECORDED_CRATES.contains(&krate)
 }
 
+/// Warnings from every recorded crate, plus the macOS window's info lines
+/// (occlusion, resize, file drop and its frame probe), which describe the
+/// state around a freeze and are otherwise lost.
+fn wanted(level: log::Level, target: &str) -> bool {
+    recorded_target(target)
+        && (level <= log::Level::Warn
+            || (level == log::Level::Info && target.split("::").next() == Some("gpui_macos")))
+}
+
 fn format_line(record: &log::Record) -> String {
     let mut message = record.args().to_string().replace(['\n', '\r'], " ");
     if let Some((index, _)) = message.char_indices().nth(MAX_MESSAGE_CHARS) {
@@ -173,7 +182,7 @@ fn format_line(record: &log::Record) -> String {
 pub(crate) fn install(directory: &Path) {
     let logger = Box::leak(Box::new(NativeLog(Mutex::new(Sink::new(directory)))));
     if log::set_logger(logger).is_ok() {
-        log::set_max_level(log::LevelFilter::Warn);
+        log::set_max_level(log::LevelFilter::Info);
     }
 }
 
@@ -193,6 +202,16 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         directory
+    }
+
+    #[test]
+    fn records_info_only_from_the_macos_window() {
+        assert!(wanted(log::Level::Info, "gpui_macos::window"));
+        assert!(wanted(log::Level::Warn, "gpui::window"));
+        assert!(!wanted(log::Level::Info, "gpui::window"));
+        assert!(!wanted(log::Level::Info, "gpui_apple"));
+        assert!(!wanted(log::Level::Debug, "gpui_macos::window"));
+        assert!(!wanted(log::Level::Warn, "reqwest::connect"));
     }
 
     #[test]

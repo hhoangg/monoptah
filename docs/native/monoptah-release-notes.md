@@ -1,17 +1,15 @@
-# Monoptah Native 0.44.0
+# Monoptah Native 0.45.0
 
-## Changes since 0.42.0
+## Changes since 0.44.0
 
-- Attach images and files to Today notes with the picker, clipboard, or drag and drop. Attachment-only notes are supported. Up to 10 files of 25 MB each are copied into app storage; task mentions include stored file paths and eligible note images in chat context.
-- Link sessions to Today tasks, see their activity in task details, and continue work in an existing session with an unsent task mention that preserves its draft. Sessions previously started from task mentions are linked automatically.
-- Keep Mono chats usable after failed completion reports or a missing provider account. Long report errors stay within a bounded area so the composer remains visible, and workflow suggestions are restored in the updated composer.
-- Make bare URLs in agent replies and every web URL in user messages clickable, while preserving GitHub issue and pull request chips.
-- Find saved conversation text faster with an incremental transcript search index.
-- Share Mono habits as YAML files, and use selectable, linked text in Today notes with the updated note composer.
-- Include upstream changes through 11769e9e: Claude authentication and queued-turn fixes, streaming performance improvements, and composer, settings, and sidebar refinements.
-- Add Linux x86_64 AppImage and Debian packages and a Windows x64 installer alongside the signed macOS updater and Homebrew cask.
+- Linux and Windows installs now update themselves. The AppImage, Debian package, Enterprise Linux rpm and Windows x64 installer are signed and listed in the update feed next to the macOS updater, and an rpm package is new in this release.
+- Split terminals to the right, drag dock terminals out into splits or title tabs, and keep the Terminal panel open with a fresh shell after dragging one out. Title tabs show when a session has an unsent draft.
+- Split sessions start with your default access mode.
+- Model pickers show fast mode.
+- Keep retrying frames until a window's redraw is answered, and stop the macOS window freezing after a screenshot is dropped onto it. The freeze log now also records window occlusion, resize and file drop state.
+- Include upstream changes through 9ee7b3dd.
 
 ## Known limits
 
-- The separate window repaint stall remains unresolved. This release adds bounded diagnostics to capture its cause; it does not establish a rendering recovery fix.
-- macOS packages are ad-hoc signed and are not Apple-notarized. Linux and Windows desktop interaction still need broader runtime testing.
+- macOS packages are ad-hoc signed and are not Apple-notarized. The Windows installer is unsigned, so SmartScreen warns on first install.
+- Linux and Windows desktop interaction still need broader runtime testing.

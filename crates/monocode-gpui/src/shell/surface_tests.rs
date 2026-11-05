@@ -380,8 +380,9 @@ fn only_the_user_facing_paths_may_create_a_terminal_session() {
     // a new one anywhere in the crate fails here until it is added on purpose,
     // after deciding the app's own paths stay chats.
     let allowed: [(&str, usize); 3] = [
-        // create_session_target (New session, tab, folder row) and split_session.
-        ("shell.rs", 2),
+        // NewSessionDefaults::create, shared by create_session_target (New
+        // session, tab, folder row) and split_session.
+        ("shell/session_loading.rs", 1),
         // Inbox "Start work", kept a terminal only when the CLI takes a first prompt.
         ("shell/app_views.rs", 1),
         // An automation run follows the provider's surface when the CLI takes a first prompt.

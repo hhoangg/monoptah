@@ -6,7 +6,13 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { test } from "node:test";
-import { packageMonoptahNative } from "./package-native-monoptah.mjs";
+import {
+  PLATFORMS,
+  TARGETS,
+  packageMonoptahNative,
+  recordsFileName,
+} from "./package-native-monoptah.mjs";
+import { packageNative } from "./package-native.mjs";
 
 const fakeTool = `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -117,3 +123,91 @@ test(
     );
   },
 );
+
+// Linux and Windows are packaged by upstream's package-native.mjs. Run it for
+// real (only the external packagers are faked) with a plain X.Y.Z version and
+// check that what it writes is what PLATFORMS and the release workflow expect.
+const fakePackager = `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const name = path.basename(process.argv[1]);
+const args = process.argv.slice(2);
+if (name === 'dpkg-deb') fs.writeFileSync(args.at(-1), 'deb bytes');
+if (name === 'appimagetool') fs.writeFileSync(args[1], 'appimage bytes');
+if (name === 'makensis') {
+  const script = fs.readFileSync(args[0], 'utf8');
+  fs.writeFileSync(/^OutFile "(.*)"$/m.exec(script)[1], 'installer bytes');
+}
+if (name === 'rpmbuild') {
+  const top = args.find((a) => a.startsWith('_topdir ')).slice(8);
+  fs.mkdirSync(path.join(top, 'RPMS/x86_64'), { recursive: true });
+  fs.writeFileSync(path.join(top, 'RPMS/x86_64/monoptah-native-0.34.0-0.preview.0.el10.x86_64.rpm'), 'rpm bytes');
+}
+`;
+
+test(
+  "upstream packaging of linux, rpm and windows matches the platform table",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "monoptah packaging linux-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const bin = join(directory, "tools");
+    await mkdir(bin);
+    for (const name of ["dpkg-deb", "appimagetool", "makensis", "rpmbuild"]) {
+      await writeFile(join(bin, name), fakePackager);
+      await chmod(join(bin, name), 0o755);
+    }
+    const binary = join(directory, "monocode-gpui");
+    await writeFile(binary, "#!/bin/sh\nprintf 'Monoptah Native 0.34.0\\n'\n");
+    await chmod(binary, 0o755);
+    const saved = { PATH: process.env.PATH, APPIMAGETOOL: process.env.APPIMAGETOOL };
+    process.env.PATH = `${bin}${delimiter}${process.env.PATH}`;
+    process.env.APPIMAGETOOL = join(bin, "appimagetool");
+    t.after(() => {
+      process.env.PATH = saved.PATH;
+      if (saved.APPIMAGETOOL === undefined) delete process.env.APPIMAGETOOL;
+      else process.env.APPIMAGETOOL = saved.APPIMAGETOOL;
+    });
+    const out = join(directory, "dist");
+    for (const kind of ["linux", "rpm", "windows"])
+      await packageNative({ kind, binary, out, version: "0.34.0", arch: "x86_64" });
+
+    for (const platform of PLATFORMS.filter((p) => p.kind !== "macos")) {
+      const records = JSON.parse(await readFile(join(out, recordsFileName(platform)), "utf8"));
+      const expected = platform.assets("0.34.0");
+      assert.equal(records.length, expected.length, platform.kind);
+      for (const { pattern, target } of expected) {
+        const record = records.find((r) => pattern.test(r.filename));
+        assert.ok(record, `${platform.kind}: ${pattern}`);
+        assert.equal(record.target, target);
+        assert.ok((await readFile(join(out, record.filename), "utf8")).length > 0);
+      }
+    }
+    // The installed layout and marker are Monoptah's, and the client accepts them.
+    const nsi = await readFile(join(out, "work/installer.nsi"), "utf8");
+    assert.match(nsi, /Name "Monoptah Native"/);
+    assert.match(nsi, /VIProductVersion "0\.34\.0\.0"/);
+    assert.match(
+      await readFile(join(out, "work/windows/native-install.json"), "utf8"),
+      /"app_id":"com\.monoptah\.native","kind":"nsis"/,
+    );
+    assert.match(
+      await readFile(join(out, "work/deb/usr/share/applications/monoptah-native.desktop"), "utf8"),
+      /^Name=Monoptah Native$/m,
+    );
+  },
+);
+
+test("PLATFORMS names every package job once", () => {
+  assert.deepEqual(PLATFORMS.map((p) => p.kind), ["macos", "linux", "rpm", "windows"]);
+  assert.deepEqual(PLATFORMS.map((p) => recordsFileName(p)), [
+    "artifacts-macos-aarch64.json",
+    "artifacts-linux-x86_64.json",
+    "artifacts-rpm-x86_64.json",
+    "artifacts-windows-x86_64.json",
+  ]);
+  assert.deepEqual(
+    PLATFORMS.flatMap((p) => p.assets("1.2.3").map((a) => a.target)).filter(Boolean),
+    TARGETS,
+  );
+});

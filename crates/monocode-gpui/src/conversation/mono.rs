@@ -943,6 +943,7 @@ impl Conversation {
             .try_global::<crate::settings::Preferences>()
             .is_some_and(|p| p.model_controls == "beside");
         let trigger_effort = (!beside).then(|| self.trigger_effort_label()).flatten();
+        let trigger_fast = self.trigger_fast(beside);
         let controls = if beside {
             self.model_controls(cx)
         } else {
@@ -1041,6 +1042,7 @@ impl Conversation {
                                                 .child(effort),
                                         )
                                     })
+                                    .when(trigger_fast, |d| d.child(fast_bolt()))
                                     .child(icon("chevron-down", 12.)),
                             )
                             .children(controls)
