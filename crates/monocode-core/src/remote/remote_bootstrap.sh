@@ -80,6 +80,28 @@ if [ "${MONOCODE_HOST_TRACK_TOKEN:-0}" = 1 ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:
     TOKEN_HASH=
   fi
 fi
+# Codespaces: Claude Code is the only harness of a cloud session and a bare codespace
+# image does not ship it. Install it (best effort) and restart a host that was started
+# before it was available, since the host discovers providers only at startup.
+CLAUDE_MARKER="$BASE/host-claude-path"
+CLAUDE_PATH=
+if [ "${MONOCODE_HOST_INSTALL_CLAUDE:-0}" = 1 ]; then
+  if ! command -v claude >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/claude" ]; then
+    echo 'Installing Claude Code on this host...' >&2
+    if command -v curl >/dev/null 2>&1; then
+      curl --proto '=https' -fsSL --connect-timeout 15 --max-time 300 https://claude.ai/install.sh | bash >&2 || echo 'Claude Code install failed; install it on this host manually.' >&2
+    fi
+  fi
+  PATH="$HOME/.local/bin:$PATH"
+  export PATH
+  CLAUDE_PATH=$(command -v claude 2>/dev/null || true)
+  if [ -n "$CLAUDE_PATH" ] && [ "$(cat "$CLAUDE_MARKER" 2>/dev/null || true)" != "$CLAUDE_PATH" ]; then
+    "$ENTRY" service uninstall >/dev/null 2>&1 || true
+  else
+    CLAUDE_PATH=
+  fi
+fi
 "$ENTRY" service install --port "$HOST_PORT" >/dev/null
 [ -z "$TOKEN_HASH" ] || printf '%s\n' "$TOKEN_HASH" > "$TOKEN_MARKER"
+[ -z "$CLAUDE_PATH" ] || printf '%s\n' "$CLAUDE_PATH" > "$CLAUDE_MARKER"
 "$ENTRY" connection-info

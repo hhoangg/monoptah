@@ -136,9 +136,10 @@ fn codespace_end_to_end() {
         "binding: machine={} env={} project={} cwd={}",
         binding.machine_id, binding.environment_id, binding.project_id, binding.remote_cwd
     ));
+    assert_eq!(binding.remote_cwd, "/workspaces/monoptah");
     assert_eq!(
-        binding.remote_cwd,
-        "remote://".to_owned() + &binding.environment_id + "/workspaces/monoptah"
+        binding.project_key,
+        format!("remote://{}/workspaces/monoptah", binding.environment_id)
     );
     let machine = binding.machine_id.clone();
 
@@ -179,6 +180,13 @@ fn codespace_end_to_end() {
         claude_models.as_array().map_or(0, Vec::len),
         models["errors"]
     ));
+    step(&format!(
+        "claude model ids: {:?}",
+        claude_models.as_array().map(|m| m
+            .iter()
+            .map(|m| (m["id"].clone(), m["isDefault"].clone()))
+            .collect::<Vec<_>>())
+    ));
     let model = claude_models
         .as_array()
         .and_then(|m| {
@@ -189,13 +197,17 @@ fn codespace_end_to_end() {
         .and_then(|m| m["id"].as_str())
         .unwrap_or_else(|| panic!("no claude models: {models}"))
         .to_owned();
-    let wire_model = format!("claude:{model}");
+    let wire_model = if model.starts_with("claude:") {
+        model
+    } else {
+        format!("claude:{model}")
+    };
     let create = conns
         .request(
             &machine,
             "commands.dispatch",
             json!({"type":"create","commandId":monocode_core::mono::new_id(),"projectId":binding.project_id,
-                   "harness":"claude","model":wire_model,"modelSettings":{},"runtimeMode":"read-only"}),
+                   "harness":"claude","model":wire_model,"modelSettings":{},"runtimeMode":"supervised"}),
         )
         .unwrap();
     let session_id = create["sessionId"].as_str().unwrap().to_owned();
@@ -216,7 +228,9 @@ fn codespace_end_to_end() {
         if !reply.is_empty() {
             step(&format!("status={} reply={reply:?}", snapshot["status"]));
         }
-        let finished = reply.contains("PONG") || snapshot_failed(&snapshot);
+        let finished = reply.contains("PONG")
+            || snapshot_failed(&snapshot)
+            || (!reply.is_empty() && snapshot["status"] == "idle");
         known = Some(snapshot);
         Ok(finished)
     });

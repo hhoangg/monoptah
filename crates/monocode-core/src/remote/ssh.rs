@@ -529,7 +529,7 @@ fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> Str
 /// (tracked as a hash, never the token itself).
 pub fn codespace_bootstrap_script() -> String {
     format!(
-        "MONOCODE_HOST_TRACK_TOKEN=1\n{}",
+        "MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{}",
         bootstrap_script(HostPlatform::Unix)
     )
 }
@@ -1050,7 +1050,8 @@ mod tests {
     #[test]
     fn codespace_bootstrap_tracks_the_token_without_exposing_it() {
         let script = codespace_bootstrap_script();
-        assert!(script.starts_with("MONOCODE_HOST_TRACK_TOKEN=1\nset -eu\n"));
+        assert!(script
+            .starts_with("MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\nset -eu\n"));
         assert!(!bootstrap_script(HostPlatform::Unix).contains("MONOCODE_HOST_TRACK_TOKEN=1\n"));
         assert!(script.contains("host-token.sha256"));
         assert!(!script.contains("echo \"$CLAUDE_CODE_OAUTH_TOKEN"));
@@ -1107,12 +1108,19 @@ mod tests {
                 .map(String::from)
                 .collect::<Vec<_>>()
         };
+        // Hermetic: never try to install or detect Claude Code from this test.
+        let no_claude_install = || {
+            codespace_bootstrap_script().replace(
+                "MONOCODE_HOST_INSTALL_CLAUDE=1",
+                "MONOCODE_HOST_INSTALL_CLAUDE=0",
+            )
+        };
         let uninstalls =
             |calls: &[String]| calls.iter().filter(|c| *c == "service uninstall").count();
         // No token in the shell: never restart.
-        assert_eq!(uninstalls(&run(codespace_bootstrap_script(), None)), 0);
+        assert_eq!(uninstalls(&run(no_claude_install(), None)), 0);
         // Token appears: restart once, store a hash only.
-        let calls = run(codespace_bootstrap_script(), Some("secret-token"));
+        let calls = run(no_claude_install(), Some("secret-token"));
         assert_eq!(uninstalls(&calls), 1, "{calls:?}");
         let marker =
             std::fs::read_to_string(home.path().join(".monocode-host/host-token.sha256")).unwrap();
@@ -1120,12 +1128,12 @@ mod tests {
         assert!(!marker.contains("secret-token"));
         // Same token: no further restart.
         assert_eq!(
-            uninstalls(&run(codespace_bootstrap_script(), Some("secret-token"))),
+            uninstalls(&run(no_claude_install(), Some("secret-token"))),
             1
         );
         // Changed token: restart again.
         assert_eq!(
-            uninstalls(&run(codespace_bootstrap_script(), Some("other-token"))),
+            uninstalls(&run(no_claude_install(), Some("other-token"))),
             2
         );
         // Plain ssh bootstrap ignores the token entirely.
@@ -1134,6 +1142,63 @@ mod tests {
             2
         );
     }
+    #[cfg(unix)]
+    #[test]
+    fn codespace_bootstrap_restarts_the_host_once_when_claude_appears() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".monocode-host/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = home.path().join("calls.log");
+        let entry = bin.join("monocode-host");
+        std::fs::write(
+            &entry,
+            format!(
+                "#!/bin/sh\necho \"$1 $2\" >> {}\n[ \"$1\" = connection-info ] && echo '{{\"port\":3774}}'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A claude binary already in ~/.local/bin: nothing is downloaded.
+        let local = home.path().join(".local/bin");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("claude"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(local.join("claude"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let run = || {
+            let mut child = Command::new("sh")
+                .arg("-s")
+                .env("HOME", home.path())
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(codespace_bootstrap_script().as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .filter(|c| *c == "service uninstall")
+                .count()
+        };
+        // The host may have started before Claude existed: restart once, then never again.
+        assert_eq!(run(), 1);
+        assert_eq!(run(), 1);
+    }
+
     #[test]
     fn ssh_targets_cannot_inject_options_or_shell_commands() {
         for target in [
