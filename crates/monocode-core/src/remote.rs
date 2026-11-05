@@ -26,6 +26,9 @@ pub struct Connections {
 }
 
 type WakeSlot = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
+const SSH_BUSY: &str = "Another SSH connection is being set up. Finish or cancel it first.";
+/// How long a wake waits for the single SSH job slot before giving up.
+const JOB_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Error returned when a wake was cancelled by its caller.
 pub const WAKE_CANCELLED: &str = "Wake cancelled";
 
@@ -565,9 +568,7 @@ impl Connections {
                 .lock()
                 .map_err(|_| "Connection setup is unavailable")?;
             if jobs.values().any(|job| !job.view().done) {
-                return Err(
-                    "Another SSH connection is being set up. Finish or cancel it first.".into(),
-                );
+                return Err(SSH_BUSY.into());
             }
             jobs.retain(|_, job| !job.view().done);
             jobs.insert(id.clone(), job.clone());
@@ -850,10 +851,20 @@ impl Connections {
                 Err(error) => return Err(error),
             }
             progress("Waking codespace…");
-            let job = self.codespace_reconnect(machine_id)?;
+            let job = self.start_when_free(cancel, JOB_SLOT_WAIT, || {
+                self.codespace_reconnect(machine_id)
+            })?;
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = self.ssh_cancel(&job);
+                    // The job thread stops within moments; let it finish so an
+                    // immediate re-send does not find the slot busy.
+                    for _ in 0..20 {
+                        if self.ssh_poll(&job).map_or(true, |view| view.done) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
                     return Err(WAKE_CANCELLED.into());
                 }
                 let view = self.ssh_poll(&job)?;
@@ -863,6 +874,31 @@ impl Connections {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         })
+    }
+
+    /// SSH setup runs one job at a time. Instead of failing while another
+    /// job (a pairing, a wake of another machine, a just-cancelled wake) holds
+    /// the slot, wait for it, bounded and cancellable.
+    fn start_when_free(
+        &self,
+        cancel: &AtomicBool,
+        limit: std::time::Duration,
+        mut start: impl FnMut() -> Result<String, String>,
+    ) -> Result<String, String> {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            match start() {
+                Err(error) if error == SSH_BUSY => {}
+                other => return other,
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err(WAKE_CANCELLED.into());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SSH_BUSY.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     fn run_coalesced(
@@ -889,12 +925,33 @@ impl Connections {
                 }
             };
             if leader {
-                let result = work.take().expect("leader runs once")(progress);
-                if let Ok(mut wakes) = self.wakes.lock() {
-                    wakes.remove(key);
+                // Fills and clears the slot even if `work` panics.
+                struct Finish<'a> {
+                    wakes: &'a Mutex<HashMap<String, WakeSlot>>,
+                    key: &'a str,
+                    slot: WakeSlot,
+                    result: Option<Result<(), String>>,
                 }
-                *slot.0.lock().unwrap() = Some(result.clone());
-                slot.1.notify_all();
+                impl Drop for Finish<'_> {
+                    fn drop(&mut self) {
+                        if let Ok(mut wakes) = self.wakes.lock() {
+                            wakes.remove(self.key);
+                        }
+                        let result = self.result.take().unwrap_or_else(|| {
+                            Err("Waking the codespace failed unexpectedly".into())
+                        });
+                        *self.slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                        self.slot.1.notify_all();
+                    }
+                }
+                let mut finish = Finish {
+                    wakes: &self.wakes,
+                    key,
+                    slot,
+                    result: None,
+                };
+                let result = work.take().expect("leader runs once")(progress);
+                finish.result = Some(result.clone());
                 return result;
             }
             progress("Waking codespace…");
@@ -1529,5 +1586,85 @@ else:
             follower.join().unwrap().unwrap();
         });
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_panicking_leader_clears_the_wake_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Connections::new(dir.path());
+        let cancel = AtomicBool::new(false);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = connections.run_coalesced("m", &cancel, &mut |_| {}, |_| panic!("boom"));
+        }));
+        assert!(panicked.is_err());
+        assert!(connections.wakes.lock().unwrap().is_empty());
+        connections
+            .run_coalesced("m", &cancel, &mut |_| {}, |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn wakes_wait_for_the_job_slot_instead_of_failing_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        // A pairing job (or a just-cancelled wake) holds the single slot.
+        let busy = Job::new();
+        connections
+            .jobs
+            .lock()
+            .unwrap()
+            .insert("pairing".into(), busy.clone());
+        // Same busy rule as start_ssh_job, without spawning a real gh job.
+        let try_start = |c: &Connections| {
+            if c.jobs.lock().unwrap().values().any(|j| !j.view().done) {
+                Err(SSH_BUSY.to_string())
+            } else {
+                Ok("job".to_string())
+            }
+        };
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let releaser = {
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(350));
+                busy.complete(|| Err("done".into()));
+            })
+        };
+        let id = connections
+            .start_when_free(&cancel, std::time::Duration::from_secs(10), || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                try_start(&connections)
+            })
+            .unwrap();
+        releaser.join().unwrap();
+        assert!(attempts.load(Ordering::SeqCst) > 1);
+        assert_eq!(id, "job");
+        // Cancel while waiting.
+        let hold = Job::new();
+        connections.jobs.lock().unwrap().insert("hold".into(), hold);
+        let cancelled = AtomicBool::new(true);
+        let error = connections
+            .start_when_free(&cancelled, std::time::Duration::from_secs(10), || {
+                try_start(&connections)
+            })
+            .unwrap_err();
+        assert_eq!(error, WAKE_CANCELLED);
+        // The wait is bounded.
+        let error = connections
+            .start_when_free(&cancel, std::time::Duration::from_millis(250), || {
+                try_start(&connections)
+            })
+            .unwrap_err();
+        assert_eq!(error, SSH_BUSY);
+        // Other errors are not retried.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let error = connections
+            .start_when_free(&cancel, std::time::Duration::from_secs(10), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("nope".into())
+            })
+            .unwrap_err();
+        assert_eq!((error.as_str(), calls.load(Ordering::SeqCst)), ("nope", 1));
     }
 }
