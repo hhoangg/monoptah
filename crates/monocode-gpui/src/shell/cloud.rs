@@ -6,7 +6,7 @@
 //! is only ever read from the cache, so it never wakes a codespace.
 use super::*;
 use monocode_core::{
-    cloud_sessions::{CloudSessions, CloudState},
+    cloud_sessions::{CloudSessions, CloudState, DeleteOutcome},
     codespaces::GhRunner,
 };
 use std::ffi::OsString;
@@ -150,9 +150,12 @@ pub(super) fn apply_choice(
             .map_err(|e| format!("Could not stop the codespace: {e}")),
         // The codespace is gone and its bindings were dropped even when only
         // disconnecting the machine failed, so the sessions go either way.
-        ArchiveChoice::Delete => match cloud.delete_codespace(codespace) {
-            Ok(()) => Ok((Then::Forget, None)),
-            Err(e) if e.starts_with("Codespace deleted") => Ok((Then::Forget, Some(e))),
+        ArchiveChoice::Delete => match cloud.delete_codespace_outcome(codespace) {
+            Ok(DeleteOutcome::Deleted) => Ok((Then::Forget, None)),
+            Ok(DeleteOutcome::DeletedWithWarning(e)) => Ok((
+                Then::Forget,
+                Some(format!("Codespace deleted, but disconnecting failed: {e}")),
+            )),
             Err(e) => Err(format!("Could not delete the codespace: {e}")),
         },
     }
@@ -438,13 +441,21 @@ impl Shell {
         } else {
             self.active_codespace()
         };
+        let flipped = crate::git_gate::set(codespace.clone());
         if let Some(panel) = &self.right_panel {
             panel.update(cx, |panel, cx| {
                 panel.set_cloud_banner(codespace.as_deref().map(banner_text), cx);
-                panel.changes.update(cx, |changes, cx| {
-                    changes.set_read_only(codespace.is_some(), cx)
-                });
+                if flipped {
+                    panel
+                        .changes
+                        .update(cx, |changes, cx| changes.gate_changed(cx));
+                }
             });
+        }
+        if flipped {
+            for review in self.reviews.values() {
+                review.update(cx, |_, cx| cx.notify());
+            }
         }
     }
 

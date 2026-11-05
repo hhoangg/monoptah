@@ -695,14 +695,15 @@ fn files_and_git_say_they_are_local_and_refuse_writes_while_a_cloud_session_is_a
             let panel = shell.right_panel.clone().expect("panel");
             shell.sync_cloud_panel(cx);
             assert_eq!(panel.read(cx).cloud_banner(), None);
-            assert!(!panel.read(cx).changes.read(cx).is_read_only());
+            assert!(crate::git_gate::writes_allowed());
             shell.workspace.active = Some(id);
             shell.sync_cloud_panel(cx);
             assert_eq!(
                 panel.read(cx).cloud_banner(),
                 Some("Local files - this session runs in codespace octo-abc")
             );
-            assert!(panel.read(cx).changes.read(cx).is_read_only());
+            assert!(!crate::git_gate::writes_allowed());
+            assert_eq!(crate::git_gate::codespace().as_deref(), Some("octo-abc"));
         })
         .unwrap();
 }

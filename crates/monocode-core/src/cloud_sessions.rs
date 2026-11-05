@@ -468,7 +468,21 @@ impl CloudSessions {
     }
 
     /// Delete the codespace, disconnect its machine and forget all bindings.
+    /// A failed disconnect after a successful delete is an `Err` here; use
+    /// [`Self::delete_codespace_outcome`] to tell the two apart.
     pub fn delete_codespace(&self, name: &str) -> Result<(), String> {
+        match self.delete_codespace_outcome(name)? {
+            DeleteOutcome::Deleted => Ok(()),
+            DeleteOutcome::DeletedWithWarning(e) => {
+                Err(format!("Codespace deleted, but disconnecting failed: {e}"))
+            }
+        }
+    }
+
+    /// Like [`Self::delete_codespace`], with a typed result: `Err` means the
+    /// codespace is still there; a warning means it is gone and its bindings
+    /// were forgotten, but the machine could not be disconnected.
+    pub fn delete_codespace_outcome(&self, name: &str) -> Result<DeleteOutcome, String> {
         codespaces::delete(&*self.gh, name)?;
         self.invalidate(name);
         let mut disconnect_error = None;
@@ -485,10 +499,10 @@ impl CloudSessions {
             Err(e) => disconnect_error = Some(e),
         }
         self.store()?.forget_codespace(name)?;
-        match disconnect_error {
-            Some(e) => Err(format!("Codespace deleted, but disconnecting failed: {e}")),
-            None => Ok(()),
-        }
+        Ok(match disconnect_error {
+            Some(e) => DeleteOutcome::DeletedWithWarning(e),
+            None => DeleteOutcome::Deleted,
+        })
     }
 
     /// Codespace binding of one session (desktop session id), with its cached
@@ -505,6 +519,14 @@ impl CloudSessions {
         let state = self.cloud_state(&codespace);
         Some(SessionTarget { codespace, state })
     }
+}
+
+/// Result of a codespace delete that took effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    /// Deleted and forgotten, but disconnecting the machine failed with this error.
+    DeletedWithWarning(String),
 }
 
 /// A session's codespace and its (cached) state.

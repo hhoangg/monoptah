@@ -29,6 +29,7 @@ mod fixtures;
 mod fonts;
 mod fs_watch;
 mod git_cache;
+mod git_gate;
 mod git_graph;
 mod git_picker;
 mod git_status;
