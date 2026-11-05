@@ -628,7 +628,7 @@ impl Shell {
                         } else {
                             view.update(cx, |v, cx| v.load(cx));
                             // A cloud session whose history cannot load is on a codespace that may be
-                            // stopped: wake it (a draft never does) and ask for a retry.
+                            // stopped: (re)connect it (a draft never does) and ask for a retry.
                             if action == "sessions.send"
                                 && self
                                     .session_metadata(id, cx)
@@ -641,12 +641,12 @@ impl Shell {
                             {
                                 let store = self.store.clone();
                                 cx.spawn(async move |this, cx| {
-                                    let woke = crate::cloud_wake::wake_if_stopped(store, id, view, cx).await;
+                                    let woke = crate::cloud_wake::wake_for_send(store, id, view, cx).await;
                                     let _ = this.update(cx, |this, cx| {
                                         this.finish_app_call(
                                             call,
                                             Err(if woke {
-                                                "The session's codespace was stopped and is being woken. Retry in a minute (with a new request ID)."
+                                                "The session's codespace is being woken or reconnected. Retry in a minute (with a new request ID)."
                                             } else {
                                                 "Session is busy, loading, or has an unsent draft. Its draft was preserved."
                                             }

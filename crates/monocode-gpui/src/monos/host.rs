@@ -756,12 +756,12 @@ impl Monos {
                                 return;
                             }
                             // The send is queued until the history loads, which a stopped codespace
-                            // never allows: wake it (a draft never does), and the queue flushes.
+                            // never allows: (re)connect it (a draft never does), and the queue flushes.
                             if action == "sessions.send" && !view.read(cx).ready_for_external(cx) {
                                 let store = self.store.clone();
                                 let view = view.clone();
                                 cx.spawn(async move |_, cx| {
-                                    crate::cloud_wake::wake_if_stopped(store, session, view, cx)
+                                    crate::cloud_wake::wake_for_send(store, session, view, cx)
                                         .await;
                                 })
                                 .detach();

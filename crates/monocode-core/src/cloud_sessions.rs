@@ -61,6 +61,13 @@ pub fn is_not_connected(error: &str) -> bool {
     error.starts_with("Codespace is not connected")
 }
 
+/// Error text for a start that failed after its codespace was created.
+pub fn created_note(codespace: &str, error: &str) -> String {
+    format!(
+        "{error} (codespace {codespace} was created and kept; retry with target {{\"codespace\":\"{codespace}\"}} or remove it with codespaces.delete)"
+    )
+}
+
 /// Which codespace a cloud session should use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodespaceChoice {
@@ -306,11 +313,28 @@ impl CloudSessions {
     }
 
     /// Get a connected, project-open codespace for `local_cwd`. BLOCKS.
+    ///
+    /// A codespace this call created is never deleted on failure: the error then names it
+    /// (see [`created_note`]) so the caller retries with `CodespaceChoice::Named`.
     pub fn prepare_target(
         &self,
         local_cwd: &str,
         target: Target,
         progress: &mut dyn FnMut(&str),
+    ) -> Result<CloudBinding, String> {
+        let mut created = None;
+        self.prepare_inner(local_cwd, target, progress, &mut created)
+            .map_err(|error| match &created {
+                Some(name) => created_note(name, &error),
+                None => error,
+            })
+    }
+    fn prepare_inner(
+        &self,
+        local_cwd: &str,
+        target: Target,
+        progress: &mut dyn FnMut(&str),
+        created: &mut Option<String>,
     ) -> Result<CloudBinding, String> {
         codespaces::auth_status(&*self.gh)?.require_codespace_scope()?;
         let repo = self.repo_for(local_cwd)?;
@@ -333,6 +357,7 @@ impl CloudSessions {
                     None,
                     progress,
                 )?;
+                *created = Some(name.clone());
                 progress("Waiting for the codespace to become available");
                 codespaces::wait_ready(&*self.gh, &name)?;
                 (name, codespaces::display_name_for(branch))

@@ -475,39 +475,20 @@ fn waking_a_cloud_session_ensures_its_machine_and_ignores_local_sessions() {
 
 #[test]
 fn a_failed_new_start_names_the_codespace_it_created() {
-    // gh creates the codespace, then it never becomes available.
-    struct Flaky(FakeGh, Mutex<usize>);
-    impl GhRunner for Flaky {
-        fn run(&self, args: &[String], stdin: Option<&str>) -> Result<GhOutput, String> {
-            let line = args.join(" ");
-            if line.contains("codespace list") {
-                let mut n = self.1.lock().unwrap();
-                *n += 1;
-                // First listing: nothing. Later ones: the new codespace.
-                return ok(if *n == 1 {
-                    "[]"
-                } else {
-                    r#"[{"name":"octo-new1","state":"Provisioning"}]"#
-                });
-            }
-            if line.contains("codespace view") {
-                return ok(r#"{"state":"Failed"}"#);
-            }
-            self.0.run(args, stdin)
-        }
-    }
-    let gh: Arc<dyn GhRunner> = Arc::new(Flaky(
-        Arc::try_unwrap(FakeGh::new(vec![
-            ("auth status", ok(AUTH_OK)),
-            ("codespace create", ok("octo-new1\n")),
-        ]))
-        .ok()
-        .unwrap(),
-        Mutex::new(0),
-    ));
-    let fx = fixture(&FakeGh::new(vec![]));
-    let api = CloudApi::new(gh, fx.host.clone(), fx.store.clone());
-    let error = api
+    // gh creates the codespace, then it never becomes available. Another codespace appearing
+    // meanwhile (a parallel start) must not be mistaken for it: the name comes from create.
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace create", ok("octo-new1\n")),
+        ("codespace view", ok(r#"{"state":"Failed"}"#)),
+        (
+            "codespace list",
+            ok(r#"[{"name":"octo-other","state":"Available"}]"#),
+        ),
+    ]);
+    let fx = fixture(&gh);
+    let error = fx
+        .api
         .prepare(
             &fx.path(),
             Target {
@@ -526,6 +507,25 @@ fn a_failed_new_start_names_the_codespace_it_created() {
         error.contains(r#"target {"codespace":"octo-new1"}"#),
         "{error}"
     );
+    assert!(!error.contains("octo-other"), "{error}");
+    assert!(
+        !gh.calls().iter().any(|c| c.contains("codespace list")),
+        "no listing is needed"
+    );
+}
+
+#[test]
+fn only_an_unavailable_codespace_is_not_woken_for_a_send() {
+    for (state, wake) in [
+        (CloudState::Available, true),
+        (CloudState::Stopped, true),
+        (CloudState::Starting, true),
+        (CloudState::Stopping, true),
+        (CloudState::Unknown, true),
+        (CloudState::Unavailable, false),
+    ] {
+        assert_eq!(should_wake(state), wake, "{state:?}");
+    }
 }
 
 #[test]

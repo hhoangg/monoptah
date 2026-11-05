@@ -1,17 +1,19 @@
-//! Waking the codespace of a cloud session when a send finds it stopped.
+//! Reconnecting the codespace of a cloud session for a user-initiated send.
 //!
-//! Shared by the Operator and Mono dispatchers. The history of a cloud session cannot load while
-//! its codespace is stopped, so a send would wait forever. The decision uses the cached codespace
-//! state (never a probe that could itself wake it); a wake runs in the background and the view is
-//! reloaded when it is done, which also flushes a send the Mono queued.
+//! Shared by the Operator and Mono dispatchers; the rule itself is
+//! `monocode_core::mono::cloud_api::should_wake` so the GUI can reuse it. The history of a cloud
+//! session cannot load while its codespace has no live connection (background work never wakes
+//! or reconnects), so a send would wait forever. A send therefore calls `ensure_codespace`
+//! (through `CloudApi::wake`) for every codespace state except Unavailable; it is a no-op when
+//! already connected. The wake runs in the background and the view reloads when it is done, which
+//! also flushes a send the Mono queued. Drafts and background polls never come here.
 use crate::{conversation::Conversation, runtime::Database};
 use gpui::{AsyncApp, Entity};
-use monocode_core::{cloud_sessions::CloudState, mono::cloud_api::CloudApi};
+use monocode_core::mono::cloud_api::{CloudApi, should_wake};
 
-/// Starts waking the codespace of cloud session `id` when it is stopping, stopped or starting
-/// (not when it is available, unavailable or of unknown state, and not for a local session).
-/// Returns whether a wake was started; never waits for it.
-pub(crate) async fn wake_if_stopped(
+/// Starts (re)connecting the codespace of cloud session `id` for a send, unless it is
+/// Unavailable or the session is local. Returns whether a wake was started; never waits for it.
+pub(crate) async fn wake_for_send(
     store: Database,
     id: i64,
     view: Entity<Conversation>,
@@ -22,10 +24,7 @@ pub(crate) async fn wake_if_stopped(
         .background_executor()
         .spawn(async move {
             let target = CloudApi::shared(&probe).ok()?.target_of(id)?;
-            Some(matches!(
-                target.state,
-                CloudState::Stopped | CloudState::Stopping | CloudState::Starting
-            ))
+            Some(should_wake(target.state))
         })
         .await
         .unwrap_or(false);

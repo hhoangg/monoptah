@@ -74,11 +74,18 @@ pub fn is_cloud_session_of(store: &Store, id: i64, project: &str) -> bool {
     })
 }
 
-/// Error text for a start that failed after its codespace was created.
-pub fn created_note(codespace: &str, error: &str) -> String {
-    format!(
-        "{error} (codespace {codespace} was created and kept; retry with target {{\"codespace\":\"{codespace}\"}} or remove it with codespaces.delete)"
-    )
+pub use crate::cloud_sessions::created_note;
+
+/// Whether a user-initiated send to a cloud session should (re)connect its codespace.
+///
+/// A codespace can be Available yet have no live tunnel (after an app restart or a dropped
+/// tunnel), and background loads never reconnect, so the session's history stays unloaded
+/// and the send would wait forever. The send therefore calls [`CloudApi::wake`] for every
+/// state except Unavailable (failed or deleted: nothing to wake); waking a connected
+/// codespace is a no-op. Drafts, listings and other background work never call it. The GUI
+/// can use the same rule for its own sends.
+pub fn should_wake(state: CloudState) -> bool {
+    state != CloudState::Unavailable
 }
 
 fn current_branch(project: &str) -> Result<String, String> {
@@ -238,49 +245,22 @@ impl CloudApi {
     /// Prepares the codespace for `sessions.start`: creating one needs a branch (default: the
     /// project's current branch). BLOCKS for minutes when creating or booting.
     ///
-    /// A codespace created here is never deleted on failure (it may hold the user's work and
-    /// billing stops by itself when it idles). When preparing fails after it was created, the
-    /// error names it so the caller retries with `target {codespace:"<name>"}` instead of
-    /// creating a second one.
+    /// A codespace created here is never deleted on failure; the error names it (the name comes
+    /// from `codespaces::create`, not from a listing) so the caller retries with
+    /// `target {codespace:"<name>"}` instead of creating a second one.
     pub fn prepare(
         &self,
         project: &str,
         mut target: Target,
         progress: &mut dyn FnMut(&str),
     ) -> Result<CloudBinding, String> {
-        let creating = target.codespace == CodespaceChoice::New;
-        if creating && target.branch.is_none() {
+        if target.codespace == CodespaceChoice::New && target.branch.is_none() {
             target.branch = Some(current_branch(project)?);
         }
-        let before = creating.then(|| self.codespace_names(project)).flatten();
-        match self.cloud.prepare_target(project, target, progress) {
-            Ok(binding) => {
-                // The state cache may still say Shutdown/Starting for a reused codespace.
-                self.cloud.invalidate(&binding.codespace);
-                Ok(binding)
-            }
-            Err(error) => {
-                let created = before.and_then(|before| {
-                    self.codespace_names(project)?
-                        .into_iter()
-                        .find(|name| !before.contains(name))
-                });
-                Err(match created {
-                    Some(name) => created_note(&name, &error),
-                    None => error,
-                })
-            }
-        }
-    }
-    fn codespace_names(&self, project: &str) -> Option<Vec<String>> {
-        let repo = self.cloud.repo_for(project).ok()?;
-        Some(
-            codespaces::list(&*self.gh, &repo)
-                .ok()?
-                .into_iter()
-                .map(|c| c.name)
-                .collect(),
-        )
+        let binding = self.cloud.prepare_target(project, target, progress)?;
+        // The state cache may still say Shutdown/Starting for a reused codespace.
+        self.cloud.invalidate(&binding.codespace);
+        Ok(binding)
     }
     /// A blank session on the binding (Claude only).
     pub fn create_session(

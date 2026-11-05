@@ -1014,25 +1014,40 @@ mod cloud {
         );
     }
 
+    /// gh says Available but the host has no live tunnel (the history never loads): a send
+    /// still reconnects it. Only an Unavailable codespace is left alone.
     #[gpui::test]
-    fn a_send_to_a_cloud_session_that_is_still_loading_does_not_wake_an_available_codespace(
+    fn a_send_reconnects_an_available_codespace_and_skips_an_unavailable_one(
         cx: &mut TestAppContext,
     ) {
-        let (window, caller, path, host, _, _dir) = setup_cloud_in(cx, AUTH_OK, "Available");
-        let cloud = add_cloud_session(window, &path, cx);
-        host.0.lock().unwrap().clear();
-        let error = call(
-            window,
-            caller,
-            "a1",
-            "sessions.send",
-            json!({"sessionId":cloud,"prompt":"hello"}),
-            cx,
-        )
-        .unwrap_err();
-        assert!(error.contains("busy, loading"), "{error}");
-        assert!(!error.contains("woken"), "{error}");
-        assert!(host.0.lock().unwrap().is_empty());
+        for (state, woken) in [("Available", true), ("Failed", false)] {
+            let (window, caller, path, host, _, _dir) = setup_cloud_in(cx, AUTH_OK, state);
+            let cloud = add_cloud_session(window, &path, cx);
+            host.0.lock().unwrap().clear();
+            let error = call(
+                window,
+                caller,
+                "a1",
+                "sessions.send",
+                json!({"sessionId":cloud,"prompt":"hello"}),
+                cx,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.contains("woken or reconnected"),
+                woken,
+                "{state}: {error}"
+            );
+            assert_eq!(
+                host.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l == "ensure m-octo-run"),
+                woken,
+                "{state}"
+            );
+        }
     }
 
     #[gpui::test]

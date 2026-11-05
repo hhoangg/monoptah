@@ -178,24 +178,34 @@ fn a_send_to_a_cloud_session_wakes_a_stopped_codespace_and_can_notify(cx: &mut T
     );
 }
 
+/// gh says Available but the host has no live tunnel: the send is queued and still reconnects.
+/// An Unavailable codespace is left alone.
 #[gpui::test]
-fn a_send_to_a_cloud_session_on_an_available_codespace_does_not_wake_it(cx: &mut TestAppContext) {
-    let _clis = crate::shell::surface_tests::NoClis::new();
-    let (s, _, host, _guard) = cloud_setup(cx, "Available");
-    let id = cloud_session(&s, cx);
-    host.0.lock().unwrap().clear();
-    let _ = run(
-        &s,
-        "m1",
-        "sessions.send",
-        json!({"sessionId":id,"prompt":"go"}),
-        cx,
-    );
-    assert!(
-        host.0.lock().unwrap().is_empty(),
-        "{:?}",
-        host.0.lock().unwrap()
-    );
+fn a_send_reconnects_an_available_codespace_and_skips_an_unavailable_one(cx: &mut TestAppContext) {
+    for (state, woken) in [("Available", true), ("Failed", false)] {
+        let _clis = crate::shell::surface_tests::NoClis::new();
+        let (s, _, host, _guard) = cloud_setup(cx, state);
+        let id = cloud_session(&s, cx);
+        host.0.lock().unwrap().clear();
+        run(
+            &s,
+            "m1",
+            "sessions.send",
+            json!({"sessionId":id,"prompt":"go"}),
+            cx,
+        )
+        .unwrap();
+        assert_eq!(
+            host.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "ensure m-octo-run"),
+            woken,
+            "{state}: {:?}",
+            host.0.lock().unwrap()
+        );
+    }
 }
 
 #[gpui::test]
