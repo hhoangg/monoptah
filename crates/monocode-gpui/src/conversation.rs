@@ -2525,7 +2525,7 @@ impl Conversation {
                         cx,
                     )
                     .hide_providers(hidden)
-                    .allow_provider_switch(true)
+                    .allow_provider_switch(!self.is_cloud_session())
                 });
                 events.push(cx.subscribe_in(
                     &list,

@@ -8,6 +8,10 @@ mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
+mod cloud;
+mod cloud_picker;
+#[cfg(test)]
+mod cloud_tests;
 mod contributors;
 #[cfg(test)]
 mod contributors_tests;
@@ -665,6 +669,21 @@ pub(crate) struct Shell {
     remote_refreshing: bool,
     remote_marks: HashMap<i64, (bool, bool)>,
     _remote_clock: gpui::Task<()>,
+    /// `gh` runner shared by the cloud session service and the codespace picker.
+    gh: Arc<dyn monocode_core::codespaces::GhRunner>,
+    cloud: Arc<monocode_core::cloud_sessions::CloudSessions>,
+    /// Sessions that live in a codespace, by id, and the cached state of each codespace.
+    cloud_marks: HashMap<i64, cloud::CloudMark>,
+    cloud_states: HashMap<String, monocode_core::cloud_sessions::CloudState>,
+    cloud_refreshing: bool,
+    cloud_archive: Option<cloud::ArchiveDialog>,
+    cloud_busy: HashSet<i64>,
+    /// Local projects whose `origin` was checked for a GitHub repository.
+    github_projects: HashMap<String, bool>,
+    /// A cloud session whose archive waits for its dialog (opened on the next render).
+    cloud_archive_request: Option<i64>,
+    codespace_picker: Option<cloud_picker::Open>,
+    _cloud_clock: gpui::Task<()>,
     sessions: HashMap<i64, Entity<Conversation>>,
     /// Sessions that run as their provider's CLI. A session is in exactly one of
     /// this map and `sessions`; a terminal session never gets a `Conversation`.
@@ -922,6 +941,9 @@ impl Shell {
                 }
             }
         });
+        let gh = cloud::default_gh();
+        let cloud = cloud::service(gh.clone(), remote.clone(), store.clone());
+        let cloud_clock = cloud::refresh_loop(cx);
         let metadata: Vec<_> = summaries.iter().map(|s| (s.id, s.cwd.clone())).collect();
         let workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
         monocode_core::cli::initialize(&workspace.preferences.binary_paths);
@@ -1064,6 +1086,17 @@ impl Shell {
             remote_refreshing: false,
             remote_marks: HashMap::new(),
             _remote_clock: remote_clock,
+            cloud,
+            gh,
+            cloud_marks: HashMap::new(),
+            cloud_states: HashMap::new(),
+            cloud_refreshing: false,
+            cloud_archive: None,
+            cloud_busy: HashSet::new(),
+            github_projects: HashMap::new(),
+            cloud_archive_request: None,
+            codespace_picker: None,
+            _cloud_clock: cloud_clock,
             sessions: HashMap::new(),
             tui_sessions: HashMap::new(),
             tui_events: HashMap::new(),
@@ -1589,6 +1622,18 @@ impl Shell {
         }
     }
     fn toggle_archive(&mut self, id: i64, cx: &mut Context<Self>) {
+        if self.archiving.contains(&id) {
+            return;
+        }
+        // A cloud session asks what to do with its codespace before it archives.
+        if self.is_cloud(id) && !self.session_metadata(id, cx).summary.archived {
+            self.cloud_archive_request = Some(id);
+            cx.notify();
+            return;
+        }
+        self.toggle_archive_now(id, cx);
+    }
+    fn toggle_archive_now(&mut self, id: i64, cx: &mut Context<Self>) {
         if self.archiving.contains(&id) {
             return;
         }
@@ -2200,7 +2245,12 @@ impl Shell {
                 && self
                     .sessions
                     .get(&self.workspace.session_for_pane(*pane))
-                    .is_some_and(|s| s.read(cx).summary.cwd == self.workspace.project)
+                    .is_some_and(|s| {
+                        self.project_of(
+                            self.workspace.session_for_pane(*pane),
+                            &s.read(cx).summary.cwd,
+                        ) == self.workspace.project
+                    })
                 && self.in_worktree_scope(*pane, cx)
                 && self
                     .workspace
@@ -3137,6 +3187,14 @@ impl Shell {
     /// Terminal: New (cmd-`): another terminal in the project's dock, which
     /// opens if it was hidden.
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A cloud session's terminal is a shell on its codespace, not on this machine.
+        if !self.mono_active(cx)
+            && !self.app_view_open()
+            && let Some(codespace) = self.active_codespace()
+        {
+            self.new_codespace_terminal(codespace, window, cx);
+            return;
+        }
         let cwd = self.terminal_cwd(cx);
         self.new_terminal_at(cwd, window, cx);
     }
@@ -3541,7 +3599,7 @@ impl Shell {
         self.history.record(id);
         self.workspace.open(id);
         if let Some(view) = self.sessions.get(&id) {
-            self.workspace.project = view.read(cx).summary.cwd.clone();
+            self.workspace.project = self.project_of(id, &view.read(cx).summary.cwd).to_owned();
             self.workspace
                 .project_focus
                 .insert(self.workspace.project.clone(), id);
@@ -4282,7 +4340,7 @@ impl Shell {
         };
         self.history.record(id);
         self.workspace.open(id);
-        self.workspace.project = cwd;
+        self.workspace.project = self.project_of(id, &cwd).to_owned();
         self.drop_stale_provider_prompt(window, cx);
         self.workspace
             .project_focus
@@ -4497,7 +4555,7 @@ impl Shell {
         }
         if let Some(id) = self.order.iter().copied().find(|id| {
             let s = self.session_metadata(*id, cx);
-            s.summary.cwd == self.workspace.project
+            self.project_of(*id, &s.summary.cwd) == self.workspace.project
                 && monocode_core::files::path_key(self.session_working_copy(*id, cx))
                     == monocode_core::files::path_key(self.working_copy())
                 && !s.summary.archived
@@ -5699,37 +5757,51 @@ impl Shell {
                     .flyout(self.worktree_flyout(events, window, cx));
                 (
                     format!("{} menu", self.project_label(&self.workspace.project)).into(),
-                    vec![
-                        match branch {
-                            Some(branch) => worktree.value(branch),
-                            None => worktree,
+                    {
+                        let mut items = vec![
+                            match branch {
+                                Some(branch) => worktree.value(branch),
+                                None => worktree,
+                            }
+                            .into(),
+                            MenuItem::Separator,
+                            MenuAction::new("switch-project", "Switch project")
+                                .icon("folder")
+                                .flyout(Flyout {
+                                    view: picker.into(),
+                                    width: 286.,
+                                    padding: 0.,
+                                    height: None,
+                                    max_height: Some(380.),
+                                    focus: Some(focus),
+                                    surface: None,
+                                })
+                                .into(),
+                            MenuAction::new("project-settings", "Project settings")
+                                .icon("sliders")
+                                .flyout(self.project_settings_flyout(events, window, cx))
+                                .into(),
+                            MenuAction::new("open-remote-project", "Open folder on a machine…")
+                                .icon("globe")
+                                .into(),
+                            MenuAction::new("settings", "Settings")
+                                .icon("settings")
+                                .shortcut(format!("{MOD},"))
+                                .into(),
+                        ];
+                        if self.offers_codespace() {
+                            items.insert(
+                                items.len() - 1,
+                                MenuAction::new(
+                                    "new-codespace-session",
+                                    "New session in Codespace…",
+                                )
+                                .icon("cloud-upload")
+                                .into(),
+                            );
                         }
-                        .into(),
-                        MenuItem::Separator,
-                        MenuAction::new("switch-project", "Switch project")
-                            .icon("folder")
-                            .flyout(Flyout {
-                                view: picker.into(),
-                                width: 286.,
-                                padding: 0.,
-                                height: None,
-                                max_height: Some(380.),
-                                focus: Some(focus),
-                                surface: None,
-                            })
-                            .into(),
-                        MenuAction::new("project-settings", "Project settings")
-                            .icon("sliders")
-                            .flyout(self.project_settings_flyout(events, window, cx))
-                            .into(),
-                        MenuAction::new("open-remote-project", "Open folder on a machine…")
-                            .icon("globe")
-                            .into(),
-                        MenuAction::new("settings", "Settings")
-                            .icon("settings")
-                            .shortcut(format!("{MOD},"))
-                            .into(),
-                    ],
+                        items
+                    },
                     240.,
                     MenuStyle::Switcher,
                 )
@@ -5919,6 +5991,8 @@ impl Shell {
                     self.open_settings(crate::settings::Section::General, window, cx);
                 } else if action == "open-remote-project" {
                     self.open_remote_project(window, cx);
+                } else if action == "new-codespace-session" {
+                    self.open_codespace_picker(window, cx);
                 } else if action == "project-settings" {
                     let at = row
                         .map_or_else(Point::default, |r| Point::new(r.right(), r.top() - px(8.)));
@@ -6187,7 +6261,9 @@ impl Shell {
             mark.update(cx, |mark, cx| mark.set_size(side, cx));
         }
         let work_item = self.work_item_badge(id, compact, cx);
+        let cloud_badge = self.cloud_badge(id, compact);
         let has_badges = work_item.is_some()
+            || cloud_badge.is_some()
             || mode.is_some()
             || self.automation_state.session_automations.contains_key(&id);
         let session = self.session_metadata(id, cx);
@@ -6348,6 +6424,7 @@ impl Shell {
             .items_center()
             .gap_1()
             .flex_shrink_0()
+            .children(cloud_badge)
             .children(work_item)
             .when(
                 self.automation_state.session_automations.contains_key(&id),
@@ -6680,7 +6757,7 @@ impl Shell {
                 .monos
                 .as_ref()
                 .is_some_and(|m| m.read(cx).hidden_session(id))
-                && s.summary.cwd == self.workspace.project
+                && self.project_of(id, &s.summary.cwd) == self.workspace.project
                 && s.summary.has_messages
                 && !self.orchestration_worker(id)
                 && self.in_sidebar_worktree_scope(id, cx)
@@ -8382,6 +8459,12 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.keep_visible_idle_agents(cx);
         self.sync_ui_scale(window, cx);
+        if let Some(id) = self.cloud_archive_request.take() {
+            let this = cx.entity();
+            window.defer(cx, move |window, cx| {
+                this.update(cx, |this, cx| this.open_cloud_archive(id, window, cx));
+            });
+        }
         if self.mono_panes_unsettled(cx) {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
@@ -8866,6 +8949,14 @@ impl Render for Shell {
                     this.close_remote_project(window, cx);
                     return;
                 }
+                if this.cloud_archive.is_some() {
+                    this.close_cloud_archive(window, cx);
+                    return;
+                }
+                if this.codespace_picker.is_some() {
+                    this.close_codespace_picker(window, cx);
+                    return;
+                }
                 // A dialog left from another project must not swallow the key.
                 this.drop_stale_provider_prompt(window, cx);
                 if this.provider_prompt.is_some() {
@@ -9111,6 +9202,8 @@ impl Render for Shell {
             .children(self.telegram_modal(window, cx))
             .children(self.telegram_topic_modal(window, cx))
             .children(self.delete_modal(window, cx))
+            .children(self.cloud_archive_modal(window, cx))
+            .children(self.codespace_picker_modal(window, cx))
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))
             .children(self.quick_open_modal(window, cx))
