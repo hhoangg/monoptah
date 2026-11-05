@@ -155,6 +155,9 @@ pub struct Machine {
     pub endpoint: String,
     pub environment_id: String,
     pub ssh: Option<SshTarget>,
+    /// Codespace name when this machine is reached through `gh codespace ssh`.
+    #[serde(default)]
+    pub codespace: Option<String>,
 }
 
 impl StoredMachine {
@@ -165,6 +168,7 @@ impl StoredMachine {
             endpoint: self.endpoint.clone(),
             environment_id: self.environment_id.clone(),
             ssh: self.ssh.clone(),
+            codespace: self.ssh.as_ref().and_then(|ssh| ssh.codespace.clone()),
         }
     }
 }
@@ -511,17 +515,25 @@ impl Connections {
             let prepared = (|| -> Result<(StoredMachine, Tunnel), String> {
                 let askpass = job.askpass()?;
                 let mut target = target;
+                let codespace = target.codespace.is_some();
                 let mut machine = if let Some(mut existing) = existing {
-                    if upgrade {
+                    if upgrade || codespace {
+                        // A codespace may have stopped, which also stopped its
+                        // host. gh starts it on connect, and the bootstrap's
+                        // service install brings the host back with its saved
+                        // state, so a codespace reconnect always re-runs it.
                         let platform = ssh::detect_platform(&target, &job, &askpass)?;
-                        job.message("Updating Monoptah Host on the machine…");
-                        let output = ssh::run_script(
-                            &target,
-                            platform,
-                            ssh::upgrade_script(platform, target.remote_port),
-                            &job,
-                            &askpass,
-                        )?;
+                        job.message(if upgrade {
+                            "Updating Monoptah Host on the machine…"
+                        } else {
+                            "Starting Monoptah Host on the codespace…"
+                        });
+                        let script = if upgrade {
+                            ssh::upgrade_script(platform, target.remote_port)
+                        } else {
+                            ssh::bootstrap_script(platform)
+                        };
+                        let output = ssh::run_script(&target, platform, script, &job, &askpass)?;
                         let info: Value = serde_json::from_str(output.lines().last().unwrap_or(""))
                             .map_err(|_| "Host update returned an invalid response")?;
                         target.remote_port = info
@@ -582,7 +594,10 @@ impl Connections {
                     StoredMachine {
                         id: uuid::Uuid::new_v4().to_string(),
                         name,
-                        endpoint: format!("ssh://{}", target.target),
+                        endpoint: match &target.codespace {
+                            Some(name) => format!("codespace://{name}"),
+                            None => format!("ssh://{}", target.target),
+                        },
                         environment_id,
                         token,
                         ssh: Some(target.clone()),
@@ -670,11 +685,51 @@ impl Connections {
                 target,
                 port,
                 remote_port: 3774,
+                codespace: None,
             },
             name.trim().chars().take(100).collect(),
             None,
             false,
         )
+    }
+
+    /// Pair with the monocode-host inside a GitHub Codespace over
+    /// `gh codespace ssh`. Poll the returned job with `ssh_poll`.
+    pub fn codespace_begin(
+        self: &Arc<Self>,
+        name: &str,
+        display_name: Option<&str>,
+    ) -> Result<String, String> {
+        let name = ssh::validate_codespace(name)?;
+        let display = display_name
+            .map(|d| d.trim().chars().take(100).collect::<String>())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| name.clone());
+        self.start_ssh_job(
+            SshTarget {
+                target: name.clone(),
+                port: None,
+                remote_port: 3774,
+                codespace: Some(name),
+            },
+            display,
+            None,
+            false,
+        )
+    }
+
+    /// Bring a codespace machine back: gh starts a stopped codespace, the
+    /// bootstrap restarts a dead host, then a new tunnel is opened.
+    pub fn codespace_reconnect(self: &Arc<Self>, machine_id: &str) -> Result<String, String> {
+        let machine = self
+            .list()?
+            .into_iter()
+            .find(|m| m.id == machine_id)
+            .ok_or("Machine is no longer connected")?;
+        if machine.codespace.is_none() {
+            return Err("This connection is not a codespace".into());
+        }
+        self.ssh_reconnect(machine_id, false)
     }
 
     pub fn ssh_reconnect(
@@ -843,6 +898,193 @@ mod tests {
             .contains(&json!("devin")));
     }
 
+    #[test]
+    fn stored_machines_without_a_codespace_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("remote-machines.json"),
+            r#"[{"id":"a","name":"box","endpoint":"ssh://me@box","environmentId":"env","token":"t","ssh":{"target":"me@box","port":null,"remotePort":3774}}]"#,
+        )
+        .unwrap();
+        let machine = Connections::new(dir.path()).list().unwrap().remove(0);
+        assert_eq!(machine.codespace, None);
+        let old: Machine = serde_json::from_str(
+            r#"{"id":"a","name":"box","endpoint":"e","environmentId":"env","ssh":null}"#,
+        )
+        .unwrap();
+        assert_eq!(old.codespace, None);
+    }
+
+    #[test]
+    fn codespace_begin_rejects_bad_names_and_reconnect_rejects_plain_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("remote-machines.json"),
+            r#"[{"id":"a","name":"box","endpoint":"ssh://me@box","environmentId":"env","token":"t"}]"#,
+        )
+        .unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        assert!(connections
+            .codespace_begin("-oProxyCommand=x", None)
+            .is_err());
+        assert!(connections.codespace_begin("a b", None).is_err());
+        assert_eq!(
+            connections.codespace_reconnect("a").unwrap_err(),
+            "This connection is not a codespace"
+        );
+        assert!(connections.codespace_reconnect("missing").is_err());
+    }
+
+    /// Drives the whole codespace lifecycle against a fake `gh`: bootstrap,
+    /// pairing and tunnel on begin, then a reconnect that must re-run the
+    /// bootstrap before tunnelling, and a lazily restarted tunnel on request.
+    #[cfg(unix)]
+    #[test]
+    fn codespace_begin_reconnect_and_tunnel_restart_use_gh() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(python) = [
+            "/usr/bin/python3",
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).exists()) else {
+            return;
+        };
+        let describe =
+            json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host" }});
+        let (url, _requests, server) = host_fixture(vec![
+            describe.clone(),
+            describe,
+            json!({ "result": { "projects": [] } }),
+        ]);
+        let fixture_port = url.rsplit(':').next().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("gh.log");
+        let token = "b".repeat(43);
+        let gh = dir.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!{python}
+import os, socket, sys, threading
+args = sys.argv[1:]
+with open({log:?}, "a") as f:
+    f.write(" ".join(args) + "\n")
+if "-N" in args:
+    port = int(args[args.index("-L") + 1].split(":")[1])
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port)); srv.listen(8)
+    def pump(a, b):
+        try:
+            while True:
+                d = a.recv(65536)
+                if not d: break
+                b.sendall(d)
+        except OSError: pass
+        try: b.shutdown(socket.SHUT_WR)
+        except OSError: pass
+    def serve(c):
+        # Readiness probes connect and hang up without data: never wake the host.
+        first = c.recv(65536)
+        if not first:
+            c.close(); return
+        u = socket.create_connection(("127.0.0.1", {fixture_port}))
+        u.sendall(first)
+        threading.Thread(target=pump, args=(u, c), daemon=True).start()
+        pump(c, u)
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=serve, args=(c,), daemon=True).start()
+else:
+    script = sys.stdin.read()
+    if "pair --name" in script:
+        print('{{"token":"{token}","environmentId":"env-cs"}}')
+    else:
+        print('noise')
+        print('{{"port":3774}}')
+"#,
+                log = log.display().to_string(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *ssh::GH_OVERRIDE.lock().unwrap() = Some(gh);
+
+        let connections = Arc::new(Connections::new(dir.path()));
+        let wait = |job: String| {
+            for _ in 0..600 {
+                let view = connections.ssh_poll(&job).unwrap();
+                if view.done {
+                    return view;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!(
+                "job did not finish: {:?}",
+                connections.ssh_poll(&job).unwrap()
+            );
+        };
+        let done = wait(
+            connections
+                .codespace_begin("octo-abc123", Some("Cloud"))
+                .unwrap(),
+        );
+        assert_eq!(done.error, None);
+        let machine = done.machine.unwrap();
+        assert_eq!(machine.name, "Cloud");
+        assert_eq!(machine.endpoint, "codespace://octo-abc123");
+        assert_eq!(machine.codespace.as_deref(), Some("octo-abc123"));
+        assert_eq!(machine.ssh.as_ref().unwrap().remote_port, 3774);
+
+        let lines = || -> Vec<String> {
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(String::from)
+                .collect()
+        };
+        let before = lines();
+        assert_eq!(before.len(), 3, "{before:?}");
+        for line in &before[..2] {
+            assert!(
+                line.starts_with("codespace ssh -c octo-abc123 -- -T "),
+                "{line}"
+            );
+            assert!(line.ends_with("sh -l -s"), "{line}");
+        }
+        assert!(before[2].contains("-N -L 127.0.0.1:"), "{}", before[2]);
+        assert!(before[2].ends_with(":127.0.0.1:3774"), "{}", before[2]);
+
+        // Reconnect: bootstrap again (no pairing), then a fresh tunnel.
+        let done = wait(connections.codespace_reconnect(&machine.id).unwrap());
+        assert_eq!(done.error, None);
+        assert_eq!(done.machine.unwrap().id, machine.id);
+        let after = lines();
+        assert_eq!(after.len(), before.len() + 2, "{after:?}");
+        assert!(after[3].ends_with("sh -l -s"), "{}", after[3]);
+        assert!(after[4].contains("-N -L 127.0.0.1:"), "{}", after[4]);
+
+        // A dead tunnel is restarted through gh on the next request.
+        connections.tunnels.clear();
+        assert_eq!(
+            connections
+                .request(&machine.id, "projects.list", json!({}))
+                .unwrap(),
+            json!({ "projects": [] })
+        );
+        let last = lines();
+        assert_eq!(last.len(), after.len() + 1);
+        assert!(
+            last[5].starts_with("codespace ssh -c octo-abc123 -- "),
+            "{}",
+            last[5]
+        );
+        assert!(last[5].contains("-N -L 127.0.0.1:"));
+        *ssh::GH_OVERRIDE.lock().unwrap() = None;
+        connections.tunnels.clear();
+        server.join().unwrap();
+    }
     #[test]
     fn incompatible_pairing_does_not_create_a_machine() {
         let (url, _, server) = host_fixture(vec![
