@@ -126,8 +126,10 @@ impl Shell {
         {
             dock.open = false;
             self.slide_dock(false, cx);
-            if self.terminal_in_panel(cx) && self.panel_terminal_shown(cx) {
-                self.set_right_panel_open(false, window, cx);
+            // The panel's Terminal tab is never left empty: a fresh shell
+            // takes the place of the one pulled out, and the panel stays.
+            if self.terminal_in_panel(cx) {
+                self.ensure_panel_terminal(cx);
             }
         }
         let cwd = terminal.read(cx).cwd.clone();
@@ -164,6 +166,34 @@ impl Shell {
         self.terminal_pane_views.insert(pane, terminal);
         self.workspace.open(pane);
         self.pane_motion = None;
+        self.fit_sidebar(cx);
+        self.open_terminal_pane(pane, window, cx);
+    }
+
+    /// Title bar placement, cmd-shift-j: a fresh shell as a pane beside the
+    /// focused one. With no focused pane it opens as its own title tab.
+    pub(super) fn split_title_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.app_view_open() {
+            return;
+        }
+        let target = self
+            .workspace
+            .active
+            .filter(|id| self.workspace.tab_of(*id).is_some());
+        let (Some(owner), Some(_)) = (self.terminal_owner(), target) else {
+            self.new_title_terminal(window, cx);
+            return;
+        };
+        let cwd = self.terminal_cwd(cx);
+        let terminal = self.spawn_terminal(cwd.clone(), cx);
+        let pane = self.workspace.next_pane_id();
+        self.workspace
+            .terminal_panes
+            .insert(pane, TerminalPane { owner, cwd });
+        self.terminal_pane_views.insert(pane, terminal);
+        let before = self.active_leaves();
+        self.workspace.split(pane, SplitDir::Right);
+        self.begin_pane_motion(before, cx);
         self.fit_sidebar(cx);
         self.open_terminal_pane(pane, window, cx);
     }
@@ -378,6 +408,76 @@ mod tests {
                     shell.tab_copy(pane, cx).headline,
                     shell.terminal_pane_title(pane, cx).unwrap()
                 );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn pulling_the_panels_last_terminal_out_leaves_a_fresh_one_behind(cx: &mut TestAppContext) {
+        use crate::right_panel::RightTab;
+        let (window, _, b) = window(cx);
+        for edge in [None, Some(Edge::Right)] {
+            window
+                .update(cx, |shell, w, cx| {
+                    cx.set_reduce_motion(true);
+                    shell.workspace.classic_layout = false;
+                    shell.workspace.new_layout_boxy = true;
+                    shell.layout_changed(cx);
+                    shell.workspace.preferences.set_terminal_placement("panel");
+                    shell.open(b, w, cx);
+                    shell.show_panel_terminal(w, cx);
+                    let project = shell.workspace.project.clone();
+                    assert_eq!(shell.terminals[&project].len(), 1);
+                    let pulled = shell.terminals[&project][0].clone();
+                    // Onto the title strip, then onto the chat's right edge.
+                    let (over, insert) = match edge {
+                        None => (None, Some(shell.visible_tabs(cx).len())),
+                        Some(edge) => (Some((b, edge)), None),
+                    };
+                    shell.drop_dock_terminal(0, over, insert, w, cx);
+                    assert!(shell.terminal_pane_views.values().any(|t| *t == pulled));
+                    // The panel stays open on a new shell.
+                    assert!(shell.workspace.right_panel_open);
+                    let panel = shell.right_panel.clone().unwrap();
+                    assert_eq!(panel.read(cx).tab(), RightTab::Terminal);
+                    assert_eq!(shell.terminals[&project].len(), 1);
+                    assert_ne!(shell.terminals[&project][0], pulled);
+                    assert_eq!(shell.workspace.docks[&project].terminals.len(), 1);
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn cmd_shift_j_splits_a_title_bar_terminal_beside_the_chat(cx: &mut TestAppContext) {
+        let (window, _, b) = window(cx);
+        cx.update(|cx| {
+            bind_keys(cx);
+            crate::terminal::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        window
+            .update(cx, |shell, w, cx| {
+                shell.workspace.preferences.set_terminal_placement("title");
+                shell.open(b, w, cx);
+                shell.focus_active(w, cx);
+            })
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.simulate_keystrokes("cmd-shift-j");
+        visual.run_until_parked();
+        window
+            .update(&mut visual, |shell, _, _| {
+                let project = shell.workspace.project.clone();
+                assert!(shell.terminals.get(&project).is_none_or(|t| t.is_empty()));
+                let panes: Vec<i64> = shell.workspace.terminal_panes.keys().copied().collect();
+                assert_eq!(panes.len(), 1);
+                let pane = panes[0];
+                // Shares the chat's title tab rather than opening its own.
+                assert_eq!(shell.workspace.tab_of(pane), shell.workspace.tab_of(b));
+                assert_eq!(shell.workspace.active, Some(pane));
+                assert_eq!(shell.workspace.terminal_panes[&pane].owner, b);
             })
             .unwrap();
     }

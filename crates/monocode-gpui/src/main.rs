@@ -5,6 +5,8 @@
 
 mod accounts;
 mod activity;
+#[cfg(not(target_os = "macos"))]
+mod app_log;
 mod app_menu;
 mod arcade;
 mod assets;
@@ -435,6 +437,9 @@ fn main() {
     // GPUI reports frame stalls through `log`; keep warnings where a Finder launch can't lose them.
     #[cfg(target_os = "macos")]
     native_log::install(&database.with_file_name("gpui-hangs"));
+    // Elsewhere there is no watchdog log; keep upstream's file logger.
+    #[cfg(not(target_os = "macos"))]
+    app_log::init();
     let platform = gpui_platform::current_platform(false);
     let title_raster = particle_text::GlyphRaster(platform.text_system());
     gpui::Application::with_platform(platform)
