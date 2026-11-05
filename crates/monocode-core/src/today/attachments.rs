@@ -158,7 +158,10 @@ pub fn agent_files(
             Some(roots) => {
                 let root = roots
                     .iter()
-                    .find(|root| canonical.starts_with(root))
+                    .filter(|root| canonical.starts_with(root))
+                    // The deepest root wins, so a worktree nested under the
+                    // project is judged against the worktree.
+                    .max_by_key(|root| root.components().count())
                     .ok_or_else(|| format!("{raw} is outside the session's project folders."))?;
                 canonical.strip_prefix(root).unwrap_or(&canonical)
             }
@@ -423,6 +426,23 @@ mod tests {
             1
         );
         assert!(agent_files(&[], None, data.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_files_judges_a_nested_worktree_against_its_own_root() {
+        let (project, data) = (dir(), dir());
+        let tree = project.path().join(".claude/worktrees/x");
+        let file = write(&tree.join("src/a.md"));
+        // The project is listed first: the deeper worktree root must still win.
+        let roots = [project.path().to_path_buf(), tree.clone()];
+        let got = agent_files(std::slice::from_ref(&file), Some(&roots), data.path()).unwrap();
+        assert_eq!(got, vec![Path::new(&file).canonicalize().unwrap()]);
+        // Judged against the worktree, a hidden folder below it is still refused.
+        let hidden = write(&tree.join(".secret/b.md"));
+        assert!(agent_files(&[hidden], Some(&roots), data.path()).is_err());
+        // Without the worktree root the same file sits in a hidden folder.
+        let only = [project.path().to_path_buf()];
+        assert!(agent_files(&[file], Some(&only), data.path()).is_err());
     }
 
     #[test]

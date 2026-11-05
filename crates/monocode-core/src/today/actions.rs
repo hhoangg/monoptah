@@ -10,8 +10,30 @@ use super::{
 use crate::{files::path_key, notes, store::Store};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// How an action reaches the store. A plain [`Store`] is used as is; a
+/// `Mutex<Store>` is locked only for the steps that need it, so a note with
+/// files can copy them without holding the lock.
+pub trait StoreAccess {
+    fn with<R>(&self, f: impl FnOnce(&Store) -> R) -> Result<R, String>;
+}
+
+impl StoreAccess for Store {
+    fn with<R>(&self, f: impl FnOnce(&Store) -> R) -> Result<R, String> {
+        Ok(f(self))
+    }
+}
+
+impl StoreAccess for std::sync::Mutex<Store> {
+    fn with<R>(&self, f: impl FnOnce(&Store) -> R) -> Result<R, String> {
+        let guard = self
+            .lock()
+            .map_err(|_| "Native session store unavailable".to_string())?;
+        Ok(f(&guard))
+    }
+}
 
 const MAX_TITLE: usize = 500;
 /// Matches the store's limit, which counts characters.
@@ -48,7 +70,38 @@ pub fn fields(action: &str) -> Option<&'static str> {
 }
 
 /// Runs a `today.*` action for a Mono. Blocking: call it off the UI thread.
-pub fn handle(
+pub fn handle<S: StoreAccess + ?Sized>(
+    access: &S,
+    caller: &MonoCaller,
+    action: &str,
+    input: &Value,
+    now: u64,
+) -> Result<Value, String> {
+    if action == "today.note" {
+        // The one action that may copy large files: see `write_note`.
+        let allowed = fields(action).unwrap_or_default();
+        let map = input.as_object().ok_or("Input must be an object")?;
+        if let Some(key) = map
+            .keys()
+            .find(|k| !allowed.split_whitespace().any(|f| f == k.as_str()))
+        {
+            return Err(format!("{action} does not take {key}"));
+        }
+        let task = access.with(|store| resolve(store, caller, map))??;
+        let note = write_note(
+            access,
+            &task.id,
+            &Actor::Mono(caller.clone()),
+            None,
+            map,
+            now,
+        )?;
+        return Ok(json!({ "note": note }));
+    }
+    access.with(|store| handle_locked(store, caller, action, input, now))?
+}
+
+fn handle_locked(
     store: &Store,
     caller: &MonoCaller,
     action: &str,
@@ -93,11 +146,6 @@ pub fn handle(
             }
             let task = store.today_update(&task.id, &patch, &actor, now)?;
             Ok(json!({ "task": task_json(&task, &defs)? }))
-        }
-        "today.note" => {
-            let task = resolve(store, caller, input)?;
-            let note = write_note(store, &task.id, &actor, None, input, now)?;
-            Ok(json!({ "note": note }))
         }
         "today.editNote" => {
             let task = resolve(store, caller, input)?;
@@ -155,8 +203,8 @@ pub fn session_action(action: &str) -> bool {
 /// Runs a `today.*` action for a plain coding session on the task it is linked
 /// to. `roots` are the folders the session may attach files from (its project
 /// and worktree). Blocking: call it off the UI thread.
-pub fn handle_session(
-    store: &Store,
+pub fn handle_session<S: StoreAccess + ?Sized>(
+    access: &S,
     session_id: i64,
     roots: &[PathBuf],
     action: &str,
@@ -178,35 +226,52 @@ pub fn handle_session(
     {
         return Err(format!("{action} does not take {key}"));
     }
-    store.today_roll(now)?;
-    let linked = store
-        .today_session_task(session_id)?
-        .ok_or(SESSION_UNLINKED)?;
-    let task = store.today_task(&linked)?.ok_or(SESSION_UNLINKED)?;
-    if let Some(id) = string(input, "id")? {
-        let id = id.trim();
-        if id != task.id && id != task.key {
-            return Err(SESSION_OTHER_TASK.into());
+    let given = string(input, "id")?;
+    let task = access.with(|store| {
+        store.today_roll(now)?;
+        let linked = store
+            .today_session_task(session_id)?
+            .ok_or(SESSION_UNLINKED)?;
+        let task = store.today_task(&linked)?.ok_or(SESSION_UNLINKED)?;
+        if let Some(id) = &given {
+            let id = id.trim();
+            if id != task.id && id != task.key {
+                return Err(SESSION_OTHER_TASK.to_string());
+            }
         }
-    }
+        Ok::<_, String>(task)
+    })??;
     let actor = Actor::Session(session_id);
+    match action {
+        "today.note" => {
+            let note = write_note(access, &task.id, &actor, Some(roots), input, now)?;
+            Ok(json!({ "note": note }))
+        }
+        _ => access.with(|store| session_locked(store, &task, &actor, action, input, now))?,
+    }
+}
+
+fn session_locked(
+    store: &Store,
+    task: &Task,
+    actor: &Actor,
+    action: &str,
+    input: &Map<String, Value>,
+    now: u64,
+) -> Result<Value, String> {
     match action {
         "today.current" => {
             let defs = store.today_tags()?;
-            let workflow = statuses::resolve(&task, &store.today_statuses()?).clone();
-            let mut value = task_json(&task, &defs)?;
+            let workflow = statuses::resolve(task, &store.today_statuses()?).clone();
+            let mut value = task_json(task, &defs)?;
             value["workflowStatus"] = workflow_json(&workflow);
             let mut notes = store.today_notes(&task.id)?;
             let skip = notes.len().saturating_sub(LISTED_NOTES);
             notes.drain(..skip);
             Ok(json!({ "task": value, "notes": notes, "notice": NOTICE }))
         }
-        "today.note" => {
-            let note = write_note(store, &task.id, &actor, Some(roots), input, now)?;
-            Ok(json!({ "note": note }))
-        }
-        "today.editNote" => Ok(json!({ "note": edit_note(store, &task.id, &actor, input, now)? })),
-        _ => delete_note(store, &task.id, &actor, input, now),
+        "today.editNote" => Ok(json!({ "note": edit_note(store, &task.id, actor, input, now)? })),
+        _ => delete_note(store, &task.id, actor, input, now),
     }
 }
 
@@ -214,9 +279,11 @@ pub fn handle_session(
 
 /// Writes a note on `task_id`. With `files`, each path is checked by
 /// [`agent_files`] (`roots` limits where they may live; `None` is a Mono), the
-/// files are copied, and the note is committed only if every copy worked.
-fn write_note(
-    store: &Store,
+/// files are copied, and the note is committed only if every copy worked. The
+/// store is used only to plan and to commit, never while the files are copied,
+/// so a large copy cannot hold up the app.
+fn write_note<S: StoreAccess + ?Sized>(
+    access: &S,
     task_id: &str,
     actor: &Actor,
     roots: Option<&[PathBuf]>,
@@ -226,18 +293,25 @@ fn write_note(
     let files = string_list(input, "files")?;
     if files.is_empty() {
         let body = note_body(input)?;
-        return store.today_note(task_id, &body, actor, now);
+        return access.with(|store| store.today_note(task_id, &body, actor, now))?;
     }
     let body = string(input, "body")?.unwrap_or_default();
     if body.trim().chars().count() > MAX_NOTE_CHARS {
         return Err(format!("body must be at most {MAX_NOTE_CHARS} characters"));
     }
-    let data_dir = store
-        .data_dir()
+    let data_dir = access
+        .with(|store| store.data_dir().map(Path::to_path_buf))?
         .ok_or("Attachment storage is unavailable")?;
-    let paths = agent_files(&files, roots, data_dir)?;
-    let plan = store.today_note_plan(task_id, &body, paths.len(), actor, now)?;
-    let (attachments, skipped) = plan.copy_agent(&paths)?;
+    let paths = agent_files(&files, roots, &data_dir)?;
+    let plan =
+        access.with(|store| store.today_note_plan(task_id, &body, paths.len(), actor, now))??;
+    let (attachments, skipped) = match plan.copy_agent(&paths) {
+        Ok(copied) => copied,
+        Err(error) => {
+            plan.discard();
+            return Err(error);
+        }
+    };
     if !skipped.is_empty() {
         plan.discard();
         // Name each file by the path the agent gave, not its resolved form.
@@ -251,9 +325,12 @@ fn write_note(
         });
         return Err(named.collect::<Vec<_>>().join("\n"));
     }
-    Ok(store
-        .today_note_commit(plan, attachments, skipped, actor, now)?
-        .note)
+    // The commit removes the copies itself when it fails.
+    let spare = plan.clone();
+    let saved = access
+        .with(|store| store.today_note_commit(plan, attachments, skipped, actor, now))
+        .inspect_err(|_| spare.discard())??;
+    Ok(saved.note)
 }
 
 /// Replaces a note's text and drops the attachments named in `removeAttachments`.

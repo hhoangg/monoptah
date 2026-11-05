@@ -405,7 +405,7 @@ impl Shell {
                         call,
                         move |store| {
                             let value = monocode_core::today::actions::handle_session(
-                                &*locked(&store)?,
+                                &*store,
                                 session,
                                 &roots,
                                 &action,

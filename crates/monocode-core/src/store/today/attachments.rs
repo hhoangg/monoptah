@@ -224,7 +224,9 @@ fn read_no_follow(path: &Path) -> Result<Vec<u8>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_NONBLOCK keeps open() from waiting forever on a FIFO swapped in
+        // after validation; the is_file() check below then refuses it.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(not(unix))]
     if std::fs::symlink_metadata(path)
@@ -630,5 +632,23 @@ mod tests {
             .unwrap()
             .get("attachments")
             .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_no_follow_refuses_a_fifo_without_hanging() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::Builder::new().prefix("fifo").tempdir().unwrap();
+        let fifo = dir.path().join("pipe.md");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_no_follow(&fifo));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("open() on a FIFO must not block");
+        assert_eq!(result.unwrap_err(), "is not a file.");
     }
 }
