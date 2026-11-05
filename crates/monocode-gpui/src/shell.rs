@@ -3636,6 +3636,19 @@ impl Shell {
     }
     /// Close one pane of a split tab; the tab's only pane closes the tab.
     fn close_pane(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .workspace
+            .tab_of(id)
+            .is_some_and(|tab| self.workspace.layout(tab).is_split())
+        {
+            self.close(id, window, cx);
+            return;
+        }
+        self.confirm_close_terminal_panes(&[id], window, cx, move |this, window, cx| {
+            this.finish_close_pane(id, window, cx);
+        });
+    }
+    fn finish_close_pane(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.workspace.active;
         let before = self.active_leaves();
         if !self.workspace.close_pane(id) {
@@ -6917,8 +6930,9 @@ impl Shell {
         let Some(active) = self.active_title_tab(cx) else {
             return;
         };
+        // Pins survive the bulk closes, as in the tab menu.
         let tabs = self
-            .visible_tabs(cx)
+            .strip_tabs(cx)
             .into_iter()
             .filter(|tab| *tab != active)
             .collect::<Vec<_>>();
@@ -9187,7 +9201,8 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &CloseAllTabs, window, cx| {
                 // An empty strip can still have a new-tab request in flight.
                 this.navigation_revision += 1;
-                this.close_title_tabs(&this.visible_tabs(cx), None, window, cx);
+                // Pins survive the bulk closes, as in the tab menu.
+                this.close_title_tabs(&this.strip_tabs(cx), None, window, cx);
                 if !this.mono_active(cx) {
                     this.ensure_project_session(window, cx);
                 }
@@ -10056,6 +10071,33 @@ mod tests {
                 assert!(!shell.sessions[&active].read(cx).summary.has_messages);
             })
             .unwrap();
+    }
+    #[gpui::test]
+    fn bulk_close_shortcuts_keep_pinned_tabs(cx: &mut TestAppContext) {
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        for keys in ["shift-w", "alt-t"] {
+            let (window, a, b) = same_project_window(cx);
+            cx.update(bind_keys);
+            window
+                .update(cx, |shell, w, cx| {
+                    shell.toggle_pin_tab(TitleTab::Session(b), cx);
+                    shell.open(a, w, cx);
+                })
+                .unwrap();
+            cx.simulate_keystrokes(window.into(), &format!("{modifier}-{keys}"));
+            cx.run_until_parked();
+            window
+                .update(cx, |shell, _, cx| {
+                    assert!(shell.workspace.tabs.contains(&b), "{keys} closed the pin");
+                    assert_eq!(shell.workspace.pinned_tabs, [TitleTab::Session(b)]);
+                    assert!(shell.visible_tabs(cx).contains(&TitleTab::Session(b)));
+                })
+                .unwrap();
+        }
     }
     #[gpui::test]
     fn tab_lifecycle_close_stays_in_project_and_keeps_running_drafts(cx: &mut TestAppContext) {
@@ -11308,6 +11350,39 @@ mod tests {
                 assert!(shell.sidebar_peek.is_none());
             })
             .unwrap();
+        cx.simulate_mouse_move(gpui::point(px(2.), px(300.)), None, Default::default());
+        cx.run_until_parked();
+        assert!(!open(cx));
+    }
+    #[gpui::test]
+    fn boxy_collapsed_sidebar_peeks_too(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.new_layout_boxy = true;
+                shell.layout_changed(cx);
+                shell.toggle_sidebar(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let open = |cx: &mut gpui::VisualTestContext| {
+            window.update(cx, |shell, _, _| shell.peek_open()).unwrap()
+        };
+        cx.simulate_mouse_move(gpui::point(px(2.), px(300.)), None, Default::default());
+        cx.run_until_parked();
+        assert!(open(cx));
+        assert!(cx.debug_bounds("sidebar-peek").is_some());
+        // The classic layout never peeks.
+        window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.classic_layout = true;
+                shell.layout_changed(cx);
+            })
+            .unwrap();
+        cx.simulate_mouse_move(gpui::point(px(300.), px(300.)), None, Default::default());
         cx.simulate_mouse_move(gpui::point(px(2.), px(300.)), None, Default::default());
         cx.run_until_parked();
         assert!(!open(cx));
