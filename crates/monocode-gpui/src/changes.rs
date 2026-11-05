@@ -215,6 +215,9 @@ pub(crate) struct Changes {
     git: Entity<ProjectGit>,
     cwd: String,
     enabled: bool,
+    /// The session in view runs elsewhere (a codespace), so this local checkout
+    /// is shown but never written to.
+    read_only: bool,
     pub(crate) text_provider: Kind,
     message: Entity<Input>,
     amend: Option<(Option<String>, Option<String>)>,
@@ -253,6 +256,7 @@ impl Changes {
             git,
             cwd: String::new(),
             enabled: false,
+            read_only: false,
             text_provider: Kind::Claude,
             message,
             amend: None,
@@ -281,6 +285,16 @@ impl Changes {
     pub(crate) fn set_view(&mut self, view: ChangesView, cx: &mut Context<Self>) {
         self.view = view;
         self.rebuild(cx);
+    }
+    pub(crate) fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        if self.read_only != read_only {
+            self.read_only = read_only;
+            cx.notify();
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only
     }
     pub(crate) fn set_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.enabled == enabled {
@@ -471,7 +485,7 @@ impl Changes {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy.is_some() {
+        if self.busy.is_some() || self.read_only {
             return;
         }
         self.busy = Some(busy);
@@ -721,7 +735,8 @@ impl Changes {
     fn can_commit(&self, cx: &App) -> bool {
         let index = self.git.read(cx).index.as_ref();
         let staged = index.is_some_and(|i| i.files.iter().any(|f| f.staged));
-        (staged || self.amend.is_some())
+        !self.read_only
+            && (staged || self.amend.is_some())
             && !self.message.read(cx).content.trim().is_empty()
             && self.busy.is_none()
     }
@@ -809,6 +824,9 @@ impl Changes {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         self.busy = Some("pr".into());
         cx.notify();
         let cwd = PathBuf::from(&self.cwd);

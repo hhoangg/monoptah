@@ -681,7 +681,7 @@ pub(crate) struct Shell {
     /// Local projects whose `origin` was checked for a GitHub repository.
     github_projects: HashMap<String, bool>,
     /// A cloud session whose archive waits for its dialog (opened on the next render).
-    cloud_archive_request: Option<i64>,
+    cloud_archive_request: Vec<i64>,
     codespace_picker: Option<cloud_picker::Open>,
     _cloud_clock: gpui::Task<()>,
     sessions: HashMap<i64, Entity<Conversation>>,
@@ -1094,7 +1094,7 @@ impl Shell {
             cloud_archive: None,
             cloud_busy: HashSet::new(),
             github_projects: HashMap::new(),
-            cloud_archive_request: None,
+            cloud_archive_request: Vec::new(),
             codespace_picker: None,
             _cloud_clock: cloud_clock,
             sessions: HashMap::new(),
@@ -1627,7 +1627,7 @@ impl Shell {
         }
         // A cloud session asks what to do with its codespace before it archives.
         if self.is_cloud(id) && !self.session_metadata(id, cx).summary.archived {
-            self.cloud_archive_request = Some(id);
+            self.cloud_archive_request.push(id);
             cx.notify();
             return;
         }
@@ -8459,10 +8459,11 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.keep_visible_idle_agents(cx);
         self.sync_ui_scale(window, cx);
-        if let Some(id) = self.cloud_archive_request.take() {
+        if !self.cloud_archive_request.is_empty() {
+            let ids = std::mem::take(&mut self.cloud_archive_request);
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
-                this.update(cx, |this, cx| this.open_cloud_archive(id, window, cx));
+                this.update(cx, |this, cx| this.open_cloud_archive(ids, window, cx));
             });
         }
         if self.mono_panes_unsettled(cx) {
@@ -8679,6 +8680,7 @@ impl Render for Shell {
         self.git.update(cx, |git, cx| {
             git.set_polling(poll_git && git.available(), cx)
         });
+        self.sync_cloud_panel(cx);
         if let Some(panel) = &self.right_panel {
             let classic = self.workspace.boxy_layout();
             let tab_width = self.project_tabs_width(cx);

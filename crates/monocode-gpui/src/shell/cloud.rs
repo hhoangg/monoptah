@@ -135,23 +135,59 @@ pub(super) enum Then {
     Forget,
 }
 
-/// Runs the codespace side of an archive. Blocking: call it on a worker.
+/// Runs the codespace side of an archive. The second value is a warning to show
+/// although the call took effect. Blocking: call it on a worker.
 pub(super) fn apply_choice(
     cloud: &CloudSessions,
     choice: ArchiveChoice,
     codespace: &str,
-) -> Result<Then, String> {
+) -> Result<(Then, Option<String>), String> {
     match choice {
-        ArchiveChoice::Keep => Ok(Then::Archive),
+        ArchiveChoice::Keep => Ok((Then::Archive, None)),
         ArchiveChoice::Stop => cloud
             .stop_codespace(codespace)
-            .map(|()| Then::Archive)
+            .map(|()| (Then::Archive, None))
             .map_err(|e| format!("Could not stop the codespace: {e}")),
-        ArchiveChoice::Delete => cloud
-            .delete_codespace(codespace)
-            .map(|()| Then::Forget)
-            .map_err(|e| format!("Could not delete the codespace: {e}")),
+        // The codespace is gone and its bindings were dropped even when only
+        // disconnecting the machine failed, so the sessions go either way.
+        ArchiveChoice::Delete => match cloud.delete_codespace(codespace) {
+            Ok(()) => Ok((Then::Forget, None)),
+            Err(e) if e.starts_with("Codespace deleted") => Ok((Then::Forget, Some(e))),
+            Err(e) => Err(format!("Could not delete the codespace: {e}")),
+        },
     }
+}
+
+/// Which sessions and codespaces the dialog is about.
+pub(super) fn archive_summary(title: &str, groups: &[CodespaceGroup]) -> String {
+    let sessions: usize = groups.iter().map(|g| g.ids.len()).sum();
+    if let [group] = groups
+        && sessions == 1
+    {
+        return format!("“{title}” runs in the codespace {}.", group.codespace);
+    }
+    let list = groups
+        .iter()
+        .map(|g| {
+            format!(
+                "{} ({} {})",
+                g.codespace,
+                g.ids.len(),
+                if g.ids.len() == 1 {
+                    "session"
+                } else {
+                    "sessions"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{sessions} cloud sessions run in: {list}. The choice applies to each codespace.")
+}
+
+/// What the File and Git panels say while a cloud session is active.
+pub(super) fn banner_text(codespace: &str) -> String {
+    format!("Local files - this session runs in codespace {codespace}")
 }
 
 /// `gh codespace ssh -c <name>`: an interactive shell on the codespace.
@@ -168,12 +204,51 @@ fn gh_program() -> OsString {
         .map_or_else(|| OsString::from("gh"), std::path::PathBuf::into_os_string)
 }
 
+/// One codespace affected by an archive: the selected sessions in it and the
+/// non-archived sessions outside the selection that still use it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CodespaceGroup {
+    pub codespace: String,
+    pub ids: Vec<i64>,
+    pub others: usize,
+}
+
+/// Groups cloud sessions by codespace; `others_of` counts the other users.
+pub(super) fn group_by_codespace(
+    ids: &[i64],
+    marks: &HashMap<i64, CloudMark>,
+    others_of: impl Fn(&str, &[i64]) -> usize,
+) -> Vec<CodespaceGroup> {
+    let mut groups: Vec<CodespaceGroup> = Vec::new();
+    for id in ids {
+        let Some(mark) = marks.get(id) else { continue };
+        match groups.iter_mut().find(|g| g.codespace == mark.codespace) {
+            Some(group) => group.ids.push(*id),
+            None => groups.push(CodespaceGroup {
+                codespace: mark.codespace.clone(),
+                ids: vec![*id],
+                others: 0,
+            }),
+        }
+    }
+    for group in &mut groups {
+        group.others = others_of(&group.codespace, &group.ids);
+    }
+    groups
+}
+
 pub(super) struct ArchiveDialog {
-    pub(super) id: i64,
-    pub(super) codespace: String,
+    pub(super) groups: Vec<CodespaceGroup>,
     pub(super) title: String,
-    pub(super) others: usize,
     focus: FocusHandle,
+}
+impl ArchiveDialog {
+    pub(super) fn ids(&self) -> Vec<i64> {
+        self.groups.iter().flat_map(|g| g.ids.clone()).collect()
+    }
+    pub(super) fn others(&self) -> usize {
+        self.groups.iter().map(|g| g.others).sum()
+    }
 }
 
 pub(super) fn default_gh() -> Arc<dyn GhRunner> {
@@ -355,43 +430,66 @@ impl Shell {
         cx.notify();
     }
 
+    /// While a cloud session is in view the File and Git panels still show the
+    /// local project: say so, and keep git writes off it.
+    pub(super) fn sync_cloud_panel(&self, cx: &mut Context<Self>) {
+        let codespace = if self.mono_active(cx) {
+            None
+        } else {
+            self.active_codespace()
+        };
+        if let Some(panel) = &self.right_panel {
+            panel.update(cx, |panel, cx| {
+                panel.set_cloud_banner(codespace.as_deref().map(banner_text), cx);
+                panel.changes.update(cx, |changes, cx| {
+                    changes.set_read_only(codespace.is_some(), cx)
+                });
+            });
+        }
+    }
+
     /// The codespace of the active cloud session, when one is in view.
     pub(super) fn active_codespace(&self) -> Option<String> {
         let id = self.workspace.active?;
         self.cloud_marks.get(&id).map(|mark| mark.codespace.clone())
     }
 
-    /// Archiving a cloud session asks what to do with its codespace first.
+    /// Archiving cloud sessions asks what to do with their codespaces first: one
+    /// dialog for all of `ids`, grouped by codespace.
     pub(super) fn open_cloud_archive(
         &mut self,
-        id: i64,
+        ids: Vec<i64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(mark) = self.cloud_marks.get(&id).cloned() else {
-            return;
-        };
-        if self.cloud_archive.is_some() || self.cloud_busy.contains(&id) {
+        let ids: Vec<i64> = ids
+            .into_iter()
+            .filter(|id| self.is_cloud(*id) && !self.cloud_busy.contains(id))
+            .collect();
+        if ids.is_empty() || self.cloud_archive.is_some() {
             return;
         }
-        let others = self
-            .cloud_marks
-            .iter()
-            .filter(|(other, m)| {
-                **other != id
-                    && m.codespace == mark.codespace
-                    && self
-                        .session_summaries
-                        .get(other)
-                        .is_some_and(|s| !s.archived)
-            })
-            .count();
+        let groups = group_by_codespace(&ids, &self.cloud_marks, |codespace, selected| {
+            self.cloud_marks
+                .iter()
+                .filter(|(other, m)| {
+                    m.codespace == codespace
+                        && !selected.contains(other)
+                        && self
+                            .session_summaries
+                            .get(other)
+                            .is_some_and(|s| !s.archived)
+                })
+                .count()
+        });
         self.close_preview(cx);
+        let title = match ids.as_slice() {
+            [id] => self.session_metadata(*id, cx).display_title(),
+            _ => String::new(),
+        };
         let dialog = ArchiveDialog {
-            id,
-            codespace: mark.codespace,
-            title: self.session_metadata(id, cx).display_title(),
-            others,
+            groups,
+            title,
             focus: cx.focus_handle(),
         };
         window.focus(&dialog.focus, cx);
@@ -416,32 +514,53 @@ impl Shell {
             return;
         };
         self.focus_active(window, cx);
-        let id = dialog.id;
         if choice == ArchiveChoice::Keep {
-            self.toggle_archive_now(id, cx);
+            for id in dialog.ids() {
+                self.toggle_archive_now(id, cx);
+            }
             cx.notify();
             return;
         }
-        self.cloud_busy.insert(id);
+        let ids = dialog.ids();
+        self.cloud_busy.extend(ids.iter().copied());
         let cloud = self.cloud.clone();
-        let codespace = dialog.codespace.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { apply_choice(&cloud, choice, &codespace) });
+        let groups = dialog.groups.clone();
+        let work = cx.background_executor().spawn(async move {
+            groups
+                .into_iter()
+                .map(|group| {
+                    let result = apply_choice(&cloud, choice, &group.codespace);
+                    (group, result)
+                })
+                .collect::<Vec<_>>()
+        });
         cx.spawn_in(window, async move |this, cx| {
-            let result = work.await;
+            let results = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.cloud_busy.remove(&id);
-                match result {
-                    Ok(Then::Archive) => {
-                        this.cloud_states
-                            .insert(dialog.codespace.clone(), CloudState::Stopping);
-                        this.toggle_archive_now(id, cx);
+                this.cloud_busy.retain(|id| !ids.contains(id));
+                let mut problems = Vec::new();
+                for (group, result) in results {
+                    match result {
+                        Ok((then, warning)) => {
+                            problems.extend(warning);
+                            match then {
+                                Then::Archive => {
+                                    this.cloud_states
+                                        .insert(group.codespace.clone(), CloudState::Stopping);
+                                    for id in group.ids {
+                                        this.toggle_archive_now(id, cx);
+                                    }
+                                }
+                                Then::Forget => {
+                                    this.forget_codespace_sessions(&group.codespace, window, cx)
+                                }
+                            }
+                        }
+                        Err(error) => problems.push(error),
                     }
-                    Ok(Then::Forget) => {
-                        this.forget_codespace_sessions(&dialog.codespace, window, cx)
-                    }
-                    Err(error) => this.error = Some(error),
+                }
+                if !problems.is_empty() {
+                    this.error = Some(problems.join(" "));
                 }
                 this.invalidate_chrome(cx);
                 cx.notify();
@@ -481,7 +600,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let dialog = self.cloud_archive.as_ref()?;
-        let default = default_choice(dialog.others);
+        let default = default_choice(dialog.others());
         let width = 460f32.min(window.viewport_size().width.as_f32() - 24.);
         let weak = cx.weak_entity();
         let button = |id: &'static str,
@@ -543,11 +662,11 @@ impl Shell {
                                 )
                                 .child(div().text_size(px(12.)).line_height(px(17.)).child(
                                     format!(
-                                        "“{}” runs in the codespace {}. A running codespace keeps costing money until it idles out.",
-                                        dialog.title, dialog.codespace
+                                        "{} A running codespace keeps costing money until it idles out.",
+                                        archive_summary(&dialog.title, &dialog.groups)
                                     ),
                                 ))
-                                .children(others_note(dialog.others).map(|note| {
+                                .children(others_note(dialog.others()).map(|note| {
                                     div()
                                         .id("cloud-archive-others")
                                         .text_size(px(12.))

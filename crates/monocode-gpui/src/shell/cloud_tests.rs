@@ -204,12 +204,12 @@ fn archive_choices_make_the_matching_codespace_calls() {
         (then, gh.calls())
     };
     let (then, calls) = run(ArchiveChoice::Keep);
-    assert_eq!((then, calls), (Then::Archive, vec![]));
+    assert_eq!((then, calls), ((Then::Archive, None), vec![]));
     let (then, calls) = run(ArchiveChoice::Stop);
-    assert_eq!(then, Then::Archive);
+    assert_eq!(then, (Then::Archive, None));
     assert_eq!(calls, vec!["codespace stop -c octo-abc".to_string()]);
     let (then, calls) = run(ArchiveChoice::Delete);
-    assert_eq!(then, Then::Forget);
+    assert_eq!(then, (Then::Forget, None));
     assert_eq!(
         calls,
         vec!["codespace delete -c octo-abc --force".to_string()]
@@ -412,7 +412,7 @@ fn archiving_a_cloud_session_opens_the_dialog_and_stop_calls_gh_then_archives(
     window
         .update(visual, |shell, _, _| {
             let dialog = shell.cloud_archive.as_ref().expect("dialog opened");
-            assert_eq!(dialog.id, id);
+            assert_eq!(dialog.ids(), vec![id]);
             assert!(!shell.session_summaries[&id].archived, "not archived yet");
         })
         .unwrap();
@@ -458,8 +458,8 @@ fn keep_running_archives_without_touching_the_codespace_and_counts_other_session
                     codespace: "octo-abc".into(),
                 },
             );
-            shell.open_cloud_archive(id, window, cx);
-            assert_eq!(shell.cloud_archive.as_ref().unwrap().others, 1);
+            shell.open_cloud_archive(vec![id], window, cx);
+            assert_eq!(shell.cloud_archive.as_ref().unwrap().others(), 1);
             shell.confirm_cloud_archive(ArchiveChoice::Keep, window, cx);
         })
         .unwrap();
@@ -478,7 +478,7 @@ fn delete_codespace_removes_its_sessions_from_the_window(cx: &mut TestAppContext
     let (window, id, gh) = shell_with_cloud(cx);
     window
         .update(cx, |shell, window, cx| {
-            shell.open_cloud_archive(id, window, cx);
+            shell.open_cloud_archive(vec![id], window, cx);
             shell.confirm_cloud_archive(ArchiveChoice::Delete, window, cx);
         })
         .unwrap();
@@ -532,6 +532,177 @@ fn the_codespace_menu_item_only_applies_to_local_github_projects(cx: &mut TestAp
                 .github_projects
                 .insert(shell.workspace.project.clone(), false);
             assert!(!shell.offers_codespace());
+        })
+        .unwrap();
+}
+
+fn cloud_row(shell: &mut Shell, codespace: &str) -> i64 {
+    let id = add_cloud_session(&shell.store, "/work/monocode", codespace);
+    let summary = locked(&shell.store)
+        .unwrap()
+        .sessions()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap();
+    shell.session_summaries.insert(
+        id,
+        Session {
+            has_messages: true,
+            ..summary
+        },
+    );
+    shell.order.push(id);
+    shell.cloud_marks.insert(
+        id,
+        CloudMark {
+            local_project: "/work/monocode".into(),
+            codespace: codespace.into(),
+        },
+    );
+    id
+}
+
+#[gpui::test]
+fn multi_select_archives_locals_now_and_asks_once_for_every_cloud_session(cx: &mut TestAppContext) {
+    let (window, a, gh) = shell_with_cloud(cx);
+    let (b, c, local) = window
+        .update(cx, |shell, _, _| {
+            let b = cloud_row(shell, "octo-abc");
+            let c = cloud_row(shell, "octo-xyz");
+            let local = locked(&shell.store)
+                .unwrap()
+                .create("claude", "/work/monocode")
+                .unwrap();
+            shell.session_summaries.insert(local.id, local.clone());
+            shell.order.push(local.id);
+            (b, c, local.id)
+        })
+        .unwrap();
+    window
+        .update(cx, |shell, _, cx| {
+            for id in [a, b, c, local] {
+                shell.toggle_archive(id, cx);
+            }
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    window
+        .update(visual, |shell, _, cx| {
+            assert!(
+                shell.session_metadata(local, cx).summary.archived,
+                "local archives at once"
+            );
+            let dialog = shell.cloud_archive.as_ref().expect("one dialog");
+            let mut ids = dialog.ids();
+            ids.sort();
+            let mut want = vec![a, b, c];
+            want.sort();
+            assert_eq!(ids, want);
+            let counts: Vec<_> = dialog
+                .groups
+                .iter()
+                .map(|g| (g.codespace.clone(), g.ids.len()))
+                .collect();
+            assert_eq!(
+                counts,
+                [("octo-abc".to_string(), 2), ("octo-xyz".to_string(), 1)]
+            );
+            assert!(cloud::archive_summary("", &dialog.groups).contains("octo-abc (2 sessions)"));
+        })
+        .unwrap();
+    window
+        .update(visual, |shell, window, cx| {
+            shell.confirm_cloud_archive(ArchiveChoice::Stop, window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    let mut calls = gh.calls();
+    calls.sort();
+    assert_eq!(
+        calls,
+        ["codespace stop -c octo-abc", "codespace stop -c octo-xyz"]
+    );
+    window
+        .update(visual, |shell, _, cx| {
+            for id in [a, b, c] {
+                assert!(shell.session_metadata(id, cx).summary.archived);
+            }
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn non_interactive_archives_never_show_the_dialog_or_touch_the_codespace(cx: &mut TestAppContext) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| shell.toggle_archive_now(id, cx))
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(gh.calls().is_empty());
+    window
+        .update(visual, |shell, _, cx| {
+            assert!(shell.cloud_archive.is_none());
+            assert!(shell.cloud_archive_request.is_empty());
+            assert!(shell.session_metadata(id, cx).summary.archived);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_partial_delete_still_drops_the_sessions_and_keeps_the_warning(cx: &mut TestAppContext) {
+    struct FailingDisconnect(FakeHost);
+    impl Host for FailingDisconnect {
+        fn machines(&self) -> Result<Vec<Machine>, String> {
+            self.0.machines()
+        }
+        fn connect(&self, c: &str, d: &str, p: &mut dyn FnMut(&str)) -> Result<Machine, String> {
+            self.0.connect(c, d, p)
+        }
+        fn ensure(&self, m: &str, c: &AtomicBool, p: &mut dyn FnMut(&str)) -> Result<(), String> {
+            self.0.ensure(m, c, p)
+        }
+        fn request(&self, m: &str, method: &str, params: Value) -> Result<Value, String> {
+            self.0.request(m, method, params)
+        }
+        fn disconnect(&self, _: &str) -> Result<(), String> {
+            Err("tunnel busy".into())
+        }
+    }
+    let host = FailingDisconnect(FakeHost::default());
+    host.0.machines.lock().unwrap().push(machine("octo-abc"));
+    let svc = CloudSessions::new(FakeGh::new(vec![]), Arc::new(host), memory_store());
+    let (then, warning) = cloud::apply_choice(&svc, ArchiveChoice::Delete, "octo-abc").unwrap();
+    assert_eq!(then, Then::Forget);
+    assert!(
+        warning
+            .unwrap()
+            .starts_with("Codespace deleted, but disconnecting failed")
+    );
+    let _ = cx;
+}
+
+#[gpui::test]
+fn files_and_git_say_they_are_local_and_refuse_writes_while_a_cloud_session_is_active(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.ensure_right_panel(window, cx);
+            let panel = shell.right_panel.clone().expect("panel");
+            shell.sync_cloud_panel(cx);
+            assert_eq!(panel.read(cx).cloud_banner(), None);
+            assert!(!panel.read(cx).changes.read(cx).is_read_only());
+            shell.workspace.active = Some(id);
+            shell.sync_cloud_panel(cx);
+            assert_eq!(
+                panel.read(cx).cloud_banner(),
+                Some("Local files - this session runs in codespace octo-abc")
+            );
+            assert!(panel.read(cx).changes.read(cx).is_read_only());
         })
         .unwrap();
 }

@@ -1314,7 +1314,7 @@ impl Shell {
                 .detach();
             }
             LinkedActivityEvent::Archive(id) => {
-                self.toggle_archive(id, cx);
+                self.toggle_archive_now(id, cx);
                 if self.archiving.contains(&id) {
                     self.notification_state
                         .linked_cleanup
