@@ -1236,6 +1236,7 @@ mod tests {
             body: body.into(),
             attachments: Vec::new(),
             edited_at: None,
+            session_id: None,
         }
     }
     fn click(visual: &mut gpui::VisualTestContext, selector: &'static str) {

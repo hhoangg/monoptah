@@ -104,6 +104,79 @@ pub fn check_file(path: &Path) -> Result<u64, String> {
     Ok(meta.len())
 }
 
+/// Validates the files an agent wants to attach and returns their canonical
+/// paths. Every path must be absolute and name an existing regular file within
+/// [`MAX_FILE_BYTES`] (symlinks are followed, then judged by where they lead).
+/// Hidden files and directories (a component starting with `.`) are refused, as
+/// is anything inside the app data directory `data_dir`. `roots` limits where
+/// the files may live (a session's project folders); `None` means no limit (a
+/// Mono). For a session the hidden-component rule applies below the matched
+/// root, so a project that itself lives in a dot folder still works. Every
+/// error names the offending path.
+pub fn agent_files(
+    paths: &[String],
+    roots: Option<&[PathBuf]>,
+    data_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    if paths.len() > MAX_PER_NOTE {
+        return Err(format!("A note holds at most {MAX_PER_NOTE} attachments"));
+    }
+    let data_dir = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let roots: Option<Vec<PathBuf>> = roots.map(|roots| {
+        roots
+            .iter()
+            .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+            .collect()
+    });
+    let hidden = |path: &Path| {
+        path.components().any(|part| match part {
+            Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+            _ => false,
+        })
+    };
+    let mut out = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let given = Path::new(raw);
+        if !given.is_absolute() {
+            return Err(format!("{raw} is not an absolute path."));
+        }
+        let canonical = given
+            .canonicalize()
+            .map_err(|_| format!("{raw} could not be read."))?;
+        // The name the agent gave, even when it is a link to a plain file.
+        if given
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+        {
+            return Err(format!("{raw} is a hidden file."));
+        }
+        let below = match &roots {
+            Some(roots) => {
+                let root = roots
+                    .iter()
+                    .find(|root| canonical.starts_with(root))
+                    .ok_or_else(|| format!("{raw} is outside the session's project folders."))?;
+                canonical.strip_prefix(root).unwrap_or(&canonical)
+            }
+            None => canonical.as_path(),
+        };
+        if hidden(below) {
+            return Err(format!("{raw} is a hidden file or inside a hidden folder."));
+        }
+        if canonical.starts_with(&data_dir) {
+            return Err(format!("{raw} is inside the app's data folder."));
+        }
+        if !canonical.is_file() {
+            return Err(format!("{raw} is not a regular file."));
+        }
+        check_file(&canonical).map_err(|error| format!("{raw}: {error}"))?;
+        out.push(canonical);
+    }
+    Ok(out)
+}
+
 /// The last segment of `path`, as shown to the user.
 pub fn display_name(path: &Path) -> String {
     path.file_name()
@@ -270,6 +343,7 @@ mod tests {
             body: String::new(),
             attachments,
             edited_at: None,
+            session_id: None,
         }
     }
 
@@ -317,5 +391,134 @@ mod tests {
             .map(|i| note(i as u64, vec![attachment(&small, AttachmentKind::Image)]))
             .collect();
         assert_eq!(turn_images(&many, 100, u64::MAX).len(), MAX_TURN_IMAGES);
+    }
+
+    fn dir() -> tempfile::TempDir {
+        // Not `tempdir()`: its names start with a dot, which agent_files refuses.
+        tempfile::Builder::new().prefix("agent").tempdir().unwrap()
+    }
+    fn text(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+    fn write(path: &Path) -> String {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+        text(path)
+    }
+
+    #[test]
+    fn agent_files_accepts_a_file_inside_a_root_or_anywhere_for_a_mono() {
+        let (root, data) = (dir(), dir());
+        let file = write(&root.path().join("sub/report.md"));
+        let roots = [root.path().to_path_buf()];
+        let got = agent_files(std::slice::from_ref(&file), Some(&roots), data.path()).unwrap();
+        assert_eq!(got, vec![Path::new(&file).canonicalize().unwrap()]);
+        // No roots: a Mono may read from anywhere.
+        let other = dir();
+        let elsewhere = write(&other.path().join("a.html"));
+        assert_eq!(
+            agent_files(&[elsewhere], None, data.path()).unwrap().len(),
+            1
+        );
+        assert!(agent_files(&[], None, data.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_files_rejects_outside_a_root_and_names_the_path() {
+        let (root, other, data) = (dir(), dir(), dir());
+        let outside = write(&other.path().join("a.md"));
+        let roots = [root.path().to_path_buf()];
+        let error =
+            agent_files(std::slice::from_ref(&outside), Some(&roots), data.path()).unwrap_err();
+        assert!(error.contains(&outside), "{error}");
+        assert!(error.contains("outside"), "{error}");
+    }
+
+    #[test]
+    fn agent_files_rejects_hidden_files_and_hidden_folders() {
+        let (root, data) = (dir(), dir());
+        let roots = [root.path().to_path_buf()];
+        for rel in [".env", ".git/config", "a/.secret/b.md"] {
+            let file = write(&root.path().join(rel));
+            let error =
+                agent_files(std::slice::from_ref(&file), Some(&roots), data.path()).unwrap_err();
+            assert!(error.contains(&file) && error.contains("hidden"), "{error}");
+            let error = agent_files(std::slice::from_ref(&file), None, data.path()).unwrap_err();
+            assert!(error.contains("hidden"), "{error}");
+        }
+        // `..` is resolved before the checks, so it cannot reach out of a root.
+        let file = write(&root.path().join("a/b.md"));
+        let tricky = text(&root.path().join("a/../a/b.md"));
+        let got = agent_files(&[tricky], Some(&roots), data.path()).unwrap();
+        assert_eq!(got, vec![Path::new(&file).canonicalize().unwrap()]);
+        let up = text(&root.path().join("a/../../x.md"));
+        assert!(agent_files(&[up], Some(&roots), data.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_files_rejects_a_symlink_that_escapes_the_root() {
+        let (root, other, data) = (dir(), dir(), dir());
+        let target = write(&other.path().join("secret.md"));
+        let link = root.path().join("link.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let roots = [root.path().to_path_buf()];
+        let error = agent_files(&[text(&link)], Some(&roots), data.path()).unwrap_err();
+        assert!(
+            error.contains(&text(&link)) && error.contains("outside"),
+            "{error}"
+        );
+        // A link to a hidden file is refused through its target.
+        let hidden = write(&root.path().join(".key"));
+        let via = root.path().join("plain.md");
+        std::os::unix::fs::symlink(&hidden, &via).unwrap();
+        assert!(agent_files(&[text(&via)], Some(&roots), data.path()).is_err());
+    }
+
+    #[test]
+    fn agent_files_rejects_directories_missing_files_and_relative_paths() {
+        let (root, data) = (dir(), dir());
+        std::fs::create_dir(root.path().join("folder")).unwrap();
+        let folder = text(&root.path().join("folder"));
+        let error = agent_files(std::slice::from_ref(&folder), None, data.path()).unwrap_err();
+        assert!(
+            error.contains(&folder) && error.contains("not a regular file"),
+            "{error}"
+        );
+        let gone = text(&root.path().join("gone.md"));
+        let error = agent_files(std::slice::from_ref(&gone), None, data.path()).unwrap_err();
+        assert!(error.contains(&gone), "{error}");
+        let error = agent_files(&["rel/a.md".to_string()], None, data.path()).unwrap_err();
+        assert!(error.contains("rel/a.md"), "{error}");
+    }
+
+    #[test]
+    fn agent_files_rejects_the_data_dir_too_big_and_too_many() {
+        let data = dir();
+        let stored = write(&data.path().join("today-attachments/t/n/a.md"));
+        let error = agent_files(std::slice::from_ref(&stored), None, data.path()).unwrap_err();
+        assert!(
+            error.contains(&stored) && error.contains("data folder"),
+            "{error}"
+        );
+        let root = dir();
+        let big = root.path().join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        let error = agent_files(&[text(&big)], None, data.path()).unwrap_err();
+        assert!(error.contains(&text(&big)), "{error}");
+        let many: Vec<String> = (0..=MAX_PER_NOTE)
+            .map(|i| write(&root.path().join(format!("f{i}.md"))))
+            .collect();
+        let error = agent_files(&many, None, data.path()).unwrap_err();
+        assert!(error.contains("at most"), "{error}");
+        assert_eq!(
+            agent_files(&many[..MAX_PER_NOTE], None, data.path())
+                .unwrap()
+                .len(),
+            MAX_PER_NOTE
+        );
     }
 }

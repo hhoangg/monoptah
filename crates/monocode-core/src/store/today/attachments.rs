@@ -42,7 +42,9 @@ impl NotePlan {
             .ok_or("Attachment storage is unavailable")?;
         Ok(copy_files(root, &self.relative, files))
     }
-    fn discard(&self) {
+    /// Removes the plan's note folder and any copies in it. Call it when the
+    /// plan will not be committed.
+    pub fn discard(&self) {
         if let Some(root) = &self.root {
             let _ = std::fs::remove_dir_all(root.join(&self.relative));
         }
@@ -93,7 +95,7 @@ impl Store {
         self.today_roll(now)?;
         self.today_ready()?;
         let task = load_task(&self.conn, id)?
-            .filter(|task| actor_sees(actor, task))
+            .filter(|task| actor_sees(&self.conn, actor, task))
             .ok_or_else(|| NOT_FOUND.to_string())?;
         let note_id = format!("note-{}", uuid::Uuid::new_v4());
         Ok(NotePlan {
@@ -130,7 +132,7 @@ impl Store {
             let day = self.today_roll(now)?;
             self.today_tx(|conn| {
                 let task = load_task(conn, &plan.task_id)?
-                    .filter(|task| actor_sees(actor, task))
+                    .filter(|task| actor_sees(conn, actor, task))
                     .ok_or_else(|| NOT_FOUND.to_string())?;
                 let note = Note {
                     id: plan.note_id.clone(),
@@ -138,16 +140,20 @@ impl Store {
                     day,
                     at: now,
                     mono_id: match actor {
-                        Actor::User => None,
+                        Actor::User | Actor::Session(_) => None,
                         Actor::Mono(caller) => Some(caller.id.clone()),
                     },
                     body: plan.body.clone(),
                     attachments,
                     edited_at: None,
+                    session_id: match actor {
+                        Actor::Session(id) => Some(*id),
+                        _ => None,
+                    },
                 };
                 conn.execute(
-                    "INSERT INTO today_notes (id, task_id, day, at, mono_id, body, attachments_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO today_notes (id, task_id, day, at, mono_id, body, attachments_json, session_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         note.id,
                         note.task_id,
@@ -155,7 +161,8 @@ impl Store {
                         note.at.min(i64::MAX as u64) as i64,
                         note.mono_id,
                         note.body,
-                        json
+                        json,
+                        note.session_id
                     ],
                 )
                 .map_err(sql)?;

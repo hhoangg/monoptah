@@ -4,12 +4,13 @@
 //! capability. Input never names a Mono, so no field can claim an identity.
 //! Everything a source says is data: it is validated and stored, never obeyed.
 use super::{
-    statuses, visible_to, workday, Actor, DayMode, Kind, MonoCaller, NewTask, Priority, Stage,
-    Status, SyncItem, SyncRequest, Task, TaskPatch, WorkflowStatus,
+    attachments::agent_files, statuses, visible_to, workday, Actor, DayMode, Kind, MonoCaller,
+    NewTask, Note, Priority, Stage, Status, SyncItem, SyncRequest, Task, TaskPatch, WorkflowStatus,
 };
 use crate::{files::path_key, notes, store::Store};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 const MAX_TITLE: usize = 500;
@@ -36,8 +37,8 @@ pub fn fields(action: &str) -> Option<&'static str> {
         "today.sync" => "source name provider status items error",
         "today.add" => "title day project priority due dueTime link reason tags",
         "today.update" => "id title priority project due dueTime tags reason",
-        "today.note" => "id body",
-        "today.editNote" => "id note body",
+        "today.note" => "id body files",
+        "today.editNote" => "id note body removeAttachments",
         "today.deleteNote" => "id note",
         "today.complete" | "today.dismiss" => "id",
         "today.snooze" => "id until",
@@ -95,21 +96,16 @@ pub fn handle(
         }
         "today.note" => {
             let task = resolve(store, caller, input)?;
-            let body = note_body(input)?;
-            Ok(json!({ "note": store.today_note(&task.id, &body, &actor, now)? }))
+            let note = write_note(store, &task.id, &actor, None, input, now)?;
+            Ok(json!({ "note": note }))
         }
         "today.editNote" => {
             let task = resolve(store, caller, input)?;
-            let note = note_id(input)?;
-            let body = note_body(input)?;
-            let note = store.today_edit_note(&task.id, &note, &body, &[], &actor, now)?;
-            Ok(json!({ "note": note }))
+            Ok(json!({ "note": edit_note(store, &task.id, &actor, input, now)? }))
         }
         "today.deleteNote" => {
             let task = resolve(store, caller, input)?;
-            let note = note_id(input)?;
-            store.today_delete_note(&task.id, &note, &actor, now)?;
-            Ok(json!({ "deleted": true }))
+            delete_note(store, &task.id, &actor, input, now)
         }
         "today.complete" | "today.snooze" | "today.dismiss" => {
             // No user is present in a run, and agents never hide a user's tasks.
@@ -133,6 +129,171 @@ pub fn handle(
             Ok(json!({ "task": task_json(&task, &store.today_tags()?)? }))
         }
         _ => Err("Unknown today action".into()),
+    }
+}
+
+// --- plain coding sessions -------------------------------------------------------------------
+
+const SESSION_ACTIONS: [&str; 4] = [
+    "today.current",
+    "today.note",
+    "today.editNote",
+    "today.deleteNote",
+];
+const SESSION_ONLY: &str =
+    "Sessions can only use today.current, today.note, today.editNote and today.deleteNote";
+const SESSION_UNLINKED: &str =
+    "This session is not linked to a Today task. Ask the user to link it from the task first.";
+const SESSION_OTHER_TASK: &str = "Sessions can only write to their linked task";
+
+/// Whether a plain coding session may call `action` (the four `today.*` actions
+/// that work on its linked task).
+pub fn session_action(action: &str) -> bool {
+    SESSION_ACTIONS.contains(&action)
+}
+
+/// Runs a `today.*` action for a plain coding session on the task it is linked
+/// to. `roots` are the folders the session may attach files from (its project
+/// and worktree). Blocking: call it off the UI thread.
+pub fn handle_session(
+    store: &Store,
+    session_id: i64,
+    roots: &[PathBuf],
+    action: &str,
+    input: &Value,
+    now: u64,
+) -> Result<Value, String> {
+    if !session_action(action) {
+        return Err(SESSION_ONLY.into());
+    }
+    let input = input.as_object().ok_or("Input must be an object")?;
+    let allowed = if action == "today.current" {
+        "id"
+    } else {
+        fields(action).unwrap_or_default()
+    };
+    if let Some(key) = input
+        .keys()
+        .find(|k| !allowed.split_whitespace().any(|f| f == k.as_str()))
+    {
+        return Err(format!("{action} does not take {key}"));
+    }
+    let linked = store
+        .today_session_task(session_id)?
+        .ok_or(SESSION_UNLINKED)?;
+    let task = store.today_task(&linked)?.ok_or(SESSION_UNLINKED)?;
+    if let Some(id) = string(input, "id")? {
+        let id = id.trim();
+        if id != task.id && id != task.key {
+            return Err(SESSION_OTHER_TASK.into());
+        }
+    }
+    let actor = Actor::Session(session_id);
+    match action {
+        "today.current" => {
+            store.today_roll(now)?;
+            let defs = store.today_tags()?;
+            let workflow = statuses::resolve(&task, &store.today_statuses()?).clone();
+            let mut value = task_json(&task, &defs)?;
+            value["workflowStatus"] = workflow_json(&workflow);
+            let mut notes = store.today_notes(&task.id)?;
+            let skip = notes.len().saturating_sub(LISTED_NOTES);
+            notes.drain(..skip);
+            Ok(json!({ "task": value, "notes": notes, "notice": NOTICE }))
+        }
+        "today.note" => {
+            let note = write_note(store, &task.id, &actor, Some(roots), input, now)?;
+            Ok(json!({ "note": note }))
+        }
+        "today.editNote" => Ok(json!({ "note": edit_note(store, &task.id, &actor, input, now)? })),
+        _ => delete_note(store, &task.id, &actor, input, now),
+    }
+}
+
+// --- notes -----------------------------------------------------------------------------------
+
+/// Writes a note on `task_id`. With `files`, each path is checked by
+/// [`agent_files`] (`roots` limits where they may live; `None` is a Mono), the
+/// files are copied, and the note is committed only if every copy worked.
+fn write_note(
+    store: &Store,
+    task_id: &str,
+    actor: &Actor,
+    roots: Option<&[PathBuf]>,
+    input: &Map<String, Value>,
+    now: u64,
+) -> Result<Note, String> {
+    let files = string_list(input, "files")?;
+    if files.is_empty() {
+        let body = note_body(input)?;
+        return store.today_note(task_id, &body, actor, now);
+    }
+    let body = string(input, "body")?.unwrap_or_default();
+    if body.trim().chars().count() > MAX_NOTE_CHARS {
+        return Err(format!("body must be at most {MAX_NOTE_CHARS} characters"));
+    }
+    let data_dir = store
+        .data_dir()
+        .ok_or("Attachment storage is unavailable")?;
+    let paths = agent_files(&files, roots, data_dir)?;
+    let plan = store.today_note_plan(task_id, &body, paths.len(), actor, now)?;
+    let (attachments, skipped) = plan.copy(&paths)?;
+    if !skipped.is_empty() {
+        plan.discard();
+        return Err(skipped.join("\n"));
+    }
+    Ok(store
+        .today_note_commit(plan, attachments, skipped, actor, now)?
+        .note)
+}
+
+/// Replaces a note's text and drops the attachments named in `removeAttachments`.
+/// The text may be empty when the note keeps an attachment; the store refuses a
+/// note left with nothing.
+fn edit_note(
+    store: &Store,
+    task_id: &str,
+    actor: &Actor,
+    input: &Map<String, Value>,
+    now: u64,
+) -> Result<Note, String> {
+    let note = note_id(input)?;
+    let body = string(input, "body")?.ok_or("Provide body")?;
+    if body.trim().chars().count() > MAX_NOTE_CHARS {
+        return Err(format!("body must be at most {MAX_NOTE_CHARS} characters"));
+    }
+    let remove = string_list(input, "removeAttachments")?;
+    store.today_edit_note(task_id, &note, &body, &remove, actor, now)
+}
+
+fn delete_note(
+    store: &Store,
+    task_id: &str,
+    actor: &Actor,
+    input: &Map<String, Value>,
+    now: u64,
+) -> Result<Value, String> {
+    let note = note_id(input)?;
+    store.today_delete_note(task_id, &note, actor, now)?;
+    Ok(json!({ "deleted": true }))
+}
+
+/// A list of texts under `key`; absent or null is an empty list.
+fn string_list(map: &Map<String, Value>, key: &str) -> Result<Vec<String>, String> {
+    match map.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) if items.len() <= super::attachments::MAX_PER_NOTE => items
+            .iter()
+            .map(|item| match item {
+                Value::String(s) if !s.trim().is_empty() => Ok(s.clone()),
+                _ => Err(format!("{key} must be a list of non-empty texts")),
+            })
+            .collect(),
+        Some(Value::Array(_)) => Err(format!(
+            "{key} holds at most {} entries",
+            super::attachments::MAX_PER_NOTE
+        )),
+        Some(_) => Err(format!("{key} must be a list of texts")),
     }
 }
 
@@ -1525,10 +1686,10 @@ mod tests {
         .contains("5000"));
         assert!(call(
             "today.editNote",
-            json!({"id": "gh:1", "note": note, "body": "x", "removeAttachments": []})
+            json!({"id": "gh:1", "note": note, "body": "x", "files": []})
         )
         .unwrap_err()
-        .contains("does not take removeAttachments"));
+        .contains("does not take files"));
         assert!(call("today.deleteNote", json!({"id": "gh:1"})).is_err());
         assert!(call("today.deleteNote", json!({"id": "gh:1", "note": 5})).is_err());
         assert_eq!(
@@ -1820,5 +1981,306 @@ mod tests {
         sync_ok(&store, &a, "gh", json!([other]));
         assert_eq!(task(&store, "gh:1").tags, vec![bug.id, ui.id]);
         assert_eq!(store.today_tags().unwrap().len(), 2);
+    }
+
+    // --- notes with files, and plain sessions ---
+
+    fn named_dir() -> tempfile::TempDir {
+        // Not `tempdir()`: its names start with a dot, which file attachment refuses.
+        tempfile::Builder::new().prefix("src").tempdir().unwrap()
+    }
+    fn file_in(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, name.as_bytes()).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+    fn linked(store: &Store, session: i64) -> Task {
+        let task = store
+            .today_add(
+                &NewTask {
+                    title: "Ship".into(),
+                    ..NewTask::default()
+                },
+                &Actor::User,
+                NOW,
+            )
+            .unwrap();
+        store.today_link_session(session, &task.id, NOW).unwrap();
+        task
+    }
+    fn session(
+        store: &Store,
+        id: i64,
+        roots: &[PathBuf],
+        action: &str,
+        input: Value,
+    ) -> Result<Value, String> {
+        handle_session(store, id, roots, action, &input, NOW)
+    }
+
+    #[test]
+    fn a_mono_note_with_files_copies_them_and_the_body_may_be_empty() {
+        let (_dir, store) = store();
+        let a = mono("a", &[]);
+        sync_ok(&store, &a, "gh", json!([item("gh:1")]));
+        let src = named_dir();
+        let report = file_in(src.path(), "report.md");
+        let page = file_in(src.path(), "page.html");
+        let out = call(
+            &store,
+            &a,
+            "today.note",
+            json!({"id": "gh:1", "files": [report, page]}),
+        )
+        .unwrap();
+        let attached = out["note"]["attachments"].as_array().unwrap();
+        assert_eq!(attached.len(), 2);
+        assert_eq!(out["note"]["body"], "");
+        assert_eq!(out["note"]["monoId"], "a");
+        for attachment in attached {
+            let stored = attachment["path"].as_str().unwrap();
+            assert!(std::path::Path::new(stored).is_file(), "{stored}");
+            assert!(!stored.starts_with(src.path().to_str().unwrap()));
+        }
+        // Without files nothing changed: the body is still required.
+        assert!(call(&store, &a, "today.note", json!({"id": "gh:1"})).is_err());
+    }
+
+    #[test]
+    fn one_bad_file_writes_no_note_and_leaves_no_copies() {
+        let (dir, store) = store();
+        let a = mono("a", &[]);
+        sync_ok(&store, &a, "gh", json!([item("gh:1")]));
+        let src = named_dir();
+        let good = file_in(src.path(), "good.md");
+        let hidden = file_in(src.path(), ".env");
+        let missing = src.path().join("gone.md").to_string_lossy().into_owned();
+        for bad in [hidden, missing] {
+            let error = call(
+                &store,
+                &a,
+                "today.note",
+                json!({"id": "gh:1", "body": "hi", "files": [good, bad]}),
+            )
+            .unwrap_err();
+            assert!(error.contains(&bad), "{error}");
+        }
+        assert!(store
+            .today_notes(&task(&store, "gh:1").id)
+            .unwrap()
+            .is_empty());
+        assert!(!dir.path().join("today-attachments").exists());
+    }
+
+    #[test]
+    fn a_copy_that_fails_discards_the_folder_and_writes_no_note() {
+        let (dir, store) = store();
+        let a = mono("a", &[]);
+        sync_ok(&store, &a, "gh", json!([item("gh:1")]));
+        let src = named_dir();
+        let good = file_in(src.path(), "good.md");
+        let doomed = file_in(src.path(), "doomed.md");
+        // Valid when checked, gone by the time it is copied.
+        let paths = [good, doomed.clone()];
+        let validated = crate::today::attachments::agent_files(&paths, None, dir.path()).unwrap();
+        let id = task(&store, "gh:1").id;
+        let plan = store
+            .today_note_plan(&id, "hi", validated.len(), &Actor::Mono(a.clone()), NOW)
+            .unwrap();
+        std::fs::remove_file(&doomed).unwrap();
+        let (_, skipped) = plan.copy(&validated).unwrap();
+        assert_eq!(skipped.len(), 1);
+        plan.discard();
+        assert!(store.today_notes(&id).unwrap().is_empty());
+        assert!(
+            !dir.path().join("today-attachments").join(&id).exists()
+                || std::fs::read_dir(dir.path().join("today-attachments").join(&id))
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
+    }
+
+    #[test]
+    fn an_edit_removes_attachments_by_their_stored_file() {
+        let (_dir, store) = store();
+        let a = mono("a", &[]);
+        sync_ok(&store, &a, "gh", json!([item("gh:1")]));
+        let src = named_dir();
+        let out = call(
+            &store,
+            &a,
+            "today.note",
+            json!({"id": "gh:1", "body": "v1", "files": [file_in(src.path(), "a.md"), file_in(src.path(), "b.md")]}),
+        )
+        .unwrap();
+        let note = out["note"]["id"].as_str().unwrap().to_string();
+        let first = out["note"]["attachments"][0]["file"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let edited = call(
+            &store,
+            &a,
+            "today.editNote",
+            json!({"id": "gh:1", "note": note, "body": "v1", "removeAttachments": [first]}),
+        )
+        .unwrap();
+        assert_eq!(edited["note"]["attachments"].as_array().unwrap().len(), 1);
+        let error = call(
+            &store,
+            &a,
+            "today.editNote",
+            json!({"id": "gh:1", "note": note, "body": "v1", "removeAttachments": ["nope"]}),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Attachment not found");
+    }
+
+    #[test]
+    fn a_session_is_limited_to_four_actions_and_a_linked_task() {
+        let (_dir, store) = store();
+        let error = session(&store, 7, &[], "today.list", json!({})).unwrap_err();
+        assert_eq!(
+            error,
+            "Sessions can only use today.current, today.note, today.editNote and today.deleteNote"
+        );
+        for action in SESSION_ACTIONS {
+            assert!(session_action(action));
+        }
+        assert!(!session_action("today.add") && !session_action("today.sync"));
+        for action in SESSION_ACTIONS {
+            let error = session(&store, 7, &[], action, json!({})).unwrap_err();
+            assert_eq!(
+                error,
+                "This session is not linked to a Today task. Ask the user to link it from the task first."
+            );
+        }
+        let task = linked(&store, 7);
+        let error = session(&store, 7, &[], "today.current", json!({"id": "gh:9"})).unwrap_err();
+        assert_eq!(error, "Sessions can only write to their linked task");
+        for id in [task.id.as_str(), task.key.as_str()] {
+            assert!(session(&store, 7, &[], "today.current", json!({"id": id})).is_ok());
+        }
+        // Another session, linked elsewhere, cannot name this task.
+        let other = linked(&store, 8);
+        let error = session(&store, 8, &[], "today.current", json!({"id": task.id})).unwrap_err();
+        assert_eq!(error, "Sessions can only write to their linked task");
+        assert_ne!(other.id, task.id);
+        assert!(session(&store, 8, &[], "today.current", json!({"nope": 1})).is_err());
+    }
+
+    #[test]
+    fn today_current_returns_the_task_and_its_notes_with_paths() {
+        let (_dir, store) = store();
+        let task = linked(&store, 7);
+        let src = named_dir();
+        let roots = [src.path().to_path_buf()];
+        let file = file_in(src.path(), "r.md");
+        session(
+            &store,
+            7,
+            &roots,
+            "today.note",
+            json!({"body": "from the session", "files": [file]}),
+        )
+        .unwrap();
+        let out = session(&store, 7, &roots, "today.current", json!({})).unwrap();
+        assert_eq!(out["task"]["id"], task.id.as_str());
+        assert_eq!(out["task"]["workflowStatus"]["name"], "To do");
+        assert_eq!(out["notice"], NOTICE);
+        let notes = out["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["sessionId"], 7);
+        assert!(notes[0].get("monoId").is_none() || notes[0]["monoId"].is_null());
+        let stored = notes[0]["attachments"][0]["path"].as_str().unwrap();
+        assert!(std::path::Path::new(stored).is_absolute());
+    }
+
+    #[test]
+    fn a_session_note_is_limited_to_its_roots() {
+        let (_dir, store) = store();
+        linked(&store, 7);
+        let (inside, outside) = (named_dir(), named_dir());
+        let roots = [inside.path().to_path_buf()];
+        let ok = file_in(inside.path(), "ok.md");
+        let bad = file_in(outside.path(), "bad.md");
+        assert!(session(&store, 7, &roots, "today.note", json!({"files": [ok]})).is_ok());
+        let error = session(&store, 7, &roots, "today.note", json!({"files": [bad]})).unwrap_err();
+        assert!(error.contains(&bad), "{error}");
+        // No roots at all means nothing can be attached.
+        let ok = file_in(inside.path(), "ok2.md");
+        assert!(session(&store, 7, &[], "today.note", json!({"files": [ok]})).is_err());
+    }
+
+    #[test]
+    fn a_session_edits_and_deletes_only_its_own_notes() {
+        let (_dir, store) = store();
+        let task = linked(&store, 7);
+        let a = mono("a", &[]);
+        let users = store
+            .today_note(&task.id, "user", &Actor::User, NOW)
+            .unwrap();
+        let monos = store
+            .today_note(&task.id, "mono", &Actor::Mono(a.clone()), NOW)
+            .unwrap();
+        let mine = session(&store, 7, &[], "today.note", json!({"body": "mine"})).unwrap();
+        let mine = mine["note"]["id"].as_str().unwrap().to_string();
+        for other in [&users.id, &monos.id] {
+            let edit = session(
+                &store,
+                7,
+                &[],
+                "today.editNote",
+                json!({"note": other, "body": "x"}),
+            )
+            .unwrap_err();
+            assert_eq!(edit, "A session can only edit or delete its own notes");
+            let delete =
+                session(&store, 7, &[], "today.deleteNote", json!({"note": other})).unwrap_err();
+            assert_eq!(delete, "A session can only edit or delete its own notes");
+        }
+        // Another session cannot touch it, nor can a Mono.
+        linked(&store, 8);
+        assert!(session(
+            &store,
+            8,
+            &[],
+            "today.editNote",
+            json!({"note": mine, "body": "x"})
+        )
+        .is_err());
+        let seen = mono("a", &[]);
+        for (action, input) in [
+            (
+                "today.editNote",
+                json!({"id": task.id, "note": mine, "body": "x"}),
+            ),
+            ("today.deleteNote", json!({"id": task.id, "note": mine})),
+        ] {
+            assert_eq!(
+                call(&store, &seen, action, input).unwrap_err(),
+                "A Mono can only edit or delete its own notes"
+            );
+        }
+        let edited = session(
+            &store,
+            7,
+            &[],
+            "today.editNote",
+            json!({"note": mine, "body": "changed"}),
+        )
+        .unwrap();
+        assert_eq!(edited["note"]["body"], "changed");
+        assert_eq!(edited["note"]["sessionId"], 7);
+        let deleted = session(&store, 7, &[], "today.deleteNote", json!({"note": mine})).unwrap();
+        assert_eq!(deleted, json!({"deleted": true}));
+        let left: Vec<_> = store
+            .today_notes(&task.id)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.body)
+            .collect();
+        assert_eq!(left, ["user", "mono"]);
     }
 }

@@ -600,6 +600,7 @@ mod tests {
             body: body.into(),
             attachments,
             edited_at: None,
+            session_id: None,
         }
     }
     /// A selected task with these notes, and a recorder in place of the system.
