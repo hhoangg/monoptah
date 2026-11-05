@@ -1,0 +1,384 @@
+use super::*;
+use crate::codespaces::GhOutput;
+use std::sync::Mutex;
+
+const AUTH_OK: &str = "github.com\n  ✓ Logged in to github.com account me (keyring)\n  - Token scopes: 'codespace', 'repo'\n";
+const AUTH_NO_SCOPE: &str =
+    "github.com\n  ✓ Logged in to github.com account me (keyring)\n  - Token scopes: 'repo'\n";
+
+/// Replies by the first rule whose words are all in the joined argv.
+struct FakeGh {
+    rules: Mutex<Vec<(String, Result<GhOutput, String>)>>,
+    calls: Mutex<Vec<String>>,
+}
+impl FakeGh {
+    fn new(rules: Vec<(&str, Result<GhOutput, String>)>) -> Arc<Self> {
+        Arc::new(Self {
+            rules: Mutex::new(rules.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
+            calls: Mutex::new(vec![]),
+        })
+    }
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+impl GhRunner for FakeGh {
+    fn run(&self, args: &[String], _stdin: Option<&str>) -> Result<GhOutput, String> {
+        let line = args.join(" ");
+        self.calls.lock().unwrap().push(line.clone());
+        self.rules
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| line.contains(key.as_str()))
+            .map(|(_, reply)| reply.clone())
+            .unwrap_or_else(|| panic!("unexpected gh call: {line}"))
+    }
+}
+fn ok(stdout: &str) -> Result<GhOutput, String> {
+    Ok(GhOutput {
+        success: true,
+        stdout: stdout.into(),
+        stderr: String::new(),
+    })
+}
+fn fail(stderr: &str) -> Result<GhOutput, String> {
+    Ok(GhOutput {
+        success: false,
+        stdout: String::new(),
+        stderr: stderr.into(),
+    })
+}
+
+#[derive(Default)]
+struct FakeHost {
+    machines: Mutex<Vec<Machine>>,
+    log: Mutex<Vec<String>>,
+}
+impl FakeHost {
+    fn with_machine(name: &str) -> Arc<Self> {
+        let host = Arc::new(Self::default());
+        host.machines.lock().unwrap().push(machine(name));
+        host
+    }
+    fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+}
+fn machine(codespace: &str) -> Machine {
+    Machine {
+        id: format!("m-{codespace}"),
+        name: codespace.into(),
+        endpoint: format!("codespace://{codespace}"),
+        environment_id: format!("env-{codespace}"),
+        ssh: None,
+        codespace: Some(codespace.into()),
+    }
+}
+impl Host for FakeHost {
+    fn machines(&self) -> Result<Vec<Machine>, String> {
+        Ok(self.machines.lock().unwrap().clone())
+    }
+    fn connect(
+        &self,
+        codespace: &str,
+        display: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
+        progress("pairing");
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("connect {codespace} {display}"));
+        let m = machine(codespace);
+        self.machines.lock().unwrap().push(m.clone());
+        Ok(m)
+    }
+    fn ensure(&self, machine_id: &str) -> Result<(), String> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("ensure {machine_id}"));
+        Ok(())
+    }
+    fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("request {machine_id} {method} {}", params["cwd"]));
+        Ok(json!({"id":"project-1","cwd":params["cwd"]}))
+    }
+    fn disconnect(&self, machine_id: &str) -> Result<(), String> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("disconnect {machine_id}"));
+        self.machines.lock().unwrap().retain(|m| m.id != machine_id);
+        Ok(())
+    }
+}
+
+fn service(gh: &Arc<FakeGh>, host: &Arc<FakeHost>) -> CloudSessions {
+    let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+    CloudSessions::new(gh.clone(), host.clone(), store)
+        .with_origin(|_| Ok("git@github.com:octo/widgets.git".into()))
+}
+const LIST: &str =
+    r#"[{"name":"octo-abc","displayName":"my cs","state":"Shutdown","repository":"octo/widgets"}]"#;
+
+fn named(name: &str) -> Target {
+    Target {
+        codespace: CodespaceChoice::Named(name.into()),
+        branch: None,
+        machine: None,
+    }
+}
+use std::path::Path;
+
+#[test]
+fn named_target_reuses_machine_wakes_it_opens_the_project_and_records_the_binding() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+    ]);
+    let host = FakeHost::with_machine("octo-abc");
+    let svc = service(&gh, &host);
+    let binding = svc
+        .prepare_target("/Users/me/widgets", named("octo-abc"), &mut |_| {})
+        .unwrap();
+    assert_eq!(binding.repo, "octo/widgets");
+    assert_eq!(binding.codespace, "octo-abc");
+    assert_eq!(
+        binding.project_key,
+        "remote://env-octo-abc/workspaces/widgets"
+    );
+    assert_eq!(binding.remote_cwd, "/workspaces/widgets");
+    // Reused machine: wake it, never pair again.
+    assert_eq!(
+        host.log(),
+        vec![
+            "ensure m-octo-abc".to_string(),
+            "request m-octo-abc projects.open \"/workspaces/widgets\"".to_string()
+        ]
+    );
+    // The binding links the remote project back to the local one.
+    let session = svc.create_session(&binding, "claude").unwrap();
+    assert_eq!(session.cwd, binding.project_key);
+    let found = svc.cloud_sessions_for("/Users/me/widgets").unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].summary.id, session.id);
+    assert_eq!(found[0].codespace, "octo-abc");
+    assert!(svc
+        .cloud_sessions_for("/Users/me/other")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn new_target_creates_waits_pairs_and_skips_the_extra_wake() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace create", ok("octo-new1\n")),
+        ("codespace view", ok(r#"{"state":"Available"}"#)),
+    ]);
+    let host = Arc::new(FakeHost::default());
+    let svc = service(&gh, &host);
+    let mut progress = vec![];
+    let binding = svc
+        .prepare_target(
+            "/Users/me/widgets",
+            Target {
+                codespace: CodespaceChoice::New,
+                branch: Some("main".into()),
+                machine: None,
+            },
+            &mut |line| progress.push(line.to_string()),
+        )
+        .unwrap();
+    assert_eq!(binding.codespace, "octo-new1");
+    assert!(gh.calls().iter().any(|c| c.contains("--branch main")));
+    assert_eq!(host.log()[0], "connect octo-new1 monoptah-main".to_string());
+    assert!(!host.log().iter().any(|l| l.starts_with("ensure")));
+    assert!(progress.iter().any(|p| p == "pairing"), "{progress:?}");
+}
+
+#[test]
+fn bad_targets_fail_before_touching_codespaces() {
+    let host = Arc::new(FakeHost::default());
+    // Missing scope: actionable, nothing else runs.
+    let gh = FakeGh::new(vec![("auth status", ok(AUTH_NO_SCOPE))]);
+    let error = service(&gh, &host)
+        .prepare_target("/p", named("octo-abc"), &mut |_| {})
+        .unwrap_err();
+    assert!(error.contains("gh auth refresh"), "{error}");
+    assert_eq!(gh.calls().len(), 1);
+    // New needs a branch.
+    let gh = FakeGh::new(vec![("auth status", ok(AUTH_OK))]);
+    let error = service(&gh, &host)
+        .prepare_target(
+            "/p",
+            Target {
+                codespace: CodespaceChoice::New,
+                branch: Some("  ".into()),
+                machine: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+    assert!(error.contains("branch"), "{error}");
+    // A codespace of another repository is refused.
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok("[]")),
+    ]);
+    let error = service(&gh, &host)
+        .prepare_target("/p", named("octo-abc"), &mut |_| {})
+        .unwrap_err();
+    assert!(error.contains("does not belong"), "{error}");
+    assert!(host.log().is_empty());
+    // No GitHub origin.
+    let gh = FakeGh::new(vec![("auth status", ok(AUTH_OK))]);
+    let svc = service(&gh, &host).with_origin(|_| Err("no origin".into()));
+    assert_eq!(
+        svc.prepare_target("/p", named("x"), &mut |_| {})
+            .unwrap_err(),
+        "no origin"
+    );
+}
+
+#[test]
+fn only_claude_sessions_can_be_created() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+    ]);
+    let host = FakeHost::with_machine("octo-abc");
+    let svc = service(&gh, &host);
+    let binding = svc
+        .prepare_target("/p", named("octo-abc"), &mut |_| {})
+        .unwrap();
+    let error = svc.create_session(&binding, "codex").unwrap_err();
+    assert!(error.contains("Claude only"), "{error}");
+    assert!(svc.cloud_sessions_for("/p").unwrap().is_empty());
+}
+
+#[test]
+fn state_is_cached_never_errors_and_maps_gh_states() {
+    let gh = FakeGh::new(vec![("codespace view", ok(r#"{"state":"Shutdown"}"#))]);
+    let svc = service(&gh, &Arc::new(FakeHost::default()));
+    assert_eq!(svc.cloud_state("octo-abc"), CloudState::Stopped);
+    assert_eq!(svc.codespace_state("octo-abc").unwrap(), "Shutdown");
+    assert_eq!(gh.calls().len(), 1, "second read must hit the cache");
+    svc.invalidate("octo-abc");
+    svc.cloud_state("octo-abc");
+    assert_eq!(gh.calls().len(), 2);
+    // A failing lookup is a state, not an error.
+    let gh = FakeGh::new(vec![("codespace view", fail("boom"))]);
+    let svc = service(&gh, &Arc::new(FakeHost::default()));
+    assert_eq!(svc.cloud_state("octo-abc"), CloudState::Unknown);
+    for (raw, state) in [
+        ("Available", CloudState::Available),
+        ("Starting", CloudState::Starting),
+        ("Provisioning", CloudState::Starting),
+        ("ShuttingDown", CloudState::Stopping),
+        ("Failed", CloudState::Unavailable),
+        ("???", CloudState::Unknown),
+    ] {
+        assert_eq!(CloudState::from_gh(raw), state);
+    }
+}
+
+#[test]
+fn state_cache_expires_after_the_ttl() {
+    let gh = FakeGh::new(vec![("codespace view", ok(r#"{"state":"Available"}"#))]);
+    let mut svc = service(&gh, &Arc::new(FakeHost::default()));
+    svc.ttl = Duration::ZERO;
+    svc.cloud_state("octo-abc");
+    svc.cloud_state("octo-abc");
+    assert_eq!(gh.calls().len(), 2);
+}
+
+fn cloud_session(provider: &str, environment: &str, codespace: Option<&str>) -> RemoteSession {
+    let store = Store::open(Path::new(":memory:")).unwrap();
+    let mut project = store
+        .remember_remote_project(environment, &json!({"id":"p","cwd":"/workspaces/widgets"}))
+        .unwrap();
+    project.codespace = codespace.map(str::to_string);
+    let summary = store.create("claude", &project.key).unwrap();
+    let mut session = store.remote_session(summary.id).unwrap().unwrap();
+    session.project = project;
+    session.summary.provider = provider.into();
+    session
+}
+
+#[test]
+fn ensure_before_send_wakes_only_cloud_sessions_and_only_for_claude() {
+    let host = FakeHost::with_machine("octo-abc");
+    // Ordinary remote session: untouched.
+    ensure_before_send(&*host, &cloud_session("codex", "env-octo-abc", None)).unwrap();
+    assert!(host.log().is_empty());
+    // Cloud + claude: wakes the matching machine.
+    ensure_before_send(
+        &*host,
+        &cloud_session("claude", "env-octo-abc", Some("octo-abc")),
+    )
+    .unwrap();
+    assert_eq!(host.log(), vec!["ensure m-octo-abc".to_string()]);
+    // Cloud + other harness: rejected before any wake.
+    let error = ensure_before_send(
+        &*host,
+        &cloud_session("codex", "env-octo-abc", Some("octo-abc")),
+    )
+    .unwrap_err();
+    assert!(error.contains("Claude only"), "{error}");
+    // Machine forgotten: clear error, no wake.
+    let error =
+        ensure_before_send(&*host, &cloud_session("claude", "env-gone", Some("gone"))).unwrap_err();
+    assert!(error.contains("no longer connected"), "{error}");
+    assert_eq!(host.log().len(), 1);
+}
+
+#[test]
+fn delete_disconnects_and_forgets_but_a_failed_delete_keeps_everything() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+        ("codespace delete", fail("HTTP 500")),
+    ]);
+    let host = FakeHost::with_machine("octo-abc");
+    let svc = service(&gh, &host);
+    let binding = svc
+        .prepare_target("/p", named("octo-abc"), &mut |_| {})
+        .unwrap();
+    svc.create_session(&binding, "claude").unwrap();
+    assert!(svc.delete_codespace("octo-abc").is_err());
+    assert_eq!(svc.cloud_sessions_for("/p").unwrap().len(), 1);
+    assert!(!host.log().iter().any(|l| l.starts_with("disconnect")));
+
+    gh.rules.lock().unwrap()[2].1 = ok("");
+    svc.delete_codespace("octo-abc").unwrap();
+    assert!(host.log().contains(&"disconnect m-octo-abc".to_string()));
+    assert!(svc.cloud_sessions_for("/p").unwrap().is_empty());
+    assert!(gh.calls().iter().any(|c| c.contains("--force")));
+}
+
+#[test]
+fn stop_runs_gh_and_drops_the_cached_state() {
+    let gh = FakeGh::new(vec![
+        ("codespace view", ok(r#"{"state":"Available"}"#)),
+        ("codespace stop", ok("")),
+    ]);
+    let svc = service(&gh, &Arc::new(FakeHost::default()));
+    assert_eq!(svc.cloud_state("octo-abc"), CloudState::Available);
+    svc.stop_codespace("octo-abc").unwrap();
+    svc.cloud_state("octo-abc");
+    let calls = gh.calls();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(calls[1].contains("codespace stop"));
+}
+
+#[test]
+fn not_connected_errors_are_recognised_as_a_state() {
+    assert!(is_not_connected(remote::CODESPACE_NOT_CONNECTED));
+    assert!(!is_not_connected("Machine is unreachable"));
+}

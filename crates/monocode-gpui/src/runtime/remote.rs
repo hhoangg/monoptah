@@ -529,6 +529,19 @@ pub(crate) fn run_with_client(
                 .into());
         }
         let machine = binding.machine(&client)?;
+        if !attaching {
+            // Cloud sessions: a send after an idle stop must wake the codespace
+            // and its host before anything is dispatched. This closure runs on a
+            // background executor thread (conversation.rs spawns it there), so
+            // blocking for the boot is fine. Attaching never wakes.
+            if binding.project.codespace.is_some() {
+                monocode_core::cloud_sessions::require_claude(&binding.summary.provider)?;
+                let mut waking = update("Waking codespace…", false);
+                waking.start = latest_rows.len();
+                let _ = tx.send_blocking(waking);
+            }
+            monocode_core::cloud_sessions::ensure_before_send(&client, &binding)?;
+        }
         if !attaching && !retrying {
             if !binding.outbox.is_empty() {
                 return Err("A remote command needs confirmation. Choose Retry before sending another message.".into());
@@ -781,6 +794,13 @@ pub(crate) fn run_with_client(
         Ok(())
     })();
     if let Err(error) = result {
+        // A stopped or unreachable codespace is a state of the cloud session,
+        // not a failure: say so plainly instead of surfacing the transport error.
+        let error = if monocode_core::cloud_sessions::is_not_connected(&error) {
+            "Codespace is stopped. Send a message to wake it.".to_string()
+        } else {
+            error
+        };
         let mut next = update(error, true);
         // Every valid snapshot was already published. An empty error patch
         // preserves any optimistic prompt awaiting a host receipt.

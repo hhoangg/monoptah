@@ -796,3 +796,77 @@ fn host_context_and_latest_turn_metrics_use_actual_session_fields() {
     assert_eq!(context.unwrap().window, None);
     assert!(metrics.is_none());
 }
+
+fn cloud_binding(store: &Database, provider: &str) -> RemoteSession {
+    let store = locked(store).unwrap();
+    let project = store
+        .remember_cloud_project(
+            "env",
+            &json!({"id":"project","cwd":"/workspaces/repo"}),
+            "/Users/me/repo",
+            "octo-abc",
+        )
+        .unwrap();
+    let summary = store.create(provider, &project.key).unwrap();
+    store.remote_session(summary.id).unwrap().unwrap()
+}
+
+#[test]
+fn cloud_sessions_reject_other_harnesses_before_any_transport() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let binding = cloud_binding(&store, "codex");
+    let host = Host::new(|_| panic!("nothing may be dispatched"));
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client(
+        host.client.clone(),
+        binding.summary.clone(),
+        "hello".into(),
+        Settings::default(),
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let result = receive(&rx);
+    assert!(result.finished);
+    assert!(result.status.contains("Claude only"), "{}", result.status);
+    assert!(
+        locked(&store)
+            .unwrap()
+            .remote_session(binding.summary.id)
+            .unwrap()
+            .unwrap()
+            .outbox
+            .is_empty()
+    );
+}
+
+#[test]
+fn cloud_send_reports_waking_before_the_host_is_asked_anything_else() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let binding = cloud_binding(&store, "claude");
+    let host = Host::new(|_| Some(json!({"error":"stop here"})));
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client(
+        host.client.clone(),
+        binding.summary.clone(),
+        "hello".into(),
+        Settings {
+            model: Some("claude:sonnet".into()),
+            ..Default::default()
+        },
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let first = receive(&rx);
+    assert_eq!(first.status, "Waking codespace…");
+    assert!(!first.finished);
+    let last = receive(&rx);
+    assert!(last.finished);
+}
