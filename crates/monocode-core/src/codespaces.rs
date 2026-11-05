@@ -163,7 +163,7 @@ fn failure(args: &[String], out: &GhOutput) -> String {
         out.stdout.trim()
     };
     let lower = detail.to_lowercase();
-    if lower.contains("scope") && lower.contains("codespace") || lower.contains("http 403") {
+    if lower.contains("scope") {
         return format!("{SCOPE_HINT} ({detail})");
     }
     if detail.is_empty() {
@@ -191,6 +191,29 @@ fn run_json<T: for<'de> Deserialize<'de>>(
 ) -> Result<T, String> {
     let text = run_ok(runner, args)?;
     serde_json::from_str(&text).map_err(|e| format!("Unexpected gh output: {e}"))
+}
+
+/// Fetch every page of a REST listing and return the pages' objects.
+fn api_pages(runner: &dyn GhRunner, path: &str) -> Result<Vec<serde_json::Value>, String> {
+    let text = run_ok(runner, argv(&["api", "--paginate", "--slurp", path]))?;
+    let mut pages = Vec::new();
+    for value in serde_json::Deserializer::from_str(&text).into_iter::<serde_json::Value>() {
+        match value.map_err(|e| format!("Unexpected gh output: {e}"))? {
+            serde_json::Value::Array(items) => pages.extend(items),
+            other => pages.push(other),
+        }
+    }
+    Ok(pages)
+}
+
+fn collect_field(pages: &[serde_json::Value], list: &str, field: &str) -> Vec<String> {
+    pages
+        .iter()
+        .filter_map(|page| page.get(list).and_then(|l| l.as_array()))
+        .flatten()
+        .filter_map(|item| item.get(field).and_then(|n| n.as_str()))
+        .map(str::to_string)
+        .collect()
 }
 
 /// `owner/repo` from an https, ssh, scp-like or git remote URL.
@@ -294,6 +317,10 @@ pub fn parse_auth_status(text: &str) -> AuthStatus {
     let mut status = AuthStatus::default();
     for line in lines {
         let line = line.trim().trim_start_matches(['-', '✓', 'X', '✗']).trim();
+        if status.user.is_some() && line.starts_with("Logged in to") {
+            // A second account: keep the first one's user and scopes together.
+            break;
+        }
         if status.user.is_none() {
             let account = line
                 .split_once(" account ")
@@ -320,7 +347,7 @@ pub fn parse_auth_status(text: &str) -> AuthStatus {
 }
 
 pub fn auth_status(runner: &dyn GhRunner) -> Result<AuthStatus, String> {
-    let out = runner.run(&argv(&["auth", "status"]), None)?;
+    let out = runner.run(&argv(&["auth", "status", "--active"]), None)?;
     let text = format!("{}\n{}", out.stdout, out.stderr);
     let mut status = parse_auth_status(&text);
     if !out.success && status.user.is_none() {
@@ -450,6 +477,12 @@ pub fn wait_ready_with(
             "Available" => return Ok(()),
             "Failed" | "Deleted" | "Unavailable" => {
                 return Err(format!("Codespace {name} is {current}"));
+            }
+            // `gh codespace view` never starts a codespace, so waiting is futile.
+            "Shutdown" | "ShuttingDown" => {
+                return Err(format!(
+                    "Codespace {name} is {current}; start it first (gh codespace ssh starts it)"
+                ));
             }
             _ => {}
         }
@@ -683,6 +716,15 @@ pub fn valid_secret_key(key: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+fn secret_repos(runner: &dyn GhRunner, key: &str) -> Result<Vec<String>, String> {
+    let path = format!("/user/codespaces/secrets/{key}/repositories?per_page=100");
+    Ok(collect_field(
+        &api_pages(runner, &path)?,
+        "repositories",
+        "full_name",
+    ))
+}
+
 /// Status of each key (plus `CLAUDE_CODE_OAUTH_TOKEN`) for this repo. Values
 /// are never read: GitHub does not return them.
 pub fn secrets_status(
@@ -700,43 +742,21 @@ pub fn secrets_status(
     if let Some(bad) = wanted.iter().find(|k| !valid_secret_key(k)) {
         return Err(format!("Invalid secret name `{bad}`"));
     }
-    let listing: serde_json::Value = run_json(
-        runner,
-        argv(&["api", "/user/codespaces/secrets?per_page=100"]),
-    )?;
-    let existing: HashSet<String> = listing
-        .get("secrets")
-        .and_then(|s| s.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|i| i.get("name").and_then(|n| n.as_str()))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let existing: HashSet<String> = collect_field(
+        &api_pages(runner, "/user/codespaces/secrets?per_page=100")?,
+        "secrets",
+        "name",
+    )
+    .into_iter()
+    .collect();
     let mut result = Vec::new();
     for key in wanted {
         let status = if !existing.contains(&key) {
             SecretState::Missing
         } else {
-            let repos: serde_json::Value = run_json(
-                runner,
-                argv(&[
-                    "api",
-                    &format!("/user/codespaces/secrets/{key}/repositories"),
-                ]),
-            )?;
-            let selected = repos
-                .get("repositories")
-                .and_then(|r| r.as_array())
-                .is_some_and(|items| {
-                    items.iter().any(|i| {
-                        i.get("full_name")
-                            .and_then(|n| n.as_str())
-                            .is_some_and(|n| n.eq_ignore_ascii_case(repo))
-                    })
-                });
+            let selected = secret_repos(runner, &key)?
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(repo));
             if selected {
                 SecretState::Set
             } else {
@@ -757,6 +777,17 @@ pub fn set_secret(runner: &dyn GhRunner, key: &str, value: &str, repo: &str) -> 
     if value.is_empty() {
         return Err("Secret value is empty".into());
     }
+    // `--repos` replaces the selection, so keep the repos the secret already has.
+    let mut repos = match secret_repos(runner, key) {
+        Ok(repos) => repos,
+        Err(error) if error.contains("404") || error.to_lowercase().contains("not found") => {
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
+    if !repos.iter().any(|r| r.eq_ignore_ascii_case(repo)) {
+        repos.push(repo.to_string());
+    }
     let args = argv(&[
         "secret",
         "set",
@@ -765,7 +796,7 @@ pub fn set_secret(runner: &dyn GhRunner, key: &str, value: &str, repo: &str) -> 
         "codespaces",
         "--user",
         "--repos",
-        repo,
+        &repos.join(","),
     ]);
     let out = runner.run(&args, Some(value))?;
     if out.success {

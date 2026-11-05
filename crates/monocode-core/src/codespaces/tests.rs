@@ -98,7 +98,7 @@ fn auth_status_with_scope() {
     let text = "github.com\n  ✓ Logged in to github.com account hhoangg (keyring)\n  - Active account: true\n  - Git operations protocol: https\n  - Token: gho_************\n  - Token scopes: 'codespace', 'gist', 'read:org', 'repo'\n";
     let fake = Fake::new(vec![ok(text)]);
     let status = auth_status(&fake).unwrap();
-    assert_eq!(fake.argv(0), v(&["auth", "status"]));
+    assert_eq!(fake.argv(0), v(&["auth", "status", "--active"]));
     assert!(status.logged_in && status.has_codespace_scope);
     assert_eq!(status.user.as_deref(), Some("hhoangg"));
     assert_eq!(status.scopes, ["codespace", "gist", "read:org", "repo"]);
@@ -163,10 +163,82 @@ fn list_argv_and_parse() {
 #[test]
 fn list_surfaces_scope_error() {
     let fake = Fake::new(vec![fail(
-        "error getting codespaces: HTTP 403: Must have admin rights",
+        "error getting codespaces: HTTP 403: needs the codespace scope",
     )]);
     let err = list(&fake, "a/b").unwrap_err();
     assert!(err.contains("gh auth refresh -h github.com -s codespace"));
+}
+
+#[test]
+fn plain_403_is_not_mapped_to_scope_hint() {
+    let fake = Fake::new(vec![fail(
+        "HTTP 403: Codespaces are disabled by your organization",
+    )]);
+    let err = list(&fake, "a/b").unwrap_err();
+    assert!(!err.contains("auth refresh"));
+    assert!(err.contains("disabled by your organization"));
+}
+
+#[test]
+fn auth_status_multi_account_keeps_first_account_scopes() {
+    let text = "github.com\n  ✓ Logged in to github.com account one (keyring)\n  - Token scopes: 'repo'\n  ✓ Logged in to github.com account two (keyring)\n  - Token scopes: 'codespace'\n";
+    let status = parse_auth_status(text);
+    assert_eq!(status.user.as_deref(), Some("one"));
+    assert!(!status.has_codespace_scope);
+}
+
+#[test]
+fn wait_ready_fails_fast_when_shut_down() {
+    for state in ["Shutdown", "ShuttingDown"] {
+        let fake = Fake::new(vec![ok(&format!(r#"{{"state":"{state}"}}"#))]);
+        let err = wait_ready_with(
+            &fake,
+            "cs-1",
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            &mut |_| panic!("must not sleep"),
+        )
+        .unwrap_err();
+        assert!(err.contains(state) && err.contains("start it"));
+        assert_eq!(fake.calls().len(), 1);
+    }
+}
+
+#[test]
+fn secrets_status_reads_all_pages() {
+    let fake = Fake::new(vec![
+        ok(r#"[{"secrets":[{"name":"A"}]},{"secrets":[{"name":"CLAUDE_CODE_OAUTH_TOKEN"}]}]"#),
+        ok(r#"[{"repositories":[{"full_name":"x/1"}]},{"repositories":[{"full_name":"a/b"}]}]"#),
+        ok(r#"[{"repositories":[]}]"#),
+    ]);
+    let status = secrets_status(&fake, "a/b", &v(&["A"])).unwrap();
+    assert_eq!(status[0].status, SecretState::Set);
+    assert_eq!(status[1].status, SecretState::NotForRepo);
+}
+
+#[test]
+fn api_pages_accepts_concatenated_objects() {
+    let fake = Fake::new(vec![ok(
+        r#"{"secrets":[{"name":"A"}]}{"secrets":[{"name":"B"}]}"#,
+    )]);
+    let pages = api_pages(&fake, "/x").unwrap();
+    assert_eq!(collect_field(&pages, "secrets", "name"), ["A", "B"]);
+}
+
+#[test]
+fn set_secret_new_secret_and_already_selected() {
+    let fake = Fake::new(vec![fail("gh: Not Found (HTTP 404)"), ok("")]);
+    set_secret(&fake, "K", "v", "a/b").unwrap();
+    assert_eq!(fake.argv(1).last().unwrap(), "a/b");
+    let fake = Fake::new(vec![
+        ok(r#"[{"repositories":[{"full_name":"A/B"}]}]"#),
+        ok(""),
+    ]);
+    set_secret(&fake, "K", "v", "a/b").unwrap();
+    assert_eq!(fake.argv(1).last().unwrap(), "A/B");
+    let fake = Fake::new(vec![fail("HTTP 500 boom")]);
+    assert!(set_secret(&fake, "K", "v", "a/b").is_err());
+    assert_eq!(fake.calls().len(), 1);
 }
 
 #[test]
@@ -402,18 +474,30 @@ fn secrets_status_set_missing_not_for_repo() {
     let status = secrets_status(&fake, "hhoangg/monoptah", &keys).unwrap();
     assert_eq!(
         fake.argv(0),
-        v(&["api", "/user/codespaces/secrets?per_page=100"])
+        v(&[
+            "api",
+            "--paginate",
+            "--slurp",
+            "/user/codespaces/secrets?per_page=100"
+        ])
     );
     assert_eq!(
         fake.argv(1),
         v(&[
             "api",
-            "/user/codespaces/secrets/CLAUDE_CODE_OAUTH_TOKEN/repositories"
+            "--paginate",
+            "--slurp",
+            "/user/codespaces/secrets/CLAUDE_CODE_OAUTH_TOKEN/repositories?per_page=100"
         ])
     );
     assert_eq!(
         fake.argv(2),
-        v(&["api", "/user/codespaces/secrets/OTHER/repositories"])
+        v(&[
+            "api",
+            "--paginate",
+            "--slurp",
+            "/user/codespaces/secrets/OTHER/repositories?per_page=100"
+        ])
     );
     assert_eq!(fake.calls().len(), 3);
     let got: Vec<_> = status.iter().map(|s| (s.key.as_str(), s.status)).collect();
@@ -440,8 +524,11 @@ fn secrets_status_always_includes_oauth_token() {
 }
 
 #[test]
-fn set_secret_uses_stdin_only() {
-    let fake = Fake::new(vec![ok("")]);
+fn set_secret_uses_stdin_only_and_keeps_existing_repos() {
+    let fake = Fake::new(vec![
+        ok(r#"[{"repositories":[{"full_name":"o/A"},{"full_name":"o/B"}]}]"#),
+        ok(""),
+    ]);
     set_secret(
         &fake,
         "CLAUDE_CODE_OAUTH_TOKEN",
@@ -449,7 +536,17 @@ fn set_secret_uses_stdin_only() {
         "hhoangg/monoptah",
     )
     .unwrap();
-    let (args, stdin) = fake.calls().remove(0);
+    assert_eq!(
+        fake.argv(0),
+        v(&[
+            "api",
+            "--paginate",
+            "--slurp",
+            "/user/codespaces/secrets/CLAUDE_CODE_OAUTH_TOKEN/repositories?per_page=100"
+        ])
+    );
+    assert_eq!(fake.calls()[0].1, None);
+    let (args, stdin) = fake.calls().remove(1);
     assert_eq!(
         args,
         v(&[
@@ -460,7 +557,7 @@ fn set_secret_uses_stdin_only() {
             "codespaces",
             "--user",
             "--repos",
-            "hhoangg/monoptah"
+            "o/A,o/B,hhoangg/monoptah"
         ])
     );
     assert!(args.iter().all(|a| !a.contains("SECRET")));
@@ -469,7 +566,10 @@ fn set_secret_uses_stdin_only() {
 
 #[test]
 fn set_secret_validation_and_error_redaction() {
-    let fake = Fake::new(vec![fail("bad value hunter2 rejected")]);
+    let fake = Fake::new(vec![
+        ok(r#"[{"repositories":[]}]"#),
+        fail("bad value hunter2 rejected"),
+    ]);
     let err = set_secret(&fake, "K", "hunter2", "a/b").unwrap_err();
     assert!(!err.contains("hunter2"));
     let fake = Fake::new(vec![]);
