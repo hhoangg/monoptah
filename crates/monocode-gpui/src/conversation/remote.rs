@@ -9,6 +9,8 @@ pub(super) struct State {
     pub(super) refreshing: bool,
     pub(super) pending: bool,
     pub(super) online: bool,
+    app_prompt_waiting: bool,
+    app_draft_launched: bool,
     waking: bool,
     error: Option<String>,
     rejected: Option<Value>,
@@ -248,6 +250,7 @@ impl Conversation {
                         } else {
                             this.run_history_actions(cx);
                         }
+                        this.finish_app_prompt(cx);
                     }
                     Err(error) => this.remote_connection_error(&error, cx),
                 }
@@ -376,34 +379,78 @@ impl Conversation {
     }
     /// The first prompt of a session started through the app API (a cloud session). It is saved
     /// as a local draft, but a remote conversation never reads local follow-ups and the host
-    /// knows no such draft block, so it goes out as an ordinary prompt and the local copy is
-    /// dropped. Without this the session would sit idle with its prompt unsent.
+    /// knows no such draft block, so it goes out as an ordinary prompt. When the machine is not
+    /// ready the draft is kept and the send is retried after the next successful load; a cloud
+    /// session also reconnects its codespace, as any user-initiated send does.
     pub(super) fn send_remote_app_prompt(&mut self, cx: &mut Context<Self>) {
         if self.busy || self.stopping || self.remote_state.pending || !self.remote_state.online {
-            self.status = "The first prompt was not sent: the machine is not ready.".into();
+            self.remote_state.app_prompt_waiting = true;
+            if self.reconnect_cloud(cx) {
+                self.status = "Reconnecting the codespace to send the first prompt…".into();
+            } else {
+                self.status = "The first prompt will be sent when the machine is ready.".into();
+            }
             cx.notify();
             return;
         }
-        let id = self.summary.id;
-        let draft = locked(&self.store).and_then(|store| {
-            let mut state = store.follow_ups(id)?;
-            let draft = state.draft.take();
-            if draft.is_some() {
-                state.revision += 1;
-                store.save_follow_ups(id, &state)?;
-            }
-            Ok(draft)
-        });
-        match draft {
+        self.remote_state.app_prompt_waiting = false;
+        match self.stored_app_draft() {
             Ok(Some(draft)) => {
                 self.settings.remote_action = None;
                 self.launch_prompt(draft.text, cx);
+                // The local copy is dropped once the turn has run (see `finish_app_prompt`).
+                self.remote_state.app_draft_launched = true;
             }
             Ok(None) => (),
             Err(error) => {
                 self.status = error;
                 cx.notify();
             }
+        }
+    }
+    /// An API draft (`draft: true`) on a remote session: the remote composer never shows local
+    /// follow-ups, so the text goes into the composer where the user can see and send it.
+    pub(super) fn show_remote_app_draft(&mut self, cx: &mut Context<Self>) {
+        match self.stored_app_draft() {
+            Ok(Some(draft)) => {
+                self.input
+                    .update(cx, |input, cx| input.set_text(draft.text, cx));
+                self.drop_stored_app_draft();
+                cx.notify();
+            }
+            Ok(None) => (),
+            Err(error) => {
+                self.status = error;
+                cx.notify();
+            }
+        }
+    }
+    fn stored_app_draft(&self) -> Result<Option<monocode_core::follow_up::Message>, String> {
+        locked(&self.store).and_then(|store| Ok(store.follow_ups(self.summary.id)?.draft))
+    }
+    fn drop_stored_app_draft(&self) {
+        let _ = locked(&self.store).and_then(|store| {
+            let mut state = store.follow_ups(self.summary.id)?;
+            state.draft = None;
+            state.revision += 1;
+            store.save_follow_ups(self.summary.id, &state)
+        });
+    }
+    /// After a refresh (which only runs between turns): drops the local copy of a launched first
+    /// prompt once its turn has run and the command is journaled, and retries one that was
+    /// waiting for the machine.
+    fn finish_app_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.remote_state.app_draft_launched && !self.busy {
+            self.remote_state.app_draft_launched = false;
+            self.drop_stored_app_draft();
+        }
+        if self.remote_state.app_prompt_waiting
+            && !self.busy
+            && !self.stopping
+            && !self.remote_state.pending
+            && self.remote_state.online
+        {
+            self.send_remote_app_prompt(cx);
         }
     }
     pub(super) fn remote_save_draft(&mut self, cx: &mut Context<Self>) {

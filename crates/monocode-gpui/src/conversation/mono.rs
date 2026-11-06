@@ -52,11 +52,19 @@ impl Conversation {
                 move |this, cx| this.install_app_launch(settings, send, cx),
                 cx,
             );
+            // A stopped codespace never loads in the background: wake it, as a send would.
+            if send {
+                self.reconnect_cloud(cx);
+            }
             return;
         }
         self.install_transfer(settings, None, cx);
-        if send && self.is_remote() {
-            self.send_remote_app_prompt(cx);
+        if self.is_remote() {
+            if send {
+                self.send_remote_app_prompt(cx);
+            } else {
+                self.show_remote_app_draft(cx);
+            }
         } else if send {
             self.draft_action(true, cx);
         }

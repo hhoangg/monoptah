@@ -305,9 +305,10 @@ impl Shell {
             .and_then(|store| store.remote_session(id).ok().flatten())
             .and_then(|remote| Some((remote.project.local_project?, remote.project.codespace?)));
         if let Some((local_project, codespace)) = binding {
+            // The state is unknown until the next refresh reads it; never claim Available.
             self.cloud_states
                 .entry(codespace.clone())
-                .or_insert(CloudState::Available);
+                .or_insert(CloudState::Unknown);
             self.cloud_marks.insert(
                 id,
                 CloudMark {

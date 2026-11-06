@@ -227,7 +227,7 @@ fn a_mono_notified_send_to_a_cloud_session_is_tracked_as_a_launch(cx: &mut TestA
         .find(|l| l.session_id == id)
         .expect("tracked");
     assert!(launch.notify_on_complete && !launch.completed);
-    assert!(launch.cwd.starts_with("remote://"), "{}", launch.cwd);
+    assert_eq!(launch.cwd, s.project);
 }
 
 #[gpui::test]

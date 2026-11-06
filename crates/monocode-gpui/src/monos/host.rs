@@ -468,11 +468,7 @@ impl Monos {
         let id = summary.id;
         // A cloud session runs on a codespace (its cwd is a remote key) but the sidebar lists it
         // under the local project it twins, so it is recorded and filed there.
-        let project = locked(&self.store)
-            .ok()
-            .and_then(|store| store.remote_session(id).ok().flatten())
-            .and_then(|remote| remote.project.local_project)
-            .unwrap_or_else(|| summary.cwd.clone());
+        let project = launch_project(&self.store, id, &summary.cwd);
         let origin = self
             .chats
             .values()
@@ -787,9 +783,11 @@ impl Monos {
                                         launch.each = each;
                                     } else {
                                         let summary = &view.read(cx).summary;
+                                        let cwd =
+                                            launch_project(&self.store, session, &summary.cwd);
                                         m.launches.push(Launch {
                                             session_id: session,
-                                            cwd: summary.cwd.clone(),
+                                            cwd,
                                             title: summary.title.clone(),
                                             harness: summary.provider.clone(),
                                             model: view.read(cx).mono_model(),
@@ -1565,4 +1563,14 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             .detach();
         }
     }
+}
+
+/// The project a launch is recorded and filed under: a cloud session belongs to the local project
+/// it twins (its cwd is a remote key no sidebar shows), every other session to its own cwd.
+fn launch_project(store: &Database, id: i64, cwd: &str) -> String {
+    locked(store)
+        .ok()
+        .and_then(|store| store.remote_session(id).ok().flatten())
+        .and_then(|remote| remote.project.local_project)
+        .unwrap_or_else(|| cwd.to_owned())
 }

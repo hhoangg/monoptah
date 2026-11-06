@@ -363,9 +363,9 @@ fn a_remote_session_started_through_the_app_dispatches_its_first_prompt(cx: &mut
             .cloned()
             .collect::<Vec<_>>()
     };
-    for _ in 0..1000 {
+    for _ in 0..10000 {
         cx.run_until_parked();
-        if !dispatched().is_empty() {
+        if dispatched().iter().any(|r| r["params"]["type"] == "send") {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -386,6 +386,104 @@ fn a_remote_session_started_through_the_app_dispatches_its_first_prompt(cx: &mut
             .unwrap()
             .draft
             .is_none()
+    );
+}
+
+/// The machine being offline when the API launch is installed must not strand the first prompt in
+/// the invisible local draft: it is sent once the next load succeeds.
+#[gpui::test]
+fn an_offline_app_launch_sends_its_first_prompt_after_the_next_successful_load(
+    cx: &mut TestAppContext,
+) {
+    let host = HostFixture::new(false, false);
+    host.store
+        .lock()
+        .unwrap()
+        .prepare_app_prompt(host.summary.id, "start-2", "Do it later")
+        .unwrap();
+    let view = host.conversation(cx);
+    host.wait(&view, cx, true);
+    let settings = monocode_core::agent::Settings {
+        model: Some("codex:gpt-test".into()),
+        ..Default::default()
+    };
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.remote_state.online = false;
+            view.install_app_launch(settings, true, cx)
+        })
+    });
+    let dispatches = || {
+        host.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "commands.dispatch" && r["params"]["type"] == "send")
+            .count()
+    };
+    cx.run_until_parked();
+    assert_eq!(dispatches(), 0);
+    assert!(
+        host.store
+            .lock()
+            .unwrap()
+            .follow_ups(host.summary.id)
+            .unwrap()
+            .draft
+            .is_some(),
+        "the draft is kept until it is sent"
+    );
+    cx.update(|cx| view.update(cx, |view, cx| view.refresh_remote_snapshot(cx)));
+    for _ in 0..10000 {
+        cx.run_until_parked();
+        if dispatches() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    host.wait(&view, cx, true);
+    assert_eq!(dispatches(), 1, "{:?}", host.requests.lock().unwrap());
+    // A later refresh drops the local copy of the sent prompt.
+    cx.update(|cx| view.update(cx, |view, cx| view.refresh_remote_snapshot(cx)));
+    host.wait(&view, cx, true);
+    assert!(
+        host.store
+            .lock()
+            .unwrap()
+            .follow_ups(host.summary.id)
+            .unwrap()
+            .draft
+            .is_none()
+    );
+}
+
+/// An API draft on a remote session lands in the composer, where the user can see it.
+#[gpui::test]
+fn an_api_draft_on_a_remote_session_is_shown_in_the_composer(cx: &mut TestAppContext) {
+    let host = HostFixture::new(false, false);
+    host.store
+        .lock()
+        .unwrap()
+        .prepare_app_prompt(host.summary.id, "start-3", "Review this")
+        .unwrap();
+    let view = host.conversation(cx);
+    host.wait(&view, cx, true);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+            view.install_app_launch(monocode_core::agent::Settings::default(), false, cx);
+            assert_eq!(view.input.read(cx).content, "Review this");
+        })
+    });
+    assert_eq!(
+        host.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "commands.dispatch")
+            .count(),
+        0
     );
 }
 
