@@ -10,7 +10,10 @@
 //   node scripts/native-release-monoptah.mjs plan [published-names-file]
 //       prints step output lines: matrix (JSON, the platforms still to build
 //       except rpm), rpm (true/false), build_any (true/false) and reuse (the
-//       published filenames to download instead of building, space separated)
+//       published filenames to download instead of building, space separated).
+//       Fails when macOS would have to be built: its files are built on the
+//       maintainer's Mac (npm run native:release:mac) and must already be on
+//       the release.
 //   node scripts/native-release-monoptah.mjs records <dir>
 //       writes artifacts-<kind>-<arch>.json for every platform whose assets are
 //       in <dir> but that has no metadata file yet (used when a re-run signs the
@@ -220,6 +223,16 @@ export function planBuilds(version, published = []) {
   return { matrix, rpm, buildAny: matrix.length > 0 || rpm, reuse };
 }
 
+// The workflow never builds macOS: the release must already carry its files.
+// Kept apart from planBuilds so that stays generic.
+export function requireReused(plan, kind, version) {
+  if (plan.matrix.some((entry) => entry.kind === kind))
+    throw new Error(
+      `The ${kind} files are missing from release native-v${version}. They are built on the maintainer's Mac, not on CI: run "npm run native:release:mac -- ${version}" from a clean main checkout (it creates the release with those files and dispatches this workflow).`,
+    );
+  return plan;
+}
+
 // Writes the metadata file for each platform whose files are in `directory`
 // but whose packaging step did not run (a reused platform).
 export async function writeMissingRecords(directory, version) {
@@ -285,7 +298,11 @@ if (
             .map((line) => line.trim())
             .filter(Boolean)
         : [];
-    const plan = planBuilds(process.env.MONOCODE_NATIVE_VERSION, published);
+    const plan = requireReused(
+      planBuilds(process.env.MONOCODE_NATIVE_VERSION, published),
+      "macos",
+      process.env.MONOCODE_NATIVE_VERSION,
+    );
     console.log(`matrix=${JSON.stringify(plan.matrix)}`);
     console.log(`rpm=${plan.rpm}`);
     console.log(`build_any=${plan.buildAny}`);

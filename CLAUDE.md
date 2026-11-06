@@ -102,57 +102,81 @@ trust that one key, so a replacement key would strand them.
 
 ### Releasing the native app
 
-Monoptah Native (GPUI) ships for macOS arm64 (ad-hoc signed, not notarized), Linux x86_64
-and Windows x86_64 (unsigned installer). It releases separately from the Tauri app. Edit
-`docs/native/monoptah-release-notes.md` (its first line must be `# Monoptah Native X.Y.Z`),
-commit it, wait for `native.yml` on main to pass (the release does not wait for it, and its
-`release-cache` job seeds the macOS, Linux and Windows build caches; the rpm job always builds
-cold), then push the tag `native-vX.Y.Z` (plain `X.Y.Z`, no pre-release form).
-`.github/workflows/native-release-monoptah.yml` plans, builds each platform in parallel, signs
-every updater package with the same `TAURI_SIGNING_PRIVATE_KEY` in one `publish` job, verifies
-them with the app's own verifier, and publishes:
+Monoptah Native (GPUI) ships for macOS arm64 (ad-hoc signed, not notarized), Linux x86_64 and
+Windows x86_64 (unsigned installer). It releases separately from the Tauri app. No macOS job
+runs on GitHub Actions (hosted macOS runners are not being acquired): the macOS app is checked,
+built and packaged on the maintainer's Mac, everything else is on CI.
+
+What CI checks (`native.yml`): `monocode-core` clippy and tests on Linux and Windows, and GPUI
+with `fmt` (Linux) and `cargo check --all-targets` (Linux and Windows). GPUI clippy
+`-D warnings`, the GPUI tests and everything macOS run locally in `npm run native:check`,
+which `native:release:mac` runs.
+
+1. Edit `docs/native/monoptah-release-notes.md` (its first line must be
+   `# Monoptah Native X.Y.Z`) and merge it into main through a PR.
+2. Wait for `native.yml` on main to pass (Linux and Windows only now). Its `release-cache` job
+   seeds the Linux and Windows build caches that the release reads (a miss is only slower).
+3. From a clean checkout of main on the Mac, run `npm run native:release:mac -- X.Y.Z`
+   (plain `X.Y.Z`, no pre-release form; add `--dry-run` first to do everything except tag,
+   push and publish). `scripts/native-release-macos-local.mjs` checks that you are on an
+   up-to-date main with no tracked changes, that the notes heading matches, that the tag and
+   release do not exist and that `native.yml` passed for HEAD; checks for macOS SDK 26 and the
+   Metal compiler; runs `npm run native:check`; builds and packages macOS; pushes the tag
+   `native-vX.Y.Z`; creates the release with the three macOS files; and dispatches
+   `.github/workflows/native-release-monoptah.yml`. A passing `native:check` is remembered per
+   commit and `rustc -V` in `crates/monocode-gpui/target/.native-check-stamp.json`, so a real
+   run after a dry run of the same commit skips it; add `--recheck` to run it again. If a step
+   after the tag push fails it prints what was left behind and how to continue; if you are
+   interrupted during publishing, check the tag and release state with `gh release view`.
+4. The workflow checks the CI gate again, builds Linux, Windows and the rpm (AlmaLinux 10
+   container, cache seeded from main by `release-cache-rpm`), signs every updater package in one `publish` job on Ubuntu with
+   `TAURI_SIGNING_PRIVATE_KEY`, verifies them with the app's own verifier, publishes, and bumps
+   the cask. The signing key exists on CI only; the local script never reads it, and it never
+   needs the `.sig` of the macOS package. The workflow has no tag trigger (the tag is pushed
+   before the macOS files are uploaded) and refuses a release that lacks the macOS files.
+
+The release page and the macOS zip are public as soon as the script creates the release, and
+they stay macOS-only if the workflow fails. The in-app feed and the cask change only at the
+end, when `publish` and `homebrew` succeed. The workflow publishes:
 
 - Release `native-vX.Y.Z` (never "latest": Tauri's updater reads `releases/latest`) with, for
   each updater package, the file and its `.sig`:
   - macOS arm64: `MonoptahNative_X.Y.Z_aarch64.app.tar.gz`, plus the `.zip` and `.zip.sha256`
     the cask pins.
   - Linux x86_64: `MonoptahNative_X.Y.Z_amd64.AppImage`, `monoptah-native_X.Y.Z_amd64.deb`
-    and `monoptah-native-X.Y.Z-0.preview.0.el10.x86_64.rpm` (built on AlmaLinux 10; the
-    release string comes from upstream's spec, which is written for previews).
+    and `monoptah-native-X.Y.Z-0.preview.0.el10.x86_64.rpm` (the release string comes from
+    upstream's spec, which is written for previews).
   - Windows x86_64: `MonoptahNative_X.Y.Z_x64-setup.exe` (NSIS).
 - `latest.json` on the rolling pre-release `native-latest`, the feed compiled into the app.
   It lists `darwin-aarch64-app`, `linux-x86_64-appimage`, `linux-x86_64-deb`,
   `linux-x86_64-rpm` and `windows-x86_64-nsis`, and it is never replaced by an older version.
 
-Every platform is required: if one package job fails, nothing is published. A re-run of the
-same tag after a partial failure never replaces published assets: a platform whose files are
-all on the release is not rebuilt (its files are downloaded and signed again) and one with no
-files is built. A platform with only some files published fails the `plan` job: delete that
-platform's published assets (files and `.sig`) by hand, then re-run; the signed files and feed are also kept as a
-workflow artifact. The Linux and Windows packages use upstream's `scripts/package-native.mjs`
-(kinds `linux`, `rpm`, `windows`), which the fork wrappers only describe and sign.
+Every platform is required: if a CI package job fails, nothing more is published. Re-run the
+workflow (`gh workflow run native-release-monoptah.yml --ref main -f tag=native-vX.Y.Z`, or
+re-run the failed jobs). Published assets are never replaced: a platform whose files are all
+on the release is not rebuilt (its files are downloaded and signed again) and one with no
+files is built, but never macOS. A platform with only some files published fails the `plan`
+job: delete that platform's published assets (files and `.sig`) by hand, then re-run. Do not
+re-run `native:release:mac` for an existing tag: it refuses. The signed files and feed are
+also kept as a workflow artifact. The Linux and Windows packages use upstream's
+`scripts/package-native.mjs`.
 
 The `homebrew` job only bumps `Casks/monoptah-native.rb` in the tap (macOS only; Linux and
 Windows have no package-manager entry), it does not create it: add that file (modelled on
 `Casks/monoptah.rb`) before the first release, or the job fails. It runs after `publish` when
 `HOMEBREW_TAP_TOKEN` is set. While it is unset, bump the cask by hand with
 `scripts/update-homebrew-cask.sh` and the sha from the `MonoptahNative_<version>_aarch64.zip.sha256`
-asset. The fork scripts are `scripts/package-native-monoptah.mjs` (also the asset table for
-every platform) and `scripts/native-release-monoptah.mjs`.
+asset. The fork scripts are `scripts/native-release-macos-local.mjs`,
+`scripts/package-native-monoptah.mjs` (also the asset table for every platform) and
+`scripts/native-release-monoptah.mjs`.
 
-Two things to keep true after merging from upstream or changing repo settings:
+Things to keep true after merging from upstream or changing repo settings:
 
 - Upstream's `native-release.yml` is gated with `if: github.repository == 'hardbeat920/monocode'`
   on each job. Any job upstream adds there runs ungated on this fork (and fails without Apple
   and R2 secrets), so give it the same `if:`.
 - The rolling feed is replaced with `gh release upload --clobber`. Do not enable GitHub
-  immutable releases for this repository, or the feed can never be updated.
-
-### macOS runner capacity fallback
-
-Native CI and Monoptah release jobs accept the repository variable
-`MONOPTAH_MACOS_RUNNER` (default `macos-latest`). If GitHub cannot acquire its
-macOS 26 arm64 runners, set it to `macos-15`; the workflows select the installed
-Xcode 26.3 on that image. The release still requires macOS SDK 26 or newer and
-packages only arm64. Clear the variable to return to the default image. The
-variable affects new jobs, so re-run CI after changing it before tagging a release.
+  immutable releases for this repository, or the feed can never be updated and CI cannot upload
+  to the release the local script created.
+- `native.yml` and `native-release-monoptah.yml` must not use a macOS runner. The
+  `MONOPTAH_MACOS_RUNNER` repository variable is unused now and can be deleted.
