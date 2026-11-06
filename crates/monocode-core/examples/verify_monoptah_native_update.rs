@@ -1,11 +1,18 @@
-//! Fork-local (Monoptah). Offline publication check for the macOS arm64 native
-//! release, run with the actual client verifier and embedded public key. Upstream's
-//! verify_native_update example expects all six platform packages; this fork
-//! publishes only `darwin-aarch64-app`.
+//! Fork-local (Monoptah). Offline publication check for the Monoptah Native
+//! release, run with the actual client verifier and embedded public key.
+//! Upstream's verify_native_update example expects all six upstream packages;
+//! this fork publishes five: macOS arm64, Linux x86_64 (AppImage, deb, rpm) and
+//! Windows x86_64 (NSIS).
 use monocode_core::app_update::{verify_feed, Config};
-use std::{env, fs, path::PathBuf};
+use std::{collections::BTreeSet, env, fs, path::PathBuf};
 
-const TARGET: &str = "darwin-aarch64-app";
+const TARGETS: [&str; 5] = [
+    "darwin-aarch64-app",
+    "linux-x86_64-appimage",
+    "linux-x86_64-deb",
+    "linux-x86_64-rpm",
+    "windows-x86_64-nsis",
+];
 
 fn verify() -> Result<(), String> {
     let directory = PathBuf::from(
@@ -23,43 +30,61 @@ fn verify() -> Result<(), String> {
         "0.0.0-0",
     )?;
     let feed = fs::read(directory.join("latest.json")).map_err(|e| e.to_string())?;
-    let records: Vec<serde_json::Value> = serde_json::from_slice(
-        &fs::read(directory.join("artifacts-macos-aarch64.json")).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let mut verified = 0;
-    for record in records {
-        let Some(target) = record["target"].as_str() else {
-            continue;
-        };
-        if target != TARGET {
-            return Err(format!("Unexpected native target: {target}"));
-        }
-        let filename = record["filename"]
-            .as_str()
-            .ok_or("Missing package filename")?;
-        if std::path::Path::new(filename)
+    let mut verified = BTreeSet::new();
+    let mut metadata = Vec::new();
+    for entry in fs::read_dir(&directory).map_err(|e| e.to_string())? {
+        let name = entry
+            .map_err(|e| e.to_string())?
             .file_name()
-            .and_then(|n| n.to_str())
-            != Some(filename)
-            || filename.contains('\\')
-        {
-            return Err("Invalid package filename".into());
+            .to_string_lossy()
+            .to_string();
+        if name.starts_with("artifacts-") && name.ends_with(".json") {
+            metadata.push(name);
         }
-        let update =
-            verify_feed(&feed, &config, target)?.ok_or("No native update in the signed feed")?;
-        if update.version.to_string() != expected {
-            return Err("Signed feed version does not match the native release".into());
+    }
+    metadata.sort();
+    for name in metadata {
+        let records: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(directory.join(&name)).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        for record in records {
+            let Some(target) = record["target"].as_str() else {
+                continue;
+            };
+            if !TARGETS.contains(&target) {
+                return Err(format!("Unexpected native target: {target}"));
+            }
+            let filename = record["filename"]
+                .as_str()
+                .ok_or("Missing package filename")?;
+            if std::path::Path::new(filename)
+                .file_name()
+                .and_then(|n| n.to_str())
+                != Some(filename)
+                || filename.contains('\\')
+            {
+                return Err("Invalid package filename".into());
+            }
+            let update = verify_feed(&feed, &config, target)?
+                .ok_or("No native update in the signed feed")?;
+            if update.version.to_string() != expected {
+                return Err("Signed feed version does not match the native release".into());
+            }
+            update.verify_file(&directory.join(filename))?;
+            if !verified.insert(target.to_string()) {
+                return Err(format!("Duplicate native target: {target}"));
+            }
         }
-        update.verify_file(&directory.join(filename))?;
-        verified += 1;
     }
-    if verified != 1 {
-        return Err(format!(
-            "Expected one signed native update package, verified {verified}"
-        ));
+    for target in TARGETS {
+        if !verified.contains(target) {
+            return Err(format!("Missing verified native update package: {target}"));
+        }
     }
-    println!("Verified the native feed and the {TARGET} updater package with the client verifier.");
+    println!(
+        "Verified the native feed and all {} updater packages with the client verifier.",
+        TARGETS.len()
+    );
     Ok(())
 }
 fn main() {

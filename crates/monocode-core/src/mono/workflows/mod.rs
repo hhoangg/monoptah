@@ -49,7 +49,7 @@ mod tick_tests;
 mod ui_fixtures;
 pub mod validate;
 pub mod yaml;
-mod yaml_emit;
-mod yaml_read;
+pub(crate) mod yaml_emit;
+pub(crate) mod yaml_read;
 #[cfg(test)]
 mod yaml_tests;

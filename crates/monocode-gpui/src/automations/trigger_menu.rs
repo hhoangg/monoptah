@@ -2,7 +2,7 @@
 //! Connection state comes from the retained Inbox snapshot; opening this menu
 //! never authenticates a provider or performs a network request.
 use super::*;
-use crate::popover::{Menu, MenuAction, MenuEvent, MenuItem, Popover, menu_popover};
+use crate::popover::{Menu, MenuAction, MenuEvent, MenuItem, MenuSearch, Popover, menu_popover};
 
 const CATEGORIES: [(&str, &str, &str); 7] = [
     ("time", "Scheduled", "clock"),
@@ -14,29 +14,8 @@ const CATEGORIES: [(&str, &str, &str); 7] = [
     ("azuredevops", "Azure DevOps", "inbox-azuredevops"),
 ];
 
-struct SearchHeader {
-    input: Entity<Input>,
-}
-impl Render for SearchHeader {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .h(px(44.))
-            .mx(px(-4.))
-            .mt(px(-4.))
-            .mb(px(4.))
-            .px(px(12.))
-            .border_b_1()
-            .border_color(content(0.1))
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .child(icon("search", 14.).text_color(content(0.45)))
-            .child(div().flex_1().min_w_0().child(self.input.clone()))
-    }
-}
-
 pub(super) struct TriggerMenu {
-    search: Entity<SearchHeader>,
+    search: Entity<MenuSearch>,
     menu: Entity<Menu>,
     connected: HashMap<String, bool>,
     _subscriptions: Vec<Subscription>,
@@ -44,16 +23,12 @@ pub(super) struct TriggerMenu {
 impl EventEmitter<MenuEvent> for TriggerMenu {}
 impl TriggerMenu {
     fn items(
-        search: &Entity<SearchHeader>,
+        search: &Entity<MenuSearch>,
         connected: &HashMap<String, bool>,
         cx: &App,
     ) -> Vec<MenuItem> {
-        let header = search.read(cx);
-        let query = header.input.read(cx).content.to_lowercase();
-        let mut items = vec![MenuItem::Custom(
-            search.clone().into(),
-            header.input.read(cx).focus_handle(cx),
-        )];
+        let query = search.read(cx).query(cx).to_lowercase();
+        let mut items = vec![MenuSearch::item(search, cx)];
         for (kind, label, mark) in CATEGORIES {
             if !label.to_lowercase().contains(&query) {
                 continue;
@@ -92,11 +67,8 @@ impl TriggerMenu {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input =
-            cx.new(|cx| Input::field("Search triggers", "Search triggers", content(0.35), cx));
-        let search = cx.new(|_| SearchHeader {
-            input: input.clone(),
-        });
+        let search = MenuSearch::new("Search triggers", cx);
+        let input = search.read(cx).input.clone();
         let items = Self::items(&search, &connected, cx);
         let menu = cx.new(|cx| {
             Menu::new("Choose automation trigger", items, window, cx)

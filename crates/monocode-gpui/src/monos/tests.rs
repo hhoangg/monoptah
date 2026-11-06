@@ -925,6 +925,171 @@ fn internal_completion_queue_stays_hidden_until_delivery_fails(cx: &mut TestAppC
     );
 }
 
+#[test]
+fn report_error_keeps_only_the_first_status_line() {
+    let long = format!(
+        "Claude Code reached its usage limit.\n{}",
+        "A paragraph of the assistant reply.\n\n".repeat(60)
+    );
+    assert_eq!(report_error(&long), "Claude Code reached its usage limit.");
+    assert_eq!(report_error("\n\n  Codex exited \nrest"), "Codex exited");
+    assert_eq!(report_error("Codex exited"), "Codex exited");
+    assert_eq!(report_error(""), "");
+}
+
+#[gpui::test]
+fn huge_queued_report_error_keeps_composer_and_retry_on_screen(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let handle: gpui::AnyWindowHandle = s.window.into();
+    let error = format!(
+        "Claude Code reached its usage limit. Choose another available model or retry when the limit resets.\n{}",
+        "A long paragraph of the assistant reply that should never be shown in the chip.\n\n"
+            .repeat(60)
+    );
+    handle
+        .update(cx, |_, window, cx| {
+            s.manager.update(cx, |m, cx| {
+                m.dismiss_settings(window, cx);
+                for n in 0..3 {
+                    m.roster.get_mut(&s.id).unwrap().outbox.push(Message {
+                        id: format!("completion-{n}"),
+                        text: "[Delegated work completed]".into(),
+                        internal: true,
+                        sent_at: None,
+                        error: Some(error.clone()),
+                        attachments: Vec::new(),
+                    });
+                }
+                m.configure_chat(&s.id, cx);
+            });
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let viewport = s
+        .window
+        .update(visual, |_, w, _| w.viewport_size())
+        .unwrap();
+    let inside = |b: gpui::Bounds<gpui::Pixels>| {
+        b.top() >= px(0.)
+            && b.left() >= px(0.)
+            && b.bottom() <= viewport.height
+            && b.right() <= viewport.width
+    };
+    let composer = visual
+        .debug_bounds("mono-composer")
+        .expect("the composer is rendered");
+    assert!(
+        inside(composer),
+        "composer {composer:?} outside {viewport:?}"
+    );
+    let chip = visual.debug_bounds("mono-internal-queue").unwrap();
+    assert!(
+        chip.size.height < px(120.),
+        "chip is {:?} tall",
+        chip.size.height
+    );
+    // A single errored report keeps its Retry control on screen.
+    s.manager.update(visual, |m, cx| {
+        m.roster.get_mut(&s.id).unwrap().outbox.truncate(1);
+        m.configure_chat(&s.id, cx);
+    });
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let retry = visual
+        .debug_bounds("mono-queue-retry-bounds")
+        .expect("retry button is rendered");
+    assert!(inside(retry), "retry {retry:?} outside {viewport:?}");
+    let composer = visual.debug_bounds("mono-composer").unwrap();
+    assert!(
+        inside(composer),
+        "composer {composer:?} outside {viewport:?}"
+    );
+}
+
+#[gpui::test]
+fn errored_completion_report_does_not_block_later_user_messages(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    s.manager.update(cx, |m, _| {
+        let outbox = &mut m.roster.get_mut(&s.id).unwrap().outbox;
+        outbox.push(Message {
+            id: "report".into(),
+            text: "[Delegated work completed]".into(),
+            internal: true,
+            sent_at: None,
+            error: Some("Codex exited".into()),
+            attachments: Vec::new(),
+        });
+        outbox.push(Message {
+            id: "typed".into(),
+            text: "Hello".into(),
+            internal: false,
+            sent_at: None,
+            error: None,
+            attachments: Vec::new(),
+        });
+        m.persisted_messages.insert("report".into());
+        m.persisted_messages.insert("typed".into());
+        let next = m.next_message(&s.id, false).map(|m| m.id);
+        assert_eq!(next.as_deref(), Some("typed"));
+        // The errored report stays queued for Retry or Discard.
+        assert_eq!(m.roster.get(&s.id).unwrap().outbox.len(), 2);
+    });
+}
+
+#[gpui::test]
+fn errored_user_message_still_blocks_later_messages(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    s.manager.update(cx, |m, _| {
+        let outbox = &mut m.roster.get_mut(&s.id).unwrap().outbox;
+        for (id, error) in [("first", Some("Failed")), ("second", None)] {
+            outbox.push(Message {
+                id: id.into(),
+                text: id.into(),
+                internal: false,
+                sent_at: None,
+                error: error.map(Into::into),
+                attachments: Vec::new(),
+            });
+            m.persisted_messages.insert(id.into());
+        }
+        assert!(m.next_message(&s.id, false).is_none());
+    });
+}
+
+#[gpui::test]
+fn dispatch_to_a_missing_account_settles_instead_of_looping(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    s.manager.update(cx, |m, cx| {
+        m.chats[&s.id].update(cx, |chat, _| {
+            chat.settings.account.id = "gone-account".into();
+        });
+        m.roster.get_mut(&s.id).unwrap().outbox.push(Message {
+            id: "typed".into(),
+            text: "Hello".into(),
+            internal: false,
+            sent_at: None,
+            error: None,
+            attachments: Vec::new(),
+        });
+        m.persisted_messages.insert("typed".into());
+        m.dispatch_limit = Some(50);
+        m.dispatch(&s.id, cx);
+    });
+    // Every notify re-runs dispatch through the chat observer; a dispatch
+    // that notifies each time never settles (the counter panics past 50).
+    cx.run_until_parked();
+    s.manager.update(cx, |m, _| {
+        assert_eq!(
+            m.roster.get(&s.id).unwrap().outbox.len(),
+            1,
+            "the message stays queued until an account is available"
+        );
+        assert!(!m.inflight.contains_key(&s.id));
+    });
+}
+
 #[gpui::test]
 fn sidebar_hidden_launches_still_list_in_the_mono_panel_after_a_restart(cx: &mut TestAppContext) {
     let s = setup(cx);
@@ -1042,7 +1207,7 @@ fn queued_messages_are_saved_before_dispatch_and_do_not_run_while_blocked(cx: &m
 }
 
 #[gpui::test]
-fn chat_composer_keeps_attach_under_the_box_and_opens_the_model_list(cx: &mut TestAppContext) {
+fn chat_composer_matches_the_session_box_and_opens_the_model_list(cx: &mut TestAppContext) {
     let s = setup(cx);
     cx.update(|cx| cx.set_reduce_motion(true));
     let handle: gpui::AnyWindowHandle = s.window.into();
@@ -1057,22 +1222,48 @@ fn chat_composer_keeps_attach_under_the_box_and_opens_the_model_list(cx: &mut Te
     let send = visual.debug_bounds("mono-send").unwrap();
     let attach = visual.debug_bounds("mono-attach").unwrap();
     let model = visual.debug_bounds("mono-model").unwrap();
-    // MonoComposer with controls: send inside the box, attach and the model
-    // on the row beneath it, the model at its right end.
+    // A click anywhere in the box, toolbar included, focuses the field.
+    let toolbar = visual.debug_bounds("mono-composer-toolbar").unwrap();
+    for point in [
+        gpui::point(toolbar.center().x, toolbar.top() + px(13.)),
+        gpui::point(send.left() - px(4.), toolbar.top() + px(13.)),
+    ] {
+        handle.update(visual, |_, w, cx| w.blur(cx)).unwrap();
+        visual.simulate_click(point, Default::default());
+        visual.run_until_parked();
+        let chat = visual.update(|_, cx| s.manager.read(cx).chat().unwrap());
+        assert!(
+            handle
+                .update(visual, |_, w, cx| chat
+                    .read(cx)
+                    .input
+                    .focus_handle(cx)
+                    .is_focused(w))
+                .unwrap(),
+            "a click at {point:?} focuses the composer"
+        );
+    }
+    // One line: the session composer's 84px box; send sits 10px above the border.
+    assert_eq!(field.size.height, px(84.));
+    assert_eq!(field.bottom() - send.bottom(), px(11.));
+    // The session composer's box: the model picker and send inside it,
+    // attach underneath on the left.
     assert!(field.contains(&send.center()));
+    assert!(field.contains(&model.center()));
+    assert!(model.right() < send.left());
     assert!(attach.top() >= field.bottom());
-    assert!(model.top() >= field.bottom());
-    assert!(model.left() > attach.right());
-    assert_eq!(send.size, gpui::size(px(26.), px(26.)));
     assert_eq!(attach.size, gpui::size(px(26.), px(26.)));
+    let meter = visual.debug_bounds("mono-context-meter").unwrap();
+    assert!(
+        (f32::from(meter.center().x) - f32::from(send.center().x)).abs() < 0.5,
+        "the context meter sits under send: {meter:?} vs {send:?}"
+    );
     let chat = visual.update(|_, cx| s.manager.read(cx).chat().unwrap());
-    for (draft, single_line) in [
-        ("".to_owned(), true),
-        ("A short message".to_owned(), true),
-        ("First line\nSecond line".to_owned(), false),
-        ("A message that wraps automatically. ".repeat(40), false),
-        ("Short again".to_owned(), true),
-        ("".to_owned(), true),
+    for draft in [
+        "".to_owned(),
+        "First line\nSecond line".to_owned(),
+        "A message that wraps automatically. ".repeat(40),
+        "".to_owned(),
     ] {
         chat.update(visual, |chat, cx| {
             chat.input.update(cx, |input, cx| input.set_text(draft, cx));
@@ -1081,45 +1272,9 @@ fn chat_composer_keeps_attach_under_the_box_and_opens_the_model_list(cx: &mut Te
         visual.refresh().unwrap();
         let field = visual.debug_bounds("mono-composer").unwrap();
         let send = visual.debug_bounds("mono-send").unwrap();
-        s.window
-            .update(visual, |_, window, _| {
-                let scale = window.scale_factor();
-                let quads = window.painted_quads();
-                for (bounds, radius) in [
-                    (
-                        field,
-                        if single_line {
-                            f32::from(field.size.height) / 2.
-                        } else {
-                            12.
-                        },
-                    ),
-                    (send, 13.),
-                ] {
-                    let quad = quads
-                        .iter()
-                        .find(|quad| {
-                            (quad.bounds.left().0 / scale - f32::from(bounds.left())).abs() < 0.1
-                                && (quad.bounds.top().0 / scale - f32::from(bounds.top())).abs()
-                                    < 0.1
-                                && (quad.bounds.size.width.0 / scale - f32::from(bounds.size.width))
-                                    .abs()
-                                    < 0.1
-                                && (quad.bounds.size.height.0 / scale
-                                    - f32::from(bounds.size.height))
-                                .abs()
-                                    < 0.1
-                        })
-                        .expect("the composer and send button paint their surfaces");
-                    assert!(
-                        (quad.corner_radii.top_left.0 / scale - radius).abs() < 0.1,
-                        "expected a {radius}px corner radius, got {:?}",
-                        quad.corner_radii
-                    );
-                }
-                assert_eq!(field.size.height <= px(38.), single_line);
-            })
-            .unwrap();
+        let attach = visual.debug_bounds("mono-attach").unwrap();
+        assert!(field.contains(&send.center()));
+        assert!(attach.top() >= field.bottom());
     }
     handle
         .update(visual, |_, w, cx| {
@@ -2075,6 +2230,89 @@ fn sessions_a_mono_makes_are_chats_whatever_the_preference(cx: &mut TestAppConte
         let shell = owner.read(cx);
         assert!(shell.mono_session_entity(child).is_some());
     });
+}
+
+#[gpui::test]
+fn subsessions_fill_a_start_that_names_no_model_and_yield_to_one_that_does(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    let provider_of = |id: i64| {
+        locked(&s.store)
+            .unwrap()
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .unwrap()
+            .provider
+    };
+    let source = cx.update(|cx| {
+        s.manager
+            .read(cx)
+            .chats
+            .get(&s.id)
+            .map(|chat| chat.read(cx).summary.provider.clone())
+    });
+    let other = if source.as_deref() == Some("claude") {
+        "codex"
+    } else {
+        "claude"
+    };
+    edit_mono(&s, cx, |m| {
+        m.subsessions = Some(mono::Subsessions {
+            harness: Some(other.into()),
+            model: None,
+            effort: None,
+        });
+    });
+    // Names no harness, model or effort: the Mono's subsessions apply.
+    let filled = start(
+        &s,
+        "filled",
+        json!({"project":s.project,"prompt":"Review the project","draft":true}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(provider_of(filled["sessionId"].as_i64().unwrap()), other);
+    // Names its own harness, unlike the subsessions': kept as is, not overridden.
+    let mine = if other == "codex" { "claude" } else { "codex" };
+    let own = start(
+        &s,
+        "own",
+        json!({"project":s.project,"prompt":"Review the project","draft":true,"harness":mine}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(provider_of(own["sessionId"].as_i64().unwrap()), mine);
+    // The filled harness reaches the start's checks (no provider has this name), while a
+    // start that names its own harness is left alone and is not judged by it. No model is
+    // filled, so no provider CLI is asked for its catalog.
+    edit_mono(&s, cx, |m| {
+        m.subsessions = Some(mono::Subsessions {
+            harness: Some("no-such-harness".into()),
+            model: None,
+            effort: None,
+        });
+    });
+    let before = session_count(&s);
+    assert!(
+        start(
+            &s,
+            "bad-harness",
+            json!({"project":s.project,"prompt":"Review the project","draft":true}),
+            cx,
+        )
+        .is_err()
+    );
+    assert_eq!(session_count(&s), before, "a rejected start leaves no row");
+    start(
+        &s,
+        "own-harness",
+        json!({"project":s.project,"prompt":"Review the project","draft":true,"harness":"claude"}),
+        cx,
+    )
+    .unwrap();
 }
 
 // sessions.start: folders, parent sessions and the no-commit worktree check
@@ -5486,4 +5724,164 @@ fn a_move_racing_a_delete_cannot_bring_the_deleted_session_back(cx: &mut TestApp
         locked(&s.store).unwrap().groups(&s.project).unwrap(),
         groups
     );
+}
+
+const HABIT_FILE: &str = "kind: habit\nversion: 1\nname: Digest\nschedule:\n  kind: weekdays\n  time: \"09:00\"\ninstructions: Check https://example.com/feed and /Users/alice/notes\n";
+
+fn ask_habit(
+    s: &Setup,
+    request: &str,
+    action: &str,
+    input: Value,
+    cx: &mut TestAppContext,
+) -> Result<Value, String> {
+    call(s, request, action, input, cx).try_recv().unwrap()
+}
+
+#[gpui::test]
+fn a_mono_imports_a_habit_file_saved_off_and_waiting_for_review(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let result = ask_habit(
+        &s,
+        "imp-1",
+        "habits.import",
+        json!({"yaml": HABIT_FILE}),
+        cx,
+    )
+    .unwrap();
+    assert!(result["note"].as_str().unwrap().contains("review"));
+    assert_eq!(result["warnings"].as_array().unwrap().len(), 2);
+    let saved = habits::load(&s.root, &s.id).unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!(!saved[0].enabled && saved[0].needs_review);
+    assert_eq!(result["habit"]["id"], json!(saved[0].id));
+    let bad = ask_habit(
+        &s,
+        "imp-2",
+        "habits.import",
+        json!({"yaml": "kind: nope\n"}),
+        cx,
+    );
+    assert_eq!(bad.unwrap_err(), "Unsupported kind: nope (expected habit)");
+    assert_eq!(habits::load(&s.root, &s.id).unwrap().len(), 1);
+    let big = "x".repeat(monocode_core::mono::workflows::yaml::MAX_FILE_BYTES + 1);
+    assert!(ask_habit(&s, "imp-3", "habits.import", json!({"yaml": big}), cx).is_err());
+}
+
+#[gpui::test]
+fn a_mono_cannot_enable_or_run_an_imported_habit(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    ask_habit(
+        &s,
+        "imp-1",
+        "habits.import",
+        json!({"yaml": HABIT_FILE}),
+        cx,
+    )
+    .unwrap();
+    let id = habits::load(&s.root, &s.id).unwrap()[0].id.clone();
+    let enable = ask_habit(
+        &s,
+        "en-1",
+        "habits.update",
+        json!({"id": id, "enabled": true}),
+        cx,
+    );
+    assert!(enable.unwrap_err().contains("needs review"));
+    let run = ask_habit(&s, "run-1", "habits.run", json!({"id": id}), cx);
+    assert!(run.unwrap_err().contains("needs review"));
+    let saved = &habits::load(&s.root, &s.id).unwrap()[0];
+    assert!(!saved.enabled && !saved.run_requested && saved.needs_review);
+    // Turning it off or renaming it stays allowed.
+    ask_habit(
+        &s,
+        "ren-1",
+        "habits.update",
+        json!({"id": id, "name": "Renamed", "enabled": false}),
+        cx,
+    )
+    .unwrap();
+}
+
+#[gpui::test]
+fn exported_habit_yaml_imports_back(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let added = ask_habit(&s, "add-1", "habits.add", json!({"name": "Digest", "instructions": "Check the news", "schedule": {"kind": "weekly", "dayOfWeek": 3, "time": "08:15"}}), cx).unwrap();
+    let yaml =
+        ask_habit(&s, "exp-1", "habits.export", json!({"id": added["id"]}), cx).unwrap()["yaml"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    assert!(!yaml.contains(added["id"].as_str().unwrap()));
+    ask_habit(&s, "imp-1", "habits.import", json!({"yaml": yaml}), cx).unwrap();
+    let all = habits::load(&s.root, &s.id).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(
+        (&all[1].name, &all[1].instructions, &all[1].schedule),
+        (&all[0].name, &all[0].instructions, &all[0].schedule)
+    );
+    assert!(all[1].needs_review && !all[0].needs_review);
+    assert!(ask_habit(&s, "exp-2", "habits.export", json!({"id": "missing"}), cx).is_err());
+}
+
+#[gpui::test]
+fn a_habit_run_can_export_but_not_import(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let added = ask_habit(
+        &s,
+        "add-1",
+        "habits.add",
+        json!({"name": "Digest", "instructions": "Check", "schedule": {"kind": "daily"}}),
+        cx,
+    )
+    .unwrap();
+    let run = fake_run(&s, cx);
+    let refused = call_from(
+        &s,
+        run,
+        "i1",
+        "habits.import",
+        json!({"yaml": HABIT_FILE}),
+        cx,
+    )
+    .try_recv()
+    .unwrap();
+    assert_eq!(refused, Err("A habit run cannot schedule more runs".into()));
+    assert_eq!(habits::load(&s.root, &s.id).unwrap().len(), 1);
+    for (request, action, input) in [
+        ("e1", "habits.export", json!({"id": added["id"]})),
+        ("l1", "habits.list", json!({})),
+    ] {
+        assert!(
+            call_from(&s, run, request, action, input, cx)
+                .try_recv()
+                .unwrap()
+                .is_ok(),
+            "{action}"
+        );
+    }
+}
+
+#[gpui::test]
+fn imports_respect_the_habit_limit(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    for i in 0..habits::MAX {
+        ask_habit(
+            &s,
+            &format!("imp-{i}"),
+            "habits.import",
+            json!({"yaml": HABIT_FILE}),
+            cx,
+        )
+        .unwrap();
+    }
+    let over = ask_habit(
+        &s,
+        "imp-over",
+        "habits.import",
+        json!({"yaml": HABIT_FILE}),
+        cx,
+    );
+    assert!(over.is_err());
+    assert_eq!(habits::load(&s.root, &s.id).unwrap().len(), habits::MAX);
 }

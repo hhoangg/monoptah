@@ -1,15 +1,40 @@
 # Fork-local release workflow (Monoptah Native). Pushing a native-vX.Y.Z tag
-# builds the GPUI app for macOS arm64 only, packages it ad-hoc signed (this fork
-# has no Apple Developer account, so nothing is notarized), and publishes:
-#   - a GitHub Release native-vX.Y.Z with the updater archive and its signature
-#     (what the in-app updater downloads) plus the zip and zip.sha256 that the
-#     monoptah-native Homebrew cask pins;
+# builds the GPUI app for macOS arm64, Linux x86_64 and Windows x86_64 and
+# publishes:
+#   - a GitHub Release native-vX.Y.Z with, per platform, the updater package and
+#     its signature (what the in-app updater downloads):
+#       macOS arm64    MonoptahNative_X.Y.Z_aarch64.app.tar.gz (+ .sig), plus the
+#                      .zip and .zip.sha256 that the monoptah-native Homebrew
+#                      cask pins (ad-hoc signed, not notarized: no Apple account)
+#       Linux x86_64   MonoptahNative_X.Y.Z_amd64.AppImage (+ .sig),
+#                      monoptah-native_X.Y.Z_amd64.deb (+ .sig) and
+#                      monoptah-native-X.Y.Z-<release>.x86_64.rpm (+ .sig), the
+#                      rpm built on AlmaLinux 10 in a container
+#       Windows x86_64 MonoptahNative_X.Y.Z_x64-setup.exe (+ .sig), an NSIS
+#                      installer (unsigned, so SmartScreen warns)
 #   - latest.json (the signed update feed) on the rolling release native-latest,
-#     which is the endpoint compiled into the app. It never moves to an older
-#     version.
+#     which is the endpoint compiled into the app. It lists all five targets
+#     (darwin-aarch64-app, linux-x86_64-appimage, linux-x86_64-deb,
+#     linux-x86_64-rpm, windows-x86_64-nsis) and never moves to an older version.
 # Neither release is ever marked "latest" (--latest=false). The Tauri updater
 # reads releases/latest/download/latest.json, so a native release becoming the
 # repository's latest release would break updates for the Tauri app.
+#
+# Jobs: plan (validate the tag, look for an existing release), package (macOS,
+# Linux and Windows matrix) and package-rpm build in parallel, publish signs every
+# updater package and the feed in one place, verifies them with the app's own
+# verifier and publishes, then homebrew bumps the macOS-only cask. Every
+# platform is required: if one package job fails nothing is published, and a
+# re-run reuses the platforms that already succeeded only once they are on the
+# release (see "Re-runs" below).
+#
+# Re-runs: published assets are never replaced. When the release already has all
+# files of a platform, that platform is not rebuilt and its published files are
+# downloaded and signed again; platforms with no files on the release are built.
+# A platform with only some of its files published fails the plan job: delete
+# its published assets by hand and re-run. The publish job also refuses to skip
+# a freshly built file that is already on the release. The feed is replaced only
+# by the same or a newer version.
 #
 # Only plain X.Y.Z tags are supported (no -preview.N): the cask, the checksum
 # asset and the feed all assume a final version, and the cask bump script
@@ -17,7 +42,7 @@
 # step.
 #
 # The secrets read are the two updater signing secrets, TAURI_SIGNING_PRIVATE_KEY
-# and its password (they sign the updater archive and the feed with the same key
+# and its password (they sign the updater packages and the feed with the same key
 # the Tauri app trusts), the automatic GITHUB_TOKEN, and the optional
 # HOMEBREW_TAP_TOKEN. HOMEBREW_TAP_TOKEN is a fine-grained personal access token
 # with Contents read/write on hhoangg/homebrew-monoptah only; the homebrew job
@@ -25,6 +50,12 @@
 # skips the bump (without failing the release) when it is not set. Fine-grained
 # tokens expire: if the tap checkout fails, the likely cause is an expired
 # HOMEBREW_TAP_TOKEN. There is no Apple signing, notarization or R2 upload here.
+# Only the signing job (publish) sees the signing key; the package jobs do not.
+#
+# Build caches: tag runs cannot read another tag's cache, only main's, so the
+# release-cache job in native.yml seeds the macOS, Linux and Windows caches
+# (shared keys below). The rpm job builds in a container without a seeded cache
+# and always compiles from scratch.
 #
 # Upstream's native-release.yml also triggers on native-v* tags; it is gated to
 # the upstream repository so it does not run (and fail) on this fork.
@@ -34,8 +65,14 @@ on:
   push:
     tags:
       - "native-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing native-vX.Y.Z tag to release
+        required: true
+        type: string
 
-# Only the release job publishes, so only it gets write access.
+# Only the publish job writes, so only it gets write access.
 permissions:
   contents: read
 
@@ -45,35 +82,57 @@ concurrency:
   group: native-monoptah-release
   cancel-in-progress: false
 
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # The update feed the app polls, and the key it verifies the feed with.
+  # The key is the public updater key from src-tauri/tauri.conf.json.
+  NATIVE_FEED_URL: https://github.com/hhoangg/monoptah/releases/download/native-latest/latest.json
+  NATIVE_UPDATER_PUBKEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdDMjg4MkQ0N0E3MDA1QUYKUldTdkJYQjYxSUlvZks0RGFSU2dkQU91NnBZQitHMC9yVFNwb2swamVLbnpHU2kvVS9yNWRBZkIK
+
 jobs:
-  release:
-    name: Build and publish Monoptah Native
-    runs-on: macos-latest
-    timeout-minutes: 90
-    permissions:
-      contents: write
-    env:
-      TARGET: aarch64-apple-darwin
-      # The update feed the app polls, and the key it verifies the feed with.
-      # The key is the public updater key from src-tauri/tauri.conf.json.
-      NATIVE_FEED_URL: https://github.com/hhoangg/monoptah/releases/download/native-latest/latest.json
-      NATIVE_UPDATER_PUBKEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdDMjg4MkQ0N0E3MDA1QUYKUldTdkJYQjYxSUlvZks0RGFSU2dkQU91NnBZQitHMC9yVFNwb2swamVLbnpHU2kvVS9yNWRBZkIK
+  # Validates the tag and decides what to build. A re-run after a partial
+  # failure (for example the feed step failing after the release was created)
+  # must not rebuild and replace published assets: the cask may already pin the
+  # zip, and the feed must describe the packages that are actually published.
+  # Only "not found" (HTTP 404) means the release does not exist; any other
+  # error fails the job.
+  plan:
+    name: Plan the release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      exists: ${{ steps.existing.outputs.exists }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      rpm: ${{ steps.plan.outputs.rpm }}
+      build_any: ${{ steps.plan.outputs.build_any }}
+      reuse: ${{ steps.plan.outputs.reuse }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Select Xcode for the macOS fallback runner
+        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - name: Check the tag is a plain native release version
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#native-v}"
+          if [[ "$RELEASE_TAG" != native-v* ]]; then
+            echo "Release tag must start with native-v" >&2
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#native-v}"
           if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "Tag $GITHUB_REF_NAME must look like native-vX.Y.Z (pre-release tags are not supported)" >&2
+            echo "Tag $RELEASE_TAG must look like native-vX.Y.Z (pre-release tags are not supported)" >&2
             exit 1
           fi
           echo "MONOCODE_NATIVE_VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "MONOCODE_NATIVE_UPDATER_ENDPOINT=$NATIVE_FEED_URL" >> "$GITHUB_ENV"
-          echo "MONOCODE_NATIVE_UPDATER_PUBKEY=$NATIVE_UPDATER_PUBKEY" >> "$GITHUB_ENV"
           # The notes must be about this version; the sign step checks the heading
           # again, but failing here saves a full build.
           head -n 1 docs/native/monoptah-release-notes.md | grep -Fxq "# Monoptah Native $VERSION" || {
@@ -81,21 +140,17 @@ jobs:
             exit 1
           }
 
-      # A re-run after a partial failure (for example the feed step failing after
-      # the release was created) must not rebuild and replace published assets:
-      # the cask may already pin the zip, and the feed must describe the archive
-      # that is actually published. When the release exists, the build is skipped
-      # and the published assets are used. Only "not found" (HTTP 404) means the
-      # release does not exist; any other error fails the job.
       - name: Look for an existing release of this tag
         id: existing
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if out=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" 2>&1); then
-            echo "::notice::Release $GITHUB_REF_NAME already exists; its published assets are reused and none is replaced."
+          : > "$RUNNER_TEMP/published.txt"
+          if out=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>&1); then
+            echo "::notice::Release $RELEASE_TAG already exists; its published assets are reused and none is replaced."
             echo "exists=true" >> "$GITHUB_OUTPUT"
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/published.txt"
           elif grep -q "HTTP 404" <<<"$out"; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
           else
@@ -103,14 +158,223 @@ jobs:
             exit 1
           fi
 
+      # Prints matrix, rpm, build_any and reuse. A platform is built unless the
+      # release already has every one of its files.
+      - name: Decide which platforms to build
+        id: plan
+        run: |
+          set -euo pipefail
+          node scripts/native-release-monoptah.mjs plan "$RUNNER_TEMP/published.txt" | tee -a "$GITHUB_OUTPUT"
+
+  # macOS arm64, Linux x86_64 and Windows x86_64. No signing key here: these jobs
+  # only build and package, and publish signs what they upload.
+  package:
+    name: Package ${{ matrix.kind }}
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ${{ matrix.kind == 'macos' && vars.MONOPTAH_MACOS_RUNNER || matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Select Xcode for the macOS fallback runner
+        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Set before the cache step so the cache key sees the same flags as the
+      # seeding job in native.yml.
+      - name: Link the Windows C runtime statically
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          'RUSTFLAGS=-C target-feature=+crt-static' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # The shared keys match the release-cache job in native.yml, which seeds
+      # them from main. A tag run only reads them.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/monocode-gpui
+          shared-key: ${{ matrix.kind == 'macos' && 'native-monoptah-release' || format('native-monoptah-release-{0}', matrix.target) }}
+          save-if: false
+
+      - name: Configure version and update feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "MONOCODE_NATIVE_VERSION=${RELEASE_TAG#native-v}" >> "$GITHUB_ENV"
+          echo "MONOCODE_NATIVE_UPDATER_ENDPOINT=$NATIVE_FEED_URL" >> "$GITHUB_ENV"
+          echo "MONOCODE_NATIVE_UPDATER_PUBKEY=$NATIVE_UPDATER_PUBKEY" >> "$GITHUB_ENV"
+          # The macOS runner is memory-bound; the release-cache job in native.yml
+          # builds with the same limit.
+          if [ "$RUNNER_OS" = macOS ]; then echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"; fi
+
+      # Same checks as upstream: AppKit draws its controls for the SDK the app
+      # links against, and Xcode 26 ships the Metal compiler GPUI's shaders need
+      # separately.
+      - name: Require a current macOS SDK
+        if: matrix.kind == 'macos'
+        run: |
+          sdk=$(xcrun --sdk macosx --show-sdk-version)
+          echo "macOS SDK $sdk"
+          if (( ${sdk%%.*} < 26 )); then
+            echo "macOS SDK $sdk would draw pre-macOS 26 window controls" >&2
+            exit 1
+          fi
+          if ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun metal --version
+          fi
+
+      - name: Install native Linux build dependencies
+        if: matrix.kind == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils
+          curl --fail --location --retry 3 https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage -o "$RUNNER_TEMP/appimagetool"
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          echo "APPIMAGETOOL=$RUNNER_TEMP/appimagetool" >> "$GITHUB_ENV"
+
+      - name: Install native Windows packaging tools
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build optimized native app
+        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --target ${{ matrix.target }} --release
+
+      # Packages ad-hoc and verifies the signature, the arm64 slice and the
+      # embedded version ("Monoptah Native X.Y.Z") before anything is written.
+      - name: Package the macOS app
+        if: matrix.kind == 'macos'
+        run: node scripts/package-native-monoptah.mjs "crates/monocode-gpui/target/${{ matrix.target }}/release/monocode-gpui" native-dist
+
+      # Upstream's packager: it accepts plain X.Y.Z versions, checks the embedded
+      # version, and writes the AppImage and deb (linux) or the NSIS installer
+      # (windows) plus artifacts-<kind>-<arch>.json with the feed targets.
+      - name: Package the Linux and Windows installers
+        if: matrix.kind != 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY="crates/monocode-gpui/target/${{ matrix.target }}/release/monocode-gpui"
+          if [ "$RUNNER_OS" = Windows ]; then BINARY="$BINARY.exe"; fi
+          node scripts/package-native.mjs '${{ matrix.kind }}' "$BINARY" native-dist '${{ matrix.arch }}'
+
+      # Only the packages and their metadata; the work/ directory with the
+      # staged trees stays behind.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: platform-${{ matrix.kind }}
+          path: |
+            native-dist/artifacts-*.json
+            native-dist/MonoptahNative_*
+            native-dist/monoptah-native*
+          if-no-files-found: error
+
+  # Enterprise Linux rpm, built the way upstream does: AlmaLinux 10 in a
+  # container. The file name carries the container's dist tag (for example
+  # el10), so the plan matches it by pattern. The release is "0.preview.0"
+  # because upstream's spec is written for previews; the file is still an
+  # ordinary rpm of the plain X.Y.Z version.
+  package-rpm:
+    name: Package rpm
+    needs: plan
+    if: needs.plan.outputs.rpm == 'true'
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - run: dnf install -y git
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Select Xcode for the macOS fallback runner
+        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
+      - name: Install native rpm build dependencies
+        run: |
+          dnf install -y dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf install -y epel-release
+          dnf install -y clang gcc-c++ cmake ninja-build pkgconf-pkg-config fontconfig-devel freetype-devel libxcb-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel alsa-lib-devel libX11-devel libX11-xcb mesa-libEGL-devel vulkan-loader-devel dbus-devel rpm-build perl
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure version and update feed
+        run: |
+          set -euo pipefail
+          echo "MONOCODE_NATIVE_VERSION=${RELEASE_TAG#native-v}" >> "$GITHUB_ENV"
+          echo "MONOCODE_NATIVE_UPDATER_ENDPOINT=$NATIVE_FEED_URL" >> "$GITHUB_ENV"
+          echo "MONOCODE_NATIVE_UPDATER_PUBKEY=$NATIVE_UPDATER_PUBKEY" >> "$GITHUB_ENV"
+      - run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --release
+      - run: node scripts/package-native.mjs rpm crates/monocode-gpui/target/release/monocode-gpui native-dist x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: platform-rpm
+          path: |
+            native-dist/artifacts-*.json
+            native-dist/monoptah-native*
+          if-no-files-found: error
+
+  # The only job with the signing key and write access. It signs every updater
+  # package and the feed, checks them with the app's own verifier, then
+  # publishes. Skipped packaging jobs are fine (a platform whose files were
+  # already published); a failed one stops the release.
+  publish:
+    name: Sign and publish Monoptah Native
+    needs: [plan, package, package-rpm]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    runs-on: ${{ vars.MONOPTAH_MACOS_RUNNER || 'macos-latest' }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      EXISTS: ${{ needs.plan.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Select Xcode for the macOS fallback runner
+        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
+
+      - name: Configure version
+        run: |
+          set -euo pipefail
+          echo "MONOCODE_NATIVE_VERSION=${RELEASE_TAG#native-v}" >> "$GITHUB_ENV"
+          echo "MONOCODE_NATIVE_UPDATER_ENDPOINT=$NATIVE_FEED_URL" >> "$GITHUB_ENV"
+          echo "MONOCODE_NATIVE_UPDATER_PUBKEY=$NATIVE_UPDATER_PUBKEY" >> "$GITHUB_ENV"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
 
       # A tag cannot read another tag's cache, only main's, so the release-cache
       # job in native.yml seeds this and a tag run never saves one.
@@ -125,61 +389,50 @@ jobs:
       - name: Test the release scripts
         run: node --test scripts/package-native-monoptah.test.mjs scripts/native-release-monoptah.test.mjs
 
-      # Same checks as upstream: AppKit draws its controls for the SDK the app
-      # links against, and Xcode 26 ships the Metal compiler GPUI's shaders need
-      # separately.
-      - name: Require a current macOS SDK
-        if: steps.existing.outputs.exists != 'true'
-        run: |
-          sdk=$(xcrun --sdk macosx --show-sdk-version)
-          echo "macOS SDK $sdk"
-          if (( ${sdk%%.*} < 26 )); then
-            echo "macOS SDK $sdk would draw pre-macOS 26 window controls" >&2
-            exit 1
-          fi
-          if ! xcrun metal --version >/dev/null 2>&1; then
-            xcodebuild -downloadComponent MetalToolchain
-            xcrun metal --version
-          fi
+      - name: Download the packages built by this run
+        if: needs.plan.outputs.build_any == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: platform-*
+          merge-multiple: true
+          path: native-dist
 
-      - name: Build optimized native app
-        if: steps.existing.outputs.exists != 'true'
-        env:
-          CARGO_BUILD_JOBS: 2
-        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --target "$TARGET" --release
-
-      # Packages ad-hoc and verifies the signature, the arm64 slice and the
-      # embedded version ("Monoptah Native X.Y.Z") before anything is written.
-      - name: Package native app
-        if: steps.existing.outputs.exists != 'true'
-        run: node scripts/package-native-monoptah.mjs "crates/monocode-gpui/target/$TARGET/release/monocode-gpui" native-dist
-
-      # Re-run path: take the zip, its checksum and the updater archive from the
-      # release instead of building them again, and check the zip against the
-      # published checksum. The signing step below signs these exact bytes.
-      - name: Download the published assets
-        if: steps.existing.outputs.exists == 'true'
+      # Re-run path: take the files of already published platforms from the
+      # release instead of building them again. The signing step below signs
+      # these exact bytes. The macOS zip is checked against its published
+      # checksum, which is what the cask pins.
+      - name: Download the published assets of platforms that were not rebuilt
+        if: needs.plan.outputs.reuse != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          REUSE: ${{ needs.plan.outputs.reuse }}
         run: |
           set -euo pipefail
-          STEM="MonoptahNative_${MONOCODE_NATIVE_VERSION}_aarch64"
+          set -f
           mkdir -p native-dist
-          for name in "$STEM.app.tar.gz" "$STEM.zip" "$STEM.zip.sha256"; do
-            gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir native-dist
+          for name in $REUSE; do
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir native-dist
           done
-          (cd native-dist && shasum -a 256 -c "$STEM.zip.sha256")
-          node scripts/native-release-monoptah.mjs records native-dist
+          SUM="native-dist/MonoptahNative_${MONOCODE_NATIVE_VERSION}_aarch64.zip.sha256"
+          if [[ -f "$SUM" ]]; then
+            (cd native-dist && shasum -a 256 -c "$(basename "$SUM")")
+          fi
 
-      # Signs the updater archive and the feed with the Tauri updater key. A
-      # missing key fails the step, so no unsigned update can be published.
-      - name: Sign the updater archive and the feed
+      # Metadata for the platforms taken from the release (the package jobs wrote
+      # their own).
+      - name: Describe the reused assets
+        run: node scripts/native-release-monoptah.mjs records native-dist
+
+      # Signs every updater package and the feed with the Tauri updater key. A
+      # missing key, a missing platform or an unexpected file name fails the
+      # step, so no unsigned or partial update can be published.
+      - name: Sign the updater packages and the feed
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: node scripts/native-release-monoptah.mjs sign native-dist docs/native/monoptah-release-notes.md
 
-      # Checks the feed and the archive with the app's own verifier and the
+      # Checks the feed and all five packages with the app's own verifier and the
       # public key compiled into the app. This stays on the native-dev profile:
       # building the example with --release --target recompiled about 90 crates
       # anyway (cargo unifies features per invocation), so it saved nothing.
@@ -187,12 +440,13 @@ jobs:
         run: cargo run --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-core --example verify_monoptah_native_update --profile native-dev -- native-dist
 
       # Kept for manual recovery if a publish step below fails: the signed
-      # archive, zip, checksum and feed. Contains signatures only, no secrets.
+      # packages, zip, checksum and feed. Contains signatures only, no secrets.
       - uses: actions/upload-artifact@v4
         with:
           name: native-release-${{ env.MONOCODE_NATIVE_VERSION }}
           path: |
             native-dist/MonoptahNative_*
+            native-dist/monoptah-native*
             native-dist/latest.json
             native-dist/release-files.json
           retention-days: 30
@@ -209,19 +463,32 @@ jobs:
       - name: Publish the versioned GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          EXISTS: ${{ steps.existing.outputs.exists }}
+          REUSE: ${{ needs.plan.outputs.reuse }}
         run: |
           set -euo pipefail
+          set -f
           FILES=()
           while IFS= read -r file; do
             FILES+=("native-dist/$file")
           done < <(node -e 'for (const f of JSON.parse(require("fs").readFileSync("native-dist/release-files.json", "utf8"))) console.log(f)')
-          if (( ${#FILES[@]} != 4 )); then
-            echo "Expected four release files, got ${#FILES[@]}" >&2
+          EXPECTED=$(node scripts/native-release-monoptah.mjs file-count)
+          if (( ${#FILES[@]} != EXPECTED )); then
+            echo "Expected $EXPECTED release files, got ${#FILES[@]}" >&2
             exit 1
           fi
           if [[ "$EXISTS" == "true" ]]; then
-            PUBLISHED=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            PUBLISHED=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            # Only files taken from the release may already be on it. A freshly
+            # built file (or its .sig) that is already published would be
+            # silently skipped below while the feed signs the new bytes.
+            for file in "${FILES[@]}"; do
+              name=$(basename "$file")
+              base="${name%.sig}"
+              if grep -Fxq "$name" <<<"$PUBLISHED" && ! grep -Fxq "$base" <<<"$(tr ' ' '\n' <<<"$REUSE")"; then
+                echo "$name was built by this run but is already published on $RELEASE_TAG; refusing to publish different bytes. Delete that platform's assets from the release by hand and re-run." >&2
+                exit 1
+              fi
+            done
             MISSING=()
             for file in "${FILES[@]}"; do
               if ! grep -Fxq "$(basename "$file")" <<<"$PUBLISHED"; then
@@ -229,10 +496,10 @@ jobs:
               fi
             done
             if (( ${#MISSING[@]} > 0 )); then
-              gh release upload "$GITHUB_REF_NAME" "${MISSING[@]}" --repo "$GITHUB_REPOSITORY"
+              gh release upload "$RELEASE_TAG" "${MISSING[@]}" --repo "$GITHUB_REPOSITORY"
             fi
           else
-            gh release create "$GITHUB_REF_NAME" \
+            gh release create "$RELEASE_TAG" \
               "${FILES[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
@@ -299,7 +566,8 @@ jobs:
   # downgrade the cask. It shares the homebrew-tap group with release.yml.
   homebrew:
     name: Update Homebrew cask
-    needs: [release]
+    needs: [publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
     concurrency:
       group: homebrew-tap
       cancel-in-progress: false
@@ -325,6 +593,11 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Select Xcode for the macOS fallback runner
+        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
 
       - name: Read published sha256
         id: sha
@@ -333,10 +606,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          V="${GITHUB_REF_NAME#native-v}"
+          V="${RELEASE_TAG#native-v}"
           DIR="$RUNNER_TEMP/tap-sha"
           mkdir -p "$DIR"
-          gh release download "$GITHUB_REF_NAME" \
+          gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "MonoptahNative_${V}_aarch64.zip.sha256" \
             --dir "$DIR"
@@ -364,7 +637,7 @@ jobs:
           SHA: ${{ steps.sha.outputs.sha }}
         run: |
           set -euo pipefail
-          V="${GITHUB_REF_NAME#native-v}"
+          V="${RELEASE_TAG#native-v}"
           bash scripts/update-homebrew-cask.sh homebrew-tap/Casks/monoptah-native.rb "$V" "$SHA"
           cd homebrew-tap
           if git diff --quiet; then

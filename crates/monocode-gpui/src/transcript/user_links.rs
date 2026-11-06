@@ -2,7 +2,7 @@
 //! ported from src/features/sessions/ui/UserLinkPreview.tsx.
 use super::*;
 use crate::popover::Align;
-use gpui::{AnyElement, HighlightStyle, Hsla, StyledText, Task};
+use gpui::{AnyElement, HighlightStyle, Hsla, Task};
 use monocode_core::inbox::{Details, Item};
 use monocode_core::user_links::{GithubWorkItemLink, plain_text_summary};
 use std::{
@@ -64,8 +64,15 @@ impl TranscriptView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // One search pass and one selection handle for every piece of the chunk.
+        let chip = link.range.clone();
         let pieces = Pieces {
+            id: format!("user-text-{message_start}-{}", row.1).into(),
             text: text.clone(),
+            links: monocode_core::user_links::find_web_links(text)
+                .into_iter()
+                .filter(|found| found.range != chip || link.link.github_work_item.is_none())
+                .map(|found| (found.range, found.link.url))
+                .collect(),
             highlights: markdown::mark_styles(
                 text,
                 vec![],
@@ -570,7 +577,11 @@ impl TranscriptView {
 
 /// A chunk's shared search highlights and selection, cut per piece.
 struct Pieces {
+    /// Prefix of every piece's element id.
+    id: SharedString,
     text: SharedString,
+    /// Every web link of the chunk, except the one drawn as a chip.
+    links: Vec<(Range<usize>, String)>,
     highlights: Vec<(Range<usize>, HighlightStyle)>,
     selection: Option<crate::transcript::selection::TextSelection>,
 }
@@ -591,13 +602,23 @@ impl Pieces {
             })
             .collect::<Vec<_>>();
         let word: SharedString = word.to_owned().into();
-        let styled = StyledText::new(word.clone()).with_highlights(highlights);
-        let layout = styled.layout().clone();
-        let child = styled.into_any_element();
-        let child = match &self.selection {
-            Some(selection) => selection.offset(range.start).wrap(word, layout, child),
-            None => child,
-        };
+        let links = self
+            .links
+            .iter()
+            .filter_map(|(r, url)| {
+                let (start, stop) = (r.start.max(range.start), r.end.min(end));
+                (start < stop).then(|| (start - range.start..stop - range.start, url.clone()))
+            })
+            .collect();
+        let child = markdown::linked_text(
+            format!("{}-{}", self.id, range.start).into(),
+            word,
+            highlights,
+            links,
+            self.selection
+                .as_ref()
+                .map(|selection| selection.offset(range.start)),
+        );
         // GPUI measures a text leaf's min-content width unwrapped, so as a
         // bare flex item it can't shrink below its longest line. A whole
         // chunk would overflow the bubble instead of wrapping.
@@ -843,5 +864,142 @@ mod tests {
                 assert!(view.work_item_cards.open.is_none())
             })
             .unwrap();
+    }
+
+    fn user_window(text: &str, cx: &mut TestAppContext) -> gpui::WindowHandle<TranscriptView> {
+        role_window("user", text, cx)
+    }
+
+    fn role_window(
+        role: &str,
+        text: &str,
+        cx: &mut TestAppContext,
+    ) -> gpui::WindowHandle<TranscriptView> {
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(900.), px(600.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| TranscriptView::new()),
+            )
+            .unwrap()
+        });
+        let (text, role) = (text.to_owned(), role.to_owned());
+        window
+            .update(cx, |view, _, cx| {
+                let mut source = monocode_core::transcript::Transcript::default();
+                source.begin(&role);
+                source.append(&text);
+                view.patch(0, source.rows, cx);
+                view.visible = true;
+            })
+            .unwrap();
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        window
+    }
+
+    fn click(
+        window: gpui::WindowHandle<TranscriptView>,
+        at: gpui::Point<gpui::Pixels>,
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+        for event in [
+            PlatformInput::MouseDown(MouseDownEvent {
+                position: at,
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            PlatformInput::MouseUp(MouseUpEvent {
+                position: at,
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+        ] {
+            cx.update_window(window.into(), |_, w, cx| w.dispatch_event(event, cx))
+                .unwrap();
+            cx.refresh().unwrap();
+        }
+    }
+
+    /// Clicks the drawn link to `url` and returns what the app opened.
+    fn open_by_click(
+        window: gpui::WindowHandle<TranscriptView>,
+        url: &str,
+        cx: &mut TestAppContext,
+    ) -> Option<String> {
+        let at = crate::markdown::rendered_link_point(url)
+            .unwrap_or_else(|| panic!("no link drawn for {url}"));
+        let before = cx.opened_url();
+        click(window, at, cx);
+        let after = cx.opened_url();
+        // Only a click that opened something new counts.
+        (after != before).then_some(after).flatten()
+    }
+
+    #[gpui::test]
+    fn a_second_pull_request_url_is_a_clickable_link_beside_the_chip(cx: &mut TestAppContext) {
+        let (first, second) = (
+            "https://github.com/acme/links/pull/1",
+            "https://github.com/acme/links/pull/2",
+        );
+        let window = user_window(&format!("review {first} {second} please"), cx);
+        window
+            .update(cx, |view, _, _| {
+                let (_, link) = view.messages[0].user_link.clone().unwrap();
+                assert_eq!(link.link.url, first);
+                // The first link stays a chip.
+                assert!(view.work_item_cards.anchors[&0].get().is_some());
+            })
+            .unwrap();
+        assert!(crate::markdown::rendered_link_point(first).is_none());
+        assert_eq!(open_by_click(window, second, cx).as_deref(), Some(second));
+    }
+
+    #[gpui::test]
+    fn pull_request_urls_on_separate_lines_and_before_punctuation_are_links(
+        cx: &mut TestAppContext,
+    ) {
+        let window = user_window(
+            "https://github.com/acme/links/pull/3\nsee https://github.com/acme/links/pull/4, and https://github.com/acme/links/pull/5/files.",
+            cx,
+        );
+        for url in [
+            "https://github.com/acme/links/pull/4",
+            "https://github.com/acme/links/pull/5/files",
+        ] {
+            assert_eq!(open_by_click(window, url, cx).as_deref(), Some(url));
+        }
+    }
+
+    #[gpui::test]
+    fn a_plain_url_in_a_prompt_is_clickable_and_other_schemes_are_not(cx: &mut TestAppContext) {
+        let window = user_window("read https://example.com/x and ftp://example.com/y", cx);
+        let url = "https://example.com/x";
+        assert_eq!(open_by_click(window, url, cx).as_deref(), Some(url));
+        assert!(crate::markdown::rendered_link_point("ftp://example.com/y").is_none());
+    }
+
+    #[gpui::test]
+    fn a_url_in_a_later_chunk_of_a_prompt_is_clickable(cx: &mut TestAppContext) {
+        let (first, later) = ("https://example.com/one", "https://example.com/two");
+        let window = user_window(&format!("{first}\n\nmore text\n{later}"), cx);
+        assert_eq!(open_by_click(window, later, cx).as_deref(), Some(later));
+    }
+
+    #[gpui::test]
+    fn a_bare_url_in_an_agent_reply_is_clickable(cx: &mut TestAppContext) {
+        let url = "https://example.com/reply";
+        let window = role_window("assistant", &format!("Docs are at {url}, enjoy."), cx);
+        assert_eq!(open_by_click(window, url, cx).as_deref(), Some(url));
     }
 }

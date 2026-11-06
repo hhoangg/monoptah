@@ -363,10 +363,14 @@ fn operator_sessions_cannot_use_today_actions() {
         "today.add",
         "today.update",
         "today.note",
+        "today.editNote",
+        "today.deleteNote",
         "today.complete",
         "today.snooze",
         "today.dismiss",
         "today.sources",
+        "today.statuses",
+        "today.tags",
     ] {
         let error = validate_operator(action, &json!({})).unwrap_err();
         assert!(

@@ -10,6 +10,9 @@ pub(super) struct State {
     /// A confirmed provider mutation followed by a storage conflict requires a
     /// history reload, rather than silently appending to inconsistent context.
     blocked: bool,
+    /// True only while an accepted edit is being re-sent. Its attachments are
+    /// exactly what the user kept, so nothing is added to them.
+    pub(super) resending: bool,
 }
 impl State {
     pub(super) fn pending(&self) -> bool {
@@ -292,7 +295,9 @@ impl Conversation {
                         if this.input.read(cx).content.as_str() == prompt && this.attachments == attachments {
                             // Normal submit still owns mode commands, attachments,
                             // account checks, durable acceptance and failure recovery.
+                            this.editing_last_turn.resending = true;
                             this.send(cx);
+                            this.editing_last_turn.resending = false;
                         } else {
                             // Programmatic composer updates can bypass read-only.
                             // Preserve both the new composer and the accepted edit.

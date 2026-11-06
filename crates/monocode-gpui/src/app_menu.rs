@@ -80,6 +80,7 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
             MenuItem::action("New Claude Tab", NewClaude),
             MenuItem::action("New Terminal", NewTerminal),
             MenuItem::action("New Terminal in Home", NewTerminalHome),
+            MenuItem::action("Split Terminal Right", SplitTerminal),
             MenuItem::action("Split Pane Right", SplitRight),
             MenuItem::action("Split Pane Down", SplitDown),
             MenuItem::action("Close Pane", CloseTab),

@@ -288,7 +288,7 @@ impl Monos {
             .get(&call.session)
             .is_some_and(|r| r.habit == mono::heartbeat::RUN_ID);
         if call.action.starts_with("habits.")
-            && call.action != "habits.list"
+            && !matches!(call.action.as_str(), "habits.list" | "habits.export")
             && (habit_run || question)
         {
             return Err("A habit run cannot schedule more runs".into());
@@ -316,7 +316,10 @@ impl Monos {
         let key = (call.session, call.request_id.clone());
         self.app_pending.remove(&key);
         // A read has nothing to replay, and a day's list is large to keep as a receipt.
-        if matches!(call.action.as_str(), "today.list" | "today.sources") {
+        if matches!(
+            call.action.as_str(),
+            "today.list" | "today.sources" | "today.statuses" | "today.tags"
+        ) {
             let _ = call.reply.send(result);
             return;
         }
@@ -427,7 +430,10 @@ impl Monos {
                     }
                     // Reads change nothing: they must not make the page reload.
                     if (call.action.starts_with("today.")
-                        && !matches!(call.action.as_str(), "today.list" | "today.sources"))
+                        && !matches!(
+                            call.action.as_str(),
+                            "today.list" | "today.sources" | "today.statuses" | "today.tags"
+                        ))
                         || (call.action == "sessions.pullEvidence"
                             && call.input.get("taskId").is_some_and(|v| !v.is_null()))
                     {
@@ -604,8 +610,15 @@ impl Monos {
             self.finish_call(call, Err("Input must be a JSON object".into()), cx);
             return;
         }
-        let input = call.input.clone();
+        let mut input = call.input.clone();
         let action = call.action.clone();
+        // A session it starts without naming a model takes the one set for
+        // its sessions, if any; the receipt still keys on what it sent.
+        if action == "sessions.start"
+            && let Some(subsessions) = &mono.subsessions
+        {
+            subsessions.fill(&mut input);
+        }
         let root = self.root.clone();
         let target = mono.id.clone();
         let project = if action.starts_with("sessions.")
@@ -656,7 +669,7 @@ impl Monos {
                 return;
             }
             "sessions.start" => {
-                self.start_call(call, mono, project, source, cx);
+                self.start_call(call, &input, mono, project, source, cx);
                 return;
             }
             "sessions.list" | "sessions.read" => {
@@ -1110,8 +1123,9 @@ impl Monos {
             }
             "soul.read" | "soul.update" | "memory.read" | "memory.search" | "memory.add"
             | "memory.replace" | "memory.remove" | "habits.list" | "habits.add"
-            | "habits.update" | "habits.run" | "habits.remove" | "notes.list" | "notes.read"
-            | "notes.write" | "worktrees.list" | "worktrees.create" => {
+            | "habits.export" | "habits.import" | "habits.update" | "habits.run"
+            | "habits.remove" | "notes.list" | "notes.read" | "notes.write" | "worktrees.list"
+            | "worktrees.create" => {
                 let caller = call.session;
                 let request = call.request_id.clone();
                 let projects = mono.projects.clone();
@@ -1124,10 +1138,12 @@ impl Monos {
                         "memory.add"|"memory.replace"|"memory.remove"=>{let entry=if action=="memory.remove"{None}else{Some(memory::entry(&text(&input,"fact",4000)?,&memory::date(),input.get("until").and_then(Value::as_str))?)};let find=input.get("find").and_then(Value::as_str).unwrap_or_default();let hash=memory::edit(&root,&target,input.get("topic").and_then(Value::as_str),|old|if action=="memory.add"{Ok(memory::add(old,entry.as_deref().unwrap()))}else{memory::replace(old,find,entry.as_deref(),&memory::date())})?;json!({"hash":hash})},
                         "habits.list"=>json!(habits::load(&root,&target)?),
                         "habits.add"=>{let schedule=habits::Schedule::from_cli(input.get("schedule").ok_or("Provide schedule")?)?;let h=Habit::new(text(&input,"name",480)?,text(&input,"instructions",32000)?,schedule,now_ms())?;habits::update(&root,&target,|all|{all.push(h.clone());Ok(())})?;json!(h)},
-                        "habits.update"|"habits.run"|"habits.remove"=>{let id=text(&input,"id",128)?;habits::update(&root,&target,|all|{let index=all.iter().position(|h|h.id==id).ok_or("Habit not found")?;if action=="habits.remove"{all.remove(index);return Ok(json!({"removed":true}));}let h=&mut all[index];if action=="habits.run"{h.run_requested=true;}else{if let Some(name)=input.get("name").and_then(Value::as_str){if name.trim().is_empty()||name.chars().count()>120{return Err("Invalid habit name".into());}h.name=name.trim().into();}
+                        "habits.update"|"habits.run"|"habits.remove"=>{let id=text(&input,"id",128)?;habits::update(&root,&target,|all|{let index=all.iter().position(|h|h.id==id).ok_or("Habit not found")?;if action=="habits.remove"{all.remove(index);return Ok(json!({"removed":true}));}let h=&mut all[index];if action=="habits.run"{h.request_run()?;}else{if let Some(name)=input.get("name").and_then(Value::as_str){if name.trim().is_empty()||name.chars().count()>120{return Err("Invalid habit name".into());}h.name=name.trim().into();}
 if let Some(instructions)=input.get("instructions").and_then(Value::as_str){if instructions.trim().is_empty()||instructions.len()>32000{return Err("Invalid habit instructions".into());}h.instructions=instructions.into();}
 if let Some(schedule)=input.get("schedule"){h.reschedule(habits::Schedule::from_cli(schedule)?,now_ms())?;}
-if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=enabled;if enabled{h.next_run_at=h.schedule.next(now_ms())?;}}}Ok(json!(h))})?},
+if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled(enabled,now_ms())?;}}Ok(json!(h))})?},
+                        "habits.export"=>{let id=text(&input,"id",128)?;let h=habits::load(&root,&target)?.into_iter().find(|h|h.id==id).ok_or("Habit not found")?;json!({"yaml":monocode_core::mono::habit_yaml::export_habit(&h)})},
+                        "habits.import"=>{let preview=monocode_core::mono::habit_yaml::preview_habit_import(&text(&input,"yaml",monocode_core::mono::workflows::yaml::MAX_FILE_BYTES)?)?;let h=monocode_core::mono::habit_yaml::import_habit(&preview,now_ms())?;habits::update(&root,&target,|all|{all.push(h.clone());Ok(())})?;json!({"habit":h,"note":"Saved disabled: the user must review and approve this habit in the Habits panel before it can be enabled or run.","warnings":preview.warnings})},
                         "notes.list"|"notes.read"|"notes.write"=>app::notes_action(&*locked(&store)?,caller,&request,&action,&input,&projects)?,
                         "worktrees.list"=>json!(monocode_core::git::snapshot(Path::new(&project))?.worktrees.iter().map(|w|json!({"path":w.path,"branch":w.branch,"head":w.head,"main":w.main})).collect::<Vec<_>>()),
                         "worktrees.create"=>{let branch=text(&input,"branch",240)?;let tree=monocode_core::git::create_project_worktree(Path::new(&project),&branch,input.get("base").and_then(Value::as_str),flag(&input,"existing",false))?;json!({"path":tree.path,"branch":tree.branch})},
@@ -1145,7 +1161,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                     target,
                     move |store| {
                         let value = monocode_core::today::actions::handle(
-                            &*locked(&store)?,
+                            &*store,
                             &caller,
                             &name,
                             &input,
@@ -1186,10 +1202,12 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         };
         self.finish_call(call, result, cx);
     }
-    /// sessions.start. Every check runs before the session row exists.
+    /// sessions.start. Every check runs before the session row exists. `input` is the call's
+    /// input with the Mono's subsession defaults filled in; the receipt keys on `call.input`.
     fn start_call(
         &mut self,
         call: Call,
+        input: &Value,
         mono: mono::Mono,
         project: String,
         source: Option<Entity<Conversation>>,
@@ -1199,7 +1217,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         let placement = self
             .owner
             .update(cx, |owner, cx| {
-                owner.app_placement(&call.input, call.session, &project, cx)
+                owner.app_placement(input, call.session, &project, cx)
             })
             .map_err(|e| e.to_string())
             .and_then(|placement| placement);
@@ -1208,7 +1226,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                 &mono,
                 project,
                 source,
-                &call.input,
+                input,
                 StartContext {
                     request: call.request_id.clone(),
                     placement,

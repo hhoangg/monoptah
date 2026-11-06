@@ -5,14 +5,17 @@ pub(crate) mod cards;
 mod changes;
 #[cfg(test)]
 mod cloud_tests;
-mod color_picker;
+pub(crate) mod color_picker;
 mod dashboard;
 mod files;
 mod filters;
 mod floating;
+mod habit_share;
+#[cfg(test)]
+mod habit_share_tests;
 mod habit_stop;
 mod host;
-mod html;
+pub(crate) mod html;
 mod memory_ui;
 mod mobile;
 mod notifications;
@@ -139,15 +142,21 @@ pub(crate) struct Monos {
     files: Option<AgentFiles>,
     habits: Vec<Habit>,
     habit_ui: scheduler::HabitUi,
+    habit_share: habit_share::HabitShare,
     picker: Option<OpenPicker>,
     settings_anchor: AnchorSlot,
     model_anchor: AnchorSlot,
+    subsession_model_anchor: AnchorSlot,
+    subsession_effort_anchor: AnchorSlot,
     projects_anchor: AnchorSlot,
     access_anchor: AnchorSlot,
     menu: Option<(String, Entity<Menu>, Vec<Subscription>)>,
     menu_anchor: Anchor,
     documents: HashMap<String, Entity<crate::transcript::TranscriptView>>,
     html_documents: HashMap<String, Entity<html::Html>>,
+    /// Set while an app-level modal sits above the Mono page: a native web
+    /// view would draw over it, so HTML documents stay hidden.
+    suppress_html: bool,
     /// Native visuals the Mono published in its chat, opened as documents.
     visual_documents: HashMap<String, Entity<crate::visuals::VisualView>>,
     project_changes: changes::ProjectChanges,
@@ -172,6 +181,10 @@ pub(crate) struct Monos {
     scheduling: bool,
     persisted_messages: HashSet<String>,
     failed_reports: HashSet<String>,
+    #[cfg(test)]
+    dispatch_calls: usize,
+    #[cfg(test)]
+    dispatch_limit: Option<usize>,
     inflight: HashMap<String, Message>,
     card_refresh: HashMap<String, u64>,
     session_filters: filters::Filters,
@@ -300,6 +313,9 @@ impl Monos {
             }
         }
     }
+    pub(crate) fn set_suppress_html(&mut self, suppress: bool) {
+        self.suppress_html = suppress;
+    }
     pub(crate) fn hide_html(&self, cx: &App) {
         for view in self.html_documents.values() {
             view.read(cx).hide();
@@ -413,15 +429,19 @@ impl Monos {
             files: None,
             habits: Vec::new(),
             habit_ui: scheduler::HabitUi::default(),
+            habit_share: habit_share::HabitShare::default(),
             picker: None,
             settings_anchor: AnchorSlot::default(),
             model_anchor: AnchorSlot::default(),
+            subsession_model_anchor: AnchorSlot::default(),
+            subsession_effort_anchor: AnchorSlot::default(),
             projects_anchor: AnchorSlot::default(),
             access_anchor: AnchorSlot::default(),
             menu: None,
             menu_anchor: Anchor::Point(gpui::Point::default()),
             documents: HashMap::new(),
             html_documents: HashMap::new(),
+            suppress_html: false,
             visual_documents: HashMap::new(),
             project_changes: Default::default(),
             review: None,
@@ -440,6 +460,10 @@ impl Monos {
             scheduling: false,
             persisted_messages,
             failed_reports: HashSet::new(),
+            #[cfg(test)]
+            dispatch_calls: 0,
+            #[cfg(test)]
+            dispatch_limit: None,
             inflight: HashMap::new(),
             card_refresh: HashMap::new(),
             session_filters,
@@ -516,6 +540,12 @@ impl Monos {
             self.active = None;
         }
         cx.notify();
+    }
+    /// Arms the Mono chats that are waiting on a usage limit.
+    pub(crate) fn sweep_auto_resume(&mut self, cx: &mut Context<Self>) {
+        for chat in self.chats.values() {
+            chat.update(cx, |chat, cx| chat.sweep_auto_resume(cx));
+        }
     }
     pub(crate) fn set_original_chrome(&mut self, original: bool, cx: &mut Context<Self>) {
         if self.original_chrome == original {
@@ -792,9 +822,13 @@ impl Monos {
             let mut summary = db.create(provider.id(), &home)?;
             summary.title = mono.label();
             db.title(summary.id, &summary.title)?;
+            // A Mono's chat is conversation: it answers quickly at low effort
+            // and hands heavy work to background sessions. Only new chats get
+            // this; existing Monos keep whatever effort they already have.
             let settings = Settings {
                 access: AccessMode::Auto,
                 model: prefs.default_models.get(provider.id()).cloned(),
+                effort: Some("low".into()),
                 ..Default::default()
             };
             db.configure_agent(summary.id, provider.id(), &settings)?;
@@ -1048,7 +1082,7 @@ impl Monos {
             changed = before != mono.outbox.len();
             for (id, error) in failures {
                 if let Some(message) = mono.outbox.iter_mut().find(|m| m.id == id) {
-                    message.error = Some(error);
+                    message.error = Some(report_error(&error));
                     changed = true;
                 }
             }
@@ -1110,18 +1144,36 @@ impl Monos {
             return;
         };
         let busy = view.read(cx).busy;
-        let Some(message) = self
-            .roster
-            .get(id)
-            .and_then(|m| m.outbox.iter().find(|message| !busy || !message.internal))
-            .cloned()
-            .filter(|m| m.error.is_none() && self.persisted_messages.contains(&m.id))
-        else {
+        #[cfg(test)]
+        {
+            if let Some(limit) = self.dispatch_limit {
+                self.dispatch_calls += 1;
+                assert!(
+                    self.dispatch_calls < limit,
+                    "dispatch is re-entering forever"
+                );
+            }
+        }
+        let Some(message) = self.next_message(id, busy) else {
             return;
         };
         if view.update(cx, |v, cx| v.mono_dispatch(&message, cx)) && !busy {
             self.inflight.insert(id.into(), message);
         }
+    }
+    /// The message `dispatch` sends next.
+    fn next_message(&self, id: &str, busy: bool) -> Option<Message> {
+        self.roster
+            .get(id)
+            .and_then(|m| {
+                // A failed report waits for Retry or Discard without holding
+                // back the user's messages; a failed user message still does.
+                m.outbox.iter().find(|message| {
+                    (!busy || !message.internal) && !(message.internal && message.error.is_some())
+                })
+            })
+            .cloned()
+            .filter(|m| m.error.is_none() && self.persisted_messages.contains(&m.id))
     }
     fn chat_changed(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(view) = self.chats.get(id) else {
@@ -1152,10 +1204,10 @@ impl Monos {
                 if !ok && !status.starts_with("Stopped") {
                     if let Some(mono) = self.roster.get_mut(id) {
                         if let Some(queued) = mono.outbox.iter_mut().find(|m| m.id == sent.id) {
-                            queued.error = Some(status);
+                            queued.error = Some(report_error(&status));
                         } else {
                             sent.id = mono::new_id();
-                            sent.error = Some(status);
+                            sent.error = Some(report_error(&status));
                             mono.outbox.insert(0, sent);
                         }
                     }
@@ -1366,7 +1418,9 @@ impl Monos {
                 icon_button("new-mono", "New mono", "plus")
                     .debug_selector(|| "sidebar-mono-button".into())
                     .size(px(20.))
-                    .when(!original, |d| d.mr(px(-2.)))
+                    // Centred on the sidebar's trailing column, with the
+                    // session filter and the navigation hints and counts.
+                    .when(!original, |d| d.mr(px(-3.)))
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.create(add_project.clone().into_iter().collect(), w, cx)
                     })),
@@ -1622,11 +1676,15 @@ impl Monos {
                         .w_full()
                         .min_w_0()
                         .pr_7()
-                        .gap(px(6.))
+                        .gap(px(crate::tab_tile::TAB_TILE_GAP))
                         .group_hover(group.clone(), move |s| {
                             s.opacity(1.).bg(title_tab_fill(active, true))
                         })
-                        .child(avatar::avatar(&mono.mascot, mono.color, "idle", 16., true))
+                        .child(crate::tab_tile::mark_tile(
+                            &crate::tab_tile::TAB_TILE,
+                            crate::tab_tile::Face::Neutral,
+                            avatar::avatar(&mono.mascot, mono.color, "idle", 14., true),
+                        ))
                         .child(
                             div()
                                 .flex_1()
@@ -1784,4 +1842,15 @@ impl gpui::Render for Monos {
             )
             .into_any_element()
     }
+}
+
+/// A queued report keeps only the status line of a failed turn, never the reply text
+/// that `external_outcome` appends after it.
+pub(super) fn report_error(status_and_text: &str) -> String {
+    status_and_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
 }

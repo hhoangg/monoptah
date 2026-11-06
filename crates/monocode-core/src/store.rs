@@ -18,6 +18,9 @@ mod shared;
 mod side_threads;
 mod thread_files;
 mod today;
+pub use today::{NotePlan, NoteSaved};
+mod today_mention;
+mod today_sessions;
 use crate::surface::Surface;
 use crate::transcript::{Row, Transcript};
 pub use edit::EditSnapshot;
@@ -1195,6 +1198,8 @@ impl Store {
                 let _ = self.set_cloud_converted(env, host, false);
             }
         }
+        // Best effort: a stale link is filtered out by the UI, and the delete is done.
+        let _ = self.today_drop_session_link(id);
         thread_files::remove_dir(dir);
         Ok(())
     }

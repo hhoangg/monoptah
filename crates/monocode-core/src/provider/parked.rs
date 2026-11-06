@@ -44,12 +44,32 @@ pub(super) struct Wire {
     reader: Option<thread::JoinHandle<()>>,
     stderr_reader: Option<thread::JoinHandle<()>>,
     writer: Option<thread::JoinHandle<()>>,
-    _registration: process::Registration,
-    _account: crate::accounts::Tracked,
+    // Held until the child is gone, which may be after `Wire` is dropped.
+    _registration: Option<process::Registration>,
+    _account: Option<crate::accounts::Tracked>,
 }
+#[cfg(unix)]
+fn spawn_process(command: &mut Command) -> std::io::Result<std::process::Child> {
+    const ATTEMPTS: u32 = 5;
+    for attempt in 1..ATTEMPTS {
+        match command.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                thread::sleep(Duration::from_millis(25 * attempt as u64));
+            }
+            settled => return settled,
+        }
+    }
+    command.spawn()
+}
+
+#[cfg(not(unix))]
+fn spawn_process(command: &mut Command) -> std::io::Result<std::process::Child> {
+    command.spawn()
+}
+
 impl Wire {
     pub fn spawn(command: &mut Command, request: &Request) -> Result<Self, String> {
-        let mut child = command.spawn().map_err(|e| {
+        let mut child = spawn_process(command).map_err(|e| {
             format!(
                 "Cannot start {} at {}: {e}",
                 request.kind.label(),
@@ -120,12 +140,38 @@ impl Wire {
             reader: Some(reader),
             stderr_reader: Some(stderr_reader),
             writer: Some(writer),
-            _registration: registration,
-            _account: account,
+            _registration: Some(registration),
+            _account: Some(account),
         })
     }
 }
 impl Drop for Wire {
+    /// Close stdin and let the provider exit on its own before any signal, on
+    /// a background thread: `process::retire_pid` explains why a hard kill can
+    /// sign Claude out. Pool locks and turn completion never wait on this.
+    #[cfg(unix)]
+    fn drop(&mut self) {
+        self.stdin.sender.take();
+        // Disconnect before joining so a bounded stdout sender cannot deadlock.
+        let (_, empty) = mpsc::channel();
+        drop(std::mem::replace(&mut self.rx, empty));
+        let pid = self.child.id();
+        let threads = [
+            self.writer.take(),
+            self.reader.take(),
+            self.stderr_reader.take(),
+        ];
+        let held = (self._registration.take(), self._account.take());
+        thread::spawn(move || {
+            process::retire_pid(pid, || {
+                for t in threads.into_iter().flatten() {
+                    let _ = t.join();
+                }
+            });
+            drop(held);
+        });
+    }
+    #[cfg(not(unix))]
     fn drop(&mut self) {
         process::terminate(&mut self.child);
         self.stdin.sender.take();
@@ -285,7 +331,11 @@ pub(super) fn take(key: &str) -> Option<Parked> {
     Some(parked)
 }
 pub(super) fn put(wire: Wire, mut protocol: Protocol) {
-    if LIMIT.load(Ordering::Relaxed) == 0 || protocol.request.provider_id.is_none() {
+    // A prompt still queued in the CLI would answer into the next turn.
+    if LIMIT.load(Ordering::Relaxed) == 0
+        || protocol.request.provider_id.is_none()
+        || !protocol.claude_unstarted_steers.is_empty()
+    {
         return;
     }
     let key = key(&protocol.request);
@@ -337,6 +387,8 @@ pub(super) fn settle_cancelled(mut wire: Wire, mut protocol: Protocol) {
     if LIMIT.load(Ordering::Relaxed) == 0
         || (protocol.request.kind == Kind::Codex && protocol.active_turn.is_none())
         || (protocol.request.kind == Kind::Claude && !protocol.claude_prompt_sent)
+        // The CLI runs a queued prompt after an interrupt, so end the process.
+        || !protocol.claude_unstarted_steers.is_empty()
     {
         return;
     }
@@ -378,7 +430,8 @@ pub(super) fn settle_cancelled(mut wire: Wire, mut protocol: Protocol) {
                             && thread.is_none_or(|id| {
                                 Some(id) == protocol.request.provider_id.as_deref()
                             });
-                        let claude_terminal = kind == Kind::Claude && value["type"] == "result";
+                        let claude_terminal =
+                            kind == Kind::Claude && super::claude_turn_result(&value);
                         if codex_terminal || claude_terminal {
                             // Discard already-buffered trailing frames too.
                             while wire.rx.try_recv().is_ok() {}
@@ -630,6 +683,125 @@ for line in sys.stdin:
         request.settings.account = Default::default();
         request.cwd = dir.path().join("other");
         assert_ne!(original, key(&request));
+        configure(0);
+        idle_pool().lock().unwrap().clear();
+    }
+
+    #[test]
+    fn a_stopped_claude_process_with_a_queued_prompt_is_not_reused() {
+        const CHILD: &str = "MONOCODE_PARKED_QUEUED_STOP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The idle limit and pool are process-wide, as in the reuse test.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "provider::parked::tests::a_stopped_claude_process_with_a_queued_prompt_is_not_reused",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("claude");
+        let trace = dir.path().join("starts");
+        // On interrupt the real CLI reports the aborted request, then still
+        // runs the prompt that was queued behind it.
+        std::fs::write(
+            &binary,
+            format!(
+                r#"#!/usr/bin/env python3
+import json,os,sys
+with open({:?},'a') as f: f.write(str(os.getpid())+'\n')
+def send(v): print(json.dumps(v),flush=True)
+def text(id,value): send({{'type':'assistant','parent_tool_use_id':None,'message':{{'id':id,'content':[{{'type':'text','text':value}}]}}}})
+queued=None
+for line in sys.stdin:
+ v=json.loads(line)
+ if v['type']=='control_request' and v['request']['subtype']=='initialize':
+  send({{'type':'control_response','response':{{'subtype':'success','request_id':v['request_id']}}}})
+ elif v['type']=='control_request' and v['request']['subtype']=='interrupt':
+  send({{'type':'result','subtype':'error_during_execution','is_error':True,'num_turns':1,'errors':[]}})
+  send({{'type':'system','subtype':'init','session_id':'s'}})
+  send({{'type':'user','isReplay':True,'uuid':queued,'parent_tool_use_id':None,'message':{{'content':[]}}}})
+  text('stale','STALE')
+  send({{'type':'result','subtype':'success','num_turns':1}})
+ elif v['type']=='user' and 'third' in json.dumps(v['message']):
+  text('fresh','FRESH')
+  send({{'type':'result','subtype':'success','num_turns':1}})
+ elif v['type']=='user' and 'second' in json.dumps(v['message']):
+  queued=v.get('uuid')
+ elif v['type']=='user':
+  text('first','working')
+"#,
+                trace.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        configure(1);
+        let request = Request {
+            kind: Kind::Claude,
+            binary,
+            cwd: dir.path().into(),
+            prompt: "first".into(),
+            provider_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            model: None,
+            settings: Settings::default(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let (controls, receive) = mpsc::channel();
+        let mut steered = false;
+        let stopped = run_with_controls(request.clone(), cancel, Some(receive), |events| {
+            for event in events {
+                match event {
+                    Event::Text(_) if !steered => {
+                        steered = true;
+                        controls
+                            .send(Control {
+                                id: "queued".into(),
+                                decision: Decision::Steer(crate::follow_up::Message {
+                                    id: "queued".into(),
+                                    text: "second".into(),
+                                    ..Default::default()
+                                }),
+                            })
+                            .unwrap();
+                    }
+                    Event::FollowUp(_) => stop.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+            Ok(())
+        });
+        assert_eq!(stopped.unwrap_err(), "Stopped");
+        // Give a retained process time to settle into the pool.
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            idle_pool().lock().unwrap().is_empty(),
+            "its queued prompt would answer into the next turn"
+        );
+        let mut next = request.clone();
+        next.prompt = "third".into();
+        let mut output = String::new();
+        run(next, Arc::new(AtomicBool::new(false)), |events| {
+            for event in events {
+                if let Event::Text(text) = event {
+                    output.push_str(&text);
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(output, "FRESH");
         configure(0);
         idle_pool().lock().unwrap().clear();
     }

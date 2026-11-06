@@ -915,7 +915,14 @@ fn count(path: &std::path::Path, table: &str) -> i64 {
         .unwrap()
 }
 
-const TODAY_TABLES: [&str; 4] = ["today_days", "today_notes", "today_sources", "today_tasks"];
+const TODAY_TABLES: [&str; 6] = [
+    "today_days",
+    "today_events",
+    "today_notes",
+    "today_session_links",
+    "today_sources",
+    "today_tasks",
+];
 
 #[test]
 fn the_legacy_store_gains_today_tables_in_place_and_reopens_idempotently() {
@@ -1108,4 +1115,1748 @@ fn an_id_wins_over_a_key_that_equals_it() {
         t(14, 10, 5),
     );
     assert_eq!(store.today_task(&a.id).unwrap().unwrap().key, "a");
+}
+
+// --- workflow statuses, stage-aware reconcile, events (Today v2) ------------------------------
+
+use crate::today::statuses::{self, default_statuses};
+use crate::today::{Activity, EventKind, Stage};
+
+fn at(day: u32, hour: u32) -> u64 {
+    t(day, hour, 0)
+}
+
+fn sync_items(store: &Store, who: &MonoCaller, items: Vec<SyncItem>, now: u64) -> SyncSummary {
+    store.today_sync(&request("cu", items), who, now).unwrap()
+}
+
+fn staged(key: &str, stage: Stage) -> SyncItem {
+    SyncItem {
+        stage: Some(stage),
+        ..item(key)
+    }
+}
+
+fn closed_item(key: &str) -> SyncItem {
+    SyncItem {
+        closed: true,
+        ..item(key)
+    }
+}
+
+fn manual(store: &Store, title: &str, now: u64) -> Task {
+    let new = NewTask {
+        title: title.into(),
+        ..NewTask::default()
+    };
+    store.today_add(&new, &Actor::User, now).unwrap()
+}
+
+fn add_status(store: &Store, name: &str, stage: Stage) -> WorkflowStatus {
+    store.today_add_status(name, stage, "#112233").unwrap()
+}
+
+fn ids(list: &[WorkflowStatus]) -> Vec<String> {
+    list.iter().map(|s| s.id.clone()).collect()
+}
+
+fn kinds(store: &Store, key: &str) -> Vec<EventKind> {
+    store
+        .today_activity(key)
+        .unwrap()
+        .into_iter()
+        .filter_map(|a| match a {
+            Activity::Event(e) => Some(e.kind),
+            Activity::Note(_) => None,
+        })
+        .collect()
+}
+
+fn event_of(store: &Store, key: &str, kind: EventKind) -> TaskEvent {
+    store
+        .today_activity(key)
+        .unwrap()
+        .into_iter()
+        .find_map(|a| match a {
+            Activity::Event(e) if e.kind == kind => Some(e),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no {kind:?} event"))
+}
+
+#[test]
+fn statuses_default_when_absent_and_unreadable_is_not_overwritten() {
+    let store = store();
+    assert_eq!(store.today_statuses().unwrap(), default_statuses());
+    store.save_setting("today.statuses", "{not json").unwrap();
+    assert_eq!(store.today_statuses().unwrap(), default_statuses());
+    manual(&store, "a", at(14, 10));
+    store.today_view("2026-07-14", at(14, 11)).unwrap();
+    assert_eq!(
+        store.setting("today.statuses").unwrap().as_deref(),
+        Some("{not json")
+    );
+    store
+        .today_add_status("Review", Stage::Started, "#aabbcc")
+        .unwrap();
+    assert_ne!(
+        store.setting("today.statuses").unwrap().as_deref(),
+        Some("{not json")
+    );
+}
+
+#[test]
+fn a_stored_list_missing_a_builtin_is_repaired_on_read() {
+    let store = store();
+    store.save_setting("today.statuses", "[]").unwrap();
+    assert_eq!(store.today_statuses().unwrap(), default_statuses());
+}
+
+#[test]
+fn adding_a_status_goes_to_the_end_of_its_stage() {
+    let store = store();
+    let first = add_status(&store, "Next", Stage::NotStarted);
+    let second = add_status(&store, "Review", Stage::Started);
+    assert!(first.id.starts_with("status-"));
+    assert!(!first.builtin);
+    assert_eq!(
+        ids(&store.today_statuses().unwrap()),
+        [
+            "todo",
+            first.id.as_str(),
+            "in_progress",
+            second.id.as_str(),
+            "done"
+        ]
+    );
+}
+
+#[test]
+fn status_names_are_trimmed_checked_and_unique_ignoring_case() {
+    let store = store();
+    assert_eq!(
+        add_status(&store, "  Next  ", Stage::NotStarted).name,
+        "Next"
+    );
+    for bad in ["", "   "] {
+        assert!(store
+            .today_add_status(bad, Stage::Started, "#112233")
+            .is_err());
+    }
+    let long = "x".repeat(statuses::MAX_NAME + 1);
+    assert!(store
+        .today_add_status(&long, Stage::Started, "#112233")
+        .unwrap_err()
+        .contains("40"));
+    assert!(store
+        .today_add_status(&"x".repeat(statuses::MAX_NAME), Stage::Started, "#112233")
+        .is_ok());
+    for clash in ["next", "NEXT", "to do", "Done"] {
+        assert_eq!(
+            store
+                .today_add_status(clash, Stage::Started, "#112233")
+                .unwrap_err(),
+            "Another status already has that name"
+        );
+    }
+    // Renaming to its own name (other case) is fine.
+    let next = store.today_statuses().unwrap()[1].clone();
+    let patch = StatusPatch {
+        name: Some("NEXT".into()),
+        color: None,
+    };
+    assert_eq!(
+        store
+            .today_update_status(&next.id, &patch, at(14, 10))
+            .unwrap()
+            .name,
+        "NEXT"
+    );
+}
+
+#[test]
+fn status_colors_must_be_rrggbb_and_are_stored_lowercase() {
+    let store = store();
+    for bad in ["red", "#12345", "#1234567", "112233", "#12345g"] {
+        assert!(
+            store.today_add_status("A", Stage::Started, bad).is_err(),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        store
+            .today_add_status("A", Stage::Started, "#AABBCC")
+            .unwrap()
+            .color,
+        "#aabbcc"
+    );
+    let patch = StatusPatch {
+        name: None,
+        color: Some("nope".into()),
+    };
+    assert!(store
+        .today_update_status("todo", &patch, at(14, 10))
+        .is_err());
+}
+
+#[test]
+fn builtins_can_be_renamed_and_recolored_but_not_deleted() {
+    let store = store();
+    let patch = StatusPatch {
+        name: Some("Backlog".into()),
+        color: Some("#ABCDEF".into()),
+    };
+    let got = store
+        .today_update_status("todo", &patch, at(14, 10))
+        .unwrap();
+    assert_eq!(
+        (got.name.as_str(), got.color.as_str()),
+        ("Backlog", "#abcdef")
+    );
+    assert!(got.builtin);
+    assert_eq!(store.today_statuses().unwrap()[0], got);
+    assert!(store.today_delete_status("todo", at(14, 10)).is_err());
+    assert!(store
+        .today_update_status("missing", &StatusPatch::default(), at(14, 10))
+        .is_err());
+}
+
+#[test]
+fn moving_a_status_clamps_the_index_and_protects_builtins() {
+    let store = store();
+    let a = add_status(&store, "A", Stage::Started);
+    let b = add_status(&store, "B", Stage::Started);
+    let moved = store
+        .today_move_status(&b.id, Stage::Started, 0, at(14, 10))
+        .unwrap();
+    assert_eq!(
+        ids(&moved),
+        ["todo", b.id.as_str(), "in_progress", a.id.as_str(), "done"]
+    );
+    let moved = store
+        .today_move_status(&b.id, Stage::Started, 99, at(14, 10))
+        .unwrap();
+    assert_eq!(
+        ids(&moved),
+        ["todo", "in_progress", a.id.as_str(), b.id.as_str(), "done"]
+    );
+    // A built-in moves inside its stage only.
+    let moved = store
+        .today_move_status("in_progress", Stage::Started, 1, at(14, 10))
+        .unwrap();
+    assert_eq!(
+        ids(&moved),
+        ["todo", a.id.as_str(), "in_progress", b.id.as_str(), "done"]
+    );
+    assert!(store
+        .today_move_status("in_progress", Stage::Finished, 0, at(14, 10))
+        .is_err());
+    assert_eq!(store.today_statuses().unwrap(), moved);
+}
+
+#[test]
+fn a_status_can_move_to_a_stage_with_only_its_builtin() {
+    let store = store();
+    let a = add_status(&store, "A", Stage::Started);
+    let moved = store
+        .today_move_status(&a.id, Stage::NotStarted, 0, at(14, 10))
+        .unwrap();
+    assert_eq!(ids(&moved), [a.id.as_str(), "todo", "in_progress", "done"]);
+    assert_eq!(moved[0].stage, Stage::NotStarted);
+}
+
+#[test]
+fn deleting_a_status_moves_its_tasks_to_the_builtin_of_the_stage_with_events() {
+    let store = store();
+    let review = add_status(&store, "Review", Stage::Started);
+    let task = manual(&store, "a", at(14, 10));
+    store
+        .today_set_status(&task.id, &review.id, &Actor::User, at(14, 11))
+        .unwrap();
+    let list = store.today_delete_status(&review.id, at(14, 12)).unwrap();
+    assert_eq!(ids(&list), ["todo", "in_progress", "done"]);
+    let got = by_key(&store, &task.key);
+    assert_eq!(got.status_id, "in_progress");
+    assert_eq!(got.status, Status::Open);
+    let last = store
+        .today_activity(&task.id)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find_map(|a| match a {
+            Activity::Event(e) if e.kind == EventKind::StatusChanged => Some(e),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(last.from.unwrap().id, review.id);
+    assert_eq!(last.to.unwrap().id, "in_progress");
+    assert!(store.today_delete_status("nope", at(14, 12)).is_err());
+}
+
+#[test]
+fn deleting_a_finished_status_keeps_done_tasks_done() {
+    let store = store();
+    let shipped = add_status(&store, "Shipped", Stage::Finished);
+    let task = manual(&store, "a", at(14, 10));
+    store
+        .today_set_status(&task.id, &shipped.id, &Actor::User, at(14, 11))
+        .unwrap();
+    store.today_delete_status(&shipped.id, at(14, 12)).unwrap();
+    let got = by_key(&store, &task.key);
+    assert_eq!((got.status, got.status_id.as_str()), (Status::Done, "done"));
+}
+
+#[test]
+fn moving_a_custom_status_into_finished_completes_its_tasks_and_back_reopens() {
+    let store = store();
+    let review = add_status(&store, "Review", Stage::Started);
+    let task = manual(&store, "a", at(14, 10));
+    let other = manual(&store, "other", at(14, 10));
+    store
+        .today_set_status(&task.id, &review.id, &Actor::User, at(14, 11))
+        .unwrap();
+    store
+        .today_move_status(&review.id, Stage::Finished, 0, at(14, 12))
+        .unwrap();
+    let got = by_key(&store, &task.key);
+    assert_eq!(got.status, Status::Done);
+    assert_eq!(got.status_id, review.id);
+    assert_eq!(got.closed_by, Some(ClosedBy::User));
+    assert_eq!(got.closed_day.as_deref(), Some("2026-07-14"));
+    assert_eq!(by_key(&store, &other.key).status, Status::Open);
+    assert!(kinds(&store, &task.key).contains(&EventKind::StatusChanged));
+    let view = store.today_view("2026-07-14", at(14, 13)).unwrap();
+    let row = view.rows.iter().find(|r| r.task.id == task.id).unwrap();
+    assert_eq!(row.status.stage, Stage::Finished);
+    store
+        .today_move_status(&review.id, Stage::Started, 0, at(14, 14))
+        .unwrap();
+    let got = by_key(&store, &task.key);
+    assert_eq!(
+        (got.status, got.status_id.as_str()),
+        (Status::Open, review.id.as_str())
+    );
+    assert_eq!(got.closed_day, None);
+}
+
+#[test]
+fn new_manual_tasks_start_in_to_do_and_complete_reopen_keep_the_status_in_step() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    assert_eq!(task.status_id, "todo");
+    let done = store
+        .today_complete(&task.id, &Actor::User, at(14, 11))
+        .unwrap();
+    assert_eq!(
+        (done.status, done.status_id.as_str()),
+        (Status::Done, "done")
+    );
+    let open = store.today_reopen(&task.id, at(14, 12)).unwrap();
+    assert_eq!(
+        (open.status, open.status_id.as_str()),
+        (Status::Open, "todo")
+    );
+    assert_eq!(
+        kinds(&store, &task.key),
+        [
+            EventKind::Added,
+            EventKind::StatusChanged,
+            EventKind::StatusChanged
+        ]
+    );
+}
+
+#[test]
+fn completing_a_task_already_in_a_finished_status_keeps_it() {
+    let store = store();
+    let shipped = add_status(&store, "Shipped", Stage::Finished);
+    let task = manual(&store, "a", at(14, 10));
+    store
+        .today_set_status(&task.id, &shipped.id, &Actor::User, at(14, 11))
+        .unwrap();
+    store.today_reopen(&task.id, at(14, 12)).unwrap();
+    assert_eq!(by_key(&store, &task.key).status_id, "todo");
+    let started = add_status(&store, "Review", Stage::Started);
+    store
+        .today_set_status(&task.id, &started.id, &Actor::User, at(14, 13))
+        .unwrap();
+    store.today_reopen(&task.id, at(14, 14)).unwrap();
+    assert_eq!(by_key(&store, &task.key).status_id, started.id);
+}
+
+#[test]
+fn set_status_inside_a_stage_changes_only_the_id_and_a_user_pins_it() {
+    let store = store();
+    let review = add_status(&store, "Review", Stage::Started);
+    let task = manual(&store, "a", at(14, 10));
+    let got = store
+        .today_set_status(&task.id, &review.id, &Actor::User, at(14, 11))
+        .unwrap();
+    assert_eq!(
+        (got.status, got.status_id.as_str()),
+        (Status::Open, review.id.as_str())
+    );
+    assert!(got.status_pinned);
+    assert!(store
+        .today_set_status(&task.id, "nope", &Actor::User, at(14, 12))
+        .is_err());
+}
+
+#[test]
+fn set_status_out_of_finished_reopens_even_from_needs_check() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    store.today_complete("a", &Actor::User, at(14, 11)).unwrap();
+    sync_items(&store, &me, vec![item("a")], at(14, 12));
+    let checked = by_key(&store, "a");
+    assert_eq!(checked.status, Status::NeedsCheck);
+    assert_eq!(checked.check_reason, Some(CheckReason::DoneButSourceOpen));
+    assert_eq!(checked.status_id, "done");
+    let got = store
+        .today_set_status("a", "todo", &Actor::User, at(14, 13))
+        .unwrap();
+    assert_eq!((got.status, got.check_reason), (Status::Open, None));
+    assert_eq!(got.status_id, "todo");
+    assert!(kinds(&store, "a").contains(&EventKind::CheckCleared));
+}
+
+#[test]
+fn set_status_into_finished_completes_a_task() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    let got = store
+        .today_set_status(&task.id, "done", &Actor::User, at(14, 11))
+        .unwrap();
+    assert_eq!(got.status, Status::Done);
+    assert_eq!(got.closed_by, Some(ClosedBy::User));
+    assert_eq!(got.closed_day.as_deref(), Some("2026-07-14"));
+}
+
+#[test]
+fn a_mono_sets_status_without_pinning_and_never_finishes_in_a_run() {
+    let store = store();
+    let me = caller("m1", &[]);
+    let other = caller("m2", &["/elsewhere"]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    let got = store
+        .today_set_status("a", "in_progress", &Actor::Mono(me.clone()), at(14, 11))
+        .unwrap();
+    assert!(!got.status_pinned);
+    assert_eq!(got.status_id, "in_progress");
+    let in_run = MonoCaller {
+        in_run: true,
+        habit: Some("h".into()),
+        ..me.clone()
+    };
+    assert!(store
+        .today_set_status("a", "done", &Actor::Mono(in_run.clone()), at(14, 12))
+        .is_err());
+    assert!(store
+        .today_set_status("a", "todo", &Actor::Mono(in_run), at(14, 12))
+        .is_ok());
+    // A Mono that cannot see the task gets not found.
+    assert_eq!(
+        store
+            .today_set_status("a", "todo", &Actor::Mono(other), at(14, 12))
+            .unwrap_err(),
+        "Task not found"
+    );
+}
+
+#[test]
+fn keep_done_answers_the_check_and_a_sync_does_not_raise_it_again() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    assert!(store.today_keep_done("a", at(14, 10)).is_err());
+    store.today_complete("a", &Actor::User, at(14, 11)).unwrap();
+    assert!(store.today_keep_done("a", at(14, 11)).is_err());
+    sync_items(&store, &me, vec![item("a")], at(14, 12));
+    let kept = store.today_keep_done("a", at(14, 13)).unwrap();
+    assert_eq!(kept.status, Status::Done);
+    assert!(kept.kept_done);
+    assert_eq!(kept.check_reason, None);
+    assert_eq!(kept.status_id, "done");
+    assert_eq!(kept.closed_day.as_deref(), Some("2026-07-14"));
+    sync_items(&store, &me, vec![item("a")], at(14, 14));
+    assert_eq!(by_key(&store, "a").status, Status::Done);
+    let kinds = kinds(&store, "a");
+    assert!(kinds.contains(&EventKind::KeptDone));
+    assert!(!kinds[kinds.len() - 2..].contains(&EventKind::CheckCleared));
+}
+
+#[test]
+fn a_kept_done_task_closed_by_the_source_later_is_source_closed_and_reopens_clear_the_flag() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    store.today_complete("a", &Actor::User, at(14, 11)).unwrap();
+    sync_items(&store, &me, vec![item("a")], at(14, 12));
+    store.today_keep_done("a", at(14, 13)).unwrap();
+    sync_items(&store, &me, vec![closed_item("a")], at(14, 14));
+    let got = by_key(&store, "a");
+    assert_eq!(got.closed_by, Some(ClosedBy::Source));
+    sync_items(&store, &me, vec![item("a")], at(14, 15));
+    let got = by_key(&store, "a");
+    assert_eq!(got.status, Status::Open);
+    assert!(!got.kept_done);
+    assert_eq!(got.status_id, "todo");
+}
+
+#[test]
+fn a_user_reopen_clears_kept_done() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    store.today_complete("a", &Actor::User, at(14, 11)).unwrap();
+    sync_items(&store, &me, vec![item("a")], at(14, 12));
+    store.today_keep_done("a", at(14, 13)).unwrap();
+    store.today_reopen("a", at(14, 14)).unwrap();
+    assert!(!by_key(&store, "a").kept_done);
+}
+
+#[test]
+fn sync_places_new_tasks_by_stage_explicit_then_source_status() {
+    let store = store();
+    let me = caller("m1", &[]);
+    let mut reviewing = item("c");
+    reviewing.source_status = Some("In Review".into());
+    let mut explicit = staged("d", Stage::NotStarted);
+    explicit.source_status = Some("In Progress".into());
+    sync_items(
+        &store,
+        &me,
+        vec![staged("a", Stage::Started), item("b"), reviewing, explicit],
+        at(14, 10),
+    );
+    let got = |key: &str| by_key(&store, key).status_id;
+    assert_eq!(
+        (got("a").as_str(), got("b").as_str()),
+        ("in_progress", "todo")
+    );
+    assert_eq!(
+        (got("c").as_str(), got("d").as_str()),
+        ("in_progress", "todo")
+    );
+}
+
+#[test]
+fn a_synced_stage_change_moves_the_task_with_an_event_by_the_source() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    sync_items(&store, &me, vec![staged("a", Stage::Started)], at(14, 11));
+    assert_eq!(by_key(&store, "a").status_id, "in_progress");
+    let moved = event_of(&store, "a", EventKind::StatusChanged);
+    assert_eq!(moved.source_id.as_deref(), Some("cu"));
+    assert_eq!(moved.mono_id.as_deref(), Some("m1"));
+    assert_eq!(moved.from.unwrap().id, "todo");
+    assert_eq!(moved.to.unwrap().id, "in_progress");
+}
+
+#[test]
+fn a_users_status_change_is_never_overwritten_by_a_sync() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    store
+        .today_set_status("a", "in_progress", &Actor::User, at(14, 11))
+        .unwrap();
+    sync_items(&store, &me, vec![item("a")], at(14, 12));
+    sync_items(
+        &store,
+        &me,
+        vec![staged("a", Stage::NotStarted)],
+        at(14, 13),
+    );
+    assert_eq!(by_key(&store, "a").status_id, "in_progress");
+    // The lifecycle still applies: the source closing it closes it.
+    sync_items(&store, &me, vec![closed_item("a")], at(14, 14));
+    let got = by_key(&store, "a");
+    assert_eq!((got.status, got.status_id.as_str()), (Status::Done, "done"));
+}
+
+#[test]
+fn a_finished_stage_on_an_open_item_is_ignored_and_the_sync_summary_counts_stay_v1() {
+    let store = store();
+    let me = caller("m1", &[]);
+    let summary = sync_items(&store, &me, vec![staged("a", Stage::Finished)], at(14, 10));
+    assert_eq!(summary.added, 1);
+    let got = by_key(&store, "a");
+    assert_eq!((got.status, got.status_id.as_str()), (Status::Open, "todo"));
+}
+
+#[test]
+fn needs_check_both_causes_keep_the_status_and_record_events() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(
+        &store,
+        &me,
+        vec![staged("a", Stage::Started), item("b")],
+        at(14, 10),
+    );
+    store.today_complete("b", &Actor::User, at(14, 11)).unwrap();
+    let summary = sync_items(&store, &me, vec![item("b")], at(14, 12));
+    // "a" went missing, "b" was done by the user and is still listed.
+    assert_eq!(summary.needs_check, 2);
+    let a = by_key(&store, "a");
+    assert_eq!(
+        (a.status, a.check_reason),
+        (Status::NeedsCheck, Some(CheckReason::Missing))
+    );
+    assert_eq!(a.status_id, "in_progress");
+    let b = by_key(&store, "b");
+    assert_eq!(b.check_reason, Some(CheckReason::DoneButSourceOpen));
+    assert_eq!(b.status_id, "done");
+    assert_eq!(
+        event_of(&store, "a", EventKind::NeedsCheck).check_reason,
+        Some(CheckReason::Missing)
+    );
+    assert_eq!(
+        event_of(&store, "b", EventKind::NeedsCheck).check_reason,
+        Some(CheckReason::DoneButSourceOpen)
+    );
+    // Listed again, the missing one comes back and the check clears.
+    sync_items(&store, &me, vec![item("a"), item("b")], at(14, 13));
+    assert_eq!(by_key(&store, "a").status, Status::Open);
+    assert!(kinds(&store, "a").contains(&EventKind::CheckCleared));
+}
+
+#[test]
+fn a_failed_sync_changes_no_status_and_writes_no_event() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    let before = (store.today_tasks(at(14, 11)).unwrap(), kinds(&store, "a"));
+    store.today_sync(&failed("cu"), &me, at(14, 12)).unwrap();
+    assert_eq!(
+        (store.today_tasks(at(14, 12)).unwrap(), kinds(&store, "a")),
+        before
+    );
+}
+
+#[test]
+fn source_close_and_reopen_record_events_and_set_the_status() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![staged("a", Stage::Started)], at(14, 10));
+    let mut done = closed_item("a");
+    done.close_reason = Some("Merged".into());
+    sync_items(&store, &me, vec![done], at(14, 11));
+    let got = by_key(&store, "a");
+    assert_eq!((got.status, got.status_id.as_str()), (Status::Done, "done"));
+    assert_eq!(
+        event_of(&store, "a", EventKind::ClosedBySource)
+            .detail
+            .as_deref(),
+        Some("Merged")
+    );
+    sync_items(&store, &me, vec![staged("a", Stage::Started)], at(14, 12));
+    let got = by_key(&store, "a");
+    assert_eq!(
+        (got.status, got.status_id.as_str()),
+        (Status::Open, "in_progress")
+    );
+    let reopened = event_of(&store, "a", EventKind::ReopenedBySource);
+    assert_eq!(reopened.source_id.as_deref(), Some("cu"));
+}
+
+#[test]
+fn snooze_and_dismiss_record_events() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a"), item("b")], at(14, 10));
+    store
+        .today_snooze("a", "2026-07-20", &Actor::User, at(14, 11))
+        .unwrap();
+    store.today_dismiss("b", &Actor::User, at(14, 11)).unwrap();
+    assert_eq!(
+        event_of(&store, "a", EventKind::Snoozed).detail.as_deref(),
+        Some("2026-07-20")
+    );
+    assert!(kinds(&store, "b").contains(&EventKind::Dismissed));
+}
+
+#[test]
+fn snoozing_a_done_but_source_open_check_leaves_the_finished_status() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    store.today_complete("a", &Actor::User, at(14, 11)).unwrap();
+    sync_items(&store, &me, vec![item("a")], at(14, 12));
+    store
+        .today_snooze("a", "2026-07-20", &Actor::User, at(14, 13))
+        .unwrap();
+    let got = by_key(&store, "a");
+    assert_eq!(
+        (got.status, got.status_id.as_str()),
+        (Status::Snoozed, "todo")
+    );
+}
+
+#[test]
+fn rows_carry_the_status_and_sort_by_status_order_first() {
+    let store = store();
+    let review = add_status(&store, "Review", Stage::Started);
+    let a = manual(&store, "A first", at(14, 10));
+    let b = manual(&store, "B second", at(14, 10));
+    let c = manual(&store, "C third", at(14, 10));
+    store
+        .today_set_status(&c.id, &review.id, &Actor::User, at(14, 11))
+        .unwrap();
+    store
+        .today_set_status(&b.id, "in_progress", &Actor::User, at(14, 11))
+        .unwrap();
+    let view = store.today_view("2026-07-14", at(14, 12)).unwrap();
+    let order: Vec<_> = view
+        .rows
+        .iter()
+        .map(|r| (r.task.id.clone(), r.status.id.clone()))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (a.id.clone(), "todo".to_string()),
+            (b.id.clone(), "in_progress".to_string()),
+            (c.id.clone(), review.id.clone()),
+        ]
+    );
+    // Reordering the statuses reorders the rows.
+    store
+        .today_move_status(&review.id, Stage::Started, 0, at(14, 13))
+        .unwrap();
+    let view = store.today_view("2026-07-14", at(14, 13)).unwrap();
+    assert_eq!(view.rows[1].task.id, c.id);
+    assert_eq!(view.rows[2].task.id, b.id);
+}
+
+#[test]
+fn a_past_day_keeps_the_status_as_it_stood_at_the_end_of_that_day() {
+    let store = store();
+    let review = store
+        .today_add_status("Review", Stage::Started, "#aa00aa")
+        .unwrap();
+    let task = manual(&store, "a", at(14, 10));
+    store
+        .today_set_status(&task.id, &review.id, &Actor::User, at(14, 11))
+        .unwrap();
+    // A rename on the 14th shows on the 14th: its record is rewritten.
+    let first = StatusPatch {
+        name: Some("Code review".into()),
+        color: Some("#00ff00".into()),
+    };
+    store
+        .today_update_status(&review.id, &first, at(14, 12))
+        .unwrap();
+    let past = store.today_view("2026-07-14", at(15, 10)).unwrap();
+    assert_eq!(past.mode, DayMode::Past);
+    let row = &past.rows[0];
+    assert_eq!(
+        (row.status.name.as_str(), row.status.color.as_str()),
+        ("Code review", "#00ff00")
+    );
+    // A rename on the 15th leaves the 14th alone.
+    let second = StatusPatch {
+        name: Some("QA".into()),
+        color: None,
+    };
+    store.today_view("2026-07-15", at(15, 10)).unwrap();
+    store
+        .today_update_status(&review.id, &second, at(15, 10))
+        .unwrap();
+    let past = store.today_view("2026-07-14", at(15, 11)).unwrap();
+    assert_eq!(past.rows[0].status.name, "Code review");
+    let now = store.today_view("2026-07-15", at(15, 11)).unwrap();
+    assert_eq!(now.rows[0].status.name, "QA");
+    // Deleting the status later leaves the past view alone.
+    store.today_delete_status(&review.id, at(15, 12)).unwrap();
+    let past = store.today_view("2026-07-14", at(15, 13)).unwrap();
+    assert_eq!(past.rows[0].status.name, "Code review");
+    let now = store.today_view("2026-07-15", at(15, 13)).unwrap();
+    assert_eq!(now.rows[0].status.id, "in_progress");
+}
+
+#[test]
+fn moving_a_status_into_finished_does_not_finish_a_dismissed_task() {
+    let store = store();
+    let review = add_status(&store, "Review", Stage::Started);
+    let task = manual(&store, "a", at(14, 10));
+    store
+        .today_set_status(&task.id, &review.id, &Actor::User, at(14, 11))
+        .unwrap();
+    store
+        .today_dismiss(&task.id, &Actor::User, at(14, 12))
+        .unwrap();
+    store
+        .today_move_status(&review.id, Stage::Finished, 0, at(14, 13))
+        .unwrap();
+    let got = by_key(&store, &task.key);
+    assert_eq!(
+        (got.status, got.status_id.as_str()),
+        (Status::Dismissed, "in_progress")
+    );
+}
+
+#[test]
+fn an_unparseable_status_entry_is_dropped_alone() {
+    let store = store();
+    let good =
+        serde_json::json!({"id": "c1", "name": "Next", "stage": "not_started", "color": "#112233"});
+    let json = serde_json::json!([good, {"id": "bad", "stage": "nowhere"}, 5]);
+    store
+        .save_setting("today.statuses", &json.to_string())
+        .unwrap();
+    assert_eq!(
+        ids(&store.today_statuses().unwrap()),
+        ["todo", "c1", "in_progress", "done"]
+    );
+    store.save_setting("today.statuses", "{\"a\":1}").unwrap();
+    assert_eq!(store.today_statuses().unwrap(), default_statuses());
+}
+
+#[test]
+fn an_unknown_status_id_is_not_rewritten_by_a_save() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    let mut value = serde_json::to_value(by_key(&store, &task.key)).unwrap();
+    value["statusId"] = serde_json::json!("from-a-newer-build");
+    store
+        .conn
+        .execute(
+            "UPDATE today_tasks SET json = ?1 WHERE id = ?2",
+            params![value.to_string(), task.id],
+        )
+        .unwrap();
+    store
+        .today_update(
+            &task.id,
+            &TaskPatch {
+                title: Some("b".into()),
+                ..TaskPatch::default()
+            },
+            &Actor::User,
+            at(14, 11),
+        )
+        .unwrap();
+    assert_eq!(by_key(&store, &task.key).status_id, "from-a-newer-build");
+}
+
+#[test]
+fn past_rows_sort_a_deleted_status_after_the_rest_of_its_stage() {
+    let store = store();
+    let review = add_status(&store, "Review", Stage::Started);
+    let a = manual(&store, "A", at(14, 10));
+    let b = manual(&store, "B", at(14, 10));
+    store
+        .today_set_status(&a.id, &review.id, &Actor::User, at(14, 11))
+        .unwrap();
+    store
+        .today_set_status(&b.id, "in_progress", &Actor::User, at(14, 11))
+        .unwrap();
+    store.today_delete_status(&review.id, at(15, 10)).unwrap();
+    let past = store.today_view("2026-07-14", at(15, 11)).unwrap();
+    let names: Vec<_> = past.rows.iter().map(|r| r.status.name.clone()).collect();
+    assert_eq!(names, ["In progress", "Review"]);
+}
+
+#[test]
+fn a_task_saved_before_statuses_resolves_on_read_and_persists_on_save() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a"), item("b")], at(14, 10));
+    // Simulate pre-v2 JSON: no status fields at all.
+    for key in ["a", "b"] {
+        let mut value: serde_json::Value = serde_json::to_value(by_key(&store, key)).unwrap();
+        for field in ["statusId", "statusPinned", "keptDone", "summary"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE today_tasks SET json = ?1 WHERE key = ?2",
+                params![value.to_string(), key],
+            )
+            .unwrap();
+    }
+    assert_eq!(by_key(&store, "a").status_id, "");
+    let view = store.today_view("2026-07-14", at(14, 11)).unwrap();
+    assert!(view.rows.iter().all(|r| r.status.id == "todo"));
+    // Reading changed nothing; the next real save persists the resolved id.
+    assert_eq!(by_key(&store, "a").status_id, "");
+    store
+        .today_note("a", "hi", &Actor::User, at(14, 11))
+        .unwrap();
+    assert_eq!(by_key(&store, "a").status_id, "");
+    store.today_complete("a", &Actor::User, at(14, 12)).unwrap();
+    assert_eq!(by_key(&store, "a").status_id, "done");
+    store
+        .today_snooze("b", "2026-07-20", &Actor::User, at(14, 12))
+        .unwrap();
+    assert_eq!(by_key(&store, "b").status_id, "todo");
+}
+
+#[test]
+fn old_lifecycle_states_resolve_to_sensible_statuses() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(
+        &store,
+        &me,
+        vec![
+            item("a"),
+            item("b"),
+            item("c"),
+            item("d"),
+            item("e"),
+            item("f"),
+        ],
+        at(14, 10),
+    );
+    store.today_complete("a", &Actor::User, at(14, 11)).unwrap();
+    store.today_dismiss("c", &Actor::User, at(14, 11)).unwrap();
+    store
+        .today_snooze("d", "2026-07-20", &Actor::User, at(14, 11))
+        .unwrap();
+    for key in ["a", "b", "c", "d", "e", "f"] {
+        let mut value = serde_json::to_value(by_key(&store, key)).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("statusId");
+        // Two tasks saved in Needs check, one per reason.
+        if key == "e" || key == "f" {
+            object.insert("status".into(), "needs_check".into());
+            let reason = if key == "e" {
+                "done_but_source_open"
+            } else {
+                "missing"
+            };
+            object.insert("checkReason".into(), reason.into());
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE today_tasks SET json = ?1 WHERE key = ?2",
+                params![value.to_string(), key],
+            )
+            .unwrap();
+    }
+    let list = store.today_statuses().unwrap();
+    let resolved = |key: &str| statuses::resolve(&by_key(&store, key), &list).id.clone();
+    assert_eq!(resolved("a"), "done");
+    assert_eq!(resolved("b"), "todo");
+    assert_eq!(resolved("c"), "todo");
+    assert_eq!(resolved("d"), "todo");
+    assert_eq!(resolved("e"), "done", "done but the source is open");
+    assert_eq!(resolved("f"), "todo", "missing from the source");
+    // Dismissed and snoozed stay hidden, done shows on its day.
+    let view = store.today_view("2026-07-14", at(14, 12)).unwrap();
+    let keys: Vec<_> = view.rows.iter().map(|r| r.task.key.as_str()).collect();
+    assert_eq!(keys, ["f", "b", "e", "a"]);
+}
+
+#[test]
+fn a_day_record_without_status_json_reads_through_the_current_statuses() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    store
+        .conn
+        .execute("UPDATE today_days SET status_json = NULL", [])
+        .unwrap();
+    store
+        .today_update_status(
+            "todo",
+            &StatusPatch {
+                name: Some("Backlog".into()),
+                color: None,
+            },
+            at(15, 10),
+        )
+        .unwrap();
+    let past = store.today_view("2026-07-14", at(15, 10)).unwrap();
+    assert_eq!(past.rows[0].task.id, task.id);
+    assert_eq!(past.rows[0].status.name, "Backlog");
+}
+
+#[test]
+fn a_legacy_days_table_gains_the_status_column_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("native.db");
+    {
+        let store = Store::open(&path).unwrap();
+        store.conn.execute_batch(
+            "CREATE TABLE today_days (day TEXT NOT NULL, task_id TEXT NOT NULL, grp TEXT NOT NULL,
+               age_days INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (day, task_id));
+             CREATE TABLE today_tasks (id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, source_id TEXT,
+               status TEXT NOT NULL, first_day TEXT NOT NULL, snoozed_until TEXT, closed_day TEXT,
+               json TEXT NOT NULL);",
+        ).unwrap();
+        let old = serde_json::json!({
+            "id": "t1", "key": "manual:t1", "title": "Old", "status": "open",
+            "firstSeen": 1, "firstDay": "2026-07-10", "updatedAt": 1
+        });
+        store.conn.execute(
+            "INSERT INTO today_tasks (id,key,source_id,status,first_day,json) VALUES ('t1','manual:t1',NULL,'open','2026-07-10',?1)",
+            [old.to_string()],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO today_days (day,task_id,grp,age_days,json) VALUES ('2026-07-10','t1','today',0,?1)",
+            [old.to_string()],
+        ).unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let past = store.today_view("2026-07-10", at(14, 10)).unwrap();
+    assert_eq!(past.rows.len(), 1);
+    assert_eq!(past.rows[0].status.id, "todo");
+    let current = store.today_view("2026-07-14", at(14, 10)).unwrap();
+    assert_eq!(current.rows.len(), 1);
+    manual(&store, "new", at(14, 11));
+    assert!(super::super::shared::has_table(&store.conn, "today_events").unwrap());
+}
+
+#[test]
+fn activity_is_oldest_first_with_notes_merged_in() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    store
+        .today_note("a", "first", &Actor::User, at(14, 11))
+        .unwrap();
+    store
+        .today_set_status("a", "in_progress", &Actor::User, at(14, 12))
+        .unwrap();
+    store
+        .today_note("a", "second", &Actor::User, at(14, 13))
+        .unwrap();
+    let line: Vec<String> = store
+        .today_activity("a")
+        .unwrap()
+        .iter()
+        .map(|a| match a {
+            Activity::Event(e) => format!("{:?}", e.kind),
+            Activity::Note(n) => n.body.clone(),
+        })
+        .collect();
+    assert_eq!(line, ["Added", "first", "StatusChanged", "second"]);
+    let times: Vec<u64> = store
+        .today_activity("a")
+        .unwrap()
+        .iter()
+        .map(Activity::at)
+        .collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]));
+}
+
+#[test]
+fn a_task_with_no_added_event_gets_one_synthesized_first() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    store.conn.execute("DELETE FROM today_events", []).unwrap();
+    store
+        .today_note("a", "n", &Actor::User, at(14, 11))
+        .unwrap();
+    let activity = store.today_activity("a").unwrap();
+    assert_eq!(activity.len(), 2);
+    let Activity::Event(first) = &activity[0] else {
+        panic!("first is an event")
+    };
+    assert_eq!(first.kind, EventKind::Added);
+    assert_eq!(first.at, at(14, 10));
+    assert_eq!(first.source_id.as_deref(), Some("cu"));
+    assert!(store.today_activity("missing").is_err());
+}
+
+#[test]
+fn added_events_say_who_added_the_task() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync_items(&store, &me, vec![item("a")], at(14, 10));
+    let by_sync = event_of(&store, "a", EventKind::Added);
+    assert_eq!(
+        (by_sync.source_id.as_deref(), by_sync.mono_id.as_deref()),
+        (Some("cu"), Some("m1"))
+    );
+    let mine = manual(&store, "mine", at(14, 10));
+    let by_user = event_of(&store, &mine.key, EventKind::Added);
+    assert_eq!((by_user.source_id, by_user.mono_id), (None, None));
+    let new = NewTask {
+        title: "mono".into(),
+        ..NewTask::default()
+    };
+    let task = store.today_add(&new, &Actor::Mono(me), at(14, 10)).unwrap();
+    assert_eq!(
+        event_of(&store, &task.key, EventKind::Added)
+            .mono_id
+            .as_deref(),
+        Some("m1")
+    );
+}
+
+#[test]
+fn mention_keys_skip_dismissed_tasks() {
+    let store = store();
+    let me = caller("m1", &[]);
+    assert!(store.today_mention_keys().unwrap().is_empty());
+    sync_items(&store, &me, vec![item("a"), item("b")], at(14, 10));
+    store.today_dismiss("b", &Actor::User, at(14, 11)).unwrap();
+    assert_eq!(store.today_mention_keys().unwrap(), ["a"]);
+}
+
+#[test]
+fn a_status_edit_that_fails_changes_no_task() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    let before = by_key(&store, &task.key);
+    assert!(store.today_delete_status("todo", at(14, 11)).is_err());
+    assert!(store
+        .today_move_status("todo", Stage::Finished, 0, at(14, 11))
+        .is_err());
+    assert_eq!(by_key(&store, &task.key), before);
+}
+
+#[test]
+fn a_rename_right_after_the_rollover_does_not_touch_yesterdays_record() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    // 04:30 on the 15th, after the rollover, and nothing has rolled the day yet.
+    let rename = StatusPatch {
+        name: Some("Backlog".into()),
+        color: None,
+    };
+    store
+        .today_update_status("todo", &rename, t(15, 4, 30))
+        .unwrap();
+    let past = store.today_view("2026-07-14", t(15, 5, 0)).unwrap();
+    assert_eq!(past.rows[0].task.id, task.id);
+    assert_eq!(past.rows[0].status.name, "To do");
+    let now = store.today_view("2026-07-15", t(15, 5, 0)).unwrap();
+    assert_eq!(now.rows[0].status.name, "Backlog");
+}
+
+// --- tags ------------------------------------------------------------------------------------
+
+fn tag(store: &Store, name: &str) -> Tag {
+    store.today_add_tag(name, "#112233").unwrap()
+}
+
+fn tag_names(list: &[Tag]) -> Vec<String> {
+    list.iter().map(|t| t.name.clone()).collect()
+}
+
+fn with_tags(store: &Store, task: &Task, tags: &[&str]) {
+    let patch = TaskPatch {
+        tags: Some(tags.iter().map(|t| t.to_string()).collect()),
+        ..TaskPatch::default()
+    };
+    store
+        .today_update(&task.id, &patch, &Actor::User, at(14, 10))
+        .unwrap();
+}
+
+/// Writes free text tags straight into a task, as a build before definitions did.
+fn legacy_tags(store: &Store, key: &str, tags: &[&str]) {
+    let mut task = by_key(store, key);
+    task.tags = tags.iter().map(|t| t.to_string()).collect();
+    save_task(&store.conn, &task).unwrap();
+}
+
+/// Forgets that the migration ran, as a store from before tags had definitions.
+fn unmigrate(store: &Store) {
+    store
+        .conn
+        .execute(
+            "DELETE FROM native_settings WHERE key = 'today.tagsMigrated'",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn tag_names_are_trimmed_unique_ignoring_case_and_bounded() {
+    let store = store();
+    let bug = store.today_add_tag("  Bug ", "#AABBCC").unwrap();
+    assert_eq!(bug.name, "Bug");
+    assert_eq!(bug.color, "#aabbcc");
+    assert!(bug.id.starts_with("tag-"));
+    assert_eq!(
+        store.today_add_tag("bUg", "#112233").unwrap_err(),
+        "Another tag already has that name"
+    );
+    assert_eq!(
+        store.today_add_tag("   ", "#112233").unwrap_err(),
+        "A tag needs a name"
+    );
+    assert!(store
+        .today_add_tag(&"x".repeat(41), "#112233")
+        .unwrap_err()
+        .contains("at most 40"));
+    assert!(store.today_add_tag(&"x".repeat(40), "#112233").is_ok());
+    assert!(store.today_add_tag("Ok", "red").is_err());
+    assert_eq!(store.today_tags().unwrap().len(), 2);
+}
+
+#[test]
+fn renaming_and_recoloring_a_tag_shows_on_rows_and_keeps_names_unique() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let ui = tag(&store, "UI");
+    let task = manual(&store, "a", at(14, 10));
+    with_tags(&store, &task, &[&bug.id]);
+    let patch = TagPatch {
+        name: Some("Defect".into()),
+        color: Some("#ff0000".into()),
+    };
+    let got = store.today_update_tag(&bug.id, &patch).unwrap();
+    assert_eq!(
+        (got.name.as_str(), got.color.as_str()),
+        ("Defect", "#ff0000")
+    );
+    let view = store.today_view("2026-07-14", at(14, 11)).unwrap();
+    assert_eq!(view.rows[0].tags, vec![got.clone()]);
+    // Its own name is fine, another tag's is not, and a missing tag is an error.
+    let same = TagPatch {
+        name: Some("defect".into()),
+        color: None,
+    };
+    assert!(store.today_update_tag(&bug.id, &same).is_ok());
+    let clash = TagPatch {
+        name: Some(" ui ".into()),
+        color: None,
+    };
+    assert!(store.today_update_tag(&bug.id, &clash).is_err());
+    assert!(store.today_update_tag("tag-none", &same).is_err());
+    assert_eq!(store.today_tags().unwrap()[1], ui);
+}
+
+#[test]
+fn a_past_day_shows_a_renamed_tag_by_its_new_name_and_a_deleted_one_not_at_all() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let ui = tag(&store, "UI");
+    let task = manual(&store, "a", at(14, 10));
+    with_tags(&store, &task, &[&bug.id, &ui.id]);
+    store.today_view("2026-07-15", t(15, 10, 0)).unwrap();
+    let patch = TagPatch {
+        name: Some("Defect".into()),
+        color: None,
+    };
+    store.today_update_tag(&bug.id, &patch).unwrap();
+    store.today_delete_tag(&ui.id, t(15, 11, 0)).unwrap();
+    let past = store.today_view("2026-07-14", t(15, 12, 0)).unwrap();
+    assert_eq!(tag_names(&past.rows[0].tags), ["Defect"]);
+}
+
+#[test]
+fn moving_a_tag_reorders_and_clamps() {
+    let store = store();
+    let a = tag(&store, "A");
+    let b = tag(&store, "B");
+    let c = tag(&store, "C");
+    let list = store.today_move_tag(&c.id, 0).unwrap();
+    assert_eq!(tag_names(&list), ["C", "A", "B"]);
+    let list = store.today_move_tag(&c.id, 99).unwrap();
+    assert_eq!(tag_names(&list), ["A", "B", "C"]);
+    assert_eq!(store.today_tags().unwrap(), list);
+    assert!(store.today_move_tag("tag-none", 0).is_err());
+    let _ = (a, b);
+}
+
+#[test]
+fn deleting_a_tag_takes_it_off_tasks_with_an_event_and_usage_counts_them() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let ui = tag(&store, "UI");
+    let one = manual(&store, "one", at(14, 10));
+    let two = manual(&store, "two", at(14, 10));
+    let three = manual(&store, "three", at(14, 10));
+    with_tags(&store, &one, &[&bug.id, &ui.id]);
+    with_tags(&store, &two, &[&bug.id]);
+    with_tags(&store, &three, &[&ui.id]);
+    assert_eq!(store.today_tag_usage(&bug.id).unwrap(), 2);
+    assert_eq!(store.today_tag_usage(&ui.id).unwrap(), 2);
+    assert_eq!(store.today_tag_usage("tag-none").unwrap(), 0);
+    let list = store.today_delete_tag(&bug.id, at(14, 12)).unwrap();
+    assert_eq!(tag_names(&list), ["UI"]);
+    assert_eq!(by_key(&store, &one.key).tags, vec![ui.id.clone()]);
+    assert!(by_key(&store, &two.key).tags.is_empty());
+    assert_eq!(store.today_tag_usage(&bug.id).unwrap(), 0);
+    let event = store
+        .today_activity(&two.id)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find_map(|a| match a {
+            Activity::Event(e) if e.kind == EventKind::TagsChanged => Some(e),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(event.removed_tags, vec![bug.clone()]);
+    assert!(event.added_tags.is_empty());
+    assert!(event.mono_id.is_none() && event.source_id.is_none());
+    assert_eq!(event.at, at(14, 12));
+    // Today's record no longer lists it either.
+    let view = store.today_view("2026-07-14", at(14, 13)).unwrap();
+    let row = view.rows.iter().find(|r| r.task.id == one.id).unwrap();
+    assert_eq!(row.tags, vec![ui]);
+    assert!(store.today_delete_tag(&bug.id, at(14, 12)).is_err());
+}
+
+#[test]
+fn updating_task_tags_records_added_and_removed_and_refuses_unknown_ids() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let ui = tag(&store, "UI");
+    let task = manual(&store, "a", at(14, 10));
+    with_tags(&store, &task, &[&ui.id, &bug.id, &ui.id]);
+    // Stored in definition order, without duplicates.
+    assert_eq!(
+        by_key(&store, &task.key).tags,
+        vec![bug.id.clone(), ui.id.clone()]
+    );
+    with_tags(&store, &task, &[&bug.id]);
+    let events: Vec<TaskEvent> = store
+        .today_activity(&task.id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|a| match a {
+            Activity::Event(e) if e.kind == EventKind::TagsChanged => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].added_tags, vec![bug.clone(), ui.clone()]);
+    assert_eq!(events[1].removed_tags, vec![ui.clone()]);
+    assert!(events[1].added_tags.is_empty());
+    // The same set again is no change and no event.
+    with_tags(&store, &task, &[&bug.id]);
+    let count = store
+        .today_activity(&task.id)
+        .unwrap()
+        .iter()
+        .filter(|a| matches!(a, Activity::Event(e) if e.kind == EventKind::TagsChanged))
+        .count();
+    assert_eq!(count, 2);
+    let patch = TaskPatch {
+        tags: Some(vec!["tag-missing".into()]),
+        ..TaskPatch::default()
+    };
+    let err = store
+        .today_update(&task.id, &patch, &Actor::User, at(14, 11))
+        .unwrap_err();
+    assert_eq!(err, "Unknown tag: tag-missing");
+    assert_eq!(by_key(&store, &task.key).tags, vec![bug.id.clone()]);
+    // A new task is validated the same way, and a plain name is not an id.
+    let bad = NewTask {
+        title: "x".into(),
+        tags: vec!["Bug".into()],
+        ..NewTask::default()
+    };
+    assert!(store.today_add(&bad, &Actor::User, at(14, 11)).is_err());
+    let good = NewTask {
+        title: "y".into(),
+        tags: vec![ui.id.clone(), bug.id.clone()],
+        ..NewTask::default()
+    };
+    let added = store.today_add(&good, &Actor::User, at(14, 11)).unwrap();
+    assert_eq!(added.tags, vec![bug.id, ui.id]);
+}
+
+#[test]
+fn a_task_holds_at_most_twenty_tags() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    let ids: Vec<String> = (0..21).map(|n| tag(&store, &format!("t{n}")).id).collect();
+    let patch = TaskPatch {
+        tags: Some(ids.clone()),
+        ..TaskPatch::default()
+    };
+    assert!(store
+        .today_update(&task.id, &patch, &Actor::User, at(14, 11))
+        .unwrap_err()
+        .contains("at most 20"));
+    let patch = TaskPatch {
+        tags: Some(ids[..20].to_vec()),
+        ..TaskPatch::default()
+    };
+    assert!(store
+        .today_update(&task.id, &patch, &Actor::User, at(14, 11))
+        .is_ok());
+}
+
+#[test]
+fn free_text_tags_become_definitions_once_and_tasks_hold_ids() {
+    let store = store();
+    let a = manual(&store, "a", at(14, 10));
+    let b = manual(&store, "b", at(14, 10));
+    let c = manual(&store, "c", at(14, 10));
+    let d = manual(&store, "d", at(14, 10));
+    legacy_tags(&store, &a.key, &["Bug", "UI"]);
+    legacy_tags(&store, &b.key, &["bug ", "", "  "]);
+    legacy_tags(&store, &c.key, &["BUG", "ui"]);
+    legacy_tags(&store, &d.key, &[]);
+    unmigrate(&store);
+    let updated = by_key(&store, &a.key).updated_at;
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["Bug", "UI"]);
+    assert_eq!(list[0].color, format_color(tags::preset_for(0)));
+    assert_eq!(list[1].color, format_color(tags::preset_for(1)));
+    assert_eq!(
+        by_key(&store, &a.key).tags,
+        vec![list[0].id.clone(), list[1].id.clone()]
+    );
+    assert_eq!(by_key(&store, &b.key).tags, vec![list[0].id.clone()]);
+    assert_eq!(
+        by_key(&store, &c.key).tags,
+        vec![list[0].id.clone(), list[1].id.clone()]
+    );
+    assert!(by_key(&store, &d.key).tags.is_empty());
+    // Nothing a user did: no timestamp change, no event.
+    assert_eq!(by_key(&store, &a.key).updated_at, updated);
+    assert!(!store
+        .today_activity(&a.id)
+        .unwrap()
+        .iter()
+        .any(|x| matches!(x, Activity::Event(e) if e.kind == EventKind::TagsChanged)));
+    assert_eq!(
+        store.setting("today.tagsMigrated").unwrap().as_deref(),
+        Some("1")
+    );
+    // A second call does nothing, even when a task gets a free text tag again.
+    legacy_tags(&store, &d.key, &["New"]);
+    assert_eq!(store.today_tags().unwrap(), list);
+    assert_eq!(by_key(&store, &d.key).tags, vec!["New".to_string()]);
+}
+
+#[test]
+fn migration_reuses_existing_definitions_and_repeats_safely_after_a_stop() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    legacy_tags(&store, &task.key, &["UI", "Bug"]);
+    // The state a crash leaves after the definitions were saved: one exists, the
+    // tasks still hold names and the marker is missing.
+    let ui = Tag {
+        id: format!("tag-{}", uuid::Uuid::new_v4()),
+        name: "ui".into(),
+        color: "#112233".into(),
+    };
+    store
+        .save_setting("today.tags", &serde_json::to_string(&[&ui]).unwrap())
+        .unwrap();
+    unmigrate(&store);
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["ui", "Bug"]);
+    assert_eq!(list[0], ui);
+    assert_eq!(
+        by_key(&store, &task.key).tags,
+        vec![ui.id.clone(), list[1].id.clone()]
+    );
+    // Running it again after another stop changes nothing.
+    unmigrate(&store);
+    assert_eq!(store.today_tags().unwrap(), list);
+    assert_eq!(
+        by_key(&store, &task.key).tags,
+        vec![ui.id, list[1].id.clone()]
+    );
+}
+
+#[test]
+fn migration_leaves_past_day_records_alone_and_they_still_resolve_by_name() {
+    let store = store();
+    let task = manual(&store, "a", t(14, 10, 0));
+    // Day 14's record, frozen with free text tags before definitions existed.
+    legacy_tags(&store, &task.key, &["Bug"]);
+    unmigrate(&store);
+    let frozen = by_key(&store, &task.key);
+    write_record(&store.conn, "2026-07-14", &frozen, &default_statuses()).unwrap();
+    let json_before: String = store
+        .conn
+        .query_row(
+            "SELECT json FROM today_days WHERE day = '2026-07-14'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let view = store.today_view("2026-07-15", t(15, 10, 0)).unwrap();
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["Bug"]);
+    assert_eq!(view.rows[0].tags, list);
+    let json_after: String = store
+        .conn
+        .query_row(
+            "SELECT json FROM today_days WHERE day = '2026-07-14'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(json_before, json_after);
+    let past = store.today_view("2026-07-14", t(15, 11, 0)).unwrap();
+    assert_eq!(past.rows[0].tags, list);
+    assert_eq!(past.rows[0].task.tags, vec!["Bug".to_string()]);
+}
+
+#[test]
+fn a_view_and_a_sync_migrate_before_using_tags() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    legacy_tags(&store, &task.key, &["Bug"]);
+    unmigrate(&store);
+    let view = store.today_view("2026-07-14", at(14, 11)).unwrap();
+    assert_eq!(tag_names(&view.rows[0].tags), ["Bug"]);
+    assert!(by_key(&store, &task.key).tags[0].starts_with("tag-"));
+}
+
+#[test]
+fn sync_adds_tag_ids_for_known_names_and_reports_the_rest() {
+    let store = store();
+    let me = caller("m1", &[]);
+    let bug = tag(&store, "Bug");
+    let mut first = item("a");
+    first.tags = Some(vec!["BUG".into(), "Nope".into(), "nope".into()]);
+    let summary = sync_items(&store, &me, vec![first], at(14, 10));
+    assert_eq!(summary.rejected_tags, vec!["Nope".to_string()]);
+    assert_eq!(by_key(&store, "a").tags, vec![bug.id.clone()]);
+    let events = store
+        .today_activity(&by_key(&store, "a").id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|x| match x {
+            Activity::Event(e) if e.kind == EventKind::TagsChanged => Some(e),
+            _ => None,
+        })
+        .count();
+    assert_eq!(events, 0, "a new task has only its Added event");
+    let ui = tag(&store, "UI");
+    let mut next = item("a");
+    next.tags = Some(vec!["ui".into()]);
+    sync_items(&store, &me, vec![next], at(14, 11));
+    assert_eq!(by_key(&store, "a").tags, vec![bug.id, ui.id.clone()]);
+    let added = store
+        .today_activity(&by_key(&store, "a").id)
+        .unwrap()
+        .into_iter()
+        .find_map(|x| match x {
+            Activity::Event(e) if e.kind == EventKind::TagsChanged => Some(e),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(added.added_tags, vec![ui]);
+    assert_eq!(added.source_id.as_deref(), Some("cu"));
+}
+
+#[test]
+fn migration_keeps_entries_it_cannot_resolve() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    // The definitions were lost (a restored settings database) but tasks hold ids.
+    let gone = format!("tag-{}", uuid::Uuid::new_v4());
+    legacy_tags(&store, &task.key, &[&gone, "Bug"]);
+    unmigrate(&store);
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["Bug"]);
+    assert_eq!(
+        by_key(&store, &task.key).tags,
+        vec![gone, list[0].id.clone()]
+    );
+}
+
+#[test]
+fn a_legacy_name_that_starts_with_tag_dash_is_a_name_not_an_id() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    legacy_tags(&store, &task.key, &["tag-cleanup"]);
+    unmigrate(&store);
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["tag-cleanup"]);
+    assert_eq!(by_key(&store, &task.key).tags, vec![list[0].id.clone()]);
+}
+
+#[test]
+fn a_read_only_store_shows_legacy_names_as_in_memory_tags_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("monocode.db");
+    {
+        let writer = Store::open_monocode(&path).unwrap();
+        writer.today_ready().unwrap();
+        let task = Task {
+            id: "task-1".into(),
+            key: "manual:task-1".into(),
+            title: "a".into(),
+            tags: vec!["Bug".into(), "bug".into(), "UI".into()],
+            first_day: "2026-07-14".into(),
+            ..Task::default()
+        };
+        save_task(&writer.conn, &task).unwrap();
+    }
+    let store = Store::read_monocode(&path).unwrap();
+    let list = store.today_tags().unwrap();
+    assert_eq!(tag_names(&list), ["Bug", "UI"]);
+    assert_eq!(store.today_tags().unwrap(), list);
+    let view = store.today_view("2026-07-14", t(14, 10, 0)).unwrap();
+    assert_eq!(view.rows[0].tags, list);
+    assert_eq!(store.setting("today.tagsMigrated").unwrap(), None);
+    assert_eq!(store.setting("today.tags").unwrap(), None);
+    assert_eq!(by_key(&store, "manual:task-1").tags[0], "Bug");
+}
+
+#[test]
+fn tags_over_the_limit_are_never_cut_by_a_sync_and_can_be_removed_one_by_one() {
+    let store = store();
+    let me = caller("m1", &[]);
+    sync(&store, &me, "cu", &["a"], at(14, 10));
+    let names: Vec<String> = (0..25).map(|n| format!("t{n}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    legacy_tags(&store, "a", &refs);
+    unmigrate(&store);
+    let list = store.today_tags().unwrap();
+    assert_eq!(by_key(&store, "a").tags.len(), 25);
+    let mut empty = item("a");
+    empty.tags = Some(Vec::new());
+    sync_items(&store, &me, vec![empty], at(14, 11));
+    assert_eq!(by_key(&store, "a").tags.len(), 25);
+    let id = by_key(&store, "a").id;
+    let keep: Vec<String> = list[..24].iter().map(|t| t.id.clone()).collect();
+    let patch = TaskPatch {
+        tags: Some(keep),
+        ..TaskPatch::default()
+    };
+    store
+        .today_update(&id, &patch, &Actor::User, at(14, 12))
+        .unwrap();
+    assert_eq!(by_key(&store, "a").tags.len(), 24);
+    // It may not grow while over the limit.
+    let all: Vec<String> = list.iter().map(|t| t.id.clone()).collect();
+    let patch = TaskPatch {
+        tags: Some(all),
+        ..TaskPatch::default()
+    };
+    assert!(store
+        .today_update(&id, &patch, &Actor::User, at(14, 13))
+        .is_err());
+}
+
+#[test]
+fn sending_the_same_tags_again_is_not_a_change_and_added_ones_join_in_definition_order() {
+    let store = store();
+    let me = caller("m1", &[]);
+    let a = tag(&store, "A");
+    let b = tag(&store, "B");
+    let c = tag(&store, "C");
+    let mut first = item("k");
+    first.tags = Some(vec!["C".into(), "A".into()]);
+    sync_items(&store, &me, vec![first.clone()], at(14, 10));
+    assert_eq!(by_key(&store, "k").tags, vec![a.id.clone(), c.id.clone()]);
+    let stamp = by_key(&store, "k").updated_at;
+    // The user moved C first; resending changes nothing, not even the order.
+    store.today_move_tag(&c.id, 0).unwrap();
+    sync_items(&store, &me, vec![first], at(14, 11));
+    assert_eq!(by_key(&store, "k").updated_at, stamp);
+    let mut more = item("k");
+    more.tags = Some(vec!["b".into()]);
+    sync_items(&store, &me, vec![more], at(14, 12));
+    assert_eq!(by_key(&store, "k").tags, vec![c.id, a.id, b.id]);
+}
+
+#[test]
+fn toggling_one_tag_changes_only_that_tag_and_keeps_definition_order() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let ui = tag(&store, "UI");
+    let docs = tag(&store, "Docs");
+    let task = manual(&store, "a", at(14, 10));
+    // Two toggles from stale callers each keep the other's change.
+    store
+        .today_toggle_tag(&task.id, &docs.id, true, &Actor::User, at(14, 11))
+        .unwrap();
+    store
+        .today_toggle_tag(&task.id, &bug.id, true, &Actor::User, at(14, 11))
+        .unwrap();
+    assert_eq!(
+        by_key(&store, &task.key).tags,
+        vec![bug.id.clone(), docs.id.clone()]
+    );
+    store
+        .today_toggle_tag(&task.id, &bug.id, false, &Actor::User, at(14, 12))
+        .unwrap();
+    assert_eq!(by_key(&store, &task.key).tags, vec![docs.id.clone()]);
+    // Already in the wanted state: no change, no new event.
+    let events = |store: &Store| {
+        store
+            .today_activity(&task.id)
+            .unwrap()
+            .into_iter()
+            .filter(|a| matches!(a, Activity::Event(e) if e.kind == EventKind::TagsChanged))
+            .count()
+    };
+    let before = events(&store);
+    store
+        .today_toggle_tag(&task.id, &docs.id, true, &Actor::User, at(14, 13))
+        .unwrap();
+    assert_eq!(events(&store), before);
+    assert!(store
+        .today_toggle_tag(&task.id, "tag-unknown", true, &Actor::User, at(14, 13))
+        .is_err());
+    let _ = ui;
+}
+
+#[test]
+fn toggling_a_tag_on_respects_the_twenty_tag_limit() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    let ids: Vec<String> = (0..21).map(|n| tag(&store, &format!("t{n}")).id).collect();
+    for id in &ids[..20] {
+        store
+            .today_toggle_tag(&task.id, id, true, &Actor::User, at(14, 11))
+            .unwrap();
+    }
+    assert!(store
+        .today_toggle_tag(&task.id, &ids[20], true, &Actor::User, at(14, 11))
+        .unwrap_err()
+        .contains("at most 20"));
+}
+
+fn seed_raw_tags(store: &Store, id: &str, raw: &[&str], now: u64) {
+    let raw: Vec<String> = raw.iter().map(|t| t.to_string()).collect();
+    store
+        .today_mutate(id, &Actor::User, now, false, |task, _, _| {
+            task.tags = raw;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn toggling_a_tag_on_a_task_holding_an_orphan_id_drops_the_orphan() {
+    let store = store();
+    let bug = tag(&store, "Bug");
+    let task = manual(&store, "a", at(14, 10));
+    let orphan = format!("tag-{}", uuid::Uuid::new_v4());
+    seed_raw_tags(&store, &task.id, &[orphan.as_str()], at(14, 11));
+    store
+        .today_toggle_tag(&task.id, &bug.id, true, &Actor::User, at(14, 12))
+        .unwrap();
+    assert_eq!(by_key(&store, &task.key).tags, vec![bug.id.clone()]);
+    // An id the caller names that has no definition is still refused.
+    assert!(store
+        .today_toggle_tag(&task.id, &orphan, true, &Actor::User, at(14, 13))
+        .is_err());
+}
+
+#[test]
+fn toggling_off_a_tag_held_as_a_legacy_name_removes_it() {
+    let store = store();
+    let task = manual(&store, "a", at(14, 10));
+    seed_raw_tags(&store, &task.id, &["New", "Other"], at(14, 11));
+    let new = tag(&store, "New");
+    store
+        .today_toggle_tag(&task.id, &new.id, false, &Actor::User, at(14, 12))
+        .unwrap();
+    assert!(by_key(&store, &task.key).tags.is_empty());
+    // Toggling on converts a legacy name to its id without duplicating it.
+    seed_raw_tags(&store, &task.id, &["new"], at(14, 13));
+    let bug = tag(&store, "Bug");
+    store
+        .today_toggle_tag(&task.id, &bug.id, true, &Actor::User, at(14, 14))
+        .unwrap();
+    assert_eq!(by_key(&store, &task.key).tags, vec![new.id, bug.id]);
 }

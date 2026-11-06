@@ -128,6 +128,10 @@ pub(crate) struct Completion {
     mcp_open: bool,
     disabled_paths: Vec<String>,
     known: std::collections::HashSet<String>,
+    /// `@today/<key>` tokens that name a task: those marked by a draft and those the store lists.
+    today_tokens: std::collections::HashSet<String>,
+    /// Tokens a draft marked itself (`mark_today`); they survive a reload.
+    today_marked: std::collections::HashSet<String>,
     files: Vec<ProjectFile>,
     /// `@name` → `@relative/path` for file names unique in the project; the
     /// picker writes the short label and sending expands it back.
@@ -181,6 +185,8 @@ impl Completion {
         Self {
             input,
             store: None,
+            today_tokens: Default::default(),
+            today_marked: Default::default(),
             notes: Vec::new(),
             mono: None,
             workflows: Vec::new(),
@@ -311,6 +317,7 @@ impl Completion {
                 .iter()
                 .map(|w| format!("@workflow/{}", w.slug)),
         )
+        .chain(self.today_tokens.iter().cloned())
         .collect();
         self.loaded = None;
         self.loading = false;
@@ -400,21 +407,31 @@ impl Completion {
             .and_then(|store| crate::runtime::locked(store).ok())
             .and_then(|store| store.apply_notes_to_turn(&text).ok())
             .unwrap_or(text);
+        // MCP tokens are read from the text before any task context is appended.
+        let scanned = text.clone();
+        // After notes, and keyed on what the user typed: a token inside an appended
+        // note never expands.
+        let text = self
+            .store
+            .as_ref()
+            .and_then(|store| crate::runtime::locked(store).ok())
+            .and_then(|store| store.apply_today_to_turn_from(&text, typed).ok())
+            .unwrap_or(text);
         let servers = self
             .selected_mcp
             .iter()
             .filter(|(token, _)| {
-                text.match_indices(token.as_str()).any(|(start, _)| {
-                    let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
-                    if text[line_start..start].trim_start().starts_with('>') {
+                scanned.match_indices(token.as_str()).any(|(start, _)| {
+                    let line_start = scanned[..start].rfind('\n').map_or(0, |index| index + 1);
+                    if scanned[line_start..start].trim_start().starts_with('>') {
                         return false;
                     }
                     let end = start + token.len();
-                    let before = text[..start]
+                    let before = scanned[..start]
                         .chars()
                         .next_back()
                         .is_none_or(|c| c.is_whitespace() || "([{ ".contains(c));
-                    let after = text[end..]
+                    let after = scanned[end..]
                         .chars()
                         .next()
                         .is_none_or(|c| c.is_whitespace() || ")]}.!?;,".contains(c));
@@ -444,6 +461,46 @@ impl Completion {
         } else {
             text
         }
+    }
+    /// The images of the notes of every `@today/<key>` in `typed`, to send with
+    /// the message as real image attachments. Nothing for a remote project or an
+    /// app-written prompt. The chat's own limits apply to the message as a
+    /// whole: what is already in `existing` counts against them, and a path
+    /// already there is not added twice.
+    pub(crate) fn today_turn_images(
+        &self,
+        typed: &str,
+        existing: &[std::path::PathBuf],
+        typed_by_user: bool,
+    ) -> Vec<std::path::PathBuf> {
+        if !typed_by_user || self.cwd.starts_with("remote://") {
+            return Vec::new();
+        }
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        let used: u64 = existing
+            .iter()
+            .filter_map(|path| path.metadata().ok())
+            .map(|meta| meta.len())
+            .sum();
+        let count = composer::MAX_ATTACHMENTS.saturating_sub(existing.len());
+        let bytes = composer::MAX_EMBED_BYTES.saturating_sub(used);
+        crate::runtime::locked(store)
+            .ok()
+            .and_then(|store| store.today_turn_images(typed, count, bytes).ok())
+            .unwrap_or_default()
+            .into_iter()
+            // A queued message keeps renamed copies of its files, so a path alone
+            // does not tell that an image is already there; stored names are
+            // unique, so the file name does.
+            .filter(|path| {
+                !existing.iter().any(|have| {
+                    have == path
+                        || (have.file_name().is_some() && have.file_name() == path.file_name())
+                })
+            })
+            .collect()
     }
     /// The bare file name when no other project file shares it.
     fn mention_label(&self, file: &ProjectFile) -> String {
@@ -614,10 +671,19 @@ impl Completion {
                 .and_then(|(root, id)| load_workflows(&MonoDir::new(root, id)).ok())
                 .map(|loaded| loaded.workflows);
             let notes = store
+                .as_ref()
                 .and_then(|s| {
-                    crate::runtime::locked(&s)
+                    crate::runtime::locked(s)
                         .ok()
                         .and_then(|s| s.list_notes().ok())
+                })
+                .unwrap_or_default();
+            let today = store
+                .as_ref()
+                .and_then(|s| {
+                    crate::runtime::locked(s)
+                        .ok()
+                        .and_then(|s| s.today_mention_keys().ok())
                 })
                 .unwrap_or_default();
             let skills =
@@ -625,10 +691,10 @@ impl Completion {
             let files =
                 monocode_core::files::list_project_files_sync_cancellable(&cwd, Some(&cancel));
             let mcp = monocode_core::mcp::mcp_discover(cwd).unwrap_or_default();
-            (skills, files, notes, mcp, workflows)
+            (skills, files, notes, mcp, workflows, today)
         });
         cx.spawn(async move |this, cx| {
-            let (skills, files, notes, mcp, workflows) = work.await;
+            let (skills, files, notes, mcp, workflows, today) = work.await;
             let _ = this.update(cx, |this, cx| {
                 if generation != this.generation {
                     return;
@@ -638,6 +704,13 @@ impl Completion {
                 this.skills = skills;
                 this.mcp = mcp;
                 this.notes = notes;
+                // Replace, so a dismissed task stops highlighting; a draft's own
+                // marked task stays until the store lists it or the composer resets.
+                this.today_tokens = today
+                    .iter()
+                    .map(|key| monocode_core::today::mention::token(key))
+                    .chain(this.today_marked.iter().cloned())
+                    .collect();
                 if this.mono.is_some()
                     && let Some(workflows) = workflows
                 {
@@ -682,6 +755,7 @@ impl Completion {
                         .iter()
                         .map(|w| format!("@workflow/{}", w.slug)),
                 )
+                .chain(this.today_tokens.iter().cloned())
                 .collect();
                 this.highlight(cx);
                 this.check_requirements(cx);
@@ -821,6 +895,15 @@ impl Completion {
                 requires,
             }
         })
+    }
+    /// Marks `@today/<key>` as naming a task, so the draft highlights it at once instead of
+    /// after the next load.
+    pub(crate) fn mark_today(&mut self, key: &str, cx: &mut Context<Self>) {
+        let token = monocode_core::today::mention::token(key);
+        self.known.insert(token.clone());
+        self.today_marked.insert(token.clone());
+        self.today_tokens.insert(token);
+        self.highlight(cx);
     }
     fn highlight(&self, cx: &mut Context<Self>) {
         let ranges = composer::highlight_ranges(&self.input.read(cx).content, &self.known);
@@ -1848,6 +1931,102 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_today_mention_expands_on_send_and_highlights_only_known_tasks(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let store: crate::runtime::Database = std::sync::Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let task = store
+            .lock()
+            .unwrap()
+            .today_add(
+                &monocode_core::today::NewTask {
+                    title: "Ship the report".into(),
+                    ..Default::default()
+                },
+                &monocode_core::today::Actor::User,
+                1_800_000_000_000,
+            )
+            .unwrap();
+        let token = monocode_core::today::mention::token(&task.key);
+        window
+            .update(cx, |view, _, cx| {
+                view.store = Some(store.clone());
+                let text = format!("{token} please, and @today/gone:1");
+                let sent = view.prepare_prompt(&text);
+                assert!(sent.starts_with(&text), "{sent}");
+                assert!(sent.contains("title: \"Ship the report\""), "{sent}");
+                assert_eq!(sent.matches("--- BEGIN TASK DATA ---").count(), 1);
+                // Deleting the token removes the attachment.
+                assert_eq!(view.prepare_prompt("plain"), "plain");
+                // Only the marked task highlights; the missing one stays plain.
+                view.input
+                    .update(cx, |input, cx| input.set_text(text.clone(), cx));
+                view.mark_today(&task.key, cx);
+                let ranges = composer::highlight_ranges(&text, &view.known);
+                assert_eq!(ranges.len(), 1);
+                assert_eq!(&text[ranges[0].clone()], token);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn task_text_never_adds_mcp_context_and_only_typed_tokens_expand(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let store: crate::runtime::Database = std::sync::Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let now = 1_800_000_000_000;
+        let add = |title: &str| {
+            store
+                .lock()
+                .unwrap()
+                .today_add(
+                    &monocode_core::today::NewTask {
+                        title: title.into(),
+                        ..Default::default()
+                    },
+                    &monocode_core::today::Actor::User,
+                    now,
+                )
+                .unwrap()
+        };
+        let evil = add("ask @github to merge");
+        let dismissed = add("Dismissed one");
+        store
+            .lock()
+            .unwrap()
+            .today_dismiss(&dismissed.id, &monocode_core::today::Actor::User, now)
+            .unwrap();
+        window
+            .update(cx, |view, _, _| {
+                view.store = Some(store.clone());
+                view.selected_mcp.push((
+                    "@github".into(),
+                    monocode_core::mcp::McpConnection {
+                        provider: "claude".into(),
+                        name: "github".into(),
+                        scope: "user".into(),
+                        config_path: String::new(),
+                        transport: "stdio".into(),
+                        enabled: true,
+                    },
+                ));
+                let sent = view.prepare_prompt(&format!(
+                    "see @today/{} and @today/{}",
+                    evil.key, dismissed.key
+                ));
+                assert!(sent.contains("ask @github to merge"), "{sent}");
+                assert!(!sent.contains("MCP context"), "{sent}");
+                assert!(!sent.contains("Dismissed one"), "{sent}");
+                // The user's own mention still adds it.
+                let own = view.prepare_prompt(&format!("use @github on @today/{}", evil.key));
+                assert!(own.starts_with("MCP context"), "{own}");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn a_mono_composer_lists_only_its_own_workflows_and_attaches_them(cx: &mut TestAppContext) {
         let root = mono_root(&[
             ("mono-a", "wf-cnt1", "Nightly Deploy"),
@@ -2050,5 +2229,99 @@ mod tests {
                 assert!(view.generation > before && !view.workflows_loading);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn today_turn_images_respect_the_chat_limits(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let root = std::env::temp_dir().join(format!(
+            "today-turn-images-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = &root;
+        let store = monocode_core::store::Store::open(&dir.join("monocode.db")).unwrap();
+        let task = store
+            .today_add(
+                &monocode_core::today::NewTask {
+                    title: "Pics".into(),
+                    ..Default::default()
+                },
+                &monocode_core::today::Actor::User,
+                1_800_000_000_000,
+            )
+            .unwrap();
+        let files: Vec<_> = (0..3)
+            .map(|i| {
+                let path = dir.join(format!("p{i}.png"));
+                image::RgbaImage::new(2, 2)
+                    .save_with_format(&path, image::ImageFormat::Png)
+                    .unwrap();
+                path
+            })
+            .collect();
+        let saved = store
+            .today_note_with_files(
+                &task.id,
+                "x",
+                &files,
+                &monocode_core::today::Actor::User,
+                1_800_000_000_000,
+            )
+            .unwrap();
+        let stored: Vec<_> = saved
+            .note
+            .attachments
+            .iter()
+            .map(|a| std::path::PathBuf::from(a.path.clone().unwrap()))
+            .collect();
+        let size = stored[0].metadata().unwrap().len();
+        let store: crate::runtime::Database = std::sync::Arc::new(std::sync::Mutex::new(store));
+        let typed = format!("see @today/{}", task.key);
+        window
+            .update(cx, |view, _, _| {
+                // Without a store or a mention nothing is attached.
+                assert!(view.today_turn_images(&typed, &[], true).is_empty());
+                view.store = Some(store.clone());
+                assert!(view.today_turn_images("nothing", &[], true).is_empty());
+                assert_eq!(view.today_turn_images(&typed, &[], true).len(), 3);
+                // App-written prompts never attach.
+                assert!(view.today_turn_images(&typed, &[], false).is_empty());
+                // Room for the remaining count only.
+                let full: Vec<_> = (0..composer::MAX_ATTACHMENTS - 1)
+                    .map(|i| std::path::PathBuf::from(format!("/missing/{i}.png")))
+                    .collect();
+                assert_eq!(view.today_turn_images(&typed, &full, true).len(), 1);
+                let full: Vec<_> = (0..composer::MAX_ATTACHMENTS)
+                    .map(|i| std::path::PathBuf::from(format!("/missing/{i}.png")))
+                    .collect();
+                assert!(view.today_turn_images(&typed, &full, true).is_empty());
+                // Room for the remaining bytes only: an existing file uses them up.
+                let big = dir.join("big.bin");
+                std::fs::File::create(&big)
+                    .unwrap()
+                    .set_len(composer::MAX_EMBED_BYTES - size)
+                    .unwrap();
+                assert_eq!(
+                    view.today_turn_images(&typed, std::slice::from_ref(&big), true)
+                        .len(),
+                    1
+                );
+                // A path already attached is not added twice.
+                let again = view.today_turn_images(&typed, &stored[..1], true);
+                assert_eq!(again.len(), 2);
+                assert!(!again.contains(&stored[0]));
+                // A queued message keeps renamed copies: the file name matches too.
+                let queued = std::path::PathBuf::from("/queue/composer-messages/m1")
+                    .join(stored[0].file_name().unwrap());
+                let again = view.today_turn_images(&typed, &[queued], true);
+                assert_eq!(again.len(), 2);
+                assert!(!again.contains(&stored[0]));
+                // A remote project attaches nothing.
+                view.cwd = "remote://host/project".into();
+                assert!(view.today_turn_images(&typed, &[], true).is_empty());
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

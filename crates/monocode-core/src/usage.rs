@@ -73,6 +73,10 @@ pub struct Limit {
     pub resume_at_reset: bool,
 }
 impl Limit {
+    /// Manual continuation becomes available when the reported reset passes.
+    pub fn waiting(&self, now: i64) -> bool {
+        self.resets_at.is_some_and(|at| at > now)
+    }
     pub fn from_error(message: &str) -> Option<Self> {
         // Claude's synthetic assistant errors use this code before the result
         // frame arrives. Ordinary transient HTTP 429s must remain retryable.
@@ -99,6 +103,29 @@ impl Limit {
             && self
                 .resets_at
                 .is_some_and(|at| now >= at.saturating_add(30_000))
+    }
+}
+/// What an armed limit is waiting for before it resumes by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoResume {
+    /// The reset time is not known yet.
+    Unknown,
+    /// The limit resets at this time (ms).
+    At(i64),
+    /// The reset has passed; the next clock tick resumes the session.
+    Due,
+}
+impl Limit {
+    /// `Some` while this limit is armed to resume at its reset.
+    pub fn auto_resume(&self, now: i64) -> Option<AutoResume> {
+        if !self.resume_at_reset {
+            return None;
+        }
+        Some(match self.resets_at {
+            None => AutoResume::Unknown,
+            Some(at) if at > now => AutoResume::At(at),
+            Some(_) => AutoResume::Due,
+        })
     }
 }
 #[derive(Clone, Debug)]
@@ -567,6 +594,19 @@ mod tests {
         assert!(Limit::from_error("You've hit your session limit · resets 5:30pm").is_some());
         assert!(Limit::from_error("429: rate limit exceeded, retry in 3 seconds").is_none());
         assert!(Limit::from_error("Network timeout").is_none());
+    }
+    #[test]
+    fn auto_resume_state_names_what_an_armed_limit_waits_for() {
+        let mut limit = Limit {
+            resets_at: Some(200_000),
+            resume_at_reset: false,
+        };
+        assert_eq!(limit.auto_resume(100_000), None);
+        limit.resume_at_reset = true;
+        assert_eq!(limit.auto_resume(100_000), Some(AutoResume::At(200_000)));
+        assert_eq!(limit.auto_resume(200_000), Some(AutoResume::Due));
+        limit.resets_at = None;
+        assert_eq!(limit.auto_resume(100_000), Some(AutoResume::Unknown));
     }
     #[test]
     fn opencode_go_requires_known_window_statuses() {

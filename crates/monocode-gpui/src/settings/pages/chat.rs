@@ -48,6 +48,34 @@ impl SettingsView {
                     |this, on, cx| this.update(cx, |p| p.paced_reveal = on),
                 )],
             ),
+            self.row(
+                Some("collapse-tool-groups"),
+                false,
+                "Collapse tool groups",
+                Some("Keep tool groups closed, even while they run. Click a group to see its steps.".into()),
+                vec![self.toggle(
+                    "collapse-tool-groups",
+                    "Collapse tool groups",
+                    p.collapse_tool_groups,
+                    false,
+                    cx,
+                    |this, on, cx| this.update(cx, |p| p.collapse_tool_groups = on),
+                )],
+            ),
+            self.row(
+                Some("fold-finished-work"),
+                false,
+                "Fold finished work",
+                Some("Fold a finished reply's tool calls under \"worked for\". Turn off to keep text and tool groups inline.".into()),
+                vec![self.toggle(
+                    "fold-finished-work",
+                    "Fold finished work",
+                    p.fold_finished_work,
+                    false,
+                    cx,
+                    |this, on, cx| this.update(cx, |p| p.fold_finished_work = on),
+                )],
+            ),
         ];
         let composer = vec![
             self.row(
@@ -62,6 +90,20 @@ impl SettingsView {
                     &[("queue", "Queue"), ("steer", "Steer")],
                     cx,
                     |this, v, cx| this.update(cx, |p| p.follow_up = v.into()),
+                )],
+            ),
+            self.row(
+                Some("auto-resume-usage-limit"),
+                false,
+                "Auto resume at usage limit reset",
+                Some("When a session hits its usage limit, resume it automatically once the limit resets. You can still turn it off per session from the usage notice.".into()),
+                vec![self.toggle(
+                    "auto-resume-usage-limit",
+                    "Auto resume at usage limit reset",
+                    p.auto_resume_usage_limit,
+                    false,
+                    cx,
+                    |this, on, cx| this.update(cx, |p| p.auto_resume_usage_limit = on),
                 )],
             ),
             self.row(

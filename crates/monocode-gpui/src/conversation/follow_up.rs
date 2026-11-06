@@ -30,12 +30,18 @@ impl Conversation {
     pub(super) fn message(
         &mut self,
         text: String,
-        attachments: Vec<std::path::PathBuf>,
+        mut attachments: Vec<std::path::PathBuf>,
         mode: Option<String>,
         cx: &gpui::App,
     ) -> Message {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let prepared = self.completion.read(cx).prepare_prompt(&text);
+        let images = self.completion.read(cx).today_turn_images(
+            &text,
+            &attachments,
+            !self.settings.internal_message,
+        );
+        attachments.extend(images);
         Message {
             prepared_prompt: (prepared != text).then_some(prepared),
             id: format!(
@@ -471,6 +477,31 @@ impl Conversation {
         if save {
             let text = edit.input.read(cx).content.to_string();
             let prepared = self.completion.read(cx).prepare_prompt(&text);
+            // Images of the notes of an `@today/<key>` mention follow the text:
+            // those of the old text go (matched by their unique stored file
+            // name, as the queue keeps renamed copies), those of the new come.
+            let old = self
+                .follow_ups
+                .state
+                .messages
+                .iter()
+                .find(|m| m.id == edit.id)
+                .map(|m| (m.text.clone(), m.attachments.clone()));
+            let attachments = old.map(|(old_text, mut kept)| {
+                let completion = self.completion.read(cx);
+                let gone: Vec<_> = completion
+                    .today_turn_images(&old_text, &[], true)
+                    .iter()
+                    .filter_map(|path| path.file_name().map(ToOwned::to_owned))
+                    .collect();
+                kept.retain(|path| {
+                    path.file_name()
+                        .is_none_or(|name| !gone.contains(&name.to_owned()))
+                });
+                let added = completion.today_turn_images(&text, &kept, true);
+                kept.extend(added);
+                kept
+            });
             if let Some(message) = self
                 .follow_ups
                 .state
@@ -480,6 +511,9 @@ impl Conversation {
             {
                 if text.trim().is_empty() && message.attachments.is_empty() {
                     return;
+                }
+                if let Some(attachments) = attachments {
+                    message.attachments = attachments;
                 }
                 message.replace_text(text, prepared);
                 message.error = None;

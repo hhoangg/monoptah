@@ -12,6 +12,9 @@ pub(crate) struct InlineStyle {
     pub task: Option<TaskMarker>,
     pub math: bool,
     pub search: Option<bool>,
+    /// Text of a link whose target has not streamed in yet. It is never
+    /// autolinked, so a URL in the label cannot open the wrong address.
+    pub pending_link: bool,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TaskMarker {
@@ -473,7 +476,8 @@ fn parse_at(text: &str, base: usize, hard_breaks: bool) -> BlockTree {
         if depth == 0 {
             let mut events = std::mem::take(&mut pending).into_iter().peekable();
             tree.blocks
-                .extend(blocks(&mut events, None, 0).into_iter().map(|block| {
+                .extend(blocks(&mut events, None, 0).into_iter().map(|mut block| {
+                    linkify_block(&mut block);
                     Arc::new(TopBlock {
                         range: base + start..base + range.end,
                         block,
@@ -482,6 +486,83 @@ fn parse_at(text: &str, base: usize, hard_breaks: bool) -> BlockTree {
         }
     }
     tree
+}
+/// pulldown-cmark has no GFM bare-URL autolinks, so bare http(s) URLs in prose
+/// are found here with the one detector the rest of the app uses.
+fn linkify_block(block: &mut Block) {
+    match block {
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => linkify_runs(runs),
+        Block::List { items, .. } => items.iter_mut().flatten().for_each(linkify_block),
+        Block::BlockQuote { children } => children.iter_mut().for_each(linkify_block),
+        Block::Table { header, rows, .. } => {
+            header.iter_mut().for_each(linkify_runs);
+            rows.iter_mut().flatten().for_each(linkify_runs);
+        }
+        _ => {}
+    }
+}
+/// Splits plain runs on bare URLs. pulldown-cmark can break one URL across
+/// adjacent text events, so runs with the same style are joined first.
+fn linkify_runs(runs: &mut Vec<InlineRun>) {
+    let plain = |style: &InlineStyle| {
+        !style.code
+            && !style.math
+            && !style.pending_link
+            && style.link.is_none()
+            && style.task.is_none()
+    };
+    // The detector is case-insensitive, so this cheap gate must be too.
+    if !runs
+        .iter()
+        .any(|r| plain(&r.style) && r.text.contains("://"))
+    {
+        return;
+    }
+    let mut out = Vec::with_capacity(runs.len());
+    let mut at = 0;
+    while at < runs.len() {
+        let mut end = at + 1;
+        if plain(&runs[at].style) {
+            while end < runs.len() && runs[end].style == runs[at].style {
+                end += 1;
+            }
+        }
+        let group = &runs[at..end];
+        let text: String = group.iter().map(|r| r.text.as_str()).collect();
+        let links = if plain(&group[0].style) {
+            monocode_core::user_links::find_web_links(&text)
+        } else {
+            Vec::new()
+        };
+        if links.is_empty() {
+            out.extend_from_slice(group);
+        } else {
+            let mut done = 0;
+            for found in links {
+                if found.range.start > done {
+                    out.push(InlineRun {
+                        text: text[done..found.range.start].to_owned(),
+                        style: group[0].style.clone(),
+                    });
+                }
+                let mut style = group[0].style.clone();
+                style.link = Some(found.link.url);
+                out.push(InlineRun {
+                    text: text[found.range.clone()].to_owned(),
+                    style,
+                });
+                done = found.range.end;
+            }
+            if done < text.len() {
+                out.push(InlineRun {
+                    text: text[done..].to_owned(),
+                    style: group[0].style.clone(),
+                });
+            }
+        }
+        at = end;
+    }
+    *runs = out;
 }
 fn blocks(events: &mut Events<'_>, until: Option<TagEnd>, depth: usize) -> Vec<Block> {
     let mut out = Vec::new();
@@ -706,6 +787,7 @@ fn inline_span(
         Tag::Link { dest_url, .. } if dest_url.as_ref() != "streamdown:incomplete-link" => {
             style.link = Some(dest_url.into_string());
         }
+        Tag::Link { .. } => style.pending_link = true,
         _ => {}
     }
     while let Some(event) = events.next() {
@@ -759,6 +841,10 @@ mod note_break_tests {
         assert_eq!(code, "one\ntwo\n");
     }
 }
+
+#[cfg(test)]
+#[path = "markdown_model/link_tests.rs"]
+mod link_tests;
 
 #[cfg(test)]
 #[path = "markdown_model/streaming_tests.rs"]

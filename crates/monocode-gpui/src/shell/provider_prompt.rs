@@ -85,7 +85,7 @@ impl Shell {
         };
         should_prompt_for_provider(
             &self.workspace.project,
-            self.default_kind(),
+            self.default_choice().kind,
             surfaces,
             &self.prompt_providers(),
         )
@@ -97,7 +97,7 @@ impl Shell {
         if self.should_prompt_for_provider() {
             self.open_provider_prompt(None, window, cx);
         } else {
-            self.create(self.default_kind(), cx);
+            self.new_chat(cx);
         }
     }
 
@@ -139,7 +139,7 @@ impl Shell {
             folder,
             highlighted: providers
                 .iter()
-                .position(|kind| *kind == self.default_kind())
+                .position(|kind| *kind == self.default_choice().kind)
                 .unwrap_or(0),
             focus,
             restore,
@@ -196,7 +196,8 @@ impl Shell {
             return;
         };
         self.close_provider_prompt(window, cx);
-        self.create_session_target(kind, false, folder, self.provider_surface(kind), cx);
+        let choice = self.explicit_choice(kind);
+        self.create_session_target(choice, false, folder, self.provider_surface(kind), cx);
     }
 
     fn provider_prompt_key(
@@ -583,6 +584,24 @@ mod tests {
         window
             .update(cx, |shell, _, _| shell.provider_prompt_rows())
             .unwrap()
+    }
+
+    #[gpui::test]
+    fn the_title_bar_new_tab_session_item_asks_for_a_provider_like_cmd_t(cx: &mut TestAppContext) {
+        let window = window(cx, &[Kind::Claude]);
+        window
+            .update(cx, |shell, window, cx| {
+                assert!(shell.provider_prompt.is_none());
+                shell.run_menu(MenuTarget::NewTab, "session", None, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.provider_prompt.is_some());
+                assert!(shell.provider_prompt_rows().len() >= 2);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

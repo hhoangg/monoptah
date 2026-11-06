@@ -17,6 +17,14 @@ impl Shell {
     /// shadows. These listen for Escape in `on_key_down`, which only runs when no
     /// action binding handled the key, so the shell closes them itself.
     pub(super) fn dismiss_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(view) = self
+            .document_lightbox
+            .as_ref()
+            .map(|(view, _)| view.clone())
+        {
+            view.update(cx, |view, cx| view.close(window, cx));
+            return true;
+        }
         if let Some(view) = self.image_lightbox.as_ref().map(|(view, _)| view.clone()) {
             view.update(cx, |view, cx| view.close(window, cx));
             return true;
