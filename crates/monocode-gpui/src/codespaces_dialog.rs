@@ -79,7 +79,11 @@ fn code_box(text: &str) -> Div {
 }
 
 fn button(id: &'static str, label: impl Into<SharedString>, disabled: bool) -> Stateful<Div> {
-    secondary_button(id, label, false, disabled).debug_selector(move || id.into())
+    // `secondary_button` only sets the accessible label; the visible text is a child.
+    let label = label.into();
+    secondary_button(id, label.clone(), false, disabled)
+        .child(label)
+        .debug_selector(move || id.into())
 }
 
 fn section() -> Div {
