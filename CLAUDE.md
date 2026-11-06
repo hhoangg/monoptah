@@ -108,8 +108,9 @@ runs on GitHub Actions (hosted macOS runners are not being acquired): the macOS 
 built and packaged on the maintainer's Mac, everything else is on CI.
 
 What CI checks (`native.yml`): `monocode-core` clippy and tests on Linux and Windows, and GPUI
-with `fmt` and clippy only (Linux) or clippy only (Windows). The GPUI tests and everything
-macOS run locally in `npm run native:check`, which `native:release:mac` runs.
+with `fmt` (Linux) and `cargo check --all-targets` (Linux and Windows). GPUI clippy
+`-D warnings`, the GPUI tests and everything macOS run locally in `npm run native:check`,
+which `native:release:mac` runs.
 
 1. Edit `docs/native/monoptah-release-notes.md` (its first line must be
    `# Monoptah Native X.Y.Z`) and merge it into main through a PR.

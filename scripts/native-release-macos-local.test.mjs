@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
@@ -234,7 +235,7 @@ test("publish commands: tag at the checked commit, push only that tag, release w
   const release = commands[2].args;
   assert.deepEqual(release.slice(0, 2), ["release", "create"]);
   assert.equal(release[2], "native-v0.40.5");
-  assert.deepEqual(release.slice(3, 6), params.files.map((n) => `/tmp/out/${n}`));
+  assert.deepEqual(release.slice(3, 6), params.files.map((n) => join("/tmp/out", n)));
   for (const flag of ["--verify-tag", "--latest=false"]) assert.ok(release.includes(flag));
   assert.equal(release[release.indexOf("--title") + 1], "Monoptah Native 0.40.5");
   assert.equal(release[release.indexOf("--notes-file") + 1], NOTES_FILE);
@@ -247,7 +248,7 @@ test("the workflow is dispatched by a file name that exists and accepts the tag 
   const dispatch = publishCommands(params)[3].args[2];
   const workflow = read(`.github/workflows/${dispatch}`);
   assert.ok(workflow.includes("workflow_dispatch"));
-  assert.match(workflow, /inputs:\n\s+tag:/);
+  assert.match(workflow, /inputs:\r?\n\s+tag:/);
 });
 
 test("each failed publish step prints the state left behind and a recovery", () => {

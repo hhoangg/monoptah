@@ -66,10 +66,13 @@ jobs:
       - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --all-targets --profile native-dev -- -D warnings
       - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --profile native-dev
 
-  # GPUI itself: fmt and clippy only. The gpui tests are not run here (they are
-  # the CI long pole); npm run native:check runs them locally before every
-  # release, and the macOS-only parts are checked there too. Windows only runs
-  # clippy, without release flags, so it does not share the release cache.
+  # GPUI itself: fmt (Linux) and a compile check of every target (Linux and
+  # Windows), so a change that breaks the Linux or Windows build fails here and
+  # not halfway through a release. It is `cargo check`, not clippy -D warnings:
+  # much of the crate is macOS-only, so it has dead-code warnings elsewhere.
+  # The gpui tests and clippy -D warnings run locally in npm run native:check
+  # before every release. No release flags, so it does not share the release
+  # cache.
   desktop:
     name: GPUI (${{ matrix.os }})
     strategy:
@@ -81,7 +84,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/monocode-gpui
@@ -94,7 +97,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils
       - if: runner.os == 'Linux'
         run: cargo fmt --manifest-path crates/monocode-gpui/Cargo.toml --all --check
-      - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core -p monocode-gpui --all-targets --profile native-dev -- -D warnings
+      - run: cargo check --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core -p monocode-gpui --all-targets --profile native-dev
 
   # Release runs restore these, which is what makes a native release faster (a miss is
   # only slower). Keep the toolchain, per-OS setup and build command in step with
