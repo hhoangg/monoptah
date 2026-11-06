@@ -620,3 +620,45 @@ fn only_codespace_lifecycle_calls_get_the_long_timeout() {
         Duration::from_secs(120)
     );
 }
+
+#[test]
+fn oauth_token_loses_all_whitespace_and_is_validated() {
+    let fake = Fake::new(vec![ok(r#"[{"repositories":[]}]"#), ok("")]);
+    set_secret(
+        &fake,
+        OAUTH_SECRET_KEY,
+        "  sk-ant-oat01-AAAA\nBBBB CC_dd\r\n\tEE-ff \n",
+        "a/b",
+    )
+    .unwrap();
+    let (args, stdin) = fake.calls().remove(1);
+    assert_eq!(stdin.as_deref(), Some("sk-ant-oat01-AAAABBBBCC_ddEE-ff"));
+    assert!(args.iter().all(|a| !a.contains("AAAA")));
+
+    for bad in [
+        "",
+        "  \n ",
+        "abc-def",
+        "sk-ant-oat01-ab$cd",
+        "sk-ant-oat01-a\u{e9}",
+    ] {
+        let fake = Fake::new(vec![]);
+        let err = set_secret(&fake, OAUTH_SECRET_KEY, bad, "a/b").unwrap_err();
+        assert!(err.contains(OAUTH_SECRET_KEY));
+        assert!(bad.trim().is_empty() || !err.contains(bad.trim()));
+        assert!(fake.calls().is_empty());
+    }
+}
+
+#[test]
+fn other_secrets_are_only_trimmed() {
+    assert_eq!(
+        normalize_secret_value("K", " \n a b\nc \r\n").unwrap(),
+        "a b\nc"
+    );
+    let fake = Fake::new(vec![ok(r#"[{"repositories":[]}]"#), ok("")]);
+    set_secret(&fake, "K", "\n  v w \n", "a/b").unwrap();
+    assert_eq!(fake.calls().remove(1).1.as_deref(), Some("v w"));
+    let fake = Fake::new(vec![]);
+    assert!(set_secret(&fake, "K", " \n ", "a/b").is_err());
+}

@@ -838,12 +838,36 @@ pub fn secrets_status(
     Ok(result)
 }
 
-/// Store a user codespaces secret for `repo`. The value goes over stdin only.
+/// Clean a pasted secret value. `claude setup-token` wraps its output across lines, so a
+/// copied CLAUDE_CODE_OAUTH_TOKEN carries whitespace in the middle: strip all of it and
+/// check the result looks like a token. Other secrets only lose leading/trailing
+/// whitespace. Errors never contain the value.
+pub fn normalize_secret_value(key: &str, value: &str) -> Result<String, String> {
+    if key != OAUTH_SECRET_KEY {
+        return Ok(value.trim().to_owned());
+    }
+    let token: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+    let well_formed = token.starts_with("sk-ant-")
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !well_formed {
+        return Err(format!(
+            "{key} does not look like a Claude token: it should start with sk-ant- and contain only letters, digits, - and _. Paste the full output of `claude setup-token`."
+        ));
+    }
+    Ok(token)
+}
+
+/// Store a user codespaces secret for `repo`. The value goes over stdin only. This is the
+/// single entry point for writing secrets, so the value is normalized here.
 pub fn set_secret(runner: &dyn GhRunner, key: &str, value: &str, repo: &str) -> Result<(), String> {
     valid_repo(repo)?;
     if !valid_secret_key(key) {
         return Err(format!("Invalid secret name `{key}`"));
     }
+    let value = normalize_secret_value(key, value)?;
+    let value = value.as_str();
     if value.is_empty() {
         return Err("Secret value is empty".into());
     }

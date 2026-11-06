@@ -395,10 +395,10 @@ fn save_stores_only_typed_fields_clears_them_and_refreshes_status(cx: &mut TestA
 fn a_failed_save_keeps_that_value_and_reports_it(cx: &mut TestAppContext) {
     let gh = FakeGh::new(Ok(AUTH_OK)).failing("CLAUDE_CODE_OAUTH_TOKEN");
     let window = open(cx, env(&gh, origin));
-    type_in(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN", "tok");
+    type_in(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-tok");
     act(&window, cx, |dialog, cx| dialog.save(cx));
     read(&window, cx, |dialog, cx| {
-        assert_eq!(dialog.fields[0].1.read(cx).content, "tok");
+        assert_eq!(dialog.fields[0].1.read(cx).content, "sk-ant-tok");
         assert!(
             dialog
                 .error

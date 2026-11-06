@@ -6,7 +6,7 @@ use monocode_core::codespaces::{
 };
 use std::path::Path;
 
-pub(super) const CLAUDE_TOKEN_NOTE: &str = "A changed CLAUDE_CODE_OAUTH_TOKEN applies the next time Monoptah connects to a codespace. Monoptah restarts its host there automatically.";
+pub(super) const CLAUDE_TOKEN_NOTE: &str = "GitHub only injects a changed secret into a codespace when it starts. After changing CLAUDE_CODE_OAUTH_TOKEN, stop and restart the codespace (or create a new one), then reconnect. Whitespace from a wrapped `claude setup-token` paste is removed.";
 pub(super) const PRIVACY_NOTE: &str = "Monoptah keeps no copy of these values. They go straight to GitHub as user Codespaces secrets for this repository.";
 pub(super) const REFRESH_COMMAND: &str = "gh auth refresh -h github.com -s codespace";
 pub(super) const LOGIN_COMMAND: &str = "gh auth login";
