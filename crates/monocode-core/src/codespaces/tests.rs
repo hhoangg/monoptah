@@ -665,12 +665,13 @@ fn other_secrets_are_only_trimmed() {
 
 #[test]
 fn copy_from_argv_expands_only_a_safe_literal_path() {
+    let destination = tempfile::tempdir().unwrap();
     let fake = Fake::new(vec![ok("")]);
     copy_from(
         &fake,
         "cs-1",
         "/workspaces/widgets/.evidence",
-        Path::new("/tmp/out"),
+        destination.path(),
     )
     .unwrap();
     assert_eq!(
@@ -683,13 +684,14 @@ fn copy_from_argv_expands_only_a_safe_literal_path() {
             "-c",
             "cs-1",
             "remote:/workspaces/widgets/.evidence",
-            "/tmp/out"
+            destination.path().to_str().unwrap()
         ])
     );
 }
 
 #[test]
 fn copy_from_rejects_unsafe_input_without_calling_gh() {
+    let destination = tempfile::tempdir().unwrap();
     let fake = Fake::new(vec![]);
     for path in [
         "",
@@ -707,11 +709,11 @@ fn copy_from_rejects_unsafe_input_without_calling_gh() {
         "/x{a,b}",
     ] {
         assert!(
-            copy_from(&fake, "cs-1", path, Path::new("/tmp/out")).is_err(),
+            copy_from(&fake, "cs-1", path, destination.path()).is_err(),
             "{path:?}"
         );
     }
-    assert!(copy_from(&fake, "bad name", "/x", Path::new("/tmp/out")).is_err());
+    assert!(copy_from(&fake, "bad name", "/x", destination.path()).is_err());
     assert!(copy_from(&fake, "cs-1", "/x", Path::new("relative")).is_err());
     assert!(copy_from(&fake, "cs-1", "/x", Path::new("-r")).is_err());
     assert!(fake.calls().is_empty());
@@ -719,8 +721,9 @@ fn copy_from_rejects_unsafe_input_without_calling_gh() {
 
 #[test]
 fn copy_from_reports_gh_failure_and_missing_path() {
+    let destination = tempfile::tempdir().unwrap();
     let fake = Fake::new(vec![fail("scp: '/x': No such file or directory")]);
-    let error = copy_from(&fake, "cs-1", "/x", Path::new("/tmp/out")).unwrap_err();
+    let error = copy_from(&fake, "cs-1", "/x", destination.path()).unwrap_err();
     assert!(is_missing_path(&error, "/x"), "{error}");
     assert!(is_missing_path("scp: /x: No such file or directory", "/x"));
     assert!(!is_missing_path("permission denied", "/x"));
