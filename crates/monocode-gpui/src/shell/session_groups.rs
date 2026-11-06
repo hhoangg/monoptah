@@ -499,6 +499,7 @@ impl Shell {
                         MenuAction::new("copy-harness-session-id", "Harness session ID")
                             .disabled(summary.provider_id.is_none()),
                         MenuAction::new("copy-monocode-session-id", "Monoptah session ID"),
+                        MenuAction::new("copy-database-session-id", "Desktop database ID"),
                     ])
                     .into(),
                 MenuAction::new(
@@ -511,6 +512,26 @@ impl Shell {
                 )
                 .into(),
             ]);
+            if self.is_cloud(id) {
+                items.push(
+                    MenuAction::new("codespace-terminal", "Open terminal in codespace").into(),
+                );
+            }
+            if self.codespace_restore_pending(id) {
+                items.push(
+                    MenuAction::new("codespace-restore", "Restore code from codespace").into(),
+                );
+            }
+            if let Some(name) = self.live_origin_codespace(id) {
+                items.push(
+                    MenuAction::new("codespace-stop", format!("Stop codespace {name}")).into(),
+                );
+                items.push(
+                    MenuAction::new("codespace-delete", format!("Delete codespace {name}"))
+                        .danger()
+                        .into(),
+                );
+            }
             items.extend(self.telegram_topic_item(id, cx));
         }
         items.extend([
@@ -576,13 +597,28 @@ impl Shell {
         let summary = self.session_metadata(id, cx).summary.clone();
         let ids = self.session_menu_ids(id, cx);
         match action {
-            "copy-harness-session-id" | "copy-monocode-session-id" => {
-                let text = if action == "copy-harness-session-id" {
-                    summary.provider_id
-                } else {
-                    locked(&self.store)
+            "codespace-restore" => self.restore_codespace_code(id, cx),
+            "codespace-stop" => {
+                self.run_origin_codespace_action(id, cloud::ArchiveChoice::Stop, window, cx)
+            }
+            "codespace-delete" => {
+                self.run_origin_codespace_action(id, cloud::ArchiveChoice::Delete, window, cx)
+            }
+            "codespace-terminal" => {
+                if let Some(codespace) = self.cloud_marks.get(&id).map(|m| m.codespace.clone()) {
+                    self.new_codespace_terminal(codespace, window, cx);
+                }
+            }
+            "copy-harness-session-id" | "copy-monocode-session-id" | "copy-database-session-id" => {
+                let text = match action {
+                    "copy-harness-session-id" => summary.provider_id,
+                    // The numeric id is what the app API and Monos accept.
+                    // Remote sessions have negative handles, so they keep their
+                    // persisted identity.
+                    "copy-monocode-session-id" if summary.id > 0 => Some(summary.id.to_string()),
+                    _ => locked(&self.store)
                         .and_then(|store| store.persisted_session_id(summary.id))
-                        .ok()
+                        .ok(),
                 };
                 if let Some(text) = text {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -829,6 +865,16 @@ impl Shell {
             cx.notify();
             return;
         }
+        if self
+            .workspace
+            .terminal_panes
+            .iter()
+            .any(|(pane, t)| t.owner == id && self.workspace.tab_of(*pane).is_some())
+        {
+            self.error = Some("Close this session's terminal panes before deleting it".into());
+            cx.notify();
+            return;
+        }
         if !self.session_summaries.contains_key(&id) || !self.deleting.insert(id) {
             refuse(&report, "Session is not available to delete");
             return;
@@ -970,7 +1016,7 @@ impl Shell {
         })
         .detach();
     }
-    fn forget_session(&mut self, id: i64, cx: &mut Context<Self>) {
+    pub(super) fn forget_session(&mut self, id: i64, cx: &mut Context<Self>) {
         // A tab opened on it while the store was deleting keeps it alive.
         if self.workspace.tab_of(id).is_some() {
             return;
@@ -2254,10 +2300,10 @@ mod tests {
         assert!((options.center().x - mono.center().x).abs() <= px(1.));
         assert!((options.center().x - filter.center().x).abs() <= px(1.));
         let project = visual.debug_bounds("sidebar-project-button").unwrap();
-        let search = visual.debug_bounds("sidebar-search-field").unwrap();
-        assert_eq!(project.left(), search.left());
+        let search = visual.debug_bounds("sidebar-search-button").unwrap();
         assert_eq!(project.size.height, px(28.));
-        assert!(project.right() < options.left());
+        assert!(project.right() < search.left());
+        assert!(search.right() <= options.left());
     }
 
     #[gpui::test]

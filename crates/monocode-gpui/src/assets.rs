@@ -76,6 +76,7 @@ impl AssetSource for Assets {
    "chevron-left"=>include_bytes!("../assets/chevron-left.svg"),
    "chevron-right"=>include_bytes!("../assets/chevron-right.svg"),
    "inbox"=>include_bytes!("../assets/inbox.svg"),
+   "square-plus"=>include_bytes!("../assets/square-plus.svg"),
    "circle-dot"=>include_bytes!("../assets/hugeicons/circle-dot.svg"),
    "inbox-github"=>include_bytes!("../assets/inbox-github.svg"),
    "inbox-linear"=>include_bytes!("../assets/inbox-linear.svg"),
@@ -167,6 +168,8 @@ impl AssetSource for Assets {
    "check-hi"=>include_bytes!("../assets/hugeicons/check-hi.svg"),
    "monocode.png"=>include_bytes!("../assets/monocode.png"),
    "codex.svg"=>include_bytes!("../assets/codex.svg"),
+   "codex-glyph.svg"=>include_bytes!("../assets/codex-glyph.svg"),
+   "prompt.svg"=>include_bytes!("../assets/prompt.svg"),
    "claude.svg"=>include_bytes!("../assets/claude.svg"),
    "cursor.svg"=>include_bytes!("../assets/cursor.svg"),
    "grok.svg"=>include_bytes!("../assets/grok.svg"),
@@ -189,10 +192,14 @@ impl AssetSource for Assets {
 fn icon_body(path: &str) -> Option<&'static str> {
     Some(match path {
         "circle-alert" => "<circle cx='12' cy='12' r='9'/><path d='M12 7v6m0 4h.01'/>",
+        "triangle-alert" => "<path d='M12 4 3 20h18Z'/><path d='M12 10v4m0 3h.01'/>",
         "refresh" => {
             "<path d='M20 7v5h-5M4 17v-5h5'/><path d='M6 6a8 8 0 0 1 13 2l1 4M4 12l1 4a8 8 0 0 0 13 2'/>"
         }
         "plus" => "<path d='M12 5v14M5 12h14'/>",
+        "tag" => {
+            "<path d='M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z'/><circle cx='7.5' cy='7.5' r='.5'/>"
+        }
         "close" => "<path d='m7 7 10 10M17 7 7 17'/>",
         "grip-vertical" => {
             "<circle cx='9' cy='5' r='1'/><circle cx='9' cy='12' r='1'/><circle cx='9' cy='19' r='1'/><circle cx='15' cy='5' r='1'/><circle cx='15' cy='12' r='1'/><circle cx='15' cy='19' r='1'/>"

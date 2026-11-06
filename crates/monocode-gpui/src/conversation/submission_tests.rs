@@ -462,3 +462,117 @@ fn mcp_in_a_mono_chat_sends_like_any_message(cx: &mut TestAppContext) {
         .unwrap();
     let _ = std::fs::remove_dir_all(root);
 }
+
+fn today_chat(
+    cx: &mut TestAppContext,
+) -> (
+    WindowHandle<Conversation>,
+    String,
+    std::path::PathBuf,
+    String,
+    std::path::PathBuf,
+) {
+    let root = std::env::temp_dir().join(format!(
+        "today-send-images-{}",
+        monocode_core::mono::new_id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = &root;
+    let store = Store::open(&dir.join("monocode.db")).unwrap();
+    let task = store
+        .today_add(
+            &monocode_core::today::NewTask {
+                title: "Ship".into(),
+                ..Default::default()
+            },
+            &monocode_core::today::Actor::User,
+            1_800_000_000_000,
+        )
+        .unwrap();
+    let picture = dir.join("shot.png");
+    image::RgbaImage::new(2, 2)
+        .save_with_format(&picture, image::ImageFormat::Png)
+        .unwrap();
+    let spec = dir.join("spec.pdf");
+    std::fs::write(&spec, b"%PDF").unwrap();
+    let saved = store
+        .today_note_with_files(
+            &task.id,
+            "see these",
+            &[picture, spec],
+            &monocode_core::today::Actor::User,
+            1_800_000_000_000,
+        )
+        .unwrap();
+    let image_copy = std::path::PathBuf::from(saved.note.attachments[0].path.clone().unwrap());
+    let pdf_copy = saved.note.attachments[1].path.clone().unwrap();
+    let mut summary = store
+        .create("codex", "/missing/optimistic-send-project")
+        .unwrap();
+    summary.provider = "fixture".into();
+    let window = cx.update(|cx| {
+        input::bind(cx);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+                view.loaded = true;
+                view
+            })
+        })
+        .unwrap()
+    });
+    (window, task.key, image_copy, pdf_copy, root)
+}
+
+#[gpui::test]
+fn a_sent_today_mention_carries_the_note_images_as_attachments(cx: &mut TestAppContext) {
+    let (window, key, image_copy, pdf_copy, root) = today_chat(cx);
+    let own = std::path::PathBuf::from("/missing/own.png");
+    window
+        .update(cx, |view, _, cx| {
+            let text = format!("work on @today/{key} now");
+            let prepared = view.completion.read(cx).prepare_prompt(&text);
+            assert!(prepared.contains(&pdf_copy), "{prepared}");
+            view.attachments.push(own.clone());
+            view.input
+                .update(cx, |input, cx| input.set_text(text.clone(), cx));
+            view.send(cx);
+            let rows = view.transcript.read(cx).source_rows();
+            let manifest = rows
+                .iter()
+                .find(|row| row.role == attachments::ROLE)
+                .unwrap();
+            assert_eq!(
+                attachments::paths(manifest).unwrap(),
+                [own.clone(), image_copy.clone()]
+            );
+            // The follow-up path adds them too, and never the non-image file.
+            let message = view.message(text, vec![own.clone()], None, cx);
+            assert_eq!(message.attachments, [own, image_copy]);
+        })
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[gpui::test]
+fn re_sending_an_edited_last_turn_adds_no_note_images(cx: &mut TestAppContext) {
+    let (window, key, _image, _pdf, root) = today_chat(cx);
+    let own = std::path::PathBuf::from("/missing/own.png");
+    window
+        .update(cx, |view, _, cx| {
+            let text = format!("work on @today/{key} now");
+            view.editing_last_turn.resending = true;
+            view.attachments.push(own.clone());
+            view.input.update(cx, |input, cx| input.set_text(text, cx));
+            view.send(cx);
+            view.editing_last_turn.resending = false;
+            let rows = view.transcript.read(cx).source_rows();
+            let manifest = rows
+                .iter()
+                .find(|row| row.role == attachments::ROLE)
+                .unwrap();
+            assert_eq!(attachments::paths(manifest).unwrap(), [own]);
+        })
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -172,7 +172,10 @@ impl Store {
         busy: bool,
         has_draft: bool,
     ) -> Result<Value, String> {
-        let blocks = if self.shared.is_some() {
+        // A remote (cloud) session has no row in the local or shared session table: its
+        // transcript lives on its host and `load` reads it from there.
+        let remote = self.remote_session(id)?.is_some();
+        let blocks = if self.shared.is_some() && !remote {
             self.shared_blocks(id)?
         } else {
             let mut blocks: Vec<Value> = Vec::new();

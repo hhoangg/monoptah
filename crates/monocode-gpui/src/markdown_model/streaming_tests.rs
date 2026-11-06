@@ -16,6 +16,7 @@ fn appends_and_display_repairs_match_full_parses_at_every_character() {
         "[docs][ref]\n\nfirst\n\nsecond\n\n[ref]: https://example.com\n",
         "[docs]\n\n> [docs]: https://example.com\n\nend",
         "first\n\nRead [the docs](https://example.com/path) and `code`.",
+        "first\n\nSee https://example.com/a_b, then **https://x.org/y** and `https://c.io`.\n\n- item https://example.com/z",
         "first\n\n<div>\nignored\n</div>\n\nlast paragraph",
         "a\n\n$$x^2$$\n\n- [x] task\n  - nested\n\nlast",
         "first\n\n![image](file.png)\n\n***\n\n    indented\n\nlast",

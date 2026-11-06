@@ -1481,7 +1481,7 @@ impl Render for Explorer {
         if let Some(search) = &self.search {
             return search
                 .clone()
-                .cached(StyleRefinement::default().flex_1().min_h_0().w_full())
+                .cached(StyleRefinement::default().size_full())
                 .into_any_element();
         }
         if !self.available() {
@@ -1740,5 +1740,99 @@ impl Render for Explorer {
             )
             .children(menu)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{
+        Bounds, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, point, size,
+    };
+    use std::time::Duration;
+
+    struct Host {
+        explorer: Entity<Explorer>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().flex().flex_col().child(
+                div().flex_1().min_h_0().child(
+                    self.explorer
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn search_results_get_a_height_when_explorer_is_a_cached_root(cx: &mut TestAppContext) {
+        let root =
+            std::env::temp_dir().join(format!("monoptah-explorer-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (dir, file) in [
+            ("minmed-active-be/src", "a.ts"),
+            ("minmed-active-be/src", "c.ts"),
+            ("minmed-active-fe/src", "b.ts"),
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(
+                root.join(dir).join(file),
+                "const a = 'trainer';\nconst b = 'trainer';\n",
+            )
+            .unwrap();
+        }
+        let cwd = root.to_string_lossy().into_owned();
+        let window = cx.update(|cx| {
+            crate::input::bind(cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(400.), px(700.)),
+                    ))),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                    let explorer = cx.new(|cx| Explorer::new(git, window, cx));
+                    explorer.update(cx, |explorer, cx| {
+                        explorer.set_enabled(true, cx);
+                        explorer.open_search(window, cx);
+                    });
+                    cx.new(|_| Host { explorer })
+                },
+            )
+            .unwrap()
+        });
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let explorer = window
+            .read_with(visual, |host, _| host.explorer.clone())
+            .unwrap();
+        let search = explorer.read_with(visual, |e, _| e.search.clone().unwrap());
+        search.update(visual, |search, cx| {
+            search.set_test_filters("'trainer'", "minmed-active-be", cx)
+        });
+        visual.executor().advance_clock(Duration::from_millis(500));
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+
+        let paths = search.read_with(visual, |s, _| s.test_group_paths());
+        assert!(!paths.is_empty(), "search found nothing");
+        assert!(
+            paths.iter().all(|p| p.contains("minmed-active-be")),
+            "{paths:?}"
+        );
+        let results = visual
+            .debug_bounds("project-search-results")
+            .expect("results container was not painted");
+        assert!(
+            results.size.height > px(0.),
+            "results container has no height: {results:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

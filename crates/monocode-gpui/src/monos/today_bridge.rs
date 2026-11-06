@@ -119,6 +119,11 @@ impl Monos {
             .into()
     }
     /// Bumped after each `today.*` action, so the page can reload live.
+    /// A hook that tells the Today page it may have changed; safe to call from any thread.
+    pub(crate) fn today_bumper(&self) -> impl Fn() + Send + Sync + 'static {
+        let bridge = self.today.clone();
+        move || bridge.bump()
+    }
     pub(crate) fn today_revision(&self) -> u64 {
         self.today.lock().revision
     }
@@ -229,6 +234,7 @@ impl Monos {
                     .habits
                     .get_mut(mono)
                     .and_then(|all| all.iter_mut().find(|h| &h.id == id))
+                    && !h.needs_review
                 {
                     h.run_requested = true;
                 }
@@ -249,7 +255,8 @@ impl Monos {
                 let done = habits::update(&root, mono, |all| {
                     for h in all.iter_mut().filter(|h| ids.contains(&&h.id)) {
                         if h.running_since.is_none() {
-                            h.run_requested = true;
+                            // An imported habit waiting for review is left as it is.
+                            let _ = h.request_run();
                         }
                     }
                     Ok(())

@@ -94,7 +94,7 @@ struct Markup {
     accent: gpui::Hsla,
     html: Arc<str>,
 }
-pub(super) struct Html {
+pub(crate) struct Html {
     body: String,
     interactive: bool,
     #[cfg(target_os = "macos")]
@@ -136,7 +136,7 @@ fn sandbox(body: &str) -> String {
     )
 }
 impl Html {
-    pub(super) fn new(body: String) -> Self {
+    pub(crate) fn new(body: String) -> Self {
         Self {
             body,
             interactive: true,
@@ -163,12 +163,12 @@ impl Html {
         }
         self.markup.as_ref().unwrap().html.clone()
     }
-    pub(super) fn set_interactive(&mut self, interactive: bool) {
+    pub(crate) fn set_interactive(&mut self, interactive: bool) {
         if self.interactive != interactive {
             self.interactive = interactive;
         }
     }
-    pub(super) fn hide(&self) {
+    pub(crate) fn hide(&self) {
         #[cfg(target_os = "macos")]
         if let Some(view) = self.view.borrow().as_ref() {
             view.clip.setHidden(true);

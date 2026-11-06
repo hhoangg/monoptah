@@ -31,12 +31,19 @@ pub(crate) struct Preferences {
     pub tab_animations: bool,
     pub notes: bool,
     pub quick_composer: bool,
+    /// Global search floats as a command panel instead of opening a page.
+    pub search_panel: bool,
     pub working_agents: bool,
     pub close_to_tray: bool,
     /// Running an action shows the terminal it runs in.
     pub action_opens_terminal: bool,
-    /// The new layout opens the terminal as a right panel tab, not a dock.
+    /// Legacy: the new layout opens the terminal as a right panel tab, not a
+    /// dock. Read when `terminal_placement` is unset, and kept in step with it.
     pub terminal_in_panel: bool,
+    /// Where terminals open: "bottom" (the dock), "panel" (the right panel's
+    /// Terminal tab) or "title" (their own title bar tabs). Empty falls back
+    /// to `terminal_in_panel`.
+    pub terminal_placement: String,
     // Appearance
     pub theme: String,
     pub wayland_window_decorations: bool,
@@ -65,7 +72,14 @@ pub(crate) struct Preferences {
     pub transcript_layout: String,
     pub anchor_prompts: bool,
     pub paced_reveal: bool,
+    /// Tool groups stay closed, even while they run, until clicked open.
+    pub collapse_tool_groups: bool,
+    /// A finished reply folds its work under "worked for"; off keeps the
+    /// text and tool groups inline.
+    pub fold_finished_work: bool,
     pub follow_up: String,
+    /// A session that hits a usage limit resumes by itself once it resets.
+    pub auto_resume_usage_limit: bool,
     pub model_controls: String,
     pub autocorrect: bool,
     pub format_on_save: bool,
@@ -132,10 +146,12 @@ impl Default for Preferences {
             tab_animations: false,
             notes: true,
             quick_composer: true,
+            search_panel: false,
             working_agents: true,
             close_to_tray: true,
             action_opens_terminal: true,
             terminal_in_panel: false,
+            terminal_placement: String::new(),
             theme: "dark".into(),
             wayland_window_decorations: true,
             workspace_theme: "default".into(),
@@ -159,7 +175,10 @@ impl Default for Preferences {
             transcript_layout: "chat".into(),
             anchor_prompts: true,
             paced_reveal: true,
+            collapse_tool_groups: false,
+            fold_finished_work: true,
             follow_up: "steer".into(),
+            auto_resume_usage_limit: false,
             model_controls: "menu".into(),
             autocorrect: false,
             format_on_save: true,
@@ -198,6 +217,20 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    /// "bottom", "panel" or "title".
+    pub(crate) fn terminal_placement(&self) -> &str {
+        match self.terminal_placement.as_str() {
+            placement @ ("bottom" | "panel" | "title") => placement,
+            _ if self.terminal_in_panel => "panel",
+            _ => "bottom",
+        }
+    }
+
+    pub(crate) fn set_terminal_placement(&mut self, placement: &str) {
+        self.terminal_placement = placement.to_owned();
+        self.terminal_in_panel = placement == "panel";
+    }
+
     pub(crate) fn apply_workspace_theme(&mut self, id: String) {
         let color: gpui::Hsla = gpui::rgb(super::palette(&id, false).surface).into();
         self.theme_hue = (color.h * 360.).round() as u32;
@@ -286,6 +319,20 @@ impl Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_resume_usage_limit_is_off_by_default_and_survives_old_files() {
+        assert!(!Preferences::default().auto_resume_usage_limit);
+        let old: Preferences = serde_json::from_str(r#"{"sounds":false}"#).unwrap();
+        assert!(!old.auto_resume_usage_limit);
+        let prefs = Preferences {
+            auto_resume_usage_limit: true,
+            ..Default::default()
+        };
+        let saved = serde_json::to_string(&prefs).unwrap();
+        let loaded: Preferences = serde_json::from_str(&saved).unwrap();
+        assert!(loaded.auto_resume_usage_limit);
+    }
 
     #[test]
     fn surfaces_round_trip_and_default_to_none() {

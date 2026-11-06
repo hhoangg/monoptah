@@ -358,6 +358,7 @@ impl Shell {
             return row;
         }
         let work_item = self.work_item_badge(id, false, cx);
+        let cloud_badge = self.cloud_badge(id, false);
         let agents = match rail {
             Some((Rail::Agents(summary), true)) => Some(self.agents(id, summary, cx)),
             _ => None,
@@ -531,6 +532,7 @@ impl Shell {
                                         d.child(self.session_archive_button(id, &session, cx))
                                     }),
                             )
+                            .children(cloud_badge)
                             .children(work_item)
                             .when(
                                 self.automation_state.session_automations.contains_key(&id),
@@ -752,6 +754,10 @@ impl Shell {
                 .text_color(crate::theme::accent_color())
                 .children(self.session_marks.get(&id).cloned())
                 .child("Working...")
+                .into_any_element()
+        } else if let Some(state) = session.auto_resume(monocode_core::usage::now_ms()) {
+            status
+                .child(self.auto_resume_badge(id, state, true, 12.))
                 .into_any_element()
         } else if self.unseen_finished.contains(&id) {
             status

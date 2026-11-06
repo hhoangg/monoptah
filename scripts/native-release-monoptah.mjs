@@ -1,26 +1,36 @@
-// Fork-local (Monoptah). Signs the Monoptah Native updater archive and builds the
-// signed update feed (latest.json) for the macOS arm64 build. Upstream's
-// native-release.mjs needs all six platform targets and an R2 base URL; this fork
-// ships one target from GitHub Releases. Kept in its own file so upstream merges
-// do not conflict. The feed format matches crates/monocode-core/src/app_update:
+// Fork-local (Monoptah). Plans, signs and describes the Monoptah Native release:
+// the signed update feed (latest.json) covers macOS arm64, Linux x86_64 (AppImage,
+// deb, rpm) and Windows x86_64 (NSIS). Upstream's native-release.mjs needs all six
+// upstream targets and an R2 base URL; this fork ships five targets from GitHub
+// Releases. Kept in its own file so upstream merges do not conflict. The feed
+// format matches crates/monocode-core/src/app_update:
 // {"payload": base64(manifest JSON), "signature": <tauri signer signature>}.
 //
-// usage:
-//   node scripts/native-release-monoptah.mjs sign <dir> <notes-file>
-//       env: MONOCODE_NATIVE_VERSION, TAURI_SIGNING_PRIVATE_KEY (+ _PASSWORD)
+// usage (MONOCODE_NATIVE_VERSION must be set for all but feed-supersedes):
+//   node scripts/native-release-monoptah.mjs plan [published-names-file]
+//       prints step output lines: matrix (JSON, the platforms still to build
+//       except rpm), rpm (true/false), build_any (true/false) and reuse (the
+//       published filenames to download instead of building, space separated)
 //   node scripts/native-release-monoptah.mjs records <dir>
-//       writes artifacts-macos-aarch64.json for assets already in <dir>
-//       (used when a re-run signs the assets a release already published)
+//       writes artifacts-<kind>-<arch>.json for every platform whose assets are
+//       in <dir> but that has no metadata file yet (used when a re-run signs the
+//       assets a release already published)
+//   node scripts/native-release-monoptah.mjs sign <dir> <notes-file>
+//       env: TAURI_SIGNING_PRIVATE_KEY (+ _PASSWORD)
+//   node scripts/native-release-monoptah.mjs file-count
+//       prints how many files release-files.json must list
 //   node scripts/native-release-monoptah.mjs feed-supersedes <new> [existing]
 //       prints "true" when <new> should replace <existing> as the rolling feed
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
-  artifactRecords,
-  assetNames,
+  PLATFORMS,
+  RELEASE_FILE_COUNT,
+  TARGETS,
+  recordsFileName,
   releaseVersion,
 } from "./package-native-monoptah.mjs";
 
@@ -28,7 +38,7 @@ export const REPOSITORY = "hhoangg/monoptah";
 export const APP_ID = "com.monoptah.native";
 // Must equal CHANNEL in crates/monocode-core/src/app_update/mod.rs.
 export const CHANNEL = "native-preview";
-export const TARGET = "darwin-aarch64-app";
+export { RELEASE_FILE_COUNT, TARGETS };
 
 export function downloadBase(version) {
   releaseVersion(version);
@@ -56,7 +66,7 @@ export function monoptahManifest({ version, baseUrl, artifacts, notes = "" }) {
     )
       throw new Error("An artifact must be a plain filename");
     if (!artifact.target) continue;
-    if (artifact.target !== TARGET || platforms[artifact.target])
+    if (!TARGETS.includes(artifact.target) || platforms[artifact.target])
       throw new Error(
         `Duplicate or unexpected native target: ${artifact.target}`,
       );
@@ -67,8 +77,9 @@ export function monoptahManifest({ version, baseUrl, artifacts, notes = "" }) {
       signature: artifact.signature.trim(),
     };
   }
-  if (!platforms[TARGET])
-    throw new Error(`Missing native package: ${TARGET}`);
+  for (const target of TARGETS)
+    if (!platforms[target])
+      throw new Error(`Missing native package: ${target}`);
   return { app_id: APP_ID, channel: CHANNEL, version, notes, platforms };
 }
 
@@ -110,10 +121,19 @@ export async function prepareMonoptahRelease(
   if (!env.TAURI_SIGNING_PRIVATE_KEY)
     throw new Error("TAURI_SIGNING_PRIVATE_KEY is required");
   directory = resolve(directory);
-  const names = assetNames(version);
-  const records = JSON.parse(
-    await readFile(join(directory, "artifacts-macos-aarch64.json"), "utf8"),
-  );
+  // Which filename each updater target must have, so a package from another
+  // version or platform cannot be signed under the wrong target.
+  const expected = {};
+  for (const platform of PLATFORMS)
+    for (const { pattern, target } of platform.assets(version))
+      if (target) expected[target] = pattern;
+  const records = [];
+  for (const metadata of (await readdir(directory))
+    .filter((name) => /^artifacts-.*\.json$/.test(name))
+    .sort())
+    records.push(
+      ...JSON.parse(await readFile(join(directory, metadata), "utf8")),
+    );
   const files = [];
   for (const record of records) {
     if (
@@ -127,12 +147,18 @@ export async function prepareMonoptahRelease(
       throw new Error(`Missing native artifact: ${record.filename}`);
     files.push(record.filename);
     if (record.target) {
-      if (record.filename !== names.updater)
-        throw new Error(`Unexpected updater archive: ${record.filename}`);
+      if (!expected[record.target]?.test(record.filename))
+        throw new Error(
+          `Unexpected updater package for ${record.target}: ${record.filename}`,
+        );
       record.signature = await sign(join(directory, record.filename), env);
       files.push(`${record.filename}.sig`);
     }
   }
+  if (files.length !== RELEASE_FILE_COUNT)
+    throw new Error(
+      `Expected ${RELEASE_FILE_COUNT} release files, found ${files.length}`,
+    );
   const notes = checkNotes(await readFile(notesFile, "utf8"), version);
   const manifest = monoptahManifest({
     version,
@@ -152,6 +178,70 @@ export async function prepareMonoptahRelease(
   // rolling native-latest release instead.
   await writeFile(join(directory, "release-files.json"), JSON.stringify(files));
   return files;
+}
+
+// Which platforms still need a build. A platform counts as published when every
+// one of its files is already on the release; those files are reused (never
+// rebuilt or replaced) so the cask pin and the feed keep describing published
+// bytes. A platform with only some of its files published is an error. `published` is the list of asset names on the existing release.
+export function planBuilds(version, published = []) {
+  releaseVersion(version);
+  const matrix = [];
+  let rpm = false;
+  const reuse = [];
+  for (const platform of PLATFORMS) {
+    const found = platform
+      .assets(version)
+      .map(({ pattern }) => published.filter((name) => pattern.test(name)));
+    if (found.every((names) => names.length === 1)) {
+      reuse.push(...found.flat());
+      continue;
+    }
+    // Some files published, some not: rebuilding would produce bytes that differ
+    // from the published ones, and only missing names are uploaded, so the feed
+    // and the cask checksum would describe files the release does not serve.
+    // The operator must clear the platform by hand.
+    if (found.some((names) => names.length > 0)) {
+      const present = found.flat();
+      throw new Error(
+        `The ${platform.kind} files on release native-v${version} are incomplete or ambiguous (found: ${present.join(", ") || "none"}). ` +
+          `Delete every published ${platform.kind} asset of this release (the files and their .sig files) by hand, then re-run the workflow so the platform is rebuilt as a whole.`,
+      );
+    }
+    if (platform.kind === "rpm") rpm = true;
+    else
+      matrix.push({
+        kind: platform.kind,
+        os: platform.os,
+        target: platform.rust,
+        arch: platform.arch,
+      });
+  }
+  return { matrix, rpm, buildAny: matrix.length > 0 || rpm, reuse };
+}
+
+// Writes the metadata file for each platform whose files are in `directory`
+// but whose packaging step did not run (a reused platform).
+export async function writeMissingRecords(directory, version) {
+  releaseVersion(version);
+  directory = resolve(directory);
+  const present = await readdir(directory);
+  const written = [];
+  for (const platform of PLATFORMS) {
+    const file = recordsFileName(platform);
+    if (present.includes(file)) continue;
+    const assets = platform.assets(version);
+    const records = [];
+    for (const { pattern, target } of assets) {
+      const matches = present.filter((name) => pattern.test(name));
+      if (matches.length !== 1) break;
+      records.push({ filename: matches[0], target });
+    }
+    if (records.length !== assets.length) continue;
+    await writeFile(join(directory, file), JSON.stringify(records, null, 2));
+    written.push(file);
+  }
+  return written;
 }
 
 export function feedVersion(feedText) {
@@ -187,21 +277,30 @@ if (
   const [command, first, second] = process.argv.slice(2);
   if (command === "sign" && first && second) {
     await prepareMonoptahRelease(first, second);
+  } else if (command === "plan") {
+    const published =
+      first && existsSync(first)
+        ? (await readFile(first, "utf8"))
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean)
+        : [];
+    const plan = planBuilds(process.env.MONOCODE_NATIVE_VERSION, published);
+    console.log(`matrix=${JSON.stringify(plan.matrix)}`);
+    console.log(`rpm=${plan.rpm}`);
+    console.log(`build_any=${plan.buildAny}`);
+    console.log(`reuse=${plan.reuse.join(" ")}`);
   } else if (command === "records" && first) {
-    await writeFile(
-      join(resolve(first), "artifacts-macos-aarch64.json"),
-      JSON.stringify(
-        artifactRecords(releaseVersion(process.env.MONOCODE_NATIVE_VERSION)),
-        null,
-        2,
-      ),
-    );
+    await writeMissingRecords(first, process.env.MONOCODE_NATIVE_VERSION);
+  } else if (command === "file-count") {
+    console.log(String(RELEASE_FILE_COUNT));
   } else if (command === "feed-supersedes" && first) {
-    const existing = second && existsSync(second) ? await readFile(second, "utf8") : null;
+    const existing =
+      second && existsSync(second) ? await readFile(second, "utf8") : null;
     console.log(String(feedSupersedes(await readFile(first, "utf8"), existing)));
   } else {
     console.error(
-      "usage: native-release-monoptah.mjs sign <dir> <notes-file> | records <dir> | feed-supersedes <new> [existing]",
+      "usage: native-release-monoptah.mjs plan [published-file] | records <dir> | sign <dir> <notes-file> | file-count | feed-supersedes <new> [existing]",
     );
     process.exit(2);
   }

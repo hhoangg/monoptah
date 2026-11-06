@@ -340,3 +340,31 @@ mod blame {
         std::fs::remove_file(path).ok();
     }
 }
+
+#[gpui::test]
+fn hunk_actions_are_refused_while_a_cloud_session_is_in_view(cx: &mut TestAppContext) {
+    let path = std::env::temp_dir().join(format!("monocode-gate-{}.txt", std::process::id()));
+    std::fs::write(&path, "one\n").unwrap();
+    cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            let git = cx
+                .new(|cx| ProjectGit::new(std::env::temp_dir().to_string_lossy().into_owned(), cx));
+            cx.new(|cx| FileEditor::new(path.to_string_lossy().into_owned(), git, cx))
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    crate::git_gate::set(Some("octo-abc".into()));
+    window
+        .update(cx, |editor, _, cx| {
+            editor.apply_change(true, cx);
+            assert_eq!(editor.error.as_deref(), Some(crate::git_gate::REFUSED));
+            editor.error = None;
+            editor.apply_change(false, cx);
+            assert_eq!(editor.error.as_deref(), Some(crate::git_gate::REFUSED));
+        })
+        .unwrap();
+    crate::git_gate::set(None);
+    let _ = std::fs::remove_file(&path);
+}

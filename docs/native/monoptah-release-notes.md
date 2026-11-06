@@ -1,47 +1,21 @@
-# Monoptah Native 0.40.4
+# Monoptah Native 0.47.0
 
-A release of the experimental Rust + GPUI app for macOS on Apple silicon. The React/Tauri app, Monoptah, remains the production app.
+## Changes since 0.46.0
 
-## Changes since 0.40.3
+- Closing a terminal pane or title tab now asks for confirmation when a foreground process is running. Closing several tabs lists their running terminals together; cancelling keeps them open. Idle shells still close immediately.
+- Close All Tabs and Close Other Tabs keyboard shortcuts preserve pinned tabs, matching the tab menu.
+- The collapsed sidebar peeks open in the boxy Focused layout, and glass blur eases with the slide animation.
+- On mobile, the message composer stays editable while the desktop reconnects.
+- Synced upstream through native preview 14 (`a25b5b89`). Monoptah's terminal session surfaces and other fork features are preserved.
 
-- Global search finds text in saved conversations faster. Message text is kept in a search index next to your database (`monocode.db.search.sqlite3`), and only conversations that changed are read again, instead of every conversation on every search. The first search after updating builds the index once. Results, snippets and ranking are the same as before. The index is a cache: deleting it is safe, and it is rebuilt on the next search.
+## Downloads and updates
 
-## What it is
+- macOS Apple silicon: app archive and ZIP; Homebrew cask `hhoangg/monoptah/monoptah-native`.
+- Linux x86_64: AppImage, DEB and RPM (built on AlmaLinux 10).
+- Windows x86_64: NSIS installer.
+- Every updater package and the shared native update feed are signed. Native releases use their own feed and do not replace the Tauri update feed.
 
-Monoptah Native is a native rewrite of the Monoptah desktop app. It works with the same agent CLIs as Monoptah and covers the main workflows:
+## Known limits
 
-- Chat with the supported providers (Claude Code, Codex, Cursor, Grok Build, OpenCode, Pi, omp, fx, Hermes Agent, Antigravity and Devin), with streaming, resume, steering and cancellation.
-- Sessions, projects, split panes, terminals, a file editor and Git actions in one window.
-- Markdown, Mermaid diagrams and inline charts in conversations.
-- Inbox, notes, Monos, automations, remote connections, and macOS notifications and Dock badges.
-- In-app updates from Settings > General > About.
-
-Feature and platform parity with Monoptah is still being tested. See `docs/native/parity.md` at this release's tag for the known limitations.
-
-## Installing next to Monoptah
-
-Install with Homebrew:
-
-```sh
-brew install --cask hhoangg/monoptah/monoptah-native
-```
-
-Monoptah Native has its own name and bundle identifier (`com.monoptah.native`), so it installs beside the Monoptah (Tauri) app instead of replacing it.
-
-**Ad-hoc signed.** This fork has no Apple Developer account, so the app is signed ad-hoc and not notarized. The first launch is blocked by macOS: open System Settings > Privacy & Security, scroll to Security, and choose Open Anyway next to Monoptah Native. Later updates installed from inside the app launch normally.
-
-Because builds are ad-hoc signed, macOS may ask again for Keychain access and privacy permissions (for example Files and Folders) after an update.
-
-## Your data
-
-- Monoptah Native uses your existing Monoptah database (`com.monoptah.desktop/monocode.db`) and saves changes there. Back up your Monoptah data with both apps closed before trying it.
-- Settings you change in Monoptah Native are stored separately from the Tauri app's settings. They are not copied back.
-- Run only one of the two apps at a time while Telegram forwarding, Contributors sync or scoring, or scheduled Mono workflows are on. With both open they would work on the same bots, tickets and workflows and undo or duplicate each other's work. Avoid editing the same conversation in both apps at once. See `docs/native/parity.md` for details.
-
-## Updates
-
-Monoptah Native updates itself from this fork's native releases and does not use the Tauri app's update feed. The Homebrew cask is marked as self-updating, so `brew upgrade` is not needed after the first install.
-
-## Reporting problems
-
-Please include the version, your macOS version, the provider and the steps to reproduce. Remove credentials and private conversation content from logs and screenshots.
+- macOS packages are ad-hoc signed and are not Apple-notarized. The Windows installer is unsigned, so SmartScreen warns on first install.
+- Linux and Windows desktop interaction still need broader runtime testing. The in-app HTML viewer is macOS only; on Linux and Windows the viewer offers to open HTML with the default app.

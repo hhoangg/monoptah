@@ -16,9 +16,11 @@ pub(super) enum MentionIcon {
     File(SharedString),
     Note,
     Workflow,
+    /// A Today task, `@today/<key>`.
+    Today,
 }
 impl MentionIcon {
-    /// `@path`, `@"spaced path"`, or `@note/slug`, or `@workflow/slug`.
+    /// `@path`, `@"spaced path"`, or `@note/slug`, `@workflow/slug`, or `@today/key`.
     pub fn of(token: &str) -> Option<Self> {
         let path = token.strip_prefix('@')?;
         if path.starts_with("note/") {
@@ -26,6 +28,9 @@ impl MentionIcon {
         }
         if path.starts_with("workflow/") {
             return Some(Self::Workflow);
+        }
+        if path.starts_with("today/") {
+            return Some(Self::Today);
         }
         let path = path
             .strip_prefix('"')

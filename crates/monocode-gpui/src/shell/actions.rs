@@ -163,20 +163,7 @@ impl Shell {
         let menu_open = self.menu_open(&MenuTarget::Actions);
         // Each part rounds fully inside the frame's 2px inset.
         let outer = if classic { 6. } else { 10. };
-        let segment = |id: &'static str| {
-            div()
-                .id(id)
-                .role(Role::Button)
-                .h_full()
-                .flex()
-                .items_center()
-                .rounded(px(outer - 2.))
-                .cursor_pointer()
-                .text_color(content(0.4))
-                // The whole button lights up; the part under the pointer more.
-                .group_hover("footer-actions", |s| s.text_color(content(0.8)))
-                .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
-        };
+        let segment = |id: &'static str| split_segment(id, "footer-actions", outer);
         let pad = px(if classic { 4. } else { 6. });
         let main = match &current {
             Some(action) => {
@@ -221,21 +208,8 @@ impl Shell {
                 }
             }));
         Some(
-            div()
-                .id("footer-actions")
-                .group("footer-actions")
-                .role(Role::Group)
-                .aria_label("Actions")
+            split_frame("footer-actions", "Actions", outer, menu_open)
                 .h(px(20.))
-                .p(px(2.))
-                .gap(px(1.))
-                .flex()
-                .flex_shrink_0()
-                .items_stretch()
-                .whitespace_nowrap()
-                .rounded(px(outer))
-                .when(menu_open, |d| d.bg(content(0.06)))
-                .hover(|s| s.bg(content(0.06)))
                 .child(main)
                 .child(chevron)
                 .into_any_element(),

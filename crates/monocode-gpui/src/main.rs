@@ -5,11 +5,17 @@
 
 mod accounts;
 mod activity;
+#[cfg(not(target_os = "macos"))]
+mod app_log;
 mod app_menu;
 mod arcade;
 mod assets;
+mod attachment_tray;
 mod automations;
 mod changes;
+mod cloud_wake;
+mod codespaces_dialog;
+mod composer_box;
 mod composer_completion;
 mod composer_motion;
 mod composer_runner;
@@ -19,6 +25,7 @@ mod conversation;
 #[cfg(debug_assertions)]
 mod dev_reload;
 mod diff_view;
+mod document_lightbox;
 mod editor_analysis;
 mod editor_scrollbar;
 mod editor_syntax;
@@ -27,8 +34,10 @@ mod file_editor;
 mod file_icons;
 mod fixtures;
 mod fonts;
+mod frame_log;
 mod fs_watch;
 mod git_cache;
+mod git_gate;
 mod git_graph;
 mod git_picker;
 mod git_status;
@@ -50,11 +59,14 @@ mod metal_tests;
 mod mobile;
 mod modal;
 mod monos;
+#[cfg(target_os = "macos")]
+mod native_log;
 mod notes;
 mod notifications;
 mod pane_layout;
 mod pane_motion;
 mod particle_text;
+mod phase_tile;
 mod pickers;
 mod popover;
 mod project_background;
@@ -74,6 +86,7 @@ mod review;
 mod right_panel;
 mod runtime;
 mod search;
+mod send_morph;
 mod session_mark;
 mod session_review;
 mod settings;
@@ -82,6 +95,7 @@ mod sound;
 mod syntax;
 mod tab_label;
 mod tab_motion;
+mod tab_tile;
 mod telegram_dialog;
 mod terminal;
 mod theme;
@@ -92,6 +106,8 @@ mod transcript;
 mod tui_session;
 mod usage_footer;
 mod visuals;
+#[cfg(test)]
+mod wheel_glide_tests;
 mod window_state;
 mod workspace;
 mod worktree_switcher;
@@ -196,6 +212,13 @@ fn main() {
     }
     if cli_args.first().is_some_and(|a| a == "visual-mcp") {
         if let Err(error) = monocode_core::visual_bridge::mcp_stdio() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if cli_args.first().is_some_and(|a| a == "app-mcp") {
+        if let Err(error) = monocode_core::mono::bridge::mcp_stdio() {
             eprintln!("{error}");
             std::process::exit(1);
         }
@@ -415,6 +438,12 @@ fn main() {
     }
     let sidebar_metadata = db.session_sidebar_metadata(&projects);
     let db = Arc::new(Mutex::new(db));
+    // GPUI reports frame stalls through `log`; keep warnings where a Finder launch can't lose them.
+    #[cfg(target_os = "macos")]
+    native_log::install(&database.with_file_name("gpui-hangs"));
+    // Elsewhere there is no watchdog log; keep upstream's file logger.
+    #[cfg(not(target_os = "macos"))]
+    app_log::init();
     let platform = gpui_platform::current_platform(false);
     let title_raster = particle_text::GlyphRaster(platform.text_system());
     gpui::Application::with_platform(platform)
@@ -426,11 +455,13 @@ fn main() {
             image_memory::init(cx);
             #[cfg(target_os = "macos")]
             memory_log::start(cx);
+            frame_log::start(cx);
             gpu_trim::start(cx);
             #[cfg(target_os = "macos")]
             hang_watchdog::start(database.with_file_name("gpui-hangs"), cx);
             input::bind(cx);
             image_lightbox::bind(cx);
+            document_lightbox::bind(cx);
             composer_completion::bind(cx);
             file_editor::bind(cx);
             popover::bind(cx);

@@ -21,6 +21,10 @@ impl Metadata<'_> {
     pub(super) fn responding(&self) -> bool {
         self.live.is_some_and(Conversation::responding) || self.terminal_busy
     }
+    /// Set while a loaded local session waits to resume by itself at its limit reset.
+    pub(super) fn auto_resume(&self, now: i64) -> Option<monocode_core::usage::AutoResume> {
+        self.live.and_then(|chat| chat.auto_resume_state(now))
+    }
     pub(super) fn has_saved_draft(&self) -> bool {
         self.live.map_or(self.draft, Conversation::has_saved_draft)
     }
@@ -117,6 +121,86 @@ pub(super) fn new_session_settings(
         settings.model = Some(model);
     }
     settings
+}
+
+/// The user's defaults for a new session: provider, model, access, effort and
+/// account. Read on the UI thread, applied with the store in the background,
+/// so every way of starting a session (new tab, split) begins the same way.
+pub(super) struct NewSessionDefaults {
+    kind: Kind,
+    model: Option<String>,
+    account: monocode_core::accounts::Profile,
+    access: monocode_core::agent::AccessMode,
+    effort: Option<String>,
+    /// Where the session would like to open; Monoptah only.
+    surface: monocode_core::surface::Surface,
+}
+
+impl NewSessionDefaults {
+    pub(super) fn read(
+        choice: super::new_chat_choice::NewChatChoice,
+        cwd: &str,
+        surface: monocode_core::surface::Surface,
+        cx: &App,
+    ) -> Self {
+        let super::new_chat_choice::NewChatChoice { kind, model } = choice;
+        Self {
+            kind,
+            model,
+            account: crate::accounts::get(cx)
+                .map(|center| center.read(cx).selected(kind, cwd))
+                .unwrap_or_default(),
+            access: crate::conversation::default_access(cx),
+            effort: crate::conversation::preferred_effort(kind.id(), cx),
+            surface,
+        }
+    }
+
+    /// Create the session and save its starting settings.
+    pub(super) fn create(
+        self,
+        store: &monocode_core::store::Store,
+        cwd: &str,
+        worktree_cwd: Option<String>,
+    ) -> Result<(Session, monocode_core::agent::Settings), String> {
+        let Self {
+            kind,
+            model,
+            account,
+            access,
+            effort,
+            surface,
+        } = self;
+        let summary = store.create_with_surface(kind.id(), cwd, surface)?;
+        let mut settings = new_session_settings(
+            store
+                .desktop_preferences()
+                .and_then(|preferences| preferences.session_defaults(kind.id(), cwd)),
+            model,
+        );
+        settings.access = access;
+        if let Some(effort) = effort {
+            settings.model_settings.retain(|key, _| {
+                !matches!(
+                    key.as_str(),
+                    "effort" | "reasoning" | "reasoningEffort" | "reasoning_effort"
+                )
+            });
+            settings.effort = Some(effort);
+        }
+        settings.account = account;
+        settings.worktree_cwd = worktree_cwd;
+        if settings.model.is_some()
+            || settings.effort.is_some()
+            || !settings.model_settings.is_empty()
+            || settings.worktree_cwd.is_some()
+            || settings.account.id != monocode_core::accounts::DEFAULT
+            || access != Default::default()
+        {
+            store.save_agent_settings(summary.id, &settings)?;
+        }
+        Ok((summary, settings))
+    }
 }
 
 #[cfg(test)]

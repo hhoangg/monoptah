@@ -139,6 +139,10 @@ struct HostFixture {
     stop: Arc<AtomicBool>,
     server: Option<std::thread::JoinHandle<()>>,
     directory: PathBuf,
+    /// A running host turn goes idle after this many syncs.
+    idle_after: Arc<std::sync::atomic::AtomicUsize>,
+    /// From this sync on (0: never) the host reports a title it chose itself.
+    rename_at: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl HostFixture {
     fn new(running: bool, saved_draft: bool) -> Self {
@@ -161,6 +165,10 @@ impl HostFixture {
         let received = requests.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let done = stop.clone();
+        let idle_after = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let idles = idle_after.clone();
+        let rename_at = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let renames = rename_at.clone();
         let server = std::thread::spawn(move || {
             let mut snapshot = snapshot;
             let mut syncs = 0;
@@ -199,7 +207,11 @@ impl HostFixture {
                     "environment.describe" => descriptor.clone(),
                     "sessions.sync" => {
                         syncs += 1;
-                        if running && syncs > 1 {
+                        let renamed = renames.load(Ordering::Relaxed);
+                        if renamed > 0 && syncs >= renamed {
+                            snapshot["session"]["title"] = json!("Named by the host");
+                        }
+                        if running && syncs > idles.load(Ordering::Relaxed) {
                             snapshot["status"] = json!("idle");
                             snapshot["runId"] = serde_json::Value::Null;
                             snapshot["revision"] = json!(2);
@@ -234,6 +246,8 @@ impl HostFixture {
             stop,
             server: Some(server),
             directory,
+            idle_after,
+            rename_at,
         }
     }
     fn conversation(&self, cx: &mut TestAppContext) -> Entity<Conversation> {
@@ -306,6 +320,57 @@ fn snapshot_load_restores_host_draft_without_replacing_unsent_composer(cx: &mut 
     );
 }
 
+/// The GPUI test executor runs the remote observer inline, so the host itself
+/// scripts the turn: it renames the conversation on sync 3 and goes idle on 4.
+#[gpui::test]
+fn a_host_title_change_reaches_the_busy_view_without_a_rename_request(cx: &mut TestAppContext) {
+    let host = HostFixture::new(true, false);
+    host.idle_after.store(3, Ordering::Relaxed);
+    host.rename_at.store(3, Ordering::Relaxed);
+    let view = host.conversation(cx);
+    let seen = Arc::new(Mutex::new(Vec::<(bool, String)>::new()));
+    let log = seen.clone();
+    let _changes = cx.update(|cx| {
+        cx.subscribe(&view, move |view, _: &SessionChanged, cx| {
+            let view = view.read(cx);
+            log.lock()
+                .unwrap()
+                .push((view.busy, view.summary.title.to_string()));
+        })
+    });
+    host.wait(&view, cx, true);
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.summary.title, "Named by the host");
+        assert_eq!(view.display_title(), "Named by the host");
+    });
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.contains(&(true, "Named by the host".to_owned())),
+        "chrome must be told while the turn is still running: {seen:?}"
+    );
+    let requests = host.requests.lock().unwrap();
+    assert!(
+        !requests.iter().any(|r| matches!(
+            r["method"].as_str(),
+            Some("sessions.update" | "commands.dispatch")
+        )),
+        "a title from the host must never be written back: {requests:?}"
+    );
+    drop(requests);
+    assert_eq!(
+        host.store
+            .lock()
+            .unwrap()
+            .remote_session(host.summary.id)
+            .unwrap()
+            .unwrap()
+            .summary
+            .title,
+        "Named by the host"
+    );
+}
+
 #[gpui::test]
 fn opening_running_host_reattaches_without_dispatching_another_turn(cx: &mut TestAppContext) {
     let host = HostFixture::new(true, false);
@@ -330,6 +395,263 @@ fn opening_running_host_reattaches_without_dispatching_another_turn(cx: &mut Tes
             >= 2
     );
     assert!(!requests.iter().any(|r| r["method"] == "commands.dispatch"));
+}
+
+/// A session started through the app API (a cloud session) keeps its first prompt as a local
+/// draft; a remote conversation never reads local follow-ups, so the prompt used to be dropped
+/// and the session sat idle. It must be dispatched to the host as an ordinary prompt.
+#[gpui::test]
+fn a_remote_session_started_through_the_app_dispatches_its_first_prompt(cx: &mut TestAppContext) {
+    let host = HostFixture::new(false, false);
+    {
+        let store = host.store.lock().unwrap();
+        store
+            .prepare_app_prompt(host.summary.id, "start-1", "Do the first thing")
+            .unwrap();
+    }
+    let view = host.conversation(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            let settings = monocode_core::agent::Settings {
+                model: Some("codex:gpt-test".into()),
+                ..Default::default()
+            };
+            view.install_app_launch(settings, true, cx)
+        })
+    });
+    let dispatched = || {
+        host.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "commands.dispatch")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..10000 {
+        cx.run_until_parked();
+        if dispatched().iter().any(|r| r["params"]["type"] == "send") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    host.wait(&view, cx, true);
+    let sent = dispatched();
+    assert!(
+        sent.iter()
+            .any(|r| r["params"]["type"] == "send" && r["params"]["text"] == "Do the first thing"),
+        "{sent:?}"
+    );
+    // The local copy is consumed, so the session does not also report a stale draft.
+    assert!(
+        host.store
+            .lock()
+            .unwrap()
+            .follow_ups(host.summary.id)
+            .unwrap()
+            .draft
+            .is_none()
+    );
+}
+
+/// The machine being offline when the API launch is installed must not strand the first prompt in
+/// the invisible local draft: it is sent once the next load succeeds.
+#[gpui::test]
+fn an_offline_app_launch_sends_its_first_prompt_after_the_next_successful_load(
+    cx: &mut TestAppContext,
+) {
+    let host = HostFixture::new(false, false);
+    host.store
+        .lock()
+        .unwrap()
+        .prepare_app_prompt(host.summary.id, "start-2", "Do it later")
+        .unwrap();
+    let view = host.conversation(cx);
+    host.wait(&view, cx, true);
+    let settings = monocode_core::agent::Settings {
+        model: Some("codex:gpt-test".into()),
+        ..Default::default()
+    };
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.remote_state.online = false;
+            view.install_app_launch(settings, true, cx)
+        })
+    });
+    let dispatches = || {
+        host.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "commands.dispatch" && r["params"]["type"] == "send")
+            .count()
+    };
+    cx.run_until_parked();
+    assert_eq!(dispatches(), 0);
+    assert!(
+        host.store
+            .lock()
+            .unwrap()
+            .follow_ups(host.summary.id)
+            .unwrap()
+            .draft
+            .is_some(),
+        "the draft is kept until it is sent"
+    );
+    cx.update(|cx| view.update(cx, |view, cx| view.refresh_remote_snapshot(cx)));
+    for _ in 0..10000 {
+        cx.run_until_parked();
+        if dispatches() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    host.wait(&view, cx, true);
+    assert_eq!(dispatches(), 1, "{:?}", host.requests.lock().unwrap());
+    // A later refresh drops the local copy of the sent prompt.
+    cx.update(|cx| view.update(cx, |view, cx| view.refresh_remote_snapshot(cx)));
+    host.wait(&view, cx, true);
+    assert!(
+        host.store
+            .lock()
+            .unwrap()
+            .follow_ups(host.summary.id)
+            .unwrap()
+            .draft
+            .is_none()
+    );
+}
+
+/// An API draft on a remote session lands in the composer, where the user can see it.
+#[gpui::test]
+fn an_api_draft_on_a_remote_session_is_shown_in_the_composer(cx: &mut TestAppContext) {
+    let host = HostFixture::new(false, false);
+    host.store
+        .lock()
+        .unwrap()
+        .prepare_app_prompt(host.summary.id, "start-3", "Review this")
+        .unwrap();
+    let view = host.conversation(cx);
+    host.wait(&view, cx, true);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+            view.install_app_launch(monocode_core::agent::Settings::default(), false, cx);
+            assert_eq!(view.input.read(cx).content, "Review this");
+        })
+    });
+    assert_eq!(
+        host.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "commands.dispatch")
+            .count(),
+        0
+    );
+}
+
+/// After an app restart a stored API prompt that never went out is shown in the composer with a
+/// notice, and is not sent on its own.
+#[gpui::test]
+fn a_stored_app_prompt_is_recovered_into_the_composer_after_a_restart(cx: &mut TestAppContext) {
+    let host = HostFixture::new(false, false);
+    host.store
+        .lock()
+        .unwrap()
+        .prepare_app_prompt(host.summary.id, "start-4", "Never sent")
+        .unwrap();
+    let view = host.conversation(cx);
+    host.wait(&view, cx, true);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            // The fixture seeds the composer; a fresh app has it empty.
+            assert_eq!(view.input.read(cx).content, "Keep this next message");
+        })
+    });
+    let fresh = {
+        host.store
+            .lock()
+            .unwrap()
+            .prepare_app_prompt(host.summary.id, "start-5", "Never sent")
+            .unwrap();
+        cx.update(|cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(host.summary.clone(), host.store.clone(), cx);
+                view.remote_state.client = Some(host.client.clone());
+                view.load_remote(cx);
+                view
+            })
+        })
+    };
+    host.wait(&fresh, cx, true);
+    cx.update(|cx| {
+        let view = fresh.read(cx);
+        assert_eq!(view.input.read(cx).content, "Never sent");
+        assert!(view.status.contains("not sent yet"), "{}", view.status);
+    });
+    assert!(
+        host.store
+            .lock()
+            .unwrap()
+            .follow_ups(host.summary.id)
+            .unwrap()
+            .draft
+            .is_none()
+    );
+    assert!(
+        !host
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["method"] == "commands.dispatch")
+    );
+}
+
+/// A remote view never queues a prompt into local follow-ups while stopping: the host would never
+/// get it.
+#[gpui::test]
+fn a_remote_view_does_not_queue_into_local_follow_ups_while_stopping(cx: &mut TestAppContext) {
+    let view = conversation(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.stopping = true;
+            view.launch_prompt("later".into(), cx);
+            assert!(view.follow_ups.state.messages.is_empty());
+            assert!(view.status.contains("Wait"), "{}", view.status);
+        })
+    });
+}
+
+/// A freshly launched remote session has no stored messages until its first prompt is journaled;
+/// loading it must not turn off the in-memory flag that keeps it in the sidebar.
+#[gpui::test]
+fn loading_a_blank_launched_remote_session_keeps_it_listable(cx: &mut TestAppContext) {
+    let host = HostFixture::new(false, false);
+    let blank = {
+        let store = host.store.lock().unwrap();
+        let project = store
+            .remote_projects()
+            .unwrap()
+            .into_values()
+            .next()
+            .unwrap();
+        store.create("codex", &project.key).unwrap()
+    };
+    let mut summary = blank.clone();
+    summary.has_messages = true;
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, host.store.clone(), cx);
+            view.remote_state.client = Some(host.client.clone());
+            view.load_remote(cx);
+            view
+        })
+    });
+    host.wait(&view, cx, true);
+    cx.update(|cx| assert!(view.read(cx).summary.has_messages));
 }
 
 #[gpui::test]
@@ -434,4 +756,61 @@ fn ambiguous_legacy_requests_block_send_retry_and_restore_without_consuming_draf
             assert!(view.transcript.read(cx).source_rows().is_empty());
         })
     });
+}
+
+/// After an app restart a cloud session has no live tunnel and its history never loads in the
+/// background; a send (and the Reconnect button) must wake the codespace off the UI thread.
+#[gpui::test]
+fn sending_to_an_unloaded_cloud_session_reconnects_its_codespace(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
+    use monocode_core::cloud_sessions::{CodespaceChoice, Target};
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (_gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let api = monocode_core::mono::cloud_api::CloudApi::shared(&store).unwrap();
+    let binding = api
+        .prepare(
+            dir.0.to_str().unwrap(),
+            Target {
+                codespace: CodespaceChoice::Named("octo-run".into()),
+                branch: None,
+                machine: None,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    let summary = api.create_session(&binding, "claude").unwrap();
+    host.0.lock().unwrap().clear();
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, store.clone(), cx);
+            view.loaded = false;
+            view.remote_state.online = false;
+            // The reload that follows a wake is not under test (it would open real connections).
+            view.remote_state.refreshing = true;
+            view.input
+                .update(cx, |input, cx| input.set_text("Reply with PONG".into(), cx));
+            view
+        })
+    });
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.send(cx);
+            assert!(view.status.contains("Reconnecting"), "{}", view.status);
+            assert!(view.remote_state.waking);
+            // A second send while waking does not start another wake.
+            view.send(cx);
+            assert_eq!(view.input.read(cx).content, "Reply with PONG");
+        })
+    });
+    cx.run_until_parked();
+    let calls = host.0.lock().unwrap().clone();
+    assert_eq!(
+        calls.iter().filter(|c| *c == "ensure m-octo-run").count(),
+        1,
+        "{calls:?}"
+    );
+    cx.update(|cx| view.update(cx, |view, _| assert!(!view.remote_state.waking)));
 }

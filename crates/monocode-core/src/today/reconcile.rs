@@ -1,5 +1,9 @@
 //! The reconcile rules, pure: tasks and a report in, changed tasks out.
-use super::{CheckReason, ClosedBy, Kind, Priority, Status, SyncItem, SyncSummary, Task};
+use super::statuses::{self, builtin_id, resolve, stage_of_source_status};
+use super::{
+    CheckReason, ClosedBy, Kind, Priority, Stage, Status, SyncItem, SyncSummary, Task,
+    WorkflowStatus,
+};
 use std::collections::{HashMap, HashSet};
 
 /// What the reconcile needs to know besides the tasks.
@@ -10,6 +14,8 @@ pub struct Context<'a> {
     pub mono_id: &'a str,
     pub day: &'a str,
     pub now: u64,
+    /// The workflow statuses (normalized), to read a task's current stage.
+    pub statuses: &'a [WorkflowStatus],
 }
 pub struct Reconciled {
     /// Every new or changed task; the others are untouched.
@@ -49,9 +55,15 @@ pub fn reconcile(
         }
         match by_key.get(key) {
             Some(task) => {
+                // A task saved before statuses existed gets its resolved id the
+                // first time it changes; on its own that is not a change.
                 let mut next = (*task).clone();
+                if next.status_id.is_empty() {
+                    next.status_id = resolve(task, context.statuses).id.clone();
+                }
+                let baseline = next.clone();
                 listed(&mut next, item, context, &mut summary);
-                if next != **task {
+                if next != baseline {
                     next.updated_at = context.now;
                     out.push(next);
                 }
@@ -70,6 +82,9 @@ pub fn reconcile(
             continue;
         }
         let mut next = task.clone();
+        if next.status_id.is_empty() {
+            next.status_id = resolve(task, context.statuses).id.clone();
+        }
         next.status = Status::NeedsCheck;
         next.check_reason = Some(CheckReason::Missing);
         next.source_status = UNKNOWN_STATUS.into();
@@ -83,8 +98,22 @@ pub fn reconcile(
     }
 }
 
+/// The stage an item states or implies. A Finished stage on an open item is
+/// ignored: `closed` stays the only authority for closing a task.
+fn item_stage(item: &SyncItem) -> Option<Stage> {
+    let stage = item.stage.or_else(|| {
+        item.source_status
+            .as_deref()
+            .and_then(stage_of_source_status)
+    });
+    stage.filter(|stage| item.closed || *stage != Stage::Finished)
+}
+
 fn new_task(item: &SyncItem, context: &Context) -> Task {
+    let stage = item_stage(item).unwrap_or(Stage::NotStarted);
     Task {
+        status_id: builtin_id(stage).into(),
+        summary: item.summary.clone().unwrap_or_default(),
         id: format!("task-{}", uuid::Uuid::new_v4()),
         key: item.key.clone(),
         title: item.title.clone(),
@@ -137,8 +166,34 @@ fn apply_fields(task: &mut Task, item: &SyncItem) {
     if let (Some(value), false) = (item.priority, task.priority_pinned) {
         task.priority = value;
     }
+    // Tags the item names are added; a sync never takes a tag off a task.
     if let Some(value) = &item.tags {
-        task.tags = value.clone();
+        // Existing tags are never cut; only new ones stop at the limit.
+        for id in value {
+            if task.tags.len() >= super::tags::MAX_PER_TASK {
+                break;
+            }
+            if !task.tags.contains(id) {
+                task.tags.push(id.clone());
+            }
+        }
+    }
+    if let Some(value) = &item.summary {
+        task.summary = value.clone();
+    }
+}
+
+/// An unpinned task listed open follows the stage the source states, unless it
+/// is finished (the lifecycle rules own that) or already in that stage.
+fn follow_stage(task: &mut Task, item: &SyncItem, context: &Context) {
+    if task.status_pinned || task.status == Status::Dismissed {
+        return;
+    }
+    let current = resolve(task, context.statuses).stage;
+    if let Some(stage) = item_stage(item) {
+        if stage != Stage::Finished && current != Stage::Finished && stage != current {
+            task.status_id = builtin_id(stage).into();
+        }
     }
 }
 
@@ -170,24 +225,36 @@ fn listed(task: &mut Task, item: &SyncItem, context: &Context, summary: &mut Syn
         }
         Status::Done => {
             if task.closed_by == Some(ClosedBy::User) {
-                task.status = Status::NeedsCheck;
-                task.check_reason = Some(CheckReason::DoneButSourceOpen);
-                summary.needs_check += 1;
+                // The user answered an earlier check with Keep done: leave it be.
+                if !task.kept_done {
+                    task.status = Status::NeedsCheck;
+                    task.check_reason = Some(CheckReason::DoneButSourceOpen);
+                    summary.needs_check += 1;
+                    clear_closed(task);
+                }
             } else {
                 task.status = Status::Open;
+                task.kept_done = false;
+                task.status_id = builtin_id(item_stage(item).unwrap_or(Stage::NotStarted)).into();
                 summary.reopened += 1;
+                clear_closed(task);
             }
-            clear_closed(task);
         }
         Status::Snoozed => {}
         Status::Dismissed => {
             if item.reopened || task.source_closed_after_dismiss {
                 task.status = Status::Open;
                 task.source_closed_after_dismiss = false;
+                // Never open with a finished status.
+                if resolve(task, context.statuses).stage == Stage::Finished {
+                    task.status_id =
+                        builtin_id(item_stage(item).unwrap_or(Stage::NotStarted)).into();
+                }
                 summary.reopened += 1;
             }
         }
     }
+    follow_stage(task, item, context);
 }
 
 fn listed_closed(task: &mut Task, item: &SyncItem, context: &Context, summary: &mut SyncSummary) {
@@ -203,6 +270,9 @@ fn listed_closed(task: &mut Task, item: &SyncItem, context: &Context, summary: &
             if status != Status::Done {
                 task.closed_at = Some(context.now);
                 task.closed_day = Some(context.day.to_string());
+            }
+            if resolve(task, context.statuses).stage != Stage::Finished {
+                task.status_id = statuses::DONE_ID.into();
             }
             task.status = Status::Done;
             task.closed_by = Some(ClosedBy::Source);
@@ -224,6 +294,24 @@ mod tests {
 
     const DAY: &str = "2026-07-14";
 
+    fn statuses() -> &'static [WorkflowStatus] {
+        static LIST: std::sync::OnceLock<Vec<WorkflowStatus>> = std::sync::OnceLock::new();
+        LIST.get_or_init(|| {
+            let mut list = statuses::default_statuses();
+            list.insert(
+                1,
+                WorkflowStatus {
+                    id: "custom-next".into(),
+                    name: "Next".into(),
+                    stage: Stage::NotStarted,
+                    color: "#e5a23c".into(),
+                    builtin: false,
+                },
+            );
+            statuses::normalize(list)
+        })
+    }
+
     fn context(now: u64) -> Context<'static> {
         Context {
             source_id: "src",
@@ -231,6 +319,7 @@ mod tests {
             mono_id: "mono-1",
             day: DAY,
             now,
+            statuses: statuses(),
         }
     }
 
@@ -601,5 +690,241 @@ mod tests {
         let before = keys.len();
         keys.dedup();
         assert_eq!(before, keys.len());
+    }
+
+    fn staged(key: &str, stage: Stage) -> SyncItem {
+        SyncItem {
+            stage: Some(stage),
+            ..item(key)
+        }
+    }
+
+    fn with_status(mut t: Task, id: &str) -> Task {
+        t.status_id = id.into();
+        t
+    }
+
+    #[test]
+    fn a_new_task_takes_the_explicit_stage() {
+        let got = run(&[], &[staged("a", Stage::Started)]);
+        assert_eq!(only(&got).status_id, "in_progress");
+    }
+
+    #[test]
+    fn a_new_task_maps_the_stage_from_the_source_status() {
+        let mut next = item("a");
+        next.source_status = Some("In Review".into());
+        assert_eq!(only(&run(&[], &[next])).status_id, "in_progress");
+        let mut next = item("b");
+        next.source_status = Some("Backlog".into());
+        assert_eq!(only(&run(&[], &[next])).status_id, "todo");
+    }
+
+    #[test]
+    fn an_explicit_stage_beats_the_source_status() {
+        let mut next = staged("a", Stage::NotStarted);
+        next.source_status = Some("In Progress".into());
+        assert_eq!(only(&run(&[], &[next])).status_id, "todo");
+    }
+
+    #[test]
+    fn a_new_task_with_no_stage_is_to_do() {
+        assert_eq!(only(&run(&[], &[item("a")])).status_id, "todo");
+        let mut odd = item("b");
+        odd.source_status = Some("Wontfix".into());
+        assert_eq!(only(&run(&[], &[odd])).status_id, "todo");
+    }
+
+    #[test]
+    fn a_finished_stage_on_an_open_item_is_ignored() {
+        let got = run(&[], &[staged("a", Stage::Finished)]);
+        assert_eq!(only(&got).status_id, "todo");
+        assert_eq!(only(&got).status, Status::Open);
+        let mut done_text = item("b");
+        done_text.source_status = Some("Done".into());
+        assert_eq!(only(&run(&[], &[done_text])).status_id, "todo");
+    }
+
+    #[test]
+    fn a_new_task_stores_the_summary() {
+        let mut next = item("a");
+        next.summary = Some("Line one\nLine two".into());
+        assert_eq!(only(&run(&[], &[next])).summary, "Line one\nLine two");
+    }
+
+    #[test]
+    fn an_absent_summary_keeps_the_old_one() {
+        let existing = [Task {
+            summary: "old".into(),
+            ..with_status(task("a", Status::Open), "todo")
+        }];
+        assert!(run(&existing, &[item("a")]).tasks.is_empty());
+        let mut next = item("a");
+        next.summary = Some("new".into());
+        assert_eq!(only(&run(&existing, &[next])).summary, "new");
+    }
+
+    #[test]
+    fn an_unpinned_task_follows_a_different_stage() {
+        let existing = [with_status(task("a", Status::Open), "todo")];
+        let got = run(&existing, &[staged("a", Stage::Started)]);
+        assert_eq!(only(&got).status_id, "in_progress");
+        // Back to Not started lands on the built-in, not a custom status.
+        let existing = [with_status(task("a", Status::Open), "in_progress")];
+        let got = run(&existing, &[staged("a", Stage::NotStarted)]);
+        assert_eq!(only(&got).status_id, "todo");
+    }
+
+    #[test]
+    fn a_task_in_the_same_stage_keeps_its_custom_status() {
+        let existing = [with_status(task("a", Status::Open), "custom-next")];
+        assert!(run(&existing, &[staged("a", Stage::NotStarted)])
+            .tasks
+            .is_empty());
+    }
+
+    #[test]
+    fn a_pinned_status_is_never_mapped() {
+        let existing = [Task {
+            status_pinned: true,
+            ..with_status(task("a", Status::Open), "todo")
+        }];
+        assert!(run(&existing, &[staged("a", Stage::Started)])
+            .tasks
+            .is_empty());
+    }
+
+    #[test]
+    fn a_finished_stage_on_an_open_item_does_not_move_an_existing_task() {
+        let existing = [with_status(task("a", Status::Open), "in_progress")];
+        assert!(run(&existing, &[staged("a", Stage::Finished)])
+            .tasks
+            .is_empty());
+    }
+
+    #[test]
+    fn user_finished_task_listed_open_needs_check_and_keeps_its_finished_status() {
+        let existing = [with_status(done_by("a", ClosedBy::User), "done")];
+        let got = run(&existing, &[staged("a", Stage::Started)]);
+        assert_eq!(only(&got).status, Status::NeedsCheck);
+        assert_eq!(only(&got).status_id, "done");
+    }
+
+    #[test]
+    fn a_kept_done_task_listed_open_stays_done() {
+        let existing = [Task {
+            kept_done: true,
+            ..with_status(done_by("a", ClosedBy::User), "done")
+        }];
+        let result = run(&existing, &[item("a")]);
+        assert!(result.tasks.is_empty());
+        assert_eq!(result.summary.needs_check, 0);
+    }
+
+    #[test]
+    fn a_kept_done_task_later_listed_closed_becomes_source_closed() {
+        let existing = [Task {
+            kept_done: true,
+            ..with_status(done_by("a", ClosedBy::User), "done")
+        }];
+        let got = run(&existing, &[closed("a")]);
+        assert_eq!(only(&got).closed_by, Some(ClosedBy::Source));
+        assert_eq!(only(&got).status_id, "done");
+    }
+
+    #[test]
+    fn source_reopening_a_kept_done_task_clears_the_flag() {
+        let existing = [Task {
+            kept_done: true,
+            ..with_status(done_by("a", ClosedBy::Source), "done")
+        }];
+        let got = run(&existing, &[item("a")]);
+        assert!(!only(&got).kept_done);
+    }
+
+    #[test]
+    fn source_closing_moves_to_done_unless_already_finished() {
+        let got = run(
+            &[with_status(task("a", Status::Open), "in_progress")],
+            &[closed("a")],
+        );
+        assert_eq!(only(&got).status_id, "done");
+        let mut list = statuses().to_vec();
+        list.push(WorkflowStatus {
+            id: "shipped".into(),
+            name: "Shipped".into(),
+            stage: Stage::Finished,
+            color: "#10b981".into(),
+            builtin: false,
+        });
+        let list = statuses::normalize(list);
+        let ctx = Context {
+            statuses: &list,
+            ..context(1_000)
+        };
+        let existing = [with_status(done_by("a", ClosedBy::User), "shipped")];
+        let got = reconcile(&existing, &HashSet::new(), &[closed("a")], &ctx);
+        assert_eq!(only(&got).status_id, "shipped");
+    }
+
+    #[test]
+    fn source_closing_a_pinned_task_still_applies_the_lifecycle() {
+        let existing = [Task {
+            status_pinned: true,
+            ..with_status(task("a", Status::Open), "in_progress")
+        }];
+        let got = run(&existing, &[closed("a")]);
+        assert_eq!(only(&got).status, Status::Done);
+        assert_eq!(only(&got).status_id, "done");
+    }
+
+    #[test]
+    fn source_reopening_a_closed_task_takes_the_item_stage_or_to_do() {
+        let existing = [with_status(done_by("a", ClosedBy::Source), "done")];
+        let got = run(&existing, &[staged("a", Stage::Started)]);
+        assert_eq!(only(&got).status, Status::Open);
+        assert_eq!(only(&got).status_id, "in_progress");
+        let got = run(&existing, &[item("a")]);
+        assert_eq!(only(&got).status_id, "todo");
+    }
+
+    #[test]
+    fn going_missing_keeps_the_status() {
+        let existing = [with_status(task("a", Status::Open), "in_progress")];
+        let got = run(&existing, &[]);
+        assert_eq!(only(&got).status, Status::NeedsCheck);
+        assert_eq!(only(&got).status_id, "in_progress");
+    }
+
+    #[test]
+    fn a_task_saved_before_statuses_gets_its_id_only_when_it_changes() {
+        let old = task("a", Status::Open);
+        assert!(run(std::slice::from_ref(&old), &[item("a")])
+            .tasks
+            .is_empty());
+        let mut next = item("a");
+        next.title = "Renamed".into();
+        assert_eq!(only(&run(&[old], &[next])).status_id, "todo");
+    }
+
+    #[test]
+    fn a_dismissed_task_with_a_finished_status_reopens_with_an_unfinished_one() {
+        let existing = [with_status(task("a", Status::Dismissed), "done")];
+        let mut next = staged("a", Stage::Started);
+        next.reopened = true;
+        let got = run(&existing, &[next]);
+        assert_eq!(only(&got).status, Status::Open);
+        assert_eq!(only(&got).status_id, "in_progress");
+        let mut plain = item("a");
+        plain.reopened = true;
+        assert_eq!(only(&run(&existing, &[plain])).status_id, "todo");
+    }
+
+    #[test]
+    fn an_unknown_status_id_is_left_as_it_is() {
+        let existing = [with_status(task("a", Status::Open), "gone")];
+        let mut next = item("a");
+        next.title = "Renamed".into();
+        assert_eq!(only(&run(&existing, &[next])).status_id, "gone");
     }
 }

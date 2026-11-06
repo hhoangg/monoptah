@@ -363,10 +363,14 @@ fn operator_sessions_cannot_use_today_actions() {
         "today.add",
         "today.update",
         "today.note",
+        "today.editNote",
+        "today.deleteNote",
         "today.complete",
         "today.snooze",
         "today.dismiss",
         "today.sources",
+        "today.statuses",
+        "today.tags",
     ] {
         let error = validate_operator(action, &json!({})).unwrap_err();
         assert!(
@@ -374,4 +378,78 @@ fn operator_sessions_cannot_use_today_actions() {
             "{action}: {error}"
         );
     }
+}
+
+#[test]
+fn operator_may_use_codespaces_except_delete() {
+    for (action, input) in [
+        ("codespaces.list", json!({})),
+        ("codespaces.secretsStatus", json!({})),
+        ("codespaces.create", json!({"branch":"main"})),
+        ("codespaces.stop", json!({"name":"octo-abc"})),
+        (
+            "sessions.start",
+            json!({"prompt":"x","target":{"codespace":"new"}}),
+        ),
+    ] {
+        assert!(validate_operator(action, &input).is_ok(), "{action}");
+    }
+    assert_eq!(
+        validate_operator("codespaces.delete", &json!({"name":"octo-abc"})).unwrap_err(),
+        "Deleting a codespace is only available to a Mono"
+    );
+    // Invalid input is still refused for the allowed ones.
+    assert!(validate_operator("codespaces.stop", &json!({"name":"a b"})).is_err());
+    // A completion notification stays Mono-only for cloud sessions too.
+    assert!(validate_operator(
+        "sessions.start",
+        &json!({"prompt":"x","notifyOnComplete":true,"target":{"codespace":"new"}})
+    )
+    .is_err());
+}
+
+/// A remote (cloud) session has no row in the shared desktop database: its transcript lives on
+/// its host. Reading it must go through the remote store instead of the local session table.
+#[test]
+fn reading_a_remote_session_works_on_a_shared_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_monocode(&dir.path().join("shared.db")).unwrap();
+    let project = store
+        .remember_cloud_project(
+            "env",
+            &json!({"id":"project","cwd":"/workspaces/repo"}),
+            "/Users/me/repo",
+            "octo-abc",
+        )
+        .unwrap();
+    let session = store.create("claude", &project.key).unwrap();
+    assert!(session.id < 0);
+    let page = store
+        .app_conversation(session.id, &json!({}), false, false)
+        .unwrap();
+    assert_eq!(page["sessionId"], session.id);
+    assert_eq!(page["title"], session.title);
+}
+
+/// The first prompt of an API-started cloud session is saved as a follow-up draft; reading the
+/// follow-ups back on the shared store used to look the (remote) session up in the sessions
+/// table and fail with "Query returned no rows", so the prompt was never sent.
+#[test]
+fn follow_ups_of_a_remote_session_with_a_draft_load_on_a_shared_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_monocode(&dir.path().join("shared.db")).unwrap();
+    let project = store
+        .remember_cloud_project(
+            "env",
+            &json!({"id":"project","cwd":"/workspaces/repo"}),
+            "/Users/me/repo",
+            "octo-abc",
+        )
+        .unwrap();
+    let session = store.create("claude", &project.key).unwrap();
+    store
+        .prepare_app_prompt(session.id, "start", "Do the thing")
+        .unwrap();
+    let state = store.follow_ups(session.id).unwrap();
+    assert_eq!(state.draft.unwrap().text, "Do the thing");
 }

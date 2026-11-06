@@ -820,7 +820,9 @@ impl Shell {
             .order
             .iter()
             .copied()
-            .filter(|id| self.session_metadata(*id, cx).summary.cwd == project)
+            .filter(|id| {
+                self.project_of(*id, &self.session_metadata(*id, cx).summary.cwd) == project
+            })
             .collect();
         let sessions = self
             .workspace
@@ -836,7 +838,7 @@ impl Shell {
                             return None;
                         }
                         let session = self.session_metadata(id, cx);
-                        (session.summary.cwd == project).then(|| TabSession {
+                        (self.project_of(id, &session.summary.cwd) == project).then(|| TabSession {
                             id,
                             tab: *tab,
                             cwd: self.session_working_copy(id, cx).to_owned(),

@@ -796,3 +796,153 @@ fn host_context_and_latest_turn_metrics_use_actual_session_fields() {
     assert_eq!(context.unwrap().window, None);
     assert!(metrics.is_none());
 }
+
+fn cloud_binding(store: &Database, provider: &str) -> RemoteSession {
+    let store = locked(store).unwrap();
+    let project = store
+        .remember_cloud_project(
+            "env",
+            &json!({"id":"project","cwd":"/workspaces/repo"}),
+            "/Users/me/repo",
+            "octo-abc",
+        )
+        .unwrap();
+    let summary = store.create(provider, &project.key).unwrap();
+    store.remote_session(summary.id).unwrap().unwrap()
+}
+
+#[test]
+fn cloud_sessions_reject_other_harnesses_before_any_transport() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let binding = cloud_binding(&store, "codex");
+    let host = Host::new(|_| panic!("nothing may be dispatched"));
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client(
+        host.client.clone(),
+        binding.summary.clone(),
+        "hello".into(),
+        Settings::default(),
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let result = receive(&rx);
+    assert!(result.finished);
+    assert!(result.status.contains("Claude only"), "{}", result.status);
+    assert!(
+        locked(&store)
+            .unwrap()
+            .remote_session(binding.summary.id)
+            .unwrap()
+            .unwrap()
+            .outbox
+            .is_empty()
+    );
+}
+
+#[test]
+fn cloud_send_on_a_connected_codespace_does_not_flash_waking() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let binding = cloud_binding(&store, "claude");
+    let host = Host::new(|_| Some(json!({"error":"stop here"})));
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client(
+        host.client.clone(),
+        binding.summary.clone(),
+        "hello".into(),
+        Settings {
+            model: Some("claude:sonnet".into()),
+            ..Default::default()
+        },
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    loop {
+        let update = receive(&rx);
+        assert_ne!(update.status, "Waking codespace…");
+        if update.finished {
+            break;
+        }
+    }
+}
+
+#[test]
+fn observer_reports_a_host_title_change_once_and_never_writes_it_back() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let mut bound = binding(&store);
+    bound.session_id = Some("host-session".into());
+    bound.summary.title = "Fixture".into();
+    journal(&store, &bound).unwrap();
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let recorded = methods.clone();
+    let mut polls = 0;
+    let host = Host::new(move |request| {
+        recorded.lock().unwrap().push(request["method"].clone());
+        polls += 1;
+        let mut value = snapshot(if polls < 4 { "running" } else { "idle" }, polls);
+        if polls > 1 {
+            value["session"]["title"] = json!("Named by the host");
+        }
+        Some(json!({"kind":"snapshot","value":value}))
+    });
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    let settings = Settings {
+        remote_action: Some(json!({"type":"attach"})),
+        ..Default::default()
+    };
+    let client = host.client.clone();
+    let summary = bound.summary.clone();
+    let saved = store.clone();
+    let worker = thread::spawn(move || {
+        run_with_client(
+            client,
+            summary,
+            String::new(),
+            settings,
+            controls,
+            saved,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )
+    });
+    let mut titles = Vec::new();
+    loop {
+        let next = receive(&rx);
+        titles.push(next.title.clone());
+        if next.finished {
+            break;
+        }
+    }
+    worker.join().unwrap();
+    assert_eq!(
+        titles,
+        [None, Some("Named by the host".to_owned()), None, None],
+        "only the tick where the host title changed carries it"
+    );
+    assert!(
+        methods
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|method| method == "sessions.sync")
+    );
+    assert_eq!(
+        locked(&store)
+            .unwrap()
+            .remote_session(bound.summary.id)
+            .unwrap()
+            .unwrap()
+            .summary
+            .title,
+        "Named by the host"
+    );
+}

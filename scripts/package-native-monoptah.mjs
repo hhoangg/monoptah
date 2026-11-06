@@ -1,8 +1,13 @@
 // Fork-local (Monoptah). Packages a prebuilt macOS arm64 native executable as an
 // ad-hoc signed app. Upstream's package-native.mjs requires a Developer ID and
-// notarization and only accepts X.Y.Z-preview.N versions; this fork has no Apple
-// Developer account and releases plain X.Y.Z. Kept in its own file so upstream
-// merges do not conflict. Never builds or launches the app.
+// notarization for macOS; this fork has no Apple Developer account. Kept in its
+// own file so upstream merges do not conflict. Never builds or launches the app.
+//
+// It also owns the asset naming for every platform the fork ships (the PLATFORMS
+// table below). Linux and Windows are packaged by upstream's package-native.mjs
+// (kinds linux, rpm, windows), which already accepts plain X.Y.Z versions and
+// brands its files Monoptah; their names are only described here so the release
+// script and the workflow can plan, sign and verify them.
 //
 // usage: node scripts/package-native-monoptah.mjs <binary> <out-dir> [version]
 // The version defaults to MONOCODE_NATIVE_VERSION.
@@ -47,6 +52,91 @@ export function artifactRecords(version) {
     { filename: names.sha256, target: null },
   ];
 }
+
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const exact = (name) => new RegExp(`^${escapeRegExp(name)}$`);
+
+// Every feed target the fork publishes. The client looks the target up as
+// <os>-<arch>-<install kind> (crates/monocode-core/src/app_update/mod.rs).
+export const TARGETS = [
+  "darwin-aarch64-app",
+  "linux-x86_64-appimage",
+  "linux-x86_64-deb",
+  "linux-x86_64-rpm",
+  "windows-x86_64-nsis",
+];
+
+// One entry per package job. `assets(version)` lists every file the job
+// produces as a RegExp that must match the whole filename, plus the feed target
+// of the updater package (null for files that are not signed or in the feed).
+// The rpm name is only known after rpmbuild ran (the dist tag, such as el10,
+// comes from the build container), hence the pattern.
+export const PLATFORMS = [
+  {
+    kind: "macos",
+    os: "macos-latest",
+    rust: "aarch64-apple-darwin",
+    arch: "aarch64",
+    assets: (version) => {
+      const names = assetNames(version);
+      return [
+        { pattern: exact(names.updater), target: "darwin-aarch64-app" },
+        { pattern: exact(names.zip), target: null },
+        { pattern: exact(names.sha256), target: null },
+      ];
+    },
+  },
+  {
+    kind: "linux",
+    os: "ubuntu-22.04",
+    rust: "x86_64-unknown-linux-gnu",
+    arch: "x86_64",
+    assets: (version) => [
+      {
+        pattern: exact(`MonoptahNative_${version}_amd64.AppImage`),
+        target: "linux-x86_64-appimage",
+      },
+      {
+        pattern: exact(`monoptah-native_${version}_amd64.deb`),
+        target: "linux-x86_64-deb",
+      },
+    ],
+  },
+  {
+    kind: "rpm",
+    os: "ubuntu-latest",
+    rust: "x86_64-unknown-linux-gnu",
+    arch: "x86_64",
+    assets: (version) => [
+      {
+        pattern: new RegExp(
+          `^monoptah-native-${escapeRegExp(version)}-[0-9A-Za-z._~+]+\\.x86_64\\.rpm$`,
+        ),
+        target: "linux-x86_64-rpm",
+      },
+    ],
+  },
+  {
+    kind: "windows",
+    os: "windows-latest",
+    rust: "x86_64-pc-windows-msvc",
+    arch: "x86_64",
+    assets: (version) => [
+      {
+        pattern: exact(`MonoptahNative_${version}_x64-setup.exe`),
+        target: "windows-x86_64-nsis",
+      },
+    ],
+  },
+];
+
+// The metadata file package-native.mjs (and packageMonoptahNative) writes.
+export const recordsFileName = (platform) =>
+  `artifacts-${platform.kind}-${platform.arch}.json`;
+
+// Every file a release carries: each platform's assets plus a .sig next to each
+// updater package. Used to check the published file list.
+export const RELEASE_FILE_COUNT = 12;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {

@@ -9,7 +9,7 @@ impl Shell {
             .order
             .iter()
             .map(|&id| self.session_metadata(id, cx).summary)
-            .filter(|s| s.archived && s.cwd == self.workspace.project)
+            .filter(|s| s.archived && self.project_of(s.id, &s.cwd) == self.workspace.project)
             .map(|s| ArchivedSession {
                 id: s.id,
                 title: s.title.clone(),
@@ -273,15 +273,24 @@ impl Shell {
         // Settings entity was notified, without rebuilding the shell for
         // ordinary settings edits.
         let mut overlay_was_open = false;
-        self.settings_overlay_watch = Some(cx.observe(&view, move |_, view, cx| {
+        // The search lives in the cached rail, so redraw it as the query moves.
+        let mut search_was = view.read(cx).search_state();
+        self.settings_overlay_watch = Some(cx.observe(&view, move |this, view, cx| {
             let open = view.read(cx).mobile_overlay_open();
             if open || overlay_was_open {
                 cx.notify();
             }
             overlay_was_open = open;
+            let search = view.read(cx).search_state();
+            if search != search_was {
+                search_was = search;
+                this.invalidate_chrome(cx);
+                cx.notify();
+            }
         }));
         self.settings = Some(view.clone());
         // Settings has its own complete rail, even when the project rail was hidden.
+        self.settings_nav_visible = true;
         self.sidebar_slide = None;
         self.sidebar_fraction = 1.;
         window.focus(&view.focus_handle(cx), cx);
@@ -317,6 +326,7 @@ impl Shell {
         if self.mobile.invite.is_some() {
             self.mobile_cancel_invite(cx);
         }
+        self.sidebar_slide = None;
         self.sidebar_fraction = if self.workspace.sidebar_visible {
             1.
         } else {
@@ -357,22 +367,33 @@ impl Shell {
         })
         .detach();
     }
-    pub(super) fn default_kind(&self) -> Kind {
-        self.default_kind_in(&self.workspace.project)
-    }
-    /// The provider a new session in `project` starts with.
-    pub(super) fn default_kind_in(&self, project: &str) -> Kind {
-        let p = &self.workspace.preferences;
-        p.project_providers
-            .get(project)
-            .and_then(|p| p.provider.as_deref())
-            .or(p.default_provider.as_deref())
-            .and_then(Kind::parse)
-            .unwrap_or(Kind::Codex)
+    /// With "auto resume at usage limit reset" on, every loaded local session
+    /// still waiting on a limit is armed. Sessions that exist only on disk are
+    /// armed when they load. Turning the switch off arms and cancels nothing.
+    fn sweep_auto_resume(&mut self, cx: &mut Context<Self>) {
+        if !self.workspace.preferences.auto_resume_usage_limit {
+            return;
+        }
+        for view in self.sessions.values() {
+            view.update(cx, |view, cx| view.sweep_auto_resume(cx));
+        }
+        if let Some(monos) = &self.monos {
+            monos.update(cx, |monos, cx| monos.sweep_auto_resume(cx));
+        }
     }
     pub(super) fn apply_preferences(&mut self, cx: &mut Context<Self>) {
         self.refresh_notification_permission();
         self.configure_quick_composer(cx);
+        // Switching search styles closes an open search of the other style.
+        if self
+            .app_search
+            .as_ref()
+            .is_some_and(|s| s.panel != self.workspace.preferences.search_panel)
+        {
+            self.leave_app_search(cx);
+            self.update_chat_visibility(cx);
+            self.invalidate_chrome(cx);
+        }
         monocode_core::cli::initialize(&self.workspace.preferences.binary_paths);
         self.keep_visible_idle_agents(cx);
         monocode_core::provider::configure_idle_agents(
@@ -389,6 +410,7 @@ impl Shell {
         // After the keymap, so the menu shows rebound shortcuts.
         crate::app_menu::install(&self.workspace.preferences, cx);
         cx.set_global(self.workspace.preferences.clone());
+        self.sweep_auto_resume(cx);
         self.sync_right_panel(cx);
         if let Some(center) = crate::accounts::get(cx) {
             center.update(cx, |center, cx| {
@@ -566,6 +588,52 @@ mod tests {
     use gpui::TestAppContext;
 
     #[gpui::test]
+    fn the_global_auto_resume_switch_arms_waiting_sessions_and_off_leaves_them_armed(
+        cx: &mut TestAppContext,
+    ) {
+        use monocode_core::usage::{AutoResume, Limit, now_ms};
+        let (window, a, b) = window(cx);
+        let reset = Some(now_ms() + 3_600_000);
+        window
+            .update(cx, |shell, _, cx| {
+                for (id, opt_out) in [(a, false), (b, true)] {
+                    let view = shell.ensure_session(id, cx).unwrap();
+                    view.update(cx, |v, _| {
+                        v.settings.usage_limit = Some(Limit {
+                            resets_at: reset,
+                            resume_at_reset: false,
+                        });
+                        v.settings.auto_resume_opt_out = opt_out;
+                    });
+                    assert_eq!(shell.session_metadata(id, cx).auto_resume(now_ms()), None);
+                }
+                shell.workspace.preferences.auto_resume_usage_limit = true;
+                shell.apply_preferences(cx);
+                let armed = |shell: &Shell, id: i64, cx: &gpui::App| {
+                    shell.sessions[&id]
+                        .read(cx)
+                        .settings
+                        .usage_limit
+                        .as_ref()
+                        .is_some_and(|l| l.resume_at_reset)
+                };
+                assert!(armed(shell, a, cx));
+                assert!(!armed(shell, b, cx));
+                // The sidebar indicator follows the armed state only.
+                assert_eq!(
+                    shell.session_metadata(a, cx).auto_resume(now_ms()),
+                    reset.map(AutoResume::At)
+                );
+                assert_eq!(shell.session_metadata(b, cx).auto_resume(now_ms()), None);
+                shell.workspace.preferences.auto_resume_usage_limit = false;
+                shell.apply_preferences(cx);
+                assert!(armed(shell, a, cx));
+                assert!(!armed(shell, b, cx));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn pairing_dialog_is_a_window_overlay_and_updates_from_settings_notifications(
         cx: &mut TestAppContext,
     ) {
@@ -696,6 +764,41 @@ mod tests {
             .unwrap();
     }
     #[gpui::test]
+    fn settings_nav_search_steps_through_results_with_arrows(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            super::super::bind_keys(cx);
+            crate::input::bind(cx);
+            crate::popover::bind(cx);
+        });
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_settings(Section::General, w, cx)
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let back = visual.debug_bounds("settings-nav-back").unwrap();
+        let search = visual.debug_bounds("settings-search").unwrap();
+        let first = visual.debug_bounds("settings-nav-general").unwrap();
+        assert!(search.bottom() < first.top() && first.bottom() < back.top());
+        visual.simulate_click(search.center(), Default::default());
+        visual.simulate_input("theme");
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("settings-result-1").is_some());
+        visual.simulate_keystrokes("down");
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(
+                    shell.settings.as_ref().unwrap().read(cx).search_state().1,
+                    1
+                )
+            })
+            .unwrap();
+    }
+    #[gpui::test]
     fn settings_replace_native_rail_and_tabs_and_return_to_the_same_session(
         cx: &mut TestAppContext,
     ) {
@@ -764,6 +867,56 @@ mod tests {
             })
             .unwrap();
         assert!(visual.debug_bounds("sidebar-content").is_some());
+    }
+
+    #[gpui::test]
+    fn settings_nav_collapses_with_search_on_top_and_back_at_the_bottom(cx: &mut TestAppContext) {
+        cx.update(super::super::bind_keys);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        window
+            .update(cx, |shell, w, cx| shell.focus_active(w, cx))
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_keystrokes("cmd-,");
+        visual.run_until_parked();
+        let back = visual.debug_bounds("settings-nav-back").unwrap();
+        let search = visual.debug_bounds("settings-search").unwrap();
+        let general = visual.debug_bounds("settings-nav-general").unwrap();
+        let header = visual.debug_bounds("settings-header").unwrap();
+        assert!(
+            search.bottom() <= general.top(),
+            "search heads the nav, above the pages"
+        );
+        assert!(general.bottom() <= back.top(), "Back sits below the pages");
+        assert!(search.right() <= header.left(), "search lives in the nav");
+
+        let toggle = visual.debug_bounds("toggle-sidebar").unwrap();
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.settings.is_some());
+                assert_eq!(shell.sidebar_fraction, 0.);
+                assert!(
+                    shell.workspace.sidebar_visible,
+                    "the project sidebar is untouched"
+                );
+            })
+            .unwrap();
+        let search = visual.debug_bounds("settings-search").unwrap();
+        let header = visual.debug_bounds("settings-header").unwrap();
+        assert!(
+            search.left() >= header.left() && search.bottom() <= header.bottom(),
+            "collapsed, search moves to the title bar"
+        );
+
+        let toggle = visual.debug_bounds("toggle-sidebar").unwrap();
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| assert_eq!(shell.sidebar_fraction, 1.))
+            .unwrap();
     }
 
     #[gpui::test]

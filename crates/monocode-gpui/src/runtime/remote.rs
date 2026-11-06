@@ -26,6 +26,7 @@ fn update(status: impl Into<String>, finished: bool) -> Update {
         model: None,
         config_model: None,
         config_settings: None,
+        title: None,
         context: None,
         metrics: None,
         usage_limit: None,
@@ -500,6 +501,7 @@ pub(crate) fn run_with_client(
     tx: async_channel::Sender<Update>,
 ) {
     let mut latest_rows = Vec::new();
+    let mut attaching_run = false;
     let result = (|| -> Result<(), String> {
         if tx.is_closed() {
             return Ok(());
@@ -516,6 +518,7 @@ pub(crate) fn run_with_client(
             .take()
             .unwrap_or_else(|| json!({"type":"send"}));
         let attaching = action["type"] == "attach";
+        attaching_run = attaching;
         let retrying = action["type"] == "retry";
         if !attaching
             && let Some(recovery) = binding
@@ -529,6 +532,28 @@ pub(crate) fn run_with_client(
                 .into());
         }
         let machine = binding.machine(&client)?;
+        if !attaching {
+            // Cloud sessions: a send after an idle stop must wake the codespace
+            // and its host before anything is dispatched. This closure runs on a
+            // background executor thread (conversation.rs spawns it there), so
+            // blocking for the boot is fine. Attaching never wakes.
+            if binding.project.codespace.is_some() {
+                monocode_core::cloud_sessions::require_claude(&binding.summary.provider)?;
+                // Stop cancels the wake; the status line shows it only when a
+                // reconnect actually starts (a connected codespace is instant).
+                let start = latest_rows.len();
+                monocode_core::cloud_sessions::ensure_before_send(
+                    &client,
+                    &binding,
+                    &cancel,
+                    &mut |message| {
+                        let mut waking = update(message, false);
+                        waking.start = start;
+                        let _ = tx.send_blocking(waking);
+                    },
+                )?;
+            }
+        }
         if !attaching && !retrying {
             if !binding.outbox.is_empty() {
                 return Err("A remote command needs confirmation. Choose Retry before sending another message.".into());
@@ -703,10 +728,15 @@ pub(crate) fn run_with_client(
             // new host session. Metadata refreshes find this binding by host ID.
             binding.running = running;
             binding.needs_input = !seen_approvals.is_empty() || !seen_questions.is_empty();
-            binding.summary.title = snapshot["session"]["title"]
+            let title = snapshot["session"]["title"]
                 .as_str()
                 .unwrap_or(&binding.summary.title)
-                .into();
+                .to_owned();
+            // Only a host change reaches the open view; it is never written back.
+            if binding.summary.title != title {
+                next.title = Some(title.clone());
+            }
+            binding.summary.title = title;
             binding.summary.provider_id = next.provider_id.clone();
             binding.summary.updated_at = snapshot["updatedAt"]
                 .as_u64()
@@ -781,6 +811,19 @@ pub(crate) fn run_with_client(
         Ok(())
     })();
     if let Err(error) = result {
+        // A stopped or unreachable codespace is a state of the cloud session,
+        // not a failure: say so plainly instead of surfacing the transport error.
+        let error = if monocode_core::cloud_sessions::is_not_connected(&error) {
+            if attaching_run {
+                "Codespace is stopped. Send a message to wake it.".to_string()
+            } else {
+                "Could not reach the codespace. Try sending again.".to_string()
+            }
+        } else if error == monocode_core::remote::WAKE_CANCELLED {
+            "Ready".to_string()
+        } else {
+            error
+        };
         let mut next = update(error, true);
         // Every valid snapshot was already published. An empty error patch
         // preserves any optimistic prompt awaiting a host receipt.

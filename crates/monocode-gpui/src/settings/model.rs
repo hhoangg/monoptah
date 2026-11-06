@@ -267,10 +267,10 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "actions commands run script dock background",
     ),
     (
-        "terminal-in-panel",
+        "terminal-placement",
         Section::General,
-        "Terminal in side panel",
-        "terminal dock right panel tab shell focused layout",
+        "Terminal",
+        "terminal placement dock bottom side right panel title bar tab shell focused layout",
     ),
     (
         "file-tabs",
@@ -394,10 +394,28 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "streaming pacing immediate latency performance animation",
     ),
     (
+        "collapse-tool-groups",
+        Section::Chat,
+        "Collapse tool groups",
+        "tool calls commands steps expand closed mobile compact activity",
+    ),
+    (
+        "fold-finished-work",
+        Section::Chat,
+        "Fold finished work",
+        "worked for collapse tool calls reply inline expanded history turns",
+    ),
+    (
         "follow-up",
         Section::Chat,
         "Follow-up behavior",
         "queue steer interrupt send while running",
+    ),
+    (
+        "auto-resume-usage-limit",
+        Section::Chat,
+        "Auto resume at usage limit reset",
+        "usage limit rate limit resume continue automatically reset session quota",
     ),
     (
         "model-controls",
@@ -616,6 +634,19 @@ pub(crate) fn search(query: &str, compositor: &str) -> Vec<SearchResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auto_resume_is_a_chat_setting_found_by_its_words() {
+        for query in ["auto resume", "usage limit", "resume"] {
+            assert!(
+                search(query, "Wayland")
+                    .iter()
+                    .any(|r| r.section == Section::Chat
+                        && r.setting == Some("auto-resume-usage-limit")),
+                "{query}"
+            );
+        }
+    }
+
     #[test]
     fn wayland_decorations_are_searchable_only_on_wayland() {
         for query in ["Wayland", "window decorations", "compositor", "title bar"] {

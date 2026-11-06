@@ -102,28 +102,43 @@ trust that one key, so a replacement key would strand them.
 
 ### Releasing the native app
 
-Monoptah Native (GPUI, macOS arm64 only, ad-hoc signed, not notarized) releases separately
-from the Tauri app. Edit `docs/native/monoptah-release-notes.md` (its first line must be
-`# Monoptah Native X.Y.Z`), commit it, wait for `native.yml` on main to pass (the release does
-not wait for it, and its `release-cache` job seeds the build cache), then push the tag
-`native-vX.Y.Z` (plain `X.Y.Z`, no pre-release form). `.github/workflows/native-release-monoptah.yml` builds, signs with the same
-`TAURI_SIGNING_PRIVATE_KEY`, and publishes:
+Monoptah Native (GPUI) ships for macOS arm64 (ad-hoc signed, not notarized), Linux x86_64
+and Windows x86_64 (unsigned installer). It releases separately from the Tauri app. Edit
+`docs/native/monoptah-release-notes.md` (its first line must be `# Monoptah Native X.Y.Z`),
+commit it, wait for `native.yml` on main to pass (the release does not wait for it, and its
+`release-cache` job seeds the macOS, Linux and Windows build caches; the rpm job always builds
+cold), then push the tag `native-vX.Y.Z` (plain `X.Y.Z`, no pre-release form).
+`.github/workflows/native-release-monoptah.yml` plans, builds each platform in parallel, signs
+every updater package with the same `TAURI_SIGNING_PRIVATE_KEY` in one `publish` job, verifies
+them with the app's own verifier, and publishes:
 
-- Release `native-vX.Y.Z` (never "latest": Tauri's updater reads `releases/latest`) with
-  `MonoptahNative_X.Y.Z_aarch64.app.tar.gz` and `.sig` for the in-app updater, plus the
-  `.zip` and `.zip.sha256` the cask pins.
+- Release `native-vX.Y.Z` (never "latest": Tauri's updater reads `releases/latest`) with, for
+  each updater package, the file and its `.sig`:
+  - macOS arm64: `MonoptahNative_X.Y.Z_aarch64.app.tar.gz`, plus the `.zip` and `.zip.sha256`
+    the cask pins.
+  - Linux x86_64: `MonoptahNative_X.Y.Z_amd64.AppImage`, `monoptah-native_X.Y.Z_amd64.deb`
+    and `monoptah-native-X.Y.Z-0.preview.0.el10.x86_64.rpm` (built on AlmaLinux 10; the
+    release string comes from upstream's spec, which is written for previews).
+  - Windows x86_64: `MonoptahNative_X.Y.Z_x64-setup.exe` (NSIS).
 - `latest.json` on the rolling pre-release `native-latest`, the feed compiled into the app.
-  It is never replaced by an older version.
+  It lists `darwin-aarch64-app`, `linux-x86_64-appimage`, `linux-x86_64-deb`,
+  `linux-x86_64-rpm` and `windows-x86_64-nsis`, and it is never replaced by an older version.
 
-A re-run of the same tag after a partial failure reuses the published assets and never
-replaces them; the signed files and feed are also kept as a workflow artifact.
+Every platform is required: if one package job fails, nothing is published. A re-run of the
+same tag after a partial failure never replaces published assets: a platform whose files are
+all on the release is not rebuilt (its files are downloaded and signed again) and one with no
+files is built. A platform with only some files published fails the `plan` job: delete that
+platform's published assets (files and `.sig`) by hand, then re-run; the signed files and feed are also kept as a
+workflow artifact. The Linux and Windows packages use upstream's `scripts/package-native.mjs`
+(kinds `linux`, `rpm`, `windows`), which the fork wrappers only describe and sign.
 
-The `homebrew` job only bumps `Casks/monoptah-native.rb` in the tap, it does not create it:
-add that file (modelled on `Casks/monoptah.rb`) before the first release, or the job fails.
-It runs when `HOMEBREW_TAP_TOKEN` is set. While it is unset, bump the cask by hand with
+The `homebrew` job only bumps `Casks/monoptah-native.rb` in the tap (macOS only; Linux and
+Windows have no package-manager entry), it does not create it: add that file (modelled on
+`Casks/monoptah.rb`) before the first release, or the job fails. It runs after `publish` when
+`HOMEBREW_TAP_TOKEN` is set. While it is unset, bump the cask by hand with
 `scripts/update-homebrew-cask.sh` and the sha from the `MonoptahNative_<version>_aarch64.zip.sha256`
-asset. The fork scripts are `scripts/package-native-monoptah.mjs` and
-`scripts/native-release-monoptah.mjs`.
+asset. The fork scripts are `scripts/package-native-monoptah.mjs` (also the asset table for
+every platform) and `scripts/native-release-monoptah.mjs`.
 
 Two things to keep true after merging from upstream or changing repo settings:
 
@@ -132,3 +147,12 @@ Two things to keep true after merging from upstream or changing repo settings:
   and R2 secrets), so give it the same `if:`.
 - The rolling feed is replaced with `gh release upload --clobber`. Do not enable GitHub
   immutable releases for this repository, or the feed can never be updated.
+
+### macOS runner capacity fallback
+
+Native CI and Monoptah release jobs accept the repository variable
+`MONOPTAH_MACOS_RUNNER` (default `macos-latest`). If GitHub cannot acquire its
+macOS 26 arm64 runners, set it to `macos-15`; the workflows select the installed
+Xcode 26.3 on that image. The release still requires macOS SDK 26 or newer and
+packages only arm64. Clear the variable to return to the default image. The
+variable affects new jobs, so re-run CI after changing it before tagging a release.

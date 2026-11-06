@@ -617,7 +617,7 @@ pub(super) fn refresh(s: &Setup, cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
-pub(super) fn click(visual: &mut VisualTestContext, selector: &'static str) {
+pub(in crate::monos) fn click(visual: &mut VisualTestContext, selector: &'static str) {
     let bounds = visual
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("{selector} is not on screen"));

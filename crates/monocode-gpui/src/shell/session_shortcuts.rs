@@ -15,6 +15,7 @@ impl Shell {
             || self.mono_active(cx)
             || self.quick_open.is_some()
             || self.image_lightbox.is_some()
+            || self.document_lightbox.is_some()
             || self.menu.is_some()
             || self.renaming.is_some()
             || self.link_dialog.is_some()

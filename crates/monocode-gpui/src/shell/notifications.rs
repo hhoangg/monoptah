@@ -443,7 +443,7 @@ impl Shell {
     }
 
     pub(super) fn notice_session_visible(&self, id: i64, cx: &App) -> bool {
-        if self.app_view_open() || self.settings.is_some() || self.app_search.is_some() {
+        if self.app_view_open() || self.settings.is_some() || self.search_page() {
             return false;
         }
         if self.mono_active(cx) {
@@ -460,17 +460,19 @@ impl Shell {
                 .into_iter()
                 .any(|pane| {
                     self.workspace.session_for_pane(pane) == id
-                        && !self.workspace.review_owners.contains_key(&pane)
+                        && !self.workspace.is_detached_pane(pane)
                 })
         })
     }
 
     pub(super) fn sync_notices(&mut self, window: &Window, cx: &mut Context<Self>) {
         let now = monocode_core::time::now_ms();
-        let prefs = self.workspace.preferences.clone();
-        if self.notification_state.sounds_enabled != prefs.sounds {
-            self.notification_state.sounds_enabled = prefs.sounds;
-            if prefs.sounds {
+        // This runs on every Shell frame; borrow the preferences below instead
+        // of cloning their JSON maps each time.
+        let sounds = self.workspace.preferences.sounds;
+        if self.notification_state.sounds_enabled != sounds {
+            self.notification_state.sounds_enabled = sounds;
+            if sounds {
                 self.notification_state.sounds_enabled_at = now;
             }
         }
@@ -556,6 +558,7 @@ impl Shell {
                 cx,
             );
         }
+        let prefs = &self.workspace.preferences;
         self.notification_state.approvals.update(cx, |notices, cx| {
             notices.sync(
                 &snapshots,
@@ -933,6 +936,24 @@ impl Shell {
         cx.notify();
     }
 
+    /// Whether the quit notice, a toast or an approval is up. They draw above
+    /// the document lightbox (priority 110 and 120 against its 100), but a
+    /// native web view sits above all of GPUI, so the lightbox hides it.
+    pub(super) fn overlay_above_lightbox(&self, cx: &App) -> bool {
+        let state = &self.notification_state;
+        self.quit_gate.expires_at().is_some()
+            || self.error.is_some()
+            || self
+                .monos
+                .as_ref()
+                .is_some_and(|monos| monos.read(cx).error.is_some())
+            || state.file_error.read(cx).is_visible()
+            || !state.reminders.read(cx).is_empty()
+            || state.harness.read(cx).is_visible()
+            || state.layout.read(cx).is_visible()
+            || !state.approvals.read(cx).is_empty()
+    }
+
     pub(super) fn notices_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.notification_state;
         let mono_error = self.monos.as_ref().and_then(|monos| {
@@ -962,6 +983,19 @@ impl Shell {
                         .debug_selector(|| "dismiss-error".into())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.error = None;
+                            cx.notify();
+                        })),
+                ))
+            })
+            .when_some(self.notice.clone(), |stack, message| {
+                stack.child(errors::severity_card(
+                    "app-notice",
+                    errors::Severity::Warning,
+                    message,
+                    icon_button("dismiss-notice", "Dismiss notice", "close")
+                        .debug_selector(|| "dismiss-notice".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.notice = None;
                             cx.notify();
                         })),
                 ))
@@ -1314,7 +1348,7 @@ impl Shell {
                 .detach();
             }
             LinkedActivityEvent::Archive(id) => {
-                self.toggle_archive(id, cx);
+                self.toggle_archive_now(id, cx);
                 if self.archiving.contains(&id) {
                     self.notification_state
                         .linked_cleanup
@@ -1359,7 +1393,7 @@ impl Shell {
 }
 
 #[cfg(test)]
-mod error_tests {
+mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
 
@@ -1418,6 +1452,32 @@ mod error_tests {
             .update(visual, |shell, _, cx| {
                 assert!(shell.error.is_none());
                 assert!(!shell.notification_state.file_error.read(cx).is_visible());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn dismissing_installed_update_does_not_open_whats_new(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, _, cx| {
+                shell.notification_state.installed.update(cx, |notice, cx| {
+                    notice.set_version(Some("1.2.3".into()), cx)
+                });
+                shell.invalidate_chrome(cx);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let close = visual.debug_bounds("dismiss-installed-update").unwrap();
+        visual.simulate_click(close.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(!shell.notification_state.installed.read(cx).is_visible());
+                assert!(shell.notification_state.whats_new.is_none());
             })
             .unwrap();
     }

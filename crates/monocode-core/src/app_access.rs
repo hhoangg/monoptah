@@ -24,6 +24,7 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
             | "sessions.stop"
             | "sessions.archive"
             | "sessions.delete"
+            | "sessions.pullEvidence"
             | "folders.list"
             | "folders.move"
             | "notes.list"
@@ -31,7 +32,14 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
             | "notes.write"
             | "worktrees.list"
             | "worktrees.create"
+            | "codespaces.list"
+            | "codespaces.create"
+            | "codespaces.stop"
+            | "codespaces.secretsStatus"
     ) {
+        if action == "codespaces.delete" {
+            return Err("Deleting a codespace is only available to a Mono".into());
+        }
         return Err("Unknown Operator action. Run app help for project actions; memory, habits and artifacts require a Mono.".into());
     }
     crate::mono::api::validate(action, input)?;
@@ -116,6 +124,14 @@ pub fn model_controls(kind: Kind, model: &Model) -> Vec<ModelControl> {
         });
     }
     controls
+}
+/// A model's effort levels as `sessions.start` accepts them, value and name.
+pub fn effort_choices(kind: Kind, model: &Model) -> Vec<(String, String)> {
+    model_controls(kind, model)
+        .into_iter()
+        .find(|c| is_effort(&c.id))
+        .map(|c| c.choices)
+        .unwrap_or_default()
 }
 fn is_effort(key: &str) -> bool {
     matches!(

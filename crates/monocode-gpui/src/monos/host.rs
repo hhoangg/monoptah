@@ -5,7 +5,12 @@ use monocode_core::mono::workflows::{
     cli::{StoreHost, handle_value},
     store::MonoDir,
 };
-use monocode_core::mono::{Document, Launch, bridge::Call, files, memory};
+use monocode_core::mono::{
+    Document, Launch,
+    bridge::Call,
+    cloud_api::{self, CloudApi},
+    files, memory,
+};
 use monocode_core::{app_access as app, session_groups::Groups, time::now_ms};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -221,7 +226,8 @@ fn text(v: &Value, key: &str, max: usize) -> Result<String, String> {
 fn id(v: &Value, key: &str) -> Result<i64, String> {
     v.get(key)
         .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
-        .filter(|n| *n > 0)
+        // Cloud sessions live in the remote store, whose session IDs are negative.
+        .filter(|n| *n > 0 || (matches!(key, "sessionId" | "besideSessionId") && *n != 0))
         .ok_or_else(|| format!("Provide {key}"))
 }
 fn flag(v: &Value, key: &str, default: bool) -> bool {
@@ -282,7 +288,7 @@ impl Monos {
             .get(&call.session)
             .is_some_and(|r| r.habit == mono::heartbeat::RUN_ID);
         if call.action.starts_with("habits.")
-            && call.action != "habits.list"
+            && !matches!(call.action.as_str(), "habits.list" | "habits.export")
             && (habit_run || question)
         {
             return Err("A habit run cannot schedule more runs".into());
@@ -310,7 +316,10 @@ impl Monos {
         let key = (call.session, call.request_id.clone());
         self.app_pending.remove(&key);
         // A read has nothing to replay, and a day's list is large to keep as a receipt.
-        if matches!(call.action.as_str(), "today.list" | "today.sources") {
+        if matches!(
+            call.action.as_str(),
+            "today.list" | "today.sources" | "today.statuses" | "today.tags"
+        ) {
             let _ = call.reply.send(result);
             return;
         }
@@ -469,8 +478,13 @@ impl Monos {
                         }
                     }
                     // Reads change nothing: they must not make the page reload.
-                    if call.action.starts_with("today.")
-                        && !matches!(call.action.as_str(), "today.list" | "today.sources")
+                    if (call.action.starts_with("today.")
+                        && !matches!(
+                            call.action.as_str(),
+                            "today.list" | "today.sources" | "today.statuses" | "today.tags"
+                        ))
+                        || (call.action == "sessions.pullEvidence"
+                            && call.input.get("taskId").is_some_and(|v| !v.is_null()))
                     {
                         this.today.bump();
                     }
@@ -509,7 +523,9 @@ impl Monos {
             visible,
         } = started;
         let id = summary.id;
-        let project = summary.cwd.clone();
+        // A cloud session runs on a codespace (its cwd is a remote key) but the sidebar lists it
+        // under the local project it twins, so it is recorded and filed there.
+        let project = launch_project(&self.store, id, &summary.cwd);
         let origin = self
             .chats
             .values()
@@ -522,7 +538,7 @@ impl Monos {
         if let Some(mono) = self.roster.get_mut(mono_id) {
             mono.launches.push(Launch {
                 session_id: id,
-                cwd: summary.cwd.clone(),
+                cwd: project.clone(),
                 title: summary.title.clone(),
                 harness: summary.provider.clone(),
                 model: settings.model.clone(),
@@ -643,13 +659,21 @@ impl Monos {
             self.finish_call(call, Err("Input must be a JSON object".into()), cx);
             return;
         }
-        let input = call.input.clone();
+        let mut input = call.input.clone();
         let action = call.action.clone();
+        // A session it starts without naming a model takes the one set for
+        // its sessions, if any; the receipt still keys on what it sent.
+        if action == "sessions.start"
+            && let Some(subsessions) = &mono.subsessions
+        {
+            subsessions.fill(&mut input);
+        }
         let root = self.root.clone();
         let target = mono.id.clone();
         let project = if action.starts_with("sessions.")
             || action.starts_with("folders.")
             || action.starts_with("worktrees.")
+            || action.starts_with("codespaces.")
         {
             match mono.project(input.get("project").and_then(Value::as_str)) {
                 Ok(p) => p,
@@ -694,7 +718,7 @@ impl Monos {
                 return;
             }
             "sessions.start" => {
-                self.start_call(call, mono, project, source, cx);
+                self.start_call(call, &input, mono, project, source, cx);
                 return;
             }
             "sessions.list" | "sessions.read" => {
@@ -704,16 +728,21 @@ impl Monos {
                     .map(|owner| owner.read(cx).mono_session_views(cx))
                     .unwrap_or_default();
                 self.call_work(call,target,move|store|{
+                    // Cloud sessions live on a codespace but belong to this project. Their targets
+                    // are read (cached, never waking) before the store is locked.
+                    let targets=CloudApi::shared(&store).map(|api|api.session_targets(&project)).unwrap_or_default();
                     let db=locked(&store)?;let all=db.sessions()?;
-                    let sessions:Vec<_>=all.iter().filter(|s|!hidden.contains(&s.id)&&s.cwd==project).collect();
+                    let sessions:Vec<_>=all.iter().filter(|s|!hidden.contains(&s.id)&&(s.cwd==project||targets.contains_key(&s.id))).collect();
                     let value=if action=="sessions.list" {
                         let drafts=db.draft_sessions()?;let metadata=db.mobile_session_metadata()?;
                         let mut facts=db.app_session_facts(&sessions,false)?;
-                        json!({"cwd":project,"sessions":sessions.iter().map(|s|{let mut row=json!({"id":s.id,"sessionId":s.id,"title":s.title,"harness":s.provider,"model":metadata.get(&s.id).and_then(|m|m.model.clone()),"busy":views.iter().any(|v|v.id==s.id&&v.busy),"hasDraft":drafts.contains(&s.id),"archived":s.archived});if let Some(Value::Object(extra))=facts.remove(&s.id){row.as_object_mut().unwrap().extend(extra);}row}).collect::<Vec<_>>()})
+                        json!({"cwd":project,"sessions":sessions.iter().map(|s|{let mut row=json!({"id":s.id,"sessionId":s.id,"title":s.title,"harness":s.provider,"model":metadata.get(&s.id).and_then(|m|m.model.clone()),"busy":views.iter().any(|v|v.id==s.id&&v.busy),"hasDraft":drafts.contains(&s.id),"archived":s.archived});if let Some(Value::Object(extra))=facts.remove(&s.id){row.as_object_mut().unwrap().extend(extra);}cloud_api::annotate(&mut row,targets.get(&s.id));row}).collect::<Vec<_>>()})
                     }else{
                         let session=if let Some(id)=input["sessionId"].as_str(){db.resolve_session_id(id)?}else{id(&input,"sessionId")?};
                         if !sessions.iter().any(|s|s.id==session){return Err("Session is outside the assigned project".into());}
-                        db.app_conversation(session,&input,views.iter().any(|v|v.id==session&&v.busy),db.draft_sessions()?.contains(&session))?
+                        let mut page=db.app_conversation(session,&input,views.iter().any(|v|v.id==session&&v.busy),db.draft_sessions()?.contains(&session))?;
+                        cloud_api::annotate(&mut page,targets.get(&session));
+                        page
                     };
                     Ok((value,Effect::None))
                 },cx);
@@ -754,8 +783,14 @@ impl Monos {
                         owner.update(cx, |owner, cx| owner.mono_ensure_session(session, cx))
                     })
                     .filter(|v| {
-                        monocode_core::files::path_key(&v.read(cx).summary.cwd)
+                        let cwd = &v.read(cx).summary.cwd;
+                        monocode_core::files::path_key(cwd)
                             == monocode_core::files::path_key(&project)
+                            // A cloud session is on a codespace but belongs to its local project.
+                            || (cwd.starts_with("remote://")
+                                && locked(&self.store).is_ok_and(|store| {
+                                    cloud_api::is_cloud_session_of(&store, session, &project)
+                                }))
                     });
                 let Some(view) = view else {
                     self.finish_call(
@@ -787,6 +822,17 @@ impl Monos {
                                 self.finish_call(call, Err(e), cx);
                                 return;
                             }
+                            // The send is queued until the history loads, which a stopped codespace
+                            // never allows: (re)connect it (a draft never does), and the queue flushes.
+                            if action == "sessions.send" && !view.read(cx).ready_for_external(cx) {
+                                let store = self.store.clone();
+                                let view = view.clone();
+                                cx.spawn(async move |_, cx| {
+                                    crate::cloud_wake::wake_for_send(store, session, view, cx)
+                                        .await;
+                                })
+                                .detach();
+                            }
                             if flag(&input, "notifyOnComplete", false) {
                                 if let Some(m) = self.roster.get_mut(&mono.id) {
                                     let origin = source.map(|v| v.read(cx).mono_turn).unwrap_or(0);
@@ -802,9 +848,11 @@ impl Monos {
                                         launch.each = each;
                                     } else {
                                         let summary = &view.read(cx).summary;
+                                        let cwd =
+                                            launch_project(&self.store, session, &summary.cwd);
                                         m.launches.push(Launch {
                                             session_id: session,
-                                            cwd: summary.cwd.clone(),
+                                            cwd,
                                             title: summary.title.clone(),
                                             harness: summary.provider.clone(),
                                             model: view.read(cx).mono_model(),
@@ -864,6 +912,59 @@ impl Monos {
                     }
                     Ok(json!({"accepted":true}))
                 }
+            }
+            "sessions.pullEvidence" => {
+                let session = match id(&input, "sessionId") {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.finish_call(call, Err(e), cx);
+                        return;
+                    }
+                };
+                // The caller comes from the checked session capability, never from the input.
+                let scope = cloud_api::EvidenceScope::Mono(self.today_caller(&call, &mono));
+                self.call_work(
+                    call,
+                    target,
+                    move |store| {
+                        let value = CloudApi::shared(&store)?.pull_evidence(
+                            &store,
+                            &project,
+                            session,
+                            &input,
+                            &scope,
+                            now_ms(),
+                        )?;
+                        Ok((value, Effect::None))
+                    },
+                    cx,
+                );
+                return;
+            }
+            "codespaces.list"
+            | "codespaces.create"
+            | "codespaces.stop"
+            | "codespaces.delete"
+            | "codespaces.secretsStatus" => {
+                // gh calls, and for create minutes of waiting: always off the UI thread.
+                self.call_work(
+                    call,
+                    target,
+                    move |store| {
+                        let api = CloudApi::shared(&store)?;
+                        let name = || text(&input, "name", 100);
+                        let value = match action.as_str() {
+                            "codespaces.list" => api.list(&project)?,
+                            "codespaces.create" => api.create(&project, &input, &mut |_| {})?,
+                            "codespaces.stop" => api.stop(&project, &name()?)?,
+                            "codespaces.delete" => api.delete(&project, &name()?)?,
+                            _ => api.secrets_status(&project)?,
+                        };
+                        Ok((value, Effect::None))
+                    },
+                    cx,
+                );
+                return;
             }
             "folders.list" => Ok(json!(
                 self.owner
@@ -1076,8 +1177,9 @@ impl Monos {
             }
             "soul.read" | "soul.update" | "memory.read" | "memory.search" | "memory.add"
             | "memory.replace" | "memory.remove" | "habits.list" | "habits.add"
-            | "habits.update" | "habits.run" | "habits.remove" | "notes.list" | "notes.read"
-            | "notes.write" | "worktrees.list" | "worktrees.create" => {
+            | "habits.export" | "habits.import" | "habits.update" | "habits.run"
+            | "habits.remove" | "notes.list" | "notes.read" | "notes.write" | "worktrees.list"
+            | "worktrees.create" => {
                 let caller = call.session;
                 let request = call.request_id.clone();
                 let projects = mono.projects.clone();
@@ -1090,10 +1192,12 @@ impl Monos {
                         "memory.add"|"memory.replace"|"memory.remove"=>{let entry=if action=="memory.remove"{None}else{Some(memory::entry(&text(&input,"fact",4000)?,&memory::date(),input.get("until").and_then(Value::as_str))?)};let find=input.get("find").and_then(Value::as_str).unwrap_or_default();let hash=memory::edit(&root,&target,input.get("topic").and_then(Value::as_str),|old|if action=="memory.add"{Ok(memory::add(old,entry.as_deref().unwrap()))}else{memory::replace(old,find,entry.as_deref(),&memory::date())})?;json!({"hash":hash})},
                         "habits.list"=>json!(habits::load(&root,&target)?),
                         "habits.add"=>{let schedule=habits::Schedule::from_cli(input.get("schedule").ok_or("Provide schedule")?)?;let h=Habit::new(text(&input,"name",480)?,text(&input,"instructions",32000)?,schedule,now_ms())?;habits::update(&root,&target,|all|{all.push(h.clone());Ok(())})?;json!(h)},
-                        "habits.update"|"habits.run"|"habits.remove"=>{let id=text(&input,"id",128)?;habits::update(&root,&target,|all|{let index=all.iter().position(|h|h.id==id).ok_or("Habit not found")?;if action=="habits.remove"{all.remove(index);return Ok(json!({"removed":true}));}let h=&mut all[index];if action=="habits.run"{h.run_requested=true;}else{if let Some(name)=input.get("name").and_then(Value::as_str){if name.trim().is_empty()||name.chars().count()>120{return Err("Invalid habit name".into());}h.name=name.trim().into();}
+                        "habits.update"|"habits.run"|"habits.remove"=>{let id=text(&input,"id",128)?;habits::update(&root,&target,|all|{let index=all.iter().position(|h|h.id==id).ok_or("Habit not found")?;if action=="habits.remove"{all.remove(index);return Ok(json!({"removed":true}));}let h=&mut all[index];if action=="habits.run"{h.request_run()?;}else{if let Some(name)=input.get("name").and_then(Value::as_str){if name.trim().is_empty()||name.chars().count()>120{return Err("Invalid habit name".into());}h.name=name.trim().into();}
 if let Some(instructions)=input.get("instructions").and_then(Value::as_str){if instructions.trim().is_empty()||instructions.len()>32000{return Err("Invalid habit instructions".into());}h.instructions=instructions.into();}
 if let Some(schedule)=input.get("schedule"){h.reschedule(habits::Schedule::from_cli(schedule)?,now_ms())?;}
-if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=enabled;if enabled{h.next_run_at=h.schedule.next(now_ms())?;}}}Ok(json!(h))})?},
+if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled(enabled,now_ms())?;}}Ok(json!(h))})?},
+                        "habits.export"=>{let id=text(&input,"id",128)?;let h=habits::load(&root,&target)?.into_iter().find(|h|h.id==id).ok_or("Habit not found")?;json!({"yaml":monocode_core::mono::habit_yaml::export_habit(&h)})},
+                        "habits.import"=>{let preview=monocode_core::mono::habit_yaml::preview_habit_import(&text(&input,"yaml",monocode_core::mono::workflows::yaml::MAX_FILE_BYTES)?)?;let h=monocode_core::mono::habit_yaml::import_habit(&preview,now_ms())?;habits::update(&root,&target,|all|{all.push(h.clone());Ok(())})?;json!({"habit":h,"note":"Saved disabled: the user must review and approve this habit in the Habits panel before it can be enabled or run.","warnings":preview.warnings})},
                         "notes.list"|"notes.read"|"notes.write"=>app::notes_action(&*locked(&store)?,caller,&request,&action,&input,&projects)?,
                         "worktrees.list"=>json!(monocode_core::git::snapshot(Path::new(&project))?.worktrees.iter().map(|w|json!({"path":w.path,"branch":w.branch,"head":w.head,"main":w.main})).collect::<Vec<_>>()),
                         "worktrees.create"=>{let branch=text(&input,"branch",240)?;let tree=monocode_core::git::create_project_worktree(Path::new(&project),&branch,input.get("base").and_then(Value::as_str),flag(&input,"existing",false))?;json!({"path":tree.path,"branch":tree.branch})},
@@ -1111,7 +1215,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                     target,
                     move |store| {
                         let value = monocode_core::today::actions::handle(
-                            &*locked(&store)?,
+                            &*store,
                             &caller,
                             &name,
                             &input,
@@ -1152,10 +1256,12 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         };
         self.finish_call(call, result, cx);
     }
-    /// sessions.start. Every check runs before the session row exists.
+    /// sessions.start. Every check runs before the session row exists. `input` is the call's
+    /// input with the Mono's subsession defaults filled in; the receipt keys on `call.input`.
     fn start_call(
         &mut self,
         call: Call,
+        input: &Value,
         mono: mono::Mono,
         project: String,
         source: Option<Entity<Conversation>>,
@@ -1165,7 +1271,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
         let placement = self
             .owner
             .update(cx, |owner, cx| {
-                owner.app_placement(&call.input, call.session, &project, cx)
+                owner.app_placement(input, call.session, &project, cx)
             })
             .map_err(|e| e.to_string())
             .and_then(|placement| placement);
@@ -1174,7 +1280,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                 &mono,
                 project,
                 source,
-                &call.input,
+                input,
                 StartContext {
                     request: call.request_id.clone(),
                     placement,
@@ -1206,9 +1312,11 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             options,
         } = context;
         let prompt = app::prompt(&input)?;
+        let cloud = cloud_api::target_from_input(&input);
         let provider = input["harness"]
             .as_str()
             .map(str::to_owned)
+            .or_else(|| cloud.as_ref().map(|_| "claude".to_owned()))
             .or_else(|| source.as_ref().map(|v| v.read(cx).summary.provider.clone()))
             .unwrap_or_else(|| "codex".into());
         let kind = Kind::parse(&provider).ok_or("Unknown provider")?;
@@ -1301,36 +1409,59 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             settings.revision = 0;
             let title = app::optional_text(&input, "title", 160)?
                 .unwrap_or_else(|| prompt.chars().take(160).collect());
-            let mut db = locked(&store)?;
+            // Every check that needs the store runs before a codespace is created.
             let mut parent = parent;
-            if let Some(candidate) = parent {
-                let key = monocode_core::files::path_key(&project);
-                let known = db
-                    .sessions()?
-                    .iter()
-                    .any(|s| s.id == candidate && monocode_core::files::path_key(&s.cwd) == key);
-                let child = is_child_launch(&db.started_links()?, &launches, candidate);
-                if !known || child {
-                    if !options.lenient_parent {
-                        return Err(if !known {
+            {
+                let db = locked(&store)?;
+                if let Some(candidate) = parent {
+                    let key = monocode_core::files::path_key(&project);
+                    let known = db.sessions()?.iter().any(|s| {
+                        s.id == candidate && monocode_core::files::path_key(&s.cwd) == key
+                    });
+                    let child = is_child_launch(&db.started_links()?, &launches, candidate);
+                    if !known || child {
+                        if !options.lenient_parent {
+                            return Err(if !known {
                                 "Session was not found in this project"
                             } else {
                                 "parentSessionId cannot be a session started under another one; a child of a child is not allowed"
                             }.into());
+                        }
+                        parent = None;
                     }
-                    parent = None;
                 }
             }
+            // A cloud session needs its codespace (minutes: this runs off the UI thread and no row
+            // exists until it is ready); the store is not locked meanwhile. A codespace created for
+            // a start that then fails is kept, and the error names it so a retry can target it.
+            let creating = matches!(&cloud, Some(t) if t.codespace == monocode_core::cloud_sessions::CodespaceChoice::New);
+            let binding = match cloud {
+                Some(target) => {
+                    Some(CloudApi::shared(&store)?.prepare(&project, target, &mut |_| {})?)
+                }
+                None => None,
+            };
+            let note = |e: String| match &binding {
+                Some(b) if creating => cloud_api::created_note(&b.codespace, &e),
+                _ => e,
+            };
+            let mut db = locked(&store).map_err(note)?;
             // Always a chat: the app drives this session, whatever the surface preference.
-            let mut summary = db.create(&provider, &project)?;
+            let cwd = binding
+                .as_ref()
+                .map_or(project.as_str(), |b| b.project_key.as_str());
+            let mut summary = db.create(&provider, cwd).map_err(note)?;
             let mut made = None;
             let built = (|| {
-                monocode_core::app_access::launch_checkout(
-                    &input,
-                    &project,
-                    summary.id,
-                    &mut settings,
-                )?;
+                // A cloud session has no local checkout to prepare.
+                if binding.is_none() {
+                    monocode_core::app_access::launch_checkout(
+                        &input,
+                        &project,
+                        summary.id,
+                        &mut settings,
+                    )?;
+                }
                 if worktree {
                     made = settings.worktree_cwd.as_ref().map(std::path::PathBuf::from);
                 }
@@ -1356,9 +1487,14 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                     ),
                     _ => e,
                 };
-                return Err(e);
+                return Err(note(e));
             }
             let mut result = json!({"sessionId":summary.id,"accepted":true,"project":project});
+            if let Some(binding) = &binding {
+                result["target"] =
+                    json!({"kind":"codespace","codespace":binding.codespace,"state":"available"});
+                result["codespaceState"] = json!("available");
+            }
             if let Some((id, name)) = filed {
                 result["folderId"] = json!(id);
                 result["folderName"] = json!(name);
@@ -1529,4 +1665,14 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
             .detach();
         }
     }
+}
+
+/// The project a launch is recorded and filed under: a cloud session belongs to the local project
+/// it twins (its cwd is a remote key no sidebar shows), every other session to its own cwd.
+fn launch_project(store: &Database, id: i64, cwd: &str) -> String {
+    locked(store)
+        .ok()
+        .and_then(|store| store.remote_session(id).ok().flatten())
+        .and_then(|remote| remote.project.local_project)
+        .unwrap_or_else(|| cwd.to_owned())
 }

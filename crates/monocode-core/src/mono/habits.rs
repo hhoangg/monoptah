@@ -9,6 +9,7 @@ use std::path::Path;
 pub const MAX: usize = 20;
 pub const GRACE_MS: u64 = 2 * 60 * 60 * 1000;
 pub const TIMEOUT_MS: u64 = 60 * 60 * 1000;
+const NEEDS_REVIEW: &str = "This habit was imported and needs review: the user must approve it in the Habits panel before it can be enabled or run";
 pub const APPROVAL_WAIT_MS: u64 = 12 * 60 * 60 * 1000;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -311,6 +312,12 @@ pub struct Habit {
     pub running_since: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_card: Option<String>,
+    /// Set on a habit that came from a file: it stays off until the user approves it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub needs_review: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 fn yes() -> bool {
     true
@@ -356,6 +363,7 @@ impl Habit {
             run_requested: false,
             running_since: None,
             from_card: None,
+            needs_review: false,
         })
     }
     /// A new schedule counts from `now`; nothing changes when it is unusable.
@@ -368,8 +376,58 @@ impl Habit {
     }
     pub fn due(&self, now: u64) -> bool {
         self.running_since.is_none()
+            && !self.needs_review
             && (self.run_requested
                 || self.enabled && self.next_run_at <= now && now - self.next_run_at <= GRACE_MS)
+    }
+    /// Turns the habit on or off. An imported habit cannot be turned on until approved.
+    pub fn set_enabled(&mut self, on: bool, now: u64) -> Result<(), String> {
+        if on && self.needs_review {
+            return Err(NEEDS_REVIEW.into());
+        }
+        if on {
+            self.next_run_at = self.schedule.next(now)?;
+        }
+        self.enabled = on;
+        Ok(())
+    }
+    /// Asks for a run now. An imported habit cannot run until approved.
+    pub fn request_run(&mut self) -> Result<(), String> {
+        if self.needs_review {
+            return Err(NEEDS_REVIEW.into());
+        }
+        self.run_requested = true;
+        Ok(())
+    }
+    /// What the user reviews: a digest of the name, instructions and schedule.
+    pub fn review_fingerprint(&self) -> String {
+        let s = &self.schedule;
+        files::content_hash(
+            &serde_json::json!([
+                self.name,
+                self.instructions,
+                s.schedule_kind,
+                s.time,
+                s.minute,
+                s.day_of_week,
+                s.interval_hours
+            ])
+            .to_string(),
+        )
+    }
+    /// The user approves what they saw: clears the review mark and turns the habit on.
+    /// Refused when the habit is no longer the one that was shown.
+    pub fn approve(&mut self, fingerprint: &str, now: u64) -> Result<(), String> {
+        if !self.needs_review {
+            return Err("This habit does not need review".into());
+        }
+        if fingerprint != self.review_fingerprint() {
+            return Err("This habit changed since it was shown; review it again".into());
+        }
+        self.needs_review = false;
+        // A run queued before the approval must not fire the moment it is enabled.
+        self.run_requested = false;
+        self.set_enabled(true, now)
     }
     pub fn finish(&mut self, run: Run) -> Result<(), String> {
         self.last_run_at = Some(run.at);

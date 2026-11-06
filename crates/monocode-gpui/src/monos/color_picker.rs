@@ -2,7 +2,7 @@
 use super::*;
 use gpui::{DispatchPhase, canvas, linear_color_stop, linear_gradient};
 
-pub(super) struct Picked(pub u32);
+pub(crate) struct Picked(pub u32);
 #[derive(Clone, Copy)]
 struct Hsv {
     h: f32,
@@ -52,7 +52,7 @@ impl Hsv {
             | ((b + m) * 255.).round() as u32
     }
 }
-pub(super) struct ColorPicker {
+pub(crate) struct ColorPicker {
     hsv: Hsv,
     hex: Entity<Input>,
     sv: AnchorSlot,
@@ -62,7 +62,7 @@ pub(super) struct ColorPicker {
 }
 impl EventEmitter<Picked> for ColorPicker {}
 impl ColorPicker {
-    pub(super) fn new(color: u32, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(color: u32, cx: &mut Context<Self>) -> Self {
         let hex = cx.new(|cx| {
             let mut field = Input::field("Hex color", "#rrggbb", content(0.35), cx);
             field.set_font_size(12.);
@@ -90,7 +90,7 @@ impl ColorPicker {
             _change: change,
         }
     }
-    pub(super) fn set_color(&mut self, color: u32, cx: &mut Context<Self>) {
+    pub(crate) fn set_color(&mut self, color: u32, cx: &mut Context<Self>) {
         self.hsv = Hsv::from_hex(color);
         let text = format!("#{color:06x}");
         // The enclosing editor mirrors Picked back into this picker. Rewriting
@@ -298,7 +298,7 @@ impl gpui::Render for ColorPicker {
             )
     }
 }
-pub(super) fn spectrum() -> AnyElement {
+pub(crate) fn spectrum() -> AnyElement {
     canvas(
         |_, _, _| {},
         |bounds, _, window, _| {

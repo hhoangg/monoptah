@@ -34,6 +34,14 @@ impl Shell {
                 .collect();
             store.prune_remote_sessions(&project, &host_ids)?;
             for value in values {
+                // Saved as a local copy: never a cloud session again.
+                if value["id"].as_str().is_some_and(|id| {
+                    store
+                        .is_cloud_converted(&project.environment_id, id)
+                        .unwrap_or(false)
+                }) {
+                    continue;
+                }
                 let summary = store.register_remote_summary(&project, value)?;
                 let state = store
                     .remote_session(summary.id)?
@@ -103,6 +111,11 @@ impl Shell {
                                     if !view.busy {
                                         view.summary = summary.clone();
                                         cx.notify();
+                                    } else if view.summary.title != summary.title {
+                                        // A running turn owns the rest; a host title is metadata.
+                                        view.summary.title = summary.title.clone();
+                                        cx.emit(crate::conversation::SessionChanged);
+                                        cx.notify();
                                     }
                                 });
                             }
@@ -130,3 +143,7 @@ impl Shell {
         .detach();
     }
 }
+
+#[cfg(test)]
+#[path = "remote_title_tests.rs"]
+mod remote_title_tests;

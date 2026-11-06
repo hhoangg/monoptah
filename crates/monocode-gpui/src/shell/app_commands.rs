@@ -4,9 +4,13 @@ use super::*;
 use monocode_core::{
     agent::Settings,
     app_access as app,
-    mono::bridge::{Call, Server},
+    mono::{
+        bridge::{Call, Server},
+        cloud_api::{self, CloudApi},
+    },
 };
 use serde_json::{Value, json};
+use std::path::PathBuf;
 
 #[cfg(test)]
 mod tests;
@@ -17,6 +21,8 @@ enum Effect {
     Start(Box<(Session, Settings, bool, bool, Placement)>),
     /// The sessions an archive covered, those the store saved, and why it stopped.
     Archive(Vec<i64>, Vec<i64>, Option<String>),
+    /// A session wrote to its Today task: the page reloads to show it.
+    Today,
 }
 impl Shell {
     pub(super) fn init_app_bridge(&mut self, cx: &mut Context<Self>) {
@@ -102,12 +108,24 @@ impl Shell {
                             this.sidebar_hidden_sessions.remove(&id);
                             this.session_worktrees
                                 .insert(id, settings.worktree_cwd.clone());
-                            this.add(summary, cx);
+                            // A cloud session is listed under its local project, not as a
+                            // rail project of its own.
+                            this.mark_cloud_session(id);
+                            if this.is_cloud(id) {
+                                this.add_loaded(summary, cx);
+                            } else {
+                                this.add(summary, cx);
+                            }
                             this.started_by.insert(id, call.session);
                             if let Some(view) = this.sessions.get(&id) {
                                 view.update(cx, |v, cx| v.install_app_launch(settings, !draft, cx));
                             }
                             this.app_place_launch(id, placement, reveal, window, cx);
+                        }
+                        Effect::Today => {
+                            if let Some(today) = this.today.clone() {
+                                today.update(cx, |today, cx| today.refresh(cx));
+                            }
                         }
                         Effect::Archive(family, written, error) => {
                             this.finish_archive(
@@ -132,8 +150,7 @@ impl Shell {
         })
         .detach();
     }
-    fn authorize_app_call(&self, call: &Call, cx: &App) -> Result<(), String> {
-        app::validate_operator(&call.action, &call.input)?;
+    fn check_request_id(call: &Call) -> Result<(), String> {
         if call.request_id.is_empty()
             || call.request_id.len() > 128
             || !call
@@ -143,6 +160,37 @@ impl Shell {
         {
             return Err("request ID must use letters, digits, underscores or hyphens".into());
         }
+        Ok(())
+    }
+    /// A plain coding session's Today task actions. Operator need not be enabled; the
+    /// session only has to exist, be local, and (for writes) not be read-only. Returns the
+    /// roots its attached files must live in.
+    fn authorize_session_today(&self, call: &Call, cx: &App) -> Result<Vec<PathBuf>, String> {
+        Self::check_request_id(call)?;
+        let caller = self
+            .sessions
+            .get(&call.session)
+            .map(|v| v.read(cx))
+            .ok_or("Unknown session.")?;
+        if caller.summary.cwd.starts_with("remote://") {
+            return Err("Today task notes are not available on remote projects".into());
+        }
+        if (caller.app_read_only
+            || caller.settings.plan
+            || caller.settings.access == monocode_core::agent::AccessMode::ReadOnly)
+            && call.action != "today.current"
+        {
+            return Err("This thread's access policy allows read-only app actions.".into());
+        }
+        let mut roots = vec![PathBuf::from(&caller.summary.cwd)];
+        if let Some(tree) = &caller.settings.worktree_cwd {
+            roots.push(PathBuf::from(tree));
+        }
+        Ok(roots)
+    }
+    fn authorize_app_call(&self, call: &Call, cx: &App) -> Result<(), String> {
+        app::validate_operator(&call.action, &call.input)?;
+        Self::check_request_id(call)?;
         let caller = self
             .sessions
             .get(&call.session)
@@ -175,6 +223,8 @@ impl Shell {
                     | "notes.list"
                     | "notes.read"
                     | "worktrees.list"
+                    | "codespaces.list"
+                    | "codespaces.secretsStatus"
             )
         {
             return Err("This thread's access policy allows read-only app actions.".into());
@@ -182,7 +232,12 @@ impl Shell {
         Ok(())
     }
     fn handle_app_call(&mut self, call: Call, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = self.authorize_app_call(&call, cx) {
+        let allowed = if monocode_core::today::actions::session_action(&call.action) {
+            self.authorize_session_today(&call, cx).map(drop)
+        } else {
+            self.authorize_app_call(&call, cx)
+        };
+        if let Err(error) = allowed {
             let _ = call.reply.send(Err(error));
             return;
         }
@@ -289,7 +344,13 @@ impl Shell {
             .get(&id)
             .ok_or("Session was not found in this project")?;
         if monocode_core::files::path_key(&summary.cwd) != monocode_core::files::path_key(project) {
-            return Err("Session is outside this project.".into());
+            // A cloud session lives on a codespace but belongs to its local project.
+            let cloud = summary.cwd.starts_with("remote://")
+                && locked(&self.store)
+                    .is_ok_and(|store| cloud_api::is_cloud_session_of(&store, id, project));
+            if !cloud {
+                return Err("Session is outside this project.".into());
+            }
         }
         if manage
             && (id == caller
@@ -351,6 +412,33 @@ impl Shell {
         self.persist(cx);
     }
     fn dispatch_app_call(&mut self, call: Call, window: &mut Window, cx: &mut Context<Self>) {
+        if monocode_core::today::actions::session_action(&call.action) {
+            match self.authorize_session_today(&call, cx) {
+                Ok(roots) => {
+                    let session = call.session;
+                    let action = call.action.clone();
+                    let input = call.input.clone();
+                    let write = mutating(&action);
+                    self.app_background(
+                        call,
+                        move |store| {
+                            let value = monocode_core::today::actions::handle_session(
+                                &*store,
+                                session,
+                                &roots,
+                                &action,
+                                &input,
+                                monocode_core::time::now_ms(),
+                            )?;
+                            Ok((value, if write { Effect::Today } else { Effect::None }))
+                        },
+                        cx,
+                    );
+                }
+                Err(error) => self.finish_app_call(call, Err(error), cx),
+            }
+            return;
+        }
         if let Err(error) = self.authorize_app_call(&call, cx) {
             self.finish_app_call(call, Err(error), cx);
             return;
@@ -365,13 +453,25 @@ impl Shell {
             "sessions.list" => {
                 let entries: Vec<_> = self.order.iter().filter_map(|id|{
                     let metadata=self.session_metadata(*id,cx);
-                    if metadata.summary.cwd!=project || self.monos.as_ref().is_some_and(|m|m.read(cx).hidden_session(*id)) || self.orchestration_worker(*id){return None;}
+                    let remote=metadata.summary.cwd.starts_with("remote://");
+                    if (metadata.summary.cwd!=project && !remote) || self.monos.as_ref().is_some_and(|m|m.read(cx).hidden_session(*id)) || self.orchestration_worker(*id){return None;}
                     let live=self.sessions.get(id).map(|v|v.read(cx));
                     Some((metadata.summary.clone(),json!({"id":id,"sessionId":id,"title":metadata.summary.title,"harness":metadata.summary.provider,"model":live.and_then(|v|v.settings.model.clone()).or_else(||self.session_details.get(id).and_then(|m|m.model.clone())),"busy":metadata.busy,"hasDraft":live.is_some_and(|v|v.has_saved_draft() || !v.input.read(cx).content.is_empty()) || self.draft_sessions.contains(id),"archived":metadata.summary.archived})))
                 }).collect();
                 self.app_background(
                     call,
                     move |store| {
+                        let targets = if entries.iter().any(|(s, _)| s.cwd != project) {
+                            CloudApi::shared(&store)
+                                .map(|api| api.session_targets(&project))
+                                .unwrap_or_default()
+                        } else {
+                            Default::default()
+                        };
+                        let entries: Vec<_> = entries
+                            .into_iter()
+                            .filter(|(s, _)| s.cwd == project || targets.contains_key(&s.id))
+                            .collect();
                         let sessions: Vec<_> = entries.iter().map(|(s, _)| s).collect();
                         let mut facts = locked(&store)?.app_session_facts(&sessions, false)?;
                         let rows: Vec<_> = entries
@@ -381,6 +481,7 @@ impl Shell {
                                 if let Some(Value::Object(extra)) = facts.remove(&s.id) {
                                     row.as_object_mut().unwrap().extend(extra);
                                 }
+                                cloud_api::annotate(&mut row, targets.get(&s.id));
                                 row
                             })
                             .collect();
@@ -414,7 +515,13 @@ impl Shell {
             "sessions.start" => {
                 let parsed = (|| {
                     let prompt = app::prompt(&input)?;
-                    let kind = Kind::parse(input["harness"].as_str().unwrap_or(&provider))
+                    // A cloud session is Claude's: that is the default when a target is given.
+                    let default = if input.get("target").is_some() {
+                        "claude"
+                    } else {
+                        &provider
+                    };
+                    let kind = Kind::parse(input["harness"].as_str().unwrap_or(default))
                         .ok_or("Unknown harness")?;
                     let placement = self.app_placement(&input, call.session, &project, cx)?;
                     let mut settings = inherited;
@@ -435,18 +542,35 @@ impl Shell {
                 let caller = call.session;
                 let request = call.request_id.clone();
                 let fingerprint = app::fingerprint(&action, &input);
+                let cloud = cloud_api::target_from_input(&input);
                 self.app_background(call,move|store| {
+                    // Creating or waking a codespace takes minutes; this runs off the UI thread and
+                    // no session row exists until it is ready. A retry with the same request ID
+                    // waits for it (the app answers "still running", then replays the result).
                     let models=if input.get("model").is_some() || input.get("modelSettings").is_some() || input.get("effort").is_some() {
                         monocode_core::catalog::models_for(kind,&settings.account)?
                     }else{monocode_core::catalog::cached_models_for(kind,&settings.account).unwrap_or_default()};
                     let mut settings=app::launch_settings(&input,&provider,settings,kind,&models)?;
                     settings.revision=0;
                     let title=app::optional_text(&input,"title",160)?.unwrap_or_else(||prompt.chars().take(160).collect());
+                    // Everything cheap is validated above; only now is a codespace created (minutes).
+                    let creating = matches!(&cloud, Some(t) if t.codespace == monocode_core::cloud_sessions::CodespaceChoice::New);
+                    let binding = match cloud {
+                        Some(target) => {
+                            let api = CloudApi::shared(&store)?;
+                            Some(api.prepare(&project, target, &mut |_| {})?)
+                        }
+                        None => None,
+                    };
+                    let built=(||{
                     // Always a chat: the app drives this session, whatever the surface preference.
                     let mut store=locked(&store)?;
-                    let (mut summary,fresh)=store.create_app_session(caller,&request,&fingerprint,kind.id(),&project)?;
+                    let cwd=binding.as_ref().map_or(project.as_str(),|b|b.project_key.as_str());
+                    let (mut summary,fresh)=store.create_app_session(caller,&request,&fingerprint,kind.id(),cwd)?;
                     if fresh {
-                        if let Err(error)=app::launch_checkout(&input,&project,summary.id,&mut settings) {let _=store.delete(summary.id);return Err(error);}
+                        // A cloud session has no local checkout to prepare.
+                        if binding.is_none()
+                            && let Err(error)=app::launch_checkout(&input,&project,summary.id,&mut settings) {let _=store.delete(summary.id);return Err(error);}
                         store.title(summary.id,&title)?;summary.title=title;
                         store.configure_agent(summary.id,kind.id(),&settings)?;
                         store.save_started_link(summary.id,caller)?;
@@ -454,8 +578,15 @@ impl Shell {
                         summary.has_messages=true;
                     }
                     let draft=input["draft"].as_bool().unwrap_or(false);let reveal=input["reveal"].as_bool().unwrap_or(false);
-                    let value=json!({"id":summary.id,"sessionId":summary.id,"cwd":project,"harness":kind.id(),"model":settings.model,"submitted":!draft,"draft":draft,"accepted":true});
+                    let mut value=json!({"id":summary.id,"sessionId":summary.id,"cwd":project,"harness":kind.id(),"model":settings.model,"submitted":!draft,"draft":draft,"accepted":true});
+                    if let Some(binding)=&binding {
+                        value["target"]=json!({"kind":"codespace","codespace":binding.codespace,"state":"available"});
+                        value["codespaceState"]=json!("available");
+                    }
                     Ok((value,if fresh {Effect::Start(Box::new((summary,settings,draft,reveal,placement)))}else{Effect::None}))
+                    })();
+                    // A codespace created for this start is kept: say so, so a retry targets it.
+                    built.map_err(|e| match &binding { Some(b) if creating => cloud_api::created_note(&b.codespace,&e), _ => e })
                 },cx);
                 return;
             }
@@ -467,13 +598,23 @@ impl Shell {
                         .get(&id)
                         .is_some_and(|v| v.read(cx).has_saved_draft())
                         || self.draft_sessions.contains(&id);
+                    let remote = self
+                        .session_metadata(id, cx)
+                        .summary
+                        .cwd
+                        .starts_with("remote://");
                     self.app_background(
                         call,
                         move |store| {
-                            Ok((
-                                locked(&store)?.app_conversation(id, &input, busy, draft)?,
-                                Effect::None,
-                            ))
+                            let mut value =
+                                locked(&store)?.app_conversation(id, &input, busy, draft)?;
+                            let target = if remote {
+                                CloudApi::shared(&store)?.target_of(id)
+                            } else {
+                                None
+                            };
+                            cloud_api::annotate(&mut value, target.as_ref());
+                            Ok((value, Effect::None))
                         },
                         cx,
                     );
@@ -581,6 +722,37 @@ impl Shell {
                             Ok(json!({"sessionId":id,"stopped":true}))
                         } else {
                             view.update(cx, |v, cx| v.load(cx));
+                            // A cloud session whose history cannot load is on a codespace that may be
+                            // stopped: (re)connect it (a draft never does) and ask for a retry.
+                            if action == "sessions.send"
+                                && self
+                                    .session_metadata(id, cx)
+                                    .summary
+                                    .cwd
+                                    .starts_with("remote://")
+                                && view.read(cx).needs_history_restore()
+                                && locked(&self.store)
+                                    .is_ok_and(|s| cloud_api::is_cloud_session_of(&s, id, &project))
+                            {
+                                let store = self.store.clone();
+                                cx.spawn(async move |this, cx| {
+                                    let woke = crate::cloud_wake::wake_for_send(store, id, view, cx).await;
+                                    let _ = this.update(cx, |this, cx| {
+                                        this.finish_app_call(
+                                            call,
+                                            Err(if woke {
+                                                "The session's codespace is being woken or reconnected. Retry in a minute (with a new request ID)."
+                                            } else {
+                                                "Session is busy, loading, or has an unsent draft. Its draft was preserved."
+                                            }
+                                            .into()),
+                                            cx,
+                                        )
+                                    });
+                                })
+                                .detach();
+                                return;
+                            }
                             if !view.read(cx).ready_for_external(cx)
                                 || view.read(cx).has_saved_draft()
                             {
@@ -609,6 +781,58 @@ impl Shell {
                         }
                     }
                 }
+            }
+            "sessions.pullEvidence" => {
+                match self.app_target(&input, call.session, &project, false, cx) {
+                    Ok(id) => {
+                        // gh copy (it may boot the codespace) and a note: off the UI thread.
+                        let refresh_today = self.monos.as_ref().map(|m| m.read(cx).today_bumper());
+                        self.app_background(
+                            call,
+                            move |store| {
+                                let value = CloudApi::shared(&store)?.pull_evidence(
+                                    &store,
+                                    &project,
+                                    id,
+                                    &input,
+                                    &cloud_api::EvidenceScope::Operator,
+                                    monocode_core::time::now_ms(),
+                                )?;
+                                if let (Some(_), Some(refresh)) =
+                                    (value.get("note"), &refresh_today)
+                                {
+                                    refresh();
+                                }
+                                Ok((value, Effect::None))
+                            },
+                            cx,
+                        );
+                        return;
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "codespaces.list"
+            | "codespaces.create"
+            | "codespaces.stop"
+            | "codespaces.secretsStatus" => {
+                // gh calls, and for create minutes of waiting: always off the UI thread.
+                self.app_background(
+                    call,
+                    move |store| {
+                        let api = CloudApi::shared(&store)?;
+                        let name = || app::text(&input, "name", 100);
+                        let value = match action.as_str() {
+                            "codespaces.list" => api.list(&project)?,
+                            "codespaces.create" => api.create(&project, &input, &mut |_| {})?,
+                            "codespaces.stop" => api.stop(&project, &name()?)?,
+                            _ => api.secrets_status(&project)?,
+                        };
+                        Ok((value, Effect::None))
+                    },
+                    cx,
+                );
+                return;
             }
             "notes.list" | "notes.read" | "notes.write" => {
                 let caller = call.session;
@@ -731,12 +955,15 @@ fn mutating(action: &str) -> bool {
     !matches!(
         action,
         "models.list"
+            | "today.current"
             | "sessions.list"
             | "sessions.read"
             | "folders.list"
             | "notes.list"
             | "notes.read"
             | "worktrees.list"
+            | "codespaces.list"
+            | "codespaces.secretsStatus"
     )
 }
 fn worktree_json(tree: &monocode_core::git::Worktree) -> Value {

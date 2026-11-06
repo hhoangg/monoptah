@@ -210,6 +210,16 @@ impl Photo {
         }
     }
 
+    /// The decoded sprite, once the background decode finished.
+    pub(crate) fn source(&self) -> Option<ImageSource> {
+        self.source.clone()
+    }
+
+    /// The decoded sprite's pixel size, once known.
+    pub(crate) fn shape(&self) -> Option<(u32, u32)> {
+        self.shape
+    }
+
     pub(crate) fn matches(&self, origin: &Origin, mime: &SharedString) -> bool {
         self.origin.same(origin) && &self.mime == mime
     }
