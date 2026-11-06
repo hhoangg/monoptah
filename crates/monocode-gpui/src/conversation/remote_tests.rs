@@ -487,6 +487,79 @@ fn an_api_draft_on_a_remote_session_is_shown_in_the_composer(cx: &mut TestAppCon
     );
 }
 
+/// After an app restart a stored API prompt that never went out is shown in the composer with a
+/// notice, and is not sent on its own.
+#[gpui::test]
+fn a_stored_app_prompt_is_recovered_into_the_composer_after_a_restart(cx: &mut TestAppContext) {
+    let host = HostFixture::new(false, false);
+    host.store
+        .lock()
+        .unwrap()
+        .prepare_app_prompt(host.summary.id, "start-4", "Never sent")
+        .unwrap();
+    let view = host.conversation(cx);
+    host.wait(&view, cx, true);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            // The fixture seeds the composer; a fresh app has it empty.
+            assert_eq!(view.input.read(cx).content, "Keep this next message");
+        })
+    });
+    let fresh = {
+        host.store
+            .lock()
+            .unwrap()
+            .prepare_app_prompt(host.summary.id, "start-5", "Never sent")
+            .unwrap();
+        cx.update(|cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(host.summary.clone(), host.store.clone(), cx);
+                view.remote_state.client = Some(host.client.clone());
+                view.load_remote(cx);
+                view
+            })
+        })
+    };
+    host.wait(&fresh, cx, true);
+    cx.update(|cx| {
+        let view = fresh.read(cx);
+        assert_eq!(view.input.read(cx).content, "Never sent");
+        assert!(view.status.contains("not sent yet"), "{}", view.status);
+    });
+    assert!(
+        host.store
+            .lock()
+            .unwrap()
+            .follow_ups(host.summary.id)
+            .unwrap()
+            .draft
+            .is_none()
+    );
+    assert!(
+        !host
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["method"] == "commands.dispatch")
+    );
+}
+
+/// A remote view never queues a prompt into local follow-ups while stopping: the host would never
+/// get it.
+#[gpui::test]
+fn a_remote_view_does_not_queue_into_local_follow_ups_while_stopping(cx: &mut TestAppContext) {
+    let view = conversation(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.stopping = true;
+            view.launch_prompt("later".into(), cx);
+            assert!(view.follow_ups.state.messages.is_empty());
+            assert!(view.status.contains("Wait"), "{}", view.status);
+        })
+    });
+}
+
 #[gpui::test]
 fn explicit_retry_reuses_pending_command_and_preserves_new_composer_and_attachment(
     cx: &mut TestAppContext,

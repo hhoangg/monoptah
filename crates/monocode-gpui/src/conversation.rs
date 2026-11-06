@@ -1044,6 +1044,13 @@ impl Conversation {
         )
     }
     fn launch_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if self.stopping && self.is_remote() {
+            // Local follow-ups are never delivered to a host: queueing here would lose the prompt.
+            self.status =
+                "Wait for this remote turn to stop before sending another message.".into();
+            cx.notify();
+            return;
+        }
         if self.stopping {
             let mode = if self.settings.orchestrator {
                 Some("orchestrator")

@@ -251,6 +251,10 @@ impl Conversation {
                             this.run_history_actions(cx);
                         }
                         this.finish_app_prompt(cx);
+                        if initial {
+                            let known = this.remote_state.snapshot.clone();
+                            this.recover_unsent_app_prompt(known.as_ref(), cx);
+                        }
                     }
                     Err(error) => this.remote_connection_error(&error, cx),
                 }
@@ -435,6 +439,41 @@ impl Conversation {
             state.revision += 1;
             store.save_follow_ups(self.summary.id, &state)
         });
+    }
+    /// After the first load of a remote conversation: an API launch whose prompt never went out
+    /// (the app quit while offline or waking) is still in the local draft, which a remote view
+    /// never shows. Put it in the composer with a notice; it is not sent on its own after a
+    /// restart. A prompt the host already has is just dropped.
+    fn recover_unsent_app_prompt(&mut self, snapshot: Option<&Value>, cx: &mut Context<Self>) {
+        if self.remote_state.app_prompt_waiting
+            || self.remote_state.app_draft_launched
+            || !self.history_actions.is_empty()
+        {
+            return;
+        }
+        let Ok(Some(draft)) = self.stored_app_draft() else {
+            return;
+        };
+        if !draft.id.starts_with("app-prompt-") {
+            return;
+        }
+        let sent = snapshot.is_some_and(|snapshot| {
+            snapshot["session"]["blocks"]
+                .as_array()
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b["role"] == "user" && b["text"] == draft.text.as_str())
+                })
+        });
+        if sent {
+            self.drop_stored_app_draft();
+        } else if self.input.read(cx).content.is_empty() {
+            self.input
+                .update(cx, |input, cx| input.set_text(draft.text, cx));
+            self.drop_stored_app_draft();
+            self.status = "This prompt was not sent yet".into();
+        }
     }
     /// After a refresh (which only runs between turns): drops the local copy of a launched first
     /// prompt once its turn has run and the command is journaled, and retries one that was
