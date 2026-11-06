@@ -184,6 +184,14 @@ impl CodespacesDialog {
         self.snapshot = Some(snapshot);
     }
 
+    #[cfg(test)]
+    pub(crate) fn first_field_text(&self, cx: &gpui::App) -> String {
+        self.fields
+            .first()
+            .map(|(_, input)| input.read(cx).content.to_string())
+            .unwrap_or_default()
+    }
+
     fn typed(&self, cx: &gpui::App) -> Vec<(String, String)> {
         self.fields
             .iter()
@@ -488,7 +496,15 @@ impl CodespacesDialog {
         }
         let disabled = snapshot.disabled_reason();
         let enabled = disabled.is_none();
-        if let Some(reason) = disabled {
+        if self.busy {
+            out.push(
+                muted("Checking GitHub…")
+                    .text_size(px(12.))
+                    .id("codespaces-checking")
+                    .debug_selector(|| "codespaces-checking".into())
+                    .into_any_element(),
+            );
+        } else if let Some(reason) = disabled {
             out.push(
                 alert(
                     "codespaces-disabled",

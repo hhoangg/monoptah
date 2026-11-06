@@ -3,7 +3,7 @@
 //! Every `gh` call goes through the injectable [`GhRunner`] so tests never
 //! touch the network. Secret values only ever travel over stdin.
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -17,6 +17,8 @@ pub const IDLE_TIMEOUT: &str = "30m";
 pub const RETENTION_PERIOD: &str = "72h";
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const READY_POLL: Duration = Duration::from_secs(5);
+const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+const SLOW_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const DISPLAY_NAME_MAX: usize = 48;
 const GH_MISSING: &str = "GitHub CLI (gh) is not installed";
 const SCOPE_HINT: &str = "The GitHub token is missing the `codespace` scope. \
@@ -78,9 +80,45 @@ fn spawn_error(error: std::io::Error) -> String {
     }
 }
 
-impl GhRunner for SystemGh {
-    fn run(&self, args: &[String], stdin: Option<&str>) -> Result<GhOutput, String> {
-        let mut cmd = Self::command(args)?;
+/// How long one non-streaming `gh` call may take before it is killed. Slow lifecycle
+/// calls get longer; everything else (auth, listing, secrets) must answer quickly so a
+/// keyring prompt or a dead network cannot hang a caller forever.
+pub fn call_timeout(args: &[String]) -> Duration {
+    let slow = matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (
+            Some("codespace"),
+            Some("create" | "stop" | "delete" | "rebuild")
+        )
+    );
+    if slow {
+        SLOW_CALL_TIMEOUT
+    } else {
+        CALL_TIMEOUT
+    }
+}
+
+impl SystemGh {
+    fn run_with_timeout(
+        args: &[String],
+        stdin: Option<&str>,
+        timeout: Duration,
+    ) -> Result<GhOutput, String> {
+        run_command(Self::command(args)?, args, stdin, timeout)
+    }
+}
+
+/// Runs `cmd`, killing it when it outlives `timeout`.
+fn run_command(
+    mut cmd: Command,
+    args: &[String],
+    stdin: Option<&str>,
+    timeout: Duration,
+) -> Result<GhOutput, String> {
+    {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.stdin(if stdin.is_some() {
             Stdio::piped()
@@ -92,12 +130,44 @@ impl GhRunner for SystemGh {
             // A closed pipe means gh exited early; its status reports why.
             let _ = pipe.write_all(text.as_bytes());
         }
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut text = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut text);
+                }
+                String::from_utf8_lossy(&text).into_owned()
+            })
+        };
+        let out = read(child.stdout.take().map(|p| Box::new(p) as _));
+        let err = read(child.stderr.take().map(|p| Box::new(p) as _));
+        let deadline = std::time::Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait().map_err(|e| e.to_string())? {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "GitHub CLI did not answer within {} seconds (`gh {}`). Check your network connection and that no keychain prompt is waiting.",
+                        timeout.as_secs(),
+                        args.first().map(String::as_str).unwrap_or("")
+                    ));
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
         Ok(GhOutput {
-            success: out.status.success(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            success: status.success(),
+            stdout: out.join().unwrap_or_default(),
+            stderr: err.join().unwrap_or_default(),
         })
+    }
+}
+
+impl GhRunner for SystemGh {
+    fn run(&self, args: &[String], stdin: Option<&str>) -> Result<GhOutput, String> {
+        Self::run_with_timeout(args, stdin, call_timeout(args))
     }
 
     fn run_streaming(

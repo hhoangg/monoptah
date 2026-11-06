@@ -14,14 +14,23 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_codespaces_dialog_with(path, codespaces_dialog::Env::system(), window, cx);
+    }
+
+    pub(super) fn open_codespaces_dialog_with(
+        &mut self,
+        path: String,
+        env: codespaces_dialog::Env,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.close_menu(cx);
         self.close_preview(cx);
         if let Some(open) = self.codespaces.take() {
             open.view.update(cx, |view, cx| view.shutdown(cx));
         }
         let name = self.project_label(&path);
-        let view =
-            cx.new(|cx| CodespacesDialog::new(path, name, codespaces_dialog::Env::system(), cx));
+        let view = cx.new(|cx| CodespacesDialog::new(path, name, env, cx));
         let events = cx.subscribe_in(
             &view,
             window,
@@ -74,5 +83,75 @@ impl Shell {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::tests::window;
+    use gpui::{TestAppContext, WindowHandle};
+    use monocode_core::codespaces::{GhOutput, GhRunner};
+    use std::{path::Path, sync::Arc};
+
+    struct Gh;
+    impl GhRunner for Gh {
+        fn run(&self, args: &[String], _: Option<&str>) -> Result<GhOutput, String> {
+            let stdout = match args.first().map(String::as_str) {
+                Some("auth") => "github.com\n  \u{2713} Logged in to github.com account octo (keyring)\n  - Token scopes: 'codespace', 'repo'\n".to_owned(),
+                _ => r#"[{"secrets":[]}]"#.to_owned(),
+            };
+            Ok(GhOutput {
+                success: true,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn env() -> codespaces_dialog::Env {
+        codespaces_dialog::Env {
+            runner: Arc::new(Gh),
+            origin: |_: &Path| Some("git@github.com:acme/alpha.git".to_owned()),
+            claude: || None,
+        }
+    }
+
+    fn token(window: &WindowHandle<Shell>, cx: &mut TestAppContext) -> String {
+        window
+            .update(cx, |shell, _, cx| {
+                shell
+                    .codespaces
+                    .as_ref()
+                    .unwrap()
+                    .view
+                    .read(cx)
+                    .first_field_text(cx)
+            })
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn typing_and_pasting_reach_the_field_inside_the_shell_popover(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        cx.update(crate::input::bind);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_codespaces_dialog_with("/work/alpha".into(), env(), w, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let center = visual
+            .debug_bounds("codespaces-field-CLAUDE_CODE_OAUTH_TOKEN")
+            .expect("the field is drawn inside the shell")
+            .center();
+        visual.simulate_click(center, Default::default());
+        visual.simulate_input("sk-ant");
+        visual.write_to_clipboard(gpui::ClipboardItem::new_string("-pasted".into()));
+        visual.simulate_keystrokes("cmd-v");
+        visual.run_until_parked();
+        assert_eq!(token(&window, cx), "sk-ant-pasted");
     }
 }

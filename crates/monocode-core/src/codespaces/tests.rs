@@ -586,3 +586,37 @@ fn workspace_path_uses_repo_name() {
         Some("/workspaces/monoptah")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_hung_gh_is_killed_and_reported_as_an_error() {
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("30");
+    let started = std::time::Instant::now();
+    let result = super::run_command(
+        cmd,
+        &["auth".to_string(), "status".to_string()],
+        None,
+        Duration::from_millis(200),
+    );
+    let error = result.unwrap_err();
+    assert!(error.contains("did not answer within"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn only_codespace_lifecycle_calls_get_the_long_timeout() {
+    let args = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        super::call_timeout(&args(&["auth", "status"])),
+        Duration::from_secs(20)
+    );
+    assert_eq!(
+        super::call_timeout(&args(&["api", "x"])),
+        Duration::from_secs(20)
+    );
+    assert_eq!(
+        super::call_timeout(&args(&["codespace", "create"])),
+        Duration::from_secs(120)
+    );
+}

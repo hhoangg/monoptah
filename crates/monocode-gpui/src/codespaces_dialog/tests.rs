@@ -627,3 +627,71 @@ fn disabled_and_unknown_reasons_name_the_actual_problem() {
         Some("HTTP 403: Resource not accessible")
     );
 }
+
+#[gpui::test]
+fn typing_is_blocked_while_the_dialog_is_busy_and_it_says_checking(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    act(&window, cx, |dialog, cx| {
+        dialog.busy = true;
+        cx.notify();
+    });
+    let center = field_center(&window, cx);
+    let visual = &mut VisualTestContext::from_window(*window, cx);
+    visual.simulate_click(center, Default::default());
+    visual.simulate_input("nope");
+    assert_eq!(typed_token(&window, cx), "");
+    assert!(visual.debug_bounds("codespaces-checking").is_some());
+    assert!(visual.debug_bounds("codespaces-disabled").is_none());
+}
+
+#[gpui::test]
+fn checking_again_after_fixing_gh_enables_the_field(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_NO_SCOPE));
+    let window = open(cx, env(&gh, origin));
+    let center = field_center(&window, cx);
+    let visual = &mut VisualTestContext::from_window(*window, cx);
+    visual.simulate_click(center, Default::default());
+    visual.simulate_input("a");
+    assert_eq!(typed_token(&window, cx), "");
+    assert!(visual.debug_bounds("codespaces-disabled").is_some());
+
+    *gh.auth.lock().unwrap() = Ok(AUTH_OK.to_owned());
+    act(&window, cx, |dialog, cx| dialog.refresh(cx));
+    let center = field_center(&window, cx);
+    let visual = &mut VisualTestContext::from_window(*window, cx);
+    assert!(visual.debug_bounds("codespaces-disabled").is_none());
+    visual.simulate_click(center, Default::default());
+    visual.simulate_input("ok");
+    assert_eq!(typed_token(&window, cx), "ok");
+}
+
+#[gpui::test]
+fn a_gh_that_times_out_ends_busy_and_the_fields_explain_why(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Err(
+        "GitHub CLI did not answer within 20 seconds (`gh auth`).",
+    ));
+    let window = open(cx, env(&gh, origin));
+    read(&window, cx, |dialog, _| {
+        assert!(!dialog.busy);
+        let snapshot = dialog.snapshot.as_ref().unwrap();
+        assert!(matches!(snapshot.gh, Gh::Failed(_)));
+        assert!(
+            snapshot
+                .unknown_reason(&snapshot.rows[0])
+                .unwrap()
+                .contains("did not answer within 20 seconds")
+        );
+    });
+    let center = field_center(&window, cx);
+    let visual = &mut VisualTestContext::from_window(*window, cx);
+    visual.simulate_click(center, Default::default());
+    visual.simulate_input("x");
+    assert_eq!(typed_token(&window, cx), "");
+    assert!(visual.debug_bounds("codespaces-disabled").is_some());
+    assert!(
+        visual
+            .debug_bounds("codespaces-unknown-CLAUDE_CODE_OAUTH_TOKEN")
+            .is_some()
+    );
+}
