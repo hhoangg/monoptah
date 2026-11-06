@@ -61,6 +61,10 @@ pub(super) struct Snapshot {
     pub activity: HashMap<i64, (bool, bool)>,
     /// Whether each newly checked project has a GitHub `origin`.
     pub github: HashMap<String, bool>,
+    /// Converted local sessions and the codespace each came from.
+    pub origins: HashMap<i64, String>,
+    /// Codespaces among `origins` that gh says no longer exist.
+    pub gone: std::collections::HashSet<String>,
 }
 
 /// Reads every cloud session of `projects` from the store and the cached state of
@@ -71,7 +75,16 @@ pub(super) fn collect(
     projects: &[String],
     unchecked: &[String],
 ) -> Snapshot {
-    let mut snapshot = Snapshot::default();
+    let mut snapshot = Snapshot {
+        origins: cloud.converted_origins().into_iter().collect(),
+        ..Default::default()
+    };
+    let names: std::collections::BTreeSet<&String> = snapshot.origins.values().collect();
+    snapshot.gone = names
+        .into_iter()
+        .filter(|name| cloud.codespace_gone(name))
+        .cloned()
+        .collect();
     for project in unchecked.iter().filter(|p| !p.starts_with("remote://")) {
         snapshot
             .github
@@ -227,13 +240,22 @@ pub(super) struct GroupOutcome {
     pub converted: Vec<Converted>,
     /// The codespace call, or why nothing was done to it.
     pub result: Result<(Then, Option<String>), String>,
+    /// With `result` set to `NEEDS_REVIEW`: what a delete would lose, one line each.
+    pub risky: Vec<String>,
 }
+
+/// The error of a group that was paused before deleting its codespace: the local copy has files
+/// missing that only exist there, so the user decides first.
+pub(super) const NEEDS_REVIEW: &str = "Needs review";
+
+pub(super) use monocode_core::cloud_sessions::unsaved_lines;
 
 /// The worker side of Stop/Delete: for each codespace, save a local copy of every selected
 /// cloud session that still exists, and only when all of them are saved stop or delete the
 /// codespace. With `save_copy` false (the user chose "anyway") the copy is skipped. A failed
 /// copy leaves the codespace alone. Sessions that were already converted by an earlier
 /// attempt are skipped, so a retry never duplicates them.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn archive_groups(
     cloud: &CloudSessions,
     groups: Vec<CodespaceGroup>,
@@ -241,6 +263,8 @@ pub(super) fn archive_groups(
     save_copy: bool,
     convert: &ConvertFn,
     cancel: &std::sync::atomic::AtomicBool,
+    // What the user already saw and accepted losing; anything else asks again.
+    confirmed: &[String],
     progress: &mut dyn FnMut(&str),
 ) -> Vec<GroupOutcome> {
     use std::sync::atomic::Ordering;
@@ -268,6 +292,9 @@ pub(super) fn archive_groups(
         .map(|(group, ids)| {
             let mut converted = Vec::new();
             let mut failure = None;
+            // Lines kept in memory too, so a failed store write cannot open the gate.
+            let mut memory: Vec<String> = Vec::new();
+            let mut store_warning = None;
             if save_copy {
                 for id in &ids {
                     done += 1;
@@ -284,7 +311,17 @@ pub(super) fn archive_groups(
                         String::new()
                     };
                     match convert(cloud, *id, &mut |line| progress(&format!("{prefix}{line}"))) {
-                        Ok(c) => converted.push(c),
+                        Ok(c) => {
+                            // Remembered per codespace, so any later delete asks again.
+                            let lines = unsaved_lines(std::slice::from_ref(&c));
+                            if let Err(e) = cloud.record_unsaved(&group.codespace, &lines) {
+                                store_warning = Some(format!(
+                                    "Could not remember which files were not saved ({e}); deleting this codespace will still ask."
+                                ));
+                            }
+                            memory.extend(lines);
+                            converted.push(c)
+                        }
                         Err(e) => {
                             failure = Some(format!("Could not save a local copy: {e}"));
                             break;
@@ -295,6 +332,21 @@ pub(super) fn archive_groups(
             if failure.is_none() && cancel.load(Ordering::Relaxed) {
                 failure = Some(CANCELLED.to_string());
             }
+            // Never delete silently while the codespace holds files the local copy lacks, even
+            // when the copies were made by an earlier attempt: the list is stored.
+            let mut risky = Vec::new();
+            if failure.is_none() && choice == ArchiveChoice::Delete {
+                let mut stored = cloud.unsaved_for(&group.codespace);
+                for line in memory {
+                    if !stored.contains(&line) {
+                        stored.push(line);
+                    }
+                }
+                if stored.iter().any(|line| !confirmed.contains(line)) {
+                    risky = stored;
+                    failure = Some(NEEDS_REVIEW.to_string());
+                }
+            }
             let result = match failure {
                 Some(error) => Err(error),
                 None => {
@@ -302,13 +354,21 @@ pub(super) fn archive_groups(
                         ArchiveChoice::Delete => "Deleting the codespace",
                         _ => "Stopping the codespace",
                     });
-                    apply_choice(cloud, choice, &group.codespace)
+                    apply_choice(cloud, choice, &group.codespace).map(|(then, warning)| {
+                        let joined = [warning, store_warning]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (then, (!joined.is_empty()).then_some(joined))
+                    })
                 }
             };
             GroupOutcome {
                 group,
                 converted,
                 result,
+                risky,
             }
         })
         .collect()
@@ -419,6 +479,15 @@ pub(super) enum Phase {
     Failed {
         choice: ArchiveChoice,
         error: String,
+    },
+    /// The local copies are saved, but deleting the codespace would lose what `items` says.
+    Review {
+        items: Vec<String>,
+    },
+    /// Deleting from the session menu: confirm first, listing what the codespace holds that the
+    /// local copies lack.
+    ConfirmDelete {
+        items: Vec<String>,
     },
 }
 
@@ -535,7 +604,12 @@ impl Shell {
     }
 
     pub(super) fn apply_cloud_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
-        let changed = snapshot.marks != self.cloud_marks || snapshot.states != self.cloud_states;
+        let changed = snapshot.marks != self.cloud_marks
+            || snapshot.states != self.cloud_states
+            || snapshot.origins != self.cloud_origins
+            || snapshot.gone != self.cloud_gone;
+        self.cloud_origins = snapshot.origins;
+        self.cloud_gone = snapshot.gone;
         for (id, activity) in &snapshot.activity {
             // Host activity of the project is only polled for remote projects.
             self.remote_marks.insert(*id, *activity);
@@ -716,6 +790,58 @@ impl Shell {
         cx.notify();
     }
 
+    /// The codespace a converted local session came from, while gh says it still exists.
+    pub(super) fn live_origin_codespace(&self, id: i64) -> Option<String> {
+        self.cloud_origins
+            .get(&id)
+            .filter(|name| !self.cloud_gone.contains(*name) && !self.is_cloud(id))
+            .cloned()
+    }
+
+    /// Stops or deletes the codespace a converted session came from (session menu). Deleting
+    /// saves any session still in it and asks first when files would be lost.
+    pub(super) fn run_origin_codespace_action(
+        &mut self,
+        id: i64,
+        choice: ArchiveChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(codespace) = self.live_origin_codespace(id) else {
+            return;
+        };
+        if self.cloud_archive.is_some() {
+            return;
+        }
+        let total = self
+            .cloud_marks
+            .values()
+            .filter(|m| m.codespace == codespace)
+            .count();
+        self.close_preview(cx);
+        self.cloud_archive = Some(ArchiveDialog {
+            groups: vec![CodespaceGroup {
+                codespace: codespace.clone(),
+                ids: vec![],
+                others: 0,
+                total,
+            }],
+            title: String::new(),
+            phase: Phase::Choose,
+            focus: cx.focus_handle(),
+        });
+        if choice == ArchiveChoice::Delete {
+            let items = self.cloud.unsaved_for(&codespace);
+            if let Some(dialog) = self.cloud_archive.as_mut() {
+                dialog.phase = Phase::ConfirmDelete { items };
+                window.focus(&dialog.focus, cx);
+            }
+            cx.notify();
+            return;
+        }
+        self.run_cloud_archive(choice, false, Vec::new(), window, cx);
+    }
+
     pub(super) fn close_cloud_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Saving a local copy cannot be interrupted half way: Cancel asks the worker to stop
         // before its next step, and the dialog closes when it has.
@@ -753,7 +879,7 @@ impl Shell {
             cx.notify();
             return;
         }
-        self.run_cloud_archive(choice, true, window, cx);
+        self.run_cloud_archive(choice, true, Vec::new(), window, cx);
     }
 
     /// Saves a local copy of every session (unless `save_copy` is false), then stops or
@@ -763,6 +889,7 @@ impl Shell {
         &mut self,
         choice: ArchiveChoice,
         save_copy: bool,
+        confirmed: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -803,6 +930,7 @@ impl Shell {
                 save_copy,
                 &convert,
                 &cancel,
+                &confirmed,
                 &mut |line| {
                     if let Ok(mut current) = worker_progress.lock() {
                         *current = line.to_string();
@@ -868,16 +996,20 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.cloud_busy.retain(|id| !ids.contains(id));
+        // Conversion warnings are notices; a partial codespace failure stays an error.
         let mut notes = Vec::new();
+        let mut warnings = Vec::new();
         let mut failed: Vec<(CodespaceGroup, String)> = Vec::new();
+        let mut review: Vec<(CodespaceGroup, Vec<String>)> = Vec::new();
         for outcome in outcomes {
             let GroupOutcome {
                 mut group,
                 converted,
                 result,
+                risky,
             } = outcome;
             for saved in converted {
-                notes.extend(saved.warnings.iter().cloned());
+                warnings.extend(saved.warnings.iter().cloned());
                 self.adopt_converted(saved, window, cx);
             }
             group.ids.retain(|id| self.is_cloud(*id));
@@ -893,30 +1025,47 @@ impl Shell {
                             }
                         }
                         Then::Forget => {
+                            self.cloud_gone.insert(group.codespace.clone());
                             self.forget_codespace_sessions(&group.codespace, window, cx)
                         }
                     }
                 }
                 Err(error) if error == CANCELLED => {}
+                Err(error) if error == NEEDS_REVIEW => review.push((group, risky)),
                 Err(error) => failed.push((group, error)),
             }
         }
-        if failed.is_empty() {
+        if failed.is_empty() && review.is_empty() {
             if self.cloud_archive.take().is_some() {
                 self.focus_active(window, cx);
             }
         } else if let Some(dialog) = self.cloud_archive.as_mut() {
-            let error = failed
-                .iter()
-                .map(|(_, error)| error.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            dialog.groups = failed.into_iter().map(|(group, _)| group).collect();
-            dialog.phase = Phase::Failed { choice, error };
+            if failed.is_empty() {
+                let items = review.iter().flat_map(|(_, items)| items.clone()).collect();
+                dialog.groups = review.into_iter().map(|(group, _)| group).collect();
+                dialog.phase = Phase::Review { items };
+            } else {
+                let error = failed
+                    .iter()
+                    .map(|(_, error)| error.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                // Paused groups ride along: a retry asks about them again before deleting,
+                // from the list stored for their codespace.
+                dialog.groups = failed
+                    .into_iter()
+                    .map(|(group, _)| group)
+                    .chain(review.into_iter().map(|(group, _)| group))
+                    .collect();
+                dialog.phase = Phase::Failed { choice, error };
+            }
             window.focus(&dialog.focus, cx);
         }
         if !notes.is_empty() {
             self.error = Some(notes.join(" "));
+        }
+        if !warnings.is_empty() {
+            self.notice = Some(warnings.join(" "));
         }
         self.invalidate_chrome(cx);
         cx.notify();
@@ -976,6 +1125,7 @@ impl Shell {
         self.remote_marks.remove(&cloud_id);
         self.forget_session(cloud_id, cx);
         let id = saved.local_id;
+        self.cloud_origins.insert(id, saved.codespace.clone());
         self.workspace.add_project(&saved.summary.cwd);
         self.session_summaries.insert(id, saved.summary);
         self.order.retain(|s| *s != id);
@@ -1115,6 +1265,107 @@ impl Shell {
                 )),
                 footer.child(cancel),
             ),
+            Phase::ConfirmDelete { items } => {
+                let seen = items.clone();
+                let name = dialog
+                    .groups
+                    .first()
+                    .map(|g| g.codespace.clone())
+                    .unwrap_or_default();
+                let mut lines = vec![format!(
+                    "Delete the codespace {name}? This cannot be undone."
+                )];
+                lines.extend(items.iter().cloned());
+                (
+                    "Delete codespace?",
+                    div().child(text("cloud-archive-confirm", lines.join(" "), false)),
+                    footer
+                        .child(cancel)
+                        .child(
+                            crate::modal::danger_button(
+                                "cloud-archive-confirm-delete",
+                                "Delete codespace",
+                            )
+                            .debug_selector(|| "cloud-archive-confirm-delete".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.run_cloud_archive(
+                                    ArchiveChoice::Delete,
+                                    true,
+                                    seen.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                        ),
+                )
+            }
+            Phase::Review { items } => {
+                let seen = items.clone();
+                (
+                    "Some files are not saved",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(text("cloud-archive-risk", items.join(" "), false))
+                        .child(text(
+                            "cloud-archive-risk-note",
+                            "The local copy is saved without them. Deleting the codespace removes \
+                             them for good; stopping it keeps them. Keep running leaves it as it \
+                             is: stop or delete it later from the session menu."
+                                .into(),
+                            true,
+                        )),
+                    footer
+                        .child(
+                            crate::modal::ghost_button("cloud-archive-review-keep", "Keep running")
+                                .debug_selector(|| "cloud-archive-review-keep".into())
+                                .cursor_pointer()
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.close_cloud_archive(window, cx)
+                                    }),
+                                ),
+                        )
+                        .child(
+                            crate::modal::danger_button(
+                                "cloud-archive-delete-anyway",
+                                "Delete anyway",
+                            )
+                            .debug_selector(|| "cloud-archive-delete-anyway".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                // Copies any session that appeared meanwhile, then asks again
+                                // if that found more to lose.
+                                this.run_cloud_archive(
+                                    ArchiveChoice::Delete,
+                                    true,
+                                    seen.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                        )
+                        .child(
+                            crate::modal::primary_button(
+                                "cloud-archive-stop-instead",
+                                "Stop instead",
+                            )
+                            .debug_selector(|| "cloud-archive-stop-instead".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.run_cloud_archive(
+                                    ArchiveChoice::Stop,
+                                    false,
+                                    Vec::new(),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                        ),
+                )
+            }
             Phase::Failed { choice, error } => {
                 let choice = *choice;
                 let anyway = if choice == ArchiveChoice::Delete {
@@ -1143,7 +1394,7 @@ impl Shell {
                                 .debug_selector(|| "cloud-archive-anyway".into())
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.run_cloud_archive(choice, false, window, cx)
+                                    this.run_cloud_archive(choice, false, Vec::new(), window, cx)
                                 })),
                         )
                         .child(
@@ -1151,7 +1402,7 @@ impl Shell {
                                 .debug_selector(|| "cloud-archive-retry".into())
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.run_cloud_archive(choice, true, window, cx)
+                                    this.run_cloud_archive(choice, true, Vec::new(), window, cx)
                                 })),
                         ),
                 )
