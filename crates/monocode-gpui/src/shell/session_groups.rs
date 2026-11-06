@@ -499,6 +499,7 @@ impl Shell {
                         MenuAction::new("copy-harness-session-id", "Harness session ID")
                             .disabled(summary.provider_id.is_none()),
                         MenuAction::new("copy-monocode-session-id", "Monoptah session ID"),
+                        MenuAction::new("copy-database-session-id", "Desktop database ID"),
                     ])
                     .into(),
                 MenuAction::new(
@@ -576,13 +577,16 @@ impl Shell {
         let summary = self.session_metadata(id, cx).summary.clone();
         let ids = self.session_menu_ids(id, cx);
         match action {
-            "copy-harness-session-id" | "copy-monocode-session-id" => {
-                let text = if action == "copy-harness-session-id" {
-                    summary.provider_id
-                } else {
-                    locked(&self.store)
+            "copy-harness-session-id" | "copy-monocode-session-id" | "copy-database-session-id" => {
+                let text = match action {
+                    "copy-harness-session-id" => summary.provider_id,
+                    // The numeric id is what the app API and Monos accept.
+                    // Remote sessions have negative handles, so they keep their
+                    // persisted identity.
+                    "copy-monocode-session-id" if summary.id > 0 => Some(summary.id.to_string()),
+                    _ => locked(&self.store)
                         .and_then(|store| store.persisted_session_id(summary.id))
-                        .ok()
+                        .ok(),
                 };
                 if let Some(text) = text {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
