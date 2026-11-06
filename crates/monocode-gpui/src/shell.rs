@@ -12338,7 +12338,26 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
+        // Harness ID is skipped (none), so one `down` lands on the Monoptah ID,
+        // which must be the numeric handle the app API and Monos accept.
         cx.simulate_keystrokes(window.into(), "down down right down enter");
+        cx.run_until_parked();
+        let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text()));
+        assert_eq!(copied, Some(id.to_string()));
+        assert_ne!(original, id.to_string());
+        // The desktop database ID stays available as its own labelled action.
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_menu(
+                    MenuTarget::Session(id),
+                    Anchor::Point(gpui::point(px(40.), px(120.))),
+                    w,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes(window.into(), "down down right down down enter");
         cx.run_until_parked();
         let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text()));
         assert_eq!(copied, Some(original));
