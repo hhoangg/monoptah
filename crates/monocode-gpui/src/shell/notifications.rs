@@ -966,6 +966,19 @@ impl Shell {
                         })),
                 ))
             })
+            .when_some(self.notice.clone(), |stack, message| {
+                stack.child(errors::severity_card(
+                    "app-notice",
+                    errors::Severity::Warning,
+                    message,
+                    icon_button("dismiss-notice", "Dismiss notice", "close")
+                        .debug_selector(|| "dismiss-notice".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.notice = None;
+                            cx.notify();
+                        })),
+                ))
+            })
             .when_some(mono_error, |stack, (monos, message)| {
                 stack.child(errors::card(
                     "mono-error",

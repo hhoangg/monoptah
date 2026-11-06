@@ -868,7 +868,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.cloud_busy.retain(|id| !ids.contains(id));
+        // Conversion warnings are notices; a partial codespace failure stays an error.
         let mut notes = Vec::new();
+        let mut warnings = Vec::new();
         let mut failed: Vec<(CodespaceGroup, String)> = Vec::new();
         for outcome in outcomes {
             let GroupOutcome {
@@ -877,7 +879,7 @@ impl Shell {
                 result,
             } = outcome;
             for saved in converted {
-                notes.extend(saved.warnings.iter().cloned());
+                warnings.extend(saved.warnings.iter().cloned());
                 self.adopt_converted(saved, window, cx);
             }
             group.ids.retain(|id| self.is_cloud(*id));
@@ -917,6 +919,9 @@ impl Shell {
         }
         if !notes.is_empty() {
             self.error = Some(notes.join(" "));
+        }
+        if !warnings.is_empty() {
+            self.notice = Some(warnings.join(" "));
         }
         self.invalidate_chrome(cx);
         cx.notify();

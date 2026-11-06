@@ -829,6 +829,8 @@ pub(crate) struct Shell {
     hovered_space: Option<String>,
     space_anchor: AnchorSlot,
     error: Option<String>,
+    /// A non-failure message (for example a finished conversion that skipped some files).
+    notice: Option<String>,
     tab_scroll: ScrollHandle,
     tab_scroll_task: Option<gpui::Task<()>>,
     resize: Option<(Pixels, f32)>,
@@ -1215,6 +1217,7 @@ impl Shell {
             hovered_space: None,
             space_anchor: AnchorSlot::default(),
             error: None,
+            notice: None,
             tab_scroll: ScrollHandle::new(),
             tab_scroll_task: None,
             resize: None,

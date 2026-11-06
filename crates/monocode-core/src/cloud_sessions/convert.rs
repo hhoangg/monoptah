@@ -313,6 +313,66 @@ pub fn pin_key(cloud_id: i64) -> String {
     format!("s{}", cloud_id.unsigned_abs())
 }
 
+/// Directory names whose content a build or install brings back, so skipping them loses nothing.
+const REGENERABLE_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".cache",
+    ".gradle",
+    "Pods",
+];
+
+/// Whether an ignored entry reported by the snapshot (`dir/` for folders) is a dependency or
+/// build directory that is rebuilt on demand. Matches by path component at any depth.
+pub(super) fn is_regenerable(path: &str) -> bool {
+    let is_dir = path.ends_with('/');
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let last = parts.len().saturating_sub(1);
+    // The final component only counts when the entry is a directory.
+    let dir_parts = |i: usize| i < last || is_dir;
+    parts
+        .iter()
+        .enumerate()
+        .any(|(i, part)| dir_parts(i) && REGENERABLE_DIRS.contains(part))
+        || parts
+            .windows(2)
+            .enumerate()
+            .any(|(i, w)| w == ["vendor", "bundle"] && dir_parts(i + 1))
+}
+
+/// The warning for ignored entries that cannot be rebuilt, or `None` when only regenerable
+/// ones were skipped. Names the first few paths.
+pub(super) fn ignored_warning(ignored: &[(u64, String)]) -> Option<String> {
+    const NAMED: usize = 3;
+    let lost: Vec<&(u64, String)> = ignored.iter().filter(|(_, p)| !is_regenerable(p)).collect();
+    if lost.is_empty() {
+        return None;
+    }
+    let kb: u64 = lost.iter().map(|(kb, _)| kb).sum();
+    let list = lost
+        .iter()
+        .take(NAMED)
+        .map(|(_, p)| p.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tail = match lost.len().saturating_sub(NAMED) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    Some(format!(
+        "{} ignored files or folders (about {} MB) were not saved: {list}{tail}. All are listed in the session's codespace manifest.",
+        lost.len(),
+        kb / 1024
+    ))
+}
+
 fn nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -652,7 +712,6 @@ impl CloudSessions {
                 copy_tree(&code.join(PATCHES), &dir.join(PATCHES))
                     .map_err(|e| format!("Cannot keep the patch series: {e}"))?;
             }
-            let ignored_kb: u64 = snap.ignored.iter().map(|(kb, _)| kb).sum();
             let manifest = json!({
                 "version": 3,
                 "pinKey": pin_key(remote.summary.id),
@@ -671,7 +730,7 @@ impl CloudSessions {
                 "bundle": dir.join(BUNDLE).is_file().then_some(BUNDLE),
                 "patches": dir.join(PATCHES).is_dir().then_some(PATCHES),
                 "patch": dir.join(PATCH).is_file().then_some(PATCH),
-                "ignoredNotSaved": snap.ignored.iter().map(|(kb, path)| json!({"path": path, "kib": kb})).collect::<Vec<_>>(),
+                "ignoredNotSaved": snap.ignored.iter().map(|(kb, path)| json!({"path": path, "kib": kb, "regenerable": is_regenerable(path)})).collect::<Vec<_>>(),
                 "createdAt": crate::time::now_ms(),
             });
             std::fs::write(
@@ -679,13 +738,7 @@ impl CloudSessions {
                 serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
-            if !snap.ignored.is_empty() {
-                warnings.push(format!(
-                    "{} ignored files or folders (about {} MB) were not saved; they are listed in the session's codespace manifest.",
-                    snap.ignored.len(),
-                    ignored_kb / 1024
-                ));
-            }
+            warnings.extend(ignored_warning(&snap.ignored));
             if !snap.fetched {
                 warnings.push(
                     "The codespace could not refresh from origin, so unpushed work may be counted conservatively.".into(),

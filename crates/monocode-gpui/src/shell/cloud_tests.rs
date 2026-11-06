@@ -854,6 +854,38 @@ fn non_interactive_archives_never_show_the_dialog_or_touch_the_codespace(cx: &mu
 }
 
 #[gpui::test]
+fn a_conversion_warning_is_a_notice_and_not_an_error(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            let inner = fake_convert(shell.store.clone(), None);
+            shell.cloud_convert = Arc::new(move |svc, id, progress| {
+                let mut done = inner(svc, id, progress)?;
+                done.warnings =
+                    vec!["1 ignored files or folders (about 1 MB) were not saved.".into()];
+                Ok(done)
+            });
+            shell.open_cloud_archive(vec![id], window, cx);
+            shell.confirm_cloud_archive(ArchiveChoice::Stop, window, cx);
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    window
+        .update(visual, |shell, _, _| {
+            assert!(!shell.is_cloud(id));
+            assert_eq!(shell.error, None);
+            assert_eq!(
+                shell.notice.as_deref(),
+                Some("1 ignored files or folders (about 1 MB) were not saved.")
+            );
+        })
+        .unwrap();
+    assert!(visual.debug_bounds("app-notice").is_some());
+    assert!(visual.debug_bounds("app-error").is_none());
+}
+
+#[gpui::test]
 fn a_partial_delete_still_drops_the_sessions_and_keeps_the_warning(cx: &mut TestAppContext) {
     struct FailingDisconnect(FakeHost);
     impl Host for FailingDisconnect {

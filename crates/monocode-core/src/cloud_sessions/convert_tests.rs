@@ -454,6 +454,158 @@ fn converting_keeps_transcript_jsonl_evidence_and_the_code_state_locally() {
 }
 
 #[test]
+fn regenerable_directories_are_recognised_by_path_component() {
+    for path in [
+        "node_modules/",
+        "web/node_modules/",
+        "target/",
+        "crates/x/target/",
+        ".venv/",
+        "venv/",
+        "pkg/__pycache__/",
+        "dist/",
+        "build/",
+        ".next/",
+        ".turbo/",
+        ".cache/",
+        ".gradle/",
+        "ios/Pods/",
+        "vendor/bundle/",
+        "app/vendor/bundle/",
+        "node_modules/a/b.js",
+    ] {
+        assert!(is_regenerable(path), "{path}");
+    }
+    for path in [
+        ".env",
+        "junk.log",
+        "target",
+        "build",
+        "notes/build.txt",
+        "my_node_modules/",
+        "vendor/",
+        "vendor/gems/",
+        "bundle/",
+        "secrets/",
+    ] {
+        assert!(!is_regenerable(path), "{path}");
+    }
+}
+
+#[test]
+fn only_irreplaceable_ignored_files_produce_a_warning_naming_the_first_few() {
+    let regen = vec![(638_976, "node_modules/".to_string())];
+    assert_eq!(ignored_warning(&regen), None);
+    assert_eq!(ignored_warning(&[]), None);
+
+    let mut mixed = regen.clone();
+    mixed.push((2048, ".env".into()));
+    let text = ignored_warning(&mixed).unwrap();
+    assert!(
+        text.starts_with("1 ignored files or folders (about 2 MB)"),
+        "{text}"
+    );
+    assert!(
+        text.contains(".env") && !text.contains("node_modules"),
+        "{text}"
+    );
+
+    let many: Vec<(u64, String)> = (0..5).map(|i| (1, format!("f{i}.key"))).collect();
+    let text = ignored_warning(&many).unwrap();
+    assert!(text.starts_with("5 ignored"), "{text}");
+    assert!(text.contains("f0.key, f1.key, f2.key and 2 more"), "{text}");
+    assert!(!text.contains("f3.key"), "{text}");
+}
+
+#[test]
+fn ignored_files_are_never_copied_into_the_session_folder() {
+    let w = world_with(true, false, true);
+    let secret = "SECRET-TOKEN-4f9c1d";
+    let dep = "DEP-CONTENT-77aa";
+    std::fs::write(w.ws.join(".env"), format!("KEY={secret}\n")).unwrap();
+    std::fs::create_dir_all(w.ws.join("node_modules")).unwrap();
+    std::fs::write(w.ws.join("node_modules/x"), format!("{dep}\n")).unwrap();
+    let mut exclude = std::fs::read_to_string(w.ws.join(".git/info/exclude")).unwrap();
+    exclude.push_str(".env\nnode_modules/\n");
+    std::fs::write(w.ws.join(".git/info/exclude"), exclude).unwrap();
+
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+
+    // Listed in the manifest (node_modules marked regenerable), never stored.
+    let code = thread.join(CODESPACE_DIR);
+    let manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(code.join(MANIFEST)).unwrap()).unwrap();
+    let listed = manifest["ignoredNotSaved"].as_array().unwrap();
+    let entry = |name: &str| {
+        listed
+            .iter()
+            .find(|e| e["path"].as_str().is_some_and(|p| p.starts_with(name)))
+            .unwrap_or_else(|| panic!("{name} missing from {listed:?}"))
+    };
+    assert_eq!(entry("node_modules")["regenerable"], true);
+    assert_eq!(entry(".env")["regenerable"], false);
+    // Only the .env-like entries count towards the warning.
+    let warning = done
+        .warnings
+        .iter()
+        .find(|w| w.contains("ignored"))
+        .unwrap();
+    assert!(
+        warning.contains(".env") && !warning.contains("node_modules"),
+        "{warning}"
+    );
+
+    // Every file under the session folder is an expected artifact.
+    let mut files = vec![];
+    collect_files(&thread, &thread, &mut files);
+    assert!(!files.is_empty());
+    for (rel, bytes) in &files {
+        let top = rel.split('/').next().unwrap();
+        let name = rel.strip_prefix("codespace/").unwrap_or(rel);
+        let expected = top == "evidence"
+            || [RAW_JSONL, MANIFEST, BUNDLE, PATCH].contains(&name)
+            || name.starts_with("patches/")
+            || top != "codespace";
+        assert!(expected, "unexpected file {rel}");
+        for needle in [secret, dep] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                "{needle} leaked into {rel}"
+            );
+        }
+        assert!(
+            !rel.contains("node_modules") && !rel.ends_with(".env"),
+            "{rel}"
+        );
+    }
+    let names: Vec<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
+    assert!(names.contains(&"codespace/changes.patch"), "{names:?}");
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_files(root, &path, out);
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, std::fs::read(&path).unwrap()));
+        }
+    }
+}
+
+#[test]
 fn restore_builds_a_new_worktree_with_the_commit_and_the_uncommitted_changes() {
     let w = world(true);
     let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
