@@ -17,6 +17,7 @@ import {
   monoptahManifest,
   planBuilds,
   prepareMonoptahRelease,
+  requireReused,
   writeMissingRecords,
 } from "./native-release-monoptah.mjs";
 import {
@@ -263,7 +264,8 @@ test("the plan command prints step output lines", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "monoptah-native-plan-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const published = join(directory, "published.txt");
-  await writeFile(published, `${assetFiles().filter((n) => n.endsWith(".exe")).join("\n")}\n`);
+  const macFiles = assetFiles().filter((n) => n.startsWith("MonoptahNative_0.34.0_aarch64"));
+  await writeFile(published, `${[...macFiles, ...assetFiles().filter((n) => n.endsWith(".exe"))].join("\n")}\n`);
   const script = join(root, "scripts/native-release-monoptah.mjs");
   const run = (args) =>
     spawnSync(process.execPath, [script, ...args], {
@@ -275,12 +277,23 @@ test("the plan command prints step output lines", async (t) => {
   const lines = Object.fromEntries(
     partial.stdout.trim().split("\n").map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]),
   );
-  assert.deepEqual(JSON.parse(lines.matrix).map((e) => e.kind), ["macos", "linux"]);
+  assert.deepEqual(JSON.parse(lines.matrix).map((e) => e.kind), ["linux"]);
   assert.equal(lines.rpm, "true");
   assert.equal(lines.build_any, "true");
-  assert.equal(lines.reuse, "MonoptahNative_0.34.0_x64-setup.exe");
-  // No release yet: the file does not exist.
-  assert.match(run(["plan", join(directory, "none.txt")]).stdout, /build_any=true\nreuse=\n?$/);
+  assert.equal(
+    lines.reuse,
+    [...macFiles, "MonoptahNative_0.34.0_x64-setup.exe"].join(" "),
+  );
+  // The macOS files are not on the release: macOS is never built on CI.
+  await writeFile(published, "MonoptahNative_0.34.0_x64-setup.exe\n");
+  const noMac = run(["plan", published]);
+  assert.notEqual(noMac.status, 0);
+  assert.equal(noMac.stdout, "");
+  assert.match(noMac.stderr, /macos files are missing from release native-v0\.34\.0.*npm run native:release:mac -- 0\.34\.0/s);
+  // No release listing at all fails the same way.
+  const none = run(["plan", join(directory, "none.txt")]);
+  assert.notEqual(none.status, 0);
+  assert.match(none.stderr, /native:release:mac/);
   // A partially published platform makes the plan command fail.
   await writeFile(published, "MonoptahNative_0.34.0_aarch64.zip\n");
   const bad = run(["plan", published]);
@@ -444,4 +457,13 @@ signingTest("signing produces a feed and package signature that verify with the 
     }),
     /plain native release version/,
   );
+});
+
+test("requireReused refuses a plan that would build the platform", () => {
+  const withMac = planBuilds("0.34.0", []);
+  assert.throws(() => requireReused(withMac, "macos", "0.34.0"), /npm run native:release:mac -- 0\.34\.0/);
+  const macPublished = planBuilds("0.34.0", assetFiles().filter((n) => n.startsWith("MonoptahNative_0.34.0_aarch64")));
+  assert.equal(requireReused(macPublished, "macos", "0.34.0"), macPublished);
+  // Other platforms may still be built.
+  assert.ok(macPublished.buildAny);
 });

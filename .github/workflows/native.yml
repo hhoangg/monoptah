@@ -26,20 +26,21 @@ concurrency:
   group: native-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
+# macOS is not built or checked on CI at all: GitHub-hosted macOS runners are not
+# reliably available. The macOS app is checked (npm run native:check), built and
+# packaged on the maintainer's Mac by npm run native:release:mac. CI covers the
+# core crate on Linux and Windows, GPUI (fmt and clippy on Linux, clippy on
+# Windows), and seeds the release caches.
 jobs:
   core:
     name: Core (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, "${{ vars.MONOPTAH_MACOS_RUNNER || 'macos-latest' }}", windows-latest]
-    runs-on: ${{ startsWith(matrix.os, 'macos-') && vars.MONOPTAH_MACOS_RUNNER || matrix.os }}
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      # macos-15 keeps Xcode 16 as its default; select its installed Xcode 26.
-      - name: Select Xcode for the macOS fallback runner
-        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
-        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -57,21 +58,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libdbus-1-dev pkg-config
       # ci.yml, the other npm ci, is paused; the native release needs a good lock.
-      - if: runner.os == 'macOS'
+      # It also installs @tauri-apps/cli, without which the signing tests in
+      # native:test:dev are skipped.
+      - if: runner.os == 'Linux'
         run: npm ci
       - run: npm run native:test:dev
       - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --all-targets --profile native-dev -- -D warnings
       - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --profile native-dev
 
+  # GPUI itself: fmt and clippy only. The gpui tests are not run here (they are
+  # the CI long pole); npm run native:check runs them locally before every
+  # release, and the macOS-only parts are checked there too. Windows only runs
+  # clippy, without release flags, so it does not share the release cache.
   desktop:
-    name: Monoptah Native (macOS)
-    runs-on: ${{ vars.MONOPTAH_MACOS_RUNNER || 'macos-latest' }}
+    name: GPUI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      # macos-15 keeps Xcode 16 as its default; select its installed Xcode 26.
-      - name: Select Xcode for the macOS fallback runner
-        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
-        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -80,28 +87,30 @@ jobs:
           workspaces: crates/monocode-gpui
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo fmt --manifest-path crates/monocode-gpui/Cargo.toml --all --check
+      - name: Install native Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils
+      - if: runner.os == 'Linux'
+        run: cargo fmt --manifest-path crates/monocode-gpui/Cargo.toml --all --check
       - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core -p monocode-gpui --all-targets --profile native-dev -- -D warnings
-      - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui --profile native-dev -- --test-threads=1
-      - run: cargo build --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui --profile native-dev
 
-  # Tag runs restore these, which is what makes a native release fast. Keep the
-  # toolchain, per-OS setup and build command in step with the package job in
-  # native-release-monoptah.yml, and the shared keys equal to the ones it reads.
-  # The rpm job (AlmaLinux container) has no seeded cache.
+  # Release runs restore these, which is what makes a native release faster (a miss is
+  # only slower). Keep the toolchain, per-OS setup and build command in step with
+  # the package job in native-release-monoptah.yml, and the shared keys equal to
+  # the ones it reads. The Linux cache also seeds the publish job, which builds
+  # the update verifier example. The rpm job (AlmaLinux container) is seeded by
+  # release-cache-rpm below, and macOS is built locally.
   release-cache:
     name: Seed the release build cache (${{ matrix.kind }})
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ${{ startsWith(matrix.os, 'macos-') && vars.MONOPTAH_MACOS_RUNNER || matrix.os }}
+    runs-on: ${{ matrix.os }}
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            kind: macos
-            target: aarch64-apple-darwin
-            key: native-monoptah-release
           - os: ubuntu-22.04
             kind: linux
             target: x86_64-unknown-linux-gnu
@@ -112,10 +121,6 @@ jobs:
             key: native-monoptah-release-x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
-      # macos-15 keeps Xcode 16 as its default; select its installed Xcode 26.
-      - name: Select Xcode for the macOS fallback runner
-        if: runner.os == 'macOS' && vars.MONOPTAH_MACOS_RUNNER == 'macos-15'
-        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -135,16 +140,41 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y clang cmake ninja-build pkg-config libfontconfig1-dev libfreetype6-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libasound2-dev libx11-xcb-dev libegl1-mesa-dev libvulkan-dev libdbus-1-dev squashfs-tools desktop-file-utils
-      - if: matrix.kind == 'macos' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          if ! xcrun metal --version >/dev/null 2>&1; then
-            xcodebuild -downloadComponent MetalToolchain
-          fi
-      - if: matrix.kind == 'macos' && steps.cache.outputs.cache-hit != 'true'
-        env:
-          CARGO_BUILD_JOBS: 2
+      - if: steps.cache.outputs.cache-hit != 'true'
         run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --target ${{ matrix.target }} --release
-      - if: matrix.kind != 'macos' && steps.cache.outputs.cache-hit != 'true'
-        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --target ${{ matrix.target }} --release
-      - if: matrix.kind == 'macos' && steps.cache.outputs.cache-hit != 'true'
+      # Only the publish job (Ubuntu) runs the verifier, so only Linux needs its
+      # dependencies seeded.
+      - if: matrix.kind == 'linux' && steps.cache.outputs.cache-hit != 'true'
         run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-core --example verify_monoptah_native_update --profile native-dev
+
+  # Seeds the rpm cache. The rpm job builds in the same AlmaLinux container, and a
+  # cache key includes the OS, the rustc version and a hash of the CARGO*, CC,
+  # CFLAGS, CXX, CMAKE and RUST* environment variables (Swatinem/rust-cache
+  # src/config.ts), so this job must have exactly the environment package-rpm has:
+  # the same container, toolchain action, packages and no CARGO_* job env. Keep
+  # the packages and the build command in step with package-rpm in
+  # native-release-monoptah.yml. A miss is only slower.
+  release-cache-rpm:
+    name: Seed the release build cache (rpm)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    continue-on-error: true
+    steps:
+      - run: dnf install -y git
+      - uses: actions/checkout@v4
+      - name: Install native rpm build dependencies
+        run: |
+          dnf install -y dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf install -y epel-release
+          dnf install -y clang gcc-c++ cmake ninja-build pkgconf-pkg-config fontconfig-devel freetype-devel libxcb-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel alsa-lib-devel libX11-devel libX11-xcb mesa-libEGL-devel vulkan-loader-devel dbus-devel rpm-build perl tar zstd
+      - uses: dtolnay/rust-toolchain@stable
+      - id: cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/monocode-gpui
+          shared-key: native-monoptah-release-rpm-el10
+          lookup-only: true
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --release
