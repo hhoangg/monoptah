@@ -454,7 +454,7 @@ fn codespace_archive_to_local() {
     let session_id = create["sessionId"].as_str().unwrap().to_owned();
     step(&format!("created session {session_id}"));
     let prompt = "Do exactly these steps with your tools, then reply with the single word DONE. \
-        1) Run `git checkout -b t7-live`. \
+        1) Run `git checkout -b t7b-live`. \
         2) Create the file t7-created.txt in the repository root containing the single line `hello from the codespace`. \
         3) Run `git add t7-created.txt && git -c user.name=t7 -c user.email=t7@example.com commit -m 'T7 live commit'`. \
         4) Append the line `uncommitted t7 change` to README.md and do not commit it. \
@@ -580,7 +580,7 @@ fn codespace_archive_to_local() {
         )
         .unwrap();
         step(&format!("manifest: {manifest}"));
-        assert_eq!(manifest["branch"], "t7-live");
+        assert_eq!(manifest["branch"], "t7b-live");
         assert_eq!(manifest["unpushedCommits"], 1);
         assert!(thread.join(CODESPACE_DIR).join("commits.bundle").is_file());
         let patch =
@@ -614,7 +614,7 @@ fn codespace_archive_to_local() {
         let restored = restore_code(&project, &thread).unwrap();
         step(&format!("restored: {restored:?}"));
         assert!(
-            restored.branch.starts_with("t7-live"),
+            restored.branch.starts_with("t7b-live"),
             "{}",
             restored.branch
         );

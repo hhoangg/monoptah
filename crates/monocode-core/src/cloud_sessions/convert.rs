@@ -789,14 +789,28 @@ fn git_run(
     envs: &[(&str, &str)],
     limit: Duration,
 ) -> Result<String, String> {
-    use std::io::Read;
+    git_run_stdin(cwd, args, envs, limit, None)
+}
+
+fn git_run_stdin(
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    limit: Duration,
+    input: Option<&str>,
+) -> Result<String, String> {
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     let mut command = Command::new("git");
     command
         .current_dir(cwd)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if std::env::var_os("GIT_SSH_COMMAND").is_none() {
@@ -808,6 +822,12 @@ fn git_run(
     let mut child = command
         .spawn()
         .map_err(|e| format!("Could not run Git: {e}"))?;
+    if let (Some(text), Some(mut pipe)) = (input, child.stdin.take()) {
+        let text = text.to_string();
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(text.as_bytes());
+        });
+    }
     let read = |mut pipe: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -869,6 +889,15 @@ pub(super) fn check_restorable(
     let id8 = &head[..8];
     fetch_origin(project, id8);
     let _cleanup = OriginRefs { project, id8 };
+    let mut pins: Vec<(String, &str)> = vec![("head".into(), head)];
+    pins.extend(snap.base.as_deref().map(|b| ("base".to_string(), b)));
+    pins.extend(
+        snap.refs
+            .iter()
+            .enumerate()
+            .map(|(i, (_, sha))| (format!("ref{i}"), sha.as_str())),
+    );
+    pin_commits(project, id8, &pins);
     let mut notes = Vec::new();
     if snap.base.is_some() && !snap.base_on_origin {
         notes.push("the base commit is not on origin".to_string());
@@ -922,6 +951,46 @@ pub(super) fn check_restorable(
     }))
 }
 
+/// Deletes every ref under `prefix` in one `update-ref --stdin` batch.
+fn drop_refs(project: &Path, prefix: &str) {
+    let Ok(list) = run_git(project, &["for-each-ref", "--format=%(refname)", prefix]) else {
+        return;
+    };
+    let batch: String = list
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|name| format!("delete {name}\n"))
+        .collect();
+    if !batch.is_empty() {
+        let _ = git_run_stdin(
+            project,
+            &["update-ref", "--stdin"],
+            &[],
+            GIT_LIMIT,
+            Some(&batch),
+        );
+    }
+}
+
+/// Pins the commits restore needs under `refs/codespace/<id8>/keep/`, so they stay
+/// reachable here after the bulk copy of origin's branches is dropped.
+fn pin_commits(project: &Path, id8: &str, pins: &[(String, &str)]) {
+    let batch: String = pins
+        .iter()
+        .filter(|(_, sha)| has_commit(project, sha))
+        .map(|(name, sha)| format!("update refs/codespace/{id8}/keep/{name} {sha}\n"))
+        .collect();
+    if !batch.is_empty() {
+        let _ = git_run_stdin(
+            project,
+            &["update-ref", "--stdin"],
+            &[],
+            GIT_LIMIT,
+            Some(&batch),
+        );
+    }
+}
+
 /// Removes the `refs/codespace/<id8>/origin/*` copy of origin's branches when dropped.
 struct OriginRefs<'a> {
     project: &'a Path,
@@ -929,15 +998,10 @@ struct OriginRefs<'a> {
 }
 impl Drop for OriginRefs<'_> {
     fn drop(&mut self) {
-        let prefix = format!("refs/codespace/{}/origin/", self.id8);
-        if let Ok(list) = run_git(
+        drop_refs(
             self.project,
-            &["for-each-ref", "--format=%(refname)", &prefix],
-        ) {
-            for name in list.lines().filter(|l| !l.is_empty()) {
-                let _ = run_git(self.project, &["update-ref", "-d", name]);
-            }
-        }
+            &format!("refs/codespace/{}/origin/", self.id8),
+        );
     }
 }
 
@@ -956,16 +1020,37 @@ pub struct CodeManifest {
     /// The `git format-patch` series `base..head`, a fallback when the bundle cannot be used.
     pub patches: Option<PathBuf>,
     pub patch: Option<PathBuf>,
+    /// A restore that created its worktree but could not finish; a retry continues there.
+    pub partial: Option<PartialRestore>,
     /// `(ref name, sha)` of the codespace's local branches and stash.
     pub refs: Vec<(String, String)>,
+}
+
+/// Where an unfinished restore stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialRestore {
+    pub worktree: PathBuf,
+    pub branch: String,
+    /// `series` (replaying the commits) or `patch` (the uncommitted changes).
+    pub step: String,
 }
 
 /// The pending code restore of a local session folder, or `None` when there is no manifest or
 /// the restore already ran.
 pub fn pending_restore(thread_dir: &Path) -> Option<CodeManifest> {
     let dir = thread_dir.join(CODESPACE_DIR);
-    if dir.join(RESTORED).exists() {
-        return None;
+    let mut partial = None;
+    if let Ok(raw) = std::fs::read_to_string(dir.join(RESTORED)) {
+        let done: Value = serde_json::from_str(&raw).unwrap_or_default();
+        if done["status"] != "partial" {
+            return None;
+        }
+        let worktree = PathBuf::from(done["worktree"].as_str()?);
+        partial = Some(PartialRestore {
+            worktree,
+            branch: done["branch"].as_str()?.to_string(),
+            step: done["step"].as_str()?.to_string(),
+        });
     }
     let raw = std::fs::read_to_string(dir.join(MANIFEST)).ok()?;
     let value: Value = serde_json::from_str(&raw).ok()?;
@@ -1001,6 +1086,7 @@ pub fn pending_restore(thread_dir: &Path) -> Option<CodeManifest> {
         bundle: file("bundle"),
         patches: file("patches"),
         patch: file("patch"),
+        partial,
         refs,
     })
 }
@@ -1073,6 +1159,20 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
     let id8 = manifest.head[..8].to_string();
     // Origin's branches are only fetched to find objects; they are removed again at the end.
     let _cleanup = OriginRefs { project, id8: &id8 };
+    if let Some(partial) = manifest.partial.clone().filter(|p| p.worktree.is_dir()) {
+        // A retry: continue in the worktree the first attempt made.
+        let mut restored = Restored {
+            worktree: partial.worktree.clone(),
+            branch: partial.branch.clone(),
+            head: manifest.head.clone(),
+            patch_applied: false,
+            conflicts: None,
+        };
+        let replay = (partial.step == "series")
+            .then(|| manifest.patches.clone())
+            .flatten();
+        return finish_restore(project, thread_dir, &manifest, &mut restored, replay, &id8);
+    }
     let mut have_head = has_commit(project, &manifest.head);
     let mut unpacked = false;
     if let Some(bundle) = &manifest.bundle {
@@ -1171,6 +1271,22 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
         patch_applied: false,
         conflicts: None,
     };
+    finish_restore(project, thread_dir, &manifest, &mut restored, replay, &id8)
+}
+
+/// Replays the commit series (when `replay`), applies the uncommitted patch and records the
+/// outcome in `restored.json`. A step that fails leaves the worktree and records
+/// `status: partial` with the step, so a retry continues there.
+fn finish_restore(
+    project: &Path,
+    thread_dir: &Path,
+    manifest: &CodeManifest,
+    restored: &mut Restored,
+    replay: Option<PathBuf>,
+    id8: &str,
+) -> Result<Restored, String> {
+    let worktree = restored.worktree.clone();
+    let mut failed_step = None;
     if let Some(series) = replay {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&series)
             .map_err(|e| e.to_string())?
@@ -1183,7 +1299,8 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let mut args = vec!["am", "--3way", "--quiet"];
+        // Hooks of the user's repository do not run while commits are replayed.
+        let mut args = vec!["-c", "core.hooksPath=/dev/null", "am", "--3way", "--quiet"];
         args.extend(names.iter().map(String::as_str));
         let ident = run_git(&worktree, &["config", "user.email"])
             .map(|e| !e.trim().is_empty())
@@ -1204,13 +1321,22 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
             }
             Err(e) => {
                 let _ = run_git(&worktree, &["am", "--abort"]);
+                failed_step = Some("series");
                 restored.conflicts = Some(format!(
-                    "The saved commits could not be replayed onto the base: {e}"
+                    "The saved commits could not be replayed onto the base in {} (branch {}): {e}. To finish: cd {} && git am --3way {}/*.patch, then apply the uncommitted changes with git apply --binary {}.",
+                    worktree.display(),
+                    restored.branch,
+                    worktree.display(),
+                    series.display(),
+                    manifest
+                        .patch
+                        .as_ref()
+                        .map_or("(none saved)".to_string(), |p| p.display().to_string()),
                 ));
             }
         }
     }
-    if let (Some(patch), None) = (&manifest.patch, &restored.conflicts) {
+    if let (Some(patch), None) = (&manifest.patch, failed_step) {
         match run_git(
             &worktree,
             &[
@@ -1222,15 +1348,21 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
         ) {
             Ok(_) => restored.patch_applied = true,
             Err(e) => {
-                restored.conflicts = Some(if e.is_empty() {
-                    "The uncommitted changes could not be applied.".into()
-                } else {
-                    e
-                })
+                failed_step = Some("patch");
+                restored.conflicts = Some(format!(
+                    "The uncommitted changes did not apply in {} (branch {}): {}. To finish: cd {} && git apply --binary {}",
+                    worktree.display(),
+                    restored.branch,
+                    if e.is_empty() { "no details from git" } else { e.as_str() },
+                    worktree.display(),
+                    patch.display(),
+                ));
             }
         }
     }
     let record = json!({
+        "status": if failed_step.is_some() { "partial" } else { "done" },
+        "step": failed_step,
         "worktree": restored.worktree,
         "branch": restored.branch,
         "head": restored.head,
@@ -1248,7 +1380,9 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
             worktree.display()
         )
     })?;
-    Ok(restored)
+    // The worktree's branch holds the commits now.
+    drop_refs(project, &format!("refs/codespace/{id8}/keep/"));
+    Ok(restored.clone())
 }
 
 /// The pending code restore of local session `id`, if it came from a codespace.

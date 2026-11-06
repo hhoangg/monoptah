@@ -1051,3 +1051,66 @@ fn deleting_the_local_copy_releases_the_tombstone() {
     store.delete(done.local_id).unwrap();
     assert!(!store.is_cloud_converted("env-1", "host-1").unwrap());
 }
+
+#[test]
+fn commits_only_on_origin_stay_reachable_after_origin_loses_them() {
+    let w = world_with(true, false, false);
+    // Pushed work: nothing to bundle, so restore depends on the commit staying here.
+    git(&w.ws, &["checkout", "-q", "-b", "feat/p", "main"]);
+    std::fs::write(w.ws.join("p.txt"), "p\n").unwrap();
+    git(&w.ws, &["add", "p.txt"]);
+    git(&w.ws, &["commit", "-q", "-m", "p work"]);
+    git(&w.ws, &["push", "-q", "origin", "feat/p"]);
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    no_codespace_namespace_left(&w.project);
+    let keep = git(&w.project, &["for-each-ref", "refs/codespace"]);
+    assert!(keep.contains("/keep/head"), "{keep}");
+    // The branch disappears from origin and the repository forgets unreachable objects.
+    git(&w.origin, &["branch", "-D", "feat/p"]);
+    git(&w.project, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&w.project, &["gc", "-q", "--prune=now"]);
+    let restored = restore_code(&w.project, &thread).unwrap();
+    assert!(restored.worktree.join("p.txt").is_file());
+    // The pins are released once the branch holds the commits.
+    assert!(!git(&w.project, &["for-each-ref", "refs/codespace"]).contains("/keep/"));
+}
+
+#[test]
+fn a_failed_patch_leaves_a_partial_restore_that_a_retry_finishes_in_the_same_worktree() {
+    let w = world(true);
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    let patch = thread.join(CODESPACE_DIR).join(PATCH);
+    let good = std::fs::read_to_string(&patch).unwrap();
+    std::fs::write(&patch, "not a patch\n").unwrap();
+    let first = restore_code(&w.project, &thread).unwrap();
+    let message = first.conflicts.clone().unwrap();
+    assert!(
+        message.contains(first.worktree.to_str().unwrap()),
+        "{message}"
+    );
+    assert!(message.contains("git apply --binary"), "{message}");
+    let pending = pending_restore(&thread).expect("still pending");
+    assert_eq!(pending.partial.unwrap().worktree, first.worktree);
+    // Fixed: the retry continues there and does not make a second worktree.
+    std::fs::write(&patch, good).unwrap();
+    let second = restore_code(&w.project, &thread).unwrap();
+    assert_eq!(second.worktree, first.worktree);
+    assert!(second.patch_applied && second.conflicts.is_none());
+    assert!(pending_restore(&thread).is_none());
+    let trees = git(&w.project, &["worktree", "list"]);
+    assert_eq!(trees.lines().count(), 2, "{trees}");
+}
