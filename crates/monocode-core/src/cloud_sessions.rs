@@ -837,7 +837,8 @@ pub struct SessionTarget {
 mod convert;
 pub use convert::*;
 
-#[cfg(test)]
+// These fixtures execute the Linux host scripts against local Unix paths.
+#[cfg(all(test, unix))]
 mod convert_tests;
 #[cfg(test)]
 mod tests;

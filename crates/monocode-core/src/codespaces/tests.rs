@@ -781,6 +781,7 @@ fn prepare_evidence_rejects_unsafe_workspaces_and_reports_failures() {
 }
 
 /// Runs the script with `HOME` set; returns whether it exited successfully.
+#[cfg(unix)]
 fn run_script(script: &str, home: &Path) -> bool {
     let mut child = std::process::Command::new("sh")
         .arg("-s")
@@ -798,6 +799,7 @@ fn run_script(script: &str, home: &Path) -> bool {
     child.wait().unwrap().success()
 }
 
+#[cfg(unix)]
 fn git_init(path: &Path) {
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -808,6 +810,7 @@ fn git_init(path: &Path) {
 }
 
 /// Names in `dir`, to prove no temp file is left behind.
+#[cfg(unix)]
 fn names(dir: &Path) -> Vec<String> {
     let mut all: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -817,6 +820,7 @@ fn names(dir: &Path) -> Vec<String> {
     all
 }
 
+#[cfg(unix)]
 fn guide_env() -> (tempfile::TempDir, tempfile::TempDir, String) {
     let home = tempfile::tempdir().unwrap();
     let ws = tempfile::tempdir().unwrap();
@@ -826,6 +830,7 @@ fn guide_env() -> (tempfile::TempDir, tempfile::TempDir, String) {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_evidence_script_writes_a_local_guide_keeps_other_content_and_is_idempotent() {
     let (home, ws, script) = guide_env();
     // An exclude file without a trailing newline must not have its last pattern corrupted.
@@ -860,6 +865,7 @@ fn the_evidence_script_writes_a_local_guide_keeps_other_content_and_is_idempoten
 }
 
 #[test]
+#[cfg(unix)]
 fn a_new_guide_file_is_created_world_readable() {
     use std::os::unix::fs::PermissionsExt;
     let (home, ws, script) = guide_env();
@@ -872,6 +878,7 @@ fn a_new_guide_file_is_created_world_readable() {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_evidence_script_replaces_only_its_own_block() {
     let (home, ws, script) = guide_env();
     let guide_path = ws.path().join("CLAUDE.local.md");
@@ -888,6 +895,7 @@ fn the_evidence_script_replaces_only_its_own_block() {
 }
 
 #[test]
+#[cfg(unix)]
 fn unbalanced_or_misordered_markers_leave_the_file_untouched_and_fail() {
     for content in [
         "keep\n<!-- monoptah-evidence:begin -->\nthe rest of my notes\n",
@@ -907,6 +915,7 @@ fn unbalanced_or_misordered_markers_leave_the_file_untouched_and_fail() {
 }
 
 #[test]
+#[cfg(unix)]
 fn an_unreadable_guide_is_not_replaced() {
     use std::os::unix::fs::PermissionsExt;
     let (home, ws, script) = guide_env();
@@ -923,6 +932,7 @@ fn an_unreadable_guide_is_not_replaced() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_directory_or_a_symlink_named_like_the_guide_is_left_alone() {
     let (home, ws, script) = guide_env();
     std::fs::create_dir(ws.path().join("CLAUDE.local.md")).unwrap();
@@ -947,6 +957,7 @@ fn a_directory_or_a_symlink_named_like_the_guide_is_left_alone() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_git_tracked_guide_is_the_projects_own_file() {
     let (home, ws, script) = guide_env();
     std::fs::write(ws.path().join("CLAUDE.local.md"), "tracked\n").unwrap();
@@ -970,6 +981,7 @@ fn a_git_tracked_guide_is_the_projects_own_file() {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_script_never_touches_the_home_guide() {
     let (home, _ws, script) = guide_env();
     std::fs::create_dir_all(home.path().join(".claude")).unwrap();
