@@ -23,6 +23,10 @@ const SLOW_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const COPY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// A short `gh codespace ssh` setup command. Best-effort callers must never wait longer.
 const SSH_TIMEOUT: Duration = Duration::from_secs(30);
+/// A `gh codespace ssh` script marked with [`LONG_SCRIPT_MARKER`] (git bundles, large trees).
+const LONG_SSH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Last argument of a `gh codespace ssh` call that may run longer than [`SSH_TIMEOUT`].
+pub const LONG_SCRIPT_MARKER: &str = "monoptah-long";
 const DISPLAY_NAME_MAX: usize = 48;
 const GH_MISSING: &str = "GitHub CLI (gh) is not installed";
 const SCOPE_HINT: &str = "The GitHub token is missing the `codespace` scope. \
@@ -104,7 +108,11 @@ pub fn call_timeout(args: &[String]) -> Duration {
         ),
         (Some("codespace"), Some("ssh"))
     ) {
-        return SSH_TIMEOUT;
+        return if args.last().map(String::as_str) == Some(LONG_SCRIPT_MARKER) {
+            LONG_SSH_TIMEOUT
+        } else {
+            SSH_TIMEOUT
+        };
     }
     let slow = matches!(
         (
@@ -696,6 +704,29 @@ pub fn prepare_evidence(runner: &dyn GhRunner, name: &str, workspace: &str) -> R
     let out = runner.run(&args, Some(&script))?;
     if out.success {
         Ok(())
+    } else {
+        Err(failure(&args, &out))
+    }
+}
+
+/// Runs `script` with `sh -s` inside the codespace (it starts a stopped one) and returns
+/// stdout. `long` allows minutes instead of 30 seconds.
+pub fn run_script(
+    runner: &dyn GhRunner,
+    name: &str,
+    script: &str,
+    long: bool,
+) -> Result<String, String> {
+    valid_codespace_name(name)?;
+    let mut parts = vec!["codespace", "ssh", "-c", name, "--", "sh", "-s"];
+    if long {
+        parts.push("--");
+        parts.push(LONG_SCRIPT_MARKER);
+    }
+    let args = argv(&parts);
+    let out = runner.run(&args, Some(script))?;
+    if out.success {
+        Ok(out.stdout)
     } else {
         Err(failure(&args, &out))
     }

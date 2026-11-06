@@ -516,6 +516,11 @@ impl Shell {
                     MenuAction::new("codespace-terminal", "Open terminal in codespace").into(),
                 );
             }
+            if self.codespace_restore_pending(id) {
+                items.push(
+                    MenuAction::new("codespace-restore", "Restore code from codespace").into(),
+                );
+            }
             items.extend(self.telegram_topic_item(id, cx));
         }
         items.extend([
@@ -581,6 +586,7 @@ impl Shell {
         let summary = self.session_metadata(id, cx).summary.clone();
         let ids = self.session_menu_ids(id, cx);
         match action {
+            "codespace-restore" => self.restore_codespace_code(id, cx),
             "codespace-terminal" => {
                 if let Some(codespace) = self.cloud_marks.get(&id).map(|m| m.codespace.clone()) {
                     self.new_codespace_terminal(codespace, window, cx);

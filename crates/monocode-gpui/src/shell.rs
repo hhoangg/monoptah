@@ -679,6 +679,8 @@ pub(crate) struct Shell {
     cloud_states: HashMap<String, monocode_core::cloud_sessions::CloudState>,
     cloud_refreshing: bool,
     cloud_archive: Option<cloud::ArchiveDialog>,
+    /// Saves the local copy of a cloud session before its codespace is stopped or deleted.
+    cloud_convert: cloud::ConvertFn,
     cloud_busy: HashSet<i64>,
     /// Local projects whose `origin` was checked for a GitHub repository.
     github_projects: HashMap<String, bool>,
@@ -1095,6 +1097,7 @@ impl Shell {
             cloud_states: HashMap::new(),
             cloud_refreshing: false,
             cloud_archive: None,
+            cloud_convert: cloud::default_convert(),
             cloud_busy: HashSet::new(),
             github_projects: HashMap::new(),
             cloud_archive_request: Vec::new(),

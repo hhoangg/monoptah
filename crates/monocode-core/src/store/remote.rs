@@ -240,6 +240,19 @@ impl Store {
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
         )
     }
+    /// Drop one cloud session's local record (the host copy is not touched). Used after the
+    /// session was converted to a local archived copy.
+    pub fn forget_cloud_session(&self, id: i64) -> Result<(), String> {
+        let mut sessions = self.remote_sessions()?;
+        if sessions.remove(&id).is_none() {
+            return Ok(());
+        }
+        self.hide_legacy_remote_sessions([id])?;
+        self.save_setting(
+            SESSIONS,
+            &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
+        )
+    }
     fn stored_remote_sessions(&self) -> Result<BTreeMap<i64, RemoteSession>, String> {
         self.setting(SESSIONS)?
             .map(|raw| {

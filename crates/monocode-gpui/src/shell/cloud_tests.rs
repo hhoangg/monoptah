@@ -4,7 +4,7 @@ use super::cloud_picker;
 use super::*;
 use gpui::TestAppContext;
 use monocode_core::{
-    cloud_sessions::{CloudSessions, CloudState, CodespaceChoice, Host},
+    cloud_sessions::{CloudSessions, CloudState, CodespaceChoice, Converted, Host, Resume},
     codespaces::{GhOutput, GhRunner},
     remote::Machine,
     store::Store,
@@ -141,6 +141,53 @@ fn github_checkout() -> Checkout {
         assert!(status.success());
     }
     Checkout(dir)
+}
+
+/// A conversion that behaves like the real one on the store, or fails with `fail`.
+fn fake_convert(store: Database, fail: Option<&'static str>) -> cloud::ConvertFn {
+    Arc::new(move |_, id, progress| {
+        progress("Waking the codespace");
+        if let Some(error) = fail {
+            return Err(error.into());
+        }
+        let s = store.lock().unwrap();
+        let remote = s.remote_session(id).unwrap().unwrap();
+        let local = s
+            .create("claude", remote.project.local_project.as_deref().unwrap())
+            .unwrap();
+        s.set_archived(local.id, true).unwrap();
+        s.forget_cloud_session(id).unwrap();
+        let summary = s
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.id == local.id)
+            .unwrap();
+        Ok(Converted {
+            cloud_id: id,
+            local_id: local.id,
+            title: summary.title.clone(),
+            summary,
+            codespace: remote.project.codespace.clone().unwrap(),
+            rows: 0,
+            resume: Resume::Missing("test".into()),
+            evidence: vec![],
+            code_dir: None,
+            warnings: vec![],
+        })
+    })
+}
+
+/// Archived local sessions of `/work/monocode` the shell knows.
+fn archived_locals(shell: &Shell) -> Vec<i64> {
+    let mut ids: Vec<i64> = shell
+        .session_summaries
+        .values()
+        .filter(|s| s.archived && s.cwd == "/work/monocode")
+        .map(|s| s.id)
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// Stores a cloud session of `local` in `codespace` and returns its id.
@@ -354,6 +401,7 @@ fn shell_with_cloud(cx: &mut TestAppContext) -> (gpui::WindowHandle<Shell>, i64,
                 Arc::new(FakeHost::default()),
                 shell.store.clone(),
             ));
+            shell.cloud_convert = fake_convert(shell.store.clone(), None);
             // No conversation entity: a remote one polls its host forever, which
             // would keep the test scheduler from ever parking.
             shell.session_summaries.insert(
@@ -440,9 +488,12 @@ fn archiving_a_cloud_session_opens_the_dialog_and_stop_calls_gh_then_archives(
     visual.run_until_parked();
     assert_eq!(gh.calls(), ["codespace stop -c octo-abc"]);
     window
-        .update(visual, |shell, _, cx| {
+        .update(visual, |shell, _, _| {
             assert!(shell.cloud_archive.is_none());
-            assert!(shell.session_metadata(id, cx).summary.archived);
+            // The cloud row is replaced by an archived local copy.
+            assert!(!shell.session_summaries.contains_key(&id));
+            assert!(!shell.is_cloud(id));
+            assert_eq!(archived_locals(shell).len(), 1);
         })
         .unwrap();
 }
@@ -502,6 +553,142 @@ fn delete_codespace_removes_its_sessions_from_the_window(cx: &mut TestAppContext
         .update(visual, |shell, _, _| {
             assert!(!shell.session_summaries.contains_key(&id));
             assert!(!shell.is_cloud(id));
+            // The copy was saved before the codespace went away.
+            assert_eq!(archived_locals(shell).len(), 1);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_failed_copy_leaves_the_codespace_alone_and_offers_retry_anyway_or_cancel(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_convert = fake_convert(shell.store.clone(), Some("ssh dropped"));
+            shell.open_cloud_archive(vec![id], window, cx);
+            shell.confirm_cloud_archive(ArchiveChoice::Delete, window, cx);
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(gh.calls().is_empty(), "nothing deleted: {:?}", gh.calls());
+    window
+        .update(visual, |shell, _, _| {
+            let dialog = shell.cloud_archive.as_ref().expect("dialog stays open");
+            match &dialog.phase {
+                cloud::Phase::Failed { choice, error } => {
+                    assert_eq!(*choice, ArchiveChoice::Delete);
+                    assert!(error.contains("ssh dropped"), "{error}");
+                }
+                _ => panic!("expected the failed phase"),
+            }
+            assert!(shell.is_cloud(id) && archived_locals(shell).is_empty());
+            assert!(shell.cloud_busy.is_empty());
+        })
+        .unwrap();
+    for id in [
+        "cloud-archive-cancel",
+        "cloud-archive-anyway",
+        "cloud-archive-retry",
+    ] {
+        assert!(visual.debug_bounds(id).is_some(), "{id}");
+    }
+    // Retry once the problem is gone: copy first, then delete.
+    window
+        .update(visual, |shell, window, cx| {
+            shell.cloud_convert = fake_convert(shell.store.clone(), None);
+            shell.run_cloud_archive(ArchiveChoice::Delete, true, window, cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+    window
+        .update(visual, |shell, _, _| {
+            assert!(shell.cloud_archive.is_none() && !shell.is_cloud(id));
+            assert_eq!(archived_locals(shell).len(), 1);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn stop_anyway_skips_the_copy_and_archives_the_cloud_session_as_before(cx: &mut TestAppContext) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_convert = fake_convert(shell.store.clone(), Some("copy failed"));
+            shell.open_cloud_archive(vec![id], window, cx);
+            shell.confirm_cloud_archive(ArchiveChoice::Stop, window, cx);
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(gh.calls().is_empty());
+    window
+        .update(visual, |shell, window, cx| {
+            shell.run_cloud_archive(ArchiveChoice::Stop, false, window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(gh.calls(), ["codespace stop -c octo-abc"]);
+    window
+        .update(visual, |shell, _, cx| {
+            assert!(shell.cloud_archive.is_none());
+            assert!(shell.session_metadata(id, cx).summary.archived);
+            assert!(archived_locals(shell).is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_session_converted_by_an_earlier_attempt_is_not_converted_twice(cx: &mut TestAppContext) {
+    let (window, a, gh) = shell_with_cloud(cx);
+    let b = window
+        .update(cx, |shell, _, _| cloud_row(shell, "octo-abc"))
+        .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<i64>::new()));
+    window
+        .update(cx, |shell, window, cx| {
+            // Converting `b` fails; `a` works.
+            let inner = fake_convert(shell.store.clone(), None);
+            let log = calls.clone();
+            shell.cloud_convert = Arc::new(move |cloud, id, progress| {
+                log.lock().unwrap().push(id);
+                if id == b {
+                    Err("disk full".into())
+                } else {
+                    inner(cloud, id, progress)
+                }
+            });
+            shell.open_cloud_archive(vec![a, b], window, cx);
+            shell.confirm_cloud_archive(ArchiveChoice::Stop, window, cx);
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(gh.calls().is_empty());
+    window
+        .update(visual, |shell, window, cx| {
+            // `a` is already a local copy; the dialog only has `b` left.
+            assert_eq!(archived_locals(shell).len(), 1);
+            assert_eq!(shell.cloud_archive.as_ref().unwrap().ids(), vec![b]);
+            let inner = fake_convert(shell.store.clone(), None);
+            let log = calls.clone();
+            shell.cloud_convert = Arc::new(move |cloud, id, progress| {
+                log.lock().unwrap().push(id);
+                inner(cloud, id, progress)
+            });
+            shell.run_cloud_archive(ArchiveChoice::Stop, true, window, cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(*calls.lock().unwrap(), vec![a, b, b]);
+    assert_eq!(gh.calls(), ["codespace stop -c octo-abc"]);
+    window
+        .update(visual, |shell, _, _| {
+            assert_eq!(archived_locals(shell).len(), 2);
+            assert!(shell.cloud_archive.is_none());
         })
         .unwrap();
 }
@@ -638,10 +825,11 @@ fn multi_select_archives_locals_now_and_asks_once_for_every_cloud_session(cx: &m
         ["codespace stop -c octo-abc", "codespace stop -c octo-xyz"]
     );
     window
-        .update(visual, |shell, _, cx| {
+        .update(visual, |shell, _, _| {
             for id in [a, b, c] {
-                assert!(shell.session_metadata(id, cx).summary.archived);
+                assert!(!shell.is_cloud(id));
             }
+            assert_eq!(archived_locals(shell).len(), 3 + 1);
         })
         .unwrap();
 }
@@ -738,4 +926,35 @@ fn archive_copy_uses_the_session_title_clipped_with_a_fallback() {
     );
     let long = cloud::quoted_title(&"word ".repeat(40));
     assert!(long.ends_with("…”") && long.chars().count() <= 52, "{long}");
+}
+
+#[test]
+fn the_restore_message_names_the_branch_and_the_worktree_and_flags_conflicts() {
+    let mut done = monocode_core::cloud_sessions::Restored {
+        worktree: "/p-worktrees/feat-x".into(),
+        branch: "feat/x".into(),
+        head: "a".repeat(40),
+        patch_applied: true,
+        conflicts: None,
+    };
+    let text = cloud::restored_message(&done);
+    assert!(text.contains("feat/x") && text.contains("/p-worktrees/feat-x"));
+    assert!(!text.contains("did not apply"));
+    done.conflicts = Some("error: patch failed: a.txt:1\nmore".into());
+    let text = cloud::restored_message(&done);
+    assert!(text.contains("did not apply") && text.contains("patch failed"));
+    assert!(!text.contains("more"));
+}
+
+#[gpui::test]
+fn the_restore_action_is_only_offered_for_converted_sessions(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            // A cloud row and an in-memory store have nothing to restore.
+            assert!(!shell.codespace_restore_pending(id));
+            shell.restore_codespace_code(id, cx);
+            assert!(shell.cloud_busy.is_empty());
+        })
+        .unwrap();
 }

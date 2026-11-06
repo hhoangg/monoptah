@@ -994,3 +994,46 @@ fn gh_ssh_has_a_short_timeout_and_cp_a_long_one() {
     assert_eq!(ssh, Duration::from_secs(30));
     assert!(super::call_timeout(&v(&["codespace", "cp"])) > Duration::from_secs(300));
 }
+
+#[test]
+fn a_marked_ssh_script_may_run_for_minutes_and_run_script_adds_the_marker() {
+    let long = super::call_timeout(&v(&[
+        "codespace",
+        "ssh",
+        "-c",
+        "x",
+        "--",
+        "sh",
+        "-s",
+        "--",
+        super::LONG_SCRIPT_MARKER,
+    ]));
+    assert!(long > Duration::from_secs(120));
+    struct Echo(std::sync::Mutex<Vec<String>>);
+    impl GhRunner for Echo {
+        fn run(&self, args: &[String], stdin: Option<&str>) -> Result<GhOutput, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} <{}>", args.join(" "), stdin.unwrap()));
+            Ok(GhOutput {
+                success: true,
+                stdout: "out".into(),
+                stderr: String::new(),
+            })
+        }
+    }
+    let echo = Echo(Default::default());
+    assert_eq!(
+        super::run_script(&echo, "cs-1", "echo hi", true).unwrap(),
+        "out"
+    );
+    super::run_script(&echo, "cs-1", "echo hi", false).unwrap();
+    let calls = echo.0.lock().unwrap().clone();
+    assert_eq!(
+        calls[0],
+        "codespace ssh -c cs-1 -- sh -s -- monoptah-long <echo hi>"
+    );
+    assert_eq!(calls[1], "codespace ssh -c cs-1 -- sh -s <echo hi>");
+    assert!(super::run_script(&echo, "bad name", "x", false).is_err());
+}

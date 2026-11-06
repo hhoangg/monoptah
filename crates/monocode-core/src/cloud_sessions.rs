@@ -279,6 +279,9 @@ pub struct CloudSessions {
     states: Mutex<HashMap<String, (Instant, String)>>,
     ttl: Duration,
     origin: OriginFn,
+    claude_dir: std::path::PathBuf,
+    /// Parent of the codespace checkouts; only tests use another one.
+    workspace_root: String,
 }
 
 impl CloudSessions {
@@ -290,7 +293,19 @@ impl CloudSessions {
             states: Mutex::new(HashMap::new()),
             ttl: STATE_TTL,
             origin: Box::new(origin_url),
+            claude_dir: convert::default_claude_dir(),
+            workspace_root: "/workspaces".into(),
         }
+    }
+    #[cfg(test)]
+    fn with_claude_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.claude_dir = dir;
+        self
+    }
+    #[cfg(test)]
+    fn with_workspace_root(mut self, root: &std::path::Path) -> Self {
+        self.workspace_root = root.to_string_lossy().into_owned();
+        self
     }
     /// Real `gh` and the app's default connections.
     pub fn system(store: Database) -> Result<Self, String> {
@@ -567,7 +582,7 @@ impl CloudSessions {
                 .ok_or("This store keeps no session folders, so evidence cannot be saved.")?;
             (codespace, session.project.cwd.clone(), thread)
         };
-        let remote = evidence_remote_path(&workspace, remote_path)?;
+        let remote = evidence_remote_path(&self.workspace_root, &workspace, remote_path)?;
         let local_dir = thread.join(EVIDENCE_DIR);
         let mut pull = EvidencePull {
             session_id,
@@ -676,9 +691,13 @@ pub struct EvidencePull {
 
 /// The codespace path to pull: default `<workspace>/.evidence`; a given path is absolute or
 /// relative to the workspace and must stay strictly inside it.
-fn evidence_remote_path(workspace: &str, given: Option<&str>) -> Result<String, String> {
+fn evidence_remote_path(
+    root: &str,
+    workspace: &str,
+    given: Option<&str>,
+) -> Result<String, String> {
     let workspace = workspace.trim_end_matches('/');
-    if !workspace.starts_with("/workspaces/") {
+    if !workspace.starts_with(&format!("{}/", root.trim_end_matches('/'))) {
         return Err("This session has no codespace workspace to pull from.".into());
     }
     let Some(path) = given else {
@@ -750,5 +769,10 @@ pub struct SessionTarget {
     pub state: CloudState,
 }
 
+mod convert;
+pub use convert::*;
+
+#[cfg(test)]
+mod convert_tests;
 #[cfg(test)]
 mod tests;
