@@ -161,13 +161,33 @@ pub(super) fn apply_choice(
     }
 }
 
+const TITLE_LIMIT: usize = 48;
+
+/// The session title quoted for the dialog copy: single line, clipped with an
+/// ellipsis when long, and "this session" when there is no title.
+pub(super) fn quoted_title(title: &str) -> String {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return "This session".into();
+    }
+    if title.chars().count() <= TITLE_LIMIT {
+        return format!("“{title}”");
+    }
+    let clipped: String = title.chars().take(TITLE_LIMIT).collect();
+    format!("“{}…”", clipped.trim_end())
+}
+
 /// Which sessions and codespaces the dialog is about.
 pub(super) fn archive_summary(title: &str, groups: &[CodespaceGroup]) -> String {
     let sessions: usize = groups.iter().map(|g| g.ids.len()).sum();
     if let [group] = groups
         && sessions == 1
     {
-        return format!("“{title}” runs in the codespace {}.", group.codespace);
+        return format!(
+            "{} runs in the codespace {}.",
+            quoted_title(title),
+            group.codespace
+        );
     }
     let list = groups
         .iter()
@@ -636,7 +656,7 @@ impl Shell {
     ) -> Option<AnyElement> {
         let dialog = self.cloud_archive.as_ref()?;
         let default = default_choice(dialog.others());
-        let width = 460f32.min(window.viewport_size().width.as_f32() - 24.);
+        let width = 560f32.min(window.viewport_size().width.as_f32() - 24.);
         let weak = cx.weak_entity();
         let button = |id: &'static str,
                       label: &'static str,
@@ -714,12 +734,13 @@ impl Shell {
                                 .child(
                                     div()
                                         .flex()
-                                        .flex_wrap()
+                                        .flex_nowrap()
                                         .items_center()
                                         .justify_end()
                                         .gap_2()
                                         .child(
                                             crate::modal::ghost_button("cloud-archive-cancel", "Cancel")
+                                                .debug_selector(|| "cloud-archive-cancel".into())
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.close_cloud_archive(window, cx)

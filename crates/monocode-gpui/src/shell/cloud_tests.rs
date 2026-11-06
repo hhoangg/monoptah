@@ -419,6 +419,19 @@ fn archiving_a_cloud_session_opens_the_dialog_and_stop_calls_gh_then_archives(
     assert!(visual.debug_bounds("cloud-archive-stop").is_some());
     assert!(visual.debug_bounds("cloud-archive-delete").is_some());
     assert!(visual.debug_bounds("cloud-archive-keep").is_some());
+    let tops: Vec<_> = [
+        "cloud-archive-cancel",
+        "cloud-archive-keep",
+        "cloud-archive-delete",
+        "cloud-archive-stop",
+    ]
+    .into_iter()
+    .map(|id| visual.debug_bounds(id).map(|b| b.origin.y))
+    .collect();
+    assert!(
+        tops.iter().all(|top| *top == tops[0]),
+        "footer buttons share one row: {tops:?}"
+    );
     window
         .update(visual, |shell, window, cx| {
             shell.confirm_cloud_archive(ArchiveChoice::Stop, window, cx)
@@ -706,4 +719,23 @@ fn files_and_git_say_they_are_local_and_refuse_writes_while_a_cloud_session_is_a
             assert_eq!(crate::git_gate::codespace().as_deref(), Some("octo-abc"));
         })
         .unwrap();
+}
+
+#[test]
+fn archive_copy_uses_the_session_title_clipped_with_a_fallback() {
+    let group = |name: &str| cloud::CodespaceGroup {
+        codespace: name.into(),
+        ids: vec![1],
+        others: 0,
+    };
+    assert_eq!(
+        cloud::archive_summary("Fix login", &[group("octo-abc")]),
+        "“Fix login” runs in the codespace octo-abc."
+    );
+    assert_eq!(
+        cloud::archive_summary("  ", &[group("octo-abc")]),
+        "This session runs in the codespace octo-abc."
+    );
+    let long = cloud::quoted_title(&"word ".repeat(40));
+    assert!(long.ends_with("…”") && long.chars().count() <= 52, "{long}");
 }
