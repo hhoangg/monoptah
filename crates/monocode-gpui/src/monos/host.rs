@@ -426,8 +426,10 @@ impl Monos {
                         }
                     }
                     // Reads change nothing: they must not make the page reload.
-                    if call.action.starts_with("today.")
-                        && !matches!(call.action.as_str(), "today.list" | "today.sources")
+                    if (call.action.starts_with("today.")
+                        && !matches!(call.action.as_str(), "today.list" | "today.sources"))
+                        || (call.action == "sessions.pullEvidence"
+                            && call.input.get("taskId").is_some())
                     {
                         this.today.bump();
                     }
@@ -843,6 +845,34 @@ impl Monos {
                     }
                     Ok(json!({"accepted":true}))
                 }
+            }
+            "sessions.pullEvidence" => {
+                let session = match id(&input, "sessionId") {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.finish_call(call, Err(e), cx);
+                        return;
+                    }
+                };
+                // The caller comes from the checked session capability, never from the input.
+                let scope = cloud_api::EvidenceScope::Mono(self.today_caller(&call, &mono));
+                self.call_work(
+                    call,
+                    target,
+                    move |store| {
+                        let value = CloudApi::shared(&store)?.pull_evidence(
+                            &store,
+                            &project,
+                            session,
+                            &input,
+                            &scope,
+                            now_ms(),
+                        )?;
+                        Ok((value, Effect::None))
+                    },
+                    cx,
+                );
+                return;
             }
             "codespaces.list"
             | "codespaces.create"

@@ -26,6 +26,10 @@ impl GhRunner for FakeGh {
     fn run(&self, args: &[String], _stdin: Option<&str>) -> Result<GhOutput, String> {
         let line = args.join(" ");
         self.calls.lock().unwrap().push(line.clone());
+        // Evidence folder setup runs after every prepare; it is best effort.
+        if line.starts_with("codespace ssh") {
+            return ok("");
+        }
         self.rules
             .lock()
             .unwrap()
@@ -542,4 +546,173 @@ fn stop_runs_gh_and_drops_the_cached_state() {
 fn not_connected_errors_are_recognised_as_a_state() {
     assert!(is_not_connected(remote::CODESPACE_NOT_CONNECTED));
     assert!(!is_not_connected("Machine is unreachable"));
+}
+
+/// Fakes `gh codespace cp`: writes `files` (relative paths) under `<dest>/<basename>`.
+struct CpGh {
+    files: Vec<&'static str>,
+    missing: bool,
+    calls: Mutex<Vec<String>>,
+}
+impl GhRunner for CpGh {
+    fn run(&self, args: &[String], _stdin: Option<&str>) -> Result<GhOutput, String> {
+        let line = args.join(" ");
+        self.calls.lock().unwrap().push(line.clone());
+        if args.get(..2) != Some(&["codespace".to_string(), "cp".to_string()]) {
+            panic!("unexpected gh call: {line}");
+        }
+        if self.missing {
+            return fail("scp: /workspaces/widgets/.evidence: No such file or directory");
+        }
+        let remote = args[args.len() - 2].strip_prefix("remote:").unwrap();
+        let dest = Path::new(args.last().unwrap());
+        let root = dest.join(remote.rsplit('/').next().unwrap());
+        for file in &self.files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("{remote}/{file}")).unwrap();
+        }
+        ok("")
+    }
+}
+
+fn evidence_service(gh: Arc<CpGh>, dir: &Path) -> (CloudSessions, i64) {
+    let store = Arc::new(Mutex::new(Store::open(&dir.join("sessions.db")).unwrap()));
+    let host = FakeHost::with_machine("octo-abc");
+    let svc = CloudSessions::new(gh, host, store.clone())
+        .with_origin(|_| Ok("git@github.com:octo/widgets.git".into()));
+    // Bind a project by hand: no gh needed.
+    let project = store
+        .lock()
+        .unwrap()
+        .remember_cloud_project(
+            "env-octo-abc",
+            &json!({"id":"project-1","cwd":"/workspaces/widgets"}),
+            "/Users/me/widgets",
+            "octo-abc",
+        )
+        .unwrap();
+    let session = store
+        .lock()
+        .unwrap()
+        .create("claude", &project.key)
+        .unwrap();
+    (svc, session.id)
+}
+
+#[test]
+fn pull_evidence_copies_the_default_folder_into_the_session_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = Arc::new(CpGh {
+        files: vec!["shot.png", "sub/report.md"],
+        missing: false,
+        calls: Mutex::new(vec![]),
+    });
+    let (svc, id) = evidence_service(gh.clone(), dir.path());
+    let pull = svc.pull_evidence(id, None).unwrap();
+    assert_eq!(pull.codespace, "octo-abc");
+    assert_eq!(pull.remote_path, "/workspaces/widgets/.evidence");
+    assert_eq!(pull.files.len(), 2, "{pull:?}");
+    assert!(pull.files.iter().all(|f| f.starts_with(&pull.local_dir)));
+    assert_eq!(
+        std::fs::read_to_string(pull.local_dir.join("sub/report.md")).unwrap(),
+        "/workspaces/widgets/.evidence/sub/report.md"
+    );
+    assert!(pull.message.is_none());
+    let call = gh.calls.lock().unwrap()[0].clone();
+    assert!(
+        call.contains("-c octo-abc remote:/workspaces/widgets/.evidence "),
+        "{call}"
+    );
+    // No staging folder is left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(pull.local_dir.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(leftovers, vec!["evidence".to_string()]);
+}
+
+#[test]
+fn pulling_again_refreshes_files_and_keeps_older_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Arc::new(CpGh {
+        files: vec!["old.png", "same.txt"],
+        missing: false,
+        calls: Mutex::new(vec![]),
+    });
+    let (svc, id) = evidence_service(first, dir.path());
+    let pull = svc.pull_evidence(id, None).unwrap();
+    std::fs::write(pull.local_dir.join("same.txt"), "stale").unwrap();
+    let svc = CloudSessions::new(
+        Arc::new(CpGh {
+            files: vec!["same.txt"],
+            missing: false,
+            calls: Mutex::new(vec![]),
+        }),
+        FakeHost::with_machine("octo-abc"),
+        svc.store.clone(),
+    );
+    svc.pull_evidence(id, None).unwrap();
+    assert!(pull.local_dir.join("old.png").exists());
+    assert_eq!(
+        std::fs::read_to_string(pull.local_dir.join("same.txt")).unwrap(),
+        "/workspaces/widgets/.evidence/same.txt"
+    );
+}
+
+#[test]
+fn a_missing_evidence_folder_is_an_empty_pull_with_a_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = Arc::new(CpGh {
+        files: vec![],
+        missing: true,
+        calls: Mutex::new(vec![]),
+    });
+    let (svc, id) = evidence_service(gh, dir.path());
+    let pull = svc.pull_evidence(id, None).unwrap();
+    assert!(pull.files.is_empty());
+    assert!(pull.message.unwrap().contains("No evidence files found"));
+}
+
+#[test]
+fn a_custom_path_is_resolved_against_the_workspace_and_confined_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = Arc::new(CpGh {
+        files: vec!["a.png"],
+        missing: false,
+        calls: Mutex::new(vec![]),
+    });
+    let (svc, id) = evidence_service(gh.clone(), dir.path());
+    let pull = svc.pull_evidence(id, Some("out/shots/")).unwrap();
+    assert_eq!(pull.remote_path, "/workspaces/widgets/out/shots");
+    assert!(pull.local_dir.join("shots/a.png").exists());
+    let pull = svc
+        .pull_evidence(id, Some("/workspaces/widgets/report.pdf"))
+        .unwrap();
+    assert!(pull.local_dir.join("report.pdf/a.png").exists());
+    for bad in [
+        "../etc",
+        "/etc/passwd",
+        "/workspaces/other/x",
+        "/workspaces/widgets",
+        "/workspaces/widgets-evil/x",
+        "-r",
+        "",
+    ] {
+        assert!(svc.pull_evidence(id, Some(bad)).is_err(), "{bad:?}");
+    }
+    assert_eq!(gh.calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn local_and_unknown_sessions_cannot_pull_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = Arc::new(CpGh {
+        files: vec![],
+        missing: false,
+        calls: Mutex::new(vec![]),
+    });
+    let (svc, _) = evidence_service(gh.clone(), dir.path());
+    assert!(svc.pull_evidence(-999_999, None).is_err());
+    assert!(gh.calls.lock().unwrap().is_empty());
 }

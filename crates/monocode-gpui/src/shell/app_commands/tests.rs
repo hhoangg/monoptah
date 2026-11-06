@@ -901,6 +901,59 @@ mod cloud {
     }
 
     #[gpui::test]
+    fn pull_evidence_reaches_the_core_only_for_cloud_sessions_of_the_project(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, caller, path, host, gh, _dir) = setup_cloud(cx, AUTH_OK);
+        let cloud = add_cloud_session(window, &path, cx);
+        let other = window
+            .update(cx, |shell, _, cx| {
+                let summary = shell.store.lock().unwrap().create("claude", &path).unwrap();
+                let id = summary.id;
+                shell.add(summary, cx);
+                id
+            })
+            .unwrap();
+        host.0.lock().unwrap().clear();
+        let calls = gh.calls.lock().unwrap().len();
+        // A local session has no codespace to pull from.
+        let local = call(
+            window,
+            caller,
+            "p1",
+            "sessions.pullEvidence",
+            json!({"sessionId":other}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(local.contains("not a cloud session"), "{local}");
+        // Bad input is refused before anything runs.
+        let bad = call(
+            window,
+            caller,
+            "p2",
+            "sessions.pullEvidence",
+            json!({"sessionId":cloud,"path":"../x"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(bad.contains(".."), "{bad}");
+        // The in-memory test store keeps no session folders: the call got as far as the core.
+        let reached = call(
+            window,
+            caller,
+            "p3",
+            "sessions.pullEvidence",
+            json!({"sessionId":cloud}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(reached.contains("no session folders"), "{reached}");
+        assert_eq!(gh.calls.lock().unwrap().len(), calls, "no gh call was made");
+        assert!(host.0.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
     fn cloud_sessions_list_and_read_with_a_target_and_never_wake_the_codespace(
         cx: &mut TestAppContext,
     ) {

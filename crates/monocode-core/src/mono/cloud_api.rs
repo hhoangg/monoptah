@@ -12,6 +12,7 @@ use crate::cloud_sessions::{
 };
 use crate::codespaces::{self, GhRunner};
 use crate::store::Store;
+use crate::today::{visible_to, Actor, MonoCaller, Task};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -75,6 +76,60 @@ pub fn is_cloud_session_of(store: &Store, id: i64, project: &str) -> bool {
 }
 
 pub use crate::cloud_sessions::created_note;
+
+/// Who is pulling evidence, which decides the Today tasks it may annotate.
+#[derive(Clone, Debug)]
+pub enum EvidenceScope {
+    /// The Operator of a local project: tasks of that project, or tasks with no project that
+    /// no source owns. Notes are written as the user.
+    Operator,
+    /// A Mono: the tasks it can see, as for `today.note`.
+    Mono(MonoCaller),
+}
+
+impl EvidenceScope {
+    fn sees(&self, task: &Task, project: &str) -> bool {
+        match self {
+            Self::Mono(caller) => visible_to(task, caller),
+            Self::Operator => match task.project.as_deref() {
+                Some(own) => crate::files::path_key(own) == crate::files::path_key(project),
+                None => task.source_id.is_none(),
+            },
+        }
+    }
+    fn actor(&self) -> Actor {
+        match self {
+            Self::Operator => Actor::User,
+            Self::Mono(caller) => Actor::Mono(caller.clone()),
+        }
+    }
+}
+
+/// Character budget of a note's file list; the store caps a note at 5000.
+const NOTE_BUDGET: usize = 4500;
+
+fn evidence_note(title: &str, codespace: &str, urls: &[String], now_ms: u64) -> String {
+    let when = chrono::DateTime::from_timestamp_millis(now_ms as i64)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_default();
+    let title: String = title.chars().take(80).collect();
+    let mut body =
+        format!("Evidence from cloud session \"{title}\" (codespace {codespace}), pulled {when}:");
+    let mut listed = 0;
+    for url in urls {
+        // Whole URLs only: a clipped file URL would point nowhere.
+        if body.chars().count() + url.chars().count() + 1 > NOTE_BUDGET {
+            break;
+        }
+        body.push('\n');
+        body.push_str(url);
+        listed += 1;
+    }
+    if listed < urls.len() {
+        body.push_str(&format!("\n... and {} more", urls.len() - listed));
+    }
+    body
+}
 
 /// Whether a user-initiated send to a cloud session should (re)connect its codespace.
 ///
@@ -308,6 +363,70 @@ impl CloudApi {
             &std::sync::atomic::AtomicBool::new(false),
             &mut |_| {},
         )
+    }
+    /// `sessions.pullEvidence`: copies the files a cloud session left in its codespace (default
+    /// `.evidence/`, or `path`) to the session's local folder and returns their paths. With a
+    /// task (`taskId`, a Today task id or key the caller may see) it also appends a note listing
+    /// the files as `file://` URLs, so a local agent can write the report later; no note is
+    /// added when nothing was pulled. A user action: it may start a stopped codespace. BLOCKS.
+    pub fn pull_evidence(
+        &self,
+        store: &Database,
+        project: &str,
+        session_id: i64,
+        input: &Value,
+        scope: &EvidenceScope,
+        now: u64,
+    ) -> Result<Value, String> {
+        let lock = || store.lock().map_err(|_| "Native session store unavailable");
+        if !is_cloud_session_of(&*lock()?, session_id, project) {
+            return Err("Session is not a cloud session of this project.".into());
+        }
+        let task = match input.get("taskId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.trim().is_empty() && id.len() <= 200 => {
+                let id = id.trim();
+                let found = lock()?
+                    .today_task(id)?
+                    .filter(|task| scope.sees(task, project))
+                    .ok_or("Task not found")?;
+                Some(found.id)
+            }
+            Some(_) => return Err("taskId must be a Today task id or key".into()),
+        };
+        let path = input.get("path").and_then(Value::as_str);
+        let pull = self.cloud.pull_evidence(session_id, path)?;
+        let files: Vec<String> = pull
+            .files
+            .iter()
+            .map(|f| f.to_string_lossy().into_owned())
+            .collect();
+        let urls: Vec<String> = pull
+            .files
+            .iter()
+            .filter_map(|f| url::Url::from_file_path(f).ok().map(String::from))
+            .collect();
+        let mut value = json!({
+            "sessionId":session_id,
+            "codespace":pull.codespace,
+            "remotePath":pull.remote_path,
+            "localDir":pull.local_dir,
+            "files":files,
+            "fileUrls":urls,
+        });
+        if let Some(message) = &pull.message {
+            value["message"] = json!(message);
+        }
+        if let (Some(task), false) = (task, urls.is_empty()) {
+            let title = lock()?
+                .remote_session(session_id)?
+                .map(|s| s.summary.title)
+                .unwrap_or_default();
+            let body = evidence_note(&title, &pull.codespace, &urls, now);
+            let note = lock()?.today_note(&task, &body, &scope.actor(), now)?;
+            value["note"] = json!({"id":note.id,"taskId":note.task_id});
+        }
+        Ok(value)
     }
     /// One session's target, `None` for a local session. Never wakes anything.
     pub fn target_of(&self, session_id: i64) -> Option<SessionTarget> {

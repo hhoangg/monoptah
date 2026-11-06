@@ -11,6 +11,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "codespaces.stop"|"codespaces.delete"=>"name project",
         "sessions.send"=>"sessionId prompt project notifyOnComplete completionDelivery",
         "sessions.draft"=>"sessionId prompt project",
+        "sessions.pullEvidence"=>"sessionId project path taskId",
         "sessions.stop"|"sessions.archive"=>"sessionId project",
         "sessions.delete"=>"sessionId project providerFiles",
         "worktrees.create"=>"branch base existing project",
@@ -134,6 +135,21 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     }
     if action.starts_with("codespaces.") {
         validate_codespace_fields(input)?;
+    }
+    if action == "sessions.pullEvidence" {
+        if input.get("sessionId").is_none() {
+            return Err("Provide sessionId".into());
+        }
+        if let Some(path) = input.get("path").and_then(Value::as_str) {
+            crate::codespaces::valid_remote_path(path)?;
+        }
+        if input
+            .get("taskId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.trim().is_empty() || id.len() > 200)
+        {
+            return Err("taskId must be a Today task id or key".into());
+        }
     }
     if input["draft"] == true && input["notifyOnComplete"] == true {
         return Err("An unsent draft cannot send a completion notification".into());
@@ -575,6 +591,26 @@ mod tests {
             &json!({"prompt":"x","parentSessionId":-4})
         )
         .is_err());
+    }
+    #[test]
+    fn pull_evidence_takes_a_session_and_checked_optional_fields() {
+        assert!(validate("sessions.pullEvidence", &json!({"sessionId":-5})).is_ok());
+        assert!(validate(
+            "sessions.pullEvidence",
+            &json!({"sessionId":-5,"path":"out/shots","taskId":"manual:7","project":"/p"})
+        )
+        .is_ok());
+        for bad in [
+            json!({}),
+            json!({"sessionId":-5,"path":"-r"}),
+            json!({"sessionId":-5,"path":"../x"}),
+            json!({"sessionId":-5,"path":5}),
+            json!({"sessionId":-5,"taskId":" "}),
+            json!({"sessionId":-5,"taskId":7}),
+            json!({"sessionId":-5,"force":true}),
+        ] {
+            assert!(validate("sessions.pullEvidence", &bad).is_err(), "{bad}");
+        }
     }
     #[test]
     fn codespace_actions_take_exactly_their_fields() {

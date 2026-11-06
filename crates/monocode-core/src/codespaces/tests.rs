@@ -662,3 +662,145 @@ fn other_secrets_are_only_trimmed() {
     let fake = Fake::new(vec![]);
     assert!(set_secret(&fake, "K", " \n ", "a/b").is_err());
 }
+
+#[test]
+fn copy_from_argv_expands_only_a_safe_literal_path() {
+    let fake = Fake::new(vec![ok("")]);
+    copy_from(
+        &fake,
+        "cs-1",
+        "/workspaces/widgets/.evidence",
+        Path::new("/tmp/out"),
+    )
+    .unwrap();
+    assert_eq!(
+        fake.argv(0),
+        v(&[
+            "codespace",
+            "cp",
+            "-e",
+            "-r",
+            "-c",
+            "cs-1",
+            "remote:/workspaces/widgets/.evidence",
+            "/tmp/out"
+        ])
+    );
+}
+
+#[test]
+fn copy_from_rejects_unsafe_input_without_calling_gh() {
+    let fake = Fake::new(vec![]);
+    for path in [
+        "",
+        "-r",
+        "--help",
+        "a\nb",
+        "a\0b",
+        "/x/../etc",
+        "/x y",
+        "/x;rm",
+        "~/x",
+        "/x/*",
+        "$HOME",
+        "/x`id`",
+        "/x{a,b}",
+    ] {
+        assert!(
+            copy_from(&fake, "cs-1", path, Path::new("/tmp/out")).is_err(),
+            "{path:?}"
+        );
+    }
+    assert!(copy_from(&fake, "bad name", "/x", Path::new("/tmp/out")).is_err());
+    assert!(copy_from(&fake, "cs-1", "/x", Path::new("relative")).is_err());
+    assert!(copy_from(&fake, "cs-1", "/x", Path::new("-r")).is_err());
+    assert!(fake.calls().is_empty());
+}
+
+#[test]
+fn copy_from_reports_gh_failure_and_missing_path() {
+    let fake = Fake::new(vec![fail("scp: /x: No such file or directory")]);
+    let error = copy_from(&fake, "cs-1", "/x", Path::new("/tmp/out")).unwrap_err();
+    assert!(is_missing_path(&error), "{error}");
+    assert!(!is_missing_path("permission denied"));
+}
+
+#[test]
+fn copy_gets_a_long_timeout() {
+    assert!(
+        super::call_timeout(&v(&["codespace", "cp", "-r"]))
+            > super::call_timeout(&v(&["codespace", "create"]))
+    );
+}
+
+#[test]
+fn prepare_evidence_sends_an_idempotent_script_over_stdin() {
+    let fake = Fake::new(vec![ok("")]);
+    prepare_evidence(&fake, "cs-1", "/workspaces/widgets").unwrap();
+    assert_eq!(
+        fake.argv(0),
+        v(&["codespace", "ssh", "-c", "cs-1", "--", "sh", "-s"])
+    );
+    let script = fake.calls()[0].1.clone().unwrap();
+    assert!(script.contains("d='/workspaces/widgets'"));
+    assert!(script.contains(".git/info/exclude"));
+    assert!(!script.contains(".gitignore"));
+    assert!(script.contains("grep -qxF '.evidence/'"));
+    assert!(script.contains("monoptah-evidence"));
+}
+
+#[test]
+fn prepare_evidence_rejects_unsafe_workspaces_and_reports_failures() {
+    let fake = Fake::new(vec![fail("ssh: connect failed")]);
+    for workspace in [
+        "",
+        "/etc",
+        "/workspaces/",
+        "/workspaces/a'b",
+        "/workspaces/a b",
+        "/workspaces/a/b",
+    ] {
+        assert!(
+            prepare_evidence(&fake, "cs-1", workspace).is_err(),
+            "{workspace}"
+        );
+    }
+    assert!(fake.calls().is_empty());
+    let error = prepare_evidence(&fake, "cs-1", "/workspaces/widgets").unwrap_err();
+    assert!(error.contains("connect failed"), "{error}");
+}
+
+#[test]
+fn the_evidence_script_is_valid_shell_and_does_its_job() {
+    let home = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    // Stand-in checkout; the script's workspace is a fixed /workspaces path, so rewrite it.
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(ws.path())
+        .status()
+        .unwrap();
+    let script =
+        evidence_script("/workspaces/w").replace("/workspaces/w", ws.path().to_str().unwrap());
+    for _ in 0..2 {
+        let mut child = std::process::Command::new("sh")
+            .arg("-s")
+            .env("HOME", home.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+    assert!(ws.path().join(".evidence").is_dir());
+    let exclude = std::fs::read_to_string(ws.path().join(".git/info/exclude")).unwrap();
+    assert_eq!(exclude.matches(".evidence/").count(), 1);
+    let guide = std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap();
+    assert_eq!(guide.matches("monoptah-evidence").count(), 1);
+    assert!(guide.contains(&format!("{}/.evidence/", ws.path().display())));
+}

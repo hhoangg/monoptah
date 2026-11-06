@@ -93,7 +93,10 @@ pub(crate) mod fakes {
                 LIST
             } else if line.contains("codespace view") {
                 &view
-            } else if line.contains("codespace stop") || line.contains("codespace delete") {
+            } else if line.contains("codespace stop")
+                || line.contains("codespace delete")
+                || line.contains("codespace ssh")
+            {
                 ""
             } else if line.contains("secrets") {
                 r#"{"secrets":[]}"#

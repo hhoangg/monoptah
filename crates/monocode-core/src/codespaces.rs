@@ -19,6 +19,8 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const READY_POLL: Duration = Duration::from_secs(5);
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const SLOW_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// `gh codespace cp` may first have to wake the codespace, then move a directory.
+const COPY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DISPLAY_NAME_MAX: usize = 48;
 const GH_MISSING: &str = "GitHub CLI (gh) is not installed";
 const SCOPE_HINT: &str = "The GitHub token is missing the `codespace` scope. \
@@ -84,6 +86,15 @@ fn spawn_error(error: std::io::Error) -> String {
 /// calls get longer; everything else (auth, listing, secrets) must answer quickly so a
 /// keyring prompt or a dead network cannot hang a caller forever.
 pub fn call_timeout(args: &[String]) -> Duration {
+    if matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("codespace"), Some("cp" | "ssh"))
+    ) {
+        return COPY_TIMEOUT;
+    }
     let slow = matches!(
         (
             args.first().map(String::as_str),
@@ -582,6 +593,125 @@ pub fn delete(runner: &dyn GhRunner, name: &str) -> Result<(), String> {
     run_ok(
         runner,
         argv(&["codespace", "delete", "-c", name, "--force"]),
+    )
+    .map(|_| ())
+}
+
+/// Marks the guidance block in `~/.claude/CLAUDE.md` of a codespace so it is written once.
+const EVIDENCE_MARKER: &str = "monoptah-evidence";
+
+/// Shell script (for `sh -s`) that prepares the evidence folder of `workspace`: creates
+/// `<workspace>/.evidence`, keeps it out of git through `.git/info/exclude` (never the repo's
+/// `.gitignore`), and tells Claude Code about it in the codespace user's `~/.claude/CLAUDE.md`.
+/// Idempotent; nothing inside the repo is tracked or changed.
+fn evidence_script(workspace: &str) -> String {
+    format!(
+        r#"set -e
+d='{workspace}'
+mkdir -p "$d/.evidence"
+if [ -d "$d/.git" ]; then
+  mkdir -p "$d/.git/info"
+  grep -qxF '.evidence/' "$d/.git/info/exclude" 2>/dev/null || echo '.evidence/' >> "$d/.git/info/exclude"
+fi
+mkdir -p "$HOME/.claude"
+f="$HOME/.claude/CLAUDE.md"
+if ! grep -q '{EVIDENCE_MARKER}' "$f" 2>/dev/null; then
+cat >> "$f" <<'GUIDE'
+
+<!-- {EVIDENCE_MARKER} -->
+## Evidence for the local user
+You run in a GitHub codespace. Save screenshots, test output and written reports that prove
+your work under `{workspace}/.evidence/` (create subfolders freely). That folder is excluded
+from git and is never committed. The user's Monoptah app copies it to their machine on request,
+so do not put secrets there. Mention the file names in your final message.
+GUIDE
+fi
+"#
+    )
+}
+
+/// Best-effort setup of the evidence folder and agent guidance in a running codespace.
+/// `workspace` is the repo checkout, `/workspaces/<repo>`.
+pub fn prepare_evidence(runner: &dyn GhRunner, name: &str, workspace: &str) -> Result<(), String> {
+    valid_codespace_name(name)?;
+    let repo = workspace
+        .strip_prefix("/workspaces/")
+        .filter(|repo| valid_segment(repo))
+        .ok_or_else(|| format!("Invalid workspace `{workspace}`"))?;
+    let args = argv(&["codespace", "ssh", "-c", name, "--", "sh", "-s"]);
+    let script = evidence_script(&format!("/workspaces/{repo}"));
+    let out = runner.run(&args, Some(&script))?;
+    if out.success {
+        Ok(())
+    } else {
+        Err(failure(&args, &out))
+    }
+}
+
+/// Checks a path inside a codespace before it is handed to `gh codespace cp`.
+///
+/// gh without `-e` quotes the remote name in a way modern `scp` (SFTP mode) takes literally, so
+/// every copy fails with "No such file or directory" (verified against a real codespace). We
+/// therefore pass `-e`, which hands the name to the remote shell: only a conservative character
+/// set is accepted, so nothing can expand, split or look like an option, and `..` is refused.
+pub fn valid_remote_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.len() > 1024 {
+        return Err("Remote path must be 1 to 1024 characters".into());
+    }
+    if path.starts_with('-') {
+        return Err("Remote path must not start with `-`".into());
+    }
+    if !path
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-' | b'+' | b'@'))
+    {
+        return Err(
+            "Remote path may only use letters, digits and . _ / - + @ (no spaces or shell characters)"
+                .into(),
+        );
+    }
+    if path.split('/').any(|part| part == "..") {
+        return Err("Remote path must not contain `..`".into());
+    }
+    Ok(())
+}
+
+/// True when a `copy_from` error says the remote path does not exist.
+pub fn is_missing_path(error: &str) -> bool {
+    error.contains("No such file or directory")
+}
+
+/// Copies `remote_path` (a file or directory inside the codespace, see [`valid_remote_path`]) into the existing local
+/// directory `local_dir`, recursively, like `cp -r remote_path local_dir`: a directory arrives
+/// as `local_dir/<its name>`. Starts a stopped codespace (gh does). A missing remote path is an
+/// error for which [`is_missing_path`] is true. Needs an absolute `local_dir`.
+pub fn copy_from(
+    runner: &dyn GhRunner,
+    name: &str,
+    remote_path: &str,
+    local_dir: &Path,
+) -> Result<(), String> {
+    valid_codespace_name(name)?;
+    valid_remote_path(remote_path)?;
+    // scp reads `host:path` for a relative local path with a colon; absolute paths are safe.
+    if !local_dir.is_absolute() {
+        return Err("Local destination must be an absolute path".into());
+    }
+    let local = local_dir
+        .to_str()
+        .ok_or("Local destination is not valid UTF-8")?;
+    run_ok(
+        runner,
+        vec![
+            "codespace".into(),
+            "cp".into(),
+            "-e".into(),
+            "-r".into(),
+            "-c".into(),
+            name.into(),
+            format!("remote:{remote_path}"),
+            local.into(),
+        ],
     )
     .map(|_| ())
 }

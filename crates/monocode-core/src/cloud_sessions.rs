@@ -39,6 +39,14 @@
 //!   call from a worker thread on a user-initiated send/retry/stop, never from
 //!   background polling.
 //!
+//! * [`CloudSessions::pull_evidence`] `(session_id, Option<remote_path>) -> EvidencePull`:
+//!   copy the files an agent left in the codespace (default
+//!   `/workspaces/<repo>/.evidence`) into the session's own folder
+//!   `<db>.threads/<session>/evidence/` (a custom path lands in `evidence/<its name>`),
+//!   merging over earlier pulls, and return the local
+//!   file paths. A missing remote folder is `Ok` with no files and a `message`. This is a
+//!   user action: `gh codespace cp` starts a stopped codespace. BLOCKS (gh).
+//!
 //! Errors are user-facing `String`s. `CODESPACE_NOT_CONNECTED` from
 //! `Connections::request` means "stopped / not connected": render it as a state
 //! (see [`is_not_connected`]).
@@ -409,6 +417,11 @@ impl CloudSessions {
         let project =
             self.host
                 .request(&machine.id, "projects.open", json!({"cwd": remote_cwd}))?;
+        // Best effort: a failure here must not block the session, the agent just has no hint.
+        progress("Preparing the evidence folder");
+        if let Err(error) = codespaces::prepare_evidence(&*self.gh, &name, &remote_cwd) {
+            progress(&format!("Could not prepare the evidence folder: {error}"));
+        }
         let remembered = self.store()?.remember_cloud_project(
             &machine.environment_id,
             &project,
@@ -533,6 +546,76 @@ impl CloudSessions {
     /// Codespace binding of one session (desktop session id), with its cached
     /// state. `None` for non-cloud sessions. May run `gh codespace view` on a
     /// cache miss; never wakes anything.
+    pub fn pull_evidence(
+        &self,
+        session_id: i64,
+        remote_path: Option<&str>,
+    ) -> Result<EvidencePull, String> {
+        let (codespace, workspace, thread) = {
+            let store = self.store()?;
+            let session = store
+                .remote_session(session_id)?
+                .ok_or("Session not found")?;
+            let codespace = session
+                .project
+                .codespace
+                .clone()
+                .ok_or("This session does not run in a codespace.")?;
+            let thread = store
+                .thread_dir(session_id)?
+                .ok_or("This store keeps no session folders, so evidence cannot be saved.")?;
+            (codespace, session.project.cwd.clone(), thread)
+        };
+        let remote = evidence_remote_path(&workspace, remote_path)?;
+        let local_dir = thread.join(EVIDENCE_DIR);
+        let mut pull = EvidencePull {
+            session_id,
+            codespace: codespace.clone(),
+            remote_path: remote.clone(),
+            local_dir: local_dir.clone(),
+            files: vec![],
+            message: None,
+        };
+        std::fs::create_dir_all(&thread).map_err(|e| e.to_string())?;
+        let staging = thread.join(format!(
+            "evidence.pull-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+        let copied = codespaces::copy_from(&*self.gh, &codespace, &remote, &staging);
+        // gh may have started the codespace.
+        self.invalidate(&codespace);
+        let result = match copied {
+            Ok(()) => {
+                let name = remote.rsplit('/').next().unwrap_or_default();
+                let source = staging.join(name);
+                match std::fs::symlink_metadata(&source) {
+                    // The default folder is the evidence folder itself; anything else keeps
+                    // its name so two pulls cannot overwrite each other.
+                    Ok(meta) if meta.is_dir() && remote_path.is_none() => {
+                        merge_files(&source, &local_dir, &mut pull.files)
+                    }
+                    Ok(_) => merge_files(&source, &local_dir.join(name), &mut pull.files),
+                    Err(_) => Ok(()),
+                }
+            }
+            Err(e) if codespaces::is_missing_path(&e) => Ok(()),
+            Err(e) => Err(e),
+        };
+        let _ = std::fs::remove_dir_all(&staging);
+        result?;
+        pull.files.sort();
+        if pull.files.is_empty() {
+            pull.message = Some(format!(
+                "No evidence files found at {remote} in codespace {codespace}."
+            ));
+        }
+        Ok(pull)
+    }
+
     pub fn target_for_session(&self, session_id: i64) -> Option<SessionTarget> {
         let codespace = self
             .store()
@@ -544,6 +627,75 @@ impl CloudSessions {
         let state = self.cloud_state(&codespace);
         Some(SessionTarget { codespace, state })
     }
+}
+
+/// Folder inside a session's thread folder that holds pulled evidence.
+pub const EVIDENCE_DIR: &str = "evidence";
+
+/// What [`CloudSessions::pull_evidence`] fetched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidencePull {
+    pub session_id: i64,
+    pub codespace: String,
+    /// The folder or file that was copied, as an absolute codespace path.
+    pub remote_path: String,
+    /// The session's local evidence folder.
+    pub local_dir: std::path::PathBuf,
+    /// Local files from this pull, sorted. Empty when there was nothing to pull.
+    pub files: Vec<std::path::PathBuf>,
+    /// Why `files` is empty.
+    pub message: Option<String>,
+}
+
+/// The codespace path to pull: default `<workspace>/.evidence`; a given path is absolute or
+/// relative to the workspace and must stay strictly inside it.
+fn evidence_remote_path(workspace: &str, given: Option<&str>) -> Result<String, String> {
+    let workspace = workspace.trim_end_matches('/');
+    if !workspace.starts_with("/workspaces/") {
+        return Err("This session has no codespace workspace to pull from.".into());
+    }
+    let Some(path) = given else {
+        return Ok(format!("{workspace}/.evidence"));
+    };
+    codespaces::valid_remote_path(path)?;
+    let path = path.trim_end_matches('/');
+    let full = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{workspace}/{}", path.trim_start_matches("./"))
+    };
+    if full.len() > workspace.len() + 1 && full.starts_with(&format!("{workspace}/")) {
+        Ok(full)
+    } else {
+        Err(format!(
+            "Evidence path must be a file or folder inside {workspace}"
+        ))
+    }
+}
+
+/// Moves the regular files under `source` into `dest` (the final path of `source` itself),
+/// replacing same-named files and skipping symlinks. Pushes each final path.
+fn merge_files(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(source).map_err(|e| e.to_string())?;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            merge_files(&entry.path(), &dest.join(entry.file_name()), out)?;
+        }
+    } else if meta.is_file() {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if std::fs::rename(source, dest).is_err() {
+            std::fs::copy(source, dest).map_err(|e| e.to_string())?;
+        }
+        out.push(dest.to_path_buf());
+    }
+    Ok(())
 }
 
 /// Result of a codespace delete that took effect.

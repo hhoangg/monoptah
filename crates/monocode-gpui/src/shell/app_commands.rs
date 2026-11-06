@@ -694,6 +694,30 @@ impl Shell {
                     }
                 }
             }
+            "sessions.pullEvidence" => {
+                match self.app_target(&input, call.session, &project, false, cx) {
+                    Ok(id) => {
+                        // gh copy (it may boot the codespace) and a note: off the UI thread.
+                        self.app_background(
+                            call,
+                            move |store| {
+                                let value = CloudApi::shared(&store)?.pull_evidence(
+                                    &store,
+                                    &project,
+                                    id,
+                                    &input,
+                                    &cloud_api::EvidenceScope::Operator,
+                                    monocode_core::time::now_ms(),
+                                )?;
+                                Ok((value, Effect::None))
+                            },
+                            cx,
+                        );
+                        return;
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             "codespaces.list"
             | "codespaces.create"
             | "codespaces.stop"

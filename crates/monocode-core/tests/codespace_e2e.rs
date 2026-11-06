@@ -296,3 +296,81 @@ fn codespace_end_to_end() {
 fn snapshot_failed(snapshot: &Value) -> bool {
     snapshot["status"] == "failed" || snapshot["status"] == "error"
 }
+
+/// Evidence pull against a real codespace: writes a file over `gh codespace ssh`, then copies
+/// it back with `codespaces::copy_from` and with `CloudSessions::pull_evidence`. Needs the same
+/// `MONOCODE_TEST_CODESPACE` (a codespace of hhoangg/monoptah) and never creates or deletes one.
+#[test]
+#[ignore = "needs real gh and MONOCODE_TEST_CODESPACE"]
+fn codespace_evidence_pull() {
+    START.get_or_init(Instant::now);
+    let name = std::env::var("MONOCODE_TEST_CODESPACE").expect("set MONOCODE_TEST_CODESPACE");
+    let scratch = std::env::temp_dir().join(format!("monoptah-cs-evidence-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let gh = SystemGh;
+    let ssh = |script: &str| {
+        let args: Vec<String> = ["codespace", "ssh", "-c", &name, "--", "sh", "-s"]
+            .map(String::from)
+            .to_vec();
+        let out = monocode_core::codespaces::GhRunner::run(&gh, &args, Some(script)).unwrap();
+        assert!(out.success, "ssh failed: {}", out.stderr);
+        out.stdout
+    };
+
+    // The setup the app runs after preparing a target: folder, git exclude, agent guidance.
+    codespaces::prepare_evidence(&gh, &name, "/workspaces/monoptah").unwrap();
+    step("prepare_evidence ok");
+    let exclude = ssh("cat /workspaces/monoptah/.git/info/exclude");
+    assert!(exclude.lines().any(|l| l == ".evidence/"), "{exclude}");
+    let guide = ssh("cat \"$HOME/.claude/CLAUDE.md\"");
+    assert!(guide.contains("monoptah-evidence"));
+    ssh("echo t6-ok > /workspaces/monoptah/.evidence/t6.txt && mkdir -p /workspaces/monoptah/.evidence/sub && echo nested > /workspaces/monoptah/.evidence/sub/n.txt");
+    step("remote files written");
+
+    // 1. copy_from directly.
+    let direct = scratch.join("direct");
+    std::fs::create_dir_all(&direct).unwrap();
+    codespaces::copy_from(&gh, &name, "/workspaces/monoptah/.evidence", &direct).unwrap();
+    let copied = direct.join(".evidence/t6.txt");
+    assert_eq!(std::fs::read_to_string(&copied).unwrap().trim(), "t6-ok");
+    step(&format!("copy_from ok: {}", copied.display()));
+    let missing = codespaces::copy_from(&gh, &name, "/workspaces/monoptah/.no-such-dir", &direct)
+        .unwrap_err();
+    assert!(codespaces::is_missing_path(&missing), "{missing}");
+
+    // 2. The session-level pull into <db>.threads/<session>/evidence.
+    let store = Arc::new(Mutex::new(
+        Store::open(&scratch.join("sessions.db")).unwrap(),
+    ));
+    let session = {
+        let db = store.lock().unwrap();
+        let project = db
+            .remember_cloud_project(
+                "env-e2e",
+                &json!({"id":"p1","cwd":"/workspaces/monoptah"}),
+                "/tmp/local-project",
+                &name,
+            )
+            .unwrap();
+        db.create("claude", &project.key).unwrap().id
+    };
+    let cloud = CloudSessions::new(
+        Arc::new(SystemGh),
+        Arc::new(Arc::new(Connections::new(scratch.join("machines")))),
+        store,
+    );
+    let pull = cloud.pull_evidence(session, None).unwrap();
+    step(&format!("pull_evidence files: {:?}", pull.files));
+    assert!(pull.files.iter().any(|f| f.ends_with("t6.txt")), "{pull:?}");
+    assert!(
+        pull.files.iter().any(|f| f.ends_with("sub/n.txt")),
+        "{pull:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(pull.local_dir.join("t6.txt"))
+            .unwrap()
+            .trim(),
+        "t6-ok"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+}

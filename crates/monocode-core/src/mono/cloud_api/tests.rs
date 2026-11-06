@@ -30,6 +30,10 @@ impl GhRunner for FakeGh {
     fn run(&self, args: &[String], stdin: Option<&str>) -> Result<GhOutput, String> {
         let line = args.join(" ");
         self.calls.lock().unwrap().push(line.clone());
+        // Evidence folder setup runs after every prepare; it is best effort.
+        if line.starts_with("codespace ssh") {
+            return ok("");
+        }
         if let Some(text) = stdin {
             self.stdin.lock().unwrap().push(text.into());
         }
@@ -545,4 +549,177 @@ fn a_named_start_error_is_not_decorated() {
         )
         .unwrap_err();
     assert!(!error.contains("was created"), "{error}");
+}
+
+struct CpGh {
+    files: Vec<&'static str>,
+}
+impl GhRunner for CpGh {
+    fn run(&self, args: &[String], _stdin: Option<&str>) -> Result<GhOutput, String> {
+        assert_eq!(&args[..2], ["codespace", "cp"], "{args:?}");
+        let remote = args[args.len() - 2].strip_prefix("remote:").unwrap();
+        let root = Path::new(args.last().unwrap()).join(remote.rsplit('/').next().unwrap());
+        for file in &self.files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        }
+        ok("")
+    }
+}
+
+struct Evidence {
+    api: CloudApi,
+    store: Database,
+    session: i64,
+    project: &'static str,
+    _dir: tempfile::TempDir,
+}
+fn evidence(files: Vec<&'static str>) -> Evidence {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Mutex::new(Store::open(&dir.path().join("s.db")).unwrap()));
+    let api = CloudApi::new(
+        Arc::new(CpGh { files }),
+        Arc::new(FakeHost::default()),
+        store.clone(),
+    );
+    let project = "/Users/me/widgets";
+    let session = {
+        let db = store.lock().unwrap();
+        let remote = db
+            .remember_cloud_project(
+                "env-1",
+                &json!({"id":"p1","cwd":"/workspaces/widgets"}),
+                project,
+                "octo-abc",
+            )
+            .unwrap();
+        db.create("claude", &remote.key).unwrap().id
+    };
+    Evidence {
+        api,
+        store,
+        session,
+        project,
+        _dir: dir,
+    }
+}
+fn add_task(store: &Database, title: &str, project: Option<&str>) -> String {
+    store
+        .lock()
+        .unwrap()
+        .today_add(
+            &crate::today::NewTask {
+                title: title.into(),
+                project: project.map(str::to_owned),
+                ..Default::default()
+            },
+            &Actor::User,
+            1_700_000_000_000,
+        )
+        .unwrap()
+        .id
+}
+
+#[test]
+fn pull_evidence_appends_a_note_with_file_urls_to_the_task() {
+    let e = evidence(vec!["a b.png", "r.md"]);
+    let task = add_task(&e.store, "Check login", Some(e.project));
+    let value = e
+        .api
+        .pull_evidence(
+            &e.store,
+            e.project,
+            e.session,
+            &json!({"taskId":task}),
+            &EvidenceScope::Operator,
+            1_700_000_100_000,
+        )
+        .unwrap();
+    assert_eq!(value["files"].as_array().unwrap().len(), 2);
+    let urls = value["fileUrls"].as_array().unwrap();
+    assert!(urls[0].as_str().unwrap().starts_with("file:///"));
+    assert!(urls[0].as_str().unwrap().ends_with("a%20b.png"));
+    let notes = e.store.lock().unwrap().today_notes(&task).unwrap();
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0].body.contains("codespace octo-abc"),
+        "{}",
+        notes[0].body
+    );
+    assert!(notes[0].body.contains(urls[1].as_str().unwrap()));
+    assert_eq!(value["note"]["id"], json!(notes[0].id));
+}
+
+#[test]
+fn pull_evidence_without_a_task_adds_no_note_and_an_empty_pull_adds_none() {
+    let e = evidence(vec![]);
+    let task = add_task(&e.store, "t", Some(e.project));
+    let value = e
+        .api
+        .pull_evidence(
+            &e.store,
+            e.project,
+            e.session,
+            &json!({"taskId":task}),
+            &EvidenceScope::Operator,
+            1_700_000_100_000,
+        )
+        .unwrap();
+    assert!(value["message"].as_str().unwrap().contains("No evidence"));
+    assert!(value.get("note").is_none());
+    assert!(e
+        .store
+        .lock()
+        .unwrap()
+        .today_notes(&task)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn pull_evidence_checks_the_session_and_the_task_before_pulling() {
+    let e = evidence(vec!["a.png"]);
+    let other = add_task(&e.store, "Other project", Some("/Users/me/other"));
+    let run = |project: &str, session: i64, input: Value, scope: &EvidenceScope| {
+        e.api
+            .pull_evidence(&e.store, project, session, &input, scope, 1)
+    };
+    let op = EvidenceScope::Operator;
+    assert!(run("/Users/me/other", e.session, json!({}), &op).is_err());
+    assert!(run(e.project, e.session, json!({"taskId":other}), &op)
+        .unwrap_err()
+        .contains("Task not found"));
+    assert!(run(e.project, e.session, json!({"taskId":"nope"}), &op).is_err());
+    assert!(run(e.project, e.session, json!({"taskId":5}), &op).is_err());
+    // A Mono that does not own the project cannot annotate its tasks either.
+    let mine = add_task(&e.store, "Mine", Some(e.project));
+    let mono = EvidenceScope::Mono(MonoCaller {
+        id: "mono-1".into(),
+        projects: vec!["/Users/me/other".into()],
+        ..Default::default()
+    });
+    assert!(run(e.project, e.session, json!({"taskId":mine}), &mono).is_err());
+    let owner = EvidenceScope::Mono(MonoCaller {
+        id: "mono-2".into(),
+        projects: vec![e.project.into()],
+        ..Default::default()
+    });
+    let ok = run(e.project, e.session, json!({"taskId":mine}), &owner).unwrap();
+    assert!(ok["note"]["id"].is_string());
+    let notes = e.store.lock().unwrap().today_notes(&mine).unwrap();
+    assert_eq!(notes[0].mono_id.as_deref(), Some("mono-2"));
+}
+
+#[test]
+fn a_long_file_list_stays_under_the_note_cap() {
+    let urls: Vec<String> = (0..200)
+        .map(|i| format!("file:///a/very/long/{}/{i}.png", "x".repeat(60)))
+        .collect();
+    let body = evidence_note("t", "cs", &urls, 0);
+    assert!(body.chars().count() <= 5000);
+    assert!(body.contains("... and "));
+    assert!(body
+        .lines()
+        .all(|l| !l.starts_with("file:") || l.ends_with(".png")));
 }

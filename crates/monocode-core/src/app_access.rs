@@ -24,6 +24,7 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
             | "sessions.stop"
             | "sessions.archive"
             | "sessions.delete"
+            | "sessions.pullEvidence"
             | "folders.list"
             | "folders.move"
             | "notes.list"
