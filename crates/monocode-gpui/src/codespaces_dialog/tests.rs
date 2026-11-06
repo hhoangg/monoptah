@@ -506,3 +506,124 @@ fn escape_in_the_terminal_never_closes_the_dialog(cx: &mut TestAppContext) {
     visual.simulate_keystrokes("escape");
     assert_eq!(closed.get(), 1);
 }
+
+fn field_center(
+    window: &WindowHandle<CodespacesDialog>,
+    cx: &mut TestAppContext,
+) -> gpui::Point<gpui::Pixels> {
+    cx.refresh().unwrap();
+    let visual = &mut VisualTestContext::from_window((*window).into(), cx);
+    visual
+        .debug_bounds("codespaces-field-CLAUDE_CODE_OAUTH_TOKEN")
+        .expect("the token field is rendered")
+        .center()
+}
+
+fn typed_token(window: &WindowHandle<CodespacesDialog>, cx: &mut TestAppContext) -> String {
+    read(window, cx, |dialog, cx| {
+        dialog.fields[0].1.read(cx).content.to_string()
+    })
+}
+
+#[gpui::test]
+fn clicking_the_field_and_typing_enters_text_when_gh_and_repo_are_ready(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK)).with_secret("CLAUDE_CODE_OAUTH_TOKEN", &[REPO]);
+    let window = open(cx, env(&gh, origin));
+    let center = field_center(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_click(center, Default::default());
+    visual.simulate_input("sk-ant-oat-123");
+    assert_eq!(typed_token(&window, cx), "sk-ant-oat-123");
+    // Pasting goes through the same path as typing.
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.write_to_clipboard(gpui::ClipboardItem::new_string("-pasted".into()));
+    visual.simulate_keystrokes("cmd-v");
+    assert_eq!(typed_token(&window, cx), "sk-ant-oat-123-pasted");
+    assert!(visual.debug_bounds("codespaces-disabled").is_none());
+    assert!(
+        visual
+            .debug_bounds("codespaces-unknown-CLAUDE_CODE_OAUTH_TOKEN")
+            .is_none()
+    );
+}
+
+#[gpui::test]
+fn a_gh_without_the_scope_blocks_typing_and_says_why(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_NO_SCOPE));
+    let window = open(cx, env(&gh, origin));
+    let center = field_center(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_click(center, Default::default());
+    visual.simulate_input("nope");
+    assert_eq!(typed_token(&window, cx), "");
+    assert!(visual.debug_bounds("codespaces-disabled").is_some());
+    assert!(
+        visual
+            .debug_bounds("codespaces-unknown-CLAUDE_CODE_OAUTH_TOKEN")
+            .is_some()
+    );
+}
+
+#[gpui::test]
+fn a_missing_repository_blocks_typing_and_says_why(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, no_origin));
+    let center = field_center(&window, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_click(center, Default::default());
+    visual.simulate_input("nope");
+    assert_eq!(typed_token(&window, cx), "");
+    assert!(visual.debug_bounds("codespaces-disabled").is_some());
+}
+
+#[test]
+fn disabled_and_unknown_reasons_name_the_actual_problem() {
+    let load = |auth, origin| {
+        let gh = FakeGh::new(auth);
+        model::load(gh.as_ref(), Path::new("/x"), origin)
+    };
+    let ready = load(Ok(AUTH_OK), Some("git@github.com:acme/alpha.git"));
+    assert_eq!(ready.disabled_reason(), None);
+    assert_eq!(ready.unknown_reason(&ready.rows[0]), None);
+
+    let no_scope = load(Ok(AUTH_NO_SCOPE), Some("git@github.com:acme/alpha.git"));
+    assert!(
+        no_scope
+            .disabled_reason()
+            .unwrap()
+            .contains("codespace scope")
+    );
+    assert!(
+        no_scope
+            .unknown_reason(&no_scope.rows[0])
+            .unwrap()
+            .contains("codespace scope")
+    );
+
+    let no_repo = load(Ok(AUTH_OK), None);
+    assert_eq!(
+        no_repo.disabled_reason().as_deref(),
+        Some(model::NO_REPO_LINE)
+    );
+
+    let broken = load(
+        Err("exec format error"),
+        Some("git@github.com:acme/alpha.git"),
+    );
+    assert!(
+        broken
+            .disabled_reason()
+            .unwrap()
+            .contains("exec format error")
+    );
+
+    // gh is fine but the secrets read failed: inputs stay usable, the row shows the error.
+    let mut failed = load(Ok(AUTH_OK), Some("git@github.com:acme/alpha.git"));
+    failed.rows[0].state = None;
+    failed.error = Some("HTTP 403: Resource not accessible".into());
+    assert_eq!(failed.disabled_reason(), None);
+    assert_eq!(
+        failed.unknown_reason(&failed.rows[0]).as_deref(),
+        Some("HTTP 403: Resource not accessible")
+    );
+}

@@ -318,17 +318,33 @@ impl CodespacesDialog {
         }
         column.child(muted(match &snapshot.repo {
             Some(repo) => format!("Repository: {repo}"),
-            None => "No GitHub repository found: the project needs a git origin on github.com."
-                .to_owned(),
+            None => model::NO_REPO_LINE.to_owned(),
         }))
     }
 
-    fn secret_row(&mut self, row: &Row, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn secret_row(
+        &mut self,
+        row: &Row,
+        snapshot: &Snapshot,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some((_, input)) = self.fields.iter().find(|(key, _)| *key == row.key).cloned() else {
             return div().into_any_element();
         };
         let busy = self.busy;
-        input.update(cx, |input, _| input.set_read_only(busy || !enabled));
+        input.update(cx, |input, cx| {
+            input.set_read_only(busy || !enabled);
+            input.set_placeholder(
+                if enabled {
+                    "Paste the value"
+                } else {
+                    "Unavailable until the problem above is fixed"
+                },
+                cx,
+            );
+        });
+        let unknown = snapshot.unknown_reason(row);
         let state = row.state;
         let colour = match state {
             Some(SecretState::Set) => rgb(0x34d399),
@@ -366,8 +382,31 @@ impl CodespacesDialog {
             .when(!row.description.is_empty(), |d| {
                 d.child(muted(row.description.clone()))
             })
+            .when_some(unknown, |d, reason| {
+                d.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "codespaces-unknown-{}",
+                            row.key
+                        )))
+                        .debug_selector({
+                            let key = row.key.clone();
+                            move || format!("codespaces-unknown-{key}")
+                        })
+                        .text_size(px(11.))
+                        .line_height(px(17.))
+                        .text_color(rgb(0xfbbf24))
+                        .child(format!("Status unknown: {}", reason.trim_end_matches('.'))),
+                )
+            })
             .child(
                 div()
+                    .id(SharedString::from(format!("codespaces-field-{}", row.key)))
+                    .debug_selector({
+                        let key = row.key.clone();
+                        move || format!("codespaces-field-{key}")
+                    })
+                    .when(!enabled, |d| d.opacity(0.45))
                     .h(px(36.))
                     .min_w_0()
                     .rounded_lg()
@@ -447,9 +486,23 @@ impl CodespacesDialog {
         if let Some(error) = snapshot.error.clone() {
             out.push(alert("codespaces-load-error", error).into_any_element());
         }
-        let enabled = snapshot.gh.ready() && snapshot.repo.is_some();
+        let disabled = snapshot.disabled_reason();
+        let enabled = disabled.is_none();
+        if let Some(reason) = disabled {
+            out.push(
+                alert(
+                    "codespaces-disabled",
+                    format!(
+                        "The fields below are read-only. {}.",
+                        reason.trim_end_matches('.')
+                    ),
+                )
+                .debug_selector(|| "codespaces-disabled".into())
+                .into_any_element(),
+            );
+        }
         for row in &snapshot.rows {
-            out.push(self.secret_row(row, enabled, cx));
+            out.push(self.secret_row(row, &snapshot, enabled, cx));
         }
         out.extend(self.terminal_pane(cx));
         let save_enabled = self.can_save(cx);

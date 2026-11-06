@@ -10,6 +10,8 @@ pub(super) const CLAUDE_TOKEN_NOTE: &str = "A changed CLAUDE_CODE_OAUTH_TOKEN ap
 pub(super) const PRIVACY_NOTE: &str = "Monoptah keeps no copy of these values. They go straight to GitHub as user Codespaces secrets for this repository.";
 pub(super) const REFRESH_COMMAND: &str = "gh auth refresh -h github.com -s codespace";
 pub(super) const LOGIN_COMMAND: &str = "gh auth login";
+pub(super) const NO_REPO_LINE: &str =
+    "No GitHub repository found: the project needs a git origin on github.com.";
 pub(super) const INSTALL_COMMAND: &str = "brew install gh";
 
 /// How far the GitHub CLI is set up.
@@ -105,6 +107,29 @@ fn wanted(secrets: &[DevcontainerSecret]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+impl Snapshot {
+    /// Why the inputs cannot be used, or None when they can.
+    pub(super) fn disabled_reason(&self) -> Option<String> {
+        if !self.gh.ready() {
+            return Some(self.gh.line());
+        }
+        if self.repo.is_none() {
+            return Some(NO_REPO_LINE.to_owned());
+        }
+        None
+    }
+
+    /// Why a row's status is unknown, or None when it is known.
+    pub(super) fn unknown_reason(&self, row: &Row) -> Option<String> {
+        if row.state.is_some() {
+            return None;
+        }
+        self.disabled_reason()
+            .or_else(|| self.error.clone())
+            .or_else(|| Some("The status was not returned by GitHub.".to_owned()))
+    }
 }
 
 /// Checks gh, resolves the repo from `origin` and reads the status of each secret.
