@@ -265,6 +265,13 @@ impl CloudApi {
     pub fn delete(&self, project: &str, name: &str) -> Result<Value, String> {
         let repo = self.scoped_repo(project)?;
         self.owned(&repo, name)?;
+        let unsaved = self.cloud.unsaved_for(name);
+        if !unsaved.is_empty() {
+            return Err(format!(
+                "Deleting {name} would lose files that are not in the local copy. {} Delete it from the app to confirm.",
+                unsaved.join(" ")
+            ));
+        }
         self.cloud.delete_codespace(name)?;
         Ok(json!({"codespace":name,"deleted":true}))
     }

@@ -521,6 +521,16 @@ impl Shell {
                     MenuAction::new("codespace-restore", "Restore code from codespace").into(),
                 );
             }
+            if let Some(name) = self.live_origin_codespace(id) {
+                items.push(
+                    MenuAction::new("codespace-stop", format!("Stop codespace {name}")).into(),
+                );
+                items.push(
+                    MenuAction::new("codespace-delete", format!("Delete codespace {name}"))
+                        .danger()
+                        .into(),
+                );
+            }
             items.extend(self.telegram_topic_item(id, cx));
         }
         items.extend([
@@ -587,6 +597,12 @@ impl Shell {
         let ids = self.session_menu_ids(id, cx);
         match action {
             "codespace-restore" => self.restore_codespace_code(id, cx),
+            "codespace-stop" => {
+                self.run_origin_codespace_action(id, cloud::ArchiveChoice::Stop, window, cx)
+            }
+            "codespace-delete" => {
+                self.run_origin_codespace_action(id, cloud::ArchiveChoice::Delete, window, cx)
+            }
             "codespace-terminal" => {
                 if let Some(codespace) = self.cloud_marks.get(&id).map(|m| m.codespace.clone()) {
                     self.new_codespace_terminal(codespace, window, cx);

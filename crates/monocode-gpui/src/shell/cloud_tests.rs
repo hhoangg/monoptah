@@ -602,7 +602,7 @@ fn a_failed_copy_leaves_the_codespace_alone_and_offers_retry_anyway_or_cancel(
     window
         .update(visual, |shell, window, cx| {
             shell.cloud_convert = fake_convert(shell.store.clone(), None);
-            shell.run_cloud_archive(ArchiveChoice::Delete, true, window, cx);
+            shell.run_cloud_archive(ArchiveChoice::Delete, true, Vec::new(), window, cx);
         })
         .unwrap();
     visual.run_until_parked();
@@ -630,7 +630,7 @@ fn stop_anyway_skips_the_copy_and_archives_the_cloud_session_as_before(cx: &mut 
     assert!(gh.calls().is_empty());
     window
         .update(visual, |shell, window, cx| {
-            shell.run_cloud_archive(ArchiveChoice::Stop, false, window, cx)
+            shell.run_cloud_archive(ArchiveChoice::Stop, false, Vec::new(), window, cx)
         })
         .unwrap();
     visual.run_until_parked();
@@ -682,7 +682,7 @@ fn a_session_converted_by_an_earlier_attempt_is_not_converted_twice(cx: &mut Tes
                 log.lock().unwrap().push(id);
                 inner(cloud, id, progress)
             });
-            shell.run_cloud_archive(ArchiveChoice::Stop, true, window, cx);
+            shell.run_cloud_archive(ArchiveChoice::Stop, true, Vec::new(), window, cx);
         })
         .unwrap();
     visual.run_until_parked();
@@ -960,6 +960,7 @@ fn deleting_pauses_for_files_that_only_exist_on_the_codespace_but_stopping_never
             true,
             &convert,
             &AtomicBool::new(false),
+            &[],
             &mut |_| {},
         );
         (out, gh.calls())
@@ -1018,7 +1019,7 @@ fn a_delete_with_unsaved_files_asks_then_delete_anyway_or_stop_instead(cx: &mut 
             })
             .unwrap();
         for button in [
-            "cloud-archive-cancel",
+            "cloud-archive-review-keep",
             "cloud-archive-delete-anyway",
             "cloud-archive-stop-instead",
         ] {
@@ -1026,12 +1027,18 @@ fn a_delete_with_unsaved_files_asks_then_delete_anyway_or_stop_instead(cx: &mut 
         }
         window
             .update(visual, |shell, window, cx| {
-                let choice = if stop_instead {
-                    ArchiveChoice::Stop
-                } else {
-                    ArchiveChoice::Delete
+                // What the two buttons do.
+                let Some(cloud::Phase::Review { items }) =
+                    shell.cloud_archive.as_ref().map(|d| &d.phase)
+                else {
+                    panic!("review phase");
                 };
-                shell.run_cloud_archive(choice, false, window, cx);
+                let seen = items.clone();
+                if stop_instead {
+                    shell.run_cloud_archive(ArchiveChoice::Stop, false, Vec::new(), window, cx);
+                } else {
+                    shell.run_cloud_archive(ArchiveChoice::Delete, true, seen, window, cx);
+                }
             })
             .unwrap();
         visual.run_until_parked();
@@ -1045,6 +1052,165 @@ fn a_delete_with_unsaved_files_asks_then_delete_anyway_or_stop_instead(cx: &mut 
             .update(visual, |shell, _, _| assert!(shell.cloud_archive.is_none()))
             .unwrap();
     }
+}
+
+/// Marks each session's ignored file by its cloud id, so two sessions lose different files.
+fn env_per_session(done: &mut Converted) {
+    done.ignored = vec![(1, format!("{}.env", done.cloud_id))];
+}
+
+#[gpui::test]
+fn every_later_delete_asks_again_until_the_user_confirmed_the_list(cx: &mut TestAppContext) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_convert = tweaked_convert(shell.store.clone(), env_per_session);
+            shell.open_cloud_archive(vec![id], window, cx);
+            shell.confirm_cloud_archive(ArchiveChoice::Delete, window, cx);
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    let review = |shell: &Shell| {
+        matches!(
+            shell.cloud_archive.as_ref().map(|d| &d.phase),
+            Some(cloud::Phase::Review { .. })
+        )
+    };
+    window
+        .update(visual, |shell, _, _| assert!(review(shell)))
+        .unwrap();
+    // The Retry of the failed dialog and a fresh Delete are both a plain Delete with nothing
+    // confirmed: the stored list stops them before any gh call.
+    window
+        .update(visual, |shell, window, cx| {
+            shell.run_cloud_archive(ArchiveChoice::Delete, true, Vec::new(), window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    window
+        .update(visual, |shell, _, _| assert!(review(shell)))
+        .unwrap();
+    // Keep running closes the dialog and leaves the codespace alone.
+    window
+        .update(visual, |shell, window, cx| {
+            shell.close_cloud_archive(window, cx)
+        })
+        .unwrap();
+    assert!(gh.calls().is_empty());
+    // The converted session offers stop and delete in its menu; delete asks again.
+    let local = window
+        .update(visual, |shell, _, _| archived_locals(shell)[0])
+        .unwrap();
+    window
+        .update(visual, |shell, window, cx| {
+            let ids: Vec<String> = shell
+                .session_menu_items(local, cx)
+                .into_iter()
+                .filter_map(|item| match item {
+                    crate::popover::MenuItem::Action(a) => Some(a.label.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                ids.contains(&"Stop codespace octo-abc".to_string()),
+                "{ids:?}"
+            );
+            assert!(
+                ids.contains(&"Delete codespace octo-abc".to_string()),
+                "{ids:?}"
+            );
+            shell.run_origin_codespace_action(local, ArchiveChoice::Delete, window, cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    window
+        .update(visual, |shell, _, _| assert!(review(shell)))
+        .unwrap();
+    // Confirming deletes; the entries disappear with the codespace.
+    window
+        .update(visual, |shell, window, cx| {
+            let Some(cloud::Phase::Review { items }) =
+                shell.cloud_archive.as_ref().map(|d| &d.phase)
+            else {
+                panic!("review");
+            };
+            let seen = items.clone();
+            shell.run_cloud_archive(ArchiveChoice::Delete, true, seen, window, cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+    window
+        .update(visual, |shell, _, cx| {
+            let labels = shell
+                .session_menu_items(local, cx)
+                .into_iter()
+                .filter_map(|item| match item {
+                    crate::popover::MenuItem::Action(a) => Some(a.id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !labels
+                    .iter()
+                    .any(|l| l.starts_with("codespace-stop") || l.starts_with("codespace-delete"))
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn delete_anyway_first_saves_a_session_that_appeared_while_the_dialog_was_open(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.cloud_convert = tweaked_convert(shell.store.clone(), env_per_session);
+            shell.open_cloud_archive(vec![id], window, cx);
+            shell.confirm_cloud_archive(ArchiveChoice::Delete, window, cx);
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    // A second session starts in the codespace while the dialog waits.
+    let late = window
+        .update(visual, |shell, _, _| {
+            add_cloud_session(&shell.store, "/work/monocode", "octo-abc")
+        })
+        .unwrap();
+    let confirm = |visual: &mut gpui::VisualTestContext| {
+        window
+            .update(visual, |shell, window, cx| {
+                let Some(cloud::Phase::Review { items }) =
+                    shell.cloud_archive.as_ref().map(|d| &d.phase)
+                else {
+                    panic!("review");
+                };
+                let seen = items.clone();
+                shell.run_cloud_archive(ArchiveChoice::Delete, true, seen, window, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+    };
+    confirm(visual);
+    // The late session was saved first, and its own unsaved file asks once more.
+    window
+        .update(visual, |shell, _, _| {
+            assert!(!shell.cloud.is_cloud_session(late));
+            assert_eq!(archived_locals(shell).len(), 2);
+            assert!(matches!(
+                shell.cloud_archive.as_ref().map(|d| &d.phase),
+                Some(cloud::Phase::Review { .. })
+            ));
+        })
+        .unwrap();
+    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    confirm(visual);
+    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
 }
 
 #[gpui::test]
@@ -1218,6 +1384,7 @@ fn a_cancelled_archive_stops_before_copying_or_touching_the_codespace() {
         true,
         &convert,
         &cancel,
+        &[],
         &mut |_| {},
     );
     assert_eq!(out[0].result.as_ref().unwrap_err(), cloud::CANCELLED);

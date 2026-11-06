@@ -564,6 +564,17 @@ impl Store {
         }
         Ok(out)
     }
+    /// Converted local sessions and the codespace each one came from.
+    pub fn codespace_origins(&self) -> Result<Vec<(i64, String)>, String> {
+        Ok(self
+            .settings_with_prefix("codespace-origin:")?
+            .into_iter()
+            .filter_map(|(id, value)| {
+                let value: serde_json::Value = serde_json::from_str(&value).ok()?;
+                Some((id, value["codespace"].as_str()?.to_string()))
+            })
+            .collect())
+    }
     /// Sessions whose latest message is saved as a draft and not yet sent.
     pub fn draft_sessions(&self) -> Result<std::collections::HashSet<i64>, String> {
         if self.shared.is_some() {

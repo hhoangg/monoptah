@@ -277,6 +277,8 @@ pub struct CloudSessions {
     host: Arc<dyn Host>,
     store: Database,
     states: Mutex<HashMap<String, (Instant, String)>>,
+    /// Codespaces gh reported as not found (or that were deleted here).
+    gone: Mutex<std::collections::HashSet<String>>,
     ttl: Duration,
     origin: OriginFn,
     claude_dir: std::path::PathBuf,
@@ -291,6 +293,7 @@ impl CloudSessions {
             host,
             store,
             states: Mutex::new(HashMap::new()),
+            gone: Mutex::new(Default::default()),
             ttl: STATE_TTL,
             origin: Box::new(origin_url),
             claude_dir: convert::default_claude_dir(),
@@ -508,6 +511,61 @@ impl CloudSessions {
         self.codespace_state(name)
             .map_or(CloudState::Unknown, |s| CloudState::from_gh(&s))
     }
+    /// Whether gh says the codespace no longer exists. A codespace that cannot be read for
+    /// another reason (offline, not signed in) is not gone.
+    pub fn codespace_gone(&self, name: &str) -> bool {
+        if self.gone.lock().is_ok_and(|g| g.contains(name)) {
+            return true;
+        }
+        match self.codespace_state(name) {
+            Ok(state) => state == "Deleted",
+            Err(e) => {
+                let e = e.to_lowercase();
+                let missing = e.contains("not found") || e.contains("404");
+                if missing {
+                    self.mark_gone(name);
+                }
+                missing
+            }
+        }
+    }
+    fn mark_gone(&self, name: &str) {
+        if let Ok(mut gone) = self.gone.lock() {
+            gone.insert(name.to_string());
+        }
+    }
+
+    /// Converted local sessions and the codespace each one came from.
+    pub fn converted_origins(&self) -> Vec<(i64, String)> {
+        self.store()
+            .and_then(|s| s.codespace_origins())
+            .unwrap_or_default()
+    }
+
+    /// What deleting `codespace` would lose, as recorded when its sessions were saved.
+    pub fn unsaved_for(&self, codespace: &str) -> Vec<String> {
+        self.store()
+            .ok()
+            .and_then(|s| s.setting(&convert::unsaved_key(codespace)).ok().flatten())
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default()
+    }
+    /// Remembers `lines` for `codespace` (merged with what is already recorded), so every later
+    /// delete of it asks again.
+    pub fn record_unsaved(&self, codespace: &str, lines: &[String]) -> Result<(), String> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let mut all = self.unsaved_for(codespace);
+        for line in lines {
+            if !all.contains(line) {
+                all.push(line.clone());
+            }
+        }
+        let value = serde_json::to_string(&all).map_err(|e| e.to_string())?;
+        self.store()?
+            .save_setting(&convert::unsaved_key(codespace), &value)
+    }
     pub fn invalidate(&self, name: &str) {
         if let Ok(mut states) = self.states.lock() {
             states.remove(name);
@@ -551,6 +609,11 @@ impl CloudSessions {
             }
             Err(e) => disconnect_error = Some(e),
         }
+        self.mark_gone(name);
+        // The codespace is gone, so what it held is no longer a question.
+        let _ = self
+            .store()?
+            .save_setting(&convert::unsaved_key(name), "[]");
         self.store()?.forget_codespace(name)?;
         Ok(match disconnect_error {
             Some(e) => DeleteOutcome::DeletedWithWarning(e),

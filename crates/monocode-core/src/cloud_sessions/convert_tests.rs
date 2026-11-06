@@ -726,6 +726,27 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
 }
 
 #[test]
+fn unsaved_lists_are_kept_per_codespace_and_converted_sessions_know_their_origin() {
+    let w = world_with(true, false, true);
+    assert!(w.svc.unsaved_for("cs-1").is_empty());
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    assert_eq!(
+        w.svc.converted_origins(),
+        vec![(done.local_id, "cs-1".to_string())]
+    );
+    let lines = unsaved_lines(std::slice::from_ref(&done));
+    assert!(lines[0].contains("junk.log"), "{lines:?}");
+    w.svc.record_unsaved("cs-1", &lines).unwrap();
+    w.svc.record_unsaved("cs-1", &lines).unwrap();
+    assert_eq!(
+        w.svc.unsaved_for("cs-1"),
+        lines,
+        "merged without duplicates"
+    );
+    assert!(w.svc.unsaved_for("other").is_empty());
+}
+
+#[test]
 fn restore_builds_a_new_worktree_with_the_commit_and_the_uncommitted_changes() {
     let w = world(true);
     let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();

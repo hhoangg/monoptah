@@ -677,6 +677,10 @@ pub(crate) struct Shell {
     /// Sessions that live in a codespace, by id, and the cached state of each codespace.
     cloud_marks: HashMap<i64, cloud::CloudMark>,
     cloud_states: HashMap<String, monocode_core::cloud_sessions::CloudState>,
+    /// Converted local sessions and the codespace each came from, and which of those no longer
+    /// exist.
+    cloud_origins: HashMap<i64, String>,
+    cloud_gone: std::collections::HashSet<String>,
     cloud_refreshing: bool,
     cloud_archive: Option<cloud::ArchiveDialog>,
     /// Saves the local copy of a cloud session before its codespace is stopped or deleted.
@@ -1097,6 +1101,8 @@ impl Shell {
             gh,
             cloud_marks: HashMap::new(),
             cloud_states: HashMap::new(),
+            cloud_origins: HashMap::new(),
+            cloud_gone: Default::default(),
             cloud_refreshing: false,
             cloud_archive: None,
             cloud_convert: cloud::default_convert(),

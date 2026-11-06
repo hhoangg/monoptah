@@ -44,6 +44,11 @@ pub fn origin_key(local_id: i64) -> String {
     format!("codespace-origin:{local_id}")
 }
 
+/// Session-independent setting listing what deleting a codespace would lose.
+pub fn unsaved_key(codespace: &str) -> String {
+    format!("codespace-unsaved:{codespace}")
+}
+
 /// Runs on the codespace with `sh -s`. `@WS@` and `@ID@` are substituted (validated first).
 /// Prints `key=value` lines; everything it stages lives under the printed `stage`. Errors are
 /// not masked: git's own message ends up in stderr and fails the conversion. The stage is
@@ -389,6 +394,36 @@ impl Converted {
     pub fn unsaved_names(&self) -> Vec<&str> {
         unsaved_names(&self.ignored)
     }
+}
+
+/// What deleting the codespace would lose after the copies in `converted` were saved: ignored
+/// files that cannot be rebuilt (first three named) and evidence that was only partly copied.
+pub fn unsaved_lines(converted: &[Converted]) -> Vec<String> {
+    const NAMED: usize = 3;
+    let mut lines = Vec::new();
+    let names: Vec<&str> = converted.iter().flat_map(|c| c.unsaved_names()).collect();
+    if !names.is_empty() {
+        let list = names[..names.len().min(NAMED)].join(", ");
+        let more = match names.len().saturating_sub(NAMED) {
+            0 => String::new(),
+            n => format!(" and {n} more"),
+        };
+        let cut = if converted.iter().any(|c| c.ignored_truncated) {
+            " The codespace has even more."
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "Ignored files are not part of the local copy: {list}{more}.{cut}"
+        ));
+    }
+    for c in converted.iter().filter(|c| c.evidence_partial) {
+        lines.push(format!(
+            "Some evidence files of \u{201c}{}\u{201d} could not be copied.",
+            c.title.split_whitespace().collect::<Vec<_>>().join(" ")
+        ));
+    }
+    lines
 }
 
 /// The warning for ignored entries that cannot be rebuilt, or `None` when only regenerable
