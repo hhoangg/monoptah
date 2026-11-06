@@ -17,7 +17,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let repo = root.join("repo");
-        let remote = root.join("remote.git");
+        let remote = dir.path().join("remote.git");
         std::fs::create_dir_all(&repo).unwrap();
         run(&root, &["init", "--bare", "-b", "main", "remote.git"]);
         run(&repo, &["init", "-b", "main"]);
