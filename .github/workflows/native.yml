@@ -29,7 +29,7 @@ concurrency:
 # macOS is not built or checked on CI at all: GitHub-hosted macOS runners are not
 # reliably available. The macOS app is checked (npm run native:check), built and
 # packaged on the maintainer's Mac by npm run native:release:mac. CI covers the
-# core crate on Linux and Windows, GPUI (fmt and clippy on Linux, clippy on
+# core crate on Linux and Windows, GPUI (fmt on Linux, cargo check on Linux and
 # Windows), and seeds the release caches.
 jobs:
   core:
