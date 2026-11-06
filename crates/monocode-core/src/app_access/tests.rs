@@ -426,3 +426,26 @@ fn reading_a_remote_session_works_on_a_shared_store() {
     assert_eq!(page["sessionId"], session.id);
     assert_eq!(page["title"], session.title);
 }
+
+/// The first prompt of an API-started cloud session is saved as a follow-up draft; reading the
+/// follow-ups back on the shared store used to look the (remote) session up in the sessions
+/// table and fail with "Query returned no rows", so the prompt was never sent.
+#[test]
+fn follow_ups_of_a_remote_session_with_a_draft_load_on_a_shared_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_monocode(&dir.path().join("shared.db")).unwrap();
+    let project = store
+        .remember_cloud_project(
+            "env",
+            &json!({"id":"project","cwd":"/workspaces/repo"}),
+            "/Users/me/repo",
+            "octo-abc",
+        )
+        .unwrap();
+    let session = store.create("claude", &project.key).unwrap();
+    store
+        .prepare_app_prompt(session.id, "start", "Do the thing")
+        .unwrap();
+    let state = store.follow_ups(session.id).unwrap();
+    assert_eq!(state.draft.unwrap().text, "Do the thing");
+}

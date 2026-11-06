@@ -24,6 +24,26 @@ impl State {
     }
 }
 impl Conversation {
+    /// Everything that decides whether a remote view can send, for live-debugging tests.
+    #[cfg(test)]
+    pub(crate) fn remote_debug(&self) -> String {
+        format!(
+            "status={:?} loaded={} loading={} unloaded={} busy={} online={} refreshing={} pending={} waiting={} waking={} error={:?} actions={} has_messages={}",
+            self.status,
+            self.loaded,
+            self.loading,
+            self.history_unloaded,
+            self.busy,
+            self.remote_state.online,
+            self.remote_state.refreshing,
+            self.remote_state.pending,
+            self.remote_state.app_prompt_waiting,
+            self.remote_state.waking,
+            self.remote_state.error,
+            self.history_actions.len(),
+            self.summary.has_messages
+        )
+    }
     pub(super) fn is_remote(&self) -> bool {
         self.summary.cwd.starts_with("remote://")
     }

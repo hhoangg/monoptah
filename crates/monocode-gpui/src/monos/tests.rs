@@ -308,10 +308,18 @@ fn detail_pages_slide_over_the_overview_and_back_without_recreating_content(
     }
 }
 pub(super) fn setup(cx: &mut TestAppContext) -> Setup {
+    setup_with(cx, false)
+}
+/// `shared` opens the desktop database layout the app uses, not the legacy native one.
+pub(super) fn setup_with(cx: &mut TestAppContext, shared: bool) -> Setup {
     let dir = std::env::temp_dir().join(format!("native-monos-{}", mono::new_id()));
     std::fs::create_dir_all(&dir).unwrap();
     let project = dir.to_string_lossy().to_string();
-    let store = Arc::new(Mutex::new(Store::open(&dir.join("native.sqlite")).unwrap()));
+    let store = Arc::new(Mutex::new(if shared {
+        Store::open_monocode(&dir.join("monocode.db")).unwrap()
+    } else {
+        Store::open(&dir.join("native.sqlite")).unwrap()
+    }));
     let db = store.clone();
     let cwd = project.clone();
     let window = cx.update(|cx| {

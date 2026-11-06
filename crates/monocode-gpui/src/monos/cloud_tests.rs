@@ -1,6 +1,7 @@
 //! Mono dispatch of the codespace actions and of cloud sessions.
-use super::tests::{Setup, call, launches_of, setup};
+use super::tests::{Setup, call, launches_of, setup, setup_with};
 use crate::cloud_wake::fakes::{AUTH_OK, FakeHost, Gh, install, serial};
+use crate::runtime::locked;
 use gpui::TestAppContext;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -328,4 +329,82 @@ fn a_cloud_session_a_mono_starts_is_listed_and_filed_under_the_local_project(
     let launches = launches_of(&s, cx);
     let launch = launches.iter().find(|l| l.session_id == id).unwrap();
     assert_eq!(launch.cwd, s.project);
+}
+
+/// LIVE: creates a real codespace of hhoangg/monoptah through the same Mono `sessions.start` path the
+/// app uses (real gh, real Connections) and watches the first prompt. Run by hand only:
+/// `cargo test live_cloud_start -- --ignored --nocapture --test-threads=1`. The codespace is kept;
+/// the caller deletes it.
+#[gpui::test]
+#[ignore]
+fn live_cloud_start(cx: &mut TestAppContext) {
+    let _guard = serial();
+    let s = setup_with(cx, std::env::var("LIVE_SHARED").is_ok());
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/hhoangg/monoptah",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&s.project)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    s.manager
+        .update(cx, |m, cx| m.sidebar_preferences(&s.id, true, true, cx));
+    cx.run_until_parked();
+    let rx = call(
+        &s,
+        "live1",
+        "sessions.start",
+        json!({"prompt":"Reply with OK and nothing else.","title":"Live debug","target":{"codespace":std::env::var("LIVE_CS").unwrap_or("new".into())}}),
+        cx,
+    );
+    let mut id = None;
+    for tick in 0..900 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        if id.is_none()
+            && let Ok(result) = rx.try_recv()
+        {
+            eprintln!("LIVE start result: {result:?}");
+            id = result.ok().and_then(|v| v["sessionId"].as_i64());
+        }
+        if let Some(id) = id {
+            let owner = cx.update(|cx| s.manager.read(cx).owner.upgrade().unwrap());
+            let (debug, listed) = cx.update(|cx| {
+                let o = owner.read(cx);
+                (
+                    o.mono_session_entity(id).map(|v| v.read(cx).remote_debug()),
+                    o.mono_listed_project(id),
+                )
+            });
+            let store = locked(&s.store).unwrap();
+            let remote = store.remote_session(id).unwrap();
+            eprintln!(
+                "LIVE t={tick} listed={listed:?} view={debug:?} session_id={:?} outbox={} draft={}",
+                remote.as_ref().and_then(|r| r.session_id.clone()),
+                remote.as_ref().map_or(0, |r| r.outbox.len()),
+                store.follow_ups(id).unwrap().draft.is_some()
+            );
+            drop(store);
+            if tick > 120 && debug.is_some() {
+                // keep going a while to see the turn
+            }
+            if tick > 300 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }

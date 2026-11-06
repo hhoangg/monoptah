@@ -462,7 +462,9 @@ impl Store {
             .and_then(|v| v.split_once(':'))
         {
             if let Ok(id) = id.parse::<i64>() {
-                if self.shared_delivered(id, message)? {
+                // A remote (cloud) session has no row to search: its host owns the transcript.
+                let remote = self.remote_session(id).ok().flatten().is_some();
+                if !remote && self.shared_delivered(id, message)? {
                     return Ok(Some("1".into()));
                 }
             }
