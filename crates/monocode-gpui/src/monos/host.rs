@@ -429,7 +429,7 @@ impl Monos {
                     if (call.action.starts_with("today.")
                         && !matches!(call.action.as_str(), "today.list" | "today.sources"))
                         || (call.action == "sessions.pullEvidence"
-                            && call.input.get("taskId").is_some())
+                            && call.input.get("taskId").is_some_and(|v| !v.is_null()))
                     {
                         this.today.bump();
                     }

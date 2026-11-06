@@ -417,14 +417,20 @@ impl CloudApi {
         if let Some(message) = &pull.message {
             value["message"] = json!(message);
         }
+        if let Some(warning) = &pull.warning {
+            value["warning"] = json!(warning);
+        }
         if let (Some(task), false) = (task, urls.is_empty()) {
             let title = lock()?
                 .remote_session(session_id)?
                 .map(|s| s.summary.title)
                 .unwrap_or_default();
             let body = evidence_note(&title, &pull.codespace, &urls, now);
-            let note = lock()?.today_note(&task, &body, &scope.actor(), now)?;
-            value["note"] = json!({"id":note.id,"taskId":note.task_id});
+            // The files are already local: a note that cannot be written is reported, not fatal.
+            match lock()?.today_note(&task, &body, &scope.actor(), now) {
+                Ok(note) => value["note"] = json!({"id":note.id,"taskId":note.task_id}),
+                Err(e) => value["noteError"] = json!(e),
+            }
         }
         Ok(value)
     }

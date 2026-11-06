@@ -552,6 +552,8 @@ fn not_connected_errors_are_recognised_as_a_state() {
 struct CpGh {
     files: Vec<&'static str>,
     missing: bool,
+    /// Copies the files, then fails like scp does for a dangling link inside the folder.
+    nested_failure: bool,
     calls: Mutex<Vec<String>>,
 }
 impl GhRunner for CpGh {
@@ -571,6 +573,11 @@ impl GhRunner for CpGh {
             let path = root.join(file);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, format!("{remote}/{file}")).unwrap();
+        }
+        if self.nested_failure {
+            return fail(&format!(
+                "scp: '{remote}/latest.png': No such file or directory"
+            ));
         }
         ok("")
     }
@@ -606,6 +613,7 @@ fn pull_evidence_copies_the_default_folder_into_the_session_folder() {
     let gh = Arc::new(CpGh {
         files: vec!["shot.png", "sub/report.md"],
         missing: false,
+        nested_failure: false,
         calls: Mutex::new(vec![]),
     });
     let (svc, id) = evidence_service(gh.clone(), dir.path());
@@ -638,6 +646,7 @@ fn pulling_again_refreshes_files_and_keeps_older_ones() {
     let first = Arc::new(CpGh {
         files: vec!["old.png", "same.txt"],
         missing: false,
+        nested_failure: false,
         calls: Mutex::new(vec![]),
     });
     let (svc, id) = evidence_service(first, dir.path());
@@ -647,6 +656,7 @@ fn pulling_again_refreshes_files_and_keeps_older_ones() {
         Arc::new(CpGh {
             files: vec!["same.txt"],
             missing: false,
+            nested_failure: false,
             calls: Mutex::new(vec![]),
         }),
         FakeHost::with_machine("octo-abc"),
@@ -666,6 +676,7 @@ fn a_missing_evidence_folder_is_an_empty_pull_with_a_message() {
     let gh = Arc::new(CpGh {
         files: vec![],
         missing: true,
+        nested_failure: false,
         calls: Mutex::new(vec![]),
     });
     let (svc, id) = evidence_service(gh, dir.path());
@@ -680,6 +691,7 @@ fn a_custom_path_is_resolved_against_the_workspace_and_confined_to_it() {
     let gh = Arc::new(CpGh {
         files: vec!["a.png"],
         missing: false,
+        nested_failure: false,
         calls: Mutex::new(vec![]),
     });
     let (svc, id) = evidence_service(gh.clone(), dir.path());
@@ -698,6 +710,10 @@ fn a_custom_path_is_resolved_against_the_workspace_and_confined_to_it() {
         "/workspaces/widgets-evil/x",
         "-r",
         "",
+        ".",
+        "./",
+        "/workspaces/widgets/.",
+        "/workspaces/widgets/./",
     ] {
         assert!(svc.pull_evidence(id, Some(bad)).is_err(), "{bad:?}");
     }
@@ -710,9 +726,95 @@ fn local_and_unknown_sessions_cannot_pull_evidence() {
     let gh = Arc::new(CpGh {
         files: vec![],
         missing: false,
+        nested_failure: false,
         calls: Mutex::new(vec![]),
     });
     let (svc, _) = evidence_service(gh.clone(), dir.path());
     assert!(svc.pull_evidence(-999_999, None).is_err());
     assert!(gh.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_failure_inside_the_folder_keeps_the_copied_files_and_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = Arc::new(CpGh {
+        files: vec!["a.png", "b.md"],
+        missing: false,
+        nested_failure: true,
+        calls: Mutex::new(vec![]),
+    });
+    let (svc, id) = evidence_service(gh, dir.path());
+    let pull = svc.pull_evidence(id, None).unwrap();
+    assert_eq!(pull.files.len(), 2, "{pull:?}");
+    assert!(pull.local_dir.join("a.png").exists());
+    assert!(pull.message.is_none());
+    assert!(pull.warning.unwrap().contains("latest.png"));
+}
+
+#[test]
+fn a_hard_failure_with_nothing_copied_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = Arc::new(CpGh {
+        files: vec![],
+        missing: false,
+        nested_failure: true,
+        calls: Mutex::new(vec![]),
+    });
+    let (svc, id) = evidence_service(gh, dir.path());
+    assert!(svc
+        .pull_evidence(id, None)
+        .unwrap_err()
+        .contains("latest.png"));
+}
+
+#[test]
+fn an_unreadable_name_collision_is_reported_and_other_files_still_arrive() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = Arc::new(CpGh {
+        files: vec!["a.png", "clash"],
+        missing: false,
+        nested_failure: false,
+        calls: Mutex::new(vec![]),
+    });
+    let (svc, id) = evidence_service(gh, dir.path());
+    let first = svc.pull_evidence(id, None).unwrap();
+    // A directory now sits where the next pull wants a file.
+    std::fs::remove_file(first.local_dir.join("clash")).unwrap();
+    std::fs::create_dir(first.local_dir.join("clash")).unwrap();
+    std::fs::write(first.local_dir.join("clash/keep"), "x").unwrap();
+    let again = svc.pull_evidence(id, None).unwrap();
+    assert!(again.files.iter().any(|f| f.ends_with("a.png")));
+    assert!(again.warning.unwrap().contains("clash"));
+}
+
+#[test]
+fn a_failing_evidence_setup_never_blocks_the_session_target() {
+    struct SshFails(FakeGh2);
+    type FakeGh2 = Arc<FakeGh>;
+    impl GhRunner for SshFails {
+        fn run(&self, args: &[String], stdin: Option<&str>) -> Result<GhOutput, String> {
+            if args.get(1).map(String::as_str) == Some("ssh") {
+                return Err("ssh stalled".into());
+            }
+            self.0.run(args, stdin)
+        }
+    }
+    let inner = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+    ]);
+    let host = FakeHost::with_machine("octo-abc");
+    let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+    let svc = CloudSessions::new(Arc::new(SshFails(inner)), host, store)
+        .with_origin(|_| Ok("git@github.com:octo/widgets.git".into()));
+    let mut progress = vec![];
+    let binding = svc
+        .prepare_target("/Users/me/widgets", named("octo-abc"), &mut |p| {
+            progress.push(p.to_string())
+        })
+        .unwrap();
+    assert_eq!(binding.codespace, "octo-abc");
+    assert!(progress
+        .iter()
+        .any(|p| p.contains("Could not prepare the evidence folder")));
 }

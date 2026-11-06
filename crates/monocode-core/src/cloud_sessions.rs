@@ -543,9 +543,10 @@ impl CloudSessions {
         })
     }
 
-    /// Codespace binding of one session (desktop session id), with its cached
-    /// state. `None` for non-cloud sessions. May run `gh codespace view` on a
-    /// cache miss; never wakes anything.
+    /// Copies the evidence of a cloud session into its local folder, see the module docs.
+    /// Remote symlinks are followed by scp (it copies what they point at), so keep secrets
+    /// out of the folder. A failure inside the folder keeps what was copied and is reported
+    /// in `warning`; only a missing top-level folder is the empty `message` case.
     pub fn pull_evidence(
         &self,
         session_id: i64,
@@ -575,6 +576,7 @@ impl CloudSessions {
             local_dir: local_dir.clone(),
             files: vec![],
             message: None,
+            warning: None,
         };
         std::fs::create_dir_all(&thread).map_err(|e| e.to_string())?;
         let staging = thread.join(format!(
@@ -588,26 +590,46 @@ impl CloudSessions {
         let copied = codespaces::copy_from(&*self.gh, &codespace, &remote, &staging);
         // gh may have started the codespace.
         self.invalidate(&codespace);
-        let result = match copied {
-            Ok(()) => {
-                let name = remote.rsplit('/').next().unwrap_or_default();
-                let source = staging.join(name);
-                match std::fs::symlink_metadata(&source) {
-                    // The default folder is the evidence folder itself; anything else keeps
-                    // its name so two pulls cannot overwrite each other.
-                    Ok(meta) if meta.is_dir() && remote_path.is_none() => {
-                        merge_files(&source, &local_dir, &mut pull.files)
-                    }
-                    Ok(_) => merge_files(&source, &local_dir.join(name), &mut pull.files),
-                    Err(_) => Ok(()),
-                }
+        let mut problems = Vec::new();
+        let mut hard_error = None;
+        match copied {
+            Ok(()) => {}
+            Err(e) if codespaces::is_missing_path(&e, &remote) => {}
+            // scp copies what it can: keep it, then say what failed.
+            Err(e) => problems.push(e),
+        }
+        let name = remote.rsplit('/').next().unwrap_or_default();
+        let source = staging.join(name);
+        match std::fs::symlink_metadata(&source) {
+            // The default folder is the evidence folder itself; anything else keeps its
+            // name so two pulls cannot overwrite each other.
+            Ok(meta) if meta.is_dir() && remote_path.is_none() => {
+                merge_files(&source, &local_dir, &mut pull.files, &mut problems)
             }
-            Err(e) if codespaces::is_missing_path(&e) => Ok(()),
-            Err(e) => Err(e),
-        };
+            Ok(meta) if meta.is_dir() || meta.is_file() => merge_files(
+                &source,
+                &local_dir.join(name),
+                &mut pull.files,
+                &mut problems,
+            ),
+            Ok(_) => {}
+            Err(_) => {}
+        }
         let _ = std::fs::remove_dir_all(&staging);
-        result?;
         pull.files.sort();
+        if !problems.is_empty() {
+            let text = problems.join("; ");
+            if pull.files.is_empty() {
+                hard_error = Some(text);
+            } else {
+                pull.warning = Some(format!(
+                    "Some files could not be copied; the rest were kept: {text}"
+                ));
+            }
+        }
+        if let Some(error) = hard_error {
+            return Err(error);
+        }
         if pull.files.is_empty() {
             pull.message = Some(format!(
                 "No evidence files found at {remote} in codespace {codespace}."
@@ -616,6 +638,9 @@ impl CloudSessions {
         Ok(pull)
     }
 
+    /// Codespace binding of one session (desktop session id), with its cached
+    /// state. `None` for non-cloud sessions. May run `gh codespace view` on a
+    /// cache miss; never wakes anything.
     pub fn target_for_session(&self, session_id: i64) -> Option<SessionTarget> {
         let codespace = self
             .store()
@@ -645,6 +670,8 @@ pub struct EvidencePull {
     pub files: Vec<std::path::PathBuf>,
     /// Why `files` is empty.
     pub message: Option<String>,
+    /// Set when part of the copy failed; `files` holds what did arrive.
+    pub warning: Option<String>,
 }
 
 /// The codespace path to pull: default `<workspace>/.evidence`; a given path is absolute or
@@ -679,23 +706,33 @@ fn merge_files(
     source: &std::path::Path,
     dest: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
-) -> Result<(), String> {
-    let meta = std::fs::symlink_metadata(source).map_err(|e| e.to_string())?;
+    problems: &mut Vec<String>,
+) {
+    let meta = match std::fs::symlink_metadata(source) {
+        Ok(meta) => meta,
+        Err(e) => return problems.push(format!("{}: {e}", source.display())),
+    };
     if meta.is_dir() {
-        for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            merge_files(&entry.path(), &dest.join(entry.file_name()), out)?;
+        match std::fs::read_dir(source) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    merge_files(&entry.path(), &dest.join(entry.file_name()), out, problems);
+                }
+            }
+            Err(e) => problems.push(format!("{}: {e}", source.display())),
         }
     } else if meta.is_file() {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let moved = dest
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| {
+                std::fs::rename(source, dest).or_else(|_| std::fs::copy(source, dest).map(|_| ()))
+            });
+        match moved {
+            Ok(()) => out.push(dest.to_path_buf()),
+            Err(e) => problems.push(format!("{}: {e}", dest.display())),
         }
-        if std::fs::rename(source, dest).is_err() {
-            std::fs::copy(source, dest).map_err(|e| e.to_string())?;
-        }
-        out.push(dest.to_path_buf());
     }
-    Ok(())
 }
 
 /// Result of a codespace delete that took effect.

@@ -698,6 +698,7 @@ impl Shell {
                 match self.app_target(&input, call.session, &project, false, cx) {
                     Ok(id) => {
                         // gh copy (it may boot the codespace) and a note: off the UI thread.
+                        let refresh_today = self.monos.as_ref().map(|m| m.read(cx).today_bumper());
                         self.app_background(
                             call,
                             move |store| {
@@ -709,6 +710,11 @@ impl Shell {
                                     &cloud_api::EvidenceScope::Operator,
                                     monocode_core::time::now_ms(),
                                 )?;
+                                if let (Some(_), Some(refresh)) =
+                                    (value.get("note"), &refresh_today)
+                                {
+                                    refresh();
+                                }
                                 Ok((value, Effect::None))
                             },
                             cx,

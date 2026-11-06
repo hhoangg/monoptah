@@ -21,6 +21,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const SLOW_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// `gh codespace cp` may first have to wake the codespace, then move a directory.
 const COPY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// A short `gh codespace ssh` setup command. Best-effort callers must never wait longer.
+const SSH_TIMEOUT: Duration = Duration::from_secs(30);
 const DISPLAY_NAME_MAX: usize = 48;
 const GH_MISSING: &str = "GitHub CLI (gh) is not installed";
 const SCOPE_HINT: &str = "The GitHub token is missing the `codespace` scope. \
@@ -91,9 +93,18 @@ pub fn call_timeout(args: &[String]) -> Duration {
             args.first().map(String::as_str),
             args.get(1).map(String::as_str)
         ),
-        (Some("codespace"), Some("cp" | "ssh"))
+        (Some("codespace"), Some("cp"))
     ) {
         return COPY_TIMEOUT;
+    }
+    if matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("codespace"), Some("ssh"))
+    ) {
+        return SSH_TIMEOUT;
     }
     let slow = matches!(
         (
@@ -597,41 +608,59 @@ pub fn delete(runner: &dyn GhRunner, name: &str) -> Result<(), String> {
     .map(|_| ())
 }
 
-/// Marks the guidance block in `~/.claude/CLAUDE.md` of a codespace so it is written once.
-const EVIDENCE_MARKER: &str = "monoptah-evidence";
-
-/// Shell script (for `sh -s`) that prepares the evidence folder of `workspace`: creates
-/// `<workspace>/.evidence`, keeps it out of git through `.git/info/exclude` (never the repo's
-/// `.gitignore`), and tells Claude Code about it in the codespace user's `~/.claude/CLAUDE.md`.
-/// Idempotent; nothing inside the repo is tracked or changed.
-fn evidence_script(workspace: &str) -> String {
-    format!(
-        r#"set -e
-d='{workspace}'
+/// Shell script (for `sh -s`) that prepares the evidence folder of `@WS@`. Idempotent.
+///
+/// * creates `@WS@/.evidence`;
+/// * keeps `.evidence/` and `CLAUDE.local.md` out of git through the repo's `info/exclude`
+///   (never `.gitignore`; `git rev-parse --git-path` also finds it for worktree checkouts);
+/// * writes the guidance for Claude Code into `@WS@/CLAUDE.local.md`, a project-local file
+///   Claude Code loads next to `CLAUDE.md`. Only our marked block is created or replaced;
+///   other content is kept, a symlink or a git-tracked file is never touched;
+/// * removes the marked block an earlier version appended to `~/.claude/CLAUDE.md`.
+const EVIDENCE_SCRIPT: &str = r#"d='@WS@'
 mkdir -p "$d/.evidence"
-if [ -d "$d/.git" ]; then
-  mkdir -p "$d/.git/info"
-  grep -qxF '.evidence/' "$d/.git/info/exclude" 2>/dev/null || echo '.evidence/' >> "$d/.git/info/exclude"
+ex=$(git -C "$d" rev-parse --git-path info/exclude 2>/dev/null || true)
+case "$ex" in /*) ;; ?*) ex="$d/$ex" ;; esac
+if [ -n "$ex" ]; then
+  mkdir -p "$(dirname "$ex")"
+  if [ -s "$ex" ] && [ -n "$(tail -c1 "$ex")" ]; then echo >> "$ex"; fi
+  for p in '.evidence/' 'CLAUDE.local.md'; do
+    grep -qxF "$p" "$ex" 2>/dev/null || echo "$p" >> "$ex"
+  done
 fi
-mkdir -p "$HOME/.claude"
-f="$HOME/.claude/CLAUDE.md"
-if ! grep -q '{EVIDENCE_MARKER}' "$f" 2>/dev/null; then
-cat >> "$f" <<'GUIDE'
-
-<!-- {EVIDENCE_MARKER} -->
+g="$d/CLAUDE.local.md"
+if [ ! -L "$g" ] && ! git -C "$d" ls-files --error-unmatch CLAUDE.local.md >/dev/null 2>&1; then
+  tmp="$g.monoptah.$$"
+  {
+    if [ -f "$g" ]; then
+      awk '/<!-- monoptah-evidence:begin -->/{s=1} !s{print} /<!-- monoptah-evidence:end -->/{s=0}' "$g"
+    fi
+    cat <<'GUIDE'
+<!-- monoptah-evidence:begin -->
 ## Evidence for the local user
 You run in a GitHub codespace. Save screenshots, test output and written reports that prove
-your work under `{workspace}/.evidence/` (create subfolders freely). That folder is excluded
+your work under `@WS@/.evidence/` (create subfolders freely). That folder is excluded
 from git and is never committed. The user's Monoptah app copies it to their machine on request,
 so do not put secrets there. Mention the file names in your final message.
+<!-- monoptah-evidence:end -->
 GUIDE
+  } > "$tmp" && mv "$tmp" "$g"
+  rm -f "$tmp"
 fi
-"#
-    )
+o="$HOME/.claude/CLAUDE.md"
+if [ -f "$o" ] && grep -q '<!-- monoptah-evidence -->' "$o"; then
+  tmp="$o.monoptah.$$"
+  awk 'index($0,"<!-- monoptah-evidence -->"){s=1} !s{print} s&&index($0,"Mention the file names in your final message."){s=0}' "$o" > "$tmp" && cat "$tmp" > "$o"
+  rm -f "$tmp"
+fi
+"#;
+
+fn evidence_script(workspace: &str) -> String {
+    EVIDENCE_SCRIPT.replace("@WS@", workspace)
 }
 
 /// Best-effort setup of the evidence folder and agent guidance in a running codespace.
-/// `workspace` is the repo checkout, `/workspaces/<repo>`.
+/// `workspace` is the repo checkout, `/workspaces/<repo>`. Bounded by `SSH_TIMEOUT` (30s).
 pub fn prepare_evidence(runner: &dyn GhRunner, name: &str, workspace: &str) -> Result<(), String> {
     valid_codespace_name(name)?;
     let repo = workspace
@@ -670,15 +699,24 @@ pub fn valid_remote_path(path: &str) -> Result<(), String> {
                 .into(),
         );
     }
-    if path.split('/').any(|part| part == "..") {
-        return Err("Remote path must not contain `..`".into());
+    if path.split('/').any(|part| part == ".." || part == ".") {
+        return Err("Remote path must not contain `.` or `..` segments".into());
     }
     Ok(())
 }
 
-/// True when a `copy_from` error says the remote path does not exist.
-pub fn is_missing_path(error: &str) -> bool {
-    error.contains("No such file or directory")
+/// True when a `copy_from` error says `remote_path` ITSELF does not exist. A nested failure
+/// (a dangling symlink or a file that vanished inside the folder) names a longer path and is
+/// not "missing": scp still copied the rest.
+pub fn is_missing_path(error: &str, remote_path: &str) -> bool {
+    error.lines().any(|line| {
+        [format!("{remote_path}': "), format!("{remote_path}: ")]
+            .iter()
+            .any(|key| {
+                line.split_once(key.as_str())
+                    .is_some_and(|(_, rest)| rest.starts_with("No such file or directory"))
+            })
+    })
 }
 
 /// Copies `remote_path` (a file or directory inside the codespace, see [`valid_remote_path`]) into the existing local

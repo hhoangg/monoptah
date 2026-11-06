@@ -719,10 +719,20 @@ fn copy_from_rejects_unsafe_input_without_calling_gh() {
 
 #[test]
 fn copy_from_reports_gh_failure_and_missing_path() {
-    let fake = Fake::new(vec![fail("scp: /x: No such file or directory")]);
+    let fake = Fake::new(vec![fail("scp: '/x': No such file or directory")]);
     let error = copy_from(&fake, "cs-1", "/x", Path::new("/tmp/out")).unwrap_err();
-    assert!(is_missing_path(&error), "{error}");
-    assert!(!is_missing_path("permission denied"));
+    assert!(is_missing_path(&error, "/x"), "{error}");
+    assert!(is_missing_path("scp: /x: No such file or directory", "/x"));
+    assert!(!is_missing_path("permission denied", "/x"));
+    // A nested failure names a longer path: the folder itself exists.
+    assert!(!is_missing_path(
+        "scp: '/x/latest.png': No such file or directory",
+        "/x"
+    ));
+    assert!(!is_missing_path(
+        "scp: /xy: No such file or directory",
+        "/x"
+    ));
 }
 
 #[test]
@@ -743,10 +753,10 @@ fn prepare_evidence_sends_an_idempotent_script_over_stdin() {
     );
     let script = fake.calls()[0].1.clone().unwrap();
     assert!(script.contains("d='/workspaces/widgets'"));
-    assert!(script.contains(".git/info/exclude"));
+    assert!(script.contains("info/exclude"));
     assert!(!script.contains(".gitignore"));
-    assert!(script.contains("grep -qxF '.evidence/'"));
-    assert!(script.contains("monoptah-evidence"));
+    assert!(script.contains("CLAUDE.local.md"));
+    assert!(script.contains("monoptah-evidence:begin"));
 }
 
 #[test]
@@ -770,37 +780,152 @@ fn prepare_evidence_rejects_unsafe_workspaces_and_reports_failures() {
     assert!(error.contains("connect failed"), "{error}");
 }
 
+fn run_script(script: &str, home: &Path) {
+    let mut child = std::process::Command::new("sh")
+        .arg("-s")
+        .env("HOME", home)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+fn git_init(path: &Path) {
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(path)
+        .status()
+        .unwrap()
+        .success());
+}
+
 #[test]
-fn the_evidence_script_is_valid_shell_and_does_its_job() {
+fn the_evidence_script_writes_a_local_guide_keeps_other_content_and_is_idempotent() {
     let home = tempfile::tempdir().unwrap();
     let ws = tempfile::tempdir().unwrap();
-    // Stand-in checkout; the script's workspace is a fixed /workspaces path, so rewrite it.
-    std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(ws.path())
-        .status()
-        .unwrap();
-    let script =
-        evidence_script("/workspaces/w").replace("/workspaces/w", ws.path().to_str().unwrap());
+    git_init(ws.path());
+    // An exclude file without a trailing newline must not have its last pattern corrupted.
+    std::fs::write(ws.path().join(".git/info/exclude"), "keep-me").unwrap();
+    let guide_path = ws.path().join("CLAUDE.local.md");
+    std::fs::write(&guide_path, "my own notes\n").unwrap();
+    let script = evidence_script(ws.path().to_str().unwrap());
     for _ in 0..2 {
-        let mut child = std::process::Command::new("sh")
-            .arg("-s")
-            .env("HOME", home.path())
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(script.as_bytes())
-            .unwrap();
-        assert!(child.wait().unwrap().success());
+        run_script(&script, home.path());
     }
     assert!(ws.path().join(".evidence").is_dir());
     let exclude = std::fs::read_to_string(ws.path().join(".git/info/exclude")).unwrap();
-    assert_eq!(exclude.matches(".evidence/").count(), 1);
-    let guide = std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap();
-    assert_eq!(guide.matches("monoptah-evidence").count(), 1);
+    let lines: Vec<_> = exclude.lines().collect();
+    assert_eq!(lines.iter().filter(|l| **l == ".evidence/").count(), 1);
+    assert_eq!(lines.iter().filter(|l| **l == "CLAUDE.local.md").count(), 1);
+    assert!(lines.contains(&"keep-me"));
+    let guide = std::fs::read_to_string(&guide_path).unwrap();
+    assert!(guide.starts_with("my own notes\n"));
+    assert_eq!(guide.matches("monoptah-evidence:begin").count(), 1);
     assert!(guide.contains(&format!("{}/.evidence/", ws.path().display())));
+    // Nothing in the user's home is created or touched.
+    assert!(!home.path().join(".claude").exists());
+    // git sees neither file.
+    let status = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(ws.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
+}
+
+#[test]
+fn the_evidence_script_replaces_only_its_own_block() {
+    let home = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    git_init(ws.path());
+    let guide_path = ws.path().join("CLAUDE.local.md");
+    std::fs::write(
+        &guide_path,
+        "before\n<!-- monoptah-evidence:begin -->\nstale\n<!-- monoptah-evidence:end -->\nafter\n",
+    )
+    .unwrap();
+    run_script(&evidence_script(ws.path().to_str().unwrap()), home.path());
+    let guide = std::fs::read_to_string(&guide_path).unwrap();
+    assert!(guide.contains("before\n") && guide.contains("after\n"));
+    assert!(!guide.contains("stale"));
+    assert_eq!(guide.matches("monoptah-evidence:begin").count(), 1);
+}
+
+#[test]
+fn the_evidence_script_never_writes_through_a_symlink_or_over_a_tracked_file() {
+    let home = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    git_init(ws.path());
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("dotfile.md");
+    std::fs::write(&target, "precious\n").unwrap();
+    std::os::unix::fs::symlink(&target, ws.path().join("CLAUDE.local.md")).unwrap();
+    run_script(&evidence_script(ws.path().to_str().unwrap()), home.path());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "precious\n");
+    assert!(ws.path().join("CLAUDE.local.md").is_symlink());
+    // A tracked CLAUDE.local.md is the project's own file.
+    let ws2 = tempfile::tempdir().unwrap();
+    git_init(ws2.path());
+    std::fs::write(ws2.path().join("CLAUDE.local.md"), "tracked\n").unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(ws2.path())
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success())
+    };
+    git(&["add", "CLAUDE.local.md"]);
+    git(&["commit", "-q", "-m", "x"]);
+    run_script(&evidence_script(ws2.path().to_str().unwrap()), home.path());
+    assert_eq!(
+        std::fs::read_to_string(ws2.path().join("CLAUDE.local.md")).unwrap(),
+        "tracked\n"
+    );
+}
+
+#[test]
+fn the_evidence_script_removes_only_the_old_marked_block_from_the_home_guide() {
+    let home = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    git_init(ws.path());
+    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    let old = home.path().join(".claude/CLAUDE.md");
+    std::fs::write(
+        &old,
+        "mine 1\n\n<!-- monoptah-evidence -->\n## Evidence for the local user\nYou run in a GitHub codespace.\nso do not put secrets there. Mention the file names in your final message.\nmine 2\n",
+    )
+    .unwrap();
+    run_script(&evidence_script(ws.path().to_str().unwrap()), home.path());
+    let text = std::fs::read_to_string(&old).unwrap();
+    assert!(text.contains("mine 1") && text.contains("mine 2"));
+    assert!(!text.contains("monoptah-evidence") && !text.contains("codespace"));
+    // A home guide without our block is left byte for byte alone.
+    std::fs::write(&old, "untouched").unwrap();
+    run_script(&evidence_script(ws.path().to_str().unwrap()), home.path());
+    assert_eq!(std::fs::read_to_string(&old).unwrap(), "untouched");
+}
+
+#[test]
+fn remote_paths_may_use_plus_and_at_but_not_dot_segments() {
+    assert!(valid_remote_path("/workspaces/a+b/@x/.evidence/shot-1.png").is_ok());
+    for bad in [".", "./", "/workspaces/w/.", "/workspaces/w/./x"] {
+        assert!(valid_remote_path(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn gh_ssh_has_a_short_timeout_and_cp_a_long_one() {
+    let ssh = super::call_timeout(&v(&["codespace", "ssh", "-c", "x"]));
+    assert_eq!(ssh, Duration::from_secs(30));
+    assert!(super::call_timeout(&v(&["codespace", "cp"])) > Duration::from_secs(300));
 }

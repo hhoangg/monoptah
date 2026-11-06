@@ -336,7 +336,10 @@ fn codespace_evidence_pull() {
     step(&format!("copy_from ok: {}", copied.display()));
     let missing = codespaces::copy_from(&gh, &name, "/workspaces/monoptah/.no-such-dir", &direct)
         .unwrap_err();
-    assert!(codespaces::is_missing_path(&missing), "{missing}");
+    assert!(
+        codespaces::is_missing_path(&missing, "/workspaces/monoptah/.no-such-dir"),
+        "{missing}"
+    );
 
     // 2. The session-level pull into <db>.threads/<session>/evidence.
     let store = Arc::new(Mutex::new(
