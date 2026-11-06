@@ -1,4 +1,5 @@
 use super::*;
+use crate::terminal::TerminalEvent;
 use gpui::{TestAppContext, VisualTestContext, WindowHandle};
 use model::Gh;
 use monocode_core::codespaces::{AuthStatus, GhOutput};
@@ -143,10 +144,15 @@ fn env(gh: &Arc<FakeGh>, origin: fn(&Path) -> Option<String>) -> Env {
 }
 
 fn open(cx: &mut TestAppContext, env: Env) -> WindowHandle<CodespacesDialog> {
+    open_at(cx, env, PROJECT)
+}
+
+fn open_at(cx: &mut TestAppContext, env: Env, project: &str) -> WindowHandle<CodespacesDialog> {
+    let project = project.to_owned();
     let window = cx.update(|cx| {
         input::bind(cx);
         cx.open_window(Default::default(), |_, cx| {
-            cx.new(|cx| CodespacesDialog::new(PROJECT.into(), "Alpha".into(), env, cx))
+            cx.new(|cx| CodespacesDialog::new(project, "Alpha".into(), env, cx))
         })
         .unwrap()
     });
@@ -694,4 +700,352 @@ fn a_gh_that_times_out_ends_busy_and_the_fields_explain_why(cx: &mut TestAppCont
             .debug_bounds("codespaces-unknown-CLAUDE_CODE_OAUTH_TOKEN")
             .is_some()
     );
+}
+
+const TOKEN: &str = "sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_abcdefghijklmnopqrstuvwxyz1xyAA";
+
+fn wrapped(token: &str, width: usize, indent: &str) -> String {
+    token
+        .as_bytes()
+        .chunks(width)
+        .map(|chunk| format!("{indent}{}", std::str::from_utf8(chunk).unwrap()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn captured_token_joins_a_wrapped_token_and_stops_at_the_blank_line() {
+    let tail = format!(
+        "Your OAuth token (valid for 1 year):\n\n{}\n\nStore this token securely.\nUse it with `export X=...`\n",
+        wrapped(TOKEN, 30, "  ")
+    );
+    assert_eq!(model::captured_token(&tail).as_deref(), Some(TOKEN));
+    // The last token on screen wins.
+    let two = format!("sk-ant-oat01-old{}\n\n{}\n", "x".repeat(40), TOKEN);
+    assert_eq!(model::captured_token(&two).as_deref(), Some(TOKEN));
+    // A token that fits on one line and ends the text.
+    assert_eq!(model::captured_token(TOKEN).as_deref(), Some(TOKEN));
+}
+
+#[test]
+fn captured_token_needs_a_blank_line_or_the_end_after_it() {
+    assert_eq!(model::captured_token(&format!("{TOKEN}\nDone.")), None);
+    assert_eq!(
+        model::captured_token(&format!("{}\nStore it securely", wrapped(TOKEN, 30, ""))),
+        None
+    );
+    assert_eq!(
+        model::captured_token(&format!("{TOKEN}\n\nDone.")).as_deref(),
+        Some(TOKEN)
+    );
+}
+
+#[test]
+fn captured_token_survives_the_narrow_dialog_terminal() {
+    assert_eq!(TOKEN.len(), 108);
+    // 52 columns: lines of 52, 52 and a letters-only tail of 4.
+    let tail = format!("Your token:\n\n{}\n\nStore it.\n", wrapped(TOKEN, 52, ""));
+    assert_eq!(tail.lines().nth(4), Some("xyAA"));
+    assert_eq!(model::captured_token(&tail).as_deref(), Some(TOKEN));
+}
+
+#[test]
+fn captured_token_rejects_a_line_with_anything_else_on_it() {
+    for line in [
+        format!("| {TOKEN} |"),
+        format!("export CLAUDE_CODE_OAUTH_TOKEN={TOKEN}"),
+        format!("token: {TOKEN} (copy it)"),
+        format!("{TOKEN} (copy it)"),
+    ] {
+        assert_eq!(model::captured_token(&line), None, "{line}");
+    }
+}
+
+#[test]
+fn captured_token_requires_even_wrapping() {
+    let (a, b, c) = (&TOKEN[..40], &TOKEN[40..80], &TOKEN[80..]);
+    // A shorter last line is how a wrapped token ends.
+    assert_eq!(
+        model::captured_token(&format!("{a}\n{b}\n{c}\n")).as_deref(),
+        Some(TOKEN)
+    );
+    // A shorter line in the middle is not.
+    assert_eq!(model::captured_token(&format!("{a}\n{c}\n{b}\n")), None);
+    // A line longer than the first is not.
+    assert_eq!(
+        model::captured_token(&format!("{}\n{}\n", &TOKEN[..30], &TOKEN[30..])),
+        None
+    );
+}
+
+#[test]
+fn captured_token_needs_a_complete_token() {
+    assert_eq!(model::captured_token(""), None);
+    assert_eq!(model::captured_token("no token here"), None);
+    assert_eq!(model::captured_token("sk-ant-oat01-short"), None);
+    assert_eq!(model::captured_token(&TOKEN[..79]), None);
+    let api = format!("sk-ant-api03-{}", "a".repeat(60));
+    assert_eq!(model::captured_token(&api), None);
+}
+
+fn exited(tail: &str) -> TerminalEvent {
+    TerminalEvent::Exited {
+        code: Some(0),
+        error: None,
+        tail: tail.into(),
+    }
+}
+
+fn terminal_of(
+    window: &WindowHandle<CodespacesDialog>,
+    cx: &mut TestAppContext,
+) -> Entity<Terminal> {
+    read(window, cx, |dialog, _| dialog.terminal.clone().unwrap())
+}
+
+fn emit(terminal: &Entity<Terminal>, event: TerminalEvent, cx: &mut gpui::App) {
+    terminal.update(cx, |_, cx| cx.emit(event));
+}
+
+#[gpui::test]
+fn a_token_printed_by_setup_token_is_saved_when_the_terminal_exits(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    act(&window, cx, |dialog, cx| dialog.generate_token(cx));
+    let terminal = terminal_of(&window, cx);
+    let tail = format!("Your token:\n\n{}\n\nStore it.\n", wrapped(TOKEN, 30, " "));
+    act(&window, cx, |_, cx| emit(&terminal, exited(&tail), cx));
+    assert_eq!(
+        gh.sets(),
+        vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), TOKEN.into())]
+    );
+    read(&window, cx, |dialog, cx| {
+        assert!(dialog.terminal.is_none());
+        assert!(!dialog.has_input(cx));
+        assert!(!dialog.busy);
+        assert!(dialog.notice.as_deref().unwrap().contains("Saved"));
+    });
+    assert_eq!(
+        state_of(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN"),
+        Some(SecretState::Set)
+    );
+}
+
+#[gpui::test]
+fn a_captured_token_waits_in_the_field_when_gh_cannot_save(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_NO_SCOPE));
+    let window = open(cx, env(&gh, origin));
+    act(&window, cx, |dialog, cx| dialog.generate_token(cx));
+    let terminal = terminal_of(&window, cx);
+    act(&window, cx, |_, cx| emit(&terminal, exited(TOKEN), cx));
+    assert!(gh.sets().is_empty());
+    assert_eq!(typed_token(&window, cx), TOKEN);
+    read(&window, cx, |dialog, _| {
+        assert!(dialog.terminal.is_none());
+        assert!(dialog.notice.as_deref().unwrap().contains("Press Save"));
+    });
+}
+
+#[gpui::test]
+fn an_exit_without_a_token_keeps_the_terminal(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    act(&window, cx, |dialog, cx| dialog.generate_token(cx));
+    let terminal = terminal_of(&window, cx);
+    act(&window, cx, |_, cx| {
+        emit(&terminal, exited("Login failed"), cx)
+    });
+    assert!(gh.sets().is_empty());
+    read(&window, cx, |dialog, _| assert!(dialog.terminal.is_some()));
+}
+
+#[gpui::test]
+fn an_exit_from_a_replaced_terminal_saves_nothing(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    act(&window, cx, |dialog, cx| dialog.generate_token(cx));
+    let old = terminal_of(&window, cx);
+    act(&window, cx, |dialog, cx| dialog.generate_token(cx));
+    act(&window, cx, |_, cx| emit(&old, exited(TOKEN), cx));
+    assert!(gh.sets().is_empty());
+    assert_eq!(typed_token(&window, cx), "");
+    read(&window, cx, |dialog, _| assert!(dialog.terminal.is_some()));
+}
+
+#[gpui::test]
+fn an_exit_after_the_dialog_shut_down_saves_nothing(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    act(&window, cx, |dialog, cx| dialog.generate_token(cx));
+    let terminal = terminal_of(&window, cx);
+    act(&window, cx, |dialog, cx| dialog.shutdown(cx));
+    act(&window, cx, |_, cx| emit(&terminal, exited(TOKEN), cx));
+    assert!(gh.sets().is_empty());
+    assert_eq!(typed_token(&window, cx), "");
+}
+
+#[gpui::test]
+fn a_token_captured_while_busy_is_saved_when_the_work_ends(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    let closed = count_closes(&window, cx);
+    act(&window, cx, |dialog, cx| dialog.generate_token(cx));
+    let terminal = terminal_of(&window, cx);
+    act(&window, cx, |dialog, cx| {
+        dialog.refresh(cx);
+        emit(&terminal, exited(TOKEN), cx);
+    });
+    assert_eq!(
+        gh.sets(),
+        vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), TOKEN.into())]
+    );
+    read(&window, cx, |dialog, cx| {
+        assert!(!dialog.pending_auto_save && !dialog.busy);
+        assert!(!dialog.has_input(cx));
+    });
+    assert_eq!(closed.get(), 1);
+}
+
+#[gpui::test]
+fn auto_save_leaves_other_typed_fields_alone(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    let closed = count_closes(&window, cx);
+    act(&window, cx, |dialog, cx| {
+        let input = cx.new(|cx| Input::field("OTHER".to_owned(), "x", content(0.35), cx));
+        input.update(cx, |input, cx| input.set_text("half-typed".into(), cx));
+        dialog.fields.push(("OTHER".into(), input));
+        dialog.generate_token(cx);
+    });
+    let terminal = terminal_of(&window, cx);
+    act(&window, cx, |_, cx| emit(&terminal, exited(TOKEN), cx));
+    assert_eq!(
+        gh.sets(),
+        vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), TOKEN.into())]
+    );
+    read(&window, cx, |dialog, cx| {
+        let other = dialog.fields.iter().find(|(k, _)| k == "OTHER").unwrap();
+        assert_eq!(other.1.read(cx).content, "half-typed");
+    });
+    // Closing would throw the typed value away.
+    assert_eq!(closed.get(), 0);
+}
+
+#[gpui::test]
+fn a_save_does_not_clear_a_token_filled_after_it_started(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    type_in(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-first");
+    act(&window, cx, |dialog, cx| {
+        dialog.save(cx);
+        let input = dialog.fields[0].1.clone();
+        input.update(cx, |input, cx| {
+            input.set_text("sk-ant-oat-second".into(), cx)
+        });
+    });
+    assert_eq!(gh.sets()[0].1, "sk-ant-oat-first");
+    assert_eq!(typed_token(&window, cx), "sk-ant-oat-second");
+}
+
+#[gpui::test]
+fn a_deferred_auto_save_keeps_the_error_of_the_save_it_waited_for(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK)).failing("OTHER");
+    let window = open(cx, env(&gh, origin));
+    let closed = count_closes(&window, cx);
+    act(&window, cx, |dialog, cx| dialog.generate_token(cx));
+    let terminal = terminal_of(&window, cx);
+    act(&window, cx, |dialog, cx| {
+        let input = cx.new(|cx| Input::field("OTHER".to_owned(), "x", content(0.35), cx));
+        input.update(cx, |input, cx| input.set_text("value".into(), cx));
+        dialog.fields.push(("OTHER".into(), input));
+        dialog.save(cx);
+        emit(&terminal, exited(TOKEN), cx);
+    });
+    assert_eq!(
+        gh.sets(),
+        vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), TOKEN.into())]
+    );
+    read(&window, cx, |dialog, cx| {
+        assert!(dialog.error.as_deref().unwrap().contains("OTHER"));
+        assert!(dialog.notice.as_deref().unwrap().contains("Saved"));
+        let other = dialog.fields.iter().find(|(k, _)| k == "OTHER").unwrap();
+        assert_eq!(other.1.read(cx).content, "value");
+    });
+    // The kept error means the work is not finished: the dialog stays open.
+    assert_eq!(closed.get(), 0);
+}
+
+fn count_closes(
+    window: &WindowHandle<CodespacesDialog>,
+    cx: &mut TestAppContext,
+) -> std::rc::Rc<std::cell::Cell<u32>> {
+    let closed: std::rc::Rc<std::cell::Cell<u32>> = Default::default();
+    let seen = closed.clone();
+    window
+        .update(cx, |_, _, cx| {
+            cx.subscribe(&cx.entity(), move |_, _, _: &Event, _| {
+                seen.set(seen.get() + 1)
+            })
+            .detach()
+        })
+        .unwrap();
+    closed
+}
+
+#[gpui::test]
+fn a_successful_auto_save_with_everything_set_closes_the_dialog(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    let closed = count_closes(&window, cx);
+    act(&window, cx, |dialog, cx| dialog.generate_token(cx));
+    let terminal = terminal_of(&window, cx);
+    act(&window, cx, |_, cx| emit(&terminal, exited(TOKEN), cx));
+    assert_eq!(gh.sets().len(), 1);
+    assert_eq!(closed.get(), 1);
+}
+
+#[gpui::test]
+fn a_manual_save_with_everything_set_closes_the_dialog(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open(cx, env(&gh, origin));
+    let closed = count_closes(&window, cx);
+    type_in(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-manual");
+    act(&window, cx, |dialog, cx| dialog.save(cx));
+    assert_eq!(closed.get(), 1);
+}
+
+#[gpui::test]
+fn a_save_leaves_the_dialog_open_while_another_secret_is_missing(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "monoptah-cs-close-{}",
+        monocode_core::mono::new_id()
+    ));
+    std::fs::create_dir_all(dir.join(".devcontainer")).unwrap();
+    std::fs::write(
+        dir.join(".devcontainer/devcontainer.json"),
+        r#"{ "secrets": { "NPM_TOKEN": {} } }"#,
+    )
+    .unwrap();
+    let gh = FakeGh::new(Ok(AUTH_OK));
+    let window = open_at(cx, env(&gh, origin), dir.to_str().unwrap());
+    let closed = count_closes(&window, cx);
+    type_in(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-manual");
+    act(&window, cx, |dialog, cx| dialog.save(cx));
+    std::fs::remove_dir_all(dir).ok();
+    assert_eq!(gh.sets().len(), 1);
+    assert_eq!(
+        state_of(&window, cx, "NPM_TOKEN"),
+        Some(SecretState::Missing)
+    );
+    assert_eq!(closed.get(), 0);
+}
+
+#[gpui::test]
+fn a_failed_save_leaves_the_dialog_open(cx: &mut TestAppContext) {
+    let gh = FakeGh::new(Ok(AUTH_OK)).failing("CLAUDE_CODE_OAUTH_TOKEN");
+    let window = open(cx, env(&gh, origin));
+    let closed = count_closes(&window, cx);
+    type_in(&window, cx, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-manual");
+    act(&window, cx, |dialog, cx| dialog.save(cx));
+    assert_eq!(closed.get(), 0);
 }

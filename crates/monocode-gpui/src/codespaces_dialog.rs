@@ -10,7 +10,7 @@ mod tests;
 use crate::{
     input::{self, Input},
     settings::widgets::secondary_button,
-    terminal::Terminal,
+    terminal::{Terminal, TerminalEvent},
     theme::*,
 };
 use gpui::{
@@ -19,7 +19,7 @@ use gpui::{
     Window, div, prelude::*, px, rgb,
 };
 use model::{Row, Snapshot};
-use monocode_core::codespaces::{GhRunner, SecretState, SystemGh};
+use monocode_core::codespaces::{GhRunner, OAUTH_SECRET_KEY, SecretState, SystemGh};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -44,6 +44,13 @@ impl Env {
             origin: model::git_origin,
             claude: || monocode_core::scm::resolve_gui_binary("claude"),
         }
+    }
+}
+
+fn join_lines(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+        (a, b) => a.or(b),
     }
 }
 
@@ -107,6 +114,9 @@ pub(crate) struct CodespacesDialog {
     error: Option<String>,
     notice: Option<String>,
     terminal: Option<Entity<Terminal>>,
+    terminal_events: Option<Subscription>,
+    /// A captured token waits for the running check or save to end, then is saved.
+    pending_auto_save: bool,
     focus: FocusHandle,
     _events: Vec<Subscription>,
 }
@@ -131,6 +141,8 @@ impl CodespacesDialog {
             error: None,
             notice: None,
             terminal: None,
+            terminal_events: None,
+            pending_auto_save: false,
             focus: cx.focus_handle(),
             _events: Vec::new(),
         };
@@ -157,6 +169,7 @@ impl CodespacesDialog {
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
                 this.apply(snapshot, cx);
+                this.run_pending_auto_save(cx);
                 cx.notify();
             });
         })
@@ -210,54 +223,111 @@ impl CodespacesDialog {
     }
 
     fn can_save(&self, cx: &gpui::App) -> bool {
-        !self.busy
-            && self.has_input(cx)
-            && self
-                .snapshot
-                .as_ref()
-                .is_some_and(|s| s.gh.ready() && s.repo.is_some())
+        !self.busy && self.has_input(cx) && self.gh_ready()
+    }
+
+    /// gh is ready and the repository is known: the two things a save needs.
+    fn gh_ready(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|s| s.gh.ready() && s.repo.is_some())
     }
 
     /// Stores each non-empty field, then empties the ones that were saved and re-reads
     /// the status. A field whose save failed keeps its value so it can be retried.
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
-        if !self.can_save(cx) {
+        self.save_keys(None, false, cx);
+    }
+
+    /// `save` limited to `only` when given; other typed fields are neither saved nor cleared.
+    /// With `keep_messages` the error and notice already shown stay, and this save's
+    /// outcome is added to them (a deferred auto-save must not hide the save before it).
+    fn save_keys(&mut self, only: Option<&[&str]>, keep_messages: bool, cx: &mut Context<Self>) {
+        if self.busy || !self.gh_ready() {
             return;
         }
         let Some(repo) = self.snapshot.as_ref().and_then(|s| s.repo.clone()) else {
             return;
         };
-        let entries = model::to_save(&self.typed(cx));
+        let mut typed = self.typed(cx);
+        if let Some(only) = only {
+            typed.retain(|(key, _)| only.contains(&key.as_str()));
+        }
+        let entries = model::to_save(&typed);
+        if entries.is_empty() {
+            return;
+        }
         self.busy = true;
-        self.error = None;
-        self.notice = None;
+        if !keep_messages {
+            self.error = None;
+            self.notice = None;
+        }
         cx.notify();
         let (env, project) = (self.env.clone(), self.project.clone());
         cx.spawn(async move |this, cx| {
             let (outcome, snapshot) = cx
                 .background_executor()
-                .spawn(async move {
-                    let outcome = model::save(env.runner.as_ref(), &repo, &entries);
-                    let path = Path::new(&project);
-                    let origin = (env.origin)(path);
-                    let snapshot = model::load(env.runner.as_ref(), path, origin.as_deref());
-                    (outcome, snapshot)
+                .spawn({
+                    let entries = entries.clone();
+                    async move {
+                        let outcome = model::save(env.runner.as_ref(), &repo, &entries);
+                        let path = Path::new(&project);
+                        let origin = (env.origin)(path);
+                        let snapshot = model::load(env.runner.as_ref(), path, origin.as_deref());
+                        (outcome, snapshot)
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
+                let clean = !outcome.saved.is_empty() && outcome.failed.is_empty();
                 for key in &outcome.saved {
-                    this.clear(key, cx);
+                    if let Some((_, value)) = entries.iter().find(|(k, _)| k == key) {
+                        this.clear_if_unchanged(key, value, cx);
+                    }
                 }
-                this.error = outcome.message();
-                if !outcome.saved.is_empty() {
-                    this.notice = Some(format!("Saved {}.", outcome.saved.join(", ")));
+                let saved = (!outcome.saved.is_empty())
+                    .then(|| format!("Saved {}.", outcome.saved.join(", ")));
+                if keep_messages {
+                    this.error = join_lines(this.error.take(), outcome.message());
+                    this.notice = join_lines(this.notice.take(), saved);
+                } else {
+                    this.error = outcome.message();
+                    this.notice = saved;
                 }
                 this.apply(snapshot, cx);
+                if this.pending_auto_save {
+                    // That save decides whether the dialog is done.
+                    this.run_pending_auto_save(cx);
+                } else if clean && this.error.is_none() && this.all_set() && !this.has_input(cx) {
+                    // Closing empties the fields, so a value still typed keeps it open.
+                    cx.emit(Event::Close);
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Every secret is set and the last check had no error: nothing is left to do here.
+    fn all_set(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|s| {
+            s.error.is_none()
+                && !s.rows.is_empty()
+                && s.rows.iter().all(|row| row.state == Some(SecretState::Set))
+        })
+    }
+
+    /// Empties a saved field, unless it was changed while the save ran.
+    fn clear_if_unchanged(&mut self, key: &str, saved: &str, cx: &mut Context<Self>) {
+        let unchanged = self
+            .fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .is_some_and(|(_, input)| input.read(cx).content.trim() == saved);
+        if unchanged {
+            self.clear(key, cx);
+        }
     }
 
     /// Opens a local terminal running `claude setup-token`; the user copies the token it
@@ -285,8 +355,71 @@ impl CodespacesDialog {
                 cx,
             )
         });
+        self.terminal_events = Some(cx.subscribe(&terminal, Self::on_terminal_event));
         self.terminal = Some(terminal);
         cx.notify();
+    }
+
+    /// When `claude setup-token` ends having printed a token, puts it in the field,
+    /// closes the terminal and saves it. Events from a terminal that is no longer the
+    /// dialog's current one are ignored.
+    fn on_terminal_event(
+        &mut self,
+        terminal: Entity<Terminal>,
+        event: &TerminalEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let TerminalEvent::Exited { tail, .. } = event else {
+            return;
+        };
+        if self.terminal.as_ref() != Some(&terminal) {
+            return;
+        }
+        let Some(token) = model::captured_token(tail) else {
+            return;
+        };
+        let Some((_, input)) = self
+            .fields
+            .iter()
+            .find(|(key, _)| key == OAUTH_SECRET_KEY)
+            .cloned()
+        else {
+            return;
+        };
+        input.update(cx, |input, cx| input.set_text(token, cx));
+        self.close_terminal(cx);
+        self.auto_save(cx);
+        cx.notify();
+    }
+
+    /// Saves the captured token now, or once the running check or save has ended.
+    fn auto_save(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            self.pending_auto_save = true;
+        } else {
+            self.run_auto_save(false, cx);
+        }
+    }
+
+    fn run_pending_auto_save(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.pending_auto_save) {
+            self.run_auto_save(true, cx);
+        }
+    }
+
+    /// Only the token field is saved: anything else half typed stays untouched.
+    fn run_auto_save(&mut self, keep_messages: bool, cx: &mut Context<Self>) {
+        if self.gh_ready() {
+            self.save_keys(Some(&[OAUTH_SECRET_KEY]), keep_messages, cx);
+        } else {
+            let waiting = "The token is in the field. Press Save when the problem above is fixed.";
+            let before = if keep_messages {
+                self.notice.take()
+            } else {
+                None
+            };
+            self.notice = join_lines(before, Some(waiting.into()));
+        }
     }
 
     /// The embedded terminal has the keyboard: Escape belongs to it (`claude setup-token`
@@ -298,6 +431,7 @@ impl CodespacesDialog {
     }
 
     fn close_terminal(&mut self, cx: &mut Context<Self>) {
+        self.terminal_events = None;
         if let Some(terminal) = self.terminal.take() {
             terminal.read(cx).kill();
         }
@@ -305,6 +439,7 @@ impl CodespacesDialog {
 
     /// Ends the terminal and drops anything typed; called when the dialog closes.
     pub(crate) fn shutdown(&mut self, cx: &mut Context<Self>) {
+        self.pending_auto_save = false;
         self.close_terminal(cx);
         for (key, _) in self.fields.clone() {
             self.clear(&key, cx);
@@ -450,13 +585,16 @@ impl CodespacesDialog {
                 .flex_col()
                 .gap_2()
                 .child(muted(
-                    "Sign in when asked, then copy the token it prints into the field above.",
+                    "Sign in when asked. The token it prints is saved automatically when it exits.",
                 ))
                 .child(
                     div()
                         .id("codespaces-terminal")
                         .debug_selector(|| "codespaces-terminal".into())
-                        .h(px(200.))
+                        // Tall enough for the whole success screen: Claude Code only draws
+                        // the part of a frame that fits, so a shorter pane loses the first
+                        // lines of the token.
+                        .h(px(400.))
                         .rounded_md()
                         .border_1()
                         .border_color(content(0.1))
