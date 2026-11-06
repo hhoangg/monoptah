@@ -5726,6 +5726,125 @@ fn a_move_racing_a_delete_cannot_bring_the_deleted_session_back(cx: &mut TestApp
     );
 }
 
+#[gpui::test]
+fn a_mono_deletes_a_session_with_its_worktree_only_when_nothing_is_lost(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let id = regular_session(&s, "codex", None, cx);
+    let refused = |request: &str, cx: &mut TestAppContext| {
+        delete(
+            &s,
+            s.session,
+            request,
+            json!({"sessionId":id,"removeWorktree":true}),
+            cx,
+        )
+        .unwrap_err()
+    };
+    assert!(refused("none", cx).contains("no worktree"));
+    assert!(stored(&s, id) && shell_has(&s, id, cx));
+    let dir = std::env::temp_dir().join(format!(
+        "native-wt-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.canonicalize().unwrap();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&root, &["init", "--bare", "-b", "main", "remote.git"]);
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "fixture@example.invalid"]);
+    git(&repo, &["config", "user.name", "Fixture"]);
+    std::fs::write(repo.join("file"), "before").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "Initial"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &root.join("remote.git").to_string_lossy(),
+        ],
+    );
+    git(&repo, &["push", "origin", "main"]);
+    let tree = monocode_core::git::create_worktree(&repo, "HEAD", id)
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    locked(&s.store)
+        .unwrap()
+        .save_agent_settings(
+            id,
+            &monocode_core::agent::Settings {
+                worktree_cwd: Some(tree.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Another session working in the same worktree keeps it.
+    let other = regular_session(&s, "codex", None, cx);
+    locked(&s.store)
+        .unwrap()
+        .save_agent_settings(
+            other,
+            &monocode_core::agent::Settings {
+                worktree_cwd: Some(tree.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(refused("shared", cx).contains("Another session"));
+    locked(&s.store)
+        .unwrap()
+        .save_agent_settings(other, &Default::default())
+        .unwrap();
+    std::fs::write(tree.join("wip"), "x").unwrap();
+    assert!(refused("dirty", cx).contains("uncommitted"));
+    assert!(stored(&s, id) && tree.exists());
+    std::fs::remove_file(tree.join("wip")).unwrap();
+    let done = delete(
+        &s,
+        s.session,
+        "clean",
+        json!({"sessionId":id,"removeWorktree":true}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(done["deleted"], true);
+    assert_eq!(done["worktreeRemoved"], true);
+    assert_eq!(done["branchDeleted"], true);
+    assert!(!stored(&s, id) && !shell_has(&s, id, cx) && !tree.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_help_documents_the_worktree_fields_and_removal() {
+    for needle in [
+        "archivedAt",
+        "lastActivityAt",
+        "worktreePath",
+        "worktreeDirty",
+        "worktreeUnpushed",
+        "sessions.delete {sessionId,project?,providerFiles?,removeWorktree?}",
+        "removeWorktree: true",
+        "branchDeleted",
+    ] {
+        assert!(mono::bridge::HELP.contains(needle), "{needle}");
+    }
+}
+
 const HABIT_FILE: &str = "kind: habit\nversion: 1\nname: Digest\nschedule:\n  kind: weekdays\n  time: \"09:00\"\ninstructions: Check https://example.com/feed and /Users/alice/notes\n";
 
 fn ask_habit(

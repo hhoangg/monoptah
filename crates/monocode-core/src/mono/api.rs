@@ -13,7 +13,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "sessions.draft"=>"sessionId prompt project",
         "sessions.pullEvidence"=>"sessionId project path taskId",
         "sessions.stop"|"sessions.archive"=>"sessionId project",
-        "sessions.delete"=>"sessionId project providerFiles",
+        "sessions.delete"=>"sessionId project providerFiles removeWorktree",
         "worktrees.create"=>"branch base existing project",
         "folders.move"=>"sessionId folderId newFolderName project",
         "notes.list"=>"limit offset","notes.read"=>"id","notes.write"=>"id title body tags",
@@ -68,6 +68,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "existing",
             "enabled",
             "providerFiles",
+            "removeWorktree",
         ]
         .contains(&key.as_str())
             && !value.is_boolean()
@@ -98,6 +99,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "existing",
             "enabled",
             "providerFiles",
+            "removeWorktree",
             "before",
             "limit",
             "offset",
@@ -129,6 +131,11 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             .is_none_or(|values| values.values().any(|v| !v.is_string()))
     }) {
         return Err("modelSettings must be an object of strings".into());
+    }
+    if input["removeWorktree"] == true && input["providerFiles"] == true {
+        return Err(
+            "removeWorktree and providerFiles cannot be combined; choose one per call".into(),
+        );
     }
     if let Some(target) = input.get("target") {
         validate_target(target, input)?;
@@ -340,6 +347,27 @@ mod tests {
             );
         }
         assert!(delete(json!({"sessionId":1,"force":true})).is_err());
+    }
+    #[test]
+    fn remove_worktree_is_a_boolean_on_delete_only() {
+        let delete = |input| validate("sessions.delete", &input);
+        assert!(delete(json!({"sessionId":1,"removeWorktree":true})).is_ok());
+        assert!(delete(json!({"sessionId":1,"removeWorktree":false})).is_ok());
+        for bad in [json!("true"), json!(1), json!(null)] {
+            assert_eq!(
+                delete(json!({"sessionId":1,"removeWorktree":bad})).unwrap_err(),
+                "removeWorktree must be true or false"
+            );
+        }
+        assert_eq!(
+            validate(
+                "sessions.archive",
+                &json!({"sessionId":1,"removeWorktree":true})
+            )
+            .unwrap_err(),
+            "sessions.archive does not take removeWorktree"
+        );
+        assert!(delete(json!({"sessionId":1,"removeWorktree":true,"providerFiles":true})).is_err());
     }
     #[test]
     fn today_actions_take_their_own_fields_and_non_text_values() {

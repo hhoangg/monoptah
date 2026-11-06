@@ -451,34 +451,41 @@ impl Shell {
         let action = call.action.clone();
         let result: Result<Value, String> = match action.as_str() {
             "sessions.list" => {
-                // Rows are built here from live state. Cloud sessions are filtered and given their
-                // target off the UI thread: the codespace state may need a `gh` call.
-                let rows: Vec<_> = self.order.iter().filter_map(|id|{
-                let metadata=self.session_metadata(*id,cx);
-                let remote=metadata.summary.cwd.starts_with("remote://");
-                if (metadata.summary.cwd!=project && !remote) || self.monos.as_ref().is_some_and(|m|m.read(cx).hidden_session(*id)) || self.orchestration_worker(*id){return None;}
-                let live=self.sessions.get(id).map(|v|v.read(cx));
-                Some((*id,metadata.summary.cwd==project,json!({"id":id,"sessionId":id,"title":metadata.summary.title,"harness":metadata.summary.provider,"model":live.and_then(|v|v.settings.model.clone()).or_else(||self.session_details.get(id).and_then(|m|m.model.clone())),"busy":metadata.busy,"hasDraft":live.is_some_and(|v|v.has_saved_draft() || !v.input.read(cx).content.is_empty()) || self.draft_sessions.contains(id),"archived":metadata.summary.archived})))
-            }).collect();
+                let entries: Vec<_> = self.order.iter().filter_map(|id|{
+                    let metadata=self.session_metadata(*id,cx);
+                    let remote=metadata.summary.cwd.starts_with("remote://");
+                    if (metadata.summary.cwd!=project && !remote) || self.monos.as_ref().is_some_and(|m|m.read(cx).hidden_session(*id)) || self.orchestration_worker(*id){return None;}
+                    let live=self.sessions.get(id).map(|v|v.read(cx));
+                    Some((metadata.summary.clone(),json!({"id":id,"sessionId":id,"title":metadata.summary.title,"harness":metadata.summary.provider,"model":live.and_then(|v|v.settings.model.clone()).or_else(||self.session_details.get(id).and_then(|m|m.model.clone())),"busy":metadata.busy,"hasDraft":live.is_some_and(|v|v.has_saved_draft() || !v.input.read(cx).content.is_empty()) || self.draft_sessions.contains(id),"archived":metadata.summary.archived})))
+                }).collect();
                 self.app_background(
                     call,
                     move |store| {
-                        let targets = if rows.iter().any(|(_, local, _)| !local) {
+                        let targets = if entries.iter().any(|(s, _)| s.cwd != project) {
                             CloudApi::shared(&store)
                                 .map(|api| api.session_targets(&project))
                                 .unwrap_or_default()
                         } else {
                             Default::default()
                         };
-                        let sessions: Vec<_> = rows
+                        let entries: Vec<_> = entries
                             .into_iter()
-                            .filter(|(id, local, _)| *local || targets.contains_key(id))
-                            .map(|(id, _, mut row)| {
-                                cloud_api::annotate(&mut row, targets.get(&id));
+                            .filter(|(s, _)| s.cwd == project || targets.contains_key(&s.id))
+                            .collect();
+                        let sessions: Vec<_> = entries.iter().map(|(s, _)| s).collect();
+                        let mut facts = locked(&store)?.app_session_facts(&sessions, false)?;
+                        let rows: Vec<_> = entries
+                            .iter()
+                            .map(|(s, row)| {
+                                let mut row = row.clone();
+                                if let Some(Value::Object(extra)) = facts.remove(&s.id) {
+                                    row.as_object_mut().unwrap().extend(extra);
+                                }
+                                cloud_api::annotate(&mut row, targets.get(&s.id));
                                 row
                             })
                             .collect();
-                        Ok((json!({"cwd":project,"sessions":sessions}), Effect::None))
+                        Ok((json!({"cwd":project,"sessions":rows}), Effect::None))
                     },
                     cx,
                 );
@@ -639,7 +646,18 @@ impl Shell {
                     }) {
                     Err(e) => Err(e),
                     Ok((id, view)) => {
-                        if action == "sessions.delete" {
+                        if action == "sessions.delete" && input["removeWorktree"] == true {
+                            let (reply, answer) = async_channel::bounded(1);
+                            self.app_delete_removing_worktree(id, reply, window, cx);
+                            cx.spawn(async move |this, cx| {
+                                let result = answer.recv().await.unwrap_or_else(|_| {
+                                    Err("The outcome of the delete is unknown. Check sessions.list before retrying".into())
+                                });
+                                let _ = this.update(cx, |this, cx| this.finish_app_call(call, result, cx));
+                            })
+                            .detach();
+                            return;
+                        } else if action == "sessions.delete" {
                             self.delete_session(id, window, cx);
                             if !self.deleting.contains(&id) {
                                 self.finish_app_call(

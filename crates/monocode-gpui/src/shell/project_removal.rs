@@ -7,6 +7,7 @@ use monocode_core::{
     provider_cleanup::{self, CleanupReport, CleanupRequest},
     store::Store,
 };
+use serde_json::{Value, json};
 use std::path::Path;
 
 /// Removes a deleted session's provider files; `None` means the store has no
@@ -135,6 +136,115 @@ pub(super) fn remove_unused_worktree(store: &Database, path: &str) -> Result<(),
 }
 
 impl Shell {
+    /// Whether the session is working or about to be driven by an app call.
+    fn session_in_flight(&self, id: i64, cx: &App) -> bool {
+        self.session_metadata(id, cx).busy
+            || self.busy_sessions.contains(&id)
+            || self.sessions.get(&id).is_some_and(|view| {
+                let view = view.read(cx);
+                view.busy || view.mono_external_pending()
+            })
+    }
+    /// `sessions.delete` with `removeWorktree`: checks that the session's own
+    /// worktree can go, deletes the session, then removes the worktree and the
+    /// branch that holds nothing of its own. Nothing is deleted when a check
+    /// fails. `reply` gets what happened, or why nothing was deleted.
+    pub(crate) fn app_delete_removing_worktree(
+        &mut self,
+        id: i64,
+        reply: async_channel::Sender<Result<Value, String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const BUSY: &str = "Session is busy; stop it before removing its worktree";
+        if self.session_in_flight(id, cx) {
+            let _ = reply.try_send(Err(BUSY.into()));
+            return;
+        }
+        let store = self.store.clone();
+        let planning = cx
+            .background_executor()
+            .spawn(async move { monocode_core::session_worktree::plan(&*locked(&store)?, id) });
+        let removing_store = self.store.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let plan = match planning.await {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let _ = reply.try_send(Err(error));
+                    return;
+                }
+            };
+            let (report, outcome) = async_channel::bounded(1);
+            // Checked again here: the session may have started working while Git was asked.
+            let started = this.update_in(cx, |this, window, cx| {
+                if this.session_in_flight(id, cx) {
+                    return Err(BUSY.to_string());
+                }
+                this.delete_session_with(
+                    id,
+                    DeleteOptions {
+                        report: Some(report),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                Ok(())
+            });
+            match started {
+                Ok(Ok(())) => (),
+                Ok(Err(error)) => {
+                    let _ = reply.try_send(Err(error));
+                    return;
+                }
+                Err(_) => {
+                    let _ = reply.try_send(Err("The app window is gone".into()));
+                    return;
+                }
+            }
+            let result = match outcome.recv().await {
+                Ok(Ok(_)) => {
+                    let work = plan.clone();
+                    let removal = cx
+                        .background_executor()
+                        .spawn(async move {
+                            Ok::<_, String>(monocode_core::session_worktree::execute_if_unused(
+                                &*locked(&removing_store)?,
+                                &work,
+                            ))
+                        })
+                        .await;
+                    let removal = match removal {
+                        Ok(removal) => removal,
+                        Err(error) => {
+                            let _ = reply.try_send(Err(error));
+                            return;
+                        }
+                    };
+                    let path = plan.path.to_string_lossy().into_owned();
+                    let removed = removal.worktree_removed;
+                    let _ = this.update(cx, |this, cx| {
+                        if removed {
+                            this.worktree_focus
+                                .retain(|_, focus| !is_equal_or_inside(&focus.path, &path));
+                            this.sync_git(cx);
+                        }
+                    });
+                    let mut value = removal.json(&plan.path);
+                    value["sessionId"] = json!(id);
+                    value["deleted"] = json!(true);
+                    Ok(value)
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(
+                    "The outcome of the delete is unknown. Check sessions.list before retrying"
+                        .into(),
+                ),
+            };
+            let _ = reply.try_send(result);
+        })
+        .detach();
+    }
     /// Finds installed editors once, off the main thread; the first lookup
     /// may read the login shell's PATH.
     pub(super) fn scan_external_editors(&mut self, cx: &mut Context<Self>) {

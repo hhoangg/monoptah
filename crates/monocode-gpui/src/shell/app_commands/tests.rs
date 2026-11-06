@@ -828,6 +828,198 @@ fn a_session_an_agent_starts_is_a_chat_whatever_the_preference(cx: &mut TestAppC
         .unwrap();
 }
 
+/// A repository with one pushed commit and a worktree made the way a new
+/// session makes it, recorded as the worktree of `session`.
+fn worktree_for(
+    window: WindowHandle<Shell>,
+    session: i64,
+    cx: &mut TestAppContext,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "native-wt-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.canonicalize().unwrap();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&root, &["init", "--bare", "-b", "main", "remote.git"]);
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "fixture@example.invalid"]);
+    git(&repo, &["config", "user.name", "Fixture"]);
+    std::fs::write(repo.join("file"), "before").unwrap();
+    std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "Initial"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &root.join("remote.git").to_string_lossy(),
+        ],
+    );
+    git(&repo, &["push", "origin", "main"]);
+    let tree = monocode_core::git::create_worktree(&repo, "HEAD", session)
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    window
+        .update(cx, |shell, _, _| {
+            locked(&shell.store)
+                .unwrap()
+                .save_agent_settings(
+                    session,
+                    &Settings {
+                        worktree_cwd: Some(tree.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        })
+        .unwrap();
+    (root, repo, tree)
+}
+
+#[gpui::test]
+fn list_and_read_report_archive_times_and_the_worktree(cx: &mut TestAppContext) {
+    let (window, _, caller) = setup(cx);
+    let child = launch(window, caller, "facts-child", json!({}), cx);
+    let (dir, _repo, tree) = worktree_for(window, child, cx);
+    std::fs::write(tree.join("wip"), "x").unwrap();
+    let row = |list: &Value| {
+        list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == child)
+            .unwrap()
+            .clone()
+    };
+    let list = call(window, caller, "l1", "sessions.list", json!({}), cx).unwrap();
+    let row1 = row(&list);
+    assert!(row1["archivedAt"].is_null());
+    assert!(row1["lastActivityAt"].as_u64().unwrap() > 0);
+    assert_eq!(row1["worktreePath"], tree.to_string_lossy().as_ref());
+    assert!(row1["worktreeDirty"].is_null(), "list does not run Git");
+    assert!(row1["worktreeUnpushed"].is_null());
+    let read = call(
+        window,
+        caller,
+        "r1",
+        "sessions.read",
+        json!({"sessionId":child}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(read["worktreePath"], tree.to_string_lossy().as_ref());
+    assert_eq!(read["worktreeDirty"], true);
+    assert_eq!(read["worktreeUnpushed"], false);
+    call(
+        window,
+        caller,
+        "a1",
+        "sessions.archive",
+        json!({"sessionId":child}),
+        cx,
+    )
+    .unwrap();
+    let archived = row(&call(window, caller, "l2", "sessions.list", json!({}), cx).unwrap());
+    assert!(archived["archivedAt"].as_u64().unwrap() > 0);
+    let read = call(
+        window,
+        caller,
+        "r2",
+        "sessions.read",
+        json!({"sessionId":child}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(read["archivedAt"], archived["archivedAt"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui::test]
+fn deleting_with_remove_worktree_refuses_first_and_cleans_up_after(cx: &mut TestAppContext) {
+    let (window, _, caller) = setup(cx);
+    let child = launch(window, caller, "rm-child", json!({}), cx);
+    let stored = |window: WindowHandle<Shell>, cx: &mut TestAppContext| {
+        window
+            .update(cx, |shell, _, _| {
+                locked(&shell.store)
+                    .unwrap()
+                    .sessions()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.id == child)
+            })
+            .unwrap()
+    };
+    let delete = |request: &str, cx: &mut TestAppContext| {
+        call(
+            window,
+            caller,
+            request,
+            "sessions.delete",
+            json!({"sessionId":child,"removeWorktree":true}),
+            cx,
+        )
+    };
+    // No worktree recorded yet.
+    assert!(delete("none", cx).unwrap_err().contains("no worktree"));
+    assert!(stored(window, cx));
+    let (dir, repo, tree) = worktree_for(window, child, cx);
+    // Busy.
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&child].update(cx, |v, _| v.busy = true)
+        })
+        .unwrap();
+    assert!(delete("busy", cx).unwrap_err().contains("busy"));
+    assert!(stored(window, cx) && tree.exists());
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&child].update(cx, |v, _| v.busy = false)
+        })
+        .unwrap();
+    // Dirty.
+    std::fs::write(tree.join("wip"), "x").unwrap();
+    assert!(delete("dirty", cx).unwrap_err().contains("uncommitted"));
+    assert!(stored(window, cx) && tree.exists());
+    std::fs::remove_file(tree.join("wip")).unwrap();
+    // Clean: the session, its worktree with ignored output, and its empty branch go.
+    std::fs::create_dir_all(tree.join("target/debug")).unwrap();
+    std::fs::write(tree.join("target/debug/big"), "x").unwrap();
+    let done = delete("clean", cx).unwrap();
+    assert_eq!(done["deleted"], true);
+    assert_eq!(done["worktreeRemoved"], true);
+    assert_eq!(done["branchDeleted"], true);
+    let branch = done["branch"].as_str().unwrap();
+    assert!(branch.starts_with("mc/native-"));
+    assert!(!stored(window, cx) && !tree.exists());
+    let branches = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["branch", "--list", branch])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 mod cloud {
     use super::*;
     use crate::cloud_wake::fakes::{
@@ -954,6 +1146,38 @@ mod cloud {
     }
 
     #[gpui::test]
+    fn removing_a_worktree_never_deletes_a_cloud_session(cx: &mut TestAppContext) {
+        let (window, caller, path, host, gh, _dir) = setup_cloud(cx, AUTH_OK);
+        let cloud = add_cloud_session(window, &path, cx);
+        host.0.lock().unwrap().clear();
+        let calls = gh.calls.lock().unwrap().len();
+        let error = call(
+            window,
+            caller,
+            "delete-cloud-worktree",
+            "sessions.delete",
+            json!({"sessionId":cloud,"removeWorktree":true}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(error.contains("no local worktree"), "{error}");
+        window
+            .update(cx, |shell, _, _| {
+                assert!(
+                    locked(&shell.store)
+                        .unwrap()
+                        .remote_session(cloud)
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(shell.session_summaries.contains_key(&cloud));
+            })
+            .unwrap();
+        assert_eq!(gh.calls.lock().unwrap().len(), calls);
+        assert!(host.0.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
     fn cloud_sessions_list_and_read_with_a_target_and_never_wake_the_codespace(
         cx: &mut TestAppContext,
     ) {
@@ -965,6 +1189,18 @@ mod cloud {
         let find = |id: i64| rows.iter().find(|s| s["id"] == id).unwrap().clone();
         assert_eq!(find(caller)["target"], json!({"kind":"local"}));
         assert!(find(caller).get("codespaceState").is_none());
+        for id in [caller, cloud] {
+            for field in [
+                "archivedAt",
+                "lastActivityAt",
+                "worktreePath",
+                "worktreeDirty",
+                "worktreeUnpushed",
+            ] {
+                assert!(find(id).get(field).is_some(), "{field}");
+            }
+        }
+        assert!(find(cloud)["worktreePath"].is_null());
         assert_eq!(
             find(cloud)["target"],
             json!({"kind":"codespace","codespace":"octo-run","state":"stopped"})

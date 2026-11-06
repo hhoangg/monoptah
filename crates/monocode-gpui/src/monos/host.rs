@@ -398,6 +398,55 @@ impl Monos {
         })
         .detach();
     }
+    /// `sessions.delete` with `removeWorktree`: the reply waits for the delete
+    /// and the worktree removal. The launch flags dismissed for the delete go
+    /// back if the delete is refused.
+    fn delete_removing_worktree(
+        &mut self,
+        call: Call,
+        session: i64,
+        flipped: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (reply, answer) = async_channel::bounded(1);
+        let owner = self.owner.clone();
+        let handle = window.window_handle();
+        let app: &mut App = cx;
+        // Deferred like the other removals, to stay clear of the entities that
+        // are being updated right now.
+        app.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = owner.update(cx, |owner, cx| {
+                    owner.app_delete_removing_worktree(session, reply, window, cx)
+                });
+            });
+        });
+        cx.spawn(async move |this, cx| {
+            let result = answer.recv().await.unwrap_or_else(|_| {
+                Err(
+                    "The outcome of the delete is unknown. Check sessions.list before retrying"
+                        .into(),
+                )
+            });
+            let _ = this.update(cx, |this, cx| {
+                if result.is_err() {
+                    for m in &mut this.roster.monos {
+                        if flipped.contains(&m.id) {
+                            for launch in &mut m.launches {
+                                if launch.session_id == session {
+                                    launch.dismissed = false;
+                                }
+                            }
+                        }
+                    }
+                    this.save(cx);
+                }
+                this.finish_call(call, result, cx);
+            });
+        })
+        .detach();
+    }
     fn call_work(
         &mut self,
         call: Call,
@@ -686,7 +735,8 @@ impl Monos {
                     let sessions:Vec<_>=all.iter().filter(|s|!hidden.contains(&s.id)&&(s.cwd==project||targets.contains_key(&s.id))).collect();
                     let value=if action=="sessions.list" {
                         let drafts=db.draft_sessions()?;let metadata=db.mobile_session_metadata()?;
-                        json!({"cwd":project,"sessions":sessions.iter().map(|s|{let mut row=json!({"id":s.id,"sessionId":s.id,"title":s.title,"harness":s.provider,"model":metadata.get(&s.id).and_then(|m|m.model.clone()),"busy":views.iter().any(|v|v.id==s.id&&v.busy),"hasDraft":drafts.contains(&s.id),"archived":s.archived});cloud_api::annotate(&mut row,targets.get(&s.id));row}).collect::<Vec<_>>()})
+                        let mut facts=db.app_session_facts(&sessions,false)?;
+                        json!({"cwd":project,"sessions":sessions.iter().map(|s|{let mut row=json!({"id":s.id,"sessionId":s.id,"title":s.title,"harness":s.provider,"model":metadata.get(&s.id).and_then(|m|m.model.clone()),"busy":views.iter().any(|v|v.id==s.id&&v.busy),"hasDraft":drafts.contains(&s.id),"archived":s.archived});if let Some(Value::Object(extra))=facts.remove(&s.id){row.as_object_mut().unwrap().extend(extra);}cloud_api::annotate(&mut row,targets.get(&s.id));row}).collect::<Vec<_>>()})
                     }else{
                         let session=if let Some(id)=input["sessionId"].as_str(){db.resolve_session_id(id)?}else{id(&input,"sessionId")?};
                         if !sessions.iter().any(|s|s.id==session){return Err("Session is outside the assigned project".into());}
@@ -837,6 +887,10 @@ impl Monos {
                         }
                     }
                     self.save(cx);
+                    if action == "sessions.delete" && flag(&input, "removeWorktree", false) {
+                        self.delete_removing_worktree(call, session, flipped, window, cx);
+                        return;
+                    }
                     if action == "sessions.delete" && flag(&input, "providerFiles", false) {
                         self.delete_with_files(call, session, flipped, window, cx);
                         return;

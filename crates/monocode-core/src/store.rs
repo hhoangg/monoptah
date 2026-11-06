@@ -1,5 +1,6 @@
 //! Session storage. Desktop launches use Monocode's existing schema directly.
 mod app_access;
+pub use app_access::ArchiveTimes;
 mod contributions;
 mod managed_sessions;
 mod monocode_import;
@@ -974,6 +975,12 @@ impl Store {
     }
     /// Archiving preserves the transcript, provider context and configuration.
     pub fn set_archived(&self, id: i64, archived: bool) -> Result<(), String> {
+        self.write_archived(id, archived)?;
+        // The flag is saved; a failure to note the time only loses the time.
+        let _ = self.record_archive_time(id, archived);
+        Ok(())
+    }
+    fn write_archived(&self, id: i64, archived: bool) -> Result<(), String> {
         if self.remote_session(id)?.is_some() {
             return self.patch_remote_session(id, serde_json::json!({"archived": archived}));
         }
@@ -1228,7 +1235,7 @@ impl Store {
         tx.execute("DELETE FROM native_reminders WHERE session_id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10) OR key LIKE ?4",
+            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11) OR key LIKE ?4",
             params![
                 format!("agent:{id}"),
                 format!("context:{id}"),
@@ -1239,6 +1246,7 @@ impl Store {
                 format!("inbox-ask:{id}"),
                 format!("automation:{id}"),
                 format!("mono-retired:{id}"),
+                format!("archive-times:{id}"),
                 format!("codespace-origin:{id}")
             ],
         )
