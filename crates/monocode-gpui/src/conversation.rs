@@ -182,6 +182,8 @@ pub(crate) struct Conversation {
     pub(crate) busy: bool,
     /// The UI is idle; serialize the next launch behind the worker's last save.
     stopping: bool,
+    /// A cloud session whose local copy is being saved: nothing may be sent meanwhile.
+    pub(crate) cloud_locked: bool,
     notification_cancelled: bool,
     /// The store's saved-draft flag, until the conversation loads its own.
     pub(crate) draft_hint: bool,
@@ -627,6 +629,7 @@ impl Conversation {
             loading: false,
             busy: false,
             stopping: false,
+            cloud_locked: false,
             notification_cancelled: false,
             draft_hint: false,
             model: std::env::var(format!(
@@ -889,12 +892,24 @@ impl Conversation {
             .update(cx, |input, cx| input.set_text(prompt, cx));
         self.send(cx);
     }
+    /// A cloud session whose local copy is being saved takes no new message.
+    pub(crate) fn refuse_while_saving_copy(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.cloud_locked {
+            self.status =
+                "This session is being saved as a local copy. Wait for it to finish.".into();
+            cx.notify();
+        }
+        self.cloud_locked
+    }
     fn send(&mut self, cx: &mut Context<Self>) {
         self.send_follow_up(false, cx);
     }
     /// `invert` sends a mid-turn message the opposite way from the follow-up
     /// preference: queued when it steers, steering when it queues.
     fn send_follow_up(&mut self, invert: bool, cx: &mut Context<Self>) {
+        if self.refuse_while_saving_copy(cx) {
+            return;
+        }
         if self.is_remote() && self.remote_send_guard(cx) {
             return;
         }

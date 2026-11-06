@@ -370,6 +370,12 @@ impl Store {
         Ok(None)
     }
     pub fn save_remote_session(&self, session: &RemoteSession) -> Result<(), String> {
+        // A session saved as a local copy must not come back through a journal write.
+        if let Some(host) = &session.session_id {
+            if self.is_cloud_converted(&session.project.environment_id, host)? {
+                return Err(CONVERTED.into());
+            }
+        }
         self.claim_legacy_remote_commands(session)?;
         let mut sessions = self.stored_remote_sessions()?;
         if session.summary.id >= 0 && session.session_id.is_some() {

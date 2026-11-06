@@ -71,7 +71,7 @@ else
     mkdir -p "$stage/codespace"
     fetcher="git"
     if command -v timeout >/dev/null 2>&1; then fetcher="timeout 60 git"; fi
-    if $fetcher fetch -q origin >/dev/null 2>&1; then echo "fetch=1"; else echo "fetch=0"; fi
+    if $fetcher fetch -q --prune origin >/dev/null 2>&1; then echo "fetch=1"; else echo "fetch=0"; fi
     echo "head=$head"
     echo "branch=$(git symbolic-ref --short -q HEAD || true)"
     echo "remote=$(git remote get-url origin 2>/dev/null || true)"
@@ -87,15 +87,15 @@ else
     if [ -n "$up" ]; then base=$(git merge-base HEAD "$up" || true); fi
     echo "base=$base"
     onorigin=0
-    if [ -n "$base" ] && [ -n "$(git branch -r --contains "$base" | head -n 1)" ]; then onorigin=1; fi
+    if [ -n "$base" ] && [ -n "$(git branch -r --list 'origin/*' --contains "$base" | head -n 1)" ]; then onorigin=1; fi
     echo "base_on_origin=$onorigin"
     set -- HEAD --branches
     if git rev-parse -q --verify refs/stash >/dev/null; then set -- "$@" refs/stash; echo "stash=1"; fi
     git for-each-ref --format='ref=%(refname) %(objectname)' refs/heads refs/stash | head -n 200
-    n=$(git rev-list --count "$@" --not --remotes)
+    n=$(git rev-list --count "$@" --not --remotes=origin)
     echo "unpushed=$n"
     if [ "$n" -gt 0 ]; then
-      git bundle create -q "$stage/codespace/commits.bundle" "$@" --not --remotes
+      git bundle create -q "$stage/codespace/commits.bundle" "$@" --not --remotes=origin
       echo "bundle=1"
     fi
     if [ -n "$base" ]; then
@@ -570,6 +570,7 @@ impl CloudSessions {
                     "codespace": codespace,
                     "remoteCwd": workspace,
                     "hostSessionId": remote.session_id,
+                    "environmentId": remote.project.environment_id,
                     "convertedAt": crate::time::now_ms(),
                 });
                 store.save_setting(&origin_key(local_id), &origin.to_string())
@@ -845,61 +846,72 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     git_run(cwd, args, &[], GIT_LIMIT)
 }
 
-/// Before the codespace goes away: the saved commits must be restorable here. The bundle
-/// verifies against the local project, or the format-patch series is there as a fallback,
-/// or the commits it still needs are on origin (fetched at restore). `Ok(Some)` is a
-/// warning; `Err` stops the conversion.
+/// Before the codespace goes away: the saved commits must be restorable here. Origin is
+/// fetched (into this feature's own ref namespace, removed again before returning), and then
+/// `head`, every saved ref and, for the patch-series fallback, the base must be present here
+/// or come from the bundle. `Ok(Some)` is a warning; `Err` stops the conversion.
 pub(super) fn check_restorable(
     project: &Path,
     code: &Path,
     snap: &Snapshot,
 ) -> Result<Option<String>, String> {
-    let mut notes = Vec::new();
-    if snap.base.is_some() && !snap.base_on_origin {
-        notes.push("the base commit is not on origin");
-    }
-    let bundle = code.join(BUNDLE);
-    if !bundle.is_file() {
-        return Ok((!notes.is_empty()).then(|| {
-            format!(
-                "Restoring the code may need extra care: {}.",
-                notes.join(", ")
-            )
-        }));
-    }
+    let head = snap
+        .head
+        .as_deref()
+        .filter(|h| valid_hex(h))
+        .ok_or("The codespace reported no valid HEAD")?;
     if !project.is_dir() {
         return Err(format!(
             "The local project {} is missing, so the saved commits cannot be checked.",
             project.display()
         ));
     }
-    let fallback = snap.patches > 0 && snap.base.is_some();
-    match run_git(project, &["bundle", "verify", &bundle.to_string_lossy()]) {
-        Ok(_) => {}
-        Err(_) if fallback => notes.push(
-            "the saved commits need commits this repository lacks; the patch series will be used",
-        ),
-        Err(error) => {
-            let missing: Vec<&str> = error
-                .split(|c: char| !c.is_ascii_hexdigit())
-                .filter(|t| t.len() == 40)
-                .collect();
-            let tips = git_run(
-                project,
-                &["ls-remote", "origin"],
-                &[],
-                Duration::from_secs(30),
-            )
-            .unwrap_or_default();
-            let on_origin = !missing.is_empty()
-                && missing
-                    .iter()
-                    .all(|sha| tips.lines().any(|l| l.starts_with(sha)));
-            if !on_origin {
-                return Err(format!(
-                    "The saved commits cannot be restored in this repository: {error}"
-                ));
+    let id8 = &head[..8];
+    fetch_origin(project, id8);
+    let _cleanup = OriginRefs { project, id8 };
+    let mut notes = Vec::new();
+    if snap.base.is_some() && !snap.base_on_origin {
+        notes.push("the base commit is not on origin".to_string());
+    }
+    let missing = |shas: Vec<&str>| -> Vec<String> {
+        shas.into_iter()
+            .filter(|sha| !has_commit(project, sha))
+            .map(|sha| sha[..12.min(sha.len())].to_string())
+            .collect()
+    };
+    let bundle = code.join(BUNDLE);
+    let refs: Vec<&str> = snap.refs.iter().map(|(_, sha)| sha.as_str()).collect();
+    if bundle.is_file() {
+        match run_git(project, &["bundle", "verify", &bundle.to_string_lossy()]) {
+            Ok(_) => {}
+            Err(error) => {
+                // The bundle does not fit this repository: only the series can still restore
+                // the current branch, and it carries neither other branches nor the stash.
+                let base = snap.base.as_deref();
+                let series_ok = snap.patches > 0
+                    && !snap.stash
+                    && base.is_some_and(|b| has_commit(project, b))
+                    && refs
+                        .iter()
+                        .all(|sha| *sha == head || has_commit(project, sha));
+                if !series_ok {
+                    return Err(format!(
+                        "The saved commits cannot be restored in this repository: {error}"
+                    ));
+                }
+                notes.push("the saved commits need commits this repository lacks; the patch series will be used".to_string());
             }
+        }
+    } else {
+        // Nothing was bundled: everything saved must already be reachable from origin.
+        let mut need = vec![head];
+        need.extend(refs);
+        let gone = missing(need);
+        if !gone.is_empty() {
+            return Err(format!(
+                "These saved commits are not on origin and were not bundled, so they cannot be restored here: {}",
+                gone.join(", ")
+            ));
         }
     }
     Ok((!notes.is_empty()).then(|| {
@@ -908,6 +920,25 @@ pub(super) fn check_restorable(
             notes.join(", ")
         )
     }))
+}
+
+/// Removes the `refs/codespace/<id8>/origin/*` copy of origin's branches when dropped.
+struct OriginRefs<'a> {
+    project: &'a Path,
+    id8: &'a str,
+}
+impl Drop for OriginRefs<'_> {
+    fn drop(&mut self) {
+        let prefix = format!("refs/codespace/{}/origin/", self.id8);
+        if let Ok(list) = run_git(
+            self.project,
+            &["for-each-ref", "--format=%(refname)", &prefix],
+        ) {
+            for name in list.lines().filter(|l| !l.is_empty()) {
+                let _ = run_git(self.project, &["update-ref", "-d", name]);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1040,6 +1071,8 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
         return Err(format!("{} is not a folder", project.display()));
     }
     let id8 = manifest.head[..8].to_string();
+    // Origin's branches are only fetched to find objects; they are removed again at the end.
+    let _cleanup = OriginRefs { project, id8: &id8 };
     let mut have_head = has_commit(project, &manifest.head);
     let mut unpacked = false;
     if let Some(bundle) = &manifest.bundle {

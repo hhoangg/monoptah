@@ -1168,7 +1168,21 @@ impl Store {
     pub fn delete(&mut self, id: i64) -> Result<(), String> {
         // Resolve the folder first; the persisted id is gone after deletion.
         let dir = self.thread_dir(id).ok().flatten();
+        // A converted cloud session's host copy may come back once its local copy is gone.
+        let origin = self
+            .setting(&format!("codespace-origin:{id}"))
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
         self.delete_rows(id)?;
+        if let Some(origin) = origin {
+            if let (Some(env), Some(host)) = (
+                origin["environmentId"].as_str(),
+                origin["hostSessionId"].as_str(),
+            ) {
+                let _ = self.set_cloud_converted(env, host, false);
+            }
+        }
         thread_files::remove_dir(dir);
         Ok(())
     }

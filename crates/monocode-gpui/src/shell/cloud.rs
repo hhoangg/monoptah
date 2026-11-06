@@ -779,6 +779,19 @@ impl Shell {
         let ids = dialog.ids();
         window.focus(&dialog.focus, cx);
         self.cloud_busy.extend(ids.iter().copied());
+        // Delete saves every session of the codespace, so all of them stop taking messages.
+        let mut locked_ids = ids.clone();
+        if choice == ArchiveChoice::Delete {
+            for group in &groups {
+                locked_ids.extend(
+                    self.cloud_marks
+                        .iter()
+                        .filter(|(_, m)| m.codespace == group.codespace)
+                        .map(|(id, _)| *id),
+                );
+            }
+        }
+        self.lock_cloud_composer(&locked_ids, true, cx);
         let cloud = self.cloud.clone();
         let convert = self.cloud_convert.clone();
         let worker_progress = progress.clone();
@@ -824,11 +837,26 @@ impl Shell {
         cx.spawn_in(window, async move |this, cx| {
             let outcomes = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                this.lock_cloud_composer(&locked_ids, false, cx);
                 this.finish_cloud_archive(choice, ids, outcomes, window, cx)
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// Stops (or resumes) message sending in the open conversations of `ids`.
+    pub(super) fn lock_cloud_composer(
+        &mut self,
+        ids: &[i64],
+        locked: bool,
+        cx: &mut Context<Self>,
+    ) {
+        for id in ids {
+            if let Some(view) = self.sessions.get(id) {
+                view.update(cx, |view, _| view.cloud_locked = locked);
+            }
+        }
     }
 
     fn finish_cloud_archive(

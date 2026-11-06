@@ -1030,3 +1030,18 @@ fn a_cancelled_archive_stops_before_copying_or_touching_the_codespace() {
     assert!(out[0].converted.is_empty());
     assert!(gh.calls().is_empty());
 }
+
+#[gpui::test]
+fn a_session_being_saved_takes_no_message_until_the_save_ends(cx: &mut TestAppContext) {
+    let (window, a, _) = crate::shell::tests::window(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let view = shell.sessions[&a].clone();
+            assert!(!view.update(cx, |v, cx| v.refuse_while_saving_copy(cx)));
+            shell.lock_cloud_composer(&[a], true, cx);
+            assert!(view.update(cx, |v, cx| v.refuse_while_saving_copy(cx)));
+            shell.lock_cloud_composer(&[a], false, cx);
+            assert!(!view.update(cx, |v, cx| v.refuse_while_saving_copy(cx)));
+        })
+        .unwrap();
+}

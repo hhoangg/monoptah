@@ -762,11 +762,6 @@ fn commits_built_on_something_the_clone_lacks_are_restored_from_the_patch_series
     let w = world_with(true, false, false);
     push_a_commit_the_clone_lacks(&w);
     let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
-    assert!(
-        done.warnings.iter().any(|m| m.contains("patch series")),
-        "{:?}",
-        done.warnings
-    );
     let thread = w
         .svc
         .store()
@@ -835,16 +830,64 @@ fn a_bundle_that_cannot_verify_and_has_no_fallback_stops_the_conversion() {
             "^main~1",
         ],
     );
-    let snap = Snapshot::default();
+    let head = git(&local, &["rev-parse", "HEAD"]);
+    let snap = Snapshot {
+        head: Some(head.clone()),
+        ..Snapshot::default()
+    };
     let error = check_restorable(&local, &code, &snap).unwrap_err();
     assert!(error.contains("cannot be restored"), "{error}");
-    // With a patch series and a base the same bundle is accepted with a warning.
+    // With a patch series and a base we have, the same bundle is accepted with a warning...
     let snap = Snapshot {
+        head: Some(head.clone()),
         patches: 1,
-        base: Some("a".repeat(40)),
+        base: Some(head.clone()),
         ..Snapshot::default()
     };
     assert!(check_restorable(&local, &code, &snap).unwrap().is_some());
+    // ...but not when the base is unknown here, or a stash would be lost.
+    let unknown = Snapshot {
+        base: Some("a".repeat(40)),
+        ..snap.clone()
+    };
+    assert!(check_restorable(&local, &code, &unknown).is_err());
+    let stash = Snapshot {
+        stash: true,
+        ..snap
+    };
+    assert!(check_restorable(&local, &code, &stash).is_err());
+}
+
+#[test]
+fn with_no_bundle_every_saved_commit_must_already_be_here() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    git(&local, &["init", "-q", "-b", "main"]);
+    std::fs::write(local.join("f"), "1").unwrap();
+    git(&local, &["add", "f"]);
+    git(&local, &["commit", "-q", "-m", "one"]);
+    let code = dir.path().join("code");
+    std::fs::create_dir_all(&code).unwrap();
+    let here = git(&local, &["rev-parse", "HEAD"]);
+    let ok = Snapshot {
+        head: Some(here.clone()),
+        refs: vec![("refs/heads/main".into(), here.clone())],
+        ..Snapshot::default()
+    };
+    assert!(check_restorable(&local, &code, &ok).unwrap().is_none());
+    let lost = Snapshot {
+        head: Some("b".repeat(40)),
+        ..Snapshot::default()
+    };
+    let error = check_restorable(&local, &code, &lost).unwrap_err();
+    assert!(error.contains("not on origin"), "{error}");
+    let lost_ref = Snapshot {
+        head: Some(here),
+        refs: vec![("refs/heads/x".into(), "c".repeat(40))],
+        ..Snapshot::default()
+    };
+    assert!(check_restorable(&local, &code, &lost_ref).is_err());
 }
 
 #[test]
@@ -907,4 +950,104 @@ fn rewriting_respects_both_boundaries() {
         "/L",
     );
     assert_eq!(out, "/L/x /L");
+}
+
+fn no_codespace_namespace_left(project: &Path) {
+    let refs = git(project, &["for-each-ref", "refs/codespace"]);
+    assert!(!refs.contains("/origin/"), "{refs}");
+}
+
+#[test]
+fn work_reachable_only_from_a_stale_remote_ref_is_still_bundled_and_restorable() {
+    let w = world_with(true, false, false);
+    // Pushed, then the branch was deleted on origin (a squash merge); the codespace still
+    // has the stale origin/feat/z until it prunes.
+    git(&w.ws, &["checkout", "-q", "-b", "feat/z", "main"]);
+    std::fs::write(w.ws.join("z.txt"), "z\n").unwrap();
+    git(&w.ws, &["add", "z.txt"]);
+    git(&w.ws, &["commit", "-q", "-m", "z work"]);
+    git(&w.ws, &["push", "-q", "origin", "feat/z"]);
+    git(&w.origin, &["branch", "-D", "feat/z"]);
+    assert!(git(&w.ws, &["branch", "-r"]).contains("origin/feat/z"));
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    let code = thread.join(CODESPACE_DIR);
+    assert!(
+        code.join(BUNDLE).is_file(),
+        "pruned, so the commit is unpushed"
+    );
+    no_codespace_namespace_left(&w.project);
+    let restored = restore_code(&w.project, &thread).unwrap();
+    assert_eq!(restored.branch, "feat/z");
+    assert!(restored.worktree.join("z.txt").is_file());
+    no_codespace_namespace_left(&w.project);
+}
+
+#[test]
+fn work_that_exists_only_on_another_remote_is_bundled() {
+    let w = world_with(true, false, false);
+    let upstream = w.root.join("upstream.git");
+    std::fs::create_dir_all(&upstream).unwrap();
+    git(&upstream, &["init", "--bare", "-q", "-b", "main"]);
+    git(
+        &w.ws,
+        &["remote", "add", "upstream", upstream.to_str().unwrap()],
+    );
+    git(&w.ws, &["checkout", "-q", "-b", "feat/u", "main"]);
+    std::fs::write(w.ws.join("u.txt"), "u\n").unwrap();
+    git(&w.ws, &["add", "u.txt"]);
+    git(&w.ws, &["commit", "-q", "-m", "u work"]);
+    git(&w.ws, &["push", "-q", "upstream", "feat/u"]);
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    assert!(thread.join(CODESPACE_DIR).join(BUNDLE).is_file());
+    let restored = restore_code(&w.project, &thread).unwrap();
+    assert!(restored.worktree.join("u.txt").is_file());
+}
+
+#[test]
+fn a_session_saved_as_a_local_copy_cannot_be_journaled_back() {
+    let w = world(true);
+    let record = w
+        .svc
+        .store()
+        .unwrap()
+        .remote_session(w.cloud_id)
+        .unwrap()
+        .unwrap();
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let store = w.svc.store().unwrap();
+    // The outbox journal of a send racing the conversion.
+    let mut late = record.clone();
+    late.outbox.push(json!({"type":"send","commandId":"late"}));
+    assert_eq!(
+        store.save_remote_session(&late).unwrap_err(),
+        crate::store::CONVERTED
+    );
+    assert!(store.remote_session(w.cloud_id).unwrap().is_none());
+    assert!(store.cloud_session_ids("cs-1").unwrap().is_empty());
+    drop(store);
+    assert!(done.local_id != w.cloud_id);
+}
+
+#[test]
+fn deleting_the_local_copy_releases_the_tombstone() {
+    let w = world(true);
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let mut store = w.svc.store().unwrap();
+    assert!(store.is_cloud_converted("env-1", "host-1").unwrap());
+    store.delete(done.local_id).unwrap();
+    assert!(!store.is_cloud_converted("env-1", "host-1").unwrap());
 }
