@@ -215,6 +215,45 @@ pub(super) fn save(runner: &dyn GhRunner, repo: &str, entries: &[(String, String
     outcome
 }
 
+const TOKEN_PREFIX: &str = "sk-ant-oat";
+/// Real tokens are about 108 characters; this still rejects a half-printed one.
+const MIN_TOKEN_LEN: usize = 80;
+
+fn is_token_line(line: &str) -> bool {
+    !line.is_empty()
+        && line
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The token `claude setup-token` printed, found in the terminal's tail text. It is the
+/// last line that is only token characters and starts with `sk-ant-oat`. When the terminal
+/// wrapped it, the lines after it are token-only and as long as the first, the last one
+/// possibly shorter. The block must end at a blank line or at the end of the text: a line
+/// with anything else on it, a longer or shorter-in-the-middle line, or text right after
+/// it means this is not a clean token and nothing is returned.
+pub(super) fn captured_token(tail: &str) -> Option<String> {
+    let lines: Vec<&str> = tail.lines().map(str::trim).collect();
+    let start = lines
+        .iter()
+        .rposition(|line| line.starts_with(TOKEN_PREFIX) && is_token_line(line))?;
+    let width = lines[start].len();
+    let mut token = String::from(lines[start]);
+    let mut shorter = false;
+    for line in &lines[start + 1..] {
+        if line.is_empty() {
+            break;
+        }
+        if shorter || !is_token_line(line) || line.len() > width {
+            return None;
+        }
+        shorter = line.len() < width;
+        token.push_str(line);
+    }
+    let token = codespaces::normalize_secret_value(OAUTH_SECRET_KEY, &token).ok()?;
+    (token.len() >= MIN_TOKEN_LEN).then_some(token)
+}
+
 /// `git remote get-url origin` for the project, if it has one.
 pub(super) fn git_origin(project: &Path) -> Option<String> {
     let program = monocode_core::scm::resolve_gui_binary("git")?;
