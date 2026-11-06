@@ -305,6 +305,8 @@ impl Shell {
             .and_then(|store| store.remote_session(id).ok().flatten())
             .and_then(|remote| Some((remote.project.local_project?, remote.project.codespace?)));
         if let Some((local_project, codespace)) = binding {
+            // The session is listed under its local project, so that project must be open.
+            self.workspace.add_project(&local_project);
             // The state is unknown until the next refresh reads it; never claim Available.
             self.cloud_states
                 .entry(codespace.clone())

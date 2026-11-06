@@ -213,7 +213,11 @@ impl Conversation {
                         this.remote_state.rejected = remote.rejected;
                         this.remote_state.pending = !remote.outbox.is_empty()
                             || this.remote_state.legacy_recovery_error().is_some();
+                        // A launch whose first prompt is still on its way has no stored messages
+                        // yet; the sidebar lists a session only once it has some.
+                        let launching = this.summary.has_messages && snapshot.is_none();
                         this.summary = remote.summary;
+                        this.summary.has_messages |= launching;
                         if let Some(descriptor) = descriptor {
                             this.remote_state.capabilities = descriptor["capabilities"]
                                 .as_array()

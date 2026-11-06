@@ -560,6 +560,35 @@ fn a_remote_view_does_not_queue_into_local_follow_ups_while_stopping(cx: &mut Te
     });
 }
 
+/// A freshly launched remote session has no stored messages until its first prompt is journaled;
+/// loading it must not turn off the in-memory flag that keeps it in the sidebar.
+#[gpui::test]
+fn loading_a_blank_launched_remote_session_keeps_it_listable(cx: &mut TestAppContext) {
+    let host = HostFixture::new(false, false);
+    let blank = {
+        let store = host.store.lock().unwrap();
+        let project = store
+            .remote_projects()
+            .unwrap()
+            .into_values()
+            .next()
+            .unwrap();
+        store.create("codex", &project.key).unwrap()
+    };
+    let mut summary = blank.clone();
+    summary.has_messages = true;
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, host.store.clone(), cx);
+            view.remote_state.client = Some(host.client.clone());
+            view.load_remote(cx);
+            view
+        })
+    });
+    host.wait(&view, cx, true);
+    cx.update(|cx| assert!(view.read(cx).summary.has_messages));
+}
+
 #[gpui::test]
 fn explicit_retry_reuses_pending_command_and_preserves_new_composer_and_attachment(
     cx: &mut TestAppContext,
