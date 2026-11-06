@@ -1176,6 +1176,18 @@ impl Store {
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
         self.delete_rows(id)?;
         if let Some(origin) = origin {
+            // The refs kept for a restore that never happened; after a restore they hold the
+            // other saved branches, which stay.
+            let restored = dir
+                .as_ref()
+                .is_some_and(|d| d.join("codespace").join("restored.json").exists());
+            if let (false, Some(project), Some(key)) = (
+                restored,
+                origin["localProject"].as_str(),
+                origin["pinKey"].as_str(),
+            ) {
+                crate::cloud_sessions::release_pins(std::path::Path::new(project), key);
+            }
             if let (Some(env), Some(host)) = (
                 origin["environmentId"].as_str(),
                 origin["hostSessionId"].as_str(),

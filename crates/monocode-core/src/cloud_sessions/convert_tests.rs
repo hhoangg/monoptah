@@ -835,7 +835,7 @@ fn a_bundle_that_cannot_verify_and_has_no_fallback_stops_the_conversion() {
         head: Some(head.clone()),
         ..Snapshot::default()
     };
-    let error = check_restorable(&local, &code, &snap).unwrap_err();
+    let error = check_restorable(&local, &code, &snap, "s1").unwrap_err();
     assert!(error.contains("cannot be restored"), "{error}");
     // With a patch series and a base we have, the same bundle is accepted with a warning...
     let snap = Snapshot {
@@ -844,18 +844,20 @@ fn a_bundle_that_cannot_verify_and_has_no_fallback_stops_the_conversion() {
         base: Some(head.clone()),
         ..Snapshot::default()
     };
-    assert!(check_restorable(&local, &code, &snap).unwrap().is_some());
+    assert!(check_restorable(&local, &code, &snap, "s1")
+        .unwrap()
+        .is_some());
     // ...but not when the base is unknown here, or a stash would be lost.
     let unknown = Snapshot {
         base: Some("a".repeat(40)),
         ..snap.clone()
     };
-    assert!(check_restorable(&local, &code, &unknown).is_err());
+    assert!(check_restorable(&local, &code, &unknown, "s1").is_err());
     let stash = Snapshot {
         stash: true,
         ..snap
     };
-    assert!(check_restorable(&local, &code, &stash).is_err());
+    assert!(check_restorable(&local, &code, &stash, "s1").is_err());
 }
 
 #[test]
@@ -875,19 +877,21 @@ fn with_no_bundle_every_saved_commit_must_already_be_here() {
         refs: vec![("refs/heads/main".into(), here.clone())],
         ..Snapshot::default()
     };
-    assert!(check_restorable(&local, &code, &ok).unwrap().is_none());
+    assert!(check_restorable(&local, &code, &ok, "s1")
+        .unwrap()
+        .is_none());
     let lost = Snapshot {
         head: Some("b".repeat(40)),
         ..Snapshot::default()
     };
-    let error = check_restorable(&local, &code, &lost).unwrap_err();
+    let error = check_restorable(&local, &code, &lost, "s1").unwrap_err();
     assert!(error.contains("not on origin"), "{error}");
     let lost_ref = Snapshot {
         head: Some(here),
         refs: vec![("refs/heads/x".into(), "c".repeat(40))],
         ..Snapshot::default()
     };
-    assert!(check_restorable(&local, &code, &lost_ref).is_err());
+    assert!(check_restorable(&local, &code, &lost_ref, "s1").is_err());
 }
 
 #[test]
@@ -901,8 +905,8 @@ fn restore_keeps_other_branches_and_the_stash_out_of_the_users_namespace() {
         .thread_dir(done.local_id)
         .unwrap()
         .unwrap();
-    let restored = restore_code(&w.project, &thread).unwrap();
-    let head = &restored.head[..8];
+    restore_code(&w.project, &thread).unwrap();
+    let head = pin_key(w.cloud_id);
     assert!(git(&w.project, &["branch", "--list", "side"]).is_empty());
     assert!(!git(
         &w.project,
@@ -1113,4 +1117,110 @@ fn a_failed_patch_leaves_a_partial_restore_that_a_retry_finishes_in_the_same_wor
     assert!(pending_restore(&thread).is_none());
     let trees = git(&w.project, &["worktree", "list"]);
     assert_eq!(trees.lines().count(), 2, "{trees}");
+}
+
+fn pushed_only_work(w: &World) {
+    git(&w.ws, &["checkout", "-q", "-b", "feat/p", "main"]);
+    std::fs::write(w.ws.join("p.txt"), "p\n").unwrap();
+    git(&w.ws, &["add", "p.txt"]);
+    git(&w.ws, &["commit", "-q", "-m", "p work"]);
+    git(&w.ws, &["push", "-q", "origin", "feat/p"]);
+}
+
+fn second_cloud_session(w: &World) -> i64 {
+    let store = w.svc.store().unwrap();
+    let project = store
+        .remember_remote_project("env-1", &json!({"id":"p","cwd": w.ws.to_str().unwrap()}))
+        .unwrap();
+    let mut value = w.host.snapshot.clone();
+    value["session"]["id"] = json!("host-2");
+    store.register_remote_summary(&project, &value).unwrap().id
+}
+
+#[test]
+fn sessions_sharing_a_head_keep_their_own_pins() {
+    let w = world_with(true, false, false);
+    pushed_only_work(&w);
+    let second = second_cloud_session(&w);
+    let first = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let other = w.svc.convert_session(second, &mut |_| {}).unwrap();
+    let refs = git(&w.project, &["for-each-ref", "refs/codespace"]);
+    assert!(
+        refs.contains(&format!("{}/keep/head", pin_key(w.cloud_id))),
+        "{refs}"
+    );
+    assert!(
+        refs.contains(&format!("{}/keep/head", pin_key(second))),
+        "{refs}"
+    );
+    let thread_of = |id| w.svc.store().unwrap().thread_dir(id).unwrap().unwrap();
+    let restored = restore_code(&w.project, &thread_of(first.local_id)).unwrap();
+    // Forget everything else about that commit.
+    git(
+        &w.project,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            restored.worktree.to_str().unwrap(),
+        ],
+    );
+    git(&w.project, &["branch", "-D", &restored.branch]);
+    git(&w.origin, &["branch", "-D", "feat/p"]);
+    git(&w.project, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&w.project, &["gc", "-q", "--prune=now"]);
+    let again = restore_code(&w.project, &thread_of(other.local_id)).unwrap();
+    assert!(again.worktree.join("p.txt").is_file());
+}
+
+#[test]
+fn restore_gives_every_saved_ref_its_own_pin_before_the_keep_pins_go() {
+    let w = world_with(true, false, false);
+    pushed_only_work(&w);
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    restore_code(&w.project, &thread).unwrap();
+    let key = pin_key(w.cloud_id);
+    let refs = git(&w.project, &["for-each-ref", "refs/codespace"]);
+    assert!(!refs.contains("/keep/"), "{refs}");
+    assert!(refs.contains(&format!("{key}/heads/feat/p")), "{refs}");
+    assert!(refs.contains(&format!("{key}/heads/main")), "{refs}");
+}
+
+#[test]
+fn pins_are_released_when_the_check_fails_or_the_copy_is_deleted_unrestored() {
+    // Failed capture: nothing stays pinned.
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    git(&local, &["init", "-q", "-b", "main"]);
+    std::fs::write(local.join("f"), "1").unwrap();
+    git(&local, &["add", "f"]);
+    git(&local, &["commit", "-q", "-m", "one"]);
+    let here = git(&local, &["rev-parse", "HEAD"]);
+    git(
+        &local,
+        &["update-ref", "refs/codespace/s9/keep/head", &here],
+    );
+    let snap = Snapshot {
+        head: Some(here),
+        refs: vec![("refs/heads/x".into(), "c".repeat(40))],
+        ..Snapshot::default()
+    };
+    assert!(check_restorable(&local, dir.path(), &snap, "s9").is_err());
+    assert!(git(&local, &["for-each-ref", "refs/codespace"]).is_empty());
+
+    // Deleted without ever restoring.
+    let w = world_with(true, false, false);
+    pushed_only_work(&w);
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    assert!(git(&w.project, &["for-each-ref", "refs/codespace"]).contains("/keep/head"));
+    w.svc.store().unwrap().delete(done.local_id).unwrap();
+    assert!(git(&w.project, &["for-each-ref", "refs/codespace"]).is_empty());
 }

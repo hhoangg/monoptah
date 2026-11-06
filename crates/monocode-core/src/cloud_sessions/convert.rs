@@ -307,6 +307,12 @@ pub struct Converted {
     pub warnings: Vec<String>,
 }
 
+/// Names a converted session's refs under `refs/codespace/`, so sessions that share a HEAD
+/// never share (or remove) each other's pins.
+pub fn pin_key(cloud_id: i64) -> String {
+    format!("s{}", cloud_id.unsigned_abs())
+}
+
 fn nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -461,6 +467,9 @@ impl CloudSessions {
             &mut warnings,
         );
         let _ = std::fs::remove_dir_all(&staging);
+        if result.is_err() {
+            release_pins(Path::new(&local_project), &pin_key(cloud_id));
+        }
         let mut converted = result?;
         converted.evidence = pulled.files;
         converted.warnings = warnings;
@@ -539,7 +548,12 @@ impl CloudSessions {
                 ));
             }
         }
-        if let Some(note) = check_restorable(Path::new(local_project), &code, &snap)? {
+        if let Some(note) = check_restorable(
+            Path::new(local_project),
+            &code,
+            &snap,
+            &pin_key(remote.summary.id),
+        )? {
             warnings.push(note);
         }
 
@@ -571,6 +585,8 @@ impl CloudSessions {
                     "remoteCwd": workspace,
                     "hostSessionId": remote.session_id,
                     "environmentId": remote.project.environment_id,
+                    "pinKey": pin_key(remote.summary.id),
+                    "localProject": local_project,
                     "convertedAt": crate::time::now_ms(),
                 });
                 store.save_setting(&origin_key(local_id), &origin.to_string())
@@ -638,7 +654,8 @@ impl CloudSessions {
             }
             let ignored_kb: u64 = snap.ignored.iter().map(|(kb, _)| kb).sum();
             let manifest = json!({
-                "version": 2,
+                "version": 3,
+                "pinKey": pin_key(remote.summary.id),
                 "codespace": codespace,
                 "remoteCwd": workspace,
                 "branch": snap.branch,
@@ -874,6 +891,26 @@ pub(super) fn check_restorable(
     project: &Path,
     code: &Path,
     snap: &Snapshot,
+    key: &str,
+) -> Result<Option<String>, String> {
+    let checked = check_restorable_inner(project, code, snap, key);
+    if checked.is_err() {
+        // Nothing will be restored from a failed capture: release its pins.
+        release_pins(project, key);
+    }
+    checked
+}
+
+/// Drops every ref this feature keeps for one converted session (`refs/codespace/<key>/`).
+pub(crate) fn release_pins(project: &Path, key: &str) {
+    drop_refs(project, &format!("refs/codespace/{key}/"));
+}
+
+fn check_restorable_inner(
+    project: &Path,
+    code: &Path,
+    snap: &Snapshot,
+    key: &str,
 ) -> Result<Option<String>, String> {
     let head = snap
         .head
@@ -886,7 +923,7 @@ pub(super) fn check_restorable(
             project.display()
         ));
     }
-    let id8 = &head[..8];
+    let id8 = key;
     fetch_origin(project, id8);
     let _cleanup = OriginRefs { project, id8 };
     let mut pins: Vec<(String, &str)> = vec![("head".into(), head)];
@@ -1022,6 +1059,8 @@ pub struct CodeManifest {
     pub patch: Option<PathBuf>,
     /// A restore that created its worktree but could not finish; a retry continues there.
     pub partial: Option<PartialRestore>,
+    /// Names this session's refs under `refs/codespace/`.
+    pub pin_key: String,
     /// `(ref name, sha)` of the codespace's local branches and stash.
     pub refs: Vec<(String, String)>,
 }
@@ -1080,6 +1119,7 @@ pub fn pending_restore(thread_dir: &Path) -> Option<CodeManifest> {
     Some(CodeManifest {
         codespace: text("codespace").unwrap_or_default(),
         branch: text("branch"),
+        pin_key: text("pinKey").unwrap_or_else(|| head[..8].to_string()),
         head,
         base: text("base").filter(|b| valid_hex(b)),
         remote_url: text("remoteUrl"),
@@ -1156,7 +1196,7 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
     if !project.is_dir() {
         return Err(format!("{} is not a folder", project.display()));
     }
-    let id8 = manifest.head[..8].to_string();
+    let id8 = manifest.pin_key.clone();
     // Origin's branches are only fetched to find objects; they are removed again at the end.
     let _cleanup = OriginRefs { project, id8: &id8 };
     if let Some(partial) = manifest.partial.clone().filter(|p| p.worktree.is_dir()) {
@@ -1220,24 +1260,10 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
             &manifest.head[..12]
         ));
     };
-    if unpacked {
-        for (name, sha) in &manifest.refs {
-            if !has_commit(project, sha) {
-                continue;
-            }
-            let short = name.trim_start_matches("refs/heads/");
-            let target = if name == "refs/stash" {
-                format!("refs/codespace/{id8}/stash")
-            } else {
-                format!("refs/codespace/{id8}/heads/{short}")
-            };
-            let _ = run_git(project, &["update-ref", &target, sha]);
-        }
-    }
     let wanted = manifest
         .branch
         .clone()
-        .unwrap_or_else(|| format!("codespace-{id8}"));
+        .unwrap_or_else(|| format!("codespace-{}", &manifest.head[..8]));
     let mut candidates = vec![wanted.clone(), format!("{wanted}-codespace")];
     candidates.extend((2..30).map(|n| format!("{wanted}-codespace-{n}")));
     let mut created = None;
@@ -1380,7 +1406,33 @@ fn finish_restore(
             worktree.display()
         )
     })?;
-    // The worktree's branch holds the commits now.
+    // Every saved branch and the stash get their own ref first, so dropping the pins loses
+    // nothing; then the worktree's branch holds the restored commits.
+    let batch: String = manifest
+        .refs
+        .iter()
+        .filter(|(_, sha)| has_commit(project, sha))
+        .map(|(name, sha)| {
+            let target = if name == "refs/stash" {
+                format!("refs/codespace/{id8}/stash")
+            } else {
+                format!(
+                    "refs/codespace/{id8}/heads/{}",
+                    name.trim_start_matches("refs/heads/")
+                )
+            };
+            format!("update {target} {sha}\n")
+        })
+        .collect();
+    if !batch.is_empty() {
+        let _ = git_run_stdin(
+            project,
+            &["update-ref", "--stdin"],
+            &[],
+            GIT_LIMIT,
+            Some(&batch),
+        );
+    }
     drop_refs(project, &format!("refs/codespace/{id8}/keep/"));
     Ok(restored.clone())
 }
