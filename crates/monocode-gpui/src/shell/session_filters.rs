@@ -37,7 +37,7 @@ impl Shell {
             .filter(|kind| {
                 self.order.iter().any(|id| {
                     let session = self.session_metadata(*id, cx);
-                    session.summary.cwd == self.workspace.project
+                    self.project_of(*id, &session.summary.cwd) == self.workspace.project
                         && session.summary.has_messages
                         && session.summary.provider == kind.id()
                         && self.in_sidebar_worktree_scope(*id, cx)

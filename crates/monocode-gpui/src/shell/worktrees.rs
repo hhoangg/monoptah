@@ -75,7 +75,9 @@ impl Shell {
             .order
             .iter()
             .copied()
-            .filter(|id| self.session_metadata(*id, cx).summary.cwd == project)
+            .filter(|id| {
+                self.project_of(*id, &self.session_metadata(*id, cx).summary.cwd) == project
+            })
             .collect();
         let sessions = self
             .workspace
@@ -91,7 +93,7 @@ impl Shell {
                             return None;
                         }
                         let session = self.session_metadata(id, cx);
-                        (session.summary.cwd == project).then(|| TabSession {
+                        (self.project_of(id, &session.summary.cwd) == project).then(|| TabSession {
                             id,
                             tab: *tab,
                             cwd: self.session_working_copy(id, cx).to_owned(),
@@ -184,7 +186,8 @@ impl Shell {
                 .contains_key(&self.workspace.session_for_pane(*id))
                 && {
                     let s = self.session_metadata(self.workspace.session_for_pane(*id), cx);
-                    s.summary.cwd == project && !s.summary.archived
+                    self.project_of(self.workspace.session_for_pane(*id), &s.summary.cwd) == project
+                        && !s.summary.archived
                 }
                 && self.in_worktree_scope(*id, cx)
                 && self.workspace.tab_of(*id).is_some()

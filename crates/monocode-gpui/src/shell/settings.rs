@@ -9,7 +9,7 @@ impl Shell {
             .order
             .iter()
             .map(|&id| self.session_metadata(id, cx).summary)
-            .filter(|s| s.archived && s.cwd == self.workspace.project)
+            .filter(|s| s.archived && self.project_of(s.id, &s.cwd) == self.workspace.project)
             .map(|s| ArchivedSession {
                 id: s.id,
                 title: s.title.clone(),

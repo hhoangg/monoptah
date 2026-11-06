@@ -7,7 +7,7 @@ mod monos;
 mod notes;
 mod remote;
 mod remote_legacy;
-pub use remote::{RemoteProject, RemoteSession, RemoteUpload};
+pub use remote::{RemoteProject, RemoteSession, RemoteUpload, CONVERTED};
 pub(crate) use shared::handle as desktop_session_handle;
 mod session_metadata;
 pub use session_metadata::{MobileSessionMetadata, SessionSidebarMetadata};
@@ -566,6 +566,17 @@ impl Store {
             }
         }
         Ok(out)
+    }
+    /// Converted local sessions and the codespace each one came from.
+    pub fn codespace_origins(&self) -> Result<Vec<(i64, String)>, String> {
+        Ok(self
+            .settings_with_prefix("codespace-origin:")?
+            .into_iter()
+            .filter_map(|(id, value)| {
+                let value: serde_json::Value = serde_json::from_str(&value).ok()?;
+                Some((id, value["codespace"].as_str()?.to_string()))
+            })
+            .collect())
     }
     /// Sessions whose latest message is saved as a draft and not yet sent.
     pub fn draft_sessions(&self) -> Result<std::collections::HashSet<i64>, String> {
@@ -1171,7 +1182,33 @@ impl Store {
     pub fn delete(&mut self, id: i64) -> Result<(), String> {
         // Resolve the folder first; the persisted id is gone after deletion.
         let dir = self.thread_dir(id).ok().flatten();
+        // A converted cloud session's host copy may come back once its local copy is gone.
+        let origin = self
+            .setting(&format!("codespace-origin:{id}"))
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
         self.delete_rows(id)?;
+        if let Some(origin) = origin {
+            // The refs kept for a restore that never happened; after a restore they hold the
+            // other saved branches, which stay.
+            let restored = dir
+                .as_ref()
+                .is_some_and(|d| d.join("codespace").join("restored.json").exists());
+            if let (false, Some(project), Some(key)) = (
+                restored,
+                origin["localProject"].as_str(),
+                origin["pinKey"].as_str(),
+            ) {
+                crate::cloud_sessions::release_pins(std::path::Path::new(project), key);
+            }
+            if let (Some(env), Some(host)) = (
+                origin["environmentId"].as_str(),
+                origin["hostSessionId"].as_str(),
+            ) {
+                let _ = self.set_cloud_converted(env, host, false);
+            }
+        }
         // Best effort: a stale link is filtered out by the UI, and the delete is done.
         let _ = self.today_drop_session_link(id);
         thread_files::remove_dir(dir);
@@ -1191,7 +1228,7 @@ impl Store {
         tx.execute("DELETE FROM native_reminders WHERE session_id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9) OR key LIKE ?4",
+            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10) OR key LIKE ?4",
             params![
                 format!("agent:{id}"),
                 format!("context:{id}"),
@@ -1201,7 +1238,8 @@ impl Store {
                 format!("orchestration:{id}"),
                 format!("inbox-ask:{id}"),
                 format!("automation:{id}"),
-                format!("mono-retired:{id}")
+                format!("mono-retired:{id}"),
+                format!("codespace-origin:{id}")
             ],
         )
         .map_err(|e| e.to_string())?;

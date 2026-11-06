@@ -10,7 +10,8 @@ pub use ssh::{JobView, Prompt, SshTarget};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,7 +21,16 @@ pub struct Connections {
     store: Mutex<()>,
     tunnels: Tunnels,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
+    /// In-flight codespace wakes by machine id, so concurrent callers share one.
+    wakes: Mutex<HashMap<String, WakeSlot>>,
 }
+
+type WakeSlot = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
+const SSH_BUSY: &str = "Another SSH connection is being set up. Finish or cancel it first.";
+/// How long a wake waits for the single SSH job slot before giving up.
+const JOB_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Error returned when a wake was cancelled by its caller.
+pub const WAKE_CANCELLED: &str = "Wake cancelled";
 
 impl Connections {
     /// Uses the same connection store as the Tauri desktop.
@@ -30,6 +40,7 @@ impl Connections {
             store: Mutex::new(()),
             tunnels: Tunnels::default(),
             jobs: Mutex::new(HashMap::new()),
+            wakes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -155,6 +166,9 @@ pub struct Machine {
     pub endpoint: String,
     pub environment_id: String,
     pub ssh: Option<SshTarget>,
+    /// Codespace name when this machine is reached through `gh codespace ssh`.
+    #[serde(default)]
+    pub codespace: Option<String>,
 }
 
 impl StoredMachine {
@@ -165,6 +179,7 @@ impl StoredMachine {
             endpoint: self.endpoint.clone(),
             environment_id: self.environment_id.clone(),
             ssh: self.ssh.clone(),
+            codespace: self.ssh.as_ref().and_then(|ssh| ssh.codespace.clone()),
         }
     }
 }
@@ -237,6 +252,20 @@ fn rpc(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
+    rpc_with(endpoint, token, environment_id, method, params, false)
+}
+
+/// `closed_is_dead`: a connection reset or closed without a reply also means
+/// the route is gone. Behind a codespace tunnel that is what a stopped host
+/// looks like: the local forward accepts, then the remote side hangs up.
+fn rpc_with(
+    endpoint: &str,
+    token: &str,
+    environment_id: Option<&str>,
+    method: &str,
+    params: Value,
+    closed_is_dead: bool,
+) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
         .timeout_connect(std::time::Duration::from_secs(5))
@@ -251,7 +280,9 @@ fn rpc(
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(_, response)) => response,
-        Err(ureq::Error::Transport(error)) if connection_refused(&error) => {
+        Err(ureq::Error::Transport(error))
+            if connection_refused(&error) || (closed_is_dead && connection_closed(&error)) =>
+        {
             return Err(
                 "Machine is unreachable. Check the host and SSH tunnel, then reconnect.".into(),
             )
@@ -285,6 +316,23 @@ fn rpc(
 
 // Only a refused connection proves the local forwarding listener is gone.
 // A slow request or an interrupted response says nothing about SSH health.
+fn connection_closed(error: &ureq::Transport) -> bool {
+    use std::io::ErrorKind::*;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof
+            )
+        }) {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
 fn connection_refused(error: &ureq::Transport) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = source {
@@ -410,8 +458,19 @@ impl Connections {
                 .find(|m| m.id == machine_id)
                 .ok_or("Machine is no longer connected")?
         };
+        let codespace = machine.ssh.as_ref().is_some_and(|t| t.codespace.is_some());
         let tunnel_lease = if let Some(target) = &machine.ssh {
-            Some(self.tunnels.endpoint(&machine.id, target)?)
+            if codespace {
+                // Background work must never wake a codespace (that is what
+                // `gh codespace ssh` does), so only a live tunnel is used.
+                Some(
+                    self.tunnels
+                        .existing(&machine.id)
+                        .ok_or(CODESPACE_NOT_CONNECTED)?,
+                )
+            } else {
+                Some(self.tunnels.endpoint(&machine.id, target)?)
+            }
         } else {
             None
         };
@@ -419,12 +478,13 @@ impl Connections {
             .as_ref()
             .map(|lease| lease.endpoint.as_str())
             .unwrap_or(&machine.endpoint);
-        let response = rpc(
+        let response = rpc_with(
             endpoint,
             &machine.token,
             Some(&machine.environment_id),
             method,
             params,
+            codespace,
         );
         if response
             .as_ref()
@@ -433,6 +493,9 @@ impl Connections {
         {
             if let Some(lease) = &tunnel_lease {
                 self.tunnels.invalidate(&machine.id, lease);
+            }
+            if codespace {
+                return Err(CODESPACE_NOT_CONNECTED.into());
             }
         }
         let result = response?;
@@ -445,6 +508,11 @@ impl Connections {
         Ok(result)
     }
 }
+
+/// Returned instead of waking a codespace. Callers that act on a user's
+/// request answer it with `ensure_codespace`/`codespace_reconnect`.
+pub const CODESPACE_NOT_CONNECTED: &str =
+    "Codespace is not connected. Reconnect to start it and restore the connection.";
 
 fn supported_remote_method(method: &str) -> bool {
     matches!(
@@ -491,6 +559,7 @@ impl Connections {
         existing: Option<StoredMachine>,
         upgrade: bool,
     ) -> Result<String, String> {
+        ssh::check_codespace(&target)?;
         let job = Job::new();
         let id = job.view().id;
         {
@@ -499,9 +568,7 @@ impl Connections {
                 .lock()
                 .map_err(|_| "Connection setup is unavailable")?;
             if jobs.values().any(|job| !job.view().done) {
-                return Err(
-                    "Another SSH connection is being set up. Finish or cancel it first.".into(),
-                );
+                return Err(SSH_BUSY.into());
             }
             jobs.retain(|_, job| !job.view().done);
             jobs.insert(id.clone(), job.clone());
@@ -511,17 +578,27 @@ impl Connections {
             let prepared = (|| -> Result<(StoredMachine, Tunnel), String> {
                 let askpass = job.askpass()?;
                 let mut target = target;
+                let codespace = target.codespace.is_some();
                 let mut machine = if let Some(mut existing) = existing {
-                    if upgrade {
+                    if upgrade || codespace {
+                        // A codespace may have stopped, which also stopped its
+                        // host. gh starts it on connect, and the bootstrap's
+                        // service install brings the host back with its saved
+                        // state, so a codespace reconnect always re-runs it.
                         let platform = ssh::detect_platform(&target, &job, &askpass)?;
-                        job.message("Updating Monoptah Host on the machine…");
-                        let output = ssh::run_script(
-                            &target,
-                            platform,
-                            ssh::upgrade_script(platform, target.remote_port),
-                            &job,
-                            &askpass,
-                        )?;
+                        job.message(if upgrade {
+                            "Updating Monoptah Host on the machine…"
+                        } else {
+                            "Starting Monoptah Host on the codespace…"
+                        });
+                        let script = if upgrade {
+                            ssh::upgrade_script(platform, target.remote_port)
+                        } else if codespace {
+                            ssh::codespace_bootstrap_script()
+                        } else {
+                            ssh::bootstrap_script(platform)
+                        };
+                        let output = ssh::run_script(&target, platform, script, &job, &askpass)?;
                         let info: Value = serde_json::from_str(output.lines().last().unwrap_or(""))
                             .map_err(|_| "Host update returned an invalid response")?;
                         target.remote_port = info
@@ -541,7 +618,11 @@ impl Connections {
                     let output = ssh::run_script(
                         &target,
                         platform,
-                        ssh::bootstrap_script(platform),
+                        if codespace {
+                            ssh::codespace_bootstrap_script()
+                        } else {
+                            ssh::bootstrap_script(platform)
+                        },
                         &job,
                         &askpass,
                     )?;
@@ -582,7 +663,10 @@ impl Connections {
                     StoredMachine {
                         id: uuid::Uuid::new_v4().to_string(),
                         name,
-                        endpoint: format!("ssh://{}", target.target),
+                        endpoint: match &target.codespace {
+                            Some(name) => format!("codespace://{name}"),
+                            None => format!("ssh://{}", target.target),
+                        },
                         environment_id,
                         token,
                         ssh: Some(target.clone()),
@@ -670,11 +754,51 @@ impl Connections {
                 target,
                 port,
                 remote_port: 3774,
+                codespace: None,
             },
             name.trim().chars().take(100).collect(),
             None,
             false,
         )
+    }
+
+    /// Pair with the monocode-host inside a GitHub Codespace over
+    /// `gh codespace ssh`. Poll the returned job with `ssh_poll`.
+    pub fn codespace_begin(
+        self: &Arc<Self>,
+        name: &str,
+        display_name: Option<&str>,
+    ) -> Result<String, String> {
+        let name = ssh::validate_codespace(name)?;
+        let display = display_name
+            .map(|d| d.trim().chars().take(100).collect::<String>())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| name.clone());
+        self.start_ssh_job(
+            SshTarget {
+                target: name.clone(),
+                port: None,
+                remote_port: 3774,
+                codespace: Some(name),
+            },
+            display,
+            None,
+            false,
+        )
+    }
+
+    /// Bring a codespace machine back: gh starts a stopped codespace, the
+    /// bootstrap restarts a dead host, then a new tunnel is opened.
+    pub fn codespace_reconnect(self: &Arc<Self>, machine_id: &str) -> Result<String, String> {
+        let machine = self
+            .list()?
+            .into_iter()
+            .find(|m| m.id == machine_id)
+            .ok_or("Machine is no longer connected")?;
+        if machine.codespace.is_none() {
+            return Err("This connection is not a codespace".into());
+        }
+        self.ssh_reconnect(machine_id, false)
     }
 
     pub fn ssh_reconnect(
@@ -697,6 +821,161 @@ impl Connections {
             .clone()
             .ok_or("This connection does not use SSH")?;
         self.start_ssh_job(target, machine.name.clone(), Some(machine), upgrade)
+    }
+
+    /// Make sure a codespace machine is connected, waking the codespace if
+    /// needed. See `ensure_codespace_with`; no cancel, no progress.
+    pub fn ensure_codespace(self: &Arc<Self>, machine_id: &str) -> Result<(), String> {
+        self.ensure_codespace_with(machine_id, &AtomicBool::new(false), &mut |_| {})
+    }
+
+    /// No-op when the tunnel already answers `environment.describe`; otherwise
+    /// runs `codespace_reconnect` and waits for it. BLOCKS for as long as the
+    /// codespace takes to start (minutes): call it from a background thread,
+    /// never the UI thread. Only user-initiated actions should call it.
+    ///
+    /// * `progress` fires (once) only when a wake actually starts or is joined.
+    /// * Concurrent callers for the same machine share one reconnect job.
+    /// * Setting `cancel` aborts this caller's wait with `WAKE_CANCELLED` and,
+    ///   if it owns the job, cancels the job.
+    pub fn ensure_codespace_with(
+        self: &Arc<Self>,
+        machine_id: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(), String> {
+        self.run_coalesced(machine_id, cancel, progress, |progress| {
+            match self.request(machine_id, "environment.describe", json!({})) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.starts_with("Codespace is not connected") => {}
+                Err(error) => return Err(error),
+            }
+            progress("Waking codespace…");
+            let job = self.start_when_free(cancel, JOB_SLOT_WAIT, || {
+                self.codespace_reconnect(machine_id)
+            })?;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = self.ssh_cancel(&job);
+                    // The job thread stops within moments; let it finish so an
+                    // immediate re-send does not find the slot busy.
+                    for _ in 0..20 {
+                        if self.ssh_poll(&job).map_or(true, |view| view.done) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    return Err(WAKE_CANCELLED.into());
+                }
+                let view = self.ssh_poll(&job)?;
+                if view.done {
+                    return view.error.map_or(Ok(()), Err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+    }
+
+    /// SSH setup runs one job at a time. Instead of failing while another
+    /// job (a pairing, a wake of another machine, a just-cancelled wake) holds
+    /// the slot, wait for it, bounded and cancellable.
+    fn start_when_free(
+        &self,
+        cancel: &AtomicBool,
+        limit: std::time::Duration,
+        mut start: impl FnMut() -> Result<String, String>,
+    ) -> Result<String, String> {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            match start() {
+                Err(error) if error == SSH_BUSY => {}
+                other => return other,
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err(WAKE_CANCELLED.into());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SSH_BUSY.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    fn run_coalesced(
+        &self,
+        key: &str,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&str),
+        work: impl FnOnce(&mut dyn FnMut(&str)) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut work = Some(work);
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(WAKE_CANCELLED.into());
+            }
+            let (slot, leader) = {
+                let mut wakes = self.wakes.lock().map_err(|_| "Wake state is unavailable")?;
+                match wakes.get(key) {
+                    Some(slot) => (slot.clone(), false),
+                    None => {
+                        let slot: WakeSlot = Arc::new((Mutex::new(None), Condvar::new()));
+                        wakes.insert(key.into(), slot.clone());
+                        (slot, true)
+                    }
+                }
+            };
+            if leader {
+                // Fills and clears the slot even if `work` panics.
+                struct Finish<'a> {
+                    wakes: &'a Mutex<HashMap<String, WakeSlot>>,
+                    key: &'a str,
+                    slot: WakeSlot,
+                    result: Option<Result<(), String>>,
+                }
+                impl Drop for Finish<'_> {
+                    fn drop(&mut self) {
+                        if let Ok(mut wakes) = self.wakes.lock() {
+                            wakes.remove(self.key);
+                        }
+                        let result = self.result.take().unwrap_or_else(|| {
+                            Err("Waking the codespace failed unexpectedly".into())
+                        });
+                        *self.slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                        self.slot.1.notify_all();
+                    }
+                }
+                let mut finish = Finish {
+                    wakes: &self.wakes,
+                    key,
+                    slot,
+                    result: None,
+                };
+                let result = work.take().expect("leader runs once")(progress);
+                finish.result = Some(result.clone());
+                return result;
+            }
+            progress("Waking codespace…");
+            let mut guard = slot.0.lock().unwrap();
+            let result = loop {
+                if let Some(result) = guard.clone() {
+                    break result;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(WAKE_CANCELLED.into());
+                }
+                guard = slot
+                    .1
+                    .wait_timeout(guard, std::time::Duration::from_millis(100))
+                    .unwrap()
+                    .0;
+            };
+            drop(guard);
+            // The leader's caller gave up; this caller did not.
+            if result.as_ref().err().is_some_and(|e| e == WAKE_CANCELLED) {
+                continue;
+            }
+            return result;
+        }
     }
 
     pub fn ssh_poll(&self, job_id: &str) -> Result<JobView, String> {
@@ -844,6 +1123,246 @@ mod tests {
     }
 
     #[test]
+    fn stored_machines_without_a_codespace_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("remote-machines.json"),
+            r#"[{"id":"a","name":"box","endpoint":"ssh://me@box","environmentId":"env","token":"t","ssh":{"target":"me@box","port":null,"remotePort":3774}}]"#,
+        )
+        .unwrap();
+        let machine = Connections::new(dir.path()).list().unwrap().remove(0);
+        assert_eq!(machine.codespace, None);
+        let old: Machine = serde_json::from_str(
+            r#"{"id":"a","name":"box","endpoint":"e","environmentId":"env","ssh":null}"#,
+        )
+        .unwrap();
+        assert_eq!(old.codespace, None);
+    }
+
+    #[test]
+    fn codespace_begin_rejects_bad_names_and_reconnect_rejects_plain_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("remote-machines.json"),
+            r#"[{"id":"a","name":"box","endpoint":"ssh://me@box","environmentId":"env","token":"t"}]"#,
+        )
+        .unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        assert!(connections
+            .codespace_begin("-oProxyCommand=x", None)
+            .is_err());
+        assert!(connections.codespace_begin("a b", None).is_err());
+        assert_eq!(
+            connections.codespace_reconnect("a").unwrap_err(),
+            "This connection is not a codespace"
+        );
+        assert!(connections.codespace_reconnect("missing").is_err());
+    }
+
+    /// Drives the whole codespace lifecycle against a fake `gh`: bootstrap,
+    /// pairing and tunnel on begin, then a reconnect that must re-run the
+    /// bootstrap before tunnelling, and a lazily restarted tunnel on request.
+    #[cfg(unix)]
+    #[test]
+    fn codespace_begin_reconnect_and_tunnel_restart_use_gh() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(python) = [
+            "/usr/bin/python3",
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).exists()) else {
+            eprintln!(
+                "SKIPPED codespace_begin_reconnect_and_tunnel_restart_use_gh: python3 not found"
+            );
+            return;
+        };
+        let describe =
+            json!({ "result": { "protocolVersion": 1, "environmentId": "env-cs", "name": "Host" }});
+        let (url, _requests, server) = host_fixture(vec![
+            describe.clone(),
+            describe.clone(),
+            describe.clone(),
+            json!({ "result": { "projects": [] } }),
+            describe,
+        ]);
+        let fixture_port = url.rsplit(':').next().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("gh.log");
+        let token = "b".repeat(43);
+        let gh = dir.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!{python}
+import os, socket, sys, threading
+args = sys.argv[1:]
+with open({log:?}, "a") as f:
+    f.write(" ".join(args) + "\n")
+if "-N" in args:
+    port = int(args[args.index("-L") + 1].split(":")[1])
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port)); srv.listen(8)
+    def pump(a, b):
+        try:
+            while True:
+                d = a.recv(65536)
+                if not d: break
+                b.sendall(d)
+        except OSError: pass
+        try: b.shutdown(socket.SHUT_WR)
+        except OSError: pass
+    def serve(c):
+        # Readiness probes connect and hang up without data: never wake the host.
+        first = c.recv(65536)
+        if not first:
+            c.close(); return
+        u = socket.create_connection(("127.0.0.1", {fixture_port}))
+        u.sendall(first)
+        threading.Thread(target=pump, args=(u, c), daemon=True).start()
+        pump(c, u)
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=serve, args=(c,), daemon=True).start()
+else:
+    script = sys.stdin.read()
+    if "pair --name" in script:
+        print('{{"token":"{token}","environmentId":"env-cs"}}')
+    else:
+        print('noise')
+        print('{{"port":3774}}')
+"#,
+                log = log.display().to_string(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _gh_guard = ssh::GhOverride::set(gh);
+
+        let connections = Arc::new(Connections::new(dir.path()));
+        let wait = |job: String| {
+            for _ in 0..600 {
+                let view = connections.ssh_poll(&job).unwrap();
+                if view.done {
+                    return view;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!(
+                "job did not finish: {:?}",
+                connections.ssh_poll(&job).unwrap()
+            );
+        };
+        let done = wait(
+            connections
+                .codespace_begin("octo-abc123", Some("Cloud"))
+                .unwrap(),
+        );
+        assert_eq!(done.error, None);
+        let machine = done.machine.unwrap();
+        assert_eq!(machine.name, "Cloud");
+        assert_eq!(machine.endpoint, "codespace://octo-abc123");
+        assert_eq!(machine.codespace.as_deref(), Some("octo-abc123"));
+        assert_eq!(machine.ssh.as_ref().unwrap().remote_port, 3774);
+
+        let lines = || -> Vec<String> {
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(String::from)
+                .collect()
+        };
+        let before = lines();
+        assert_eq!(before.len(), 3, "{before:?}");
+        for line in &before[..2] {
+            assert!(
+                line.starts_with("codespace ssh -c octo-abc123 -- -T "),
+                "{line}"
+            );
+            assert!(line.ends_with("sh -l -s"), "{line}");
+        }
+        assert!(before[2].contains("-N -L 127.0.0.1:"), "{}", before[2]);
+        assert!(before[2].ends_with(":127.0.0.1:3774"), "{}", before[2]);
+
+        // Reconnect: bootstrap again (no pairing), then a fresh tunnel.
+        let done = wait(connections.codespace_reconnect(&machine.id).unwrap());
+        assert_eq!(done.error, None);
+        assert_eq!(done.machine.unwrap().id, machine.id);
+        let after = lines();
+        assert_eq!(after.len(), before.len() + 2, "{after:?}");
+        assert!(after[3].ends_with("sh -l -s"), "{}", after[3]);
+        assert!(after[4].contains("-N -L 127.0.0.1:"), "{}", after[4]);
+
+        // With no live tunnel a request must not wake the codespace.
+        connections.tunnels.clear();
+        let error = connections
+            .request(&machine.id, "projects.list", json!({}))
+            .unwrap_err();
+        assert!(error.starts_with("Codespace is not connected"), "{error}");
+        assert_eq!(lines().len(), after.len(), "request spawned gh");
+
+        // Waking is explicit: bootstrap, then tunnel.
+        connections.ensure_codespace(&machine.id).unwrap();
+        let woke = lines();
+        assert_eq!(woke.len(), after.len() + 2, "{woke:?}");
+        assert!(woke[5].ends_with("sh -l -s"), "{}", woke[5]);
+        assert!(woke[6].contains("-N -L 127.0.0.1:"), "{}", woke[6]);
+        assert_eq!(
+            connections
+                .request(&machine.id, "projects.list", json!({}))
+                .unwrap(),
+            json!({ "projects": [] })
+        );
+        // Already connected: a no-op that does not run gh again.
+        connections.ensure_codespace(&machine.id).unwrap();
+        assert_eq!(lines().len(), woke.len());
+        connections.tunnels.clear();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn closed_connections_count_as_a_dead_route_only_when_asked() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer);
+            }
+        });
+        let call = |dead| rpc_with(&endpoint, "t", None, "projects.list", json!({}), dead);
+        assert!(call(true)
+            .unwrap_err()
+            .starts_with("Machine is unreachable"));
+        assert!(call(false)
+            .unwrap_err()
+            .starts_with("The host request did not complete"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tunnels_existing_never_starts_anything() {
+        let tunnels = Tunnels::default();
+        assert!(tunnels.existing("none").is_none());
+    }
+
+    #[test]
+    fn a_tampered_codespace_name_in_the_store_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("remote-machines.json"),
+            r#"[{"id":"a","name":"x","endpoint":"codespace://x","environmentId":"env","token":"t","ssh":{"target":"x","port":null,"remotePort":3774,"codespace":"-oProxyCommand=evil"}}]"#,
+        )
+        .unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        assert!(connections
+            .codespace_reconnect("a")
+            .unwrap_err()
+            .contains("valid codespace name"));
+    }
+    #[test]
     fn incompatible_pairing_does_not_create_a_machine() {
         let (url, _, server) = host_fixture(vec![
             json!({ "result": { "protocolVersion": 2, "environmentId": "env" } }),
@@ -989,5 +1508,163 @@ mod tests {
         let value = serde_json::to_string(&stored.public()).unwrap();
         assert!(!value.contains("secret"));
         assert!(!value.contains("token"));
+    }
+
+    #[test]
+    fn concurrent_wakes_share_one_job_and_cancel_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let waking = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let cancel = AtomicBool::new(false);
+                    connections
+                        .run_coalesced(
+                            "m",
+                            &cancel,
+                            &mut |_| {
+                                waking.fetch_add(1, Ordering::SeqCst);
+                            },
+                            |_| {
+                                runs.fetch_add(1, Ordering::SeqCst);
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        // Callers that arrived during the job joined it; late ones ran again.
+        assert!(
+            runs.load(Ordering::SeqCst) < 4,
+            "{}",
+            runs.load(Ordering::SeqCst)
+        );
+        assert!(waking.load(Ordering::SeqCst) >= 1);
+        assert!(connections.wakes.lock().unwrap().is_empty());
+
+        // Pre-cancelled: no work at all.
+        let cancel = AtomicBool::new(true);
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let error = connections
+            .run_coalesced("m", &cancel, &mut |_| {}, |_| {
+                ran.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error, WAKE_CANCELLED);
+        assert!(!ran.load(Ordering::SeqCst));
+
+        // A follower whose leader was cancelled retries instead of failing.
+        let leader_cancel = Arc::new(AtomicBool::new(false));
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let c = leader_cancel.clone();
+            let conn = &connections;
+            let leader = scope.spawn(move || {
+                conn.run_coalesced("m", &c, &mut |_| {}, |_| {
+                    while !c.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(WAKE_CANCELLED.into())
+                })
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let follower = scope.spawn(|| {
+                let cancel = AtomicBool::new(false);
+                connections.run_coalesced("m", &cancel, &mut |_| {}, |_| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            leader_cancel.store(true, Ordering::SeqCst);
+            assert_eq!(leader.join().unwrap().unwrap_err(), WAKE_CANCELLED);
+            follower.join().unwrap().unwrap();
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_panicking_leader_clears_the_wake_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Connections::new(dir.path());
+        let cancel = AtomicBool::new(false);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = connections.run_coalesced("m", &cancel, &mut |_| {}, |_| panic!("boom"));
+        }));
+        assert!(panicked.is_err());
+        assert!(connections.wakes.lock().unwrap().is_empty());
+        connections
+            .run_coalesced("m", &cancel, &mut |_| {}, |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn wakes_wait_for_the_job_slot_instead_of_failing_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        // A pairing job (or a just-cancelled wake) holds the single slot.
+        let busy = Job::new();
+        connections
+            .jobs
+            .lock()
+            .unwrap()
+            .insert("pairing".into(), busy.clone());
+        // Same busy rule as start_ssh_job, without spawning a real gh job.
+        let try_start = |c: &Connections| {
+            if c.jobs.lock().unwrap().values().any(|j| !j.view().done) {
+                Err(SSH_BUSY.to_string())
+            } else {
+                Ok("job".to_string())
+            }
+        };
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let releaser = {
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(350));
+                busy.complete(|| Err("done".into()));
+            })
+        };
+        let id = connections
+            .start_when_free(&cancel, std::time::Duration::from_secs(10), || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                try_start(&connections)
+            })
+            .unwrap();
+        releaser.join().unwrap();
+        assert!(attempts.load(Ordering::SeqCst) > 1);
+        assert_eq!(id, "job");
+        // Cancel while waiting.
+        let hold = Job::new();
+        connections.jobs.lock().unwrap().insert("hold".into(), hold);
+        let cancelled = AtomicBool::new(true);
+        let error = connections
+            .start_when_free(&cancelled, std::time::Duration::from_secs(10), || {
+                try_start(&connections)
+            })
+            .unwrap_err();
+        assert_eq!(error, WAKE_CANCELLED);
+        // The wait is bounded.
+        let error = connections
+            .start_when_free(&cancel, std::time::Duration::from_millis(250), || {
+                try_start(&connections)
+            })
+            .unwrap_err();
+        assert_eq!(error, SSH_BUSY);
+        // Other errors are not retried.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let error = connections
+            .start_when_free(&cancel, std::time::Duration::from_secs(10), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("nope".into())
+            })
+            .unwrap_err();
+        assert_eq!((error.as_str(), calls.load(Ordering::SeqCst)), ("nope", 1));
     }
 }

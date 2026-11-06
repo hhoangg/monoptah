@@ -222,12 +222,20 @@ impl Shell {
         {
             return;
         }
-        let cwd = self.terminal_cwd(cx);
+        let codespace = self.active_codespace();
+        let cwd = if codespace.is_some() {
+            crate::terminal::home_cwd()
+        } else {
+            self.terminal_cwd(cx)
+        };
         let dock = self.workspace.docks.entry(project.clone()).or_default();
         dock.add(cwd.clone());
         // The dock stays shut until the terminal moves back out of the panel.
         dock.open = false;
-        let terminal = self.spawn_terminal(cwd, cx);
+        let terminal = match codespace {
+            Some(codespace) => self.spawn_codespace_terminal(&codespace, cx),
+            None => self.spawn_terminal(cwd, cx),
+        };
         self.terminals.entry(project).or_default().push(terminal);
         self.persist(cx);
     }

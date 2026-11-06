@@ -1432,7 +1432,7 @@ impl Shell {
             }
             ("session.archive", Target::Session(id)) => {
                 if !self.session_metadata(*id, cx).summary.archived {
-                    self.toggle_archive(*id, cx);
+                    self.toggle_archive_now(*id, cx);
                 }
                 Ok(reply)
             }
