@@ -182,16 +182,16 @@ impl Job {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 static GH_OVERRIDE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
-#[cfg(test)]
+#[cfg(all(test, unix))]
 static GH_LOCK: Mutex<()> = Mutex::new(());
 
 /// Points codespace commands at a fake `gh` for the life of the guard. The
 /// guard also serializes tests, because the override is process-global.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) struct GhOverride(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl GhOverride {
     pub(super) fn set(path: std::path::PathBuf) -> Self {
         let guard = GH_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -199,7 +199,7 @@ impl GhOverride {
         Self(guard)
     }
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for GhOverride {
     fn drop(&mut self) {
         *GH_OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -207,7 +207,7 @@ impl Drop for GhOverride {
 }
 
 fn gh_program() -> std::ffi::OsString {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if let Some(path) = GH_OVERRIDE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)

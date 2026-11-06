@@ -300,12 +300,12 @@ impl CloudSessions {
             workspace_root: "/workspaces".into(),
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_claude_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.claude_dir = dir;
         self
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_workspace_root(mut self, root: &std::path::Path) -> Self {
         self.workspace_root = root.to_string_lossy().into_owned();
         self
