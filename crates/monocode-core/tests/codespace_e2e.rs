@@ -322,8 +322,13 @@ fn codespace_evidence_pull() {
     step("prepare_evidence ok");
     let exclude = ssh("cat /workspaces/monoptah/.git/info/exclude");
     assert!(exclude.lines().any(|l| l == ".evidence/"), "{exclude}");
-    let guide = ssh("cat \"$HOME/.claude/CLAUDE.md\"");
-    assert!(guide.contains("monoptah-evidence"));
+    let guide = ssh("cat /workspaces/monoptah/CLAUDE.local.md");
+    assert!(guide.contains("monoptah-evidence:begin"), "{guide}");
+    let status = ssh("git -C /workspaces/monoptah status --porcelain");
+    assert!(
+        !status.contains("CLAUDE.local.md") && !status.contains(".evidence"),
+        "{status}"
+    );
     ssh("echo t6-ok > /workspaces/monoptah/.evidence/t6.txt && mkdir -p /workspaces/monoptah/.evidence/sub && echo nested > /workspaces/monoptah/.evidence/sub/n.txt");
     step("remote files written");
 

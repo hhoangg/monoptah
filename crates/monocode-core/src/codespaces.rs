@@ -613,11 +613,18 @@ pub fn delete(runner: &dyn GhRunner, name: &str) -> Result<(), String> {
 /// * creates `@WS@/.evidence`;
 /// * keeps `.evidence/` and `CLAUDE.local.md` out of git through the repo's `info/exclude`
 ///   (never `.gitignore`; `git rev-parse --git-path` also finds it for worktree checkouts);
-/// * writes the guidance for Claude Code into `@WS@/CLAUDE.local.md`, a project-local file
-///   Claude Code loads next to `CLAUDE.md`. Only our marked block is created or replaced;
-///   other content is kept, a symlink or a git-tracked file is never touched;
-/// * removes the marked block an earlier version appended to `~/.claude/CLAUDE.md`.
-const EVIDENCE_SCRIPT: &str = r#"d='@WS@'
+/// * writes the guidance for Claude Code into `@WS@/CLAUDE.local.md` between marker lines.
+///   It only writes when the file is absent or a readable, writable regular file that is not
+///   a symlink and not tracked by git, and its markers are balanced (none, or exactly one
+///   begin before one end). The new content is built in a temp file next to it and moved
+///   over it atomically, so a failure at any step leaves the user's file untouched.
+///
+/// `set -eu` plus the explicit refusals make the exit status reflect "guide not written";
+/// callers treat that as best effort.
+const EVIDENCE_SCRIPT: &str = r#"set -eu
+d='@WS@'
+tmp=""
+trap 'if [ -n "$tmp" ]; then rm -f "$tmp"; fi' EXIT
 mkdir -p "$d/.evidence"
 ex=$(git -C "$d" rev-parse --git-path info/exclude 2>/dev/null || true)
 case "$ex" in /*) ;; ?*) ex="$d/$ex" ;; esac
@@ -629,13 +636,37 @@ if [ -n "$ex" ]; then
   done
 fi
 g="$d/CLAUDE.local.md"
-if [ ! -L "$g" ] && ! git -C "$d" ls-files --error-unmatch CLAUDE.local.md >/dev/null 2>&1; then
-  tmp="$g.monoptah.$$"
-  {
-    if [ -f "$g" ]; then
-      awk '/<!-- monoptah-evidence:begin -->/{s=1} !s{print} /<!-- monoptah-evidence:end -->/{s=0}' "$g"
-    fi
-    cat <<'GUIDE'
+skip() { echo "CLAUDE.local.md left alone: $1" >&2; exit 1; }
+if [ -L "$g" ]; then skip "it is a symlink"; fi
+if [ -e "$g" ]; then
+  if [ ! -f "$g" ]; then skip "it is not a regular file"; fi
+  if [ ! -r "$g" ] || [ ! -w "$g" ]; then skip "it is not readable and writable"; fi
+fi
+if git -C "$d" ls-files --error-unmatch CLAUDE.local.md >/dev/null 2>&1; then skip "git tracks it"; fi
+begin=0; end=0
+if [ -f "$g" ]; then
+  begin=$(grep -c '<!-- monoptah-evidence:begin -->' "$g" || true)
+  end=$(grep -c '<!-- monoptah-evidence:end -->' "$g" || true)
+fi
+if [ "$begin" != "$end" ] || [ "$begin" -gt 1 ]; then skip "its Monoptah markers are unbalanced"; fi
+if [ "$begin" = 1 ]; then
+  bl=$(grep -n '<!-- monoptah-evidence:begin -->' "$g" | cut -d: -f1)
+  el=$(grep -n '<!-- monoptah-evidence:end -->' "$g" | cut -d: -f1)
+  if [ "$bl" -ge "$el" ]; then skip "its Monoptah markers are out of order"; fi
+fi
+tmp=$(mktemp "$d/.CLAUDE.local.md.XXXXXX")
+if [ -f "$g" ]; then
+  if [ "$begin" = 1 ]; then
+    awk '/<!-- monoptah-evidence:begin -->/{s=1} !s{print} /<!-- monoptah-evidence:end -->/{s=0}' "$g" > "$tmp"
+  else
+    cat "$g" > "$tmp"
+    if [ -s "$tmp" ] && [ -n "$(tail -c1 "$tmp")" ]; then echo >> "$tmp"; fi
+  fi
+  chmod "$(stat -c %a "$g" 2>/dev/null || echo 644)" "$tmp"
+else
+  chmod 644 "$tmp"
+fi
+cat >> "$tmp" <<'GUIDE'
 <!-- monoptah-evidence:begin -->
 ## Evidence for the local user
 You run in a GitHub codespace. Save screenshots, test output and written reports that prove
@@ -644,15 +675,8 @@ from git and is never committed. The user's Monoptah app copies it to their mach
 so do not put secrets there. Mention the file names in your final message.
 <!-- monoptah-evidence:end -->
 GUIDE
-  } > "$tmp" && mv "$tmp" "$g"
-  rm -f "$tmp"
-fi
-o="$HOME/.claude/CLAUDE.md"
-if [ -f "$o" ] && grep -q '<!-- monoptah-evidence -->' "$o"; then
-  tmp="$o.monoptah.$$"
-  awk 'index($0,"<!-- monoptah-evidence -->"){s=1} !s{print} s&&index($0,"Mention the file names in your final message."){s=0}' "$o" > "$tmp" && cat "$tmp" > "$o"
-  rm -f "$tmp"
-fi
+mv "$tmp" "$g"
+tmp=""
 "#;
 
 fn evidence_script(workspace: &str) -> String {

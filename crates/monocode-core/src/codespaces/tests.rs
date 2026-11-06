@@ -780,11 +780,13 @@ fn prepare_evidence_rejects_unsafe_workspaces_and_reports_failures() {
     assert!(error.contains("connect failed"), "{error}");
 }
 
-fn run_script(script: &str, home: &Path) {
+/// Runs the script with `HOME` set; returns whether it exited successfully.
+fn run_script(script: &str, home: &Path) -> bool {
     let mut child = std::process::Command::new("sh")
         .arg("-s")
         .env("HOME", home)
         .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
     child
@@ -793,7 +795,7 @@ fn run_script(script: &str, home: &Path) {
         .unwrap()
         .write_all(script.as_bytes())
         .unwrap();
-    assert!(child.wait().unwrap().success());
+    child.wait().unwrap().success()
 }
 
 fn git_init(path: &Path) {
@@ -805,18 +807,33 @@ fn git_init(path: &Path) {
         .success());
 }
 
-#[test]
-fn the_evidence_script_writes_a_local_guide_keeps_other_content_and_is_idempotent() {
+/// Names in `dir`, to prove no temp file is left behind.
+fn names(dir: &Path) -> Vec<String> {
+    let mut all: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    all.sort();
+    all
+}
+
+fn guide_env() -> (tempfile::TempDir, tempfile::TempDir, String) {
     let home = tempfile::tempdir().unwrap();
     let ws = tempfile::tempdir().unwrap();
     git_init(ws.path());
+    let script = evidence_script(ws.path().to_str().unwrap());
+    (home, ws, script)
+}
+
+#[test]
+fn the_evidence_script_writes_a_local_guide_keeps_other_content_and_is_idempotent() {
+    let (home, ws, script) = guide_env();
     // An exclude file without a trailing newline must not have its last pattern corrupted.
     std::fs::write(ws.path().join(".git/info/exclude"), "keep-me").unwrap();
     let guide_path = ws.path().join("CLAUDE.local.md");
-    std::fs::write(&guide_path, "my own notes\n").unwrap();
-    let script = evidence_script(ws.path().to_str().unwrap());
+    std::fs::write(&guide_path, "my own notes").unwrap();
     for _ in 0..2 {
-        run_script(&script, home.path());
+        assert!(run_script(&script, home.path()));
     }
     assert!(ws.path().join(".evidence").is_dir());
     let exclude = std::fs::read_to_string(ws.path().join(".git/info/exclude")).unwrap();
@@ -828,11 +845,13 @@ fn the_evidence_script_writes_a_local_guide_keeps_other_content_and_is_idempoten
     assert!(guide.starts_with("my own notes\n"));
     assert_eq!(guide.matches("monoptah-evidence:begin").count(), 1);
     assert!(guide.contains(&format!("{}/.evidence/", ws.path().display())));
-    // Nothing in the user's home is created or touched.
-    assert!(!home.path().join(".claude").exists());
-    // git sees neither file.
+    // Nothing in the user's home is created or touched, and no temp file is left.
+    assert!(names(home.path()).is_empty());
+    assert!(!names(ws.path())
+        .iter()
+        .any(|n| n.contains("monoptah.") || n.starts_with(".CLAUDE")));
     let status = std::process::Command::new("git")
-        .args(["-C"])
+        .arg("-C")
         .arg(ws.path())
         .args(["status", "--porcelain"])
         .output()
@@ -841,17 +860,27 @@ fn the_evidence_script_writes_a_local_guide_keeps_other_content_and_is_idempoten
 }
 
 #[test]
+fn a_new_guide_file_is_created_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home, ws, script) = guide_env();
+    assert!(run_script(&script, home.path()));
+    let mode = std::fs::metadata(ws.path().join("CLAUDE.local.md"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o644);
+}
+
+#[test]
 fn the_evidence_script_replaces_only_its_own_block() {
-    let home = tempfile::tempdir().unwrap();
-    let ws = tempfile::tempdir().unwrap();
-    git_init(ws.path());
+    let (home, ws, script) = guide_env();
     let guide_path = ws.path().join("CLAUDE.local.md");
     std::fs::write(
         &guide_path,
         "before\n<!-- monoptah-evidence:begin -->\nstale\n<!-- monoptah-evidence:end -->\nafter\n",
     )
     .unwrap();
-    run_script(&evidence_script(ws.path().to_str().unwrap()), home.path());
+    assert!(run_script(&script, home.path()));
     let guide = std::fs::read_to_string(&guide_path).unwrap();
     assert!(guide.contains("before\n") && guide.contains("after\n"));
     assert!(!guide.contains("stale"));
@@ -859,25 +888,72 @@ fn the_evidence_script_replaces_only_its_own_block() {
 }
 
 #[test]
-fn the_evidence_script_never_writes_through_a_symlink_or_over_a_tracked_file() {
-    let home = tempfile::tempdir().unwrap();
-    let ws = tempfile::tempdir().unwrap();
-    git_init(ws.path());
+fn unbalanced_or_misordered_markers_leave_the_file_untouched_and_fail() {
+    for content in [
+        "keep\n<!-- monoptah-evidence:begin -->\nthe rest of my notes\n",
+        "keep\n<!-- monoptah-evidence:end -->\nnotes\n",
+        "<!-- monoptah-evidence:end -->\nx\n<!-- monoptah-evidence:begin -->\ny\n",
+        "<!-- monoptah-evidence:begin -->\na\n<!-- monoptah-evidence:end -->\n<!-- monoptah-evidence:begin -->\nb\n<!-- monoptah-evidence:end -->\n",
+    ] {
+        let (home, ws, script) = guide_env();
+        let path = ws.path().join("CLAUDE.local.md");
+        std::fs::write(&path, content).unwrap();
+        assert!(!run_script(&script, home.path()), "{content}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        assert!(!names(ws.path()).iter().any(|n| n.starts_with(".CLAUDE")));
+        // The folder and exclude are still prepared.
+        assert!(ws.path().join(".evidence").is_dir());
+    }
+}
+
+#[test]
+fn an_unreadable_guide_is_not_replaced() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home, ws, script) = guide_env();
+    let path = ws.path().join("CLAUDE.local.md");
+    std::fs::write(&path, "private\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let ran = run_script(&script, home.path());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // Root can read anything; the property only holds for an ordinary user.
+    if !ran {
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "private\n");
+    }
+    assert!(!names(ws.path()).iter().any(|n| n.starts_with(".CLAUDE")));
+}
+
+#[test]
+fn a_directory_or_a_symlink_named_like_the_guide_is_left_alone() {
+    let (home, ws, script) = guide_env();
+    std::fs::create_dir(ws.path().join("CLAUDE.local.md")).unwrap();
+    assert!(!run_script(&script, home.path()));
+    assert!(ws.path().join("CLAUDE.local.md").is_dir());
+
+    let (home, ws, script) = guide_env();
     let outside = tempfile::tempdir().unwrap();
     let target = outside.path().join("dotfile.md");
     std::fs::write(&target, "precious\n").unwrap();
     std::os::unix::fs::symlink(&target, ws.path().join("CLAUDE.local.md")).unwrap();
-    run_script(&evidence_script(ws.path().to_str().unwrap()), home.path());
+    assert!(!run_script(&script, home.path()));
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "precious\n");
     assert!(ws.path().join("CLAUDE.local.md").is_symlink());
-    // A tracked CLAUDE.local.md is the project's own file.
-    let ws2 = tempfile::tempdir().unwrap();
-    git_init(ws2.path());
-    std::fs::write(ws2.path().join("CLAUDE.local.md"), "tracked\n").unwrap();
+
+    // A dangling symlink is still a symlink: nothing is created behind it.
+    let (home, ws, script) = guide_env();
+    let missing = outside.path().join("missing.md");
+    std::os::unix::fs::symlink(&missing, ws.path().join("CLAUDE.local.md")).unwrap();
+    assert!(!run_script(&script, home.path()));
+    assert!(!missing.exists());
+}
+
+#[test]
+fn a_git_tracked_guide_is_the_projects_own_file() {
+    let (home, ws, script) = guide_env();
+    std::fs::write(ws.path().join("CLAUDE.local.md"), "tracked\n").unwrap();
     let git = |args: &[&str]| {
         assert!(std::process::Command::new("git")
             .arg("-C")
-            .arg(ws2.path())
+            .arg(ws.path())
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(args)
             .status()
@@ -886,33 +962,22 @@ fn the_evidence_script_never_writes_through_a_symlink_or_over_a_tracked_file() {
     };
     git(&["add", "CLAUDE.local.md"]);
     git(&["commit", "-q", "-m", "x"]);
-    run_script(&evidence_script(ws2.path().to_str().unwrap()), home.path());
+    assert!(!run_script(&script, home.path()));
     assert_eq!(
-        std::fs::read_to_string(ws2.path().join("CLAUDE.local.md")).unwrap(),
+        std::fs::read_to_string(ws.path().join("CLAUDE.local.md")).unwrap(),
         "tracked\n"
     );
 }
 
 #[test]
-fn the_evidence_script_removes_only_the_old_marked_block_from_the_home_guide() {
-    let home = tempfile::tempdir().unwrap();
-    let ws = tempfile::tempdir().unwrap();
-    git_init(ws.path());
+fn the_script_never_touches_the_home_guide() {
+    let (home, _ws, script) = guide_env();
     std::fs::create_dir_all(home.path().join(".claude")).unwrap();
     let old = home.path().join(".claude/CLAUDE.md");
-    std::fs::write(
-        &old,
-        "mine 1\n\n<!-- monoptah-evidence -->\n## Evidence for the local user\nYou run in a GitHub codespace.\nso do not put secrets there. Mention the file names in your final message.\nmine 2\n",
-    )
-    .unwrap();
-    run_script(&evidence_script(ws.path().to_str().unwrap()), home.path());
-    let text = std::fs::read_to_string(&old).unwrap();
-    assert!(text.contains("mine 1") && text.contains("mine 2"));
-    assert!(!text.contains("monoptah-evidence") && !text.contains("codespace"));
-    // A home guide without our block is left byte for byte alone.
-    std::fs::write(&old, "untouched").unwrap();
-    run_script(&evidence_script(ws.path().to_str().unwrap()), home.path());
-    assert_eq!(std::fs::read_to_string(&old).unwrap(), "untouched");
+    let text = "mine\n<!-- monoptah-evidence -->\nold block\n";
+    std::fs::write(&old, text).unwrap();
+    assert!(run_script(&script, home.path()));
+    assert_eq!(std::fs::read_to_string(&old).unwrap(), text);
 }
 
 #[test]
