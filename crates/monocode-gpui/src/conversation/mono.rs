@@ -55,7 +55,9 @@ impl Conversation {
             return;
         }
         self.install_transfer(settings, None, cx);
-        if send {
+        if send && self.is_remote() {
+            self.send_remote_app_prompt(cx);
+        } else if send {
             self.draft_action(true, cx);
         }
         cx.emit(SessionChanged);

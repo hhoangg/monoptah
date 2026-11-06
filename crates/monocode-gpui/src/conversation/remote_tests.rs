@@ -332,6 +332,63 @@ fn opening_running_host_reattaches_without_dispatching_another_turn(cx: &mut Tes
     assert!(!requests.iter().any(|r| r["method"] == "commands.dispatch"));
 }
 
+/// A session started through the app API (a cloud session) keeps its first prompt as a local
+/// draft; a remote conversation never reads local follow-ups, so the prompt used to be dropped
+/// and the session sat idle. It must be dispatched to the host as an ordinary prompt.
+#[gpui::test]
+fn a_remote_session_started_through_the_app_dispatches_its_first_prompt(cx: &mut TestAppContext) {
+    let host = HostFixture::new(false, false);
+    {
+        let store = host.store.lock().unwrap();
+        store
+            .prepare_app_prompt(host.summary.id, "start-1", "Do the first thing")
+            .unwrap();
+    }
+    let view = host.conversation(cx);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            let settings = monocode_core::agent::Settings {
+                model: Some("codex:gpt-test".into()),
+                ..Default::default()
+            };
+            view.install_app_launch(settings, true, cx)
+        })
+    });
+    let dispatched = || {
+        host.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "commands.dispatch")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..1000 {
+        cx.run_until_parked();
+        if !dispatched().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    host.wait(&view, cx, true);
+    let sent = dispatched();
+    assert!(
+        sent.iter()
+            .any(|r| r["params"]["type"] == "send" && r["params"]["text"] == "Do the first thing"),
+        "{sent:?}"
+    );
+    // The local copy is consumed, so the session does not also report a stale draft.
+    assert!(
+        host.store
+            .lock()
+            .unwrap()
+            .follow_ups(host.summary.id)
+            .unwrap()
+            .draft
+            .is_none()
+    );
+}
+
 #[gpui::test]
 fn explicit_retry_reuses_pending_command_and_preserves_new_composer_and_attachment(
     cx: &mut TestAppContext,

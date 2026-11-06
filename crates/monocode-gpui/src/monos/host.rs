@@ -466,7 +466,13 @@ impl Monos {
             visible,
         } = started;
         let id = summary.id;
-        let project = summary.cwd.clone();
+        // A cloud session runs on a codespace (its cwd is a remote key) but the sidebar lists it
+        // under the local project it twins, so it is recorded and filed there.
+        let project = locked(&self.store)
+            .ok()
+            .and_then(|store| store.remote_session(id).ok().flatten())
+            .and_then(|remote| remote.project.local_project)
+            .unwrap_or_else(|| summary.cwd.clone());
         let origin = self
             .chats
             .values()
@@ -479,7 +485,7 @@ impl Monos {
         if let Some(mono) = self.roster.get_mut(mono_id) {
             mono.launches.push(Launch {
                 session_id: id,
-                cwd: summary.cwd.clone(),
+                cwd: project.clone(),
                 title: summary.title.clone(),
                 harness: summary.provider.clone(),
                 model: settings.model.clone(),

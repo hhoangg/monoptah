@@ -374,6 +374,38 @@ impl Conversation {
         });
         self.launch_prompt(prompt, cx);
     }
+    /// The first prompt of a session started through the app API (a cloud session). It is saved
+    /// as a local draft, but a remote conversation never reads local follow-ups and the host
+    /// knows no such draft block, so it goes out as an ordinary prompt and the local copy is
+    /// dropped. Without this the session would sit idle with its prompt unsent.
+    pub(super) fn send_remote_app_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.busy || self.stopping || self.remote_state.pending || !self.remote_state.online {
+            self.status = "The first prompt was not sent: the machine is not ready.".into();
+            cx.notify();
+            return;
+        }
+        let id = self.summary.id;
+        let draft = locked(&self.store).and_then(|store| {
+            let mut state = store.follow_ups(id)?;
+            let draft = state.draft.take();
+            if draft.is_some() {
+                state.revision += 1;
+                store.save_follow_ups(id, &state)?;
+            }
+            Ok(draft)
+        });
+        match draft {
+            Ok(Some(draft)) => {
+                self.settings.remote_action = None;
+                self.launch_prompt(draft.text, cx);
+            }
+            Ok(None) => (),
+            Err(error) => {
+                self.status = error;
+                cx.notify();
+            }
+        }
+    }
     pub(super) fn remote_save_draft(&mut self, cx: &mut Context<Self>) {
         if self.remote_send_guard(cx) {
             return;

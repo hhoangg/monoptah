@@ -284,3 +284,48 @@ fn a_draft_for_a_cloud_session_never_wakes_its_codespace(cx: &mut TestAppContext
         host.0.lock().unwrap()
     );
 }
+
+/// A cloud session a Mono starts belongs to the local project: the sidebar lists it there at once
+/// (not after the next refresh), and the launch and its folder are filed under that project, not
+/// under the codespace's remote key, which no sidebar shows.
+#[gpui::test]
+fn a_cloud_session_a_mono_starts_is_listed_and_filed_under_the_local_project(
+    cx: &mut TestAppContext,
+) {
+    let _clis = crate::shell::surface_tests::NoClis::new();
+    let (s, _, _, _guard) = cloud_setup(cx, "Available");
+    s.manager
+        .update(cx, |m, cx| m.sidebar_preferences(&s.id, true, true, cx));
+    cx.run_until_parked();
+    let started = run(
+        &s,
+        "cs1",
+        "sessions.start",
+        json!({"prompt":"go","title":"Codespace test","target":{"codespace":"octo-run"}}),
+        cx,
+    )
+    .unwrap();
+    let id = started["sessionId"].as_i64().unwrap();
+    assert!(
+        id < 0,
+        "cloud sessions are remote, so their ids are negative"
+    );
+    let owner = cx.update(|cx| s.manager.read(cx).owner.upgrade().unwrap());
+    cx.update(|cx| {
+        let owner = owner.read(cx);
+        assert_eq!(
+            owner.mono_listed_project(id).as_deref(),
+            Some(s.project.as_str()),
+            "listed under the local project right away"
+        );
+        let groups = owner.mono_groups(&s.project);
+        assert!(
+            groups.folders.iter().any(|f| f.session_ids.contains(&id)),
+            "filed in a folder of the local project: {groups:?}"
+        );
+        assert!(!s.manager.read(cx).hidden_session(id));
+    });
+    let launches = launches_of(&s, cx);
+    let launch = launches.iter().find(|l| l.session_id == id).unwrap();
+    assert_eq!(launch.cwd, s.project);
+}

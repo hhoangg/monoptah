@@ -944,6 +944,40 @@ mod cloud {
         );
     }
 
+    /// A cloud session the Operator starts is listed under the local project at once and does not
+    /// add its codespace's remote key as a project of its own.
+    #[gpui::test]
+    fn a_started_cloud_session_is_listed_under_the_local_project_at_once(cx: &mut TestAppContext) {
+        let (window, caller, path, _, _, _dir) = setup_cloud_in(cx, AUTH_OK, "Available");
+        let started = call(
+            window,
+            caller,
+            "cs1",
+            "sessions.start",
+            json!({"prompt":"go","target":{"codespace":"octo-run"}}),
+            cx,
+        )
+        .unwrap();
+        let id = started["sessionId"].as_i64().unwrap();
+        assert!(id < 0);
+        window
+            .update(cx, |shell, _, _| {
+                let cwd = shell.session_summaries[&id].cwd.clone();
+                assert!(cwd.starts_with("remote://"), "{cwd}");
+                assert_eq!(shell.project_of(id, &cwd), path);
+                assert!(
+                    !shell
+                        .workspace
+                        .projects
+                        .iter()
+                        .any(|p| p.starts_with("remote://")),
+                    "{:?}",
+                    shell.workspace.projects
+                );
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn cloud_sessions_accept_the_session_actions_of_their_local_project(cx: &mut TestAppContext) {
         let (window, caller, path, host, _, _dir) = setup_cloud(cx, AUTH_OK);

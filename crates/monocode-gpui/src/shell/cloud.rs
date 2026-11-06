@@ -297,6 +297,27 @@ impl Shell {
                 .unwrap_or(false)
     }
 
+    /// Marks a session the app or a Mono just created, so it is listed under its local project
+    /// at once instead of after the next refresh. A no-op for a session that is not a cloud one.
+    pub(super) fn mark_cloud_session(&mut self, id: i64) {
+        let binding = locked(&self.store)
+            .ok()
+            .and_then(|store| store.remote_session(id).ok().flatten())
+            .and_then(|remote| Some((remote.project.local_project?, remote.project.codespace?)));
+        if let Some((local_project, codespace)) = binding {
+            self.cloud_states
+                .entry(codespace.clone())
+                .or_insert(CloudState::Available);
+            self.cloud_marks.insert(
+                id,
+                CloudMark {
+                    local_project,
+                    codespace,
+                },
+            );
+        }
+    }
+
     pub(super) fn is_cloud(&self, id: i64) -> bool {
         self.cloud_marks.contains_key(&id)
     }

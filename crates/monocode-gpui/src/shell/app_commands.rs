@@ -105,7 +105,14 @@ impl Shell {
                             this.sidebar_hidden_sessions.remove(&id);
                             this.session_worktrees
                                 .insert(id, settings.worktree_cwd.clone());
-                            this.add(summary, cx);
+                            // A cloud session is listed under its local project, not as a
+                            // rail project of its own.
+                            this.mark_cloud_session(id);
+                            if this.is_cloud(id) {
+                                this.add_loaded(summary, cx);
+                            } else {
+                                this.add(summary, cx);
+                            }
                             this.started_by.insert(id, call.session);
                             if let Some(view) = this.sessions.get(&id) {
                                 view.update(cx, |v, cx| v.install_app_launch(settings, !draft, cx));

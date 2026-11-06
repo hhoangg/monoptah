@@ -403,3 +403,26 @@ fn operator_may_use_codespaces_except_delete() {
     )
     .is_err());
 }
+
+/// A remote (cloud) session has no row in the shared desktop database: its transcript lives on
+/// its host. Reading it must go through the remote store instead of the local session table.
+#[test]
+fn reading_a_remote_session_works_on_a_shared_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_monocode(&dir.path().join("shared.db")).unwrap();
+    let project = store
+        .remember_cloud_project(
+            "env",
+            &json!({"id":"project","cwd":"/workspaces/repo"}),
+            "/Users/me/repo",
+            "octo-abc",
+        )
+        .unwrap();
+    let session = store.create("claude", &project.key).unwrap();
+    assert!(session.id < 0);
+    let page = store
+        .app_conversation(session.id, &json!({}), false, false)
+        .unwrap();
+    assert_eq!(page["sessionId"], session.id);
+    assert_eq!(page["title"], session.title);
+}
