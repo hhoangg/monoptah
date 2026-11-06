@@ -7,7 +7,7 @@ mod monos;
 mod notes;
 mod remote;
 mod remote_legacy;
-pub use remote::{RemoteProject, RemoteSession, RemoteUpload};
+pub use remote::{RemoteProject, RemoteSession, RemoteUpload, CONVERTED};
 pub(crate) use shared::handle as desktop_session_handle;
 mod session_metadata;
 pub use session_metadata::{MobileSessionMetadata, SessionSidebarMetadata};

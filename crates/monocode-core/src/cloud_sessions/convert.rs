@@ -26,12 +26,17 @@
 use super::*;
 use crate::codespaces::valid_remote_path;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Folder inside the local session folder that holds the code state.
 pub const CODESPACE_DIR: &str = "codespace";
 pub const MANIFEST: &str = "manifest.json";
 pub const BUNDLE: &str = "commits.bundle";
 pub const PATCH: &str = "changes.patch";
+/// The `git format-patch` series of the unpushed commits.
+pub const PATCHES: &str = "patches";
+/// Claude's transcript exactly as it was on the codespace.
+pub const RAW_JSONL: &str = "claude.jsonl";
 /// Written by [`restore_code`]; its presence means the action was used.
 pub const RESTORED: &str = "restored.json";
 /// Session setting recording where a converted session came from.
@@ -40,23 +45,35 @@ pub fn origin_key(local_id: i64) -> String {
 }
 
 /// Runs on the codespace with `sh -s`. `@WS@` and `@ID@` are substituted (validated first).
-/// Prints `key=value` lines; everything it stages lives under the printed `stage`.
+/// Prints `key=value` lines; everything it stages lives under the printed `stage`. Errors are
+/// not masked: git's own message ends up in stderr and fails the conversion. The stage is
+/// removed again unless the script finished.
 const SNAPSHOT_SCRIPT: &str = r#"set -eu
 ws='@WS@'
 id='@ID@'
 stage=$(mktemp -d /tmp/monoptah-archive.XXXXXX)
+ok=0
+trap 'if [ "$ok" != 1 ]; then rm -rf "$stage"; fi' EXIT
 echo "stage=$stage"
 if [ -n "$id" ]; then
   f=$(find "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" -maxdepth 2 -type f -name "$id.jsonl" 2>/dev/null | head -n 1 || true)
   if [ -n "$f" ]; then cp "$f" "$stage/claude.jsonl"; echo "jsonl=1"; fi
 fi
-if [ -d "$ws" ] && git -C "$ws" rev-parse --git-dir >/dev/null 2>&1; then
+if [ ! -d "$ws" ] || ! git -C "$ws" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "nogit=1"
+else
   cd "$ws"
-  head=$(git rev-parse -q --verify HEAD 2>/dev/null || true)
-  if [ -n "$head" ]; then
+  export GIT_TERMINAL_PROMPT=0
+  head=$(git rev-parse -q --verify HEAD || true)
+  if [ -z "$head" ]; then
+    echo "nohead=1"
+  else
     mkdir -p "$stage/codespace"
+    fetcher="git"
+    if command -v timeout >/dev/null 2>&1; then fetcher="timeout 60 git"; fi
+    if $fetcher fetch -q origin >/dev/null 2>&1; then echo "fetch=1"; else echo "fetch=0"; fi
     echo "head=$head"
-    echo "branch=$(git symbolic-ref --short -q HEAD 2>/dev/null || true)"
+    echo "branch=$(git symbolic-ref --short -q HEAD || true)"
     echo "remote=$(git remote get-url origin 2>/dev/null || true)"
     up=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
     if [ -z "$up" ]; then up=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true); fi
@@ -67,40 +84,73 @@ if [ -d "$ws" ] && git -C "$ws" rev-parse --git-dir >/dev/null 2>&1; then
     fi
     echo "upstream=$up"
     base=""
-    if [ -n "$up" ]; then base=$(git merge-base HEAD "$up" 2>/dev/null || true); fi
+    if [ -n "$up" ]; then base=$(git merge-base HEAD "$up" || true); fi
     echo "base=$base"
-    n=$(git rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+    onorigin=0
+    if [ -n "$base" ] && [ -n "$(git branch -r --contains "$base" | head -n 1)" ]; then onorigin=1; fi
+    echo "base_on_origin=$onorigin"
+    set -- HEAD --branches
+    if git rev-parse -q --verify refs/stash >/dev/null; then set -- "$@" refs/stash; echo "stash=1"; fi
+    git for-each-ref --format='ref=%(refname) %(objectname)' refs/heads refs/stash | head -n 200
+    n=$(git rev-list --count "$@" --not --remotes)
     echo "unpushed=$n"
     if [ "$n" -gt 0 ]; then
-      git bundle create "$stage/codespace/commits.bundle" HEAD --not --remotes >/dev/null 2>&1
+      git bundle create -q "$stage/codespace/commits.bundle" "$@" --not --remotes
       echo "bundle=1"
     fi
+    if [ -n "$base" ]; then
+      m=$(git rev-list --count "$base..HEAD")
+      if [ "$m" -gt 0 ]; then
+        git format-patch -q --binary -o "$stage/codespace/patches" "$base..HEAD" >/dev/null
+        echo "patches=$m"
+      fi
+    fi
     idx="$stage/index.tmp"
-    GIT_INDEX_FILE="$idx" git read-tree HEAD
-    GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1
+    real=$(git rev-parse --git-path index)
+    if [ -f "$real" ]; then cp "$real" "$idx"; else GIT_INDEX_FILE="$idx" git read-tree HEAD; fi
+    GIT_INDEX_FILE="$idx" git add -A
     GIT_INDEX_FILE="$idx" git diff --cached --binary HEAD > "$stage/codespace/changes.patch"
     rm -f "$idx"
     if [ -s "$stage/codespace/changes.patch" ]; then echo "patch=1"; else rm -f "$stage/codespace/changes.patch"; fi
-  else
-    echo "nohead=1"
+    git ls-files -o -i --exclude-standard --directory | grep -v -e '^\.evidence/$' -e '^CLAUDE\.local\.md$' | head -n 40 | while IFS= read -r p; do
+      kb=$(du -sk -- "$p" 2>/dev/null | cut -f1 || true)
+      echo "ignored=${kb:-0} $p"
+    done
+    echo "size_kb=$(du -sk "$stage" | cut -f1)"
   fi
 fi
+ok=1
 "#;
 
-/// Facts the snapshot script reported.
+/// Everything the snapshot script reported.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Snapshot {
     pub(super) stage: String,
     pub(super) jsonl: bool,
+    pub(super) nogit: bool,
+    pub(super) nohead: bool,
+    pub(super) fetched: bool,
     pub(super) head: Option<String>,
     pub(super) branch: Option<String>,
     pub(super) remote: Option<String>,
     pub(super) upstream: Option<String>,
     pub(super) base: Option<String>,
+    pub(super) base_on_origin: bool,
+    pub(super) stash: bool,
+    pub(super) refs: Vec<(String, String)>,
     pub(super) unpushed: u64,
     pub(super) bundle: bool,
+    pub(super) patches: u64,
     pub(super) patch: bool,
+    /// Ignored files and folders that are not saved: size in KiB and path (capped by the script).
+    pub(super) ignored: Vec<(u64, String)>,
+    pub(super) size_kb: u64,
 }
+
+/// Total size of the code state above which a conversion fails instead of copying it.
+const SIZE_LIMIT_KB: u64 = 500 * 1024;
+/// The stage is always created here; anything else is never removed.
+const STAGE_PREFIX: &str = "/tmp/monoptah-archive.";
 
 pub(super) fn parse_snapshot(out: &str) -> Result<Snapshot, String> {
     let mut snap = Snapshot::default();
@@ -110,21 +160,39 @@ pub(super) fn parse_snapshot(out: &str) -> Result<Snapshot, String> {
         };
         let value = value.trim();
         let text = || (!value.is_empty()).then(|| value.to_string());
+        let flag = value == "1";
         match key {
             "stage" => snap.stage = value.into(),
-            "jsonl" => snap.jsonl = value == "1",
+            "jsonl" => snap.jsonl = flag,
+            "nogit" => snap.nogit = flag,
+            "nohead" => snap.nohead = flag,
+            "fetch" => snap.fetched = flag,
             "head" => snap.head = text(),
             "branch" => snap.branch = text(),
             "remote" => snap.remote = text(),
             "upstream" => snap.upstream = text(),
             "base" => snap.base = text(),
+            "base_on_origin" => snap.base_on_origin = flag,
+            "stash" => snap.stash = flag,
+            "ref" => {
+                if let Some((name, sha)) = value.split_once(' ') {
+                    snap.refs.push((name.into(), sha.trim().into()));
+                }
+            }
             "unpushed" => snap.unpushed = value.parse().unwrap_or(0),
-            "bundle" => snap.bundle = value == "1",
-            "patch" => snap.patch = value == "1",
+            "bundle" => snap.bundle = flag,
+            "patches" => snap.patches = value.parse().unwrap_or(0),
+            "patch" => snap.patch = flag,
+            "ignored" => {
+                if let Some((kb, path)) = value.split_once(' ') {
+                    snap.ignored.push((kb.parse().unwrap_or(0), path.into()));
+                }
+            }
+            "size_kb" => snap.size_kb = value.parse().unwrap_or(0),
             _ => {}
         }
     }
-    if snap.stage.is_empty() {
+    if !snap.stage.starts_with(STAGE_PREFIX) {
         return Err("The codespace did not report where it staged the files".into());
     }
     valid_remote_path(&snap.stage)?;
@@ -159,25 +227,51 @@ pub(super) fn default_claude_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".claude"))
 }
 
-/// Replaces `from` (a path, matched on a boundary) by `to` in a JSONL text. `to` is escaped
-/// for use inside a JSON string.
-pub(super) fn rewrite_cwd(text: &str, from: &str, to: &str) -> String {
+/// Replaces every path in `from` (matched on boundaries) by `to` in a JSONL text. `to` is
+/// escaped for use inside a JSON string. Longer paths are tried first. A match must not be
+/// the tail of a longer path (`/tmp/workspaces/app`) or the head of a longer name
+/// (`/workspaces/app-two`, `/workspaces/app.git`).
+pub(super) fn rewrite_cwd(text: &str, from: &[&str], to: &str) -> String {
     let escaped = serde_json::to_string(to).unwrap_or_default();
     let to = &escaped[1..escaped.len().saturating_sub(1).max(1)];
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(from) {
-        let after = &rest[at + from.len()..];
-        let boundary = after
-            .chars()
-            .next()
-            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-        out.push_str(&rest[..at]);
-        out.push_str(if boundary { to } else { from });
-        rest = after;
+    let mut froms: Vec<&str> = from.iter().copied().filter(|f| !f.is_empty()).collect();
+    froms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    froms.dedup();
+    let mut text = text.to_string();
+    for from in froms {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        let mut before: Option<char> = None;
+        while let Some(at) = rest.find(from) {
+            let prefix = &rest[..at];
+            let after = &rest[at + from.len()..];
+            let left = prefix.chars().next_back().or(before).is_none_or(|c| {
+                !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~'))
+            });
+            let mut next = after.chars();
+            let right = match next.next() {
+                None => true,
+                Some(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_' => false,
+                // A dot ends a sentence unless a name continues after it.
+                Some('.') => !next
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                Some(_) => true,
+            };
+            out.push_str(prefix);
+            let replaced = left && right;
+            out.push_str(if replaced { to } else { from });
+            before = if replaced {
+                to.chars().next_back()
+            } else {
+                from.chars().next_back()
+            };
+            rest = after;
+        }
+        out.push_str(rest);
+        text = out;
     }
-    out.push_str(rest);
-    out
+    text
 }
 
 /// What happened to Claude's own transcript.
@@ -205,8 +299,10 @@ pub struct Converted {
     pub rows: usize,
     pub resume: Resume,
     pub evidence: Vec<PathBuf>,
-    /// The `codespace/` folder when the workspace is a git repository with commits.
+    /// The `codespace/` folder in the local session folder (manifest, bundle, patches).
     pub code_dir: Option<PathBuf>,
+    /// Ignored files and folders that were NOT saved: size in KiB and path.
+    pub ignored: Vec<(u64, String)>,
     /// Problems that did not stop the conversion.
     pub warnings: Vec<String>,
 }
@@ -245,6 +341,14 @@ impl CloudSessions {
         &self.claude_dir
     }
 
+    /// Every cloud session bound to `codespace`, archived or not.
+    pub fn sessions_in_codespace(&self, codespace: &str) -> Vec<i64> {
+        self.store()
+            .ok()
+            .and_then(|store| store.cloud_session_ids(codespace).ok())
+            .unwrap_or_default()
+    }
+
     /// Converts one cloud session into an archived local session, see the module docs.
     /// BLOCKS (wake, copies); call from a worker thread. On `Err` nothing local was
     /// kept and the cloud record is untouched, so it can be retried.
@@ -267,8 +371,8 @@ impl CloudSessions {
             .local_project
             .clone()
             .ok_or("This session has no local project to keep a copy in.")?;
-        let workspace = remote.project.cwd.trim_end_matches('/').to_string();
-        valid_remote_path(&workspace)?;
+        let project_cwd = remote.project.cwd.trim_end_matches('/').to_string();
+        valid_remote_path(&project_cwd)?;
         let remote_thread = self
             .store()?
             .thread_dir(cloud_id)?
@@ -298,6 +402,17 @@ impl CloudSessions {
             );
             snapshot = Some(value);
         }
+        // The session may run in its own host worktree: that is the tree to save.
+        let session_cwd = snapshot
+            .as_ref()
+            .and_then(|v| v["session"]["cwd"].as_str())
+            .map(|c| c.trim_end_matches('/').to_string())
+            .filter(|c| {
+                c.starts_with(&format!("{}/", self.workspace_root)) && valid_remote_path(c).is_ok()
+            });
+        let workspace = session_cwd.clone().unwrap_or_else(|| project_cwd.clone());
+        let mut cwds = vec![project_cwd.clone()];
+        cwds.extend(session_cwd);
         let (rows, turns) = match &snapshot {
             Some(value) => {
                 let (history, turns) = crate::store::Store::project_remote_history(value)?;
@@ -328,12 +443,15 @@ impl CloudSessions {
 
         let staging = remote_thread.join(format!("convert.{}-{}", std::process::id(), nanos()));
         let result = self.convert_staged(
-            &remote,
-            &codespace,
-            &local_project,
-            &workspace,
-            provider_id.as_deref(),
-            &title,
+            Plan {
+                remote: &remote,
+                codespace: &codespace,
+                local_project: &local_project,
+                workspace: &workspace,
+                cwds: &cwds,
+                provider_id: provider_id.as_deref(),
+                title: &title,
+            },
             rows,
             turns,
             &pulled.local_dir,
@@ -352,12 +470,7 @@ impl CloudSessions {
     #[allow(clippy::too_many_arguments)]
     fn convert_staged(
         &self,
-        remote: &RemoteSession,
-        codespace: &str,
-        local_project: &str,
-        workspace: &str,
-        provider_id: Option<&str>,
-        title: &str,
+        plan: Plan<'_>,
         rows: Vec<crate::transcript::Row>,
         turns: HashMap<usize, crate::agent::TurnInfo>,
         evidence_dir: &Path,
@@ -366,6 +479,15 @@ impl CloudSessions {
         progress: &mut dyn FnMut(&str),
         warnings: &mut Vec<String>,
     ) -> Result<Converted, String> {
+        let Plan {
+            remote,
+            codespace,
+            local_project,
+            workspace,
+            cwds,
+            provider_id,
+            title,
+        } = plan;
         std::fs::create_dir_all(staging).map_err(|e| e.to_string())?;
         progress("Saving the code state");
         let script = SNAPSHOT_SCRIPT
@@ -373,17 +495,53 @@ impl CloudSessions {
             .replace("@ID@", provider_id.unwrap_or(""));
         let out = codespaces::run_script(&*self.gh, codespace, &script, true)?;
         let snap = parse_snapshot(&out)?;
+        let drop_stage = |this: &Self| {
+            // The stage lives in /tmp on the codespace; failing to remove it is harmless.
+            if snap.stage.starts_with(STAGE_PREFIX) {
+                let _ = codespaces::run_script(
+                    &*this.gh,
+                    codespace,
+                    &format!("rm -rf '{}'\n", snap.stage),
+                    false,
+                );
+            }
+        };
+        if snap.nogit || snap.nohead {
+            drop_stage(self);
+            return Err(format!(
+                "{workspace} on the codespace is not a git repository with at least one commit, so its files cannot be saved."
+            ));
+        }
+        if snap.size_kb > SIZE_LIMIT_KB {
+            drop_stage(self);
+            return Err(format!(
+                "The code state is {} MB, over the {} MB limit for a local copy.",
+                snap.size_kb / 1024,
+                SIZE_LIMIT_KB / 1024
+            ));
+        }
         let copied = codespaces::copy_from(&*self.gh, codespace, &snap.stage, staging);
-        // The stage lives in /tmp on the codespace; failing to remove it is harmless.
-        let _ = codespaces::run_script(
-            &*self.gh,
-            codespace,
-            &format!("rm -rf '{}'\n", snap.stage),
-            false,
-        );
+        drop_stage(self);
         copied?;
-        let stage_name = snap.stage.rsplit('/').next().unwrap_or_default();
-        let staged = staging.join(stage_name);
+        let staged = staging.join(snap.stage.rsplit('/').next().unwrap_or_default());
+        let code = staged.join(CODESPACE_DIR);
+        // What the script said it staged must have arrived.
+        for (reported, file) in [
+            (snap.jsonl, staged.join("claude.jsonl")),
+            (snap.bundle, code.join(BUNDLE)),
+            (snap.patch, code.join(PATCH)),
+            (snap.patches > 0, code.join(PATCHES)),
+        ] {
+            if reported && !file.exists() {
+                return Err(format!(
+                    "{} was staged on the codespace but did not arrive",
+                    file.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+        if let Some(note) = check_restorable(Path::new(local_project), &code, &snap)? {
+            warnings.push(note);
+        }
 
         // Everything fetched: from here on a failure rolls the local session back.
         progress("Creating the local copy");
@@ -422,20 +580,27 @@ impl CloudSessions {
             }
             local_id
         };
+        let tombstone = remote
+            .session_id
+            .as_deref()
+            .map(|host| (remote.project.environment_id.clone(), host.to_string()));
         let mut finish = || -> Result<Converted, String> {
             let local_thread = self
                 .store()?
                 .thread_dir(local_id)?
                 .ok_or("This store keeps no session folders.")?;
-            std::fs::create_dir_all(&local_thread).map_err(|e| e.to_string())?;
+            let dir = local_thread.join(CODESPACE_DIR);
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            // Claude's raw transcript is always kept, whatever happens to the install below.
+            if snap.jsonl {
+                std::fs::copy(staged.join("claude.jsonl"), dir.join(RAW_JSONL))
+                    .map_err(|e| format!("Cannot keep Claude's transcript: {e}"))?;
+            }
+            let from: Vec<&str> = cwds.iter().map(String::as_str).collect();
             let resume = match (provider_id, snap.jsonl) {
                 (Some(id), true) => {
-                    match self.install_jsonl(
-                        &staged.join("claude.jsonl"),
-                        workspace,
-                        local_project,
-                        id,
-                    ) {
+                    match self.install_jsonl(&staged.join("claude.jsonl"), &from, local_project, id)
+                    {
                         Ok(resume) => resume,
                         Err(e) => Resume::Missing(e),
                     }
@@ -452,40 +617,61 @@ impl CloudSessions {
                     }
                 }
                 Resume::Missing(why) => warnings.push(format!(
-                    "Claude cannot resume this conversation locally ({why}); the next message starts a fresh one."
+                    "Claude cannot resume this conversation locally ({why}); the next message starts a fresh one. The raw transcript is kept in the session folder."
                 )),
             }
-            let mut code_dir = None;
-            if let Some(head) = snap.head.as_deref().filter(|h| valid_hex(h)) {
-                let dir = local_thread.join(CODESPACE_DIR);
-                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let from = staged.join(CODESPACE_DIR);
-                for name in [BUNDLE, PATCH] {
-                    let file = from.join(name);
-                    if file.is_file() {
-                        std::fs::copy(&file, dir.join(name)).map_err(|e| e.to_string())?;
-                    }
+            let head = snap
+                .head
+                .as_deref()
+                .filter(|h| valid_hex(h))
+                .ok_or("The codespace reported no valid HEAD")?;
+            for name in [BUNDLE, PATCH] {
+                let file = code.join(name);
+                if file.is_file() {
+                    std::fs::copy(&file, dir.join(name)).map_err(|e| e.to_string())?;
                 }
-                let manifest = json!({
-                    "version": 1,
-                    "codespace": codespace,
-                    "remoteCwd": workspace,
-                    "branch": snap.branch,
-                    "head": head,
-                    "base": snap.base.as_deref().filter(|b| valid_hex(b)),
-                    "upstream": snap.upstream,
-                    "remoteUrl": snap.remote,
-                    "unpushedCommits": snap.unpushed,
-                    "bundle": dir.join(BUNDLE).is_file().then_some(BUNDLE),
-                    "patch": dir.join(PATCH).is_file().then_some(PATCH),
-                    "createdAt": crate::time::now_ms(),
-                });
-                std::fs::write(
-                    dir.join(MANIFEST),
-                    serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| e.to_string())?;
-                code_dir = Some(dir);
+            }
+            if code.join(PATCHES).is_dir() {
+                copy_tree(&code.join(PATCHES), &dir.join(PATCHES))
+                    .map_err(|e| format!("Cannot keep the patch series: {e}"))?;
+            }
+            let ignored_kb: u64 = snap.ignored.iter().map(|(kb, _)| kb).sum();
+            let manifest = json!({
+                "version": 2,
+                "codespace": codespace,
+                "remoteCwd": workspace,
+                "branch": snap.branch,
+                "head": head,
+                "base": snap.base.as_deref().filter(|b| valid_hex(b)),
+                "baseOnOrigin": snap.base_on_origin,
+                "upstream": snap.upstream,
+                "remoteUrl": snap.remote,
+                "fetchedOrigin": snap.fetched,
+                "unpushedCommits": snap.unpushed,
+                "stash": snap.stash,
+                "refs": snap.refs,
+                "bundle": dir.join(BUNDLE).is_file().then_some(BUNDLE),
+                "patches": dir.join(PATCHES).is_dir().then_some(PATCHES),
+                "patch": dir.join(PATCH).is_file().then_some(PATCH),
+                "ignoredNotSaved": snap.ignored.iter().map(|(kb, path)| json!({"path": path, "kib": kb})).collect::<Vec<_>>(),
+                "createdAt": crate::time::now_ms(),
+            });
+            std::fs::write(
+                dir.join(MANIFEST),
+                serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            if !snap.ignored.is_empty() {
+                warnings.push(format!(
+                    "{} ignored files or folders (about {} MB) were not saved; they are listed in the session's codespace manifest.",
+                    snap.ignored.len(),
+                    ignored_kb / 1024
+                ));
+            }
+            if !snap.fetched {
+                warnings.push(
+                    "The codespace could not refresh from origin, so unpushed work may be counted conservatively.".into(),
+                );
             }
             if evidence_dir.is_dir() {
                 copy_tree(evidence_dir, &local_thread.join(super::EVIDENCE_DIR))
@@ -498,6 +684,18 @@ impl CloudSessions {
                 .into_iter()
                 .find(|s| s.id == local_id)
                 .ok_or("The local copy disappeared")?;
+            // Last, so a failure above leaves the cloud record in place. The tombstone keeps
+            // the host session from being imported again by a poll or a refresh.
+            let store = self.store()?;
+            if let Some((env, host)) = &tombstone {
+                store.set_cloud_converted(env, host, true)?;
+            }
+            if let Err(e) = store.forget_cloud_session(remote.summary.id) {
+                if let Some((env, host)) = &tombstone {
+                    let _ = store.set_cloud_converted(env, host, false);
+                }
+                return Err(e);
+            }
             Ok(Converted {
                 cloud_id: remote.summary.id,
                 local_id,
@@ -507,20 +705,23 @@ impl CloudSessions {
                 rows: rows.len(),
                 resume,
                 evidence: vec![],
-                code_dir,
+                code_dir: Some(dir),
+                ignored: snap.ignored.clone(),
                 warnings: vec![],
             })
         };
         let converted = match finish() {
             Ok(converted) => converted,
             Err(error) => {
-                let _ = self.store().map(|mut store| store.delete(local_id));
+                if let Ok(mut store) = self.store() {
+                    if let Some((env, host)) = &tombstone {
+                        let _ = store.set_cloud_converted(env, host, false);
+                    }
+                    let _ = store.delete(local_id);
+                }
                 return Err(error);
             }
         };
-        let store = self.store()?;
-        store.forget_cloud_session(remote.summary.id)?;
-        drop(store);
         // The cloud session's own folder only held the evidence, now copied.
         let _ = std::fs::remove_dir_all(evidence_dir);
         let _ = std::fs::remove_dir(remote_thread);
@@ -531,7 +732,7 @@ impl CloudSessions {
     fn install_jsonl(
         &self,
         source: &Path,
-        remote_cwd: &str,
+        remote_cwds: &[&str],
         local_cwd: &str,
         provider_id: &str,
     ) -> Result<Resume, String> {
@@ -550,7 +751,7 @@ impl CloudSessions {
         }
         let text = std::fs::read_to_string(source)
             .map_err(|e| format!("cannot read Claude's transcript: {e}"))?;
-        let text = rewrite_cwd(&text, remote_cwd, &local);
+        let text = rewrite_cwd(&text, remote_cwds, &local);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let tmp = dir.join(format!(".{provider_id}.{}.tmp", nanos()));
         std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
@@ -567,6 +768,148 @@ impl CloudSessions {
     }
 }
 
+/// What one conversion works on.
+struct Plan<'a> {
+    remote: &'a RemoteSession,
+    codespace: &'a str,
+    local_project: &'a str,
+    /// The tree that is saved: the session's own cwd on the host.
+    workspace: &'a str,
+    /// Codespace paths to rewrite in Claude's transcript.
+    cwds: &'a [String],
+    provider_id: Option<&'a str>,
+    title: &'a str,
+}
+
+/// Runs git with a time limit, no prompts, and git's own message as the error.
+fn git_run(
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    limit: Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new("git");
+    command
+        .current_dir(cwd)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Could not run Git: {e}"))?;
+    let read = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    };
+    let stdout = read(Box::new(child.stdout.take().ok_or("no stdout")?));
+    let stderr = read(Box::new(child.stderr.take().ok_or("no stderr")?));
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git {} timed out", args.first().unwrap_or(&"")));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let out = stdout.join().unwrap_or_default();
+    let err = stderr.join().unwrap_or_default();
+    if status.success() {
+        Ok(out)
+    } else {
+        let text = if err.trim().is_empty() { out } else { err };
+        Err(text.trim().to_string())
+    }
+}
+
+const GIT_LIMIT: Duration = Duration::from_secs(120);
+
+fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    git_run(cwd, args, &[], GIT_LIMIT)
+}
+
+/// Before the codespace goes away: the saved commits must be restorable here. The bundle
+/// verifies against the local project, or the format-patch series is there as a fallback,
+/// or the commits it still needs are on origin (fetched at restore). `Ok(Some)` is a
+/// warning; `Err` stops the conversion.
+pub(super) fn check_restorable(
+    project: &Path,
+    code: &Path,
+    snap: &Snapshot,
+) -> Result<Option<String>, String> {
+    let mut notes = Vec::new();
+    if snap.base.is_some() && !snap.base_on_origin {
+        notes.push("the base commit is not on origin");
+    }
+    let bundle = code.join(BUNDLE);
+    if !bundle.is_file() {
+        return Ok((!notes.is_empty()).then(|| {
+            format!(
+                "Restoring the code may need extra care: {}.",
+                notes.join(", ")
+            )
+        }));
+    }
+    if !project.is_dir() {
+        return Err(format!(
+            "The local project {} is missing, so the saved commits cannot be checked.",
+            project.display()
+        ));
+    }
+    let fallback = snap.patches > 0 && snap.base.is_some();
+    match run_git(project, &["bundle", "verify", &bundle.to_string_lossy()]) {
+        Ok(_) => {}
+        Err(_) if fallback => notes.push(
+            "the saved commits need commits this repository lacks; the patch series will be used",
+        ),
+        Err(error) => {
+            let missing: Vec<&str> = error
+                .split(|c: char| !c.is_ascii_hexdigit())
+                .filter(|t| t.len() == 40)
+                .collect();
+            let tips = git_run(
+                project,
+                &["ls-remote", "origin"],
+                &[],
+                Duration::from_secs(30),
+            )
+            .unwrap_or_default();
+            let on_origin = !missing.is_empty()
+                && missing
+                    .iter()
+                    .all(|sha| tips.lines().any(|l| l.starts_with(sha)));
+            if !on_origin {
+                return Err(format!(
+                    "The saved commits cannot be restored in this repository: {error}"
+                ));
+            }
+        }
+    }
+    Ok((!notes.is_empty()).then(|| {
+        format!(
+            "Restoring the code may need extra care: {}.",
+            notes.join(", ")
+        )
+    }))
+}
+
 // ---------------------------------------------------------------------------------------
 // Restore
 
@@ -579,7 +922,11 @@ pub struct CodeManifest {
     pub base: Option<String>,
     pub remote_url: Option<String>,
     pub bundle: Option<PathBuf>,
+    /// The `git format-patch` series `base..head`, a fallback when the bundle cannot be used.
+    pub patches: Option<PathBuf>,
     pub patch: Option<PathBuf>,
+    /// `(ref name, sha)` of the codespace's local branches and stash.
+    pub refs: Vec<(String, String)>,
 }
 
 /// The pending code restore of a local session folder, or `None` when there is no manifest or
@@ -600,11 +947,20 @@ pub fn pending_restore(thread_dir: &Path) -> Option<CodeManifest> {
     };
     let file = |key: &str| {
         let name = value[key].as_str()?;
-        // Only the two names this module writes; never a path from the file.
-        matches!(name, BUNDLE | PATCH)
+        // Only the names this module writes; never a path from the file.
+        matches!(name, BUNDLE | PATCH | PATCHES)
             .then(|| dir.join(name))
-            .filter(|p| p.is_file())
+            .filter(|p| p.exists())
     };
+    let refs = value["refs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| Some((r[0].as_str()?.to_string(), r[1].as_str()?.to_string())))
+        .filter(|(name, sha)| {
+            valid_hex(sha) && (name.starts_with("refs/heads/") || name == "refs/stash")
+        })
+        .collect();
     Some(CodeManifest {
         codespace: text("codespace").unwrap_or_default(),
         branch: text("branch"),
@@ -612,7 +968,9 @@ pub fn pending_restore(thread_dir: &Path) -> Option<CodeManifest> {
         base: text("base").filter(|b| valid_hex(b)),
         remote_url: text("remoteUrl"),
         bundle: file("bundle"),
+        patches: file("patches"),
         patch: file("patch"),
+        refs,
     })
 }
 
@@ -624,12 +982,8 @@ pub struct Restored {
     pub head: String,
     /// The uncommitted changes were applied.
     pub patch_applied: bool,
-    /// Git's complaint when the patch did not apply; the worktree is still at `head`.
+    /// Git's complaint when commits or the patch did not apply; the worktree is still usable.
     pub conflicts: Option<String>,
-}
-
-fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    crate::git::git(cwd, args)
 }
 
 fn branch_taken(project: &Path, name: &str) -> bool {
@@ -649,11 +1003,35 @@ fn has_commit(project: &Path, sha: &str) -> bool {
     run_git(project, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
 }
 
+/// Fetches origin's branches into a namespace this feature owns, so no existing branch or
+/// remote-tracking ref moves. Best effort, bounded.
+fn fetch_origin(project: &Path, id8: &str) {
+    let spec = format!("+refs/heads/*:refs/codespace/{id8}/origin/*");
+    // Fetching by URL, not by remote name: a named remote also refreshes its tracking refs.
+    let Ok(url) = run_git(project, &["remote", "get-url", "origin"]) else {
+        return;
+    };
+    let _ = run_git(
+        project,
+        &[
+            "fetch",
+            "-q",
+            "--no-tags",
+            "--no-write-fetch-head",
+            url.trim(),
+            &spec,
+        ],
+    );
+}
+
 /// Recreates the codespace's code in a NEW git worktree of `project` (the local project):
 /// the branch the codespace was on (or `<branch>-codespace` when that name is taken), the
-/// unpushed commits from the bundle, then the uncommitted changes from the patch. The main
-/// checkout and every existing worktree are left alone. Runs once per local session: a
-/// `restored.json` is written next to the manifest. Patch problems are reported in
+/// commits from the bundle (or, when the bundle does not fit this repository, from the
+/// `format-patch` series applied onto the saved base), then the uncommitted changes from the
+/// patch. The main checkout, every existing worktree and every existing branch are left alone:
+/// other saved branches and the stash are kept under `refs/codespace/<id>/`, and origin is
+/// only ever fetched into that namespace. Runs once per local session: a `restored.json` is
+/// written next to the manifest. Problems applying commits or the patch are reported in
 /// [`Restored::conflicts`] and do not undo the worktree.
 pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, String> {
     let manifest = pending_restore(thread_dir)
@@ -661,31 +1039,72 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
     if !project.is_dir() {
         return Err(format!("{} is not a folder", project.display()));
     }
+    let id8 = manifest.head[..8].to_string();
+    let mut have_head = has_commit(project, &manifest.head);
+    let mut unpacked = false;
     if let Some(bundle) = &manifest.bundle {
         let bundle = bundle.to_string_lossy().into_owned();
         let mut verified = run_git(project, &["bundle", "verify", &bundle]);
         if verified.is_err() {
-            // Missing prerequisite commits usually just need a fetch.
-            let _ = run_git(project, &["fetch", "--quiet", "origin"]);
+            // Missing prerequisite commits usually just need origin's objects.
+            fetch_origin(project, &id8);
             verified = run_git(project, &["bundle", "verify", &bundle]);
         }
-        verified.map_err(|e| format!("The saved commits cannot be unpacked here: {e}"))?;
-        run_git(project, &["bundle", "unbundle", &bundle])
-            .map_err(|e| format!("Cannot unpack the saved commits: {e}"))?;
+        match verified {
+            Ok(_) => {
+                run_git(project, &["bundle", "unbundle", &bundle])
+                    .map_err(|e| format!("Cannot unpack the saved commits: {e}"))?;
+                unpacked = true;
+                have_head = has_commit(project, &manifest.head);
+            }
+            Err(e) if manifest.patches.is_none() => {
+                return Err(format!("The saved commits cannot be unpacked here: {e}"));
+            }
+            Err(_) => {}
+        }
     }
-    if !has_commit(project, &manifest.head) {
-        let _ = run_git(project, &["fetch", "--quiet", "origin"]);
-        if !has_commit(project, &manifest.head) {
+    if !have_head && !unpacked {
+        fetch_origin(project, &id8);
+        have_head = has_commit(project, &manifest.head);
+    }
+    // Where the worktree starts, and whether the commits still have to be replayed.
+    let (start, replay) = if have_head {
+        (manifest.head.clone(), None)
+    } else if let (Some(series), Some(base)) = (&manifest.patches, &manifest.base) {
+        if !has_commit(project, base) {
+            fetch_origin(project, &id8);
+        }
+        if !has_commit(project, base) {
             return Err(format!(
-                "The commit {} is not in this repository and was not saved. Fetch it and try again.",
-                &manifest.head[..12.min(manifest.head.len())]
+                "The base commit {} is not in this repository and could not be fetched.",
+                &base[..12.min(base.len())]
             ));
+        }
+        (base.clone(), Some(series.clone()))
+    } else {
+        return Err(format!(
+            "The commit {} is not in this repository and was not saved. Fetch it and try again.",
+            &manifest.head[..12]
+        ));
+    };
+    if unpacked {
+        for (name, sha) in &manifest.refs {
+            if !has_commit(project, sha) {
+                continue;
+            }
+            let short = name.trim_start_matches("refs/heads/");
+            let target = if name == "refs/stash" {
+                format!("refs/codespace/{id8}/stash")
+            } else {
+                format!("refs/codespace/{id8}/heads/{short}")
+            };
+            let _ = run_git(project, &["update-ref", &target, sha]);
         }
     }
     let wanted = manifest
         .branch
         .clone()
-        .unwrap_or_else(|| format!("codespace-{}", &manifest.head[..8]));
+        .unwrap_or_else(|| format!("codespace-{id8}"));
     let mut candidates = vec![wanted.clone(), format!("{wanted}-codespace")];
     candidates.extend((2..30).map(|n| format!("{wanted}-codespace-{n}")));
     let mut created = None;
@@ -694,7 +1113,7 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
         if branch_taken(project, &name) {
             continue;
         }
-        match crate::git::create_project_worktree(project, &name, Some(&manifest.head), false) {
+        match crate::git::create_project_worktree(project, &name, Some(&start), false) {
             Ok(tree) => {
                 created = Some((name, tree));
                 break;
@@ -719,7 +1138,46 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
         patch_applied: false,
         conflicts: None,
     };
-    if let Some(patch) = &manifest.patch {
+    if let Some(series) = replay {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&series)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "patch"))
+            .collect();
+        files.sort();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let mut args = vec!["am", "--3way", "--quiet"];
+        args.extend(names.iter().map(String::as_str));
+        let ident = run_git(&worktree, &["config", "user.email"])
+            .map(|e| !e.trim().is_empty())
+            .unwrap_or(false);
+        let envs: &[(&str, &str)] = if ident {
+            &[]
+        } else {
+            &[
+                ("GIT_COMMITTER_NAME", "Monoptah"),
+                ("GIT_COMMITTER_EMAIL", "monoptah@localhost"),
+            ]
+        };
+        match git_run(&worktree, &args, envs, Duration::from_secs(300)) {
+            Ok(_) => {
+                if let Ok(head) = run_git(&worktree, &["rev-parse", "HEAD"]) {
+                    restored.head = head.trim().to_string();
+                }
+            }
+            Err(e) => {
+                let _ = run_git(&worktree, &["am", "--abort"]);
+                restored.conflicts = Some(format!(
+                    "The saved commits could not be replayed onto the base: {e}"
+                ));
+            }
+        }
+    }
+    if let (Some(patch), None) = (&manifest.patch, &restored.conflicts) {
         match run_git(
             &worktree,
             &[
@@ -751,7 +1209,12 @@ pub fn restore_code(project: &Path, thread_dir: &Path) -> Result<Restored, Strin
         thread_dir.join(CODESPACE_DIR).join(RESTORED),
         record.to_string(),
     )
-    .map_err(|e| format!("Restored, but could not record it: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "Restored into {}, but could not record it: {e}",
+            worktree.display()
+        )
+    })?;
     Ok(restored)
 }
 

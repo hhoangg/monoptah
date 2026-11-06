@@ -158,6 +158,12 @@ struct World {
 }
 
 fn world(ran_claude: bool) -> World {
+    world_with(ran_claude, false, true)
+}
+
+/// `worktree`: the host session runs in its own git worktree. `extras`: a second branch with
+/// work, a stash and ignored files.
+fn world_with(ran_claude: bool, worktree: bool, extras: bool) -> World {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let origin = root.join("origin.git");
@@ -200,7 +206,43 @@ fn world(ran_claude: bool) -> World {
         ".evidence/\nCLAUDE.local.md\n",
     )
     .unwrap();
+    if extras {
+        // A second branch with work of its own, a stash, and ignored files.
+        git(
+            &ws,
+            &["stash", "push", "-q", "--include-untracked", "-m", "keep"],
+        );
+        git(&ws, &["checkout", "-q", "-b", "side", "main"]);
+        std::fs::write(ws.join("side.txt"), "side\n").unwrap();
+        git(&ws, &["add", "side.txt"]);
+        git(&ws, &["commit", "-q", "-m", "side work"]);
+        git(&ws, &["checkout", "-q", "feat/x"]);
+        git(&ws, &["stash", "apply", "-q"]);
+        std::fs::write(ws.join("junk.log"), "log\n").unwrap();
+        let mut exclude = std::fs::read_to_string(ws.join(".git/info/exclude")).unwrap();
+        exclude.push_str("*.log\n");
+        std::fs::write(ws.join(".git/info/exclude"), exclude).unwrap();
+    }
+    let mut session_cwd = ws.clone();
+    if worktree {
+        let tree = root.join("cs-wt");
+        git(
+            &ws,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt-branch",
+                tree.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(tree.join("in-worktree.txt"), "wt\n").unwrap();
+        session_cwd = tree;
+    }
     let ws_text = ws.to_str().unwrap().to_string();
+    let session_text = session_cwd.to_str().unwrap().to_string();
     if ran_claude {
         let enc = claude_project_dir_name(&ws_text);
         let dir = remote_home.join(".claude/projects").join(enc);
@@ -217,7 +259,7 @@ fn world(ran_claude: bool) -> World {
     let snapshot = json!({"projectId":"p","revision":3,"status":"idle","updatedAt":50,
         "session":{"id":"host-1","harness":"claude","title":"Add made.txt",
             "providerSessionId": ran_claude.then_some(SESSION),
-            "model":"claude:sonnet","runtimeMode":"auto","cwd":ws_text,
+            "model":"claude:sonnet","runtimeMode":"auto","cwd":session_text,
             "blocks":[{"id":"u","role":"user","text":"create made.txt"},
                       {"id":"a","role":"assistant","text":"Done."}]}});
     let machine = Machine {
@@ -272,7 +314,7 @@ fn project_folder_names_follow_claudes_rule_and_cwd_rewrites_stop_at_a_boundary(
     let text =
         r#"{"cwd":"/workspaces/app"} /workspaces/app-two /workspaces/app/src /workspaces/app."#;
     assert_eq!(
-        rewrite_cwd(text, "/workspaces/app", "/Users/me/\"q\""),
+        rewrite_cwd(text, &["/workspaces/app"], "/Users/me/\"q\""),
         r#"{"cwd":"/Users/me/\"q\""} /workspaces/app-two /Users/me/\"q\"/src /Users/me/\"q\"."#
     );
 }
@@ -304,7 +346,11 @@ fn converting_keeps_transcript_jsonl_evidence_and_the_code_state_locally() {
     assert_eq!(done.codespace, "cs-1");
     assert_eq!(done.title, "Add made.txt");
     assert!(done.rows >= 2);
-    assert!(done.warnings.is_empty(), "{:?}", done.warnings);
+    assert!(
+        done.warnings.iter().all(|w| w.contains("ignored")),
+        "{:?}",
+        done.warnings
+    );
 
     // Local archived session in the binding's local project.
     let store = w.svc.store().unwrap();
@@ -363,7 +409,27 @@ fn converting_keeps_transcript_jsonl_evidence_and_the_code_state_locally() {
     assert_eq!(manifest["head"], git(&w.ws, &["rev-parse", "HEAD"]));
     assert_eq!(manifest["base"], git(&w.ws, &["rev-parse", "main~0"]));
     assert_eq!(manifest["remoteUrl"], w.origin.to_str().unwrap());
-    assert_eq!(manifest["unpushedCommits"], 1);
+    assert!(manifest["unpushedCommits"].as_u64().unwrap() >= 2);
+    let refs = manifest["refs"].to_string();
+    assert!(refs.contains("refs/heads/side") && refs.contains("refs/heads/feat/x"));
+    assert!(refs.contains("refs/stash"));
+    assert_eq!(manifest["patches"], PATCHES);
+    assert_eq!(manifest["baseOnOrigin"], true);
+    // Ignored files are not saved, but listed.
+    let ignored = manifest["ignoredNotSaved"].to_string();
+    assert!(
+        ignored.contains("junk.log") && !ignored.contains(".evidence"),
+        "{ignored}"
+    );
+    assert!(
+        done.warnings.iter().any(|w| w.contains("ignored")),
+        "{:?}",
+        done.warnings
+    );
+    assert!(code.join("patches").read_dir().unwrap().count() >= 1);
+    // Claude's raw transcript is always kept, with the codespace path untouched.
+    let raw = std::fs::read_to_string(code.join(RAW_JSONL)).unwrap();
+    assert!(raw.contains(&format!("\"cwd\":\"{}\"", w.ws.display())));
     assert_eq!(manifest["bundle"], BUNDLE);
     assert_eq!(manifest["patch"], PATCH);
     let patch = std::fs::read_to_string(code.join(PATCH)).unwrap();
@@ -548,10 +614,11 @@ fn a_missing_claude_file_resets_the_resume_id_and_warns() {
 
 #[test]
 fn a_workspace_without_unpushed_commits_or_changes_has_no_bundle_and_no_patch() {
-    let w = world(true);
+    let w = world_with(true, false, false);
     git(&w.ws, &["checkout", "-q", "main"]);
     git(&w.ws, &["checkout", "-q", "--", "."]);
     git(&w.ws, &["clean", "-fdq"]);
+    git(&w.ws, &["branch", "-D", "feat/x"]);
     let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
     let code = done.code_dir.unwrap();
     assert!(!code.join(BUNDLE).exists() && !code.join(PATCH).exists());
@@ -569,11 +636,31 @@ fn a_workspace_without_unpushed_commits_or_changes_has_no_bundle_and_no_patch() 
 }
 
 #[test]
-fn a_workspace_that_is_not_a_git_repository_keeps_only_the_conversation() {
+fn a_workspace_that_is_not_a_git_repository_fails_so_the_user_must_decide() {
     let w = world(true);
     std::fs::remove_dir_all(w.ws.join(".git")).unwrap();
+    let before = w.svc.store().unwrap().sessions().unwrap().len();
+    let error = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap_err();
+    assert!(error.contains("not a git repository"), "{error}");
+    let store = w.svc.store().unwrap();
+    assert_eq!(store.sessions().unwrap().len(), before);
+    assert!(store.remote_session(w.cloud_id).unwrap().is_some());
+}
+
+#[test]
+fn a_repository_without_commits_also_fails() {
+    let w = world(true);
+    std::fs::remove_dir_all(w.ws.join(".git")).unwrap();
+    git(&w.ws, &["init", "-q"]);
+    let error = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap_err();
+    assert!(error.contains("at least one commit"), "{error}");
+    // The script cleaned its stage up after itself.
+}
+
+#[test]
+fn the_session_worktree_is_what_gets_saved() {
+    let w = world_with(true, true, false);
     let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
-    assert!(done.code_dir.is_none());
     let thread = w
         .svc
         .store()
@@ -581,5 +668,243 @@ fn a_workspace_that_is_not_a_git_repository_keeps_only_the_conversation() {
         .thread_dir(done.local_id)
         .unwrap()
         .unwrap();
-    assert!(pending_restore(&thread).is_none());
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(thread.join(CODESPACE_DIR).join(MANIFEST)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["branch"], "wt-branch");
+    assert_eq!(
+        manifest["remoteCwd"],
+        w.root.join("cs-wt").to_str().unwrap()
+    );
+    let patch = std::fs::read_to_string(thread.join(CODESPACE_DIR).join(PATCH)).unwrap();
+    assert!(patch.contains("in-worktree.txt") && !patch.contains("untracked.txt"));
+}
+
+#[test]
+fn a_converted_host_session_is_never_imported_again_and_a_retry_skips_it() {
+    let w = world(true);
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let store = w.svc.store().unwrap();
+    assert!(store.is_cloud_converted("env-1", "host-1").unwrap());
+    // The poll of an open pane, or a later session listing, tries to register it again.
+    let project = store
+        .remember_remote_project("env-1", &json!({"id":"p","cwd": w.ws.to_str().unwrap()}))
+        .unwrap();
+    let snapshot = w.host.snapshot.clone();
+    let error = store
+        .register_remote_summary(&project, &snapshot)
+        .unwrap_err();
+    assert_eq!(error, crate::store::CONVERTED);
+    assert!(store.cloud_session_ids("cs-1").unwrap().is_empty());
+    drop(store);
+    assert!(!w.svc.is_cloud_session(w.cloud_id));
+    assert!(w.svc.sessions_in_codespace("cs-1").is_empty());
+    assert!(w.svc.convert_session(w.cloud_id, &mut |_| {}).is_err());
+    assert!(done.local_id != w.cloud_id);
+}
+
+#[test]
+fn every_session_of_a_codespace_is_listed_archived_or_not() {
+    let w = world(true);
+    let other = {
+        let store = w.svc.store().unwrap();
+        let project = store
+            .remember_remote_project("env-1", &json!({"id":"p","cwd": w.ws.to_str().unwrap()}))
+            .unwrap();
+        let mut value = w.host.snapshot.clone();
+        value["session"]["id"] = json!("host-2");
+        value["archived"] = json!(true);
+        store.register_remote_summary(&project, &value).unwrap().id
+    };
+    let mut ids = w.svc.sessions_in_codespace("cs-1");
+    ids.sort();
+    let mut want = vec![w.cloud_id, other];
+    want.sort();
+    assert_eq!(ids, want);
+    assert!(w.svc.sessions_in_codespace("elsewhere").is_empty());
+}
+
+#[test]
+fn a_failed_jsonl_install_still_keeps_the_raw_transcript_and_warns() {
+    let w = world(true);
+    // `projects` is a file, so the folder for the local project cannot be created.
+    std::fs::create_dir_all(&w.claude).unwrap();
+    std::fs::write(w.claude.join("projects"), "x").unwrap();
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    assert!(matches!(done.resume, Resume::Missing(_)));
+    assert!(done.warnings.iter().any(|m| m.contains("raw transcript")));
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    assert!(thread.join(CODESPACE_DIR).join(RAW_JSONL).is_file());
+}
+
+/// A commit pushed to origin after the local clone was made: the bundle needs it.
+fn push_a_commit_the_clone_lacks(w: &World) {
+    git(&w.ws, &["checkout", "-q", "main"]);
+    std::fs::write(w.ws.join("later.txt"), "later\n").unwrap();
+    git(&w.ws, &["add", "later.txt"]);
+    git(&w.ws, &["commit", "-q", "-m", "pushed later"]);
+    git(&w.ws, &["push", "-q", "origin", "main"]);
+    git(&w.ws, &["checkout", "-q", "-b", "feat/y"]);
+    std::fs::write(w.ws.join("y.txt"), "y\n").unwrap();
+    git(&w.ws, &["add", "y.txt"]);
+    git(&w.ws, &["commit", "-q", "-m", "on top of later"]);
+}
+
+#[test]
+fn commits_built_on_something_the_clone_lacks_are_restored_from_the_patch_series_or_origin() {
+    let w = world_with(true, false, false);
+    push_a_commit_the_clone_lacks(&w);
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    assert!(
+        done.warnings.iter().any(|m| m.contains("patch series")),
+        "{:?}",
+        done.warnings
+    );
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    let main_before = git(&w.project, &["rev-parse", "main"]);
+    let remote_ref = git(&w.project, &["rev-parse", "origin/main"]);
+    // The bundle is unusable at first; origin has the missing commit, so it works.
+    let restored = restore_code(&w.project, &thread).unwrap();
+    assert!(restored.worktree.join("y.txt").is_file());
+    assert!(restored.worktree.join("later.txt").is_file());
+    // Nothing the user owns moved: not main, not origin/main.
+    assert_eq!(git(&w.project, &["rev-parse", "main"]), main_before);
+    assert_eq!(git(&w.project, &["rev-parse", "origin/main"]), remote_ref);
+}
+
+#[test]
+fn without_the_bundle_the_series_is_replayed_onto_the_base() {
+    let w = world_with(true, false, false);
+    push_a_commit_the_clone_lacks(&w);
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(thread.join(CODESPACE_DIR).join(BUNDLE)).unwrap();
+    let restored = restore_code(&w.project, &thread).unwrap();
+    assert!(restored.conflicts.is_none(), "{:?}", restored.conflicts);
+    assert!(restored.worktree.join("y.txt").is_file());
+    assert_eq!(
+        git(&restored.worktree, &["log", "--format=%s", "-1"]),
+        "on top of later"
+    );
+    assert_eq!(git(&w.project, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_bundle_that_cannot_verify_and_has_no_fallback_stops_the_conversion() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = dir.path().join("other");
+    let local = dir.path().join("local");
+    for repo in [&other, &local] {
+        std::fs::create_dir_all(repo).unwrap();
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f"), repo.to_str().unwrap()).unwrap();
+        git(repo, &["add", "f"]);
+        git(repo, &["commit", "-q", "-m", "one"]);
+    }
+    std::fs::write(other.join("f"), "2").unwrap();
+    git(&other, &["commit", "-q", "-am", "two"]);
+    let code = dir.path().join("code");
+    std::fs::create_dir_all(&code).unwrap();
+    git(
+        &other,
+        &[
+            "bundle",
+            "create",
+            "-q",
+            code.join(BUNDLE).to_str().unwrap(),
+            "main",
+            "^main~1",
+        ],
+    );
+    let snap = Snapshot::default();
+    let error = check_restorable(&local, &code, &snap).unwrap_err();
+    assert!(error.contains("cannot be restored"), "{error}");
+    // With a patch series and a base the same bundle is accepted with a warning.
+    let snap = Snapshot {
+        patches: 1,
+        base: Some("a".repeat(40)),
+        ..Snapshot::default()
+    };
+    assert!(check_restorable(&local, &code, &snap).unwrap().is_some());
+}
+
+#[test]
+fn restore_keeps_other_branches_and_the_stash_out_of_the_users_namespace() {
+    let w = world(true);
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    let restored = restore_code(&w.project, &thread).unwrap();
+    let head = &restored.head[..8];
+    assert!(git(&w.project, &["branch", "--list", "side"]).is_empty());
+    assert!(!git(
+        &w.project,
+        &["rev-parse", &format!("refs/codespace/{head}/heads/side")]
+    )
+    .is_empty());
+    assert!(!git(
+        &w.project,
+        &["rev-parse", &format!("refs/codespace/{head}/stash")]
+    )
+    .is_empty());
+}
+
+#[test]
+fn stage_paths_outside_the_expected_prefix_are_refused() {
+    assert!(parse_snapshot(
+        "stage=/tmp/other
+"
+    )
+    .is_err());
+    assert!(parse_snapshot(
+        "stage=/home/x/monoptah-archive.A
+"
+    )
+    .is_err());
+    assert!(parse_snapshot(
+        "stage=/tmp/monoptah-archive.A
+"
+    )
+    .is_ok());
+}
+
+#[test]
+fn rewriting_respects_both_boundaries() {
+    let text = "/tmp/workspaces/app /workspaces/app.git /workspaces/app.bak /workspaces/app. \"/workspaces/app\" /workspaces/app/x";
+    let out = rewrite_cwd(text, &["/workspaces/app"], "/L");
+    assert_eq!(
+        out,
+        "/tmp/workspaces/app /workspaces/app.git /workspaces/app.bak /L. \"/L\" /L/x"
+    );
+    // The longer path wins over its parent.
+    let out = rewrite_cwd(
+        "/workspaces/app-wt/x /workspaces/app",
+        &["/workspaces/app", "/workspaces/app-wt"],
+        "/L",
+    );
+    assert_eq!(out, "/L/x /L");
 }

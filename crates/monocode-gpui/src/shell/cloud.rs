@@ -240,18 +240,41 @@ pub(super) fn archive_groups(
     choice: ArchiveChoice,
     save_copy: bool,
     convert: &ConvertFn,
+    cancel: &std::sync::atomic::AtomicBool,
     progress: &mut dyn FnMut(&str),
 ) -> Vec<GroupOutcome> {
-    let total: usize = groups.iter().map(|g| g.ids.len()).sum();
+    use std::sync::atomic::Ordering;
+    // Deleting the codespace takes every session in it with it, archived or not, so all of
+    // them are saved. Stopping only needs the selected ones.
+    let work: Vec<Vec<i64>> = groups
+        .iter()
+        .map(|group| {
+            let mut ids = group.ids.clone();
+            if save_copy && choice == ArchiveChoice::Delete {
+                for id in cloud.sessions_in_codespace(&group.codespace) {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+            ids
+        })
+        .collect();
+    let total: usize = work.iter().map(Vec::len).sum();
     let mut done = 0;
     groups
         .into_iter()
-        .map(|group| {
+        .zip(work)
+        .map(|(group, ids)| {
             let mut converted = Vec::new();
             let mut failure = None;
             if save_copy {
-                for id in &group.ids {
+                for id in &ids {
                     done += 1;
+                    if cancel.load(Ordering::Relaxed) {
+                        failure = Some(CANCELLED.to_string());
+                        break;
+                    }
                     if !cloud.is_cloud_session(*id) {
                         continue;
                     }
@@ -268,6 +291,9 @@ pub(super) fn archive_groups(
                         }
                     }
                 }
+            }
+            if failure.is_none() && cancel.load(Ordering::Relaxed) {
+                failure = Some(CANCELLED.to_string());
             }
             let result = match failure {
                 Some(error) => Err(error),
@@ -288,6 +314,9 @@ pub(super) fn archive_groups(
         .collect()
 }
 
+/// The error of a group the user cancelled before anything destructive happened.
+pub(super) const CANCELLED: &str = "Cancelled";
+
 /// What to tell the user after the code was restored.
 pub(super) fn restored_message(done: &Restored) -> String {
     let place = format!(
@@ -302,6 +331,20 @@ pub(super) fn restored_message(done: &Restored) -> String {
         ),
         None => place,
     }
+}
+
+/// How many sessions "Delete codespace" saves: every session in the codespace.
+pub(super) fn delete_note(groups: &[CodespaceGroup]) -> String {
+    let total: usize = groups.iter().map(|g| g.total.max(g.ids.len())).sum();
+    format!(
+        "Delete codespace saves a local copy of all {total} {} in the {}.",
+        if total == 1 { "session" } else { "sessions" },
+        if groups.len() == 1 {
+            "codespace"
+        } else {
+            "codespaces"
+        },
+    )
 }
 
 /// What the File and Git panels say while a cloud session is active.
@@ -330,6 +373,8 @@ pub(super) struct CodespaceGroup {
     pub codespace: String,
     pub ids: Vec<i64>,
     pub others: usize,
+    /// Every cloud session the window knows in this codespace, archived or not: what Delete saves.
+    pub total: usize,
 }
 
 /// Groups cloud sessions by codespace; `others_of` counts the other users.
@@ -347,6 +392,10 @@ pub(super) fn group_by_codespace(
                 codespace: mark.codespace.clone(),
                 ids: vec![*id],
                 others: 0,
+                total: marks
+                    .values()
+                    .filter(|m| m.codespace == mark.codespace)
+                    .count(),
             }),
         }
     }
@@ -363,6 +412,8 @@ pub(super) enum Phase {
     /// Saving a local copy; `progress` holds the latest line from the worker.
     Working {
         progress: Arc<std::sync::Mutex<String>>,
+        /// Set by Cancel: the worker stops before the next copy and before stop/delete.
+        cancel: Arc<std::sync::atomic::AtomicBool>,
     },
     /// The local copy (or the codespace call) failed; the user decides what next.
     Failed {
@@ -666,12 +717,10 @@ impl Shell {
     }
 
     pub(super) fn close_cloud_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Saving a local copy cannot be interrupted half way.
-        if self
-            .cloud_archive
-            .as_ref()
-            .is_some_and(|d| matches!(d.phase, Phase::Working { .. }))
-        {
+        // Saving a local copy cannot be interrupted half way: Cancel asks the worker to stop
+        // before its next step, and the dialog closes when it has.
+        if let Some(Phase::Working { cancel, .. }) = self.cloud_archive.as_ref().map(|d| &d.phase) {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         if self.cloud_archive.take().is_some() {
@@ -721,8 +770,10 @@ impl Shell {
             return;
         };
         let progress = Arc::new(std::sync::Mutex::new(String::from("Starting")));
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         dialog.phase = Phase::Working {
             progress: progress.clone(),
+            cancel: cancel.clone(),
         };
         let groups = dialog.groups.clone();
         let ids = dialog.ids();
@@ -732,11 +783,19 @@ impl Shell {
         let convert = self.cloud_convert.clone();
         let worker_progress = progress.clone();
         let work = cx.background_executor().spawn(async move {
-            archive_groups(&cloud, groups, choice, save_copy, &convert, &mut |line| {
-                if let Ok(mut current) = worker_progress.lock() {
-                    *current = line.to_string();
-                }
-            })
+            archive_groups(
+                &cloud,
+                groups,
+                choice,
+                save_copy,
+                &convert,
+                &cancel,
+                &mut |line| {
+                    if let Ok(mut current) = worker_progress.lock() {
+                        *current = line.to_string();
+                    }
+                },
+            )
         });
         // The worker cannot touch the window, so the dialog polls its progress line.
         cx.spawn(async move |this, cx| {
@@ -810,6 +869,7 @@ impl Shell {
                         }
                     }
                 }
+                Err(error) if error == CANCELLED => {}
                 Err(error) => failed.push((group, error)),
             }
         }
@@ -974,8 +1034,10 @@ impl Shell {
                         format!(
                             "{} A running codespace keeps costing money until it idles out. \
                              Stopping or deleting it first saves an archived local copy with the \
-                             conversation, evidence and code.",
-                            archive_summary(&dialog.title, &dialog.groups)
+                             conversation, evidence and code (branches, the stash and uncommitted \
+                             changes; ignored files are listed but not saved). {}",
+                            archive_summary(&dialog.title, &dialog.groups),
+                            delete_note(&dialog.groups),
                         ),
                         false,
                     ))
@@ -1023,7 +1085,7 @@ impl Shell {
                     ),
                     false,
                 )),
-                footer,
+                footer.child(cancel),
             ),
             Phase::Failed { choice, error } => {
                 let choice = *choice;

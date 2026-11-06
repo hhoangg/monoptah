@@ -173,6 +173,7 @@ fn fake_convert(store: Database, fail: Option<&'static str>) -> cloud::ConvertFn
             resume: Resume::Missing("test".into()),
             evidence: vec![],
             code_dir: None,
+            ignored: vec![],
             warnings: vec![],
         })
     })
@@ -915,6 +916,7 @@ fn archive_copy_uses_the_session_title_clipped_with_a_fallback() {
         codespace: name.into(),
         ids: vec![1],
         others: 0,
+        total: 1,
     };
     assert_eq!(
         cloud::archive_summary("Fix login", &[group("octo-abc")]),
@@ -957,4 +959,74 @@ fn the_restore_action_is_only_offered_for_converted_sessions(cx: &mut TestAppCon
             assert!(shell.cloud_busy.is_empty());
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn delete_saves_every_session_of_the_codespace_but_stop_only_the_selected_ones(
+    cx: &mut TestAppContext,
+) {
+    let (window, a, gh) = shell_with_cloud(cx);
+    let b = window
+        .update(cx, |shell, _, _| cloud_row(shell, "octo-abc"))
+        .unwrap();
+    // `b` is archived and not selected.
+    window
+        .update(cx, |shell, _, _| {
+            shell.session_summaries.get_mut(&b).unwrap().archived = true;
+        })
+        .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<i64>::new()));
+    let log = calls.clone();
+    window
+        .update(cx, |shell, window, cx| {
+            let inner = fake_convert(shell.store.clone(), None);
+            shell.cloud_convert = Arc::new(move |cloud, id, progress| {
+                log.lock().unwrap().push(id);
+                inner(cloud, id, progress)
+            });
+            shell.open_cloud_archive(vec![a], window, cx);
+            let dialog = shell.cloud_archive.as_ref().unwrap();
+            assert!(cloud::delete_note(&dialog.groups).contains("all 2 sessions"));
+            shell.confirm_cloud_archive(ArchiveChoice::Delete, window, cx);
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    let mut seen = calls.lock().unwrap().clone();
+    seen.sort();
+    let mut want = vec![a, b];
+    want.sort();
+    assert_eq!(seen, want);
+    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+    window
+        .update(visual, |shell, _, _| {
+            assert_eq!(archived_locals(shell).len(), 2)
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_cancelled_archive_stops_before_copying_or_touching_the_codespace() {
+    let gh = FakeGh::new(vec![]);
+    let svc = CloudSessions::new(gh.clone(), Arc::new(FakeHost::default()), memory_store());
+    let convert = fake_convert(memory_store(), Some("must not run"));
+    let cancel = AtomicBool::new(true);
+    let group = cloud::CodespaceGroup {
+        codespace: "octo-abc".into(),
+        ids: vec![1],
+        others: 0,
+        total: 1,
+    };
+    let out = cloud::archive_groups(
+        &svc,
+        vec![group],
+        ArchiveChoice::Delete,
+        true,
+        &convert,
+        &cancel,
+        &mut |_| {},
+    );
+    assert_eq!(out[0].result.as_ref().unwrap_err(), cloud::CANCELLED);
+    assert!(out[0].converted.is_empty());
+    assert!(gh.calls().is_empty());
 }

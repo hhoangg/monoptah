@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 
 const PROJECTS: &str = "remote-projects.v2";
 const SESSIONS: &str = "remote-sessions.v1";
+/// `register_remote_summary` refuses a host session that was saved as a local copy.
+pub const CONVERTED: &str = "This session was saved as a local copy.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -240,6 +242,40 @@ impl Store {
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
         )
     }
+    /// Ids of every cloud session bound to `codespace`, archived or not.
+    pub fn cloud_session_ids(&self, codespace: &str) -> Result<Vec<i64>, String> {
+        Ok(self
+            .remote_sessions()?
+            .into_iter()
+            .filter(|(_, s)| s.project.codespace.as_deref() == Some(codespace))
+            .map(|(id, _)| id)
+            .collect())
+    }
+    fn converted_key(environment: &str, host_session: &str) -> String {
+        format!("cloud-converted:{environment}:{host_session}")
+    }
+    /// Remembers (or forgets) that a host session was saved as a local copy, so a poll or a
+    /// refresh never imports it as a cloud session again.
+    pub fn set_cloud_converted(
+        &self,
+        environment: &str,
+        host_session: &str,
+        converted: bool,
+    ) -> Result<(), String> {
+        self.save_setting(
+            &Self::converted_key(environment, host_session),
+            if converted { "1" } else { "" },
+        )
+    }
+    pub fn is_cloud_converted(
+        &self,
+        environment: &str,
+        host_session: &str,
+    ) -> Result<bool, String> {
+        Ok(self
+            .setting(&Self::converted_key(environment, host_session))?
+            .is_some_and(|v| v == "1"))
+    }
     /// Drop one cloud session's local record (the host copy is not touched). Used after the
     /// session was converted to a local archived copy.
     pub fn forget_cloud_session(&self, id: i64) -> Result<(), String> {
@@ -448,6 +484,9 @@ impl Store {
         let host_id = host["id"]
             .as_str()
             .ok_or("Host session identity is missing")?;
+        if self.is_cloud_converted(&project.environment_id, host_id)? {
+            return Err(CONVERTED.into());
+        }
         let mut sessions = self.remote_sessions()?;
         let id = sessions
             .values()
