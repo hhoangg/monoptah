@@ -119,6 +119,11 @@ impl Monos {
             .into()
     }
     /// Bumped after each `today.*` action, so the page can reload live.
+    /// A hook that tells the Today page it may have changed; safe to call from any thread.
+    pub(crate) fn today_bumper(&self) -> impl Fn() + Send + Sync + 'static {
+        let bridge = self.today.clone();
+        move || bridge.bump()
+    }
     pub(crate) fn today_revision(&self) -> u64 {
         self.today.lock().revision
     }

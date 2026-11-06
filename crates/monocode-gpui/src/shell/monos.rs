@@ -24,6 +24,7 @@ impl Shell {
         self.draft_sessions.insert(id);
         self.session_worktrees
             .insert(id, settings.worktree_cwd.clone());
+        self.mark_cloud_session(id);
         self.add_loaded(summary, cx);
         self.sessions[&id].update(cx, |view, cx| view.install_app_launch(settings, !draft, cx));
         self.invalidate_chrome(cx);
@@ -134,6 +135,22 @@ impl Shell {
         self.started_by.insert(child, parent);
         self.invalidate_chrome(cx);
     }
+    /// Puts a session made in the store into the shell, as the sidebar does for a cloud session.
+    #[cfg(test)]
+    pub(crate) fn mono_add_session(
+        &mut self,
+        summary: monocode_core::store::Session,
+        cx: &mut Context<Self>,
+    ) {
+        self.add(summary, cx);
+    }
+    /// The project the sidebar lists a session under.
+    #[cfg(test)]
+    pub(crate) fn mono_listed_project(&self, id: i64) -> Option<String> {
+        self.session_summaries
+            .get(&id)
+            .map(|s| self.project_of(id, &s.cwd).to_owned())
+    }
     #[cfg(test)]
     pub(crate) fn mono_started_by(&self, id: i64) -> Option<i64> {
         self.started_by.get(&id).copied()
@@ -241,7 +258,7 @@ impl Shell {
         } else if self.session_summaries.contains_key(&id)
             && !self.session_metadata(id, cx).summary.archived
         {
-            self.toggle_archive(id, cx);
+            self.toggle_archive_now(id, cx);
         }
     }
 }

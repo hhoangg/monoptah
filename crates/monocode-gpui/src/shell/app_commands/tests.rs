@@ -828,6 +828,489 @@ fn a_session_an_agent_starts_is_a_chat_whatever_the_preference(cx: &mut TestAppC
         .unwrap();
 }
 
+mod cloud {
+    use super::*;
+    use crate::cloud_wake::fakes::{
+        AUTH_NO_SCOPE, AUTH_OK, Dir, FakeHost, Gh, github_project, install,
+    };
+    use monocode_core::cloud_sessions::{CodespaceChoice, Target};
+    use std::sync::Arc;
+
+    /// Operator whose project is a real git repo with a GitHub origin, with fake gh and host
+    /// (`state` is what gh reports for the codespace).
+    fn setup_cloud_in(
+        cx: &mut TestAppContext,
+        auth: &'static str,
+        state: &'static str,
+    ) -> (
+        WindowHandle<Shell>,
+        i64,
+        String,
+        Arc<FakeHost>,
+        Arc<Gh>,
+        Dir,
+    ) {
+        let (window, _, caller) = setup(cx);
+        let dir = github_project();
+        let path = dir.0.to_str().unwrap().to_owned();
+        let store = window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&caller].update(cx, |v, _| v.summary.cwd = path.clone());
+                shell.session_summaries.get_mut(&caller).unwrap().cwd = path.clone();
+                shell.store.clone()
+            })
+            .unwrap();
+        let (gh, host) = install(store, auth, state);
+        (window, caller, path, host, gh, dir)
+    }
+    fn setup_cloud(
+        cx: &mut TestAppContext,
+        auth: &'static str,
+    ) -> (
+        WindowHandle<Shell>,
+        i64,
+        String,
+        Arc<FakeHost>,
+        Arc<Gh>,
+        Dir,
+    ) {
+        setup_cloud_in(cx, auth, "Shutdown")
+    }
+    /// A cloud session of `path` on the fake codespace, added to the shell.
+    fn add_cloud_session(window: WindowHandle<Shell>, path: &str, cx: &mut TestAppContext) -> i64 {
+        window
+            .update(cx, |shell, _, cx| {
+                let api = CloudApi::shared(&shell.store).unwrap();
+                let binding = api
+                    .prepare(
+                        path,
+                        Target {
+                            codespace: CodespaceChoice::Named("octo-run".into()),
+                            branch: None,
+                            machine: None,
+                        },
+                        &mut |_| {},
+                    )
+                    .unwrap();
+                let summary = api.create_session(&binding, "claude").unwrap();
+                let id = summary.id;
+                shell.add(summary, cx);
+                id
+            })
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn pull_evidence_reaches_the_core_only_for_cloud_sessions_of_the_project(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, caller, path, host, gh, _dir) = setup_cloud(cx, AUTH_OK);
+        let cloud = add_cloud_session(window, &path, cx);
+        let other = window
+            .update(cx, |shell, _, cx| {
+                let summary = shell.store.lock().unwrap().create("claude", &path).unwrap();
+                let id = summary.id;
+                shell.add(summary, cx);
+                id
+            })
+            .unwrap();
+        host.0.lock().unwrap().clear();
+        let calls = gh.calls.lock().unwrap().len();
+        // A local session has no codespace to pull from.
+        let local = call(
+            window,
+            caller,
+            "p1",
+            "sessions.pullEvidence",
+            json!({"sessionId":other}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(local.contains("not a cloud session"), "{local}");
+        // Bad input is refused before anything runs.
+        let bad = call(
+            window,
+            caller,
+            "p2",
+            "sessions.pullEvidence",
+            json!({"sessionId":cloud,"path":"../x"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(bad.contains(".."), "{bad}");
+        // The in-memory test store keeps no session folders: the call got as far as the core.
+        let reached = call(
+            window,
+            caller,
+            "p3",
+            "sessions.pullEvidence",
+            json!({"sessionId":cloud}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(reached.contains("no session folders"), "{reached}");
+        assert_eq!(gh.calls.lock().unwrap().len(), calls, "no gh call was made");
+        assert!(host.0.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn cloud_sessions_list_and_read_with_a_target_and_never_wake_the_codespace(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, caller, path, host, _, _dir) = setup_cloud(cx, AUTH_OK);
+        let cloud = add_cloud_session(window, &path, cx);
+        host.0.lock().unwrap().clear();
+        let list = call(window, caller, "l1", "sessions.list", json!({}), cx).unwrap();
+        let rows = list["sessions"].as_array().unwrap();
+        let find = |id: i64| rows.iter().find(|s| s["id"] == id).unwrap().clone();
+        assert_eq!(find(caller)["target"], json!({"kind":"local"}));
+        assert!(find(caller).get("codespaceState").is_none());
+        assert_eq!(
+            find(cloud)["target"],
+            json!({"kind":"codespace","codespace":"octo-run","state":"stopped"})
+        );
+        assert_eq!(find(cloud)["codespaceState"], "stopped");
+        let read = call(
+            window,
+            caller,
+            "r1",
+            "sessions.read",
+            json!({"sessionId":cloud}),
+            cx,
+        )
+        .unwrap();
+        assert_eq!(read["target"]["codespace"], "octo-run");
+        assert_eq!(read["codespaceState"], "stopped");
+        let local = call(
+            window,
+            caller,
+            "r2",
+            "sessions.read",
+            json!({"sessionId":caller}),
+            cx,
+        )
+        .unwrap();
+        assert_eq!(local["target"], json!({"kind":"local"}));
+        assert!(
+            host.0.lock().unwrap().is_empty(),
+            "listing and reading must not wake or contact the codespace"
+        );
+    }
+
+    /// A cloud session the Operator starts is listed under the local project at once and does not
+    /// add its codespace's remote key as a project of its own.
+    #[gpui::test]
+    fn a_started_cloud_session_is_listed_under_the_local_project_at_once(cx: &mut TestAppContext) {
+        let (window, caller, path, _, _, _dir) = setup_cloud_in(cx, AUTH_OK, "Available");
+        let started = call(
+            window,
+            caller,
+            "cs1",
+            "sessions.start",
+            json!({"prompt":"go","target":{"codespace":"octo-run"}}),
+            cx,
+        )
+        .unwrap();
+        let id = started["sessionId"].as_i64().unwrap();
+        assert!(id < 0);
+        window
+            .update(cx, |shell, _, _| {
+                let cwd = shell.session_summaries[&id].cwd.clone();
+                assert!(cwd.starts_with("remote://"), "{cwd}");
+                assert_eq!(shell.project_of(id, &cwd), path);
+                assert!(
+                    !shell
+                        .workspace
+                        .projects
+                        .iter()
+                        .any(|p| p.starts_with("remote://")),
+                    "{:?}",
+                    shell.workspace.projects
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn cloud_sessions_accept_the_session_actions_of_their_local_project(cx: &mut TestAppContext) {
+        let (window, caller, path, host, _, _dir) = setup_cloud(cx, AUTH_OK);
+        let cloud = add_cloud_session(window, &path, cx);
+        // A draft never wakes a codespace.
+        host.0.lock().unwrap().clear();
+        let error = call(
+            window,
+            caller,
+            "d1",
+            "sessions.draft",
+            json!({"sessionId":cloud,"prompt":"look at the failing test"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(error.contains("busy, loading"), "{error}");
+        assert!(host.0.lock().unwrap().is_empty());
+        // A send to a session on a stopped codespace wakes it, then asks for a retry.
+        let error = call(
+            window,
+            caller,
+            "d2",
+            "sessions.send",
+            json!({"sessionId":cloud,"prompt":"look at the failing test"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(error.contains("being woken"), "{error}");
+        assert!(
+            host.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "ensure m-octo-run")
+        );
+        assert_eq!(
+            call(
+                window,
+                caller,
+                "s1",
+                "sessions.stop",
+                json!({"sessionId":cloud}),
+                cx
+            )
+            .unwrap(),
+            json!({"sessionId":cloud,"stopped":true})
+        );
+        // A session of another project stays out of reach.
+        let other = window
+            .update(cx, |s, _, _| {
+                *s.session_summaries
+                    .keys()
+                    .find(|id| **id != caller && **id != cloud)
+                    .unwrap()
+            })
+            .unwrap();
+        assert_eq!(
+            call(
+                window,
+                caller,
+                "s2",
+                "sessions.stop",
+                json!({"sessionId":other}),
+                cx
+            )
+            .unwrap_err(),
+            "Session is outside this project."
+        );
+    }
+
+    /// gh says Available but the host has no live tunnel (the history never loads): a send
+    /// still reconnects it. Only an Unavailable codespace is left alone.
+    #[gpui::test]
+    fn a_send_reconnects_an_available_codespace_and_skips_an_unavailable_one(
+        cx: &mut TestAppContext,
+    ) {
+        for (state, woken) in [("Available", true), ("Failed", false)] {
+            let (window, caller, path, host, _, _dir) = setup_cloud_in(cx, AUTH_OK, state);
+            let cloud = add_cloud_session(window, &path, cx);
+            host.0.lock().unwrap().clear();
+            let error = call(
+                window,
+                caller,
+                "a1",
+                "sessions.send",
+                json!({"sessionId":cloud,"prompt":"hello"}),
+                cx,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.contains("woken or reconnected"),
+                woken,
+                "{state}: {error}"
+            );
+            assert_eq!(
+                host.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l == "ensure m-octo-run"),
+                woken,
+                "{state}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn codespace_actions_list_stop_and_report_secrets(cx: &mut TestAppContext) {
+        let (window, caller, _, _, gh, _dir) = setup_cloud(cx, AUTH_OK);
+        let list = call(window, caller, "c1", "codespaces.list", json!({}), cx).unwrap();
+        assert_eq!(list["repo"], "octo/widgets");
+        assert_eq!(list["codespaces"][0]["name"], "octo-run");
+        assert_eq!(list["codespaces"][0]["state"], "stopped");
+        let secrets = call(
+            window,
+            caller,
+            "c2",
+            "codespaces.secretsStatus",
+            json!({}),
+            cx,
+        )
+        .unwrap();
+        assert_eq!(secrets["secrets"][0]["key"], "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(secrets["secrets"][0]["status"], "missing");
+        assert_eq!(
+            call(
+                window,
+                caller,
+                "c3",
+                "codespaces.stop",
+                json!({"name":"octo-run"}),
+                cx
+            )
+            .unwrap(),
+            json!({"codespace":"octo-run","stopped":true})
+        );
+        assert!(
+            gh.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("codespace stop -c octo-run")),
+            "{:?}",
+            gh.calls.lock().unwrap()
+        );
+        // A codespace of another repository is refused before gh is asked to stop it.
+        let error = call(
+            window,
+            caller,
+            "c4",
+            "codespaces.stop",
+            json!({"name":"elsewhere-1"}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(error.contains("not a codespace of octo/widgets"), "{error}");
+        assert!(
+            !gh.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("elsewhere-1") && c.contains("codespace stop"))
+        );
+    }
+
+    #[gpui::test]
+    fn an_operator_cannot_delete_codespaces_and_read_only_threads_only_read(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, caller, _, _, gh, _dir) = setup_cloud(cx, AUTH_OK);
+        assert_eq!(
+            call(
+                window,
+                caller,
+                "x1",
+                "codespaces.delete",
+                json!({"name":"octo-run"}),
+                cx
+            )
+            .unwrap_err(),
+            "Deleting a codespace is only available to a Mono"
+        );
+        assert!(
+            !gh.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("codespace delete"))
+        );
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&caller].update(cx, |v, _| {
+                    v.settings.access = monocode_core::agent::AccessMode::ReadOnly
+                })
+            })
+            .unwrap();
+        assert!(call(window, caller, "x2", "codespaces.list", json!({}), cx).is_ok());
+        assert!(
+            call(
+                window,
+                caller,
+                "x3",
+                "codespaces.secretsStatus",
+                json!({}),
+                cx
+            )
+            .is_ok()
+        );
+        for (request, action, input) in [
+            ("x4", "codespaces.stop", json!({"name":"octo-run"})),
+            ("x5", "codespaces.create", json!({})),
+            (
+                "x6",
+                "sessions.start",
+                json!({"prompt":"x","target":{"codespace":"new"}}),
+            ),
+        ] {
+            let error = call(window, caller, request, action, input, cx).unwrap_err();
+            assert!(error.contains("read-only"), "{action}: {error}");
+        }
+    }
+
+    #[gpui::test]
+    fn starting_a_cloud_session_fails_cleanly_without_the_scope_or_a_github_origin(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, caller, path, _, gh, _dir) = setup_cloud(cx, AUTH_NO_SCOPE);
+        let before = window
+            .update(cx, |s, _, _| s.session_summaries.len())
+            .unwrap();
+        let error = call(
+            window,
+            caller,
+            "t1",
+            "sessions.start",
+            json!({"prompt":"x","target":{"codespace":"new","branch":"main"}}),
+            cx,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("gh auth refresh -h github.com -s codespace"),
+            "{error}"
+        );
+        assert!(
+            !gh.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("codespace create"))
+        );
+        // Validation runs first: nothing reaches gh for a refused combination.
+        let calls = gh.calls.lock().unwrap().len();
+        for (request, input) in [
+            (
+                "t2",
+                json!({"prompt":"x","harness":"codex","target":{"codespace":"new"}}),
+            ),
+            (
+                "t3",
+                json!({"prompt":"x","target":{"codespace":"new"},"workspaceMode":"worktree"}),
+            ),
+            (
+                "t4",
+                json!({"prompt":"x","target":{"codespace":"has space"}}),
+            ),
+        ] {
+            assert!(call(window, caller, request, "sessions.start", input, cx).is_err());
+        }
+        assert_eq!(gh.calls.lock().unwrap().len(), calls);
+        // No session row was created by any failed start.
+        assert_eq!(
+            window
+                .update(cx, |s, _, _| s.session_summaries.len())
+                .unwrap(),
+            before
+        );
+        let _ = path;
+    }
+}
+
 fn plain_session(cx: &mut TestAppContext) -> (WindowHandle<Shell>, i64) {
     let (window, _, caller) = crate::shell::tests::window(cx);
     (window, caller)

@@ -987,6 +987,19 @@ impl Shell {
                         })),
                 ))
             })
+            .when_some(self.notice.clone(), |stack, message| {
+                stack.child(errors::severity_card(
+                    "app-notice",
+                    errors::Severity::Warning,
+                    message,
+                    icon_button("dismiss-notice", "Dismiss notice", "close")
+                        .debug_selector(|| "dismiss-notice".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.notice = None;
+                            cx.notify();
+                        })),
+                ))
+            })
             .when_some(mono_error, |stack, (monos, message)| {
                 stack.child(errors::card(
                     "mono-error",
@@ -1335,7 +1348,7 @@ impl Shell {
                 .detach();
             }
             LinkedActivityEvent::Archive(id) => {
-                self.toggle_archive(id, cx);
+                self.toggle_archive_now(id, cx);
                 if self.archiving.contains(&id) {
                     self.notification_state
                         .linked_cleanup

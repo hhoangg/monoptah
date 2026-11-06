@@ -797,6 +797,82 @@ fn host_context_and_latest_turn_metrics_use_actual_session_fields() {
     assert!(metrics.is_none());
 }
 
+fn cloud_binding(store: &Database, provider: &str) -> RemoteSession {
+    let store = locked(store).unwrap();
+    let project = store
+        .remember_cloud_project(
+            "env",
+            &json!({"id":"project","cwd":"/workspaces/repo"}),
+            "/Users/me/repo",
+            "octo-abc",
+        )
+        .unwrap();
+    let summary = store.create(provider, &project.key).unwrap();
+    store.remote_session(summary.id).unwrap().unwrap()
+}
+
+#[test]
+fn cloud_sessions_reject_other_harnesses_before_any_transport() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let binding = cloud_binding(&store, "codex");
+    let host = Host::new(|_| panic!("nothing may be dispatched"));
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client(
+        host.client.clone(),
+        binding.summary.clone(),
+        "hello".into(),
+        Settings::default(),
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    let result = receive(&rx);
+    assert!(result.finished);
+    assert!(result.status.contains("Claude only"), "{}", result.status);
+    assert!(
+        locked(&store)
+            .unwrap()
+            .remote_session(binding.summary.id)
+            .unwrap()
+            .unwrap()
+            .outbox
+            .is_empty()
+    );
+}
+
+#[test]
+fn cloud_send_on_a_connected_codespace_does_not_flash_waking() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let binding = cloud_binding(&store, "claude");
+    let host = Host::new(|_| Some(json!({"error":"stop here"})));
+    let (tx, rx) = async_channel::unbounded();
+    let (_controls_tx, controls) = std::sync::mpsc::channel();
+    run_with_client(
+        host.client.clone(),
+        binding.summary.clone(),
+        "hello".into(),
+        Settings {
+            model: Some("claude:sonnet".into()),
+            ..Default::default()
+        },
+        controls,
+        store.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tx,
+    );
+    loop {
+        let update = receive(&rx);
+        assert_ne!(update.status, "Waking codespace…");
+        if update.finished {
+            break;
+        }
+    }
+}
+
 #[test]
 fn observer_reports_a_host_title_change_once_and_never_writes_it_back() {
     let dir = Directory::new();
