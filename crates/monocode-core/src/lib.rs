@@ -32,6 +32,7 @@ pub mod scm;
 pub mod session_filters;
 pub mod session_groups;
 pub mod session_title;
+pub mod session_worktree;
 pub mod store;
 pub mod surface;
 pub mod telegram;

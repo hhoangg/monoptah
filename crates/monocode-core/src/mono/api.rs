@@ -1,24 +1,36 @@
 use serde_json::Value;
 /// Reject misspelled fields and ambiguous types before any app mutation.
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
-    let fields=match action{
-        "models.list"|"soul.read"|"habits.list"=>"",
-        "sessions.list"|"folders.list"|"worktrees.list"=>"project",
-        "sessions.read"=>"sessionId project before limit maxChars",
-        "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId",
-        "sessions.send"=>"sessionId prompt project notifyOnComplete completionDelivery",
-        "sessions.draft"=>"sessionId prompt project",
-        "sessions.stop"|"sessions.archive"=>"sessionId project",
-        "sessions.delete"=>"sessionId project providerFiles",
-        "worktrees.create"=>"branch base existing project",
-        "folders.move"=>"sessionId folderId newFolderName project",
-        "notes.list"=>"limit offset","notes.read"=>"id","notes.write"=>"id title body tags",
-        "artifacts.list"=>"kind limit offset","artifacts.read"=>"id","artifacts.write"=>"id kind title body summary",
-        "soul.update"=>"text expectedHash","memory.read"=>"topic","memory.search"=>"query since",
-        "memory.add"=>"fact topic until","memory.replace"=>"find fact topic until","memory.remove"=>"find topic",
-        "habits.add"=>"name instructions schedule","habits.update"=>"id name instructions schedule enabled","habits.run"|"habits.remove"=>"id",
-        "chat.card"=>"type repo number note sessionId options name instructions schedule",
-        _=>crate::today::actions::fields(action)
+    let fields = match action {
+        "models.list" | "soul.read" | "habits.list" => "",
+        "sessions.list" | "folders.list" | "worktrees.list" => "project",
+        "sessions.read" => "sessionId project before limit maxChars",
+        "sessions.start" => {
+            "prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId"
+        }
+        "sessions.send" => "sessionId prompt project notifyOnComplete completionDelivery",
+        "sessions.draft" => "sessionId prompt project",
+        "sessions.stop" | "sessions.archive" => "sessionId project",
+        "sessions.delete" => "sessionId project providerFiles removeWorktree",
+        "worktrees.create" => "branch base existing project",
+        "folders.move" => "sessionId folderId newFolderName project",
+        "notes.list" => "limit offset",
+        "notes.read" => "id",
+        "notes.write" => "id title body tags",
+        "artifacts.list" => "kind limit offset",
+        "artifacts.read" => "id",
+        "artifacts.write" => "id kind title body summary",
+        "soul.update" => "text expectedHash",
+        "memory.read" => "topic",
+        "memory.search" => "query since",
+        "memory.add" => "fact topic until",
+        "memory.replace" => "find fact topic until",
+        "memory.remove" => "find topic",
+        "habits.add" => "name instructions schedule",
+        "habits.update" => "id name instructions schedule enabled",
+        "habits.run" | "habits.remove" => "id",
+        "chat.card" => "type repo number note sessionId options name instructions schedule",
+        _ => crate::today::actions::fields(action)
             .or_else(|| super::workflows::cli::fields(action))
             .ok_or("Unknown app action. Run app help")?,
     };
@@ -64,6 +76,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "existing",
             "enabled",
             "providerFiles",
+            "removeWorktree",
         ]
         .contains(&key.as_str())
             && !value.is_boolean()
@@ -91,6 +104,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "existing",
             "enabled",
             "providerFiles",
+            "removeWorktree",
             "before",
             "limit",
             "offset",
@@ -120,6 +134,11 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             .is_none_or(|values| values.values().any(|v| !v.is_string()))
     }) {
         return Err("modelSettings must be an object of strings".into());
+    }
+    if input["removeWorktree"] == true && input["providerFiles"] == true {
+        return Err(
+            "removeWorktree and providerFiles cannot be combined; choose one per call".into(),
+        );
     }
     if input["draft"] == true && input["notifyOnComplete"] == true {
         return Err("An unsent draft cannot send a completion notification".into());
@@ -197,6 +216,27 @@ mod tests {
             );
         }
         assert!(delete(json!({"sessionId":1,"force":true})).is_err());
+    }
+    #[test]
+    fn remove_worktree_is_a_boolean_on_delete_only() {
+        let delete = |input| validate("sessions.delete", &input);
+        assert!(delete(json!({"sessionId":1,"removeWorktree":true})).is_ok());
+        assert!(delete(json!({"sessionId":1,"removeWorktree":false})).is_ok());
+        for bad in [json!("true"), json!(1), json!(null)] {
+            assert_eq!(
+                delete(json!({"sessionId":1,"removeWorktree":bad})).unwrap_err(),
+                "removeWorktree must be true or false"
+            );
+        }
+        assert_eq!(
+            validate(
+                "sessions.archive",
+                &json!({"sessionId":1,"removeWorktree":true})
+            )
+            .unwrap_err(),
+            "sessions.archive does not take removeWorktree"
+        );
+        assert!(delete(json!({"sessionId":1,"removeWorktree":true,"providerFiles":true})).is_err());
     }
     #[test]
     fn today_actions_take_their_own_fields_and_non_text_values() {

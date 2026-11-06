@@ -1,7 +1,95 @@
 use super::{Session, Store};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+
+/// When a session was last archived and unarchived, in Unix milliseconds. Kept
+/// as a small setting per session, so a database written before it existed
+/// simply has none: both fields default to unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ArchiveTimes {
+    pub archived_at: Option<u64>,
+    pub unarchived_at: Option<u64>,
+}
+
+impl ArchiveTimes {
+    /// `archivedAt` of the app API: null unless archived. A session archived
+    /// before times were recorded has none, so its last update stands in (the
+    /// archive can only be later); null when even that is unknown.
+    pub fn archived_at(&self, session: &Session) -> Option<u64> {
+        session.archived.then(|| {
+            self.archived_at
+                .or_else(|| (session.updated_at > 0).then_some(session.updated_at))
+        })?
+    }
+    /// `lastActivityAt` of the app API: the newest of the last message and the
+    /// last unarchive; null when neither is known.
+    pub fn last_activity_at(&self, session: &Session) -> Option<u64> {
+        let at = session.updated_at.max(self.unarchived_at.unwrap_or(0));
+        (at > 0).then_some(at)
+    }
+}
 
 impl Store {
+    fn archive_times_key(id: i64) -> String {
+        format!("archive-times:{id}")
+    }
+    pub fn archive_times(&self, id: i64) -> ArchiveTimes {
+        self.setting(&Self::archive_times_key(id))
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+    pub(super) fn record_archive_time(&self, id: i64, archived: bool) -> Result<(), String> {
+        let mut times = self.archive_times(id);
+        let now = crate::response::now_ms();
+        if archived {
+            times.archived_at = Some(now);
+        } else {
+            times.archived_at = None;
+            times.unarchived_at = Some(now);
+        }
+        self.save_setting(
+            &Self::archive_times_key(id),
+            &serde_json::to_string(&times).map_err(|e| e.to_string())?,
+        )
+    }
+    /// The fields `sessions.list` and `sessions.read` add per session. Git is
+    /// only asked (`git`) for a single session, never for a whole list.
+    pub fn app_session_facts(
+        &self,
+        sessions: &[&Session],
+        git: bool,
+    ) -> Result<HashMap<i64, Value>, String> {
+        let dirs: HashMap<i64, String> = self.working_dirs()?.into_iter().collect();
+        Ok(sessions
+            .iter()
+            .map(|session| {
+                let times = self.archive_times(session.id);
+                let path = dirs
+                    .get(&session.id)
+                    .and_then(|dir| crate::session_worktree::recorded_worktree(&session.cwd, dir));
+                let (dirty, unpushed) = match (&path, git) {
+                    (Some(path), true) => {
+                        crate::session_worktree::inspect(std::path::Path::new(path))
+                    }
+                    _ => (None, None),
+                };
+                (
+                    session.id,
+                    json!({
+                        "archivedAt": times.archived_at(session),
+                        "lastActivityAt": times.last_activity_at(session),
+                        "worktreePath": path,
+                        "worktreeDirty": dirty,
+                        "worktreeUnpushed": unpushed,
+                    }),
+                )
+            })
+            .collect())
+    }
+
     /// A launch is recoverable as an unsent draft if the app exits before its
     /// provider accepts it. Queue delivery uses this same stable message ID.
     pub fn prepare_app_prompt(&self, id: i64, request: &str, prompt: &str) -> Result<(), String> {
@@ -105,6 +193,13 @@ impl Store {
         page["hasDraft"] = json!(has_draft || blocks.iter().any(|b| b["draft"] == true));
         if let Some(session) = self.sessions()?.into_iter().find(|s| s.id == id) {
             page["title"] = json!(session.title);
+            if let Some(Value::Object(facts)) =
+                self.app_session_facts(&[&session], true)?.remove(&id)
+            {
+                for (key, value) in facts {
+                    page[key] = value;
+                }
+            }
         }
         Ok(page)
     }
