@@ -189,6 +189,7 @@ impl AssetSource for Assets {
 fn icon_body(path: &str) -> Option<&'static str> {
     Some(match path {
         "circle-alert" => "<circle cx='12' cy='12' r='9'/><path d='M12 7v6m0 4h.01'/>",
+        "triangle-alert" => "<path d='M12 4 3 20h18Z'/><path d='M12 10v4m0 3h.01'/>",
         "refresh" => {
             "<path d='M20 7v5h-5M4 17v-5h5'/><path d='M6 6a8 8 0 0 1 13 2l1 4M4 12l1 4a8 8 0 0 0 13 2'/>"
         }

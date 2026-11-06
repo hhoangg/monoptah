@@ -22,7 +22,12 @@ pub(crate) fn severity_card(
 ) -> Stateful<Div> {
     let (rose, title, glyph, role): (Hsla, _, _, _) = match severity {
         Severity::Error => (rgb(0xf43f5e).into(), "Error", "circle-alert", Role::Alert),
-        Severity::Warning => (rgb(0xf59e0b).into(), "Notice", "circle-alert", Role::Status),
+        Severity::Warning => (
+            rgb(0xf59e0b).into(),
+            "Warning",
+            "triangle-alert",
+            Role::Status,
+        ),
     };
     let mut border = rose;
     border.a = 0.3;

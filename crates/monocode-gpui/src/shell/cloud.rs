@@ -227,6 +227,42 @@ pub(super) struct GroupOutcome {
     pub converted: Vec<Converted>,
     /// The codespace call, or why nothing was done to it.
     pub result: Result<(Then, Option<String>), String>,
+    /// With `result` set to `NEEDS_REVIEW`: what a delete would lose, one line each.
+    pub risky: Vec<String>,
+}
+
+/// The error of a group that was paused before deleting its codespace: the local copy has files
+/// missing that only exist there, so the user decides first.
+pub(super) const NEEDS_REVIEW: &str = "Needs review";
+
+/// What deleting the codespace would lose after the copies in `converted` were saved: ignored
+/// files that cannot be rebuilt (first three named) and evidence that was only partly copied.
+pub(super) fn unsaved_lines(converted: &[Converted]) -> Vec<String> {
+    const NAMED: usize = 3;
+    let mut lines = Vec::new();
+    let names: Vec<&str> = converted.iter().flat_map(|c| c.unsaved_names()).collect();
+    if !names.is_empty() {
+        let list = names[..names.len().min(NAMED)].join(", ");
+        let more = match names.len().saturating_sub(NAMED) {
+            0 => String::new(),
+            n => format!(" and {n} more"),
+        };
+        let cut = if converted.iter().any(|c| c.ignored_truncated) {
+            " The codespace has even more."
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "Ignored files are not part of the local copy: {list}{more}.{cut}"
+        ));
+    }
+    for c in converted.iter().filter(|c| c.evidence_partial) {
+        lines.push(format!(
+            "Some evidence files of {} could not be copied.",
+            quoted_title(&c.title)
+        ));
+    }
+    lines
 }
 
 /// The worker side of Stop/Delete: for each codespace, save a local copy of every selected
@@ -295,6 +331,13 @@ pub(super) fn archive_groups(
             if failure.is_none() && cancel.load(Ordering::Relaxed) {
                 failure = Some(CANCELLED.to_string());
             }
+            let mut risky = Vec::new();
+            if failure.is_none() && save_copy && choice == ArchiveChoice::Delete {
+                risky = unsaved_lines(&converted);
+                if !risky.is_empty() {
+                    failure = Some(NEEDS_REVIEW.to_string());
+                }
+            }
             let result = match failure {
                 Some(error) => Err(error),
                 None => {
@@ -309,6 +352,7 @@ pub(super) fn archive_groups(
                 group,
                 converted,
                 result,
+                risky,
             }
         })
         .collect()
@@ -419,6 +463,10 @@ pub(super) enum Phase {
     Failed {
         choice: ArchiveChoice,
         error: String,
+    },
+    /// The local copies are saved, but deleting the codespace would lose what `items` says.
+    Review {
+        items: Vec<String>,
     },
 }
 
@@ -872,11 +920,13 @@ impl Shell {
         let mut notes = Vec::new();
         let mut warnings = Vec::new();
         let mut failed: Vec<(CodespaceGroup, String)> = Vec::new();
+        let mut review: Vec<(CodespaceGroup, Vec<String>)> = Vec::new();
         for outcome in outcomes {
             let GroupOutcome {
                 mut group,
                 converted,
                 result,
+                risky,
             } = outcome;
             for saved in converted {
                 warnings.extend(saved.warnings.iter().cloned());
@@ -900,21 +950,34 @@ impl Shell {
                     }
                 }
                 Err(error) if error == CANCELLED => {}
+                Err(error) if error == NEEDS_REVIEW => review.push((group, risky)),
                 Err(error) => failed.push((group, error)),
             }
         }
-        if failed.is_empty() {
+        if failed.is_empty() && review.is_empty() {
             if self.cloud_archive.take().is_some() {
                 self.focus_active(window, cx);
             }
         } else if let Some(dialog) = self.cloud_archive.as_mut() {
-            let error = failed
-                .iter()
-                .map(|(_, error)| error.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            dialog.groups = failed.into_iter().map(|(group, _)| group).collect();
-            dialog.phase = Phase::Failed { choice, error };
+            if failed.is_empty() {
+                let items = review.iter().flat_map(|(_, items)| items.clone()).collect();
+                dialog.groups = review.into_iter().map(|(group, _)| group).collect();
+                dialog.phase = Phase::Review { items };
+            } else {
+                let error = failed
+                    .iter()
+                    .map(|(_, error)| error.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                // Paused groups ride along: a retry copies nothing for them (their sessions
+                // are saved) and asks again before deleting.
+                dialog.groups = failed
+                    .into_iter()
+                    .map(|(group, _)| group)
+                    .chain(review.into_iter().map(|(group, _)| group))
+                    .collect();
+                dialog.phase = Phase::Failed { choice, error };
+            }
             window.focus(&dialog.focus, cx);
         }
         if !notes.is_empty() {
@@ -1119,6 +1182,39 @@ impl Shell {
                     false,
                 )),
                 footer.child(cancel),
+            ),
+            Phase::Review { items } => (
+                "Some files are not saved",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(text("cloud-archive-risk", items.join(" "), false))
+                    .child(text(
+                        "cloud-archive-risk-note",
+                        "The local copy is saved without them. Deleting the codespace removes \
+                         them for good; stopping it keeps them."
+                            .into(),
+                        true,
+                    )),
+                footer
+                    .child(cancel)
+                    .child(
+                        crate::modal::danger_button("cloud-archive-delete-anyway", "Delete anyway")
+                            .debug_selector(|| "cloud-archive-delete-anyway".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.run_cloud_archive(ArchiveChoice::Delete, false, window, cx)
+                            })),
+                    )
+                    .child(
+                        crate::modal::primary_button("cloud-archive-stop-instead", "Stop instead")
+                            .debug_selector(|| "cloud-archive-stop-instead".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.run_cloud_archive(ArchiveChoice::Stop, false, window, cx)
+                            })),
+                    ),
             ),
             Phase::Failed { choice, error } => {
                 let choice = *choice;

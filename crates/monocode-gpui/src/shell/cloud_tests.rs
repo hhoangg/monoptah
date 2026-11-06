@@ -174,6 +174,8 @@ fn fake_convert(store: Database, fail: Option<&'static str>) -> cloud::ConvertFn
             evidence: vec![],
             code_dir: None,
             ignored: vec![],
+            ignored_truncated: false,
+            evidence_partial: false,
             warnings: vec![],
         })
     })
@@ -883,6 +885,166 @@ fn a_conversion_warning_is_a_notice_and_not_an_error(cx: &mut TestAppContext) {
         .unwrap();
     assert!(visual.debug_bounds("app-notice").is_some());
     assert!(visual.debug_bounds("app-error").is_none());
+}
+
+/// A conversion like `fake_convert` whose result `tweak` adjusts.
+fn tweaked_convert(
+    store: Database,
+    tweak: impl Fn(&mut Converted) + Send + Sync + 'static,
+) -> cloud::ConvertFn {
+    let inner = fake_convert(store, None);
+    Arc::new(move |svc, id, progress| {
+        let mut done = inner(svc, id, progress)?;
+        tweak(&mut done);
+        Ok(done)
+    })
+}
+
+fn with_env_file(done: &mut Converted) {
+    done.ignored = vec![(638_976, "node_modules/".into()), (1, ".env".into())];
+}
+
+fn group(ids: Vec<i64>) -> cloud::CodespaceGroup {
+    cloud::CodespaceGroup {
+        codespace: "octo-abc".into(),
+        ids,
+        others: 0,
+        total: 1,
+    }
+}
+
+#[test]
+fn unsaved_lines_name_real_files_skip_dependency_dirs_and_flag_partial_evidence() {
+    let store = memory_store();
+    let make = |tweak: &dyn Fn(&mut Converted)| {
+        let id = add_cloud_session(&store, "/work/monocode", "octo-abc");
+        let svc = CloudSessions::new(
+            FakeGh::new(vec![]),
+            Arc::new(FakeHost::default()),
+            store.clone(),
+        );
+        let mut done = fake_convert(store.clone(), None)(&svc, id, &mut |_| {}).unwrap();
+        tweak(&mut done);
+        done
+    };
+    let clean = make(&|d| d.ignored = vec![(9, "web/node_modules/".into())]);
+    assert!(cloud::unsaved_lines(&[clean]).is_empty());
+    let many = make(&|d| {
+        d.ignored = (0..5).map(|i| (1, format!("k{i}.key"))).collect();
+        d.ignored_truncated = true;
+    });
+    let lines = cloud::unsaved_lines(&[many]);
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("k0.key, k1.key, k2.key and 2 more"),
+        "{lines:?}"
+    );
+    assert!(lines[0].contains("even more"), "{lines:?}");
+    let partial = make(&|d| d.evidence_partial = true);
+    let lines = cloud::unsaved_lines(&[partial]);
+    assert!(lines[0].contains("evidence") && lines[0].contains("could not be copied"));
+}
+
+#[test]
+fn deleting_pauses_for_files_that_only_exist_on_the_codespace_but_stopping_never_does() {
+    let run = |choice, tweak: fn(&mut Converted)| {
+        let gh = FakeGh::new(vec![]);
+        let store = memory_store();
+        let id = add_cloud_session(&store, "/work/monocode", "octo-abc");
+        let svc = CloudSessions::new(gh.clone(), Arc::new(FakeHost::default()), store.clone());
+        let convert = tweaked_convert(store, tweak);
+        let out = cloud::archive_groups(
+            &svc,
+            vec![group(vec![id])],
+            choice,
+            true,
+            &convert,
+            &AtomicBool::new(false),
+            &mut |_| {},
+        );
+        (out, gh.calls())
+    };
+    // A real ignored file: Delete pauses before touching the codespace.
+    let (out, calls) = run(ArchiveChoice::Delete, with_env_file);
+    assert_eq!(out[0].result.as_ref().unwrap_err(), cloud::NEEDS_REVIEW);
+    assert_eq!(out[0].converted.len(), 1, "the copy is kept");
+    assert!(out[0].risky[0].contains(".env") && !out[0].risky[0].contains("node_modules"));
+    assert!(calls.is_empty(), "{calls:?}");
+    // Partly copied evidence pauses too.
+    let (out, calls) = run(ArchiveChoice::Delete, |d| d.evidence_partial = true);
+    assert_eq!(out[0].result.as_ref().unwrap_err(), cloud::NEEDS_REVIEW);
+    assert!(calls.is_empty());
+    // Only dependency folders: nothing to ask, the codespace is deleted.
+    let (out, calls) = run(ArchiveChoice::Delete, |d| {
+        d.ignored = vec![(638_976, "node_modules/".into())]
+    });
+    assert!(out[0].result.is_ok());
+    assert_eq!(calls, ["codespace delete -c octo-abc --force"]);
+    // Stop keeps the codespace, so it never pauses (the notice comes afterwards).
+    let (out, calls) = run(ArchiveChoice::Stop, with_env_file);
+    assert!(out[0].result.is_ok());
+    assert_eq!(calls, ["codespace stop -c octo-abc"]);
+    let (out, _) = run(ArchiveChoice::Stop, |d| d.evidence_partial = true);
+    assert!(out[0].result.is_ok());
+}
+
+#[gpui::test]
+fn a_delete_with_unsaved_files_asks_then_delete_anyway_or_stop_instead(cx: &mut TestAppContext) {
+    for stop_instead in [false, true] {
+        let (window, id, gh) = shell_with_cloud(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.cloud_convert = tweaked_convert(shell.store.clone(), with_env_file);
+                shell.open_cloud_archive(vec![id], window, cx);
+                shell.confirm_cloud_archive(ArchiveChoice::Delete, window, cx);
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(
+            gh.calls().is_empty(),
+            "paused before deleting: {:?}",
+            gh.calls()
+        );
+        window
+            .update(visual, |shell, _, _| {
+                let dialog = shell.cloud_archive.as_ref().expect("dialog stays open");
+                match &dialog.phase {
+                    cloud::Phase::Review { items } => assert!(items[0].contains(".env")),
+                    _ => panic!("expected the review phase"),
+                }
+                // The local copy exists already.
+                assert_eq!(archived_locals(shell).len(), 1);
+            })
+            .unwrap();
+        for button in [
+            "cloud-archive-cancel",
+            "cloud-archive-delete-anyway",
+            "cloud-archive-stop-instead",
+        ] {
+            assert!(visual.debug_bounds(button).is_some(), "{button}");
+        }
+        window
+            .update(visual, |shell, window, cx| {
+                let choice = if stop_instead {
+                    ArchiveChoice::Stop
+                } else {
+                    ArchiveChoice::Delete
+                };
+                shell.run_cloud_archive(choice, false, window, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let expected = if stop_instead {
+            "codespace stop -c octo-abc"
+        } else {
+            "codespace delete -c octo-abc --force"
+        };
+        assert_eq!(gh.calls(), [expected]);
+        window
+            .update(visual, |shell, _, _| assert!(shell.cloud_archive.is_none()))
+            .unwrap();
+    }
 }
 
 #[gpui::test]

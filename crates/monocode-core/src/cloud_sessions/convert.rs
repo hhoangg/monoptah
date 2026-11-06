@@ -112,10 +112,22 @@ else
     GIT_INDEX_FILE="$idx" git diff --cached --binary HEAD > "$stage/codespace/changes.patch"
     rm -f "$idx"
     if [ -s "$stage/codespace/changes.patch" ]; then echo "patch=1"; else rm -f "$stage/codespace/changes.patch"; fi
-    git ls-files -o -i --exclude-standard --directory | grep -v -e '^\.evidence/$' -e '^CLAUDE\.local\.md$' | head -n 40 | while IFS= read -r p; do
-      kb=$(du -sk -- "$p" 2>/dev/null | cut -f1 || true)
-      echo "ignored=${kb:-0} $p"
-    done
+    emit() {
+      while IFS= read -r p; do
+        kb=$(du -sk -- "${p%/}" 2>/dev/null | cut -f1 || true)
+        echo "ignored=${kb:-0} $p"
+      done
+    }
+    regen='(^|/)(node_modules|target|\.venv|venv|__pycache__|dist|build|\.next|\.turbo|\.cache|\.gradle|Pods|vendor/bundle)/'
+    all=$(git -c core.quotePath=false ls-files -o -i --exclude-standard --directory | grep -v -e '^\.evidence/$' -e '^CLAUDE\.local\.md$' | while IFS= read -r p; do
+      q="${p%/}"
+      if [ -L "$q" ] && [ -d "$q" ]; then printf '%s/\n' "$q"; else printf '%s\n' "$p"; fi
+    done || true)
+    printf '%s\n' "$all" | grep -E "$regen" | head -n 40 | emit
+    lost=$(printf '%s\n' "$all" | grep -Ev "$regen" | grep -v '^$' | head -n 41 || true)
+    count=$(printf '%s\n' "$lost" | grep -c . || true)
+    if [ "${count:-0}" -gt 40 ]; then echo "ignored_truncated=1"; fi
+    printf '%s\n' "$lost" | grep -v '^$' | head -n 40 | emit
     echo "size_kb=$(du -sk "$stage" | cut -f1)"
   fi
 fi
@@ -144,6 +156,8 @@ pub(super) struct Snapshot {
     pub(super) patch: bool,
     /// Ignored files and folders that are not saved: size in KiB and path (capped by the script).
     pub(super) ignored: Vec<(u64, String)>,
+    /// More non-regenerable ignored entries exist than the script lists.
+    pub(super) ignored_truncated: bool,
     pub(super) size_kb: u64,
 }
 
@@ -188,6 +202,7 @@ pub(super) fn parse_snapshot(out: &str) -> Result<Snapshot, String> {
                     snap.ignored.push((kb.parse().unwrap_or(0), path.into()));
                 }
             }
+            "ignored_truncated" => snap.ignored_truncated = flag,
             "size_kb" => snap.size_kb = value.parse().unwrap_or(0),
             _ => {}
         }
@@ -303,6 +318,10 @@ pub struct Converted {
     pub code_dir: Option<PathBuf>,
     /// Ignored files and folders that were NOT saved: size in KiB and path.
     pub ignored: Vec<(u64, String)>,
+    /// The codespace had more non-regenerable ignored entries than `ignored` lists.
+    pub ignored_truncated: bool,
+    /// Some evidence files could not be copied (the rest were kept).
+    pub evidence_partial: bool,
     /// Problems that did not stop the conversion.
     pub warnings: Vec<String>,
 }
@@ -331,7 +350,16 @@ const REGENERABLE_DIRS: &[&str] = &[
 
 /// Whether an ignored entry reported by the snapshot (`dir/` for folders) is a dependency or
 /// build directory that is rebuilt on demand. Matches by path component at any depth.
-pub(super) fn is_regenerable(path: &str) -> bool {
+///
+/// Known blind spot, accepted: this is about the directory, so a hand-made or secret file inside
+/// such a directory (`dist/.env`, `deploy/build/prod.env`) counts as regenerable and does not
+/// warn. It is still listed in the manifest.
+pub fn is_regenerable(path: &str) -> bool {
+    // Git quotes paths with quotes, backslashes or control characters.
+    let path = path
+        .strip_prefix('"')
+        .and_then(|p| p.strip_suffix('"'))
+        .unwrap_or(path);
     let is_dir = path.ends_with('/');
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     let last = parts.len().saturating_sub(1);
@@ -347,15 +375,37 @@ pub(super) fn is_regenerable(path: &str) -> bool {
             .any(|(i, w)| w == ["vendor", "bundle"] && dir_parts(i + 1))
 }
 
+/// Entries the codespace listed that cannot be rebuilt, so skipping them can lose work.
+pub fn unsaved_names(ignored: &[(u64, String)]) -> Vec<&str> {
+    ignored
+        .iter()
+        .filter(|(_, p)| !is_regenerable(p))
+        .map(|(_, p)| p.as_str())
+        .collect()
+}
+
+impl Converted {
+    /// Ignored entries that were not saved and cannot be rebuilt.
+    pub fn unsaved_names(&self) -> Vec<&str> {
+        unsaved_names(&self.ignored)
+    }
+}
+
 /// The warning for ignored entries that cannot be rebuilt, or `None` when only regenerable
-/// ones were skipped. Names the first few paths.
-pub(super) fn ignored_warning(ignored: &[(u64, String)]) -> Option<String> {
+/// ones were skipped. Names the first few paths. `truncated`: the codespace had more than it
+/// listed.
+pub(super) fn ignored_warning(ignored: &[(u64, String)], truncated: bool) -> Option<String> {
     const NAMED: usize = 3;
     let lost: Vec<&(u64, String)> = ignored.iter().filter(|(_, p)| !is_regenerable(p)).collect();
     if lost.is_empty() {
         return None;
     }
     let kb: u64 = lost.iter().map(|(kb, _)| kb).sum();
+    let size = if kb < 1024 {
+        "under 1 MB".to_string()
+    } else {
+        format!("about {} MB", kb / 1024)
+    };
     let list = lost
         .iter()
         .take(NAMED)
@@ -366,10 +416,23 @@ pub(super) fn ignored_warning(ignored: &[(u64, String)]) -> Option<String> {
         0 => String::new(),
         more => format!(" and {more} more"),
     };
+    let what = match (lost.len(), truncated) {
+        (1, false) => "1 ignored file or folder".to_string(),
+        (n, false) => format!("{n} ignored files or folders"),
+        (n, true) => format!("At least {n} ignored files or folders"),
+    };
+    let verb = if lost.len() == 1 && !truncated {
+        "was"
+    } else {
+        "were"
+    };
+    let more = if truncated {
+        " The codespace had more than the manifest lists."
+    } else {
+        ""
+    };
     Some(format!(
-        "{} ignored files or folders (about {} MB) were not saved: {list}{tail}. All are listed in the session's codespace manifest.",
-        lost.len(),
-        kb / 1024
+        "{what} ({size}) {verb} not saved: {list}{tail}.{more} They are listed in the session's codespace manifest."
     ))
 }
 
@@ -505,6 +568,7 @@ impl CloudSessions {
 
         progress("Copying evidence");
         let pulled = self.pull_evidence(cloud_id, None)?;
+        let evidence_partial = pulled.warning.is_some();
         let mut warnings: Vec<String> = pulled.warning.into_iter().collect();
 
         let staging = remote_thread.join(format!("convert.{}-{}", std::process::id(), nanos()));
@@ -532,6 +596,7 @@ impl CloudSessions {
         }
         let mut converted = result?;
         converted.evidence = pulled.files;
+        converted.evidence_partial = evidence_partial;
         converted.warnings = warnings;
         Ok(converted)
     }
@@ -731,6 +796,7 @@ impl CloudSessions {
                 "patches": dir.join(PATCHES).is_dir().then_some(PATCHES),
                 "patch": dir.join(PATCH).is_file().then_some(PATCH),
                 "ignoredNotSaved": snap.ignored.iter().map(|(kb, path)| json!({"path": path, "kib": kb, "regenerable": is_regenerable(path)})).collect::<Vec<_>>(),
+                "ignoredTruncated": snap.ignored_truncated,
                 "createdAt": crate::time::now_ms(),
             });
             std::fs::write(
@@ -738,7 +804,7 @@ impl CloudSessions {
                 serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
-            warnings.extend(ignored_warning(&snap.ignored));
+            warnings.extend(ignored_warning(&snap.ignored, snap.ignored_truncated));
             if !snap.fetched {
                 warnings.push(
                     "The codespace could not refresh from origin, so unpushed work may be counted conservatively.".into(),
@@ -778,6 +844,8 @@ impl CloudSessions {
                 evidence: vec![],
                 code_dir: Some(dir),
                 ignored: snap.ignored.clone(),
+                ignored_truncated: snap.ignored_truncated,
+                evidence_partial: false,
                 warnings: vec![],
             })
         };

@@ -495,14 +495,14 @@ fn regenerable_directories_are_recognised_by_path_component() {
 #[test]
 fn only_irreplaceable_ignored_files_produce_a_warning_naming_the_first_few() {
     let regen = vec![(638_976, "node_modules/".to_string())];
-    assert_eq!(ignored_warning(&regen), None);
-    assert_eq!(ignored_warning(&[]), None);
+    assert_eq!(ignored_warning(&regen, false), None);
+    assert_eq!(ignored_warning(&[], false), None);
 
     let mut mixed = regen.clone();
     mixed.push((2048, ".env".into()));
-    let text = ignored_warning(&mixed).unwrap();
+    let text = ignored_warning(&mixed, false).unwrap();
     assert!(
-        text.starts_with("1 ignored files or folders (about 2 MB)"),
+        text.starts_with("1 ignored file or folder (about 2 MB) was not saved"),
         "{text}"
     );
     assert!(
@@ -511,10 +511,126 @@ fn only_irreplaceable_ignored_files_produce_a_warning_naming_the_first_few() {
     );
 
     let many: Vec<(u64, String)> = (0..5).map(|i| (1, format!("f{i}.key"))).collect();
-    let text = ignored_warning(&many).unwrap();
+    let text = ignored_warning(&many, false).unwrap();
     assert!(text.starts_with("5 ignored"), "{text}");
     assert!(text.contains("f0.key, f1.key, f2.key and 2 more"), "{text}");
     assert!(!text.contains("f3.key"), "{text}");
+
+    // A small file says "under 1 MB", not "about 0 MB".
+    let small = ignored_warning(&[(3, ".env".into())], false).unwrap();
+    assert!(
+        small.starts_with("1 ignored file or folder (under 1 MB) was not saved: .env."),
+        "{small}"
+    );
+    // A cut-off listing never claims to be complete.
+    let cut = ignored_warning(&[(3, ".env".into())], true).unwrap();
+    assert!(
+        cut.starts_with("At least 1") && cut.contains("more than the manifest lists"),
+        "{cut}"
+    );
+}
+
+#[test]
+fn git_quoted_paths_are_classified_without_their_quotes() {
+    assert!(is_regenerable("\"odd \\\"name\\\"/node_modules/\""));
+    assert!(!is_regenerable("\"odd \\\"name\\\".env\""));
+}
+
+#[test]
+fn many_regenerable_dirs_do_not_hide_a_real_ignored_file() {
+    let w = world_with(true, false, true);
+    for i in 0..50 {
+        let dir = w.ws.join(format!("pkg{i:02}/__pycache__"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.pyc"), "x").unwrap();
+        // A source file keeps git from collapsing the folder into `pkgNN/`.
+        std::fs::write(w.ws.join(format!("pkg{i:02}/a.py")), "x").unwrap();
+    }
+    std::fs::write(w.ws.join("zz-secrets.json"), "{}").unwrap();
+    // A symlinked dependency folder is a folder too.
+    let target = w.root.join("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&target, w.ws.join("node_modules")).unwrap();
+    let mut exclude = std::fs::read_to_string(w.ws.join(".git/info/exclude")).unwrap();
+    exclude.push_str("__pycache__/\nzz-secrets.json\nnode_modules\n");
+    std::fs::write(w.ws.join(".git/info/exclude"), exclude).unwrap();
+
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    let names = done.unsaved_names();
+    assert!(names.contains(&"zz-secrets.json"), "{names:?}");
+    assert!(names.contains(&"junk.log"), "{names:?}");
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("__pycache__") || n.contains("node_modules")),
+        "{names:?}"
+    );
+    assert!(!done.ignored_truncated);
+    let warning = done
+        .warnings
+        .iter()
+        .find(|w| w.contains("not saved"))
+        .unwrap();
+    assert!(
+        warning.starts_with("2 ignored files or folders (under 1 MB)"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("zz-secrets.json") && !warning.contains("__pycache__"),
+        "{warning}"
+    );
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(thread.join(CODESPACE_DIR).join(MANIFEST)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["ignoredTruncated"], false);
+    let listed = manifest["ignoredNotSaved"].to_string();
+    assert!(
+        listed.contains("zz-secrets.json") && listed.contains("pkg00/__pycache__/"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("\"node_modules/\""),
+        "symlink listed as a folder: {listed}"
+    );
+}
+
+#[test]
+fn a_long_list_of_real_ignored_files_is_marked_as_cut_off() {
+    let w = world_with(true, false, true);
+    for i in 0..45 {
+        std::fs::write(w.ws.join(format!("k{i:02}.secret")), "s").unwrap();
+    }
+    let mut exclude = std::fs::read_to_string(w.ws.join(".git/info/exclude")).unwrap();
+    exclude.push_str("*.secret\n");
+    std::fs::write(w.ws.join(".git/info/exclude"), exclude).unwrap();
+    let done = w.svc.convert_session(w.cloud_id, &mut |_| {}).unwrap();
+    assert!(done.ignored_truncated);
+    let warning = done
+        .warnings
+        .iter()
+        .find(|w| w.contains("not saved"))
+        .unwrap();
+    assert!(warning.starts_with("At least 40 ignored"), "{warning}");
+    let thread = w
+        .svc
+        .store()
+        .unwrap()
+        .thread_dir(done.local_id)
+        .unwrap()
+        .unwrap();
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(thread.join(CODESPACE_DIR).join(MANIFEST)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["ignoredTruncated"], true);
 }
 
 #[test]
@@ -567,12 +683,16 @@ fn ignored_files_are_never_copied_into_the_session_folder() {
     collect_files(&thread, &thread, &mut files);
     assert!(!files.is_empty());
     for (rel, bytes) in &files {
-        let top = rel.split('/').next().unwrap();
-        let name = rel.strip_prefix("codespace/").unwrap_or(rel);
-        let expected = top == "evidence"
-            || [RAW_JSONL, MANIFEST, BUNDLE, PATCH].contains(&name)
-            || name.starts_with("patches/")
-            || top != "codespace";
+        let expected = rel.starts_with("evidence/")
+            || rel.starts_with("codespace/patches/")
+            || [
+                "claude.jsonl",
+                "manifest.json",
+                "commits.bundle",
+                "changes.patch",
+            ]
+            .iter()
+            .any(|n| rel == &format!("codespace/{n}"));
         assert!(expected, "unexpected file {rel}");
         for needle in [secret, dep] {
             assert!(
