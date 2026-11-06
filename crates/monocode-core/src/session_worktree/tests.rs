@@ -17,7 +17,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let repo = root.join("repo");
-        let remote = root.join("remote.git");
+        let remote = dir.path().join("remote.git");
         std::fs::create_dir_all(&repo).unwrap();
         run(&root, &["init", "--bare", "-b", "main", "remote.git"]);
         run(&repo, &["init", "-b", "main"]);
@@ -260,10 +260,7 @@ fn refusals_leave_everything_in_place() {
         .contains("main checkout"));
     // A worktree the user made elsewhere.
     let outside = f.repo.parent().unwrap().join("mine");
-    run(
-        &f.repo,
-        &["worktree", "add", "-b", "mine", &outside.to_string_lossy()],
-    );
+    run(&f.repo, &["worktree", "add", "-b", "mine", "../mine"]);
     f.attach(plain.id, &outside);
     assert!(plan(&f.store, plain.id)
         .unwrap_err()
@@ -358,12 +355,19 @@ fn legacy_archived_sessions_fall_back_to_their_last_update() {
 fn session_facts_map_the_api_fields_and_only_read_asks_git() {
     let f = Fixture::new();
     let (id, path) = f.session();
+    let recorded_path = f
+        .store
+        .agent_settings(id)
+        .unwrap()
+        .unwrap()
+        .worktree_cwd
+        .unwrap();
     std::fs::write(path.join("wip"), "x").unwrap();
     let main = f.store.create("codex", &f.repo.to_string_lossy()).unwrap();
     let sessions = f.store.sessions().unwrap();
     let refs: Vec<_> = sessions.iter().collect();
     let list = f.store.app_session_facts(&refs, false).unwrap();
-    assert_eq!(list[&id]["worktreePath"], path.to_string_lossy().as_ref());
+    assert_eq!(list[&id]["worktreePath"], recorded_path);
     assert!(list[&id]["worktreeDirty"].is_null());
     assert!(list[&id]["worktreeUnpushed"].is_null());
     assert!(list[&id]["archivedAt"].is_null());
@@ -377,10 +381,10 @@ fn session_facts_map_the_api_fields_and_only_read_asks_git() {
         .store
         .app_conversation(id, &serde_json::json!({}), false, false)
         .unwrap();
-    assert_eq!(page["worktreePath"], path.to_string_lossy().as_ref());
+    assert_eq!(page["worktreePath"], recorded_path);
     assert_eq!(page["worktreeDirty"], true);
     std::fs::remove_dir_all(&path).unwrap();
     let gone = f.store.app_session_facts(&refs, true).unwrap();
-    assert_eq!(gone[&id]["worktreePath"], path.to_string_lossy().as_ref());
+    assert_eq!(gone[&id]["worktreePath"], recorded_path);
     assert!(gone[&id]["worktreeDirty"].is_null());
 }
