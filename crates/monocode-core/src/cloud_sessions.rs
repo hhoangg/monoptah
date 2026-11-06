@@ -521,7 +521,9 @@ impl CloudSessions {
             Ok(state) => state == "Deleted",
             Err(e) => {
                 let e = e.to_lowercase();
-                let missing = e.contains("not found") || e.contains("404");
+                // gh prints "HTTP 404: Not Found" for a missing codespace; a missing `gh` binary
+                // says "command not found" and must not count.
+                let missing = e.contains("http 404");
                 if missing {
                     self.mark_gone(name);
                 }

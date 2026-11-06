@@ -292,6 +292,9 @@ pub(super) fn archive_groups(
         .map(|(group, ids)| {
             let mut converted = Vec::new();
             let mut failure = None;
+            // Lines kept in memory too, so a failed store write cannot open the gate.
+            let mut memory: Vec<String> = Vec::new();
+            let mut store_warning = None;
             if save_copy {
                 for id in &ids {
                     done += 1;
@@ -310,10 +313,13 @@ pub(super) fn archive_groups(
                     match convert(cloud, *id, &mut |line| progress(&format!("{prefix}{line}"))) {
                         Ok(c) => {
                             // Remembered per codespace, so any later delete asks again.
-                            let _ = cloud.record_unsaved(
-                                &group.codespace,
-                                &unsaved_lines(std::slice::from_ref(&c)),
-                            );
+                            let lines = unsaved_lines(std::slice::from_ref(&c));
+                            if let Err(e) = cloud.record_unsaved(&group.codespace, &lines) {
+                                store_warning = Some(format!(
+                                    "Could not remember which files were not saved ({e}); deleting this codespace will still ask."
+                                ));
+                            }
+                            memory.extend(lines);
                             converted.push(c)
                         }
                         Err(e) => {
@@ -330,7 +336,12 @@ pub(super) fn archive_groups(
             // when the copies were made by an earlier attempt: the list is stored.
             let mut risky = Vec::new();
             if failure.is_none() && choice == ArchiveChoice::Delete {
-                let stored = cloud.unsaved_for(&group.codespace);
+                let mut stored = cloud.unsaved_for(&group.codespace);
+                for line in memory {
+                    if !stored.contains(&line) {
+                        stored.push(line);
+                    }
+                }
                 if stored.iter().any(|line| !confirmed.contains(line)) {
                     risky = stored;
                     failure = Some(NEEDS_REVIEW.to_string());
@@ -343,7 +354,14 @@ pub(super) fn archive_groups(
                         ArchiveChoice::Delete => "Deleting the codespace",
                         _ => "Stopping the codespace",
                     });
-                    apply_choice(cloud, choice, &group.codespace)
+                    apply_choice(cloud, choice, &group.codespace).map(|(then, warning)| {
+                        let joined = [warning, store_warning]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (then, (!joined.is_empty()).then_some(joined))
+                    })
                 }
             };
             GroupOutcome {
@@ -464,6 +482,11 @@ pub(super) enum Phase {
     },
     /// The local copies are saved, but deleting the codespace would lose what `items` says.
     Review {
+        items: Vec<String>,
+    },
+    /// Deleting from the session menu: confirm first, listing what the codespace holds that the
+    /// local copies lack.
+    ConfirmDelete {
         items: Vec<String>,
     },
 }
@@ -798,7 +821,7 @@ impl Shell {
         self.close_preview(cx);
         self.cloud_archive = Some(ArchiveDialog {
             groups: vec![CodespaceGroup {
-                codespace,
+                codespace: codespace.clone(),
                 ids: vec![],
                 others: 0,
                 total,
@@ -807,13 +830,16 @@ impl Shell {
             phase: Phase::Choose,
             focus: cx.focus_handle(),
         });
-        self.run_cloud_archive(
-            choice,
-            choice == ArchiveChoice::Delete,
-            Vec::new(),
-            window,
-            cx,
-        );
+        if choice == ArchiveChoice::Delete {
+            let items = self.cloud.unsaved_for(&codespace);
+            if let Some(dialog) = self.cloud_archive.as_mut() {
+                dialog.phase = Phase::ConfirmDelete { items };
+                window.focus(&dialog.focus, cx);
+            }
+            cx.notify();
+            return;
+        }
+        self.run_cloud_archive(choice, false, Vec::new(), window, cx);
     }
 
     pub(super) fn close_cloud_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1239,6 +1265,41 @@ impl Shell {
                 )),
                 footer.child(cancel),
             ),
+            Phase::ConfirmDelete { items } => {
+                let seen = items.clone();
+                let name = dialog
+                    .groups
+                    .first()
+                    .map(|g| g.codespace.clone())
+                    .unwrap_or_default();
+                let mut lines = vec![format!(
+                    "Delete the codespace {name}? This cannot be undone."
+                )];
+                lines.extend(items.iter().cloned());
+                (
+                    "Delete codespace?",
+                    div().child(text("cloud-archive-confirm", lines.join(" "), false)),
+                    footer
+                        .child(cancel)
+                        .child(
+                            crate::modal::danger_button(
+                                "cloud-archive-confirm-delete",
+                                "Delete codespace",
+                            )
+                            .debug_selector(|| "cloud-archive-confirm-delete".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.run_cloud_archive(
+                                    ArchiveChoice::Delete,
+                                    true,
+                                    seen.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                        ),
+                )
+            }
             Phase::Review { items } => {
                 let seen = items.clone();
                 (

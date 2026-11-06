@@ -1126,6 +1126,24 @@ fn every_later_delete_asks_again_until_the_user_confirmed_the_list(cx: &mut Test
         .unwrap();
     visual.run_until_parked();
     assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    // The menu never deletes in one click: it confirms and names the stored files.
+    window
+        .update(visual, |shell, window, cx| {
+            match shell.cloud_archive.as_ref().map(|d| &d.phase) {
+                Some(cloud::Phase::ConfirmDelete { items }) => {
+                    assert!(items[0].contains(".env"), "{items:?}")
+                }
+                _ => panic!("expected the delete confirmation"),
+            }
+            shell.run_cloud_archive(ArchiveChoice::Delete, true, Vec::new(), window, cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(
+        gh.calls().is_empty(),
+        "stored list still gates: {:?}",
+        gh.calls()
+    );
     window
         .update(visual, |shell, _, _| assert!(review(shell)))
         .unwrap();
@@ -1211,6 +1229,73 @@ fn delete_anyway_first_saves_a_session_that_appeared_while_the_dialog_was_open(
     assert!(gh.calls().is_empty(), "{:?}", gh.calls());
     confirm(visual);
     assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+}
+
+#[gpui::test]
+fn the_menu_delete_confirms_even_when_nothing_is_stored(cx: &mut TestAppContext) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.open_cloud_archive(vec![id], window, cx);
+            shell.confirm_cloud_archive(ArchiveChoice::Keep, window, cx);
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    // Convert through Stop so a local copy with an origin exists.
+    window
+        .update(visual, |shell, window, cx| {
+            shell.open_cloud_archive(vec![], window, cx);
+            shell.cloud_origins.insert(id, "octo-abc".into());
+            shell.cloud_marks.remove(&id);
+            shell.run_origin_codespace_action(id, ArchiveChoice::Delete, window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(gh.calls().is_empty(), "no delete without a click");
+    assert!(
+        visual
+            .debug_bounds("cloud-archive-confirm-delete")
+            .is_some()
+    );
+    window
+        .update(visual, |shell, window, cx| {
+            shell.run_cloud_archive(ArchiveChoice::Delete, true, Vec::new(), window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+}
+
+#[test]
+fn a_failed_store_write_still_gates_the_delete_and_is_reported() {
+    let gh = FakeGh::new(vec![]);
+    let store = memory_store();
+    let id = add_cloud_session(&store, "/work/monocode", "octo-abc");
+    let svc = CloudSessions::new(gh.clone(), Arc::new(FakeHost::default()), store.clone());
+    let poison = store.clone();
+    // After converting, the settings store breaks (poisoned lock): nothing can be recorded.
+    let convert = tweaked_convert(store, move |d| {
+        with_env_file(d);
+        // resume_unwind poisons the lock without running the panic hook.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison.lock().unwrap();
+            std::panic::resume_unwind(Box::new("break the store"));
+        }));
+    });
+    let out = cloud::archive_groups(
+        &svc,
+        vec![group(vec![id])],
+        ArchiveChoice::Delete,
+        true,
+        &convert,
+        &AtomicBool::new(false),
+        &[],
+        &mut |_| {},
+    );
+    assert_eq!(out[0].result.as_ref().unwrap_err(), cloud::NEEDS_REVIEW);
+    assert!(out[0].risky[0].contains(".env"), "{:?}", out[0].risky);
+    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
 }
 
 #[gpui::test]
