@@ -217,8 +217,24 @@ test("a detached verification app survives its agent launcher being reaped and k
     runner?.kill("SIGKILL");
     if (appPid) {
       try { process.kill(appPid, "SIGTERM"); } catch {}
+      // The app runs with the fixture as its cwd, and Windows refuses to remove a
+      // directory a live process still holds, so wait for it to exit first.
+      const running = () => {
+        try { process.kill(appPid, 0); return true; } catch (error) {
+          if (error.code === "ESRCH") return false;
+          throw error;
+        }
+      };
+      const deadline = Date.now() + 2000;
+      while (running() && Date.now() < deadline) await delay(20);
+      if (running()) {
+        try { process.kill(appPid, "SIGKILL"); } catch {}
+        while (running() && Date.now() < deadline + 2000) await delay(20);
+      }
+      assert.equal(running(), false, "cleanup must wait for the detached app to release its fixture");
     }
-    await rm(root, { recursive: true, force: true });
+    // Windows can release file handles shortly after the process is gone.
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   const helper = join(root, "helper.mjs");
   await writeFile(helper, `
@@ -231,6 +247,7 @@ test("a detached verification app survives its agent launcher being reaped and k
       writeFileSync(join(root, "app.pid"), String(process.pid));
       console.log("verification stdout");
       console.error("verification stderr");
+      process.on("SIGTERM", () => setTimeout(() => process.exit(0), 200));
       setInterval(() => writeFileSync(join(root, "heartbeat"), String(Date.now())), 20);
       if (process.env.MONOCODE_DEV_RELOAD === "1") {
         process.stdin.once("end", () => process.exit(0));
