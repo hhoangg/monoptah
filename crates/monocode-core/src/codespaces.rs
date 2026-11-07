@@ -816,6 +816,48 @@ pub fn state(runner: &dyn GhRunner, name: &str) -> Result<String, String> {
     Ok(view.state)
 }
 
+/// Whether a Codespace is in the authenticated user's complete inventory. Read-only;
+/// never starts or connects to it. A failed lookup (including 404, which can hide a
+/// permission failure) is not evidence that a Codespace was deleted.
+pub fn exists(runner: &dyn GhRunner, name: &str) -> Result<bool, String> {
+    valid_codespace_name(name)?;
+    let args = argv(&["auth", "status", "--active"]);
+    let auth = runner.run(&args, None)?;
+    if !auth.success {
+        return Err(failure(&args, &auth));
+    }
+    parse_auth_status(&format!("{}\n{}", auth.stdout, auth.stderr)).require_codespace_scope()?;
+    #[derive(Deserialize)]
+    struct Entry {
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Page {
+        total_count: usize,
+        codespaces: Vec<Entry>,
+    }
+    let pages: Vec<Page> = run_json(
+        runner,
+        argv(&["api", "--paginate", "--slurp", "user/codespaces"]),
+    )?;
+    let count: usize = pages.iter().map(|page| page.codespaces.len()).sum();
+    let names: HashSet<&str> = pages
+        .iter()
+        .flat_map(|page| &page.codespaces)
+        .map(|entry| entry.name.as_str())
+        .collect();
+    if pages.is_empty()
+        || names.len() != count
+        || pages.iter().any(|page| page.total_count != count)
+    {
+        return Err("Could not read a complete Codespace inventory; try again.".into());
+    }
+    Ok(pages
+        .iter()
+        .flat_map(|page| &page.codespaces)
+        .any(|entry| entry.name == name))
+}
+
 /// Poll until the codespace is `Available`, sleeping through `sleep`.
 pub fn wait_ready_with(
     runner: &dyn GhRunner,

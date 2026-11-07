@@ -850,6 +850,24 @@ impl CloudSessions {
             })
     }
 
+    /// Delete one session through the normal store cleanup. A missing Codespace
+    /// only loses this session's local record; live hosts must accept the delete.
+    pub fn delete_session(&self, id: i64) -> Result<(), String> {
+        self.store()?.delete_with_remote(id, &*self.gh, &*self.host)
+    }
+
+    /// Fresh, read-only inventory check before an archive/delete can attempt a
+    /// backup. Only confirmed absence permits forgetting bindings without a host.
+    pub fn forget_missing_codespace(&self, name: &str) -> Result<bool, String> {
+        if codespaces::exists(&*self.gh, name)? {
+            return Ok(false);
+        }
+        self.store()?.forget_codespace(name)?;
+        self.invalidate(name);
+        self.mark_gone(name);
+        Ok(true)
+    }
+
     pub fn stop_codespace(&self, name: &str) -> Result<(), String> {
         {
             let store = self.store()?;

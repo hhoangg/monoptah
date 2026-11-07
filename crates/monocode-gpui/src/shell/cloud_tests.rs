@@ -31,6 +31,16 @@ impl FakeGh {
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
+    /// Existing archive safety assertions concern lifecycle writes, separately
+    /// from the read-only auth/inventory preflight covered below.
+    fn archive_calls(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter(|call| {
+                call != "auth status --active" && call != "api --paginate --slurp user/codespaces"
+            })
+            .collect()
+    }
 }
 impl GhRunner for FakeGh {
     fn run(&self, args: &[String], _: Option<&str>) -> Result<GhOutput, String> {
@@ -41,7 +51,13 @@ impl GhRunner for FakeGh {
             .iter()
             .find(|(key, _)| line.contains(key))
             .map(|(_, out)| *out)
-            .unwrap_or("");
+            .unwrap_or_else(|| match line.as_str() {
+                "auth status --active" => AUTH_OK,
+                "api --paginate --slurp user/codespaces" => {
+                    r#"[{"total_count":2,"codespaces":[{"name":"octo-abc"},{"name":"octo-xyz"}]}]"#
+                }
+                _ => "",
+            });
         Ok(GhOutput {
             success: true,
             stdout: stdout.into(),
@@ -553,7 +569,7 @@ fn delete_codespace_removes_its_sessions_from_the_window(cx: &mut TestAppContext
         .unwrap();
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     visual.run_until_parked();
-    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+    assert_eq!(gh.archive_calls(), ["codespace delete -c octo-abc --force"]);
     window
         .update(visual, |shell, _, _| {
             assert!(!shell.session_summaries.contains_key(&id));
@@ -578,7 +594,11 @@ fn a_failed_copy_leaves_the_codespace_alone_and_offers_retry_anyway_or_cancel(
         .unwrap();
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     visual.run_until_parked();
-    assert!(gh.calls().is_empty(), "nothing deleted: {:?}", gh.calls());
+    assert!(
+        gh.archive_calls().is_empty(),
+        "nothing deleted: {:?}",
+        gh.archive_calls()
+    );
     window
         .update(visual, |shell, _, _| {
             let dialog = shell.cloud_archive.as_ref().expect("dialog stays open");
@@ -608,7 +628,7 @@ fn a_failed_copy_leaves_the_codespace_alone_and_offers_retry_anyway_or_cancel(
         })
         .unwrap();
     visual.run_until_parked();
-    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+    assert_eq!(gh.archive_calls(), ["codespace delete -c octo-abc --force"]);
     window
         .update(visual, |shell, _, _| {
             assert!(shell.cloud_archive.is_none() && !shell.is_cloud(id));
@@ -965,7 +985,7 @@ fn deleting_pauses_for_files_that_only_exist_on_the_codespace_but_stopping_never
             &[],
             &mut |_| {},
         );
-        (out, gh.calls())
+        (out, gh.archive_calls())
     };
     // A real ignored file: Delete pauses before touching the codespace.
     let (out, calls) = run(ArchiveChoice::Delete, with_env_file);
@@ -1005,9 +1025,9 @@ fn a_delete_with_unsaved_files_asks_then_delete_anyway_or_stop_instead(cx: &mut 
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
         assert!(
-            gh.calls().is_empty(),
+            gh.archive_calls().is_empty(),
             "paused before deleting: {:?}",
-            gh.calls()
+            gh.archive_calls()
         );
         window
             .update(visual, |shell, _, _| {
@@ -1049,7 +1069,7 @@ fn a_delete_with_unsaved_files_asks_then_delete_anyway_or_stop_instead(cx: &mut 
         } else {
             "codespace delete -c octo-abc --force"
         };
-        assert_eq!(gh.calls(), [expected]);
+        assert_eq!(gh.archive_calls(), [expected]);
         window
             .update(visual, |shell, _, _| assert!(shell.cloud_archive.is_none()))
             .unwrap();
@@ -1090,7 +1110,7 @@ fn every_later_delete_asks_again_until_the_user_confirmed_the_list(cx: &mut Test
         })
         .unwrap();
     visual.run_until_parked();
-    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    assert!(gh.archive_calls().is_empty(), "{:?}", gh.archive_calls());
     window
         .update(visual, |shell, _, _| assert!(review(shell)))
         .unwrap();
@@ -1100,7 +1120,7 @@ fn every_later_delete_asks_again_until_the_user_confirmed_the_list(cx: &mut Test
             shell.close_cloud_archive(window, cx)
         })
         .unwrap();
-    assert!(gh.calls().is_empty());
+    assert!(gh.archive_calls().is_empty());
     // The converted session offers stop and delete in its menu; delete asks again.
     let local = window
         .update(visual, |shell, _, _| archived_locals(shell)[0])
@@ -1127,7 +1147,7 @@ fn every_later_delete_asks_again_until_the_user_confirmed_the_list(cx: &mut Test
         })
         .unwrap();
     visual.run_until_parked();
-    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    assert!(gh.archive_calls().is_empty(), "{:?}", gh.archive_calls());
     // The menu never deletes in one click: it confirms and names the stored files.
     window
         .update(visual, |shell, window, cx| {
@@ -1142,9 +1162,9 @@ fn every_later_delete_asks_again_until_the_user_confirmed_the_list(cx: &mut Test
         .unwrap();
     visual.run_until_parked();
     assert!(
-        gh.calls().is_empty(),
+        gh.archive_calls().is_empty(),
         "stored list still gates: {:?}",
-        gh.calls()
+        gh.archive_calls()
     );
     window
         .update(visual, |shell, _, _| assert!(review(shell)))
@@ -1162,7 +1182,7 @@ fn every_later_delete_asks_again_until_the_user_confirmed_the_list(cx: &mut Test
         })
         .unwrap();
     visual.run_until_parked();
-    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+    assert_eq!(gh.archive_calls(), ["codespace delete -c octo-abc --force"]);
     window
         .update(visual, |shell, _, cx| {
             let labels = shell
@@ -1228,9 +1248,9 @@ fn delete_anyway_first_saves_a_session_that_appeared_while_the_dialog_was_open(
             ));
         })
         .unwrap();
-    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    assert!(gh.archive_calls().is_empty(), "{:?}", gh.archive_calls());
     confirm(visual);
-    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+    assert_eq!(gh.archive_calls(), ["codespace delete -c octo-abc --force"]);
 }
 
 #[gpui::test]
@@ -1254,7 +1274,7 @@ fn the_menu_delete_confirms_even_when_nothing_is_stored(cx: &mut TestAppContext)
         })
         .unwrap();
     visual.run_until_parked();
-    assert!(gh.calls().is_empty(), "no delete without a click");
+    assert!(gh.archive_calls().is_empty(), "no delete without a click");
     assert!(
         visual
             .debug_bounds("cloud-archive-confirm-delete")
@@ -1266,7 +1286,7 @@ fn the_menu_delete_confirms_even_when_nothing_is_stored(cx: &mut TestAppContext)
         })
         .unwrap();
     visual.run_until_parked();
-    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+    assert_eq!(gh.archive_calls(), ["codespace delete -c octo-abc --force"]);
 }
 
 #[test]
@@ -1297,7 +1317,7 @@ fn a_failed_store_write_still_gates_the_delete_and_is_reported() {
     );
     assert_eq!(out[0].result.as_ref().unwrap_err(), cloud::NEEDS_REVIEW);
     assert!(out[0].risky[0].contains(".env"), "{:?}", out[0].risky);
-    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    assert!(gh.archive_calls().is_empty(), "{:?}", gh.archive_calls());
 }
 
 #[gpui::test]
@@ -1444,7 +1464,7 @@ fn delete_saves_every_session_of_the_codespace_but_stop_only_the_selected_ones(
     let mut want = vec![a, b];
     want.sort();
     assert_eq!(seen, want);
-    assert_eq!(gh.calls(), ["codespace delete -c octo-abc --force"]);
+    assert_eq!(gh.archive_calls(), ["codespace delete -c octo-abc --force"]);
     window
         .update(visual, |shell, _, _| {
             assert_eq!(archived_locals(shell).len(), 2)
@@ -1726,4 +1746,199 @@ fn the_codespace_tab_is_never_the_saved_right_tab(cx: &mut TestAppContext) {
             );
         })
         .unwrap();
+}
+
+/// Inventory-only boundary: any SSH, lifecycle, or backup command fails the test.
+struct InventoryGh {
+    response: Result<GhOutput, String>,
+    calls: Mutex<Vec<String>>,
+}
+impl InventoryGh {
+    fn missing() -> Arc<Self> {
+        Arc::new(Self {
+            response: Ok(GhOutput {
+                success: true,
+                stdout: r#"[{"total_count":0,"codespaces":[]}]"#.into(),
+                stderr: String::new(),
+            }),
+            calls: Mutex::new(vec![]),
+        })
+    }
+}
+impl GhRunner for InventoryGh {
+    fn run(&self, args: &[String], _: Option<&str>) -> Result<GhOutput, String> {
+        let call = args.join(" ");
+        self.calls.lock().unwrap().push(call.clone());
+        match call.as_str() {
+            "auth status --active" => Ok(GhOutput {
+                success: true,
+                stdout: AUTH_OK.into(),
+                stderr: String::new(),
+            }),
+            "api --paginate --slurp user/codespaces" => self.response.clone(),
+            _ => panic!("unexpected remote operation: {call}"),
+        }
+    }
+}
+
+#[gpui::test]
+fn deleting_a_stale_cloud_session_succeeds_without_contacting_its_host(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_cloud(cx);
+    let gh = InventoryGh::missing();
+    let host = Arc::new(FakeHost::default());
+    window
+        .update(cx, |shell, w, cx| {
+            shell.cloud = Arc::new(CloudSessions::new(
+                gh.clone(),
+                host.clone(),
+                shell.store.clone(),
+            ));
+            shell.cloud_convert = fake_convert(shell.store.clone(), Some("backup must not run"));
+            {
+                let store = locked(&shell.store).unwrap();
+                let mut remote = store.remote_session(id).unwrap().unwrap();
+                remote.session_id = Some("host-session".into());
+                store.save_remote_session(&remote).unwrap();
+            }
+            shell.request_delete_sessions(vec![id], w, cx);
+            shell.confirm_delete_dialog(w, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert!(
+                !shell.session_summaries.contains_key(&id),
+                "{:?}",
+                shell.error
+            );
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .remote_session(id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(shell.error.is_none(), "{:?}", shell.error);
+        })
+        .unwrap();
+    assert!(host.log.lock().unwrap().is_empty());
+    assert_eq!(gh.calls.lock().unwrap().len(), 2);
+}
+
+#[gpui::test]
+fn deleting_an_already_missing_codespace_skips_backup_and_forgets_its_sessions(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, _) = shell_with_cloud(cx);
+    let gh = InventoryGh::missing();
+    let host = Arc::new(FakeHost::default());
+    window
+        .update(cx, |shell, w, cx| {
+            shell.cloud = Arc::new(CloudSessions::new(
+                gh.clone(),
+                host.clone(),
+                shell.store.clone(),
+            ));
+            shell.cloud_convert =
+                Arc::new(|_, _, _| panic!("must not back up a missing codespace"));
+            shell.open_cloud_archive(vec![id], w, cx);
+            shell.confirm_cloud_archive(ArchiveChoice::Delete, w, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert!(!shell.session_summaries.contains_key(&id));
+            assert!(shell.cloud_archive.is_none());
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .remote_session(id)
+                    .unwrap()
+                    .is_none()
+            );
+        })
+        .unwrap();
+    assert!(host.log.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn failed_inventory_keeps_shell_sessions_and_never_attempts_backup_or_host_deletion(
+    cx: &mut TestAppContext,
+) {
+    for response in [
+        Err("network timeout".into()),
+        Ok(GhOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "HTTP 403: Forbidden".into(),
+        }),
+        Ok(GhOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "HTTP 404: Not Found".into(),
+        }),
+    ] {
+        for archive in [false, true] {
+            let (window, id, _) = shell_with_cloud(cx);
+            let gh = Arc::new(InventoryGh {
+                response: response.clone(),
+                calls: Mutex::new(vec![]),
+            });
+            let host = Arc::new(FakeHost::default());
+            window
+                .update(cx, |shell, w, cx| {
+                    shell.cloud = Arc::new(CloudSessions::new(
+                        gh.clone(),
+                        host.clone(),
+                        shell.store.clone(),
+                    ));
+                    shell.cloud_convert =
+                        Arc::new(|_, _, _| panic!("lookup failure must not attempt backup"));
+                    {
+                        let store = locked(&shell.store).unwrap();
+                        let mut remote = store.remote_session(id).unwrap().unwrap();
+                        remote.session_id = Some("host-session".into());
+                        store.save_remote_session(&remote).unwrap();
+                    }
+                    if archive {
+                        shell.open_cloud_archive(vec![id], w, cx);
+                        shell.confirm_cloud_archive(ArchiveChoice::Delete, w, cx);
+                    } else {
+                        shell.request_delete_sessions(vec![id], w, cx);
+                        shell.confirm_delete_dialog(w, cx);
+                    }
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |shell, _, _| {
+                    assert!(shell.session_summaries.contains_key(&id));
+                    assert!(
+                        locked(&shell.store)
+                            .unwrap()
+                            .remote_session(id)
+                            .unwrap()
+                            .is_some()
+                    );
+                    if archive {
+                        assert!(matches!(
+                            shell.cloud_archive.as_ref().unwrap().phase,
+                            cloud::Phase::Failed { .. }
+                        ));
+                    } else {
+                        assert!(
+                            shell
+                                .error
+                                .as_ref()
+                                .unwrap()
+                                .starts_with("Could not delete the session:")
+                        );
+                    }
+                })
+                .unwrap();
+            assert!(host.log.lock().unwrap().is_empty());
+        }
+    }
 }

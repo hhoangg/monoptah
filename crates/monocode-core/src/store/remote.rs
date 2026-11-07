@@ -703,26 +703,59 @@ impl Store {
         self.save_remote_session(&remote)
     }
     pub fn delete_remote_session(&self, id: i64) -> Result<(), String> {
+        self.delete_remote_session_using(id, &crate::codespaces::SystemGh, None)
+    }
+
+    /// Delete through injectable GitHub and host boundaries. No remote is woken here.
+    pub fn delete_remote_session_with(
+        &self,
+        id: i64,
+        gh: &dyn crate::codespaces::GhRunner,
+        host: &dyn crate::cloud_sessions::Host,
+    ) -> Result<(), String> {
+        self.delete_remote_session_using(id, gh, Some(host))
+    }
+
+    fn delete_remote_session_using(
+        &self,
+        id: i64,
+        gh: &dyn crate::codespaces::GhRunner,
+        host: Option<&dyn crate::cloud_sessions::Host>,
+    ) -> Result<(), String> {
         let remote = self
             .remote_session(id)?
             .ok_or("Remote session no longer exists")?;
+        // Pending starts and unsent drafts have no host conversation to delete.
+        // Keep their existing local-only cleanup independent of GitHub availability.
+        if remote.session_id.is_none() {
+            return self.forget_cloud_session(id);
+        }
+        if let Some(name) = &remote.project.codespace {
+            if !crate::codespaces::exists(gh, name)? {
+                return self.forget_cloud_session(id);
+            }
+        }
         if let Some(session_id) = &remote.session_id {
-            let client = crate::remote::default_connections()?;
-            let machine = remote.machine(&client)?;
-            client.request(
+            let default_host;
+            let host = match host {
+                Some(host) => host,
+                None => {
+                    default_host = crate::remote::default_connections()?;
+                    &default_host
+                }
+            };
+            let machine = host
+                .machines()?
+                .into_iter()
+                .find(|machine| machine.environment_id == remote.project.environment_id)
+                .ok_or("Machine is no longer connected. Reconnect in Settings → Connections.")?;
+            host.request(
                 &machine.id,
                 "sessions.delete",
                 json!({"sessionId": session_id,"projectId": remote.project.project_id}),
             )?;
         }
-        crate::cloud_sessions::startup::forget_session_start(self, id)?;
-        let mut sessions = self.remote_sessions()?;
-        sessions.remove(&id);
-        self.hide_legacy_remote_sessions([id])?;
-        self.save_setting(
-            SESSIONS,
-            &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
-        )
+        self.forget_cloud_session(id)
     }
 }
 
