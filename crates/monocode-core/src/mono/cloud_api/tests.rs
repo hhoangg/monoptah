@@ -369,7 +369,10 @@ fn preparing_a_new_target_uses_the_current_branch_by_default() {
     let gh = FakeGh::new(vec![
         ("auth status", ok(AUTH_OK)),
         ("codespace list", ok("[]")),
-        ("codespace create", ok("octo-new1\n")),
+        (
+            "--method POST",
+            ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+        ),
         ("codespace view", ok(r#"{"state":"Available"}"#)),
     ]);
     let fx = fixture(&gh);
@@ -390,7 +393,7 @@ fn preparing_a_new_target_uses_the_current_branch_by_default() {
         binding.project_key,
         "remote://env-octo-new1/workspaces/widgets"
     );
-    assert!(gh.calls().iter().any(|c| c.contains("--branch trunk")));
+    assert!(gh.calls().iter().any(|c| c.contains("ref=trunk")));
     // A non-Claude harness never gets that far.
     assert_eq!(
         fx.api.create_session(&binding, "codex").unwrap_err(),
@@ -435,6 +438,74 @@ fn targets_are_local_or_codespace_and_never_wake_anything() {
     let mut row = json!({"id":local});
     annotate(&mut row, targets.get(&local));
     assert_eq!(row, json!({"id":local,"target":{"kind":"local"}}));
+}
+
+#[test]
+fn a_starting_session_is_listed_as_starting_and_refuses_sends() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        ("codespace list", ok(LIST)),
+        ("codespace view", ok(r#"{"state":"Available"}"#)),
+    ]);
+    let fx = fixture(&gh);
+    let (session, record) = fx
+        .api
+        .cloud
+        .begin_start(
+            &fx.path(),
+            Target {
+                codespace: CodespaceChoice::Named("octo-abc".into()),
+                branch: None,
+                machine: None,
+            },
+            "claude",
+        )
+        .unwrap();
+    let id = session.id;
+    fx.host.log.lock().unwrap().clear();
+    let calls = gh.calls().len();
+    let targets = fx.api.session_targets(&fx.path());
+    assert_eq!(targets[&id].state, CloudState::Starting);
+    assert_eq!(
+        gh.calls().len(),
+        calls,
+        "a starting session needs no gh read"
+    );
+    let mut row = json!({"id":id});
+    annotate(&mut row, targets.get(&id));
+    assert_eq!(
+        row,
+        json!({"id":id,"target":{"kind":"codespace","codespace":"octo-abc","state":"starting"},
+            "codespaceState":"starting","startup":{"step":"provision"}})
+    );
+    let target = fx.api.target_of(id).unwrap();
+    assert_eq!(target.state, CloudState::Starting);
+    // Sends are refused with the phase and never touch the host.
+    let error = fx.api.wake(id, &fx.store).unwrap_err();
+    assert_eq!(
+        error,
+        "This cloud session is still starting its codespace (Provisioning). Send again when it is ready."
+    );
+    assert!(fx.host.log.lock().unwrap().is_empty());
+    // A failed start reports its error and the real codespace state.
+    let mut failed = record;
+    failed.error = Some("ssh refused".into());
+    failed.failed_at = Some(crate::cloud_sessions::StepKind::Provision);
+    crate::cloud_sessions::startup::save_start_record(&fx.store.lock().unwrap(), &failed).unwrap();
+    let targets = fx.api.session_targets(&fx.path());
+    assert_eq!(targets[&id].state, CloudState::Available);
+    let mut row = json!({"id":id});
+    annotate(&mut row, targets.get(&id));
+    assert_eq!(row["codespaceState"], "available");
+    assert_eq!(
+        row["startup"],
+        json!({"step":"provision","error":"ssh refused"})
+    );
+    let error = fx.api.wake(id, &fx.store).unwrap_err();
+    assert_eq!(
+        error,
+        "This cloud session could not start: ssh refused. Choose Retry in the session."
+    );
 }
 
 #[test]
@@ -483,7 +554,10 @@ fn a_failed_new_start_names_the_codespace_it_created() {
     // meanwhile (a parallel start) must not be mistaken for it: the name comes from create.
     let gh = FakeGh::new(vec![
         ("auth status", ok(AUTH_OK)),
-        ("codespace create", ok("octo-new1\n")),
+        (
+            "--method POST",
+            ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+        ),
         ("codespace view", ok(r#"{"state":"Failed"}"#)),
         (
             "codespace list",

@@ -4,6 +4,8 @@ mod attachment_drop;
 mod background_tasks;
 mod btw;
 mod changes_shelf;
+#[cfg(test)]
+mod cloud_start_tests;
 mod commands;
 pub(crate) mod composer_features;
 mod composer_shelf;
@@ -144,6 +146,14 @@ pub(crate) struct Conversation {
     _btw_observer: Option<Subscription>,
     pub(crate) summary: Session,
     remote_state: remote::State,
+    /// The codespace of this cloud session is starting (or failed to): the host is not loaded and
+    /// sends are queued. Also kept once ready, for the status row.
+    cloud_start: Option<Arc<crate::cloud_start_view::CloudStartSnapshot>>,
+    /// The message sent while the codespace started, until the session has sent it.
+    cloud_queued: Option<String>,
+    /// The composer's own placeholder, kept while the cloud start puts its own there.
+    cloud_placeholder: Option<SharedString>,
+    _cloud_events: Subscription,
     remote_plans: remote_plans::State,
     store: Database,
     pub(crate) transcript: Entity<TranscriptView>,
@@ -577,6 +587,12 @@ impl Conversation {
             view.file_link_base = Some(summary.cwd.clone());
             view
         });
+        let cloud_events = cx.subscribe(
+            &transcript,
+            |this, _, event: &crate::cloud_start_view::CloudStartAction, cx| {
+                this.request_cloud_start_action(event.action, cx)
+            },
+        );
         let account = crate::accounts::get(cx)
             .map(|center| {
                 center
@@ -713,6 +729,10 @@ impl Conversation {
             response_request: None,
             summary,
             remote_state: remote::State::default(),
+            cloud_start: None,
+            cloud_queued: None,
+            cloud_placeholder: None,
+            _cloud_events: cloud_events,
             remote_plans: remote_plans::State::default(),
         }
     }
@@ -732,6 +752,9 @@ impl Conversation {
         Arc::new(move |before, all| locked(&store)?.load_before(id, before, all))
     }
     pub(crate) fn load(&mut self, cx: &mut Context<Self>) {
+        if self.cloud_start_blocks() {
+            return;
+        }
         if self.is_remote() {
             self.load_remote(cx);
             return;
@@ -945,6 +968,15 @@ impl Conversation {
     /// preference: queued when it steers, steering when it queues.
     fn send_follow_up(&mut self, invert: bool, cx: &mut Context<Self>) {
         if self.refuse_while_saving_copy(cx) {
+            return;
+        }
+        if self.cloud_start_blocks() {
+            if self.input.read(cx).content.trim_start().starts_with('/') {
+                self.status = "Commands are available once the codespace is ready".into();
+                cx.notify();
+                return;
+            }
+            self.queue_start_send(cx);
             return;
         }
         if self.is_remote() && self.remote_send_guard(cx) {
@@ -1583,6 +1615,7 @@ impl Conversation {
 }
 
 impl EventEmitter<SessionChanged> for Conversation {}
+impl EventEmitter<crate::cloud_start_view::CloudStartAction> for Conversation {}
 impl EventEmitter<WorktreeRenamed> for Conversation {}
 impl EventEmitter<ChooseFolder> for Conversation {}
 impl EventEmitter<OpenSessionChanges> for Conversation {}
@@ -2989,6 +3022,7 @@ impl Conversation {
                     .child(self.completion.read(cx).composer_probe())
                     .child(self.btw_home.0.probe())
                     .child(composer_surface(radius))
+                    .children(self.cloud_progress_bar(radius))
                     .children(self.attachment_chips(cx))
                     .child(
                         div()
@@ -3124,6 +3158,69 @@ impl Conversation {
             .child(self.workspace_bar(cx))
             .into_any_element()
     }
+    /// The 2px bar along the top edge of the composer while the codespace starts. GPUI clips to
+    /// rectangles, so it stops short of the rounded corners.
+    fn cloud_progress_bar(&self, radius: f32) -> Option<AnyElement> {
+        let start = self.cloud_start.as_ref()?;
+        if start.phase != crate::cloud_start_view::StartPhase::Starting {
+            return None;
+        }
+        let fraction = start.progress();
+        Some(
+            div()
+                .id("composer-start-progress")
+                .debug_selector(|| "composer-start-progress".into())
+                .absolute()
+                .top_0()
+                .left(px(radius * 0.5))
+                .right(px(radius * 0.5))
+                .h(px(2.))
+                .child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(fraction))
+                        .rounded_full()
+                        .bg(warning_color()),
+                )
+                .into_any_element(),
+        )
+    }
+    /// The codespace phase on the context line: a dot and the step now running, or "Startup
+    /// failed". Gone once the codespace is ready. Opens the Codespace panel.
+    fn cloud_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (text, phase) = self.cloud_start.as_ref()?.chip()?;
+        let failed = phase == crate::cloud_start_view::StartPhase::Failed;
+        Some(
+            div()
+                .id("composer-start-chip")
+                .debug_selector(|| "composer-start-chip".into())
+                .role(Role::Button)
+                .aria_label(format!("Codespace: {text}"))
+                .cursor_pointer()
+                .flex_shrink_0()
+                .h(px(20.))
+                .px(px(8.))
+                .rounded_full()
+                .border_1()
+                .border_color(content(0.1))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(12.))
+                .text_color(if failed { danger_color() } else { content(0.7) })
+                .hover(|s| s.bg(content(0.08)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(crate::transcript::cloud_start::cloud_dot(failed))
+                .child(text)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.request_cloud_start_action(
+                        crate::cloud_start_view::StartAction::ShowPanel,
+                        cx,
+                    )
+                }))
+                .into_any_element(),
+        )
+    }
     fn workspace_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let draft = !self.summary.has_messages;
         let linked =
@@ -3235,6 +3332,7 @@ impl Conversation {
                         })),
                 )
             })
+            .children(self.cloud_chip(cx))
             .child(
                 div()
                     .ml_auto()
@@ -3258,6 +3356,8 @@ impl Conversation {
                     })
                     .when(
                         self.status != "Ready"
+                            && !(self.cloud_start_blocks()
+                                && self.status == "Loading conversation…")
                             && !self.busy
                             && !self.loading
                             && self.settings.usage_limit.is_none(),

@@ -18,6 +18,10 @@ test("forwards app options and rejects the retired runner flags", () => {
   assert.deepEqual(parseDevArgs(["--", "--cwd", "a project"]), {
     args: ["--cwd", "a project"],
   });
+  assert.deepEqual(parseDevArgs(["--detach", "--cwd", "a project"]), {
+    args: ["--cwd", "a project"], detach: true,
+  });
+  assert.deepEqual(parseDevArgs(["--cwd", "--detach"]), { args: ["--cwd", "--detach"] });
   for (const arg of ["--watch", "--bundle"]) {
     assert.throws(() => parseDevArgs([arg]), /not supported.*rebuild and restart/);
   }
@@ -203,4 +207,73 @@ test("closing during compilation terminates Cargo and never launches an app", { 
 test("the dev bundle path is fixed and overridable", () => {
   assert.equal(devAppPath({ HOME: "/Users/a" }), join("/Users/a", "Applications", "Monoptah Native Dev.app"));
   assert.equal(devAppPath({ HOME: "/Users/a", MONOCODE_DEV_APP_DIR: "/x" }), join("/x", "Monoptah Native Dev.app"));
+});
+
+test("a detached verification app survives its agent launcher being reaped and keeps stdout and stderr", { timeout: 10_000 }, async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "monoptah-detached-test-")));
+  let appPid;
+  let runner;
+  t.after(async () => {
+    runner?.kill("SIGKILL");
+    if (appPid) {
+      try { process.kill(appPid, "SIGTERM"); } catch {}
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+  const helper = join(root, "helper.mjs");
+  await writeFile(helper, `
+    import { writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const root = process.cwd();
+    if (process.argv[2] === "metadata") {
+      console.log(JSON.stringify({target_directory: root, packages: [{name: "monocode-gpui", version: "0.16.0"}]}));
+    } else if (process.argv[2] === "app") {
+      writeFileSync(join(root, "app.pid"), String(process.pid));
+      console.log("verification stdout");
+      console.error("verification stderr");
+      setInterval(() => writeFileSync(join(root, "heartbeat"), String(Date.now())), 20);
+      if (process.env.MONOCODE_DEV_RELOAD === "1") {
+        process.stdin.once("end", () => process.exit(0));
+        process.stdin.resume();
+      }
+    }
+  `);
+  const modulePath = new URL("./dev-native.mjs", import.meta.url).href;
+  const runnerPath = join(root, "runner.mjs");
+  await writeFile(runnerPath, `
+    import { spawn } from "node:child_process";
+    import { appendFileSync } from "node:fs";
+    import { startDev } from ${JSON.stringify(modulePath)};
+    await startDev({root: ${JSON.stringify(root)}, platform: "darwin", detach: true,
+      env: {...process.env, MONOCODE_DEV_RELOAD: "1", MONOCODE_DEV_LOG_DIR: ${JSON.stringify(join(root, "logs"))}},
+      log: message => appendFileSync(${JSON.stringify(join(root, "runner.log"))}, message + String.fromCharCode(10)),
+      spawnProcess(command, args, options) {
+        const task = command === "cargo" ? args[0] : command === "bash" ? "package" : "app";
+        return spawn(process.execPath, [${JSON.stringify(helper)}, task], options);
+      }
+    });
+    setInterval(() => {}, 1000);
+  `);
+  runner = spawn(process.execPath, [runnerPath], { cwd: root, stdio: "ignore" });
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    appPid = Number(await readFile(join(root, "app.pid"), "utf8").catch(() => "")) || undefined;
+    if (appPid && await readFile(join(root, "heartbeat"), "utf8").catch(() => "")) break;
+    await delay(20);
+  }
+  assert.ok(appPid, "the verification app launched");
+  const closed = new Promise(resolve => runner.once("close", resolve));
+  runner.kill("SIGKILL");
+  await closed;
+  await delay(150);
+  const before = await readFile(join(root, "heartbeat"), "utf8");
+  await delay(150);
+  assert.notEqual(await readFile(join(root, "heartbeat"), "utf8"), before,
+    "the app must continue running when its agent-owned launcher is reaped");
+  const messages = await readFile(join(root, "runner.log"), "utf8");
+  const logPath = messages.match(/Log: (.+)/)?.[1];
+  assert.ok(logPath, messages);
+  const output = await readFile(logPath, "utf8");
+  assert.match(output, /verification stdout/);
+  assert.match(output, /verification stderr/);
 });

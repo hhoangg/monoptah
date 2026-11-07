@@ -1052,3 +1052,261 @@ fn a_marked_ssh_script_may_run_for_minutes_and_run_script_adds_the_marker() {
     assert_eq!(calls[1], "codespace ssh -c cs-1 -- sh -s <echo hi>");
     assert!(super::run_script(&echo, "bad name", "x", false).is_err());
 }
+
+const STARTED: &str = r#"{"name":"fuzzy-space-123","state":"Provisioning","web_url":"https://fuzzy-space-123.github.dev"}"#;
+
+#[test]
+fn create_started_uses_the_rest_api_and_returns_the_name() {
+    let fake = Fake::new(vec![ok(STARTED)]);
+    let started = create_started(&fake, "hhoangg/monoptah", "main", None, None).unwrap();
+    assert_eq!(
+        started,
+        StartedCodespace {
+            name: "fuzzy-space-123".into(),
+            state: "Provisioning".into(),
+            web_url: Some("https://fuzzy-space-123.github.dev".into()),
+        }
+    );
+    assert_eq!(
+        fake.argv(0),
+        v(&[
+            "api",
+            "--method",
+            "POST",
+            "repos/hhoangg/monoptah/codespaces",
+            "-f",
+            "ref=main",
+            "-f",
+            "machine=basicLinux32gb",
+            "-f",
+            "display_name=monoptah-main",
+            "-F",
+            "idle_timeout_minutes=30",
+            "-F",
+            "retention_period_minutes=4320",
+            "-F",
+            "multi_repo_permissions_opt_out=true",
+        ])
+    );
+}
+
+#[test]
+fn create_started_custom_values_and_failures() {
+    let fake = Fake::new(vec![ok(r#"{"name":"cs-1"}"#)]);
+    let branch = "feature/".to_string() + &"x".repeat(80);
+    let started = create_started(&fake, "a/b", &branch, Some("standardLinux32gb"), None).unwrap();
+    assert_eq!(started.state, "Provisioning");
+    assert_eq!(started.web_url, None);
+    let args = fake.argv(0);
+    assert!(args.contains(&"machine=standardLinux32gb".to_string()));
+    let display = args
+        .iter()
+        .find(|a| a.starts_with("display_name="))
+        .unwrap();
+    assert_eq!(display.chars().count(), "display_name=".len() + 48);
+    // gh errors, bad JSON, a missing or unsafe name and bad input never reach the network.
+    let fake = Fake::new(vec![fail("HTTP 422: no such branch")]);
+    assert!(create_started(&fake, "a/b", "x", None, None)
+        .unwrap_err()
+        .contains("no such branch"));
+    for body in ["not json", "{}", r#"{"name":"a b; rm"}"#] {
+        let fake = Fake::new(vec![ok(body)]);
+        assert!(
+            create_started(&fake, "a/b", "x", None, None).is_err(),
+            "{body}"
+        );
+    }
+    let fake = Fake::new(vec![]);
+    assert!(create_started(&fake, "bad repo", "x", None, None).is_err());
+    assert!(create_started(&fake, "a/b", "  ", None, None).is_err());
+}
+
+#[test]
+fn the_rest_create_gets_the_slow_timeout_but_other_api_reads_do_not() {
+    let create = v(&[
+        "api",
+        "--method",
+        "POST",
+        "repos/a/b/codespaces",
+        "-f",
+        "ref=x",
+    ]);
+    assert_eq!(call_timeout(&create), SLOW_CALL_TIMEOUT);
+    assert_eq!(
+        call_timeout(&v(&["api", "user/codespaces/cs-1", "--jq", ".web_url"])),
+        CALL_TIMEOUT
+    );
+}
+
+#[test]
+fn web_url_and_rebuild_argv() {
+    let fake = Fake::new(vec![ok("https://cs-1.github.dev\n")]);
+    assert_eq!(web_url(&fake, "cs-1").unwrap(), "https://cs-1.github.dev");
+    assert_eq!(
+        fake.argv(0),
+        v(&["api", "user/codespaces/cs-1", "--jq", ".web_url"])
+    );
+    assert!(web_url(&Fake::new(vec![ok("\n")]), "cs-1").is_err());
+    assert!(web_url(&Fake::new(vec![]), "cs 1").is_err());
+    let fake = Fake::new(vec![ok("")]);
+    rebuild(&fake, "cs-1").unwrap();
+    assert_eq!(fake.argv(0), v(&["codespace", "rebuild", "-c", "cs-1"]));
+    assert!(rebuild(&Fake::new(vec![fail("nope")]), "cs-1").is_err());
+    assert!(rebuild(&Fake::new(vec![]), "../x").is_err());
+}
+
+/// Streams canned lines and records whether `stop` was passed through.
+struct Streamer {
+    lines: Vec<&'static str>,
+    result: GhOutput,
+    argv: Mutex<Vec<String>>,
+}
+impl GhRunner for Streamer {
+    fn run(&self, _: &[String], _: Option<&str>) -> Result<GhOutput, String> {
+        unreachable!("the log is followed through run_streaming_until")
+    }
+    fn run_streaming_until(
+        &self,
+        args: &[String],
+        on_line: &mut dyn FnMut(&str),
+        _stop: &AtomicBool,
+    ) -> Result<GhOutput, String> {
+        *self.argv.lock().unwrap() = args.to_vec();
+        self.lines.iter().for_each(|l| on_line(l));
+        Ok(self.result.clone())
+    }
+}
+
+#[test]
+fn follow_creation_log_tails_the_persisted_log_over_gh_ssh() {
+    let runner = Streamer {
+        lines: vec![
+            "2026-11-07 04:01:54.456Z: Configuration starting...",
+            "=====",
+            "x",
+        ],
+        result: GhOutput {
+            success: true,
+            ..Default::default()
+        },
+        argv: Mutex::new(vec![]),
+    };
+    let mut seen = vec![];
+    follow_creation_log(&runner, "cs-1", &AtomicBool::new(false), &mut |l| {
+        seen.push(l.to_string())
+    })
+    .unwrap();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(
+        *runner.argv.lock().unwrap(),
+        v(&[
+            "codespace",
+            "ssh",
+            "-c",
+            "cs-1",
+            "--",
+            "tail",
+            "-n",
+            "+1",
+            "-F",
+            CREATION_LOG
+        ])
+    );
+    // A failed ssh is an error, unless it was stopped on purpose.
+    let failing = Streamer {
+        lines: vec![],
+        result: GhOutput {
+            success: false,
+            stderr: "Permission denied".into(),
+            ..Default::default()
+        },
+        argv: Mutex::new(vec![]),
+    };
+    let stop = AtomicBool::new(false);
+    assert!(follow_creation_log(&failing, "cs-1", &stop, &mut |_| {})
+        .unwrap_err()
+        .contains("Permission denied"));
+    stop.store(true, Ordering::Relaxed);
+    follow_creation_log(&failing, "cs-1", &stop, &mut |_| {}).unwrap();
+    assert!(follow_creation_log(&failing, "bad name", &stop, &mut |_| {}).is_err());
+}
+
+#[test]
+fn the_default_run_streaming_until_falls_back_to_run_streaming() {
+    let fake = Fake::new(vec![ok("a\nb\n")]);
+    let mut seen = vec![];
+    fake.run_streaming_until(
+        &v(&["x"]),
+        &mut |l| seen.push(l.to_string()),
+        &AtomicBool::new(true),
+    )
+    .unwrap();
+    assert_eq!(seen, ["a", "b"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn stream_command_kills_the_process_group_when_stopped() {
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        flag.store(true, Ordering::Relaxed);
+    });
+    let mut cmd = Command::new("sh");
+    // The grandchild keeps the pipes open: only a group kill ends the read.
+    cmd.args(["-c", "echo first; sleep 30 & sleep 30"]);
+    let started = std::time::Instant::now();
+    let mut seen = vec![];
+    let out = stream_command(cmd, &mut |l| seen.push(l.to_string()), Some(&stop)).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(seen, ["first"]);
+    assert!(!out.success);
+    assert_eq!(out.stdout, "first\n");
+}
+
+#[test]
+fn parse_log_line_reads_real_creation_log_lines() {
+    let line = parse_log_line("2026-11-07 04:01:54.456Z: Configuration starting...").unwrap();
+    assert_eq!(line.text, "Configuration starting...");
+    assert_eq!(line.at_ms, Some(1_794_024_114_456));
+    let line = parse_log_line(
+        "2026-11-07 04:01:58.000Z: Using image: mcr.microsoft.com/devcontainers/universal",
+    )
+    .unwrap();
+    assert_eq!(line.at_ms, Some(1_794_024_118_000));
+    assert_eq!(
+        line.text,
+        "Using image: mcr.microsoft.com/devcontainers/universal"
+    );
+    // Continuation lines have no prefix and keep their text (indentation trimmed).
+    let line =
+        parse_log_line("Outcome: success User: codespace WorkspaceFolder: /workspaces/monoptah\r")
+            .unwrap();
+    assert_eq!(line.at_ms, None);
+    assert_eq!(
+        line.text,
+        "Outcome: success User: codespace WorkspaceFolder: /workspaces/monoptah"
+    );
+    let line = parse_log_line("$ devcontainer up --skip-non-blocking-commands").unwrap();
+    assert_eq!(line.at_ms, None);
+    // Blank lines and separators are dropped, with or without a prefix.
+    for skipped in [
+        "",
+        "   ",
+        "==========",
+        "2026-11-07 04:01:54.456Z: =====",
+        "2026-11-07 04:01:54.456Z: ",
+    ] {
+        assert_eq!(parse_log_line(skipped), None, "{skipped:?}");
+    }
+    // A malformed stamp is plain text, never a panic.
+    let line = parse_log_line("2026-13-45 99:99:99.999Z: odd").unwrap();
+    assert_eq!(line.at_ms, None);
+    assert_eq!(
+        parse_log_line("héllo wörld ünïcode 😀 line that is long")
+            .unwrap()
+            .at_ms,
+        None
+    );
+}

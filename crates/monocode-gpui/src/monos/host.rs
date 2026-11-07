@@ -800,6 +800,14 @@ impl Monos {
                     );
                     return;
                 };
+                if action == "sessions.send"
+                    && let Some(error) = locked(&self.store).ok().and_then(|store| {
+                        monocode_core::cloud_sessions::starting_refusal(&store, session)
+                    })
+                {
+                    self.finish_call(call, Err(error), cx);
+                    return;
+                }
                 if action == "sessions.send" || action == "sessions.draft" {
                     if view.read(cx).busy
                         || view.read(cx).mono_external_pending()
@@ -1431,30 +1439,28 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                     }
                 }
             }
-            // A cloud session needs its codespace (minutes: this runs off the UI thread and no row
-            // exists until it is ready); the store is not locked meanwhile. A codespace created for
-            // a start that then fails is kept, and the error names it so a retry can target it.
-            let creating = matches!(&cloud, Some(t) if t.codespace == monocode_core::cloud_sessions::CodespaceChoice::New);
-            let binding = match cloud {
+            let startup = match cloud {
                 Some(target) => {
-                    Some(CloudApi::shared(&store)?.prepare(&project, target, &mut |_| {})?)
+                    Some(CloudApi::shared(&store)?.begin_start(&project, target, &provider)?)
                 }
                 None => None,
             };
-            let note = |e: String| match &binding {
-                Some(b) if creating => cloud_api::created_note(&b.codespace, &e),
+            let note = |e: String| match &startup {
+                Some((_, record)) if record.created => {
+                    cloud_api::created_note(&record.codespace, &e)
+                }
                 _ => e,
             };
             let mut db = locked(&store).map_err(note)?;
             // Always a chat: the app drives this session, whatever the surface preference.
-            let cwd = binding
-                .as_ref()
-                .map_or(project.as_str(), |b| b.project_key.as_str());
-            let mut summary = db.create(&provider, cwd).map_err(note)?;
+            let mut summary = match &startup {
+                Some((summary, _)) => summary.clone(),
+                None => db.create(&provider, &project).map_err(note)?,
+            };
             let mut made = None;
             let built = (|| {
                 // A cloud session has no local checkout to prepare.
-                if binding.is_none() {
+                if startup.is_none() {
                     monocode_core::app_access::launch_checkout(
                         &input,
                         &project,
@@ -1490,10 +1496,11 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                 return Err(note(e));
             }
             let mut result = json!({"sessionId":summary.id,"accepted":true,"project":project});
-            if let Some(binding) = &binding {
+            if let Some((_, record)) = &startup {
                 result["target"] =
-                    json!({"kind":"codespace","codespace":binding.codespace,"state":"available"});
-                result["codespaceState"] = json!("available");
+                    json!({"kind":"codespace","codespace":record.codespace,"state":"starting"});
+                result["codespaceState"] = json!("starting");
+                result["startup"] = json!({"step":record.current().map(|step| step.id())});
             }
             if let Some((id, name)) = filed {
                 result["folderId"] = json!(id);

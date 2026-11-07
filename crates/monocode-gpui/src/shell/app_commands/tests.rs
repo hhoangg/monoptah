@@ -1268,6 +1268,60 @@ mod cloud {
     }
 
     #[gpui::test]
+    fn an_operator_returns_a_pending_cloud_session_before_provisioning_finishes(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, caller, _, host, gh, _dir) = setup_cloud_in(cx, AUTH_OK, "Failed");
+        let input = json!({"prompt":"inspect the environment","target":{"codespace":"new","branch":"main"}});
+        let started = call(
+            window,
+            caller,
+            "pending-cloud",
+            "sessions.start",
+            input.clone(),
+            cx,
+        )
+        .unwrap();
+        let session_id = started["sessionId"].as_i64().unwrap();
+        assert_eq!(started["codespaceState"], "starting");
+        window
+            .update(cx, |shell, window, cx| {
+                assert!(shell.session_summaries[&session_id].has_messages);
+                assert!(shell.cloud_start_snapshot(session_id).unwrap().running);
+                shell.activate_session(session_id, window, cx);
+                assert_eq!(
+                    shell.right_panel.as_ref().unwrap().read(cx).tab(),
+                    crate::right_panel::RightTab::Codespace
+                );
+                let conversation = shell.sessions[&session_id].read(cx);
+                assert!(conversation.cloud_start_blocks());
+                assert_eq!(conversation.cloud_queued(), Some("inspect the environment"));
+            })
+            .unwrap();
+        assert!(host.0.lock().unwrap().is_empty());
+        assert!(
+            !gh.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.contains("codespace view"))
+        );
+        assert_eq!(
+            call(window, caller, "pending-cloud", "sessions.start", input, cx).unwrap(),
+            started
+        );
+        assert_eq!(
+            gh.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.contains("--method POST"))
+                .count(),
+            1
+        );
+    }
+
+    #[gpui::test]
     fn cloud_sessions_accept_the_session_actions_of_their_local_project(cx: &mut TestAppContext) {
         let (window, caller, path, host, _, _dir) = setup_cloud(cx, AUTH_OK);
         let cloud = add_cloud_session(window, &path, cx);
@@ -1515,7 +1569,7 @@ mod cloud {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|c| c.contains("codespace create"))
+                .any(|c| c.contains("codespace create") || c.contains("--method POST"))
         );
         // Validation runs first: nothing reaches gh for a refused combination.
         let calls = gh.calls.lock().unwrap().len();

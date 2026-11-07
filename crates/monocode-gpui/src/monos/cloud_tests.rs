@@ -260,7 +260,7 @@ fn a_mono_start_with_a_target_fails_before_creating_anything_when_validation_fai
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c.contains("codespace create")),
+            .any(|c| c.contains("codespace create") || c.contains("--method POST")),
         "no codespace may be created for a start that cannot succeed"
     );
 }
@@ -329,6 +329,103 @@ fn a_cloud_session_a_mono_starts_is_listed_and_filed_under_the_local_project(
     let launches = launches_of(&s, cx);
     let launch = launches.iter().find(|l| l.session_id == id).unwrap();
     assert_eq!(launch.cwd, s.project);
+}
+
+#[gpui::test]
+fn a_mono_returns_a_pending_cloud_session_before_provisioning_finishes(cx: &mut TestAppContext) {
+    let _clis = crate::shell::surface_tests::NoClis::new();
+    let (setup, gh, host, _guard) = cloud_setup(cx, "Failed");
+    setup.manager.update(cx, |manager, cx| {
+        manager.sidebar_preferences(&setup.id, true, true, cx)
+    });
+    let input = json!({"prompt":"inspect the environment","title":"Starting codespace","target":{"codespace":"new","branch":"trunk"}});
+    let started = run(&setup, "pending-cloud", "sessions.start", input.clone(), cx).unwrap();
+    let session_id = started["sessionId"].as_i64().unwrap();
+    assert_eq!(started["codespaceState"], "starting");
+    let owner = cx.update(|cx| setup.manager.read(cx).owner.upgrade().unwrap());
+    cx.update(|cx| {
+        let shell = owner.read(cx);
+        assert_eq!(
+            shell.mono_listed_project(session_id).as_deref(),
+            Some(setup.project.as_str())
+        );
+        let conversation = shell.mono_session_entity(session_id).unwrap();
+        assert!(conversation.read(cx).cloud_start_blocks());
+        assert!(
+            conversation
+                .read(cx)
+                .remote_debug()
+                .contains("waking=false")
+        );
+        assert!(
+            shell
+                .mono_session_views(cx)
+                .iter()
+                .find(|session| session.id == session_id)
+                .unwrap()
+                .busy
+        );
+        assert_eq!(
+            conversation.read(cx).cloud_queued(),
+            Some("inspect the environment")
+        );
+        assert!(
+            shell
+                .mono_groups(&setup.project)
+                .folders
+                .iter()
+                .any(|folder| folder.session_ids.contains(&session_id))
+        );
+    });
+    assert!(host.0.lock().unwrap().is_empty());
+    assert!(
+        !gh.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.contains("codespace view"))
+    );
+    assert_eq!(
+        run(&setup, "pending-cloud", "sessions.start", input, cx).unwrap(),
+        started
+    );
+    assert_eq!(
+        gh.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.contains("--method POST"))
+            .count(),
+        1
+    );
+    let listed = run(&setup, "pending-list", "sessions.list", json!({}), cx).unwrap();
+    let row = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sessionId"] == session_id)
+        .unwrap();
+    assert_eq!(row["codespaceState"], "starting");
+    assert!(row.get("startup").is_some());
+    let page = run(
+        &setup,
+        "pending-read",
+        "sessions.read",
+        json!({"sessionId":session_id}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(page["codespaceState"], "starting");
+    let error = run(
+        &setup,
+        "pending-send",
+        "sessions.send",
+        json!({"sessionId":session_id,"prompt":"another prompt"}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(error.contains("still starting"), "{error}");
+    assert!(host.0.lock().unwrap().is_empty());
 }
 
 /// LIVE: creates a real codespace of hhoangg/monoptah through the same Mono `sessions.start` path the

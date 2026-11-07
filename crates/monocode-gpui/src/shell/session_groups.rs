@@ -1029,6 +1029,7 @@ impl Shell {
             self.session_preview = None;
             self.preview_close = None;
         }
+        self.drop_cloud_start(id);
         self.sessions.remove(&id);
         self.stop_tui(id, cx);
         self.session_summaries.remove(&id);

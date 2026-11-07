@@ -1,5 +1,6 @@
 pub(crate) mod attachments;
 pub(crate) mod burst;
+pub(crate) mod cloud_start;
 pub(crate) mod dates;
 mod drafts;
 #[cfg(test)]
@@ -144,6 +145,10 @@ struct RenderedBlock {
 enum Body {
     RemotePlan(crate::conversation::remote_plans::Plan),
     SavedDraft,
+    /// The codespace startup status row of a cloud session.
+    CloudStart,
+    /// The message queued while the codespace starts.
+    CloudQueued,
     Markdown(Arc<MarkdownRow>),
     /// A dithered break between text replies in one Mono turn.
     MonoDivider,
@@ -708,6 +713,12 @@ pub(crate) struct TranscriptView {
     /// and Thinking header are already painted in the source transcript.
     submitted_mono_message: Option<String>,
     saved_draft: Option<monocode_core::follow_up::Message>,
+    /// The codespace start of a cloud session and the message queued behind it.
+    cloud_start: Option<Arc<crate::cloud_start_view::CloudStartSnapshot>>,
+    cloud_queued: Option<String>,
+    /// Whether the user opened or closed the status row's steps, for the phase it was in.
+    cloud_steps_open: Option<(crate::cloud_start_view::StartPhase, bool)>,
+    cloud_clock: Option<gpui::Task<()>>,
     /// Pending messages just taken, including any entrance still in flight.
     taken: Vec<TakenMessage>,
     pending_entrances: HashMap<String, Instant>,
@@ -1756,6 +1767,7 @@ impl TranscriptView {
             self.rows.clear();
             self.messages.clear();
             self.push_pending(0);
+            self.push_cloud_rows(0);
             self.list.reset(self.rows.len() + 1);
             if self.list.is_following_tail() || self.rows.len() <= self.pending.len() {
                 self.list.scroll_to_end();
@@ -2508,6 +2520,10 @@ impl TranscriptView {
             pending: Vec::new(),
             submitted_mono_message: None,
             saved_draft: None,
+            cloud_start: None,
+            cloud_queued: None,
+            cloud_steps_open: None,
+            cloud_clock: None,
             taken: Vec::new(),
             pending_entrances: HashMap::new(),
             launches: HashMap::new(),
@@ -3962,6 +3978,8 @@ impl TranscriptView {
             }
             self.rows.extend(ordered);
         }
+        // After the pinned-answers pass, which looks every row up in `messages`.
+        self.push_cloud_rows(display_start);
         // A phase and its nested steps are one sibling in the outer work tree.
         // Its final outer branch ends at the header, above the inner tool rail.
         let mut next_work_sibling = false;
@@ -4216,6 +4234,8 @@ impl TranscriptView {
                     | Body::Pending(_)
                     | Body::Launch(_)
                     | Body::SavedDraft
+                    | Body::CloudStart
+                    | Body::CloudQueued
             ) {
                 return false;
             }
@@ -4674,6 +4694,8 @@ impl TranscriptView {
         }
         match self.rows[ix].body {
             Body::SavedDraft => return self.saved_draft_row(cx),
+            Body::CloudStart => return self.cloud_start_row(cx),
+            Body::CloudQueued => return self.cloud_queued_row(cx),
             Body::Pending(i) => return self.pending_row(i, cx),
             Body::Launch(id) => return self.launch_row(ix, id, cx),
             _ => {}
@@ -4917,7 +4939,11 @@ impl TranscriptView {
                 crate::monos::cards::render(value, chosen.as_deref(), cx)
             }
             Body::MonoDivider => mono_divider::render(),
-            Body::Pending(_) | Body::Launch(_) | Body::SavedDraft => div().into_any_element(),
+            Body::Pending(_)
+            | Body::Launch(_)
+            | Body::SavedDraft
+            | Body::CloudStart
+            | Body::CloudQueued => div().into_any_element(),
             Body::Actions { turn, complete } => {
                 // Tighten only a visible Mono reply followed by a user bubble;
                 // stacked user messages keep their existing spacing.
@@ -5865,6 +5891,7 @@ impl TranscriptView {
     }
 }
 impl gpui::EventEmitter<ResponseRequest> for TranscriptView {}
+impl gpui::EventEmitter<crate::cloud_start_view::CloudStartAction> for TranscriptView {}
 impl Render for TranscriptView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.perf_scroll(window, cx);

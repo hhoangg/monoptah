@@ -35,6 +35,7 @@ impl TranscriptView {
         if self.source.is_empty() {
             self.rows.clear();
             self.push_saved_draft();
+            self.push_cloud_rows(0);
             self.list.reset(self.rows.len() + 1);
             self.list.scroll_to_end();
         } else {

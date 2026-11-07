@@ -10,6 +10,7 @@ mod classic_surface_tests;
 mod classic_surfaces;
 mod cloud;
 mod cloud_picker;
+mod cloud_start;
 #[cfg(test)]
 mod cloud_tests;
 mod contributors;
@@ -27,6 +28,7 @@ mod idle_agents;
 mod image_lightbox_tests;
 mod layout;
 mod live_agents;
+pub(crate) use live_agents::live_elapsed;
 mod mobile_host;
 mod mono_panes;
 pub(crate) mod monos;
@@ -714,6 +716,10 @@ pub(crate) struct Shell {
     /// Saves the local copy of a cloud session before its codespace is stopped or deleted.
     cloud_convert: cloud::ConvertFn,
     cloud_busy: HashSet<i64>,
+    /// Cloud sessions whose codespace is starting (or failed to start), by session id.
+    cloud_starts: HashMap<i64, cloud_start::CloudStartView>,
+    /// Where the right panel was before a startup opened the Codespace tab.
+    codespace_return: Option<cloud_start::PanelReturn>,
     /// Local projects whose `origin` was checked for a GitHub repository.
     github_projects: HashMap<String, bool>,
     /// A cloud session whose archive waits for its dialog (opened on the next render).
@@ -970,7 +976,10 @@ impl Shell {
         let remote = Arc::new(monocode_core::remote::Connections::new(remote_dir));
         monocode_core::remote::set_default_connections(remote.clone());
         let quit_remote = remote.clone();
-        cx.on_app_quit(move |_, cx| {
+        cx.on_app_quit(move |this, cx| {
+            for view in this.cloud_starts.values() {
+                view.cancel_on_quit();
+            }
             let remote = quit_remote.clone();
             cx.background_executor().spawn(async move {
                 remote.shutdown();
@@ -1161,6 +1170,8 @@ impl Shell {
             cloud_archive: None,
             cloud_convert: cloud::default_convert(),
             cloud_busy: HashSet::new(),
+            cloud_starts: HashMap::new(),
+            codespace_return: None,
             github_projects: HashMap::new(),
             cloud_archive_request: Vec::new(),
             codespace_picker: None,
@@ -1440,6 +1451,7 @@ impl Shell {
             this.order.push(summary.id);
             this.session_summaries.insert(summary.id, summary);
         }
+        this.resume_cloud_starts(cx);
         this.init_mobile_host(cx);
         if let Some(id) = this.workspace.active {
             this.ensure_session(this.workspace.session_for_pane(id), cx);
@@ -1555,7 +1567,22 @@ impl Shell {
             view.transcript.update(cx, |transcript, cx| {
                 transcript.apply_preferences(&self.workspace.preferences, cx)
             });
+            if let Some(start) = self.cloud_start_snapshot(id) {
+                view.set_cloud_start(Some(start), cx);
+            }
         });
+        self.observations.push(cx.subscribe(
+            &view,
+            move |_, _, event: &crate::cloud_start_view::CloudStartAction, cx| {
+                let action = event.action;
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.cloud_start_action(id, action, window, cx)
+                    });
+                })
+                .detach();
+            },
+        ));
         self.observations
             .push(cx.subscribe(&view, move |this, _, _: &SessionChanged, cx| {
                 let Some(view) = this.sessions.get(&id) else {
@@ -1866,16 +1893,20 @@ impl Shell {
     /// project, and not covered by an app view.
     fn right_panel_shown(&self, cx: &App) -> bool {
         (self.workspace.right_panel_open || self.right_slide.is_some())
-            && (!self.workspace.classic_layout || self.mono_active(cx))
+            && (!self.workspace.classic_layout
+                || self.mono_active(cx)
+                || self.codespace_panel_selected(cx))
             && !self.app_view_open()
             && self.settings.is_none()
             && !self.search_page()
-            && (self.mono_active(cx) || self.git.read(cx).available())
+            && (self.mono_active(cx)
+                || self.codespace_panel_selected(cx)
+                || self.git.read(cx).available())
     }
     fn sync_right_panel(&mut self, cx: &mut Context<Self>) {
         let opening = self.right_slide.as_ref().is_some_and(PaneSlide::opening);
         let shown = !self.mono_active(cx)
-            && !self.workspace.classic_layout
+            && (!self.workspace.classic_layout || self.codespace_panel_selected(cx))
             && self.workspace.right_panel_open
             && !self.app_view_open()
             && self.settings.is_none()
@@ -1944,7 +1975,10 @@ impl Shell {
     }
     fn set_right_panel_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.app_view_open()
-            || (!self.mono_active(cx) && !self.git.read(cx).available())
+            || (open
+                && !self.mono_active(cx)
+                && !self.codespace_panel_selected(cx)
+                && !self.git.read(cx).available())
             || self.workspace.right_panel_open == open
         {
             return;
@@ -1997,6 +2031,21 @@ impl Shell {
             panel.set_terminal_tab(terminal_tab, cx);
             panel
         });
+        let codespace = panel.read(cx).codespace.clone();
+        self.observations.push(cx.subscribe_in(
+            &codespace,
+            window,
+            |this, _, event: &crate::codespace_pane::PaneEvent, window, cx| match event {
+                crate::codespace_pane::PaneEvent::Close => {
+                    this.set_right_panel_open(false, window, cx)
+                }
+                crate::codespace_pane::PaneEvent::Action(action) => {
+                    if let Some(id) = this.workspace.active {
+                        this.cloud_start_action(id, *action, window, cx);
+                    }
+                }
+            },
+        ));
         let explorer = panel.read(cx).explorer.clone();
         self.observations.push(cx.subscribe(
             &explorer,
@@ -2051,7 +2100,10 @@ impl Shell {
             .push(cx.subscribe(&panel, |this, _, event: &PanelEvent, cx| {
                 match event {
                     PanelEvent::Tab(tab) => {
-                        this.workspace.right_panel_tab = *tab;
+                        // The Codespace tab belongs to a startup, not to the saved layout.
+                        if *tab != crate::right_panel::RightTab::Codespace {
+                            this.workspace.right_panel_tab = *tab;
+                        }
                         if *tab == crate::right_panel::RightTab::Terminal {
                             this.ensure_panel_terminal(cx);
                         }
@@ -4475,6 +4527,7 @@ impl Shell {
             .get(&id)
             .is_some_and(|review| review.chat_hidden);
         self.focus_active(window, cx);
+        self.auto_open_codespace_panel(id, window, cx);
         self.persist(cx);
         cx.notify();
     }

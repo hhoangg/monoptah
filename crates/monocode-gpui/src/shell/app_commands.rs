@@ -111,6 +111,7 @@ impl Shell {
                             // A cloud session is listed under its local project, not as a
                             // rail project of its own.
                             this.mark_cloud_session(id);
+                            this.register_cloud_start(id);
                             if this.is_cloud(id) {
                                 this.add_loaded(summary, cx);
                             } else {
@@ -120,6 +121,7 @@ impl Shell {
                             if let Some(view) = this.sessions.get(&id) {
                                 view.update(cx, |v, cx| v.install_app_launch(settings, !draft, cx));
                             }
+                            this.track_cloud_start(id, cx);
                             this.app_place_launch(id, placement, reveal, window, cx);
                         }
                         Effect::Today => {
@@ -544,32 +546,29 @@ impl Shell {
                 let fingerprint = app::fingerprint(&action, &input);
                 let cloud = cloud_api::target_from_input(&input);
                 self.app_background(call,move|store| {
-                    // Creating or waking a codespace takes minutes; this runs off the UI thread and
-                    // no session row exists until it is ready. A retry with the same request ID
-                    // waits for it (the app answers "still running", then replays the result).
                     let models=if input.get("model").is_some() || input.get("modelSettings").is_some() || input.get("effort").is_some() {
                         monocode_core::catalog::models_for(kind,&settings.account)?
                     }else{monocode_core::catalog::cached_models_for(kind,&settings.account).unwrap_or_default()};
                     let mut settings=app::launch_settings(&input,&provider,settings,kind,&models)?;
                     settings.revision=0;
                     let title=app::optional_text(&input,"title",160)?.unwrap_or_else(||prompt.chars().take(160).collect());
-                    // Everything cheap is validated above; only now is a codespace created (minutes).
-                    let creating = matches!(&cloud, Some(t) if t.codespace == monocode_core::cloud_sessions::CodespaceChoice::New);
-                    let binding = match cloud {
+                    let startup = match cloud {
                         Some(target) => {
                             let api = CloudApi::shared(&store)?;
-                            Some(api.prepare(&project, target, &mut |_| {})?)
+                            Some(api.begin_start(&project, target, kind.id())?)
                         }
                         None => None,
                     };
                     let built=(||{
                     // Always a chat: the app drives this session, whatever the surface preference.
                     let mut store=locked(&store)?;
-                    let cwd=binding.as_ref().map_or(project.as_str(),|b|b.project_key.as_str());
-                    let (mut summary,fresh)=store.create_app_session(caller,&request,&fingerprint,kind.id(),cwd)?;
+                    let (mut summary,fresh)=match &startup {
+                        Some((summary,_)) => (summary.clone(),true),
+                        None => store.create_app_session(caller,&request,&fingerprint,kind.id(),&project)?,
+                    };
                     if fresh {
                         // A cloud session has no local checkout to prepare.
-                        if binding.is_none()
+                        if startup.is_none()
                             && let Err(error)=app::launch_checkout(&input,&project,summary.id,&mut settings) {let _=store.delete(summary.id);return Err(error);}
                         store.title(summary.id,&title)?;summary.title=title;
                         store.configure_agent(summary.id,kind.id(),&settings)?;
@@ -579,14 +578,15 @@ impl Shell {
                     }
                     let draft=input["draft"].as_bool().unwrap_or(false);let reveal=input["reveal"].as_bool().unwrap_or(false);
                     let mut value=json!({"id":summary.id,"sessionId":summary.id,"cwd":project,"harness":kind.id(),"model":settings.model,"submitted":!draft,"draft":draft,"accepted":true});
-                    if let Some(binding)=&binding {
-                        value["target"]=json!({"kind":"codespace","codespace":binding.codespace,"state":"available"});
-                        value["codespaceState"]=json!("available");
+                    if let Some((_,record))=&startup {
+                        value["target"]=json!({"kind":"codespace","codespace":record.codespace,"state":"starting"});
+                        value["codespaceState"]=json!("starting");
+                        value["startup"]=json!({"step":record.current().map(|step|step.id())});
                     }
                     Ok((value,if fresh {Effect::Start(Box::new((summary,settings,draft,reveal,placement)))}else{Effect::None}))
                     })();
                     // A codespace created for this start is kept: say so, so a retry targets it.
-                    built.map_err(|e| match &binding { Some(b) if creating => cloud_api::created_note(&b.codespace,&e), _ => e })
+                    built.map_err(|e| match &startup { Some((_,record)) if record.created => cloud_api::created_note(&record.codespace,&e), _ => e })
                 },cx);
                 return;
             }
@@ -646,6 +646,14 @@ impl Shell {
                     }) {
                     Err(e) => Err(e),
                     Ok((id, view)) => {
+                        if action == "sessions.send"
+                            && let Some(error) = locked(&self.store).ok().and_then(|store| {
+                                monocode_core::cloud_sessions::starting_refusal(&store, id)
+                            })
+                        {
+                            self.finish_app_call(call, Err(error), cx);
+                            return;
+                        }
                         if action == "sessions.delete" && input["removeWorktree"] == true {
                             let (reply, answer) = async_channel::bounded(1);
                             self.app_delete_removing_worktree(id, reply, window, cx);

@@ -21,7 +21,7 @@ struct LiveAgent {
 }
 
 /// liveAgents.ts's formatLiveElapsed.
-fn live_elapsed(ms: u64) -> String {
+pub(crate) fn live_elapsed(ms: u64) -> String {
     let seconds = ((ms + 500) / 1000).max(1);
     if seconds < 60 {
         return format!("{seconds}s");

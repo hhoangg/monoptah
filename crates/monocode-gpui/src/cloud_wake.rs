@@ -93,6 +93,8 @@ pub(crate) mod fakes {
                 LIST
             } else if line.contains("codespace view") {
                 &view
+            } else if line.contains("api --method POST") {
+                r#"{"name":"octo-new","state":"Provisioning"}"#
             } else if line.contains("codespace stop")
                 || line.contains("codespace delete")
                 || line.contains("codespace ssh")

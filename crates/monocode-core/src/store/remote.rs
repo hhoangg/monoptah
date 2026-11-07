@@ -32,6 +32,35 @@ pub struct RemoteProject {
     pub codespace: Option<String>,
 }
 
+/// Prefix of the provisional environment id of a cloud session whose codespace is still
+/// starting (`pending-<codespace>`). It never names a connected machine.
+const PENDING_ENVIRONMENT: &str = "pending-";
+
+/// True for the provisional environment of a cloud session that is still starting.
+pub fn is_pending_cloud_environment(environment: &str) -> bool {
+    environment.starts_with(PENDING_ENVIRONMENT)
+}
+
+/// The provisional project of a cloud session created before its codespace is reachable:
+/// environment `pending-<codespace>`, no host project id, `remote_cwd` as its path.
+/// [`Store::create_pending_cloud_session`] stores a session on it and
+/// [`Store::rebind_cloud_session`] moves that session to the real project once connected.
+pub fn pending_cloud_project(
+    local_project: &str,
+    codespace: &str,
+    remote_cwd: &str,
+) -> RemoteProject {
+    let environment_id = format!("{PENDING_ENVIRONMENT}{codespace}");
+    RemoteProject {
+        key: crate::remote::remote_path(&environment_id, remote_cwd),
+        environment_id,
+        project_id: String::new(),
+        cwd: remote_cwd.into(),
+        local_project: Some(local_project.into()),
+        codespace: Some(codespace.into()),
+    }
+}
+
 /// Local bytes needed to retry the same journaled attachment references.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -237,6 +266,7 @@ impl Store {
             PROJECTS,
             &serde_json::to_string(&projects).map_err(|e| e.to_string())?,
         )?;
+        crate::cloud_sessions::startup::forget_codespace_starts(self, codespace)?;
         self.save_setting(
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
@@ -283,6 +313,7 @@ impl Store {
         if sessions.remove(&id).is_none() {
             return Ok(());
         }
+        crate::cloud_sessions::startup::forget_session_start(self, id)?;
         self.hide_legacy_remote_sessions([id])?;
         self.save_setting(
             SESSIONS,
@@ -426,6 +457,36 @@ impl Store {
                         == cwd.trim_end_matches('/')
             })
             .ok_or("Open this folder on its machine again to restore its project identity")?;
+        self.save_blank_remote_session(kind, provider, project)
+    }
+    /// Like [`Self::create`] for a remote cwd, but takes the provisional project directly
+    /// (see [`pending_cloud_project`]) instead of looking it up, and does not register it
+    /// in the remote projects: it has no host project yet. Pair with
+    /// [`Self::rebind_cloud_session`].
+    pub fn create_pending_cloud_session(
+        &self,
+        provider: &str,
+        project: RemoteProject,
+    ) -> Result<Session, String> {
+        let kind = crate::provider::Kind::parse(provider).ok_or("Unknown remote provider")?;
+        self.save_blank_remote_session(kind, provider, project)
+    }
+    /// Moves a session to `project` (replacing its stored project and `summary.cwd`, keeping
+    /// its id) and returns the updated summary. Used when a pending cloud session's codespace
+    /// is ready. `Err` when the session does not exist.
+    pub fn rebind_cloud_session(&self, id: i64, project: RemoteProject) -> Result<Session, String> {
+        let mut session = self.remote_session_stored(id)?.ok_or("Session not found")?;
+        session.summary.cwd = project.key.clone();
+        session.project = project;
+        self.save_remote_session(&session)?;
+        Ok(session.summary)
+    }
+    fn save_blank_remote_session(
+        &self,
+        kind: crate::provider::Kind,
+        provider: &str,
+        project: RemoteProject,
+    ) -> Result<Session, String> {
         let id = -shared::handle(&format!("remote:blank:{}", uuid::Uuid::new_v4()));
         let summary = Session {
             id,
@@ -433,7 +494,7 @@ impl Store {
             provider: provider.into(),
             cwd: project.key.clone(),
             provider_id: None,
-            has_messages: false,
+            has_messages: is_pending_cloud_environment(&project.environment_id),
             updated_at: crate::time::now_ms(),
             archived: false,
             pinned: false,
@@ -654,6 +715,7 @@ impl Store {
                 json!({"sessionId": session_id,"projectId": remote.project.project_id}),
             )?;
         }
+        crate::cloud_sessions::startup::forget_session_start(self, id)?;
         let mut sessions = self.remote_sessions()?;
         sessions.remove(&id);
         self.hide_legacy_remote_sessions([id])?;
@@ -1059,5 +1121,71 @@ mod configuration_tests {
         assert_eq!(store.cloud_sessions("/Users/me/repo").unwrap().len(), 1);
         store.forget_codespace("octo-abc").unwrap();
         assert!(store.remote_session(session.id).unwrap().is_none());
+    }
+    #[test]
+    fn a_pending_cloud_session_has_its_binding_but_no_registered_project() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let pending = pending_cloud_project("/Users/me/widgets", "cs-1", "/workspaces/widgets");
+        assert_eq!(pending.environment_id, "pending-cs-1");
+        assert!(is_pending_cloud_environment(&pending.environment_id));
+        assert!(!is_pending_cloud_environment("env-cs-1"));
+        assert_eq!(pending.project_id, "");
+        assert_eq!(pending.key, "remote://pending-cs-1/workspaces/widgets");
+        let session = store
+            .create_pending_cloud_session("claude", pending.clone())
+            .unwrap();
+        assert!(session.id < 0);
+        assert_eq!(session.cwd, pending.key);
+        assert_eq!(session.provider, "claude");
+        // Not a remote project, yet visible as a cloud session with its binding.
+        assert!(store.remote_projects().unwrap().is_empty());
+        let found = store.remote_session(session.id).unwrap().unwrap();
+        assert_eq!(found.project.codespace.as_deref(), Some("cs-1"));
+        assert_eq!(
+            found.project.local_project.as_deref(),
+            Some("/Users/me/widgets")
+        );
+        let listed = store.cloud_sessions("/Users/me/widgets").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].summary.id, session.id);
+        assert!(store.sessions().unwrap().iter().any(|s| s.id == session.id));
+        assert!(store.create_pending_cloud_session("nope", pending).is_err());
+    }
+
+    #[test]
+    fn rebinding_moves_a_session_to_the_real_project_and_keeps_its_id() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let pending = pending_cloud_project("/p", "cs-1", "/workspaces/widgets");
+        let session = store
+            .create_pending_cloud_session("claude", pending)
+            .unwrap();
+        let real = store
+            .remember_cloud_project(
+                "env-cs-1",
+                &json!({"id":"project-1","cwd":"/workspaces/widgets"}),
+                "/p",
+                "cs-1",
+            )
+            .unwrap();
+        let moved = store
+            .rebind_cloud_session(session.id, real.clone())
+            .unwrap();
+        assert_eq!(moved.id, session.id);
+        assert_eq!(moved.cwd, "remote://env-cs-1/workspaces/widgets");
+        let found = store.remote_session(session.id).unwrap().unwrap();
+        assert_eq!(found.project.environment_id, "env-cs-1");
+        assert_eq!(found.project.project_id, "project-1");
+        assert_eq!(found.project.codespace.as_deref(), Some("cs-1"));
+        assert_eq!(store.cloud_sessions("/p").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .sessions()
+                .unwrap()
+                .iter()
+                .filter(|s| s.id == session.id)
+                .count(),
+            1
+        );
+        assert!(store.rebind_cloud_session(-12345, real).is_err());
     }
 }
