@@ -1,0 +1,63 @@
+// Monoptah dev container for GitHub Codespaces.
+{
+  "name": "Monoptah",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".",
+    "args": {
+      "NODE_MAJOR": "22",
+      "GH_VERSION": ""
+    }
+  },
+  // No workspaceFolder / workspaceMount on purpose: the app hardcodes the checkout at
+  // /workspaces/<repo-name> (/workspaces/monoptah), which is the Codespaces default.
+  "remoteUser": "vscode",
+  "features": {
+    // The repo has no rust-toolchain file; CI uses dtolnay/rust-toolchain@stable, so latest
+    // stable matches. crates/monocode-gpui uses edition 2024 (needs >= 1.85).
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "latest",
+      "profile": "minimal",
+      "components": "rustfmt,clippy"
+    },
+    // REQUIRED: `gh codespace ssh` fails on a custom Dockerfile image without sshd, and the
+    // app runs all codespace commands through it.
+    "ghcr.io/devcontainers/features/sshd:1": {},
+    // Installs @anthropic-ai/claude-code via `npm install -g` using the image's Node, so it
+    // lands in /usr/bin/claude where the app's login-shell bootstrap finds it (otherwise the
+    // bootstrap falls back to downloading it at connect time).
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
+  "overrideFeatureInstallOrder": [
+    "ghcr.io/devcontainers/features/rust",
+    "ghcr.io/devcontainers/features/sshd",
+    "ghcr.io/anthropics/devcontainer-features/claude-code"
+  ],
+  // Keep this a plain object: the app parses this file with a JSONC stripper and serde_json
+  // and reads secrets.<KEY>.description.
+  "secrets": {
+    "CLAUDE_CODE_OAUTH_TOKEN": {
+      "description": "Claude Code OAuth token from `claude setup-token`. The Monoptah cloud session runs Claude Code in this codespace and needs it.",
+      "documentationUrl": "https://docs.anthropic.com/en/docs/claude-code/setup"
+    }
+  },
+  "updateContentCommand": "bash .devcontainer/bootstrap.sh update-content",
+  "postCreateCommand": "bash .devcontainer/bootstrap.sh post-create",
+  "postStartCommand": "bash .devcontainer/bootstrap.sh post-start",
+  "waitFor": "postCreateCommand",
+  // Sized for the default basicLinux32gb machine (2 cores, 8 GB RAM, 32 GB disk). Do not
+  // raise it or the app's default machine will be rejected.
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "8gb",
+    "storage": "32gb"
+  },
+  "customizations": {
+    "codespaces": {
+      "openFiles": ["CLAUDE.md"]
+    },
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer"]
+    }
+  }
+}
