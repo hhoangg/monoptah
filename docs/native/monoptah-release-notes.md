@@ -1,16 +1,10 @@
-# Monoptah Native 0.48.0
+# Monoptah Native 0.48.1
 
-## Changes since 0.46.0
+## Changes since 0.48.0
 
-- Run native sessions in GitHub Codespaces: configure access from the project menu, create and reconnect cloud sessions, and use remote terminals and the app API. Background requests do not wake sleeping codespaces.
-- Pull evidence into the local session folder and preserve a local archived copy before stopping or deleting a codespace. Conversion checks saved commits, preserves restore references, and asks about unsaved files before deletion.
-- Capture the Claude token from `setup-token` automatically, normalize pasted tokens, and validate them before saving.
-- Copy Session ID now copies the numeric native session ID. Mono habits can inspect archive and worktree facts and use guarded session cleanup APIs.
-- Closing a terminal pane or title tab now asks for confirmation when a foreground process is running. Closing several tabs lists their running terminals together; cancelling keeps them open. Idle shells still close immediately.
-- Close All Tabs and Close Other Tabs keyboard shortcuts preserve pinned tabs, matching the tab menu.
-- The collapsed sidebar peeks open in the boxy Focused layout, and glass blur eases with the slide animation.
-- On mobile, the message composer stays editable while the desktop reconnects.
-- Synced upstream through native preview 14 (`a25b5b89`). Monoptah's terminal session surfaces and other fork features are preserved.
+- A Codespace session appears as soon as its codespace is requested. A new Codespace panel follows the startup with each phase, its duration and the live creation log, and the transcript reports "Codespace ready in ..." or the phase that failed. Retry, Rebuild container, Open in browser and Delete codespace are available from the startup.
+- Messages sent while the codespace starts are queued and sent when it is ready. If the start fails, they are marked as not sent.
+- Codespace starts in progress are picked up again when the app relaunches.
 
 ## Downloads and updates
 
