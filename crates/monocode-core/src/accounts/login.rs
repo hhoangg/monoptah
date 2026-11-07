@@ -38,6 +38,15 @@ pub fn authenticate(
     action: AuthAction,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    if kind == Kind::Claude && profile.uses_claude_token()? {
+        if action == AuthAction::SignOut {
+            profile.remove_claude_token()?;
+        } else {
+            return Err(
+                "Replace or remove the saved token or API key in Accounts before using browser login.".into(),
+            );
+        }
+    }
     let args = arguments(kind, action)
         .ok_or("This provider does not offer a single browser sign-in flow")?;
     let binary =

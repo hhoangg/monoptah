@@ -134,6 +134,11 @@ impl Store {
             PRIMARY KEY(session_id,row_ix));
           CREATE TABLE IF NOT EXISTS native_reminders(session_id INTEGER PRIMARY KEY REFERENCES native_sessions(id),
             due_at INTEGER NOT NULL, fired_at INTEGER);").map_err(|e| e.to_string())?;
+        conn.execute_batch(crate::accounts::CREDENTIALS_TABLE)
+            .map_err(|e| e.to_string())?;
+        if let Some(dir) = path.parent() {
+            crate::accounts::register_database(dir, path);
+        }
         let columns = conn
             .prepare("PRAGMA table_info(native_sessions)")
             .map_err(|e| e.to_string())?

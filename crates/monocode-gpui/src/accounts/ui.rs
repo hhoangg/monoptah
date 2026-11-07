@@ -125,11 +125,86 @@ impl Accounts {
                 .into_any_element();
         }
         let adding = editor.id.is_none();
-        div()
+        let options = self.has_auth_options();
+        let secret = self.secret_row();
+        let ready = self.editor_ready(cx);
+        let auth = editor.auth;
+        let disabled = self.working || !ready;
+        let label = if self.working && (adding || options) {
+            if options && auth != super::AuthMethod::Browser {
+                "Saving…"
+            } else {
+                "Waiting for browser…"
+            }
+        } else if options {
+            auth.button_label(adding)
+        } else if adding {
+            "Sign in and add"
+        } else {
+            "Save"
+        };
+        let spinner = self.working;
+        let submit = primary_button("save-account-edit", label, disabled)
+            .ml_1()
+            .h_6()
+            .px(px(10.))
+            .rounded(px(4.5))
+            .when(options, |d| d.rounded_r_none())
+            .gap(px(6.))
+            .text_size(px(11.))
+            .when(spinner, |d| {
+                d.child(crate::pulse::looping(
+                    "account-editor-spinner",
+                    std::time::Duration::from_secs(1),
+                    crate::pulse::Rate::Smooth,
+                    move |delta| {
+                        icon("refresh-cw", 12.).with_transformation(gpui::Transformation::rotate(
+                            gpui::percentage(delta),
+                        ))
+                    },
+                ))
+            })
+            .child(label)
+            .on_click(cx.listener(|this, _, _, cx| this.submit_editor(cx)));
+        let mut divider = shell_fill();
+        divider.a = 0.25;
+        let mut ink = shell_fill();
+        ink.a = 1.;
+        let submit = if options {
+            div()
+                .flex()
+                .flex_shrink_0()
+                .child(submit)
+                .child(
+                    primary_button("claude-auth-options", "Sign-in options", self.working)
+                        .relative()
+                        .h_6()
+                        .w_6()
+                        .px_0()
+                        .justify_center()
+                        .rounded(px(4.5))
+                        .rounded_l_none()
+                        .border_l_1()
+                        .border_color(divider)
+                        // Match the main segment's dimmed look while it is disabled, but
+                        // stay clickable: the options must be reachable before a key is typed.
+                        .when(disabled && !self.working, |d| d.opacity(0.4))
+                        .aria_expanded(self.editor.as_ref().is_some_and(|e| e.menu.is_some()))
+                        .child(self.editor.as_ref().unwrap().anchor.probe())
+                        .child(icon("chevron-down", 12.).text_color(ink))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_auth_menu(window, cx)),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            submit.into_any_element()
+        };
+        let row = div()
             .h(px(48.))
             .px_4()
             .py_2()
-            .border_b_1()
+            .when(secret.is_none(), |d| d.border_b_1())
             .border_color(content(0.05))
             .flex()
             .items_center()
@@ -164,61 +239,14 @@ impl Accounts {
                             .text_size(px(11.))
                             .text_color(content(0.45))
                             .child("Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if this.working {
-                                    this.cancel_auth(cx);
-                                }
-                                if let Some(focus) =
-                                    this.editor.take().and_then(|e| e.previous_focus)
-                                {
-                                    window.focus(&focus, cx);
-                                }
-                                this.error = None;
-                                this.signin = None;
-                                cx.notify();
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.cancel_editor(window, cx)),
+                            ),
                     )
-                    .child(
-                        primary_button(
-                            "save-account-edit",
-                            if adding {
-                                "Sign in and add"
-                            } else {
-                                "Save account"
-                            },
-                            self.working || editor.input.read(cx).content.trim().is_empty(),
-                        )
-                        .ml_1()
-                        .h_6()
-                        .px(px(10.))
-                        .rounded(px(4.5))
-                        .gap(px(6.))
-                        .text_size(px(11.))
-                        .when(self.working, |d| {
-                            d.child(crate::pulse::looping(
-                                "account-editor-spinner",
-                                std::time::Duration::from_secs(1),
-                                crate::pulse::Rate::Smooth,
-                                move |delta| {
-                                    icon("refresh-cw", 12.).with_transformation(
-                                        gpui::Transformation::rotate(gpui::percentage(delta)),
-                                    )
-                                },
-                            ))
-                        })
-                        .child(if adding {
-                            if self.working {
-                                "Waiting for browser…"
-                            } else {
-                                "Sign in and add"
-                            }
-                        } else {
-                            "Save"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| this.submit_editor(cx))),
-                    ),
+                    .child(submit),
             )
-            .into_any_element()
+            .children(self.auth_menu_popover(cx));
+        div().child(row).children(secret).into_any_element()
     }
 
     pub(crate) fn settings_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1108,6 +1136,9 @@ impl Accounts {
     /// leaving every Sign in button disabled until then.
     pub(crate) fn cancel_auth(&mut self, cx: &mut Context<Self>) {
         if let Some(signin) = self.signin.take() {
+            if !signin.complete {
+                self.restore_pending_auth(cx);
+            }
             signin.cancel.store(true, Ordering::Relaxed);
             if !signin.complete {
                 self.working = false;

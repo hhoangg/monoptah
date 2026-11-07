@@ -330,3 +330,20 @@ fn claude_entrypoint_label_is_opt_in_for_every_profile() {
         assert_eq!(label(false, &profile), Some("sdk-cli".into()));
     }
 }
+
+#[test]
+fn setup_token_validation_accepts_wrapping_but_rejects_commands_without_disclosure() {
+    assert_eq!(
+        super::normalize_claude_token(" \nsk-ant-oat01-fixture\n wrapped\t ").unwrap(),
+        "sk-ant-oat01-fixturewrapped"
+    );
+    for value in [
+        "",
+        "secret",
+        "export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-private",
+        "sk-ant-oat01-abc;xyz",
+    ] {
+        let error = super::normalize_claude_token(value).unwrap_err();
+        assert!(!error.contains(value) || value.is_empty());
+    }
+}

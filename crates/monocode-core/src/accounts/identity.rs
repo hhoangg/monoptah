@@ -12,6 +12,9 @@ pub struct Identity {
     pub organization: Option<String>,
 }
 pub(super) fn read(profile: &Profile, kind: Kind) -> Option<Identity> {
+    if kind == Kind::Claude && profile.uses_claude_token().ok()? {
+        return None;
+    }
     let dir = profile.directory(kind).ok()?;
     match kind {
         Kind::Claude => claude_identity(dir),

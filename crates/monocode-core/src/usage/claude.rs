@@ -3,6 +3,11 @@ use serde_json::Value;
 use std::{io::Read, path::PathBuf, time::Duration};
 
 pub(super) fn fetch_for(profile: &crate::accounts::Profile) -> Result<Snapshot, FetchError> {
+    if profile.uses_claude_token().map_err(FetchError::failed)? {
+        return Err(FetchError::failed(
+            "Usage is unavailable for token and API key accounts.",
+        ));
+    }
     let config = profile
         .directory(crate::provider::Kind::Claude)
         .map_err(FetchError::failed)?

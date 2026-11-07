@@ -25,6 +25,9 @@ pub(super) fn open(
     let name = database.file_name().unwrap_or_default().to_string_lossy();
     let path = database.with_file_name(format!("{name}.gpui.sqlite3"));
     let old_path = database.with_file_name(format!("{name}.gpui.json"));
+    if let Some(dir) = database.parent() {
+        crate::accounts::register_database(dir, &path);
+    }
     if read_only && !path.exists() {
         return Ok((legacy(&old_path)?, None));
     }
@@ -60,6 +63,9 @@ pub(super) fn open(
     }
     if !read_only {
         sql(conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"))?;
+        // Encrypted provider account credentials live here, never in the
+        // desktop schema, which this app does not change.
+        sql(conn.execute_batch(crate::accounts::CREDENTIALS_TABLE))?;
         if version == 0 {
             // Another native window may have finished the import while this
             // connection waited. Acquire the writer before checking its marker.

@@ -42,6 +42,14 @@ impl Accounts {
         id: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if kind == Kind::Claude && self.uses_claude_token(id) {
+            return div().p_4().flex().flex_col().gap_3()
+                .child("This account uses a token or API key. If Claude Code reports an authentication error, replace it in Accounts.")
+                .child(crate::settings::widgets::secondary_button("manage-claude-token", "Manage sign-in", false, self.working)
+                    .child("Manage sign-in")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(AccountEvent::Manage))))
+                .into_any_element();
+        }
         let signin = self.footer_signin(kind, id);
         let complete = signin.is_some_and(|s| s.complete);
         let error = signin.and_then(|s| s.error.clone());
