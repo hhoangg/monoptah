@@ -1197,6 +1197,30 @@ impl Store {
     }
     /// Deletes the conversation, its settings, reminder and folder for good.
     pub fn delete(&mut self, id: i64) -> Result<(), String> {
+        self.delete_using(id, |store| store.delete_rows(id))
+    }
+
+    /// The normal deletion and local cleanup, with injected remote boundaries.
+    pub fn delete_with_remote(
+        &mut self,
+        id: i64,
+        gh: &dyn crate::codespaces::GhRunner,
+        host: &dyn crate::cloud_sessions::Host,
+    ) -> Result<(), String> {
+        self.delete_using(id, |store| {
+            if store.remote_session(id)?.is_some() {
+                store.delete_remote_session_with(id, gh, host)
+            } else {
+                store.delete_rows(id)
+            }
+        })
+    }
+
+    fn delete_using(
+        &mut self,
+        id: i64,
+        delete_rows: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         // Resolve the folder first; the persisted id is gone after deletion.
         let dir = self.thread_dir(id).ok().flatten();
         // A converted cloud session's host copy may come back once its local copy is gone.
@@ -1205,7 +1229,7 @@ impl Store {
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
-        self.delete_rows(id)?;
+        delete_rows(self)?;
         if let Some(origin) = origin {
             // The refs kept for a restore that never happened; after a restore they hold the
             // other saved branches, which stay.

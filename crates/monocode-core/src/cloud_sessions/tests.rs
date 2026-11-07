@@ -58,6 +58,7 @@ fn fail(stderr: &str) -> Result<GhOutput, String> {
 struct FakeHost {
     machines: Mutex<Vec<Machine>>,
     log: Mutex<Vec<String>>,
+    request_error: Mutex<Option<String>>,
 }
 impl FakeHost {
     fn with_machine(name: &str) -> Arc<Self> {
@@ -119,6 +120,9 @@ impl Host for FakeHost {
             .lock()
             .unwrap()
             .push(format!("request {machine_id} {method} {}", params["cwd"]));
+        if let Some(error) = self.request_error.lock().unwrap().clone() {
+            return Err(error);
+        }
         Ok(json!({"id":"project-1","cwd":params["cwd"]}))
     }
     fn disconnect(&self, machine_id: &str) -> Result<(), String> {
@@ -823,4 +827,125 @@ fn a_failing_evidence_setup_never_blocks_the_session_target() {
     assert!(progress
         .iter()
         .any(|p| p.contains("Could not prepare the evidence folder")));
+}
+
+#[test]
+fn deleting_a_session_of_a_missing_codespace_only_removes_its_local_record() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        (
+            "user/codespaces",
+            ok(r#"[{"total_count":0,"codespaces":[]}]"#),
+        ),
+    ]);
+    let host = FakeHost::with_machine("octo-abc");
+    let store = Store::open(Path::new(":memory:")).unwrap();
+    let project = store
+        .remember_cloud_project(
+            "env-octo-abc",
+            &json!({"id":"project","cwd":"/workspaces/widgets"}),
+            "/work/widgets",
+            "octo-abc",
+        )
+        .unwrap();
+    let summary = store.create("claude", &project.key).unwrap();
+    let other = store.create("claude", &project.key).unwrap();
+    let mut remote = store.remote_session(summary.id).unwrap().unwrap();
+    remote.session_id = Some("host-session".into());
+    store.save_remote_session(&remote).unwrap();
+
+    store
+        .delete_remote_session_with(summary.id, &*gh, &*host)
+        .unwrap();
+
+    assert!(store.remote_session(summary.id).unwrap().is_none());
+    assert!(store.remote_session(other.id).unwrap().is_some());
+    assert!(host.log().is_empty(), "no host operation: {:?}", host.log());
+    assert_eq!(gh.calls().len(), 2, "authenticate and enumerate only");
+}
+
+fn deletion_fixture() -> (Store, i64) {
+    let store = Store::open(Path::new(":memory:")).unwrap();
+    let project = store
+        .remember_cloud_project(
+            "env-octo-abc",
+            &json!({"id":"project","cwd":"/workspaces/widgets"}),
+            "/work/widgets",
+            "octo-abc",
+        )
+        .unwrap();
+    let summary = store.create("claude", &project.key).unwrap();
+    let mut remote = store.remote_session(summary.id).unwrap().unwrap();
+    remote.session_id = Some("host-session".into());
+    store.save_remote_session(&remote).unwrap();
+    (store, summary.id)
+}
+
+#[test]
+fn failed_codespace_lookups_preserve_the_session_without_contacting_the_host() {
+    for response in [
+        fail("HTTP 401: Bad credentials"),
+        fail("HTTP 403: Resource not accessible"),
+        fail("HTTP 404: Not Found"),
+        fail("HTTP 429: Rate limit exceeded"),
+        fail("HTTP 500: Internal Server Error"),
+        Err("network timeout".into()),
+        Err("gh: command not found".into()),
+        ok("not json"),
+        ok("[]"),
+        ok(r#"[{"total_count":1,"codespaces":[]}]"#),
+        ok(r#"[{"codespaces":[]}]"#),
+        ok(r#"[{"total_count":2,"codespaces":[{"name":"other"},{"name":"other"}]}]"#),
+    ] {
+        let gh = FakeGh::new(vec![
+            ("auth status", ok(AUTH_OK)),
+            ("user/codespaces", response),
+        ]);
+        let host = FakeHost::with_machine("octo-abc");
+        let (store, id) = deletion_fixture();
+        assert!(store.delete_remote_session_with(id, &*gh, &*host).is_err());
+        assert!(store.remote_session(id).unwrap().is_some());
+        assert!(host.log().is_empty());
+    }
+    for response in [
+        ok(AUTH_NO_SCOPE),
+        fail("not logged in"),
+        Err("auth timeout".into()),
+    ] {
+        let gh = FakeGh::new(vec![("auth status", response)]);
+        let host = FakeHost::with_machine("octo-abc");
+        let (store, id) = deletion_fixture();
+        assert!(store.delete_remote_session_with(id, &*gh, &*host).is_err());
+        assert!(store.remote_session(id).unwrap().is_some());
+        assert!(host.log().is_empty());
+    }
+}
+
+#[test]
+fn live_codespace_deletion_still_requires_the_host_to_accept_the_delete() {
+    let gh = FakeGh::new(vec![
+        ("auth status", ok(AUTH_OK)),
+        (
+            "user/codespaces",
+            ok(
+                r#"[{"total_count":2,"codespaces":[{"name":"other"}]},{"total_count":2,"codespaces":[{"name":"octo-abc"}]}]"#,
+            ),
+        ),
+    ]);
+    let host = FakeHost::default();
+    let (store, id) = deletion_fixture();
+    assert!(store.delete_remote_session_with(id, &*gh, &host).is_err());
+    assert!(
+        store.remote_session(id).unwrap().is_some(),
+        "disconnected live host must retain the row"
+    );
+    host.machines.lock().unwrap().push(machine("octo-abc"));
+    *host.request_error.lock().unwrap() = Some("host API failed".into());
+    assert!(store.delete_remote_session_with(id, &*gh, &host).is_err());
+    assert!(store.remote_session(id).unwrap().is_some());
+    *host.request_error.lock().unwrap() = None;
+    store.delete_remote_session_with(id, &*gh, &host).unwrap();
+    assert!(store.remote_session(id).unwrap().is_none());
+    assert_eq!(host.log().len(), 2);
+    assert!(host.log()[0].contains("sessions.delete"));
 }

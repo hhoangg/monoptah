@@ -291,6 +291,34 @@ pub(super) fn archive_groups(
         .zip(work)
         .map(|(group, ids)| {
             let mut converted = Vec::new();
+            // Never try to back up a Codespace which GitHub confirms is gone.
+            // Lookup failures keep the group intact, including on "delete anyway".
+            let preflight = if cancel.load(Ordering::Relaxed) {
+                Err(CANCELLED.to_string())
+            } else if choice == ArchiveChoice::Delete {
+                cloud.forget_missing_codespace(&group.codespace)
+            } else {
+                Ok(false)
+            };
+            match preflight {
+                Ok(true) => {
+                    return GroupOutcome {
+                        group,
+                        converted,
+                        result: Ok((Then::Forget, None)),
+                        risky: Vec::new(),
+                    };
+                }
+                Err(error) => {
+                    return GroupOutcome {
+                        group,
+                        converted,
+                        result: Err(error),
+                        risky: Vec::new(),
+                    };
+                }
+                Ok(false) => {}
+            }
             let mut failure = None;
             // Lines kept in memory too, so a failed store write cannot open the gate.
             let mut memory: Vec<String> = Vec::new();

@@ -598,4 +598,107 @@ mod tests {
             .unwrap();
         assert_eq!(source_id, original);
     }
+    #[test]
+    fn deleting_a_missing_codespace_legacy_session_stays_hidden_after_reopening_shared_store() {
+        use crate::cloud_sessions::Host;
+        use crate::codespaces::{GhOutput, GhRunner};
+        use crate::remote::Machine;
+        use std::sync::atomic::AtomicBool;
+        struct Boundary;
+        impl GhRunner for Boundary {
+            fn run(&self, args: &[String], _: Option<&str>) -> Result<GhOutput, String> {
+                let stdout = match args.join(" ").as_str() {
+                    "auth status --active" => {
+                        "Logged in to github.com account me\nToken scopes: 'codespace', 'repo'"
+                    }
+                    "api --paginate --slurp user/codespaces" => {
+                        r#"[{"total_count":0,"codespaces":[]}]"#
+                    }
+                    call => panic!("unexpected gh operation: {call}"),
+                };
+                Ok(GhOutput {
+                    success: true,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        impl Host for Boundary {
+            fn machines(&self) -> Result<Vec<Machine>, String> {
+                panic!("no host access")
+            }
+            fn connect(
+                &self,
+                _: &str,
+                _: &str,
+                _: &mut dyn FnMut(&str),
+            ) -> Result<Machine, String> {
+                panic!("no connect")
+            }
+            fn ensure(
+                &self,
+                _: &str,
+                _: &AtomicBool,
+                _: &mut dyn FnMut(&str),
+            ) -> Result<(), String> {
+                panic!("no wake")
+            }
+            fn request(&self, _: &str, _: &str, _: Value) -> Result<Value, String> {
+                panic!("no host request")
+            }
+            fn disconnect(&self, _: &str) -> Result<(), String> {
+                panic!("no disconnect")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop.db");
+        let (bound, original, blank, blank_original) = fixture(&path);
+        let prefs = Arc::new(preferences(&original, &blank_original));
+        let mut store =
+            Store::open_monocode_with_preferences_for_test(&path, prefs.clone()).unwrap();
+        store
+            .remember_cloud_project(
+                "legacy",
+                &json!({"id":"host-project","cwd":"/home/repo"}),
+                "/local/repo",
+                "octo-abc",
+            )
+            .unwrap();
+        assert!(store
+            .remote_session(bound)
+            .unwrap()
+            .unwrap()
+            .session_id
+            .is_some());
+        store
+            .delete_with_remote(bound, &Boundary, &Boundary)
+            .unwrap();
+        assert!(store.remote_session(bound).unwrap().is_none());
+        assert!(store.remote_session(blank).unwrap().is_some());
+        // The same API must still run shared local deletion, without GitHub or a host.
+        let local = store.create("claude", "/local/repo").unwrap();
+        store.set_reminders(&[local.id], 1234).unwrap();
+        store
+            .delete_with_remote(local.id, &Boundary, &Boundary)
+            .unwrap();
+        assert!(!store
+            .sessions()
+            .unwrap()
+            .iter()
+            .any(|session| session.id == local.id));
+        assert!(!store
+            .reminders()
+            .unwrap()
+            .iter()
+            .any(|reminder| reminder.session_id == local.id));
+        drop(store);
+        let store = Store::open_monocode_with_preferences_for_test(&path, prefs).unwrap();
+        assert!(store.remote_session(bound).unwrap().is_none());
+        assert!(!store
+            .sessions()
+            .unwrap()
+            .iter()
+            .any(|session| session.id == bound));
+        assert!(store.remote_session(blank).unwrap().is_some());
+    }
 }

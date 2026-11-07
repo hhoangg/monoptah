@@ -896,6 +896,7 @@ impl Shell {
         }
         self.invalidate_chrome(cx);
         let store = self.store.clone();
+        let cloud = self.cloud.clone();
         let previous = self.group_writes.take();
         self.group_writes = Some(cx.spawn(async move |this, cx| {
             if let Some(previous) = previous {
@@ -911,7 +912,7 @@ impl Shell {
                         .flatten();
                     (request, store.data_dir().map(std::path::Path::to_path_buf))
                 };
-                locked(&removed)?.delete(id)?;
+                cloud.delete_session(id)?;
                 // Drop the session's recorded turns and their Git refs.
                 if let Some(checkpoints) = monocode_core::checkpoint::store() {
                     let _ = checkpoints.exclusive(|c| c.forget(&id.to_string()));
