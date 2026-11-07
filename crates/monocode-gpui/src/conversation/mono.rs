@@ -48,13 +48,13 @@ impl Conversation {
         send: bool,
         cx: &mut Context<Self>,
     ) {
-        if !self.history_ready() {
+        if !self.history_ready() || self.cloud_start_blocks() {
             self.defer_history_action(
                 move |this, cx| this.install_app_launch(settings, send, cx),
                 cx,
             );
             // A stopped codespace never loads in the background: wake it, as a send would.
-            if send {
+            if send && !self.cloud_start_blocks() {
                 self.reconnect_cloud(cx);
             }
             return;

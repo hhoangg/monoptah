@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -57,6 +58,18 @@ pub trait GhRunner: Send + Sync {
             }
         }
         Ok(out)
+    }
+
+    /// Like `run_streaming`, but a long-running command is killed as soon as `stop` becomes
+    /// true (checked every ~200 ms); what was read so far is returned. The default ignores
+    /// `stop`, which is right for fakes that return immediately.
+    fn run_streaming_until(
+        &self,
+        args: &[String],
+        on_line: &mut dyn FnMut(&str),
+        _stop: &AtomicBool,
+    ) -> Result<GhOutput, String> {
+        self.run_streaming(args, on_line)
     }
 }
 
@@ -114,16 +127,24 @@ pub fn call_timeout(args: &[String]) -> Duration {
             SSH_TIMEOUT
         };
     }
-    let slow = matches!(
-        (
-            args.first().map(String::as_str),
-            args.get(1).map(String::as_str)
-        ),
-        (
-            Some("codespace"),
-            Some("create" | "stop" | "delete" | "rebuild")
-        )
-    );
+    // The REST create (`gh api --method POST repos/<repo>/codespaces`) answers in seconds,
+    // but its request may already have created a codespace when we give up. A premature
+    // timeout would leave an orphan (and a retry a second one), so it gets the slow class
+    // like `gh codespace create` instead of the 20 s default of other `gh api` reads.
+    let rest_create = args.first().map(String::as_str) == Some("api")
+        && args.iter().any(|a| a == "POST")
+        && args.iter().any(|a| a.ends_with("/codespaces"));
+    let slow = rest_create
+        || matches!(
+            (
+                args.first().map(String::as_str),
+                args.get(1).map(String::as_str)
+            ),
+            (
+                Some("codespace"),
+                Some("create" | "stop" | "delete" | "rebuild")
+            )
+        );
     if slow {
         SLOW_CALL_TIMEOUT
     } else {
@@ -205,10 +226,46 @@ impl GhRunner for SystemGh {
         args: &[String],
         on_line: &mut dyn FnMut(&str),
     ) -> Result<GhOutput, String> {
-        let mut cmd = Self::command(args)?;
+        Self::stream(args, on_line, None)
+    }
+
+    fn run_streaming_until(
+        &self,
+        args: &[String],
+        on_line: &mut dyn FnMut(&str),
+        stop: &AtomicBool,
+    ) -> Result<GhOutput, String> {
+        Self::stream(args, on_line, Some(stop))
+    }
+}
+
+impl SystemGh {
+    fn stream(
+        args: &[String],
+        on_line: &mut dyn FnMut(&str),
+        stop: Option<&AtomicBool>,
+    ) -> Result<GhOutput, String> {
+        stream_command(Self::command(args)?, on_line, stop)
+    }
+}
+
+/// Runs `cmd`, reporting its output lines; kills it (and its process group) when `stop` is set.
+fn stream_command(
+    mut cmd: Command,
+    on_line: &mut dyn FnMut(&str),
+    stop: Option<&AtomicBool>,
+) -> Result<GhOutput, String> {
+    {
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
+        // A stoppable command may have children (`gh codespace ssh` runs ssh): give it a
+        // process group so the stop reaches all of them and the pipes close.
+        #[cfg(unix)]
+        if stop.is_some() {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let mut child = cmd.spawn().map_err(spawn_error)?;
         let (tx, rx) = mpsc::channel::<(bool, String)>();
         let mut readers = Vec::new();
@@ -230,20 +287,40 @@ impl GhRunner for SystemGh {
         }
         drop(tx);
         let (mut stdout, mut stderr) = (String::new(), String::new());
-        for (is_err, line) in rx {
-            if !line.trim().is_empty() {
-                on_line(&line);
+        let mut stopped = false;
+        loop {
+            let next = match stop {
+                None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                Some(stop) => {
+                    if stop.load(Ordering::Relaxed) {
+                        stopped = true;
+                        break;
+                    }
+                    rx.recv_timeout(Duration::from_millis(200))
+                }
+            };
+            match next {
+                Ok((is_err, line)) => {
+                    if !line.trim().is_empty() && (!is_err || stop.is_none()) {
+                        on_line(&line);
+                    }
+                    let buf = if is_err { &mut stderr } else { &mut stdout };
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            let buf = if is_err { &mut stderr } else { &mut stdout };
-            buf.push_str(&line);
-            buf.push('\n');
+        }
+        if stopped {
+            crate::process::terminate(&mut child);
         }
         for reader in readers {
             let _ = reader.join();
         }
         let status = child.wait().map_err(|e| e.to_string())?;
         Ok(GhOutput {
-            success: status.success(),
+            success: status.success() && !stopped,
             stdout,
             stderr,
         })
@@ -546,6 +623,183 @@ pub fn create(
         .map(str::to_string)
         .filter(|name| valid_codespace_name(name).is_ok())
         .ok_or_else(|| "gh did not report the new codespace name".to_string())
+}
+
+/// A codespace whose creation was requested through the REST API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartedCodespace {
+    pub name: String,
+    /// State at creation time, normally `Provisioning`.
+    pub state: String,
+    /// Browser URL (`https://<name>.github.dev`-style), when the API returned one.
+    pub web_url: Option<String>,
+}
+
+/// Request a codespace through the REST API and return as soon as it exists.
+///
+/// Unlike [`create`] (`gh codespace create`), which polls for at most two minutes and prints
+/// the name only at the very end (a slow devcontainer build fails it with "context deadline
+/// exceeded" and the name is lost), the REST call answers in seconds with `201 Created` and
+/// the codespace JSON (`name`, `state: Provisioning`, `web_url`). A `202` is possible too, so
+/// any success with a valid `name` counts. Follow with [`wait_ready_with`] or poll
+/// [`state`]. Defaults match [`create`]: machine [`DEFAULT_MACHINE`], display name
+/// `monoptah-<branch>` (48 characters), idle timeout 30 minutes, retention 72 hours, and
+/// `multi_repo_permissions_opt_out` (the equivalent of `--default-permissions`).
+pub fn create_started(
+    runner: &dyn GhRunner,
+    repo: &str,
+    branch: &str,
+    machine: Option<&str>,
+    display: Option<&str>,
+) -> Result<StartedCodespace, String> {
+    valid_repo(repo)?;
+    if branch.trim().is_empty() {
+        return Err("A branch is required to create a codespace".into());
+    }
+    let machine = machine
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or(DEFAULT_MACHINE);
+    let display: String = match display.filter(|d| !d.trim().is_empty()) {
+        Some(d) => d.chars().take(DISPLAY_NAME_MAX).collect(),
+        None => display_name_for(branch),
+    };
+    let path = format!("repos/{repo}/codespaces");
+    let args = argv(&[
+        "api",
+        "--method",
+        "POST",
+        &path,
+        "-f",
+        &format!("ref={branch}"),
+        "-f",
+        &format!("machine={machine}"),
+        "-f",
+        &format!("display_name={display}"),
+        "-F",
+        "idle_timeout_minutes=30",
+        "-F",
+        "retention_period_minutes=4320",
+        "-F",
+        "multi_repo_permissions_opt_out=true",
+    ]);
+    let out = runner.run(&args, None)?;
+    if !out.success {
+        return Err(failure(&args, &out));
+    }
+    let value: serde_json::Value = serde_json::from_str(out.stdout.trim())
+        .map_err(|e| format!("Unexpected gh output: {e}"))?;
+    let name = value["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| valid_codespace_name(name).is_ok())
+        .ok_or_else(|| "GitHub did not report the new codespace name".to_string())?;
+    let text = |key: &str| {
+        value[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    Ok(StartedCodespace {
+        name: name.to_string(),
+        state: text("state").unwrap_or_else(|| "Provisioning".into()),
+        web_url: text("web_url"),
+    })
+}
+
+/// Browser URL of a codespace (`gh api user/codespaces/<name> --jq .web_url`).
+pub fn web_url(runner: &dyn GhRunner, name: &str) -> Result<String, String> {
+    valid_codespace_name(name)?;
+    let path = format!("user/codespaces/{name}");
+    let out = run_ok(runner, argv(&["api", &path, "--jq", ".web_url"]))?;
+    let url = out.trim();
+    if url.starts_with("https://") {
+        Ok(url.to_string())
+    } else {
+        Err(format!("GitHub reported no web URL for codespace {name}"))
+    }
+}
+
+/// Rebuild the codespace's container (`gh codespace rebuild`, no `--full`). It does not
+/// prompt. The call returns once the rebuild is requested; poll [`state`] afterwards.
+pub fn rebuild(runner: &dyn GhRunner, name: &str) -> Result<(), String> {
+    valid_codespace_name(name)?;
+    run_ok(runner, argv(&["codespace", "rebuild", "-c", name])).map(|_| ())
+}
+
+/// Where a codespace writes its creation log.
+///
+/// `gh codespace logs -c <name>` cannot be used (verified on gh 2.95.0): it waits for the
+/// codespace to be Available, then runs plain `ssh` without the key gh installs and fails
+/// with `Permission denied (publickey,password)`, and it would start a stopped codespace.
+/// `gh codespace ssh -- tail ...` works once the codespace is Available; before that gh only
+/// waits. The log is replayed from the top, so late followers still see real timestamps.
+pub const CREATION_LOG: &str = "/workspaces/.codespaces/.persistedshare/creation.log";
+
+/// Stream the creation log through `on_line` (raw lines, see [`parse_log_line`]) until `stop`
+/// becomes true or the connection ends. Call only once the codespace is Available.
+/// `Ok` also covers a stop; `Err` is a failed `gh` (not signed in, ssh refused).
+pub fn follow_creation_log(
+    runner: &dyn GhRunner,
+    name: &str,
+    stop: &AtomicBool,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    valid_codespace_name(name)?;
+    let args = argv(&[
+        "codespace",
+        "ssh",
+        "-c",
+        name,
+        "--",
+        "tail",
+        "-n",
+        "+1",
+        "-F",
+        CREATION_LOG,
+    ]);
+    let out = runner.run_streaming_until(&args, on_line, stop)?;
+    if out.success || stop.load(Ordering::Relaxed) {
+        Ok(())
+    } else {
+        Err(failure(&args, &out))
+    }
+}
+
+/// One line of the creation log, minus its timestamp prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogLine {
+    /// Epoch milliseconds from the `YYYY-MM-DD HH:MM:SS.mmmZ: ` prefix. `None` for a
+    /// continuation line (output of a command, which carries no prefix).
+    pub at_ms: Option<u64>,
+    pub text: String,
+}
+
+/// Parses a raw creation-log line. `None` for blank lines and `=====` separators.
+pub fn parse_log_line(raw: &str) -> Option<LogLine> {
+    let raw = raw.trim_end();
+    let (at_ms, text) = match split_log_prefix(raw) {
+        Some((at, rest)) => (Some(at), rest),
+        None => (None, raw),
+    };
+    let text = text.trim();
+    if text.is_empty() || text.chars().all(|c| c == '=') {
+        return None;
+    }
+    Some(LogLine {
+        at_ms,
+        text: text.to_string(),
+    })
+}
+
+fn split_log_prefix(raw: &str) -> Option<(u64, &str)> {
+    // "2026-11-07 04:01:54.456Z: " is 23 characters of time, then "Z: ".
+    let stamp = raw.get(..23)?;
+    let rest = raw.get(23..)?.strip_prefix('Z')?;
+    let rest = rest.strip_prefix(':').unwrap_or(rest);
+    let parsed = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S%.3f").ok()?;
+    let ms = u64::try_from(parsed.and_utc().timestamp_millis()).ok()?;
+    Some((ms, rest))
 }
 
 #[derive(Deserialize)]

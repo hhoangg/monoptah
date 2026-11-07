@@ -502,6 +502,9 @@ impl Input {
     pub(crate) fn set_label(&mut self, label: impl Into<SharedString>) {
         self.label = label.into();
     }
+    pub(crate) fn placeholder_text(&self) -> &SharedString {
+        &self.placeholder
+    }
     pub(crate) fn set_placeholder(
         &mut self,
         text: impl Into<SharedString>,

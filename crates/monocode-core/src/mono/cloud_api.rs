@@ -2,13 +2,14 @@
 //!
 //! One service shared by the Operator dispatcher and the Mono dispatcher so both behave the
 //! same. It is a thin layer over [`CloudSessions`] and [`crate::codespaces`]: every call here
-//! BLOCKS (gh, and for sessions.start minutes of codespace creation or boot), so callers run
-//! it on a worker thread. Nothing here wakes a codespace except preparing a session target the
+//! BLOCKS on gh, so callers run it on a worker thread. `begin_start` returns a pending session
+//! before provisioning completes. Nothing here wakes a codespace except preparing a session target the
 //! caller explicitly asked for; listings only read cached state.
 //!
 //! Secret values never pass through this module: `secrets_status` reports set/missing only.
 use crate::cloud_sessions::{
-    CloudBinding, CloudSessions, CloudState, CodespaceChoice, Host, SessionTarget, Target,
+    CloudBinding, CloudSessions, CloudState, CodespaceChoice, Host, SessionTarget, StartupSummary,
+    Target,
 };
 use crate::codespaces::{self, GhRunner};
 use crate::store::Store;
@@ -26,6 +27,7 @@ pub struct CloudApi {
     gh: Arc<dyn GhRunner>,
     host: Arc<dyn Host>,
     cloud: CloudSessions,
+    store: Database,
 }
 
 /// The codespace lifecycle as it is reported to agents.
@@ -41,11 +43,20 @@ pub fn target_json(target: Option<&SessionTarget>) -> Value {
     }
 }
 
-/// Adds `target` to a session object, and `codespaceState` for a cloud session.
+/// Adds `target` to a session object, and `codespaceState` for a cloud session. A session
+/// whose codespace is still starting (or failed to) also gets `startup {step, error?}`, and
+/// its `codespaceState` is `starting` until the start fails.
 pub fn annotate(session: &mut Value, target: Option<&SessionTarget>) {
     session["target"] = target_json(target);
     if let Some(t) = target {
         session["codespaceState"] = json!(state_id(t.state));
+        if let Some(startup) = &t.startup {
+            let mut value = json!({"step": startup.step.map(|s| s.id())});
+            if let Some(error) = &startup.error {
+                value["error"] = json!(error);
+            }
+            session["startup"] = value;
+        }
     }
 }
 
@@ -161,9 +172,10 @@ fn current_branch(project: &str) -> Result<String, String> {
 impl CloudApi {
     pub fn new(gh: Arc<dyn GhRunner>, host: Arc<dyn Host>, store: Database) -> Self {
         Self {
-            cloud: CloudSessions::new(gh.clone(), host.clone(), store),
+            cloud: CloudSessions::new(gh.clone(), host.clone(), store.clone()),
             gh,
             host,
+            store,
         }
     }
     /// Real `gh` and the app's default connections.
@@ -324,6 +336,17 @@ impl CloudApi {
         self.cloud.invalidate(&binding.codespace);
         Ok(binding)
     }
+    pub fn begin_start(
+        &self,
+        project: &str,
+        mut target: Target,
+        harness: &str,
+    ) -> Result<(crate::store::Session, crate::cloud_sessions::StartRecord), String> {
+        if target.codespace == CodespaceChoice::New && target.branch.is_none() {
+            target.branch = Some(current_branch(project)?);
+        }
+        self.cloud.begin_start(project, target, harness)
+    }
     /// A blank session on the binding (Claude only).
     pub fn create_session(
         &self,
@@ -336,31 +359,60 @@ impl CloudApi {
     /// Cloud sessions of `project` with their cached codespace state. Never wakes anything.
     pub fn session_targets(&self, project: &str) -> HashMap<i64, SessionTarget> {
         let mut states: HashMap<String, CloudState> = HashMap::new();
+        let starts: HashMap<i64, StartupSummary> = self
+            .store
+            .lock()
+            .map(|store| {
+                crate::cloud_sessions::pending_starts(&store)
+                    .iter()
+                    .map(|r| (r.session_id, StartupSummary::of(r)))
+                    .collect()
+            })
+            .unwrap_or_default();
         self.cloud
             .cloud_sessions_for(project)
             .unwrap_or_default()
             .into_iter()
             .map(|s| {
-                let state = *states
-                    .entry(s.codespace.clone())
-                    .or_insert_with(|| self.cloud.cloud_state(&s.codespace));
-                (
-                    s.summary.id,
-                    SessionTarget {
+                let id = s.summary.id;
+                let startup = starts.get(&id).cloned();
+                let target = match startup {
+                    // Starting: no gh read needed, the state is `starting`.
+                    Some(startup) if startup.error.is_none() => SessionTarget {
                         codespace: s.codespace,
-                        state,
+                        state: CloudState::Starting,
+                        startup: Some(startup),
                     },
-                )
+                    startup => SessionTarget {
+                        state: *states
+                            .entry(s.codespace.clone())
+                            .or_insert_with(|| self.cloud.cloud_state(&s.codespace)),
+                        codespace: s.codespace,
+                        startup,
+                    },
+                };
+                (id, target)
             })
             .collect()
     }
     /// Wakes the codespace of a cloud session (no-op when connected or not a cloud session).
+    /// Refuses a session whose codespace is still starting, or failed to start (see
+    /// `cloud_sessions::starting_refusal`).
     /// BLOCKS for minutes; used when a send finds the session offline.
     pub fn wake(&self, session_id: i64, store: &Database) -> Result<(), String> {
-        let session = store
-            .lock()
-            .map_err(|_| "Native session store unavailable")?
-            .remote_session(session_id)?;
+        let (session, refusal) = {
+            let store = store
+                .lock()
+                .map_err(|_| "Native session store unavailable")?;
+            (
+                store.remote_session(session_id)?,
+                crate::cloud_sessions::starting_refusal(&store, session_id),
+            )
+        };
+        // A session whose codespace is still starting (or failed to) cannot take a message.
+        if let Some(refusal) = refusal {
+            return Err(refusal);
+        }
         let Some(session) = session else {
             return Ok(());
         };

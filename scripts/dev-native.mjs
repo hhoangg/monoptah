@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { homedir } from "node:os";
+import { once } from "node:events";
+import { closeSync, mkdirSync, mkdtempSync, openSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -23,6 +25,7 @@ function track(child) {
 export async function startDev({
   root = workspace,
   args = [],
+  detach = false,
   platform = process.platform,
   spawnProcess = spawn,
   env = process.env,
@@ -79,6 +82,7 @@ export async function startDev({
         const metadataResult = await run("cargo", ["metadata", "--manifest-path", "crates/monocode-gpui/Cargo.toml", "--locked", "--no-deps", "--format-version", "1"], true);
         if (closing) return;
         if (metadataResult.code !== 0) {
+          if (detach) throw new Error("Cargo metadata failed.");
           log("Cargo metadata failed. Fix the error, then type r to retry.");
           continue;
         }
@@ -91,6 +95,7 @@ export async function startDev({
         const result = await run("cargo", ["build", "--manifest-path", "crates/monocode-gpui/Cargo.toml", "--locked", "-p", pkg.name, "--bin", pkg.name, "--profile", "native-dev"]);
         if (closing) return;
         if (result.code !== 0) {
+          if (detach) throw new Error("Build failed.");
           log("Build failed. Keeping the current app; type r to retry after fixing the error.");
           continue;
         }
@@ -107,6 +112,7 @@ export async function startDev({
           const packaged = await run("bash", ["scripts/bundle-native-macos.sh", "native-dev", target, pkg.version, dataMode]);
           if (closing) return;
           if (packaged.code !== 0) {
+            if (detach) throw new Error("App packaging failed.");
             log("App packaging failed. Fix the error, then type r to retry.");
             continue;
           }
@@ -116,6 +122,28 @@ export async function startDev({
         await stopApp();
         if (closing) return;
         if (builtRevision !== revision) continue;
+        if (detach) {
+          const logDirectory = buildEnv.MONOCODE_DEV_LOG_DIR || mkdtempSync(join(tmpdir(), "monoptah-native-dev-"));
+          mkdirSync(logDirectory, { recursive: true, mode: 0o700 });
+          const logPath = join(logDirectory, `app-${Date.now()}-${process.pid}.log`);
+          const logFile = openSync(logPath, "a", 0o600);
+          let next;
+          try {
+            next = launch(executable, args, {
+              env: { ...buildEnv, MONOCODE_DEV_RELOAD: "0" },
+              stdio: ["ignore", logFile, logFile],
+              detached: true,
+            });
+            await once(next, "spawn");
+          } finally {
+            closeSync(logFile);
+          }
+          next.unref();
+          log(`Ready in ${((Date.now() - started) / 1000).toFixed(1)}s. Detached app PID ${next.pid}. Log: ${logPath}`);
+          closing = true;
+          didClose();
+          return;
+        }
         const next = launch(executable, args, {
           env: { ...buildEnv, MONOCODE_DEV_RELOAD: "1" },
           stdio: ["pipe", "inherit", "inherit"],
@@ -166,7 +194,7 @@ export async function startDev({
     void close();
   }
 
-  log("Type r then Enter to rebuild and restart; Ctrl+C to stop. File saves do not trigger builds.");
+  log(detach ? "Building a detached verification app with persistent stdout/stderr." : "Type r then Enter to rebuild and restart; Ctrl+C to stop. File saves do not trigger builds.");
   void rebuild().catch(fail);
   return { requestBuild, close, closed };
 }
@@ -179,7 +207,9 @@ export function parseDevArgs(argv) {
       options.args.push(...argv.slice(index + 1));
       break;
     }
-    if (["--watch", "--bundle"].includes(arg)) {
+    if (arg === "--detach") {
+      options.detach = true;
+    } else if (["--watch", "--bundle"].includes(arg)) {
       throw new Error(`${arg} is not supported. Use npm run native:dev, then type r and Enter to rebuild and restart.`);
     } else {
       options.args.push(arg);

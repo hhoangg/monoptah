@@ -47,6 +47,18 @@
 //!   file paths. A missing remote folder is `Ok` with no files and a `message`. This is a
 //!   user action: `gh codespace cp` starts a stopped codespace. BLOCKS (gh).
 //!
+//! * Non-blocking start (the GUI path; full description in [`startup`]):
+//!   [`CloudSessions::begin_start`] `(local_cwd, Target, harness) -> (Session, StartRecord)`
+//!   requests the codespace through the REST API and creates the session at once, on a
+//!   provisional project; [`CloudSessions::run_start`] `(session_id, events, cancel) ->
+//!   CloudBinding` BLOCKS on a worker thread, reports [`StartEvent`]s (step list, creation
+//!   log, `Ready` or `Failed`) and is idempotent (first run, Retry, resume after a restart);
+//!   [`CloudSessions::rebuild_start`] and [`CloudSessions::start_web_url`] serve the
+//!   side-panel actions. Readers that need only a `&Store`: [`start_record`],
+//!   [`pending_starts`], [`starting_refusal`], [`queue_start_message`] and
+//!   [`queued_start_message`]. [`SessionTarget::startup`] carries the phase to the app API.
+//!   `prepare_target` keeps its blocking behaviour (used by `sessions.start`).
+//!
 //! Errors are user-facing `String`s. `CODESPACE_NOT_CONNECTED` from
 //! `Connections::request` means "stopped / not connected": render it as a state
 //! (see [`is_not_connected`]).
@@ -74,6 +86,128 @@ pub fn created_note(codespace: &str, error: &str) -> String {
     format!(
         "{error} (codespace {codespace} was created and kept; retry with target {{\"codespace\":\"{codespace}\"}} or remove it with codespaces.delete)"
     )
+}
+
+/// Error text of a start that was cancelled or whose session disappeared. Not a failure: no
+/// `Failed` event accompanies it.
+pub const START_ABORTED: &str = "The cloud session start was cancelled.";
+
+/// A codespace chosen for a start, before it is necessarily ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedCodespace {
+    pub name: String,
+    pub display: String,
+    /// `owner/repo`.
+    pub repo: String,
+    /// `/workspaces/<repo-name>`.
+    pub remote_cwd: String,
+    /// This call created the codespace (it was not an existing one).
+    pub created: bool,
+    pub web_url: Option<String>,
+    /// gh state at resolve time (`Provisioning` for a new codespace).
+    pub state: String,
+    pub branch: Option<String>,
+    pub machine: Option<String>,
+}
+
+/// How [`CloudSessions::wait_available`] waits.
+#[derive(Clone, Copy, Debug)]
+pub struct WaitPlan {
+    pub timeout: Duration,
+    /// Treat `Shutdown` / `ShuttingDown` as "go on and let connecting start it" instead of
+    /// an error.
+    pub shutdown_is_ok: bool,
+}
+
+/// Why [`CloudSessions::wait_available`] stopped waiting without an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Availability {
+    Available,
+    /// Shut down (or shutting down): connecting starts it.
+    Stopped,
+}
+
+/// What [`open_project`] needs to know about the codespace.
+struct OpenRequest<'a> {
+    local_cwd: &'a str,
+    codespace: &'a str,
+    display: &'a str,
+    repo: &'a str,
+    remote_cwd: &'a str,
+}
+
+/// Step (c) of a start: connect (pair, or wake an already paired machine), open the project,
+/// prepare the evidence folder and record the cloud binding. `halt` aborts between the
+/// sub-steps with [`START_ABORTED`]; `step` hears `Connect` and `OpenProject` start and
+/// `Connect` finish. Returns the binding and the stored project.
+fn open_project(
+    gh: &dyn GhRunner,
+    host: &dyn Host,
+    store: &Database,
+    request: &OpenRequest,
+    halt: &AtomicBool,
+    step: &mut dyn FnMut(startup::StepKind, startup::StepStatus),
+    progress: &mut dyn FnMut(&str),
+) -> Result<(CloudBinding, crate::store::RemoteProject), String> {
+    use startup::{StepKind, StepStatus};
+    let aborted = || halt.load(std::sync::atomic::Ordering::Relaxed);
+    step(StepKind::Connect, StepStatus::Running);
+    let machine = match host
+        .machines()?
+        .into_iter()
+        .find(|m| m.codespace.as_deref() == Some(request.codespace))
+    {
+        Some(machine) => {
+            progress("Connecting to the codespace");
+            host.ensure(&machine.id, halt, progress)?;
+            machine
+        }
+        None => host.connect(request.codespace, request.display, progress)?,
+    };
+    step(StepKind::Connect, StepStatus::Done);
+    if aborted() {
+        return Err(START_ABORTED.into());
+    }
+    step(StepKind::OpenProject, StepStatus::Running);
+    progress("Opening the project");
+    let project = host.request(
+        &machine.id,
+        "projects.open",
+        json!({"cwd": request.remote_cwd}),
+    )?;
+    if aborted() {
+        return Err(START_ABORTED.into());
+    }
+    // Best effort: a failure here must not block the session, the agent just has no hint.
+    progress("Preparing the evidence folder");
+    if let Err(error) = codespaces::prepare_evidence(gh, request.codespace, request.remote_cwd) {
+        progress(&format!("Could not prepare the evidence folder: {error}"));
+    }
+    if aborted() {
+        return Err(START_ABORTED.into());
+    }
+    let remembered = store
+        .lock()
+        .map_err(|_| "Native session store unavailable".to_string())?
+        .remember_cloud_project(
+            &machine.environment_id,
+            &project,
+            request.local_cwd,
+            request.codespace,
+        )?;
+    Ok((
+        CloudBinding {
+            local_project: request.local_cwd.into(),
+            codespace: request.codespace.into(),
+            repo: request.repo.into(),
+            machine_id: machine.id,
+            environment_id: remembered.environment_id.clone(),
+            project_id: remembered.project_id.clone(),
+            project_key: remembered.key.clone(),
+            remote_cwd: remembered.cwd.clone(),
+        },
+        remembered,
+    ))
 }
 
 /// Which codespace a cloud session should use.
@@ -229,6 +363,10 @@ impl Host for Arc<Connections> {
 }
 
 /// Wake hook for the remote run path; see the module docs.
+///
+/// A session whose codespace is still being started (its project is the provisional
+/// `pending-` one) is refused here without a store lookup, so the text is generic; callers
+/// that hold the store use [`startup::starting_refusal`] for the precise phase or error.
 pub fn ensure_before_send(
     host: &dyn Host,
     session: &RemoteSession,
@@ -237,6 +375,9 @@ pub fn ensure_before_send(
 ) -> Result<(), String> {
     if session.project.codespace.is_none() {
         return Ok(());
+    }
+    if crate::store::is_pending_cloud_environment(&session.project.environment_id) {
+        return Err(startup::STILL_STARTING.into());
     }
     require_claude(&session.summary.provider)?;
     let machine = host
@@ -284,6 +425,14 @@ pub struct CloudSessions {
     claude_dir: std::path::PathBuf,
     /// Parent of the codespace checkouts; only tests use another one.
     workspace_root: String,
+    /// Pause between two `gh codespace view` reads while waiting for Available.
+    ready_poll: Duration,
+    /// How [`Self::wait_available`] sleeps; tests make it instant.
+    sleep: Box<dyn Fn(Duration) + Send + Sync>,
+    /// Milliseconds since the epoch; tests make it deterministic.
+    clock: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// Pause before the creation-log follower is started again after it ended.
+    follower_retry: Duration,
 }
 
 impl CloudSessions {
@@ -298,7 +447,24 @@ impl CloudSessions {
             origin: Box::new(origin_url),
             claude_dir: convert::default_claude_dir(),
             workspace_root: "/workspaces".into(),
+            ready_poll: codespaces::READY_POLL,
+            sleep: Box::new(std::thread::sleep),
+            clock: Box::new(crate::time::now_ms),
+            follower_retry: Duration::from_secs(2),
         }
+    }
+    #[cfg(test)]
+    fn with_timing(
+        mut self,
+        poll: Duration,
+        sleep: impl Fn(Duration) + Send + Sync + 'static,
+        clock: impl Fn() -> u64 + Send + Sync + 'static,
+    ) -> Self {
+        self.ready_poll = poll;
+        self.sleep = Box::new(sleep);
+        self.clock = Box::new(clock);
+        self.follower_retry = Duration::ZERO;
+        self
     }
     #[cfg(all(test, unix))]
     fn with_claude_dir(mut self, dir: std::path::PathBuf) -> Self {
@@ -342,6 +508,10 @@ impl CloudSessions {
     ///
     /// A codespace this call created is never deleted on failure: the error then names it
     /// (see [`created_note`]) so the caller retries with `CodespaceChoice::Named`.
+    ///
+    /// This is [`Self::resolve_codespace`] + [`Self::wait_available`] (only for a codespace
+    /// just created) + [`open_project`]; the GUI drives the same pieces through
+    /// [`Self::begin_start`] and [`Self::run_start`] instead, without blocking a session.
     pub fn prepare_target(
         &self,
         local_cwd: &str,
@@ -362,11 +532,55 @@ impl CloudSessions {
         progress: &mut dyn FnMut(&str),
         created: &mut Option<String>,
     ) -> Result<CloudBinding, String> {
+        let resolved = self.resolve_codespace(local_cwd, target, progress)?;
+        if resolved.created {
+            *created = Some(resolved.name.clone());
+            progress("Waiting for the codespace to become available");
+            self.wait_available(
+                &resolved.name,
+                &WaitPlan {
+                    timeout: codespaces::READY_TIMEOUT,
+                    shutdown_is_ok: false,
+                },
+                &mut |_| {},
+                &|| false,
+            )?;
+        }
+        self.invalidate(&resolved.name);
+        let (binding, _) = open_project(
+            &*self.gh,
+            &*self.host,
+            &self.store,
+            &OpenRequest {
+                local_cwd,
+                codespace: &resolved.name,
+                display: &resolved.display,
+                repo: &resolved.repo,
+                remote_cwd: &resolved.remote_cwd,
+            },
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+            progress,
+        )?;
+        Ok(binding)
+    }
+
+    /// Step (a) of a start: check gh auth and the project's repository, then either request a
+    /// new codespace through the REST API ([`codespaces::create_started`], which returns its
+    /// name within seconds) or validate a named one. Never waits for the codespace.
+    ///
+    /// `Err` means no codespace was created by this call.
+    pub fn resolve_codespace(
+        &self,
+        local_cwd: &str,
+        target: Target,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<ResolvedCodespace, String> {
         codespaces::auth_status(&*self.gh)?.require_codespace_scope()?;
         let repo = self.repo_for(local_cwd)?;
         let remote_cwd = codespaces::workspace_path(&repo)
             .ok_or_else(|| format!("Invalid repository {repo}"))?;
-        let (name, display) = match target.codespace {
+        match target.codespace {
             CodespaceChoice::New => {
                 let branch = target
                     .branch
@@ -375,18 +589,30 @@ impl CloudSessions {
                     .filter(|b| !b.is_empty())
                     .ok_or("A branch is required to create a codespace")?;
                 progress("Creating codespace");
-                let name = codespaces::create(
+                let started = codespaces::create_started(
                     &*self.gh,
                     &repo,
                     branch,
                     target.machine.as_deref(),
                     None,
-                    progress,
                 )?;
-                *created = Some(name.clone());
-                progress("Waiting for the codespace to become available");
-                codespaces::wait_ready(&*self.gh, &name)?;
-                (name, codespaces::display_name_for(branch))
+                let machine = target
+                    .machine
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or(codespaces::DEFAULT_MACHINE);
+                Ok(ResolvedCodespace {
+                    name: started.name,
+                    display: codespaces::display_name_for(branch),
+                    repo,
+                    remote_cwd,
+                    created: true,
+                    web_url: started.web_url,
+                    state: started.state,
+                    branch: Some(branch.to_string()),
+                    machine: Some(machine.to_string()),
+                })
             }
             CodespaceChoice::Named(name) => {
                 let known = codespaces::list(&*self.gh, &repo)?;
@@ -413,49 +639,89 @@ impl CloudSessions {
                 } else {
                     found.display_name.clone()
                 };
-                (name, display)
+                Ok(ResolvedCodespace {
+                    display,
+                    repo,
+                    remote_cwd,
+                    created: false,
+                    web_url: None,
+                    state: found.state.clone(),
+                    branch: found.git_status.as_ref().map(|g| g.git_ref.clone()),
+                    machine: Some(found.machine_name.clone()).filter(|m| !m.is_empty()),
+                    name,
+                })
             }
-        };
-        self.invalidate(&name);
-        let machine = match self
-            .host
-            .machines()?
-            .into_iter()
-            .find(|m| m.codespace.as_deref() == Some(name.as_str()))
-        {
-            Some(machine) => {
-                progress("Connecting to the codespace");
-                self.host
-                    .ensure(&machine.id, &AtomicBool::new(false), progress)?;
-                machine
-            }
-            None => self.host.connect(&name, &display, progress)?,
-        };
-        progress("Opening the project");
-        let project =
-            self.host
-                .request(&machine.id, "projects.open", json!({"cwd": remote_cwd}))?;
-        // Best effort: a failure here must not block the session, the agent just has no hint.
-        progress("Preparing the evidence folder");
-        if let Err(error) = codespaces::prepare_evidence(&*self.gh, &name, &remote_cwd) {
-            progress(&format!("Could not prepare the evidence folder: {error}"));
         }
-        let remembered = self.store()?.remember_cloud_project(
-            &machine.environment_id,
-            &project,
-            local_cwd,
-            &name,
-        )?;
-        Ok(CloudBinding {
-            local_project: local_cwd.into(),
-            codespace: name,
-            repo,
-            machine_id: machine.id,
-            environment_id: remembered.environment_id,
-            project_id: remembered.project_id,
-            project_key: remembered.key,
-            remote_cwd: remembered.cwd,
-        })
+    }
+
+    /// Step (b): poll `gh codespace view` until the codespace is `Available`, sleeping
+    /// [`Self::ready_poll`] between reads. `on_state` fires with the first state and on every
+    /// change. `abort` is checked before every read; when it is true the wait ends with
+    /// [`START_ABORTED`]. A failed read is retried a few times (a 30 minute wait must not die
+    /// on one network blip) unless gh says the codespace does not exist.
+    ///
+    /// `Failed`, `Deleted` and `Unavailable` are errors. `Shutdown` and `ShuttingDown` are an
+    /// error when `plan.shutdown_is_ok` is false (nothing starts it while we only read), and
+    /// otherwise end the wait with [`Availability::Stopped`] so that connecting (which
+    /// starts a stopped codespace through `gh codespace ssh`) can take over.
+    pub fn wait_available(
+        &self,
+        name: &str,
+        plan: &WaitPlan,
+        on_state: &mut dyn FnMut(&str),
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Availability, String> {
+        let mut waited = Duration::ZERO;
+        let mut last = String::new();
+        let mut failures = 0;
+        loop {
+            if abort() {
+                return Err(START_ABORTED.into());
+            }
+            let current = match codespaces::state(&*self.gh, name) {
+                Ok(current) => {
+                    failures = 0;
+                    current
+                }
+                Err(error)
+                    if failures < 24
+                        && waited < plan.timeout
+                        && !error.to_lowercase().contains("http 404") =>
+                {
+                    failures += 1;
+                    (self.sleep)(self.ready_poll);
+                    waited += self.ready_poll;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if current != last {
+                on_state(&current);
+                last = current.clone();
+            }
+            match current.as_str() {
+                "Available" => return Ok(Availability::Available),
+                "Failed" | "Deleted" | "Unavailable" => {
+                    return Err(format!("Codespace {name} is {current}"));
+                }
+                "Shutdown" | "ShuttingDown" if plan.shutdown_is_ok => {
+                    return Ok(Availability::Stopped);
+                }
+                "Shutdown" | "ShuttingDown" => {
+                    return Err(format!(
+                        "Codespace {name} is {current}; start it first (gh codespace ssh starts it)"
+                    ));
+                }
+                _ => {}
+            }
+            if waited >= plan.timeout {
+                return Err(format!(
+                    "Timed out waiting for codespace {name} (last state: {current})"
+                ));
+            }
+            (self.sleep)(self.ready_poll);
+            waited += self.ready_poll;
+        }
     }
 
     /// Start a blank cloud session on `binding`. Claude only (phase 1).
@@ -574,7 +840,30 @@ impl CloudSessions {
         }
     }
 
+    /// A provisional session has no remote transcript to save yet.
+    pub fn is_pending_start(&self, id: i64) -> bool {
+        self.store()
+            .ok()
+            .and_then(|store| store.remote_session(id).ok().flatten())
+            .is_some_and(|remote| {
+                crate::store::is_pending_cloud_environment(&remote.project.environment_id)
+            })
+    }
+
     pub fn stop_codespace(&self, name: &str) -> Result<(), String> {
+        {
+            let store = self.store()?;
+            for record in startup::pending_starts(&store)
+                .into_iter()
+                .filter(|r| r.codespace == name)
+            {
+                startup::pause_start(
+                    &store,
+                    record.session_id,
+                    "Codespace stopped. Choose Retry to start it again.",
+                )?;
+            }
+        }
         codespaces::stop(&*self.gh, name)?;
         self.invalidate(name);
         Ok(())
@@ -596,7 +885,11 @@ impl CloudSessions {
     /// codespace is still there; a warning means it is gone and its bindings
     /// were forgotten, but the machine could not be disconnected.
     pub fn delete_codespace_outcome(&self, name: &str) -> Result<DeleteOutcome, String> {
-        codespaces::delete(&*self.gh, name)?;
+        if let Err(error) = codespaces::delete(&*self.gh, name) {
+            if !error.to_lowercase().contains("http 404") {
+                return Err(error);
+            }
+        }
         self.invalidate(name);
         let mut disconnect_error = None;
         match self.host.machines() {
@@ -729,8 +1022,32 @@ impl CloudSessions {
             .ok()??
             .project
             .codespace?;
-        let state = self.cloud_state(&codespace);
-        Some(SessionTarget { codespace, state })
+        let startup = self
+            .store()
+            .ok()
+            .and_then(|store| start_record(&store, session_id))
+            .map(|record| StartupSummary::of(&record));
+        Some(self.session_target(codespace, startup))
+    }
+}
+
+impl CloudSessions {
+    /// A session's target. While its codespace is starting the state is `Starting` without
+    /// asking gh; a failed start shows the real gh state.
+    pub(crate) fn session_target(
+        &self,
+        codespace: String,
+        startup: Option<StartupSummary>,
+    ) -> SessionTarget {
+        let state = match &startup {
+            Some(summary) if summary.error.is_none() => CloudState::Starting,
+            _ => self.cloud_state(&codespace),
+        };
+        SessionTarget {
+            codespace,
+            state,
+            startup,
+        }
     }
 }
 
@@ -832,13 +1149,43 @@ pub enum DeleteOutcome {
 pub struct SessionTarget {
     pub codespace: String,
     pub state: CloudState,
+    /// Set while the session is still starting its codespace (or failed to).
+    pub startup: Option<StartupSummary>,
+}
+
+/// The startup of a cloud session as the app API reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupSummary {
+    /// The step in progress (the one that failed when `error` is set).
+    pub step: Option<startup::StepKind>,
+    pub error: Option<String>,
+}
+impl StartupSummary {
+    pub fn of(record: &StartRecord) -> Self {
+        Self {
+            step: if record.is_failed() {
+                record.failed_at
+            } else {
+                record.current()
+            },
+            error: record.error.clone(),
+        }
+    }
 }
 
 mod convert;
 pub use convert::*;
 
+pub mod startup;
+pub use startup::{
+    pending_starts, queue_start_message, queued_start_message, start_record, starting_refusal,
+    StartEvent, StartRecord, Step, StepKind, StepStatus,
+};
+
 // These fixtures execute the Linux host scripts against local Unix paths.
 #[cfg(all(test, unix))]
 mod convert_tests;
+#[cfg(test)]
+mod startup_tests;
 #[cfg(test)]
 mod tests;

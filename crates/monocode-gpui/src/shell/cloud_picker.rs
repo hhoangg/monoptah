@@ -6,7 +6,7 @@ use super::*;
 use crate::settings::widgets::secondary_button;
 use gpui::EventEmitter;
 use monocode_core::{
-    cloud_sessions::{CloudBinding, CloudSessions, CloudState, CodespaceChoice, HARNESS, Target},
+    cloud_sessions::{CloudSessions, CloudState, CodespaceChoice, HARNESS, StartRecord, Target},
     codespaces::{self, Codespace, GhRunner, MachineType},
 };
 
@@ -20,7 +20,7 @@ pub(super) struct Open {
 enum Picked {
     Started {
         summary: Session,
-        binding: CloudBinding,
+        record: StartRecord,
     },
     Cancel,
 }
@@ -51,17 +51,15 @@ pub(super) fn target_for(
     })
 }
 
-/// Connects (creating if asked) and starts a blank Claude session on the
-/// codespace. Blocking: call it on a worker.
-pub(super) fn start_cloud_session(
+/// Requests the codespace (creating it if asked) and creates the session that will run in it.
+/// Takes seconds; the codespace itself comes up in the background (see `cloud_start`). Blocking:
+/// call it on a worker.
+pub(super) fn begin_cloud_start(
     cloud: &CloudSessions,
     local_project: &str,
     target: Target,
-    progress: &mut dyn FnMut(&str),
-) -> Result<(Session, CloudBinding), String> {
-    let binding = cloud.prepare_target(local_project, target, progress)?;
-    let summary = cloud.create_session(&binding, HARNESS)?;
-    Ok((summary, binding))
+) -> Result<(Session, StartRecord), String> {
+    cloud.begin_start(local_project, target, HARNESS)
 }
 
 /// Existing codespaces and machine types of the project's repository.
@@ -188,37 +186,18 @@ impl CodespacePicker {
         };
         self.busy = true;
         self.error.clear();
-        self.progress = "Starting".into();
-        let (lines, progress) = async_channel::unbounded::<String>();
+        self.progress = "Creating codespace...".into();
         let cloud = self.cloud.clone();
         let project = self.local_project.clone();
-        let work = cx.background_executor().spawn(async move {
-            let mut report = |line: &str| {
-                let _ = lines.try_send(line.to_owned());
-            };
-            start_cloud_session(&cloud, &project, target, &mut report)
-        });
+        let work = cx
+            .background_executor()
+            .spawn(async move { begin_cloud_start(&cloud, &project, target) });
         cx.spawn(async move |this, cx| {
-            while let Ok(line) = progress.recv().await {
-                let line = line.trim().to_owned();
-                if line.is_empty() {
-                    continue;
-                }
-                if this
-                    .update(cx, |this, cx| {
-                        this.progress = line;
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
-                    Ok((summary, binding)) => cx.emit(Picked::Started { summary, binding }),
+                    Ok((summary, record)) => cx.emit(Picked::Started { summary, record }),
                     Err(error) => this.error = error,
                 }
                 cx.notify();
@@ -512,8 +491,8 @@ impl Shell {
             move |this, _, event: &Picked, window, cx| {
                 this.close_codespace_picker(window, cx);
                 match event {
-                    Picked::Started { summary, binding } => {
-                        this.open_cloud_session(summary.clone(), binding, window, cx)
+                    Picked::Started { summary, record } => {
+                        this.open_cloud_start(summary.clone(), record.clone(), window, cx)
                     }
                     Picked::Cancel => {}
                 }
@@ -538,33 +517,6 @@ impl Shell {
             }
         }
         cx.notify();
-    }
-
-    /// Lists the new session under its local project and opens it in the chat.
-    pub(super) fn open_cloud_session(
-        &mut self,
-        summary: Session,
-        binding: &CloudBinding,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let id = summary.id;
-        self.cloud_marks.insert(
-            id,
-            super::cloud::CloudMark {
-                local_project: binding.local_project.clone(),
-                codespace: binding.codespace.clone(),
-            },
-        );
-        self.cloud_states
-            .entry(binding.codespace.clone())
-            .or_insert(CloudState::Available);
-        self.add_loaded(summary, cx);
-        self.order.retain(|s| *s != id);
-        self.order.insert(0, id);
-        self.activate_session(id, window, cx);
-        self.invalidate_chrome(cx);
-        self.refresh_cloud(cx);
     }
 
     pub(super) fn codespace_picker_modal(

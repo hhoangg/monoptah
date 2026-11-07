@@ -191,7 +191,10 @@ fn named_target_reuses_machine_wakes_it_opens_the_project_and_records_the_bindin
 fn new_target_creates_waits_pairs_and_skips_the_extra_wake() {
     let gh = FakeGh::new(vec![
         ("auth status", ok(AUTH_OK)),
-        ("codespace create", ok("octo-new1\n")),
+        (
+            "--method POST",
+            ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+        ),
         ("codespace view", ok(r#"{"state":"Available"}"#)),
     ]);
     let host = Arc::new(FakeHost::default());
@@ -209,7 +212,7 @@ fn new_target_creates_waits_pairs_and_skips_the_extra_wake() {
         )
         .unwrap();
     assert_eq!(binding.codespace, "octo-new1");
-    assert!(gh.calls().iter().any(|c| c.contains("--branch main")));
+    assert!(gh.calls().iter().any(|c| c.contains("ref=main")));
     assert_eq!(host.log()[0], "connect octo-new1 monoptah-main".to_string());
     assert!(!host.log().iter().any(|l| l.starts_with("ensure")));
     assert!(progress.iter().any(|p| p == "pairing"), "{progress:?}");
@@ -483,7 +486,10 @@ fn delete_forgets_bindings_even_when_disconnect_fails() {
 fn new_codespaces_get_the_monoptah_display_name() {
     let gh = FakeGh::new(vec![
         ("auth status", ok(AUTH_OK)),
-        ("codespace create", ok("octo-new1\n")),
+        (
+            "--method POST",
+            ok(r#"{"name":"octo-new1","state":"Provisioning"}"#),
+        ),
         ("codespace view", ok(r#"{"state":"Available"}"#)),
     ]);
     let svc = service(&gh, &Arc::new(FakeHost::default()));
@@ -500,7 +506,7 @@ fn new_codespaces_get_the_monoptah_display_name() {
     assert!(gh
         .calls()
         .iter()
-        .any(|c| c.contains("--display-name monoptah-main")));
+        .any(|c| c.contains("display_name=monoptah-main")));
 }
 
 #[test]

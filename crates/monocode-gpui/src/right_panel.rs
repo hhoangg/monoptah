@@ -65,6 +65,9 @@ pub(crate) enum RightTab {
     /// The project's terminal, when it opens in the panel. Always last and
     /// never part of the saved order.
     Terminal,
+    /// The startup of a cloud session's codespace. Opened by the shell, never part of the tab
+    /// strip or the saved order, and never saved as the panel's tab.
+    Codespace,
 }
 impl RightTab {
     fn label(self) -> &'static str {
@@ -73,6 +76,7 @@ impl RightTab {
             Self::Changes => "Changes",
             Self::Graph => "History",
             Self::Terminal => "Terminal",
+            Self::Codespace => "Codespace",
         }
     }
     /// loadRightPanelTabOrder: unique known tabs, the missing ones appended.
@@ -80,7 +84,9 @@ impl RightTab {
     pub(crate) fn normalize(order: &[RightTab]) -> Vec<RightTab> {
         let mut out = Vec::new();
         for tab in order.iter().chain(&[Self::Files, Self::Graph]) {
-            if !matches!(tab, Self::Terminal | Self::Changes) && !out.contains(tab) {
+            if !matches!(tab, Self::Terminal | Self::Changes | Self::Codespace)
+                && !out.contains(tab)
+            {
                 out.push(*tab);
             }
         }
@@ -250,6 +256,7 @@ pub(crate) struct RightPanel {
     pub explorer: Entity<Explorer>,
     pub changes: Entity<Changes>,
     pub history: Entity<History>,
+    pub codespace: Entity<crate::codespace_pane::CodespacePane>,
     focus: FocusHandle,
     tab: RightTab,
     order: Vec<RightTab>,
@@ -287,6 +294,7 @@ impl RightPanel {
         let explorer = cx.new(|cx| Explorer::new(git.clone(), window, cx));
         let changes = cx.new(|cx| Changes::new(git.clone(), window, cx));
         let history = cx.new(|cx| History::new(git.clone(), window, cx));
+        let codespace = cx.new(|_| crate::codespace_pane::CodespacePane::new());
         let subscriptions = vec![
             cx.observe(&git, |_, _, cx| cx.notify()),
             cx.subscribe(&git, |_, _, _: &GitChanged, cx| cx.notify()),
@@ -302,6 +310,7 @@ impl RightPanel {
             explorer,
             changes,
             history,
+            codespace,
             tab,
             order: RightTab::normalize(&order),
             shown: false,
@@ -524,6 +533,7 @@ impl RightPanel {
                     RightTab::Changes => ("right-panel-tab-Changes", "git-branch"),
                     RightTab::Graph => ("right-panel-tab-History", "clock"),
                     RightTab::Terminal => ("right-panel-tab-Terminal", "terminal"),
+                    RightTab::Codespace => ("right-panel-tab-Codespace", "cloud-upload"),
                 };
                 let unfolded = match progress {
                     Some((_, p)) if active => p,
@@ -617,6 +627,11 @@ impl Render for RightPanel {
                 .into_any_element(),
             RightTab::Graph => self
                 .history
+                .clone()
+                .cached(StyleRefinement::default().flex_1().min_h_0().w_full())
+                .into_any_element(),
+            RightTab::Codespace => self
+                .codespace
                 .clone()
                 .cached(StyleRefinement::default().flex_1().min_h_0().w_full())
                 .into_any_element(),

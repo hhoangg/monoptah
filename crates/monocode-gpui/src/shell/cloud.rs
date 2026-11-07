@@ -302,7 +302,7 @@ pub(super) fn archive_groups(
                         failure = Some(CANCELLED.to_string());
                         break;
                     }
-                    if !cloud.is_cloud_session(*id) {
+                    if !cloud.is_cloud_session(*id) || cloud.is_pending_start(*id) {
                         continue;
                     }
                     let prefix = if total > 1 {
@@ -627,7 +627,11 @@ impl Shell {
     /// and, in roomy rows, its name.
     pub(super) fn cloud_badge(&self, id: i64, compact: bool) -> Option<AnyElement> {
         let mark = self.cloud_marks.get(&id)?;
-        let indicator = indicator(self.cloud_states.get(&mark.codespace).copied());
+        let mut indicator = indicator(self.cloud_states.get(&mark.codespace).copied());
+        // A startup in progress or failed replaces the codespace state: the dot is amber or red.
+        if let Some(label) = self.cloud_start_label(id) {
+            indicator = label;
+        }
         let color = match indicator.tone {
             Tone::Good => rgb(0x4ade80).into(),
             Tone::Busy => rgb(0xfbbf24).into(),
@@ -722,6 +726,7 @@ impl Shell {
         } else {
             self.active_codespace()
         };
+        self.sync_codespace_pane(cx);
         let flipped = crate::git_gate::set(codespace.clone());
         if let Some(panel) = &self.right_panel {
             panel.update(cx, |panel, cx| {
@@ -1133,7 +1138,7 @@ impl Shell {
     }
 
     /// Drops every session of a deleted codespace from the window.
-    fn forget_codespace_sessions(
+    pub(super) fn forget_codespace_sessions(
         &mut self,
         codespace: &str,
         window: &mut Window,

@@ -44,6 +44,149 @@ impl Conversation {
             self.summary.has_messages
         )
     }
+    /// The snapshot of this session's codespace start, while one is shown (running, failed or
+    /// just ready). `None` for every other session.
+    #[cfg(test)]
+    pub(crate) fn cloud_start(&self) -> Option<&Arc<crate::cloud_start_view::CloudStartSnapshot>> {
+        self.cloud_start.as_ref()
+    }
+    /// The message typed while the codespace started, not sent yet.
+    #[cfg(test)]
+    pub(crate) fn cloud_queued(&self) -> Option<&str> {
+        self.cloud_queued.as_deref()
+    }
+    /// The codespace is not ready: the host is not loaded and sends are queued.
+    pub(crate) fn cloud_start_blocks(&self) -> bool {
+        self.cloud_start
+            .as_ref()
+            .is_some_and(|s| s.blocks_session())
+    }
+    pub(crate) fn cloud_launch_pending(&self) -> bool {
+        self.cloud_start.is_some()
+            && (self.cloud_start_blocks()
+                || self.remote_state.app_prompt_waiting
+                || self.remote_state.app_draft_launched)
+    }
+    /// Publishes the shell's view of the start. `None` forgets it.
+    pub(crate) fn set_cloud_start(
+        &mut self,
+        start: Option<Arc<crate::cloud_start_view::CloudStartSnapshot>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cloud_start.is_none() && start.is_some() {
+            let id = self.summary.id;
+            self.cloud_queued = locked(&self.store)
+                .ok()
+                .and_then(|store| monocode_core::cloud_sessions::queued_start_message(&store, id));
+        }
+        self.cloud_start = start;
+        self.sync_cloud_chrome(cx);
+        cx.notify();
+    }
+    /// Shows the start in the transcript row and the composer (placeholder), which draw it.
+    pub(super) fn sync_cloud_chrome(&mut self, cx: &mut Context<Self>) {
+        let (start, queued) = (self.cloud_start.clone(), self.cloud_queued.clone());
+        self.transcript
+            .update(cx, |view, cx| view.set_cloud_start(start, queued, cx));
+        let wanted = self.cloud_start.as_ref().and_then(|start| {
+            let base = self
+                .cloud_placeholder
+                .clone()
+                .unwrap_or_else(|| self.input.read(cx).placeholder_text().clone());
+            start.placeholder(&base)
+        });
+        match wanted {
+            Some(text) => {
+                if self.cloud_placeholder.is_none() {
+                    self.cloud_placeholder = Some(self.input.read(cx).placeholder_text().clone());
+                }
+                self.input
+                    .update(cx, |input, cx| input.set_placeholder(text, cx));
+            }
+            None => {
+                if let Some(base) = self.cloud_placeholder.take() {
+                    self.input
+                        .update(cx, |input, cx| input.set_placeholder(base, cx));
+                }
+            }
+        }
+    }
+    /// Asks the shell to Retry, Rebuild, open the browser, delete the codespace or show the
+    /// Codespace panel.
+    pub(crate) fn request_cloud_start_action(
+        &mut self,
+        action: crate::cloud_start_view::StartAction,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(crate::cloud_start_view::CloudStartAction { action });
+    }
+    /// The codespace is open: the session now lives on `session`'s project. A message queued
+    /// meanwhile goes out once the host history has loaded.
+    pub(crate) fn cloud_start_ready(
+        &mut self,
+        session: Session,
+        ready: Arc<crate::cloud_start_view::CloudStartSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        // The sidebar lists a session only once it has messages; this one is launching.
+        let launching = self.summary.has_messages;
+        self.summary = session;
+        self.summary.has_messages |= launching;
+        let cwd = self.summary.cwd.clone();
+        self.review.update(cx, |review, cx| review.set_cwd(cwd, cx));
+        self.cloud_start = Some(ready);
+        self.sync_cloud_chrome(cx);
+        if self.cloud_queued.is_some() {
+            self.remote_state.app_prompt_waiting = true;
+        }
+        self.status = "Codespace ready".into();
+        self.load(cx);
+        cx.emit(SessionChanged);
+        cx.notify();
+    }
+    /// A send while the codespace starts keeps the text as the session's first prompt.
+    pub(super) fn queue_start_send(&mut self, cx: &mut Context<Self>) {
+        if self.attaching || self.input.read(cx).is_composing() {
+            return;
+        }
+        if !self.attachments.is_empty() {
+            self.status =
+                "Attachments cannot be sent while the codespace starts. Remove them or wait."
+                    .into();
+            cx.notify();
+            return;
+        }
+        if !self.input.read(cx).has_message_text() {
+            return;
+        }
+        let text = self
+            .input
+            .update(cx, |input, cx| input.take(cx))
+            .unwrap_or_default();
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        let id = self.summary.id;
+        let queued = locked(&self.store).and_then(|store| {
+            monocode_core::cloud_sessions::queue_start_message(&store, id, &text)?;
+            Ok(monocode_core::cloud_sessions::queued_start_message(
+                &store, id,
+            ))
+        });
+        match queued {
+            Ok(queued) => {
+                self.cloud_queued = queued;
+                self.sync_cloud_chrome(cx);
+                self.status = "Queued. It is sent when the codespace is ready.".into();
+            }
+            Err(error) => {
+                self.input.update(cx, |input, cx| input.set_text(text, cx));
+                self.status = error;
+            }
+        }
+        cx.notify();
+    }
     pub(super) fn is_remote(&self) -> bool {
         self.summary.cwd.starts_with("remote://")
     }
@@ -126,7 +269,7 @@ impl Conversation {
         }
     }
     pub(super) fn refresh_remote_snapshot(&mut self, cx: &mut Context<Self>) {
-        if self.remote_state.refreshing || self.busy || self.stopping {
+        if self.cloud_start_blocks() || self.remote_state.refreshing || self.busy || self.stopping {
             return;
         }
         self.remote_state.refreshing = true;
@@ -506,6 +649,8 @@ impl Conversation {
         if self.remote_state.app_draft_launched && !self.busy {
             self.remote_state.app_draft_launched = false;
             self.drop_stored_app_draft();
+            self.cloud_queued = None;
+            self.sync_cloud_chrome(cx);
         }
         if self.remote_state.app_prompt_waiting
             && !self.busy

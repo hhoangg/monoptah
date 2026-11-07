@@ -8,7 +8,10 @@ mod monos;
 mod notes;
 mod remote;
 mod remote_legacy;
-pub use remote::{RemoteProject, RemoteSession, RemoteUpload, CONVERTED};
+pub use remote::{
+    is_pending_cloud_environment, pending_cloud_project, RemoteProject, RemoteSession,
+    RemoteUpload, CONVERTED,
+};
 pub(crate) use shared::handle as desktop_session_handle;
 mod session_metadata;
 pub use session_metadata::{MobileSessionMetadata, SessionSidebarMetadata};
@@ -976,6 +979,13 @@ impl Store {
     /// Archiving preserves the transcript, provider context and configuration.
     pub fn set_archived(&self, id: i64, archived: bool) -> Result<(), String> {
         self.write_archived(id, archived)?;
+        if archived {
+            crate::cloud_sessions::startup::pause_start(
+                self,
+                id,
+                "Session archived. Choose Retry to resume startup.",
+            )?;
+        }
         // The flag is saved; a failure to note the time only loses the time.
         let _ = self.record_archive_time(id, archived);
         Ok(())

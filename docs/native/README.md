@@ -76,6 +76,20 @@ On macOS, the command packages and launches `~/Applications/Monoptah Native Dev.
 All worktrees share that app, so run only one `native:dev` session at a time. Other
 platforms launch the executable directly.
 
+For verification launched from an agent or another short-lived terminal, use:
+
+```sh
+npm run native:dev -- --detach
+```
+
+This builds and opens the app, prints its PID and log path, then exits the runner.
+The app stays open when the launching agent exits or its idle provider is reaped.
+Stdout and stderr (including Rust panic output) go to the printed file. Set
+`MONOCODE_DEV_LOG_DIR` to choose its directory; otherwise a private temporary
+directory is created. Close this app through its normal Quit action. To test a
+new build, quit it before launching again. The interactive command above keeps
+its terminal-controlled restart and shutdown behavior.
+
 ## Build
 
 ```sh

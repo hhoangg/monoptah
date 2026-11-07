@@ -25,8 +25,10 @@ impl Shell {
         self.session_worktrees
             .insert(id, settings.worktree_cwd.clone());
         self.mark_cloud_session(id);
+        self.register_cloud_start(id);
         self.add_loaded(summary, cx);
         self.sessions[&id].update(cx, |view, cx| view.install_app_launch(settings, !draft, cx));
+        self.track_cloud_start(id, cx);
         self.invalidate_chrome(cx);
     }
     pub(crate) fn close_mono_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -70,7 +72,9 @@ impl Shell {
                     id,
                     title: metadata.summary.title.clone(),
                     cwd: metadata.summary.cwd.clone(),
-                    busy: metadata.busy || live.is_some_and(|v| v.mono_external_pending()),
+                    busy: metadata.busy
+                        || live
+                            .is_some_and(|v| v.mono_external_pending() || v.cloud_launch_pending()),
                     has_messages: metadata.summary.has_messages,
                     archived: metadata.summary.archived,
                     updated_at: metadata.summary.updated_at,

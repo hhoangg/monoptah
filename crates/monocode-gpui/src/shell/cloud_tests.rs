@@ -331,13 +331,16 @@ fn collect_lists_cloud_sessions_with_cached_state_and_never_wakes() {
 }
 
 #[test]
-fn the_new_session_flow_prepares_the_target_then_starts_a_claude_session() {
+fn the_new_session_flow_begins_a_start_and_lists_a_pending_claude_session() {
     let checkout = github_checkout();
     let local = checkout.path().to_string_lossy().into_owned();
     let gh = FakeGh::new(vec![
         ("auth status", AUTH_OK),
         ("codespace list", LIST),
-        ("codespace create", "octo-new1\n"),
+        (
+            "--method POST",
+            r#"{"name":"octo-new1","state":"Provisioning"}"#,
+        ),
         ("codespace view", r#"{"state":"Available"}"#),
     ]);
     let host = Arc::new(FakeHost::default());
@@ -347,21 +350,20 @@ fn the_new_session_flow_prepares_the_target_then_starts_a_claude_session() {
         cloud_picker::target_for(CodespaceChoice::New, " feature ", Some("basicLinux32gb"))
             .unwrap();
     assert_eq!(target.branch.as_deref(), Some("feature"));
-    let mut lines = vec![];
-    let (summary, binding) =
-        cloud_picker::start_cloud_session(&svc, &local, target, &mut |l| lines.push(l.to_string()))
-            .unwrap();
+    let (summary, record) = cloud_picker::begin_cloud_start(&svc, &local, target).unwrap();
     assert_eq!(summary.provider, "claude");
-    assert_eq!(summary.cwd, binding.project_key);
-    assert_eq!(binding.codespace, "octo-new1");
+    // The session exists at once, on a provisional project, with its start recorded.
+    assert!(
+        summary.cwd.starts_with("remote://pending-octo-new1"),
+        "{}",
+        summary.cwd
+    );
+    assert_eq!(record.codespace, "octo-new1");
+    assert_eq!(record.session_id, summary.id);
     assert!(
         gh.calls()
             .iter()
-            .any(|c| c.contains("--branch feature") && c.contains("--machine basicLinux32gb"))
-    );
-    assert!(
-        lines.iter().any(|l| l == "Pairing with the codespace"),
-        "{lines:?}"
+            .any(|c| c.contains("ref=feature") && c.contains("machine=basicLinux32gb"))
     );
     let bound = svc.cloud_sessions_for(&local).unwrap();
     assert_eq!(bound.len(), 1);
@@ -378,8 +380,8 @@ fn an_existing_codespace_is_used_without_creating_and_a_new_one_needs_a_branch()
     let svc = service(&gh, &host, memory_store());
     let target =
         cloud_picker::target_for(CodespaceChoice::Named("octo-abc".into()), "", None).unwrap();
-    cloud_picker::start_cloud_session(&svc, &local, target, &mut |_| {}).unwrap();
-    assert!(!gh.calls().iter().any(|c| c.contains("codespace create")));
+    cloud_picker::begin_cloud_start(&svc, &local, target).unwrap();
+    assert!(!gh.calls().iter().any(|c| c.contains("--method POST")));
     assert_eq!(
         cloud_picker::target_for(CodespaceChoice::New, "  ", None).unwrap_err(),
         "Enter a branch for the new codespace."
@@ -1488,6 +1490,240 @@ fn a_session_being_saved_takes_no_message_until_the_save_ends(cx: &mut TestAppCo
             assert!(view.update(cx, |v, cx| v.refuse_while_saving_copy(cx)));
             shell.lock_cloud_composer(&[a], false, cx);
             assert!(!view.update(cx, |v, cx| v.refuse_while_saving_copy(cx)));
+        })
+        .unwrap();
+}
+
+/// A shell wired to a fake gh/host over its own store, and a begun start in a fresh checkout.
+fn start_fixture(
+    cx: &mut TestAppContext,
+) -> (
+    gpui::WindowHandle<Shell>,
+    Arc<FakeGh>,
+    Checkout,
+    CloudSessions,
+) {
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let gh = FakeGh::new(vec![
+        ("auth status", AUTH_OK),
+        ("codespace list", LIST),
+        (
+            "--method POST",
+            r#"{"name":"octo-new1","state":"Provisioning"}"#,
+        ),
+        ("codespace view", r#"{"state":"Provisioning"}"#),
+    ]);
+    let checkout = github_checkout();
+    let svc = window
+        .update(cx, |shell, _, _| {
+            let svc = CloudSessions::new(
+                gh.clone(),
+                Arc::new(FakeHost::default()),
+                shell.store.clone(),
+            );
+            shell.cloud = Arc::new(CloudSessions::new(
+                gh.clone(),
+                Arc::new(FakeHost::default()),
+                shell.store.clone(),
+            ));
+            svc
+        })
+        .unwrap();
+    (window, gh, checkout, svc)
+}
+
+fn begin(
+    svc: &CloudSessions,
+    checkout: &Checkout,
+) -> (Session, monocode_core::cloud_sessions::StartRecord) {
+    let local = checkout.path().to_string_lossy().into_owned();
+    let target = cloud_picker::target_for(CodespaceChoice::New, "feature", None).unwrap();
+    cloud_picker::begin_cloud_start(svc, &local, target).unwrap()
+}
+
+#[gpui::test]
+fn begin_start_opens_a_session_with_a_start_view_and_the_codespace_tab(cx: &mut TestAppContext) {
+    use crate::{cloud_start_view::StartPhase, right_panel::RightTab};
+    let (window, _, checkout, svc) = start_fixture(cx);
+    let (summary, record) = begin(&svc, &checkout);
+    let id = summary.id;
+    window
+        .update(cx, |shell, window, cx| {
+            shell.open_cloud_start(summary, record, window, cx);
+            assert_eq!(shell.workspace.active, Some(id));
+            assert!(shell.sessions.contains_key(&id));
+            let snapshot = shell.cloud_start_snapshot(id).unwrap();
+            assert_eq!(snapshot.phase, StartPhase::Starting);
+            assert!(snapshot.running);
+            assert_eq!(snapshot.record.codespace, "octo-new1");
+            // The conversation does not load the host while it starts.
+            assert!(shell.sessions[&id].read(cx).cloud_start_blocks());
+            let panel = shell.right_panel.clone().unwrap();
+            assert_eq!(panel.read(cx).tab(), RightTab::Codespace);
+            let pane = panel.read(cx).codespace.clone();
+            assert!(pane.read(cx).has_start());
+            assert!(shell.workspace.right_panel_open);
+            assert!(shell.right_panel_shown(cx));
+            shell.workspace.classic_layout = true;
+            assert!(shell.right_panel_shown(cx));
+            assert!(shell.cloud_marks.contains_key(&id));
+            assert_ne!(
+                shell.cloud_states.get("octo-new1"),
+                Some(&CloudState::Available)
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn ready_rebinds_the_conversation_and_queues_a_message_sent_while_starting(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_start_view::StartPhase;
+    let (window, _, checkout, svc) = start_fixture(cx);
+    let (summary, record) = begin(&svc, &checkout);
+    let id = summary.id;
+    window
+        .update(cx, |shell, _, cx| {
+            // A message typed while the codespace started.
+            monocode_core::cloud_sessions::queue_start_message(
+                &locked(&shell.store).unwrap(),
+                id,
+                "fix the bug",
+            )
+            .unwrap();
+            shell
+                .cloud_starts
+                .insert(id, cloud_start::CloudStartView::new(record));
+            shell.add_loaded(summary.clone(), cx);
+            let chat = shell.sessions[&id].clone();
+            assert_eq!(chat.read(cx).cloud_queued(), Some("fix the bug"));
+            assert!(chat.read(cx).summary.cwd.starts_with("remote://pending-"));
+            let ready = Session {
+                cwd: "remote://env-octo-new1/workspaces/widgets".into(),
+                ..summary
+            };
+            // finish_ready needs a window only to restore the panel, which was not opened.
+            let _ = &ready;
+        })
+        .unwrap();
+    window
+        .update(cx, |shell, window, cx| {
+            let cwd = "remote://env-octo-new1/workspaces/widgets".to_string();
+            let mut session = shell.session_summaries[&id].clone();
+            session.cwd = cwd.clone();
+            shell.finish_ready(id, session, window, cx);
+            let chat = shell.sessions[&id].read(cx);
+            assert_eq!(chat.summary.cwd, cwd);
+            assert!(!chat.cloud_start_blocks());
+            assert_eq!(chat.cloud_start().unwrap().phase, StartPhase::Ready);
+            assert!(chat.cloud_start().unwrap().ready.is_some());
+            assert!(
+                chat.remote_debug().contains("waiting=true"),
+                "{}",
+                chat.remote_debug()
+            );
+            assert_eq!(shell.session_summaries[&id].cwd, cwd);
+            assert!(shell.cloud_start_label(id).is_none());
+            assert!(
+                shell
+                    .mono_session_views(cx)
+                    .iter()
+                    .find(|session| session.id == id)
+                    .unwrap()
+                    .busy
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn restart_resumes_a_running_start_and_only_shows_a_failed_one(cx: &mut TestAppContext) {
+    use crate::cloud_start_view::StartPhase;
+    use monocode_core::cloud_sessions::startup::save_start_record;
+    let (window, gh, checkout, svc) = start_fixture(cx);
+    let (running, running_record) = begin(&svc, &checkout);
+    let (failed, mut failed_record) = begin(&svc, &checkout);
+    failed_record.error = Some("Container build failed".into());
+    window
+        .update(cx, |shell, _, cx| {
+            save_start_record(&locked(&shell.store).unwrap(), &failed_record).unwrap();
+            // At startup the shell already holds every stored session summary.
+            for session in locked(&shell.store).unwrap().sessions().unwrap() {
+                shell.session_summaries.insert(session.id, session);
+            }
+            let summaries = locked(&shell.store).unwrap().sessions().unwrap();
+            let store = shell.store.clone();
+            let fresh = cx.new(|cx| {
+                Shell::new(
+                    store,
+                    summaries,
+                    checkout.path().to_string_lossy().into_owned(),
+                    None,
+                    cx,
+                )
+            });
+            assert!(fresh.read(cx).session_summaries[&running.id].has_messages);
+            assert!(fresh.read(cx).session_summaries[&failed.id].has_messages);
+            assert!(fresh.read(cx).cloud_start_snapshot(failed.id).is_some());
+            let before = gh.calls().len();
+            shell.resume_cloud_starts(cx);
+            let resumed = shell.cloud_start_snapshot(running.id).unwrap();
+            assert_eq!(resumed.phase, StartPhase::Starting);
+            assert!(resumed.running, "a start that did not fail resumes");
+            let shown = shell.cloud_start_snapshot(failed.id).unwrap();
+            assert_eq!(shown.phase, StartPhase::Failed);
+            assert!(!shown.running, "a failed start waits for Retry");
+            assert_eq!(shown.error(), Some("Container build failed"));
+            assert_eq!(running_record.session_id, running.id);
+            // Both sessions are listed under the local project and carry the right dot.
+            assert!(shell.cloud_marks.contains_key(&running.id));
+            assert!(shell.session_summaries[&failed.id].has_messages);
+            assert_eq!(
+                shell.cloud_start_label(running.id).unwrap().label,
+                "Starting"
+            );
+            assert_eq!(
+                shell.cloud_start_label(running.id).unwrap().tone,
+                Tone::Busy
+            );
+            assert_eq!(shell.cloud_start_label(failed.id).unwrap().label, "Failed");
+            assert_eq!(shell.cloud_start_label(failed.id).unwrap().tone, Tone::Bad);
+            assert!(shell.cloud_badge(failed.id, false).is_some());
+            // The failed start ran nothing against gh.
+            assert_eq!(gh.calls().len(), before);
+            // A second call never starts a second worker.
+            shell.track_cloud_start(running.id, cx);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_codespace_tab_is_never_the_saved_right_tab(cx: &mut TestAppContext) {
+    use crate::right_panel::RightTab;
+    let (window, _, checkout, svc) = start_fixture(cx);
+    let (summary, record) = begin(&svc, &checkout);
+    let id = summary.id;
+    window
+        .update(cx, |shell, window, cx| {
+            let saved = shell.workspace.right_panel_tab;
+            shell
+                .cloud_starts
+                .insert(id, cloud_start::CloudStartView::new(record));
+            shell.add_loaded(summary, cx);
+            shell.workspace.active = Some(id);
+            shell.show_codespace_panel(id, window, cx);
+            let panel = shell.right_panel.clone().unwrap();
+            assert_eq!(panel.read(cx).tab(), RightTab::Codespace);
+            assert_eq!(shell.workspace.right_panel_tab, saved);
+            assert_ne!(shell.workspace.right_panel_tab, RightTab::Codespace);
+            assert!(!panel.read(cx).tabs().contains(&RightTab::Codespace));
+            let state = serde_json::to_string(&shell.workspace).unwrap();
+            assert!(!state.contains("codespace"), "{state}");
+            assert_eq!(
+                RightTab::normalize(&[RightTab::Codespace, RightTab::Graph]),
+                [RightTab::Graph, RightTab::Files]
+            );
         })
         .unwrap();
 }
