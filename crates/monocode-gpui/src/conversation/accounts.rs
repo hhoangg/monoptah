@@ -25,7 +25,12 @@ impl Conversation {
         if self.busy || monocode_core::accounts::login_arguments(kind, action).is_none() {
             return None;
         }
+        let token_auth = kind == Kind::Claude
+            && !self.is_remote()
+            && crate::accounts::get(cx)
+                .is_some_and(|center| center.read(cx).uses_claude_token(&self.settings.account.id));
         let status = self.status.to_ascii_lowercase();
+        let unreadable = monocode_core::accounts::CREDENTIAL_UNREADABLE.to_ascii_lowercase();
         if ![
             "not signed in",
             "not authenticated",
@@ -36,9 +41,26 @@ impl Conversation {
         ]
         .iter()
         .any(|s| status.contains(s))
+            && !(token_auth
+                && [
+                    "authentication_error",
+                    "invalid oauth token",
+                    "token has expired",
+                    "invalid x-api-key",
+                    "invalid api key",
+                    unreadable.as_str(),
+                ]
+                .iter()
+                .any(|s| status.contains(s)))
         {
             return None;
         }
+
+        let label = if token_auth {
+            "Manage sign-in"
+        } else {
+            "Sign in"
+        };
         let id = self.settings.account.id.clone();
         Some(
             div()
@@ -51,19 +73,19 @@ impl Conversation {
                 .items_center()
                 .gap_2()
                 .child(provider_icon(kind.id(), 20.))
-                .child(
-                    div()
-                        .flex_1()
-                        .child(format!("Sign in to {} to continue", kind.label())),
-                )
+                .child(div().flex_1().child(if token_auth {
+                    "Check or replace this account’s token or API key in Accounts".into()
+                } else {
+                    format!("Sign in to {} to continue", kind.label())
+                }))
                 .child(
                     crate::settings::widgets::secondary_button(
                         "conversation-sign-in",
-                        "Sign in",
-                        true,
+                        label,
+                        !token_auth,
                         false,
                     )
-                    .child("Sign in")
+                    .child(label)
                     .on_click(cx.listener(move |_, _, _, cx| {
                         if let Some(center) = crate::accounts::get(cx) {
                             center.update(cx, |center, cx| {
@@ -407,6 +429,9 @@ impl Conversation {
         cx.notify();
     }
     pub(crate) fn account_authenticated(&mut self, cx: &mut Context<Self>) {
+        if self.status == ACCOUNT_UNAVAILABLE {
+            self.status.clear();
+        }
         self.attach_account(cx);
         self.refresh_catalog(cx);
         cx.notify();

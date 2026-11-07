@@ -2,6 +2,7 @@
 mod masked;
 pub(crate) mod resets;
 mod signin;
+mod token;
 pub(crate) mod ui;
 use crate::{
     input::{self, Input},
@@ -141,10 +142,39 @@ pub(crate) enum Surface {
     InlineSettings,
     Footer,
 }
+/// What is known about a named Claude account's saved credential. An account
+/// with no entry has none; `Unreadable` means one exists but its kind could not
+/// be read, which must not look like "browser sign-in".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CredentialState {
+    Known(accounts::ClaudeCredential),
+    Unreadable,
+}
+fn read_credential(profile: &Profile) -> Option<CredentialState> {
+    match profile.claude_credential() {
+        Ok(Some(credential)) => Some(CredentialState::Known(credential)),
+        Ok(None) => None,
+        Err(_) => Some(CredentialState::Unreadable),
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthMethod {
+    Keep,
+    Browser,
+    SetupToken,
+    ApiKey,
+}
 struct Editor {
     kind: Kind,
     id: Option<String>,
     input: Entity<Input>,
+    token: Entity<Input>,
+    auth: AuthMethod,
+    /// Where the sign-in options chevron sits, for the dropdown to anchor to.
+    anchor: crate::popover::AnchorSlot,
+    menu: Option<token::AuthMenu>,
+    _token_changed: Subscription,
+    _token_submit: Subscription,
     surface: Surface,
     previous_focus: Option<gpui::FocusHandle>,
     _submit: Subscription,
@@ -173,6 +203,14 @@ pub(crate) struct Accounts {
     pub usage: HashMap<Key, Cached>,
     pub reset_actions: HashMap<Key, resets::ResetAction>,
     pub identities: HashMap<(Kind, String), accounts::Identity>,
+    /// Saved credential kind per Claude account id. Loaded when the center is
+    /// created and refreshed on save, removal and `invalidate`, so rendering
+    /// never reads the database.
+    credentials: HashMap<String, CredentialState>,
+    /// A token or key is being saved or removed; it cannot be interrupted.
+    saving_credential: bool,
+    /// Account whose conversations were told it is being re-authenticated.
+    pending_auth: Option<String>,
     identity_loading: std::collections::HashSet<(Kind, String)>,
     identity_generation: HashMap<(Kind, String), u64>,
     store: Database,
@@ -212,6 +250,14 @@ impl Accounts {
                 }
             }
         });
+        let credentials = book
+            .list(Kind::Claude)
+            .into_iter()
+            .filter_map(|account| {
+                let state = read_credential(&Profile::new(&account.id, &root))?;
+                Some((account.id, state))
+            })
+            .collect();
         Self {
             book,
             root,
@@ -219,6 +265,9 @@ impl Accounts {
             usage: HashMap::new(),
             reset_actions: HashMap::new(),
             identities: HashMap::new(),
+            credentials,
+            saving_credential: false,
+            pending_auth: None,
             identity_loading: Default::default(),
             identity_generation: Default::default(),
             editor: None,
@@ -238,6 +287,35 @@ impl Accounts {
     }
     pub(crate) fn profile(&self, id: &str) -> Profile {
         Profile::new(id, &self.root)
+    }
+    /// The credential kind a named Claude account uses, from the cache.
+    pub(crate) fn claude_credential(&self, id: &str) -> Option<accounts::ClaudeCredential> {
+        match self.credentials.get(id)? {
+            CredentialState::Known(credential) => Some(*credential),
+            CredentialState::Unreadable => None,
+        }
+    }
+    /// Whether the account has a saved token or key, even one whose kind
+    /// could not be read.
+    pub(crate) fn uses_claude_token(&self, id: &str) -> bool {
+        self.credentials.contains_key(id)
+    }
+    /// Re-read one account's credential kind after it may have changed. A read
+    /// error keeps an explicit `Unreadable` entry instead of dropping it.
+    fn refresh_credential(&mut self, id: &str) {
+        match read_credential(&self.profile(id)) {
+            Some(state) => self.credentials.insert(id.to_owned(), state),
+            None => self.credentials.remove(id),
+        };
+    }
+    /// After a restricted sign-in attempt ended without a new login, tell
+    /// conversations the account is usable again if its setup still works.
+    fn restore_pending_auth(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.pending_auth.take()
+            && self.profile(&id).env(Kind::Claude).is_ok()
+        {
+            cx.emit(AccountEvent::Authenticated(Kind::Claude, id));
+        }
     }
     pub(crate) fn hide_emails(&mut self) {
         self.revealed.clear();
@@ -318,6 +396,26 @@ impl Accounts {
     }
     /// React's `accountStatus`: a tone, a word, and an optional detail.
     pub(crate) fn status(&self, kind: Kind, id: &str) -> Status {
+        if kind == Kind::Claude && self.credentials.get(id) == Some(&CredentialState::Unreadable) {
+            return Status {
+                tone: Tone::Unknown,
+                label: "Credential unreadable".into(),
+                detail: Some("Replace the token or API key".into()),
+            };
+        }
+        if kind == Kind::Claude
+            && let Some(credential) = self.claude_credential(id)
+        {
+            return Status {
+                tone: Tone::Unknown,
+                label: match credential {
+                    accounts::ClaudeCredential::SetupToken => "Token configured",
+                    accounts::ClaudeCredential::ApiKey => "API key configured",
+                }
+                .into(),
+                detail: Some("Validity and expiry unverified".into()),
+            };
+        }
         let key = Key::new(kind, self.profile(id), None);
         let checking = Status {
             tone: Tone::Checking,
@@ -586,10 +684,37 @@ impl Accounts {
         let changed = cx.subscribe(&input, |_, _, _: &input::Changed, cx| cx.notify());
         let previous_focus = window.focused(cx);
         window.focus(&input.read(cx).focus_handle(cx), cx);
+        let token = cx.new(|cx| {
+            let mut input = Input::field(
+                "Claude token or API key",
+                "Paste token from `claude setup-token`",
+                crate::theme::content(0.25),
+                cx,
+            );
+            input.set_secret(true);
+            input.set_max_chars(12000);
+            input
+        });
+        let token_changed = cx.subscribe(&token, |_, _, _: &input::Changed, cx| cx.notify());
+        let token_submit =
+            cx.subscribe_in(&token, window, |this, _, _: &input::Submitted, _, cx| {
+                this.submit_editor(cx)
+            });
+        let auth = if id.is_none() {
+            AuthMethod::Browser
+        } else {
+            AuthMethod::Keep
+        };
         self.editor = Some(Editor {
             kind,
             id,
             input,
+            token,
+            auth,
+            anchor: Default::default(),
+            menu: None,
+            _token_changed: token_changed,
+            _token_submit: token_submit,
             surface,
             previous_focus,
             _submit: submit,
@@ -603,6 +728,10 @@ impl Accounts {
             return;
         };
         if self.working {
+            return;
+        }
+        if editor.kind == Kind::Claude && editor.id.as_deref() != Some(accounts::DEFAULT) {
+            self.submit_claude_editor(cx);
             return;
         }
         let label = editor.input.read(cx).content.to_string();
@@ -644,6 +773,14 @@ impl Accounts {
         adding: Option<Account>,
         cx: &mut Context<Self>,
     ) {
+        if kind == Kind::Claude
+            && action == AuthAction::SignIn
+            && adding.is_none()
+            && self.uses_claude_token(id)
+        {
+            cx.emit(AccountEvent::Manage);
+            return;
+        }
         let surface = self
             .editor
             .as_ref()
@@ -652,6 +789,10 @@ impl Accounts {
         self.start_auth(kind, id, action, adding, surface, cx);
     }
     pub(crate) fn begin_footer_auth(&mut self, kind: Kind, id: &str, cx: &mut Context<Self>) {
+        if kind == Kind::Claude && self.uses_claude_token(id) {
+            cx.emit(AccountEvent::Manage);
+            return;
+        }
         self.start_auth(kind, id, AuthAction::SignIn, None, Surface::Footer, cx);
     }
     fn start_auth(
@@ -741,8 +882,10 @@ impl Accounts {
                         if signin.adding.is_some() {
                             this.error = Some(error);
                         }
+                        this.restore_pending_auth(cx);
                     }
                     Ok(()) => {
+                        this.pending_auth = None;
                         signin.complete = true;
                         let adding = signin.adding.take();
                         if let Some(account) = adding {
@@ -761,6 +904,9 @@ impl Accounts {
         cx.notify();
     }
     fn invalidate(&mut self, kind: Kind, id: &str, cx: &mut Context<Self>) {
+        if kind == Kind::Claude {
+            self.refresh_credential(id);
+        }
         self.reset_actions
             .retain(|key, _| key.kind != kind || key.profile.id != id);
         self.identities.remove(&(kind, id.to_owned()));
@@ -811,6 +957,7 @@ impl Accounts {
                         this.working = false;
                         match result {
                             Ok(()) => {
+                                this.credentials.remove(&account.id);
                                 this.book = book;
                                 this.usage.retain(|key, _| {
                                     key.kind != kind || key.profile.id != account.id
@@ -821,7 +968,14 @@ impl Accounts {
                                 this.identities.remove(&(kind, account.id));
                                 cx.emit(AccountEvent::Updated);
                             }
-                            Err(error) => this.error = Some(error),
+                            Err(error) => {
+                                // The delete may have failed before or after
+                                // removing the row: re-read it.
+                                if kind == Kind::Claude {
+                                    this.refresh_credential(&account.id);
+                                }
+                                this.error = Some(error);
+                            }
                         }
                         cx.notify();
                     });

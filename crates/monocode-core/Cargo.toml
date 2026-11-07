@@ -16,6 +16,7 @@ url = "2"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 sha2 = "0.10"
+aes-gcm = "0.10"
 rand = "0.9"
 regex = "1"
 unicode-normalization = "0.1"

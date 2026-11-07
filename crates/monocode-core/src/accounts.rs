@@ -1,4 +1,9 @@
 //! Provider-owned sign-ins. Metadata never contains credentials.
+mod token;
+pub use token::{
+    normalize_claude_api_key, normalize_claude_token, ClaudeCredential, CREDENTIAL_UNREADABLE,
+};
+pub(crate) use token::{register_database, CREDENTIALS_TABLE};
 mod desktop;
 mod identity;
 pub(crate) use desktop::DesktopOverrides;
@@ -129,7 +134,7 @@ impl Profile {
                 .map_err(|e| e.to_string())?;
         }
         let dir: OsString = dir.into();
-        Ok(match kind {
+        let mut environment = match kind {
             Kind::Claude => (
                 vec![
                     ("CLAUDE_CONFIG_DIR".into(), dir.clone()),
@@ -146,7 +151,17 @@ impl Profile {
                 vec!["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"],
             ),
             _ => unreachable!(),
-        })
+        };
+        if kind == Kind::Claude {
+            if let Some((credential, secret)) = self.claude_secret()? {
+                // The PTY uses an env -u wrapper for removals; retaining this
+                // key there would also strip the account-specific value.
+                let variable = credential.variable();
+                environment.1.retain(|key| *key != variable);
+                environment.0.push((variable.into(), secret.into()));
+            }
+        }
+        Ok(environment)
     }
     pub fn apply(&self, kind: Kind, command: &mut Command) -> Result<(), String> {
         if kind == Kind::Claude && claude_entrypoint() {
@@ -171,6 +186,9 @@ impl Profile {
         let dir = self
             .directory(kind)?
             .ok_or("The default provider account cannot be removed")?;
+        if kind == Kind::Claude {
+            self.remove_claude_token()?;
+        }
         #[cfg(target_os = "macos")]
         if kind == Kind::Claude {
             crate::usage::claude::delete_keychain(&dir)?;
