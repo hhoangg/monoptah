@@ -583,8 +583,7 @@ impl Tunnel {
         mut command: Command,
     ) -> Result<Self, String> {
         check_codespace(target)?;
-        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let port = reserve_local_port()?;
         if let Some(askpass) = askpass {
             askpass.configure(&mut command)?;
         }
@@ -597,7 +596,6 @@ impl Tunnel {
             command.args(["--", &target.target]);
         }
         command.stdin(Stdio::null()).stdout(Stdio::null());
-        drop(listener);
         let mut child = command.spawn().map_err(|e| spawn_error(target, e))?;
         let mut reader = child.stderr.take().unwrap();
         let stderr = Arc::new(Mutex::new(String::new()));
@@ -632,12 +630,7 @@ impl Tunnel {
                     tunnel.stderr.lock().unwrap().trim()
                 ));
             }
-            if TcpStream::connect_timeout(
-                &([127, 0, 0, 1], port).into(),
-                Duration::from_millis(100),
-            )
-            .is_ok()
-            {
+            if port_accepts(port) {
                 return Ok(tunnel);
             }
             if Instant::now() >= deadline {
@@ -649,6 +642,29 @@ impl Tunnel {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Pick a free local port for the tunnel to bind. Binding port 0 and dropping
+/// the listener is not enough on its own: where sockets are not created with
+/// close-on-exec atomically (macOS), a child spawned on another thread at that
+/// moment inherits the listener and keeps the port accepting connections after
+/// we closed ours. The readiness probe would then take that stray listener for
+/// the tunnel, and the first request would hit a connection that is reset or
+/// refused once the child exits. A port that still accepts is skipped.
+fn reserve_local_port() -> Result<u16, String> {
+    for _ in 0..20 {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        drop(listener);
+        if !port_accepts(port) {
+            return Ok(port);
+        }
+    }
+    Err("No free local port is available for the SSH tunnel".into())
+}
+
+fn port_accepts(port: u16) -> bool {
+    TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(100)).is_ok()
 }
 
 #[derive(Default)]
@@ -803,6 +819,15 @@ pub fn device_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_ports_are_not_accepting_connections() {
+        let port = reserve_local_port().unwrap();
+        assert!(!port_accepts(port));
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        assert!(port_accepts(port));
+        drop(listener);
+    }
 
     #[test]
     fn stale_requests_cannot_invalidate_a_newer_tunnel() {
