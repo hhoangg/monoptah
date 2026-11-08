@@ -1,14 +1,14 @@
-//! Cloud sessions in the shell: sessions that live in a GitHub codespace but
-//! belong to a local project. They are listed in the local project's sidebar
-//! with a cloud mark and the codespace's state, archive through a dialog that
+//! Cloud sessions in the shell: sessions that live in a GitHub codespace (or a Docker
+//! sandbox, worded with its own noun) but belong to a local project. They are listed in the
+//! local project's sidebar with a cloud mark and the codespace's state, archive through a dialog that
 //! asks what to do with the codespace, and open a local `gh codespace ssh`
 //! terminal. All `gh` and network work runs on background threads, and state
 //! is only ever read from the cache, so it never wakes a codespace.
 use super::*;
 use monocode_core::{
     cloud_sessions::{
-        CloudSessions, CloudState, Converted, DeleteOutcome, Restored, pending_restore_for,
-        restore_code,
+        CloudBackendKind, CloudRef, CloudSessions, CloudState, ConvertError, Converted,
+        DeleteOutcome, Restored, SandboxTerminal, pending_restore_for, restore_code,
     },
     codespaces::GhRunner,
 };
@@ -21,7 +21,22 @@ const REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CloudMark {
     pub local_project: String,
+    /// Name of the workspace: a codespace name or a sandbox name, see [`Self::kind`].
     pub codespace: String,
+    pub kind: CloudBackendKind,
+}
+
+impl CloudMark {
+    pub(super) fn cloud(&self) -> CloudRef {
+        CloudRef {
+            kind: self.kind,
+            name: self.codespace.clone(),
+        }
+    }
+    /// Key of the cached state (`Shell::cloud_states`).
+    pub(super) fn key(&self) -> String {
+        self.cloud().key()
+    }
 }
 
 /// What the sidebar shows for a codespace state.
@@ -57,6 +72,7 @@ pub(super) fn indicator(state: Option<CloudState>) -> Indicator {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Snapshot {
     pub marks: HashMap<i64, CloudMark>,
+    /// By [`CloudRef::key`]: the bare name for a codespace.
     pub states: HashMap<String, CloudState>,
     pub activity: HashMap<i64, (bool, bool)>,
     /// Whether each newly checked project has a GitHub `origin`.
@@ -95,27 +111,22 @@ pub(super) fn collect(
             continue;
         };
         for session in sessions {
-            // The sidebar groups and the archive dialog are codespace-only until the sandbox
-            // labels land (Phase D2); `stop_cloud` / `delete_cloud_outcome` already route a
-            // sandbox through its own backend.
-            if session.cloud.kind != monocode_core::cloud_sessions::CloudBackendKind::Codespaces {
-                continue;
-            }
             let id = session.summary.id;
             snapshot.marks.insert(
                 id,
                 CloudMark {
                     local_project: project.clone(),
-                    codespace: session.codespace.clone(),
+                    codespace: session.cloud.name.clone(),
+                    kind: session.cloud.kind,
                 },
             );
             snapshot
                 .activity
                 .insert(id, (session.running, session.needs_input));
             if let std::collections::hash_map::Entry::Vacant(slot) =
-                snapshot.states.entry(session.codespace.clone())
+                snapshot.states.entry(session.cloud.key())
             {
-                slot.insert(cloud.cloud_state(&session.codespace));
+                slot.insert(cloud.cloud_state_of(&session.cloud));
             }
         }
     }
@@ -140,11 +151,119 @@ pub(super) fn default_choice(others: usize) -> ArchiveChoice {
     }
 }
 
-pub(super) fn others_note(others: usize) -> Option<String> {
+pub(super) fn others_note(others: usize, noun: &str) -> Option<String> {
     match others {
         0 => None,
-        1 => Some("1 other session uses this codespace.".into()),
-        n => Some(format!("{n} other sessions use this codespace.")),
+        1 => Some(format!("1 other session uses this {noun}.")),
+        n => Some(format!("{n} other sessions use this {noun}.")),
+    }
+}
+
+/// The words the archive dialog uses for its groups: the backend's own when they all share
+/// one, "workspace" when a selection mixes codespaces and sandboxes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Words {
+    pub noun: &'static str,
+    pub title: &'static str,
+    pub plural: &'static str,
+    kind: Option<CloudBackendKind>,
+}
+
+pub(super) fn words(groups: &[CodespaceGroup]) -> Words {
+    let kind = groups
+        .first()
+        .map(|g| g.kind)
+        .filter(|kind| groups.iter().all(|g| g.kind == *kind));
+    match kind {
+        Some(CloudBackendKind::DockerSandbox) => Words {
+            noun: "sandbox",
+            title: "Sandbox",
+            plural: "sandboxes",
+            kind,
+        },
+        Some(CloudBackendKind::Codespaces) => Words {
+            noun: "codespace",
+            title: "Codespace",
+            plural: "codespaces",
+            kind,
+        },
+        None => Words {
+            noun: "workspace",
+            title: "Workspace",
+            plural: "workspaces",
+            kind: None,
+        },
+    }
+}
+
+/// The question of the delete confirmation (session menu).
+pub(super) fn delete_confirm_line(words: &Words, name: &str) -> String {
+    format!("Delete the {} {name}? This cannot be undone.", words.noun)
+}
+
+/// For a stopped sandbox: saving the local copy before a delete has to reach into it.
+pub(super) fn delete_start_note(words: &Words, stopped: bool) -> Option<String> {
+    (stopped && words.kind == Some(CloudBackendKind::DockerSandbox)).then(|| {
+        "Deleting saves a local copy first, which starts the sandbox for a moment.".to_string()
+    })
+}
+
+/// The body of the "Remove from Monoptah" confirmation.
+pub(super) fn remove_confirm_body(title: &str, name: &str) -> String {
+    format!(
+        "Remove {} from Monoptah? The sandbox {name} keeps existing and keeps costing money \
+         until you delete it (`sbx --cloud rm {name}`). Its conversation is not saved on this \
+         computer.",
+        quoted_title_single(title),
+    )
+}
+
+/// Like [`quoted_title`] with single curly quotes, as the other confirmations quote titles.
+fn quoted_title_single(title: &str) -> String {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return "this session".into();
+    }
+    if title.chars().count() <= TITLE_LIMIT {
+        return format!("\u{2018}{title}\u{2019}");
+    }
+    let clipped: String = title.chars().take(TITLE_LIMIT).collect();
+    format!("\u{2018}{}\u{2026}\u{2019}", clipped.trim_end())
+}
+
+/// The note under the list of files the local copy lacks.
+pub(super) fn review_note(words: &Words) -> String {
+    format!(
+        "The local copy is saved without them. Deleting the {} removes them for good; \
+         stopping it keeps them. Keep running leaves it as it is: stop or delete it later \
+         from the session menu.",
+        words.noun
+    )
+}
+
+/// The warning under a failed save or stop.
+pub(super) fn failed_note(words: &Words) -> String {
+    format!(
+        "Going on without a complete local copy can lose the code and files that only exist \
+         on the {}.",
+        words.noun
+    )
+}
+
+impl Words {
+    /// What a running workspace costs, as the dialog warns about it.
+    pub(super) fn cost(&self) -> String {
+        match self.kind {
+            Some(CloudBackendKind::DockerSandbox) => {
+                "A running sandbox keeps costing money until its runtime limit stops it.".into()
+            }
+            Some(CloudBackendKind::Codespaces) => {
+                "A running codespace keeps costing money until it idles out.".into()
+            }
+            None => "A running workspace keeps costing money until it idles out or its runtime \
+                     limit stops it."
+                .into(),
+        }
     }
 }
 
@@ -162,23 +281,26 @@ pub(super) enum Then {
 pub(super) fn apply_choice(
     cloud: &CloudSessions,
     choice: ArchiveChoice,
-    codespace: &str,
+    target: &CloudRef,
 ) -> Result<(Then, Option<String>), String> {
     match choice {
         ArchiveChoice::Keep => Ok((Then::Archive, None)),
         ArchiveChoice::Stop => cloud
-            .stop_codespace(codespace)
+            .stop_cloud(target)
             .map(|()| (Then::Archive, None))
-            .map_err(|e| format!("Could not stop the codespace: {e}")),
-        // The codespace is gone and its bindings were dropped even when only
+            .map_err(|e| format!("Could not stop the {}: {e}", target.noun())),
+        // The workspace is gone and its bindings were dropped even when only
         // disconnecting the machine failed, so the sessions go either way.
-        ArchiveChoice::Delete => match cloud.delete_codespace_outcome(codespace) {
+        ArchiveChoice::Delete => match cloud.delete_cloud_outcome(target) {
             Ok(DeleteOutcome::Deleted) => Ok((Then::Forget, None)),
             Ok(DeleteOutcome::DeletedWithWarning(e)) => Ok((
                 Then::Forget,
-                Some(format!("Codespace deleted, but disconnecting failed: {e}")),
+                Some(format!(
+                    "{} deleted, but disconnecting failed: {e}",
+                    target.title()
+                )),
             )),
-            Err(e) => Err(format!("Could not delete the codespace: {e}")),
+            Err(e) => Err(format!("Could not delete the {}: {e}", target.noun())),
         },
     }
 }
@@ -202,12 +324,14 @@ pub(super) fn quoted_title(title: &str) -> String {
 /// Which sessions and codespaces the dialog is about.
 pub(super) fn archive_summary(title: &str, groups: &[CodespaceGroup]) -> String {
     let sessions: usize = groups.iter().map(|g| g.ids.len()).sum();
+    let words = words(groups);
     if let [group] = groups
         && sessions == 1
     {
         return format!(
-            "{} runs in the codespace {}.",
+            "{} runs in the {} {}.",
             quoted_title(title),
+            words.noun,
             group.codespace
         );
     }
@@ -227,16 +351,25 @@ pub(super) fn archive_summary(title: &str, groups: &[CodespaceGroup]) -> String 
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{sessions} cloud sessions run in: {list}. The choice applies to each codespace.")
+    format!(
+        "{sessions} cloud sessions run in: {list}. The choice applies to each {}.",
+        words.noun
+    )
 }
 
 /// Saves the local copy of one cloud session (see `CloudSessions::convert_session`).
+/// The `bool` is whether the user already agreed to archive files only (see
+/// [`ConvertError::NeedsFilesOnlyConfirm`]).
 pub(super) type ConvertFn = Arc<
-    dyn Fn(&CloudSessions, i64, &mut dyn FnMut(&str)) -> Result<Converted, String> + Send + Sync,
+    dyn Fn(&CloudSessions, i64, bool, &mut dyn FnMut(&str)) -> Result<Converted, ConvertError>
+        + Send
+        + Sync,
 >;
 
 pub(super) fn default_convert() -> ConvertFn {
-    Arc::new(|cloud, id, progress| cloud.convert_session(id, progress))
+    Arc::new(|cloud, id, files_only, progress| {
+        cloud.convert_session_confirmed(id, files_only, progress)
+    })
 }
 
 /// What one codespace's archive did.
@@ -248,11 +381,36 @@ pub(super) struct GroupOutcome {
     pub result: Result<(Then, Option<String>), String>,
     /// With `result` set to `NEEDS_REVIEW`: what a delete would lose, one line each.
     pub risky: Vec<String>,
+    /// With `result` set to `NEEDS_FILES_ONLY`: the session whose conversation could not be
+    /// reached and why.
+    pub unreachable: Option<(i64, String)>,
 }
 
 /// The error of a group that was paused before deleting its codespace: the local copy has files
 /// missing that only exist there, so the user decides first.
 pub(super) const NEEDS_REVIEW: &str = "Needs review";
+
+/// The error of a group paused because a conversation could not be reached: the user decides
+/// between retrying and archiving only the code.
+pub(super) const NEEDS_FILES_ONLY: &str = "Needs files-only confirmation";
+
+/// The body of the "Archive files only?" step.
+pub(super) fn files_only_body(title: &str, reason: &str) -> String {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let who = if title.is_empty() {
+        "this session".to_string()
+    } else if title.chars().count() <= TITLE_LIMIT {
+        format!("\u{2018}{title}\u{2019}")
+    } else {
+        let clipped: String = title.chars().take(TITLE_LIMIT).collect();
+        format!("\u{2018}{}\u{2026}\u{2019}", clipped.trim_end())
+    };
+    format!(
+        "The conversation of {who} could not be reached ({reason}). You can retry, or save \
+         only the code (unpushed commits and uncommitted changes) and continue. The \
+         conversation will not be saved."
+    )
+}
 
 pub(super) use monocode_core::cloud_sessions::unsaved_lines;
 
@@ -271,6 +429,8 @@ pub(super) fn archive_groups(
     cancel: &std::sync::atomic::AtomicBool,
     // What the user already saw and accepted losing; anything else asks again.
     confirmed: &[String],
+    // Sessions whose user agreed to archive only the code.
+    files_only: &[i64],
     progress: &mut dyn FnMut(&str),
 ) -> Vec<GroupOutcome> {
     use std::sync::atomic::Ordering;
@@ -281,7 +441,7 @@ pub(super) fn archive_groups(
         .map(|group| {
             let mut ids = group.ids.clone();
             if save_copy && choice == ArchiveChoice::Delete {
-                for id in cloud.sessions_in_codespace(&group.codespace) {
+                for id in cloud.sessions_in_cloud(&group.cloud()) {
                     if !ids.contains(&id) {
                         ids.push(id);
                     }
@@ -302,7 +462,7 @@ pub(super) fn archive_groups(
             let preflight = if cancel.load(Ordering::Relaxed) {
                 Err(CANCELLED.to_string())
             } else if choice == ArchiveChoice::Delete {
-                cloud.forget_missing_codespace(&group.codespace)
+                cloud.forget_missing(&group.cloud())
             } else {
                 Ok(false)
             };
@@ -313,6 +473,7 @@ pub(super) fn archive_groups(
                         converted,
                         result: Ok((Then::Forget, None)),
                         risky: Vec::new(),
+                        unreachable: None,
                     };
                 }
                 Err(error) => {
@@ -321,11 +482,13 @@ pub(super) fn archive_groups(
                         converted,
                         result: Err(error),
                         risky: Vec::new(),
+                        unreachable: None,
                     };
                 }
                 Ok(false) => {}
             }
             let mut failure = None;
+            let mut unreachable = None;
             // Lines kept in memory too, so a failed store write cannot open the gate.
             let mut memory: Vec<String> = Vec::new();
             let mut store_warning = None;
@@ -344,19 +507,28 @@ pub(super) fn archive_groups(
                     } else {
                         String::new()
                     };
-                    match convert(cloud, *id, &mut |line| progress(&format!("{prefix}{line}"))) {
+                    let agreed = files_only.contains(id);
+                    match convert(cloud, *id, agreed, &mut |line| {
+                        progress(&format!("{prefix}{line}"))
+                    }) {
                         Ok(c) => {
                             // Remembered per codespace, so any later delete asks again.
                             let lines = unsaved_lines(std::slice::from_ref(&c));
-                            if let Err(e) = cloud.record_unsaved(&group.codespace, &lines) {
+                            if let Err(e) = cloud.record_unsaved_cloud(&group.cloud(), &lines) {
                                 store_warning = Some(format!(
-                                    "Could not remember which files were not saved ({e}); deleting this codespace will still ask."
+                                    "Could not remember which files were not saved ({e}); deleting this {} will still ask.",
+                                    group.kind.noun()
                                 ));
                             }
                             memory.extend(lines);
                             converted.push(c)
                         }
-                        Err(e) => {
+                        Err(ConvertError::NeedsFilesOnlyConfirm { reason }) => {
+                            failure = Some(NEEDS_FILES_ONLY.to_string());
+                            unreachable = Some((*id, reason));
+                            break;
+                        }
+                        Err(ConvertError::Failed(e)) => {
                             failure = Some(format!("Could not save a local copy: {e}"));
                             break;
                         }
@@ -370,7 +542,7 @@ pub(super) fn archive_groups(
             // when the copies were made by an earlier attempt: the list is stored.
             let mut risky = Vec::new();
             if failure.is_none() && choice == ArchiveChoice::Delete {
-                let mut stored = cloud.unsaved_for(&group.codespace);
+                let mut stored = cloud.unsaved_for_cloud(&group.cloud());
                 for line in memory {
                     if !stored.contains(&line) {
                         stored.push(line);
@@ -384,11 +556,11 @@ pub(super) fn archive_groups(
             let result = match failure {
                 Some(error) => Err(error),
                 None => {
-                    progress(match choice {
-                        ArchiveChoice::Delete => "Deleting the codespace",
-                        _ => "Stopping the codespace",
+                    progress(&match choice {
+                        ArchiveChoice::Delete => format!("Deleting the {}", group.kind.noun()),
+                        _ => format!("Stopping the {}", group.kind.noun()),
                     });
-                    apply_choice(cloud, choice, &group.codespace).map(|(then, warning)| {
+                    apply_choice(cloud, choice, &group.cloud()).map(|(then, warning)| {
                         let joined = [warning, store_warning]
                             .into_iter()
                             .flatten()
@@ -403,6 +575,7 @@ pub(super) fn archive_groups(
                 converted,
                 result,
                 risky,
+                unreachable,
             }
         })
         .collect()
@@ -430,20 +603,63 @@ pub(super) fn restored_message(done: &Restored) -> String {
 /// How many sessions "Delete codespace" saves: every session in the codespace.
 pub(super) fn delete_note(groups: &[CodespaceGroup]) -> String {
     let total: usize = groups.iter().map(|g| g.total.max(g.ids.len())).sum();
+    let words = words(groups);
     format!(
-        "Delete codespace saves a local copy of all {total} {} in the {}.",
+        "Delete {} saves a local copy of all {total} {} in the {}.",
+        words.noun,
         if total == 1 { "session" } else { "sessions" },
         if groups.len() == 1 {
-            "codespace"
+            words.noun
         } else {
-            "codespaces"
+            words.plural
         },
     )
 }
 
 /// What the File and Git panels say while a cloud session is active.
-pub(super) fn banner_text(codespace: &str) -> String {
-    format!("Local files - this session runs in codespace {codespace}")
+pub(super) fn banner_text(cloud: &CloudRef) -> String {
+    format!(
+        "Local files - this session runs in {} {}",
+        cloud.noun(),
+        cloud.name
+    )
+}
+
+/// `ssh -t <id>@sbx_cloud <devcontainer exec ... bash -l>`: an interactive shell in a
+/// sandbox's container. The remote command is one word, as the start flow sends it.
+pub(super) fn sandbox_ssh_args(terminal: &SandboxTerminal) -> Vec<OsString> {
+    [
+        "-t",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ForwardX11=no",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "PermitLocalCommand=no",
+        // Resuming a stopped sandbox through the sbx ProxyCommand can take a while.
+        "-o",
+        "ConnectTimeout=120",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "--",
+        terminal.destination.as_str(),
+        terminal.remote.as_str(),
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect()
+}
+
+/// `ssh` on the login-shell PATH.
+fn ssh_program() -> OsString {
+    monocode_core::scm::resolve_gui_binary("ssh")
+        .map_or_else(|| OsString::from("ssh"), std::path::PathBuf::into_os_string)
 }
 
 /// `gh codespace ssh -c <name>`: an interactive shell on the codespace.
@@ -464,37 +680,52 @@ fn gh_program() -> OsString {
 /// non-archived sessions outside the selection that still use it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CodespaceGroup {
+    /// Name of the workspace (see [`CloudMark::codespace`]).
     pub codespace: String,
+    pub kind: CloudBackendKind,
     pub ids: Vec<i64>,
     pub others: usize,
     /// Every cloud session the window knows in this codespace, archived or not: what Delete saves.
     pub total: usize,
 }
 
+impl CodespaceGroup {
+    pub(super) fn cloud(&self) -> CloudRef {
+        CloudRef {
+            kind: self.kind,
+            name: self.codespace.clone(),
+        }
+    }
+}
+
 /// Groups cloud sessions by codespace; `others_of` counts the other users.
 pub(super) fn group_by_codespace(
     ids: &[i64],
     marks: &HashMap<i64, CloudMark>,
-    others_of: impl Fn(&str, &[i64]) -> usize,
+    others_of: impl Fn(&CloudRef, &[i64]) -> usize,
 ) -> Vec<CodespaceGroup> {
     let mut groups: Vec<CodespaceGroup> = Vec::new();
     for id in ids {
         let Some(mark) = marks.get(id) else { continue };
-        match groups.iter_mut().find(|g| g.codespace == mark.codespace) {
+        match groups
+            .iter_mut()
+            .find(|g| g.codespace == mark.codespace && g.kind == mark.kind)
+        {
             Some(group) => group.ids.push(*id),
             None => groups.push(CodespaceGroup {
                 codespace: mark.codespace.clone(),
+                kind: mark.kind,
                 ids: vec![*id],
                 others: 0,
                 total: marks
                     .values()
-                    .filter(|m| m.codespace == mark.codespace)
+                    .filter(|m| m.codespace == mark.codespace && m.kind == mark.kind)
                     .count(),
             }),
         }
     }
     for group in &mut groups {
-        group.others = others_of(&group.codespace, &group.ids);
+        group.others = others_of(&group.cloud(), &group.ids);
     }
     groups
 }
@@ -514,6 +745,19 @@ pub(super) enum Phase {
         choice: ArchiveChoice,
         error: String,
     },
+    /// "Remove from Monoptah" of session `id` (a stopped sandbox's): confirm first.
+    ConfirmRemove {
+        id: i64,
+        title: String,
+        name: String,
+    },
+    /// The conversation of session `id` could not be reached: retry, or archive only the code.
+    FilesOnly {
+        choice: ArchiveChoice,
+        id: i64,
+        title: String,
+        reason: String,
+    },
     /// The local copies are saved, but deleting the codespace would lose what `items` says.
     Review {
         items: Vec<String>,
@@ -529,7 +773,22 @@ pub(super) struct ArchiveDialog {
     pub(super) groups: Vec<CodespaceGroup>,
     pub(super) title: String,
     pub(super) phase: Phase,
+    /// Sessions whose user agreed to archive only the code.
+    pub(super) files_only: Vec<i64>,
+    /// Groups whose conversation could not be reached while another group failed: they get
+    /// their own "Archive files only?" step once the failed ones are dealt with, so a "Delete
+    /// anyway" never reaches them unseen.
+    deferred: Vec<Unreachable>,
     focus: FocusHandle,
+}
+
+/// A paused group and what the files-only step says about it.
+#[derive(Clone)]
+struct Unreachable {
+    group: CodespaceGroup,
+    id: i64,
+    title: String,
+    reason: String,
 }
 impl ArchiveDialog {
     pub(super) fn ids(&self) -> Vec<i64> {
@@ -589,19 +848,25 @@ impl Shell {
         let binding = locked(&self.store)
             .ok()
             .and_then(|store| store.remote_session(id).ok().flatten())
-            .and_then(|remote| Some((remote.project.local_project?, remote.project.codespace?)));
-        if let Some((local_project, codespace)) = binding {
+            .and_then(|remote| {
+                Some((
+                    remote.project.local_project.clone()?,
+                    remote.project.cloud()?,
+                ))
+            });
+        if let Some((local_project, cloud)) = binding {
             // The session is listed under its local project, so that project must be open.
             self.workspace.add_project(&local_project);
             // The state is unknown until the next refresh reads it; never claim Available.
             self.cloud_states
-                .entry(codespace.clone())
+                .entry(cloud.key())
                 .or_insert(CloudState::Unknown);
             self.cloud_marks.insert(
                 id,
                 CloudMark {
                     local_project,
-                    codespace,
+                    codespace: cloud.name,
+                    kind: cloud.kind,
                 },
             );
         }
@@ -661,7 +926,7 @@ impl Shell {
     /// and, in roomy rows, its name.
     pub(super) fn cloud_badge(&self, id: i64, compact: bool) -> Option<AnyElement> {
         let mark = self.cloud_marks.get(&id)?;
-        let mut indicator = indicator(self.cloud_states.get(&mark.codespace).copied());
+        let mut indicator = indicator(self.cloud_states.get(&mark.key()).copied());
         // A startup in progress or failed replaces the codespace state: the dot is amber or red.
         if let Some(label) = self.cloud_start_label(id) {
             indicator = label;
@@ -677,7 +942,12 @@ impl Shell {
                 .id(("cloud-badge", id as usize))
                 .debug_selector(move || format!("cloud-badge-{id}"))
                 .role(Role::Image)
-                .aria_label(format!("Codespace {}: {}", mark.codespace, indicator.label))
+                .aria_label(format!(
+                    "{} {}: {}",
+                    mark.kind.title(),
+                    mark.codespace,
+                    indicator.label
+                ))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
@@ -713,15 +983,75 @@ impl Shell {
         terminal
     }
 
-    /// Terminal for a cloud session: a local PTY running `gh codespace ssh`.
-    pub(super) fn new_codespace_terminal(
+    /// A local PTY running `ssh -t` into the container of sandbox session `id`. `None`, with
+    /// the reason in the window's error line, when the sandbox connection cannot be found.
+    pub(super) fn spawn_sandbox_terminal(
         &mut self,
-        codespace: String,
+        id: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Terminal>> {
+        let command = match self.cloud.sandbox_terminal(id) {
+            Ok(command) => command,
+            Err(error) => {
+                self.error = Some(format!("Could not open a terminal in the sandbox: {error}"));
+                cx.notify();
+                return None;
+            }
+        };
+        let cwd = crate::terminal::home_cwd();
+        // The ssh alias runs `sbx` as its ProxyCommand, which a Finder-launched app cannot
+        // find on launchd's bare PATH.
+        let env = vec![(
+            "PATH".to_string(),
+            OsString::from(monocode_core::scm::terminal_search_path()),
+        )];
+        let terminal = cx.new(|cx| {
+            Terminal::launch(
+                std::path::Path::new(&cwd),
+                ssh_program(),
+                sandbox_ssh_args(&command),
+                env,
+                Vec::new(),
+                cx,
+            )
+        });
+        self.observations
+            .push(cx.subscribe(&terminal, |_, _, _: &TerminalEvent, cx| cx.notify()));
+        Some(terminal)
+    }
+
+    /// The terminal that belongs to cloud session `id`: `gh codespace ssh` for a codespace,
+    /// `ssh -t` into the container for a sandbox. A sandbox whose terminal cannot be opened
+    /// falls back to a local shell at home, with the reason shown.
+    pub(super) fn spawn_cloud_terminal(
+        &mut self,
+        id: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Terminal>> {
+        let mark = self.cloud_marks.get(&id)?.clone();
+        match mark.kind {
+            CloudBackendKind::Codespaces => {
+                Some(self.spawn_codespace_terminal(&mark.codespace, cx))
+            }
+            CloudBackendKind::DockerSandbox => self.spawn_sandbox_terminal(id, cx),
+        }
+    }
+
+    /// Terminal for a cloud session: a local PTY running `gh codespace ssh`, or `ssh` into
+    /// the container for a sandbox.
+    pub(super) fn new_cloud_terminal(
+        &mut self,
+        id: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let cwd = crate::terminal::home_cwd();
         let project = self.workspace.project.clone();
+        // Resolve the terminal first: when it can not be opened (the reason is on screen)
+        // no dock tab is added and nothing is spawned.
+        let Some(terminal) = self.spawn_cloud_terminal(id, cx) else {
+            return;
+        };
         let was_open = self
             .workspace
             .docks
@@ -731,9 +1061,8 @@ impl Shell {
         let viewport = self.viewport();
         let dock = self.workspace.docks.entry(project.clone()).or_default();
         dock.size = dock.side.clamp(dock.size, viewport);
-        let added = dock.add(cwd.clone());
+        let added = dock.add(cwd);
         self.dock_tab_scroll.scroll_to_item(added);
-        let terminal = self.spawn_codespace_terminal(&codespace, cx);
         self.terminals.entry(project).or_default().push(terminal);
         if self.terminal_in_panel(cx) {
             if let Some(dock) = self.workspace.docks.get_mut(&self.workspace.project) {
@@ -755,16 +1084,16 @@ impl Shell {
     /// While a cloud session is in view the File and Git panels still show the
     /// local project: say so, and keep git writes off it.
     pub(super) fn sync_cloud_panel(&self, cx: &mut Context<Self>) {
-        let codespace = if self.mono_active(cx) {
+        let cloud = if self.mono_active(cx) {
             None
         } else {
-            self.active_codespace()
+            self.active_cloud()
         };
         self.sync_codespace_pane(cx);
-        let flipped = crate::git_gate::set(codespace.clone());
+        let flipped = crate::git_gate::set(cloud.as_ref().map(CloudRef::key));
         if let Some(panel) = &self.right_panel {
             panel.update(cx, |panel, cx| {
-                panel.set_cloud_banner(codespace.as_deref().map(banner_text), cx);
+                panel.set_cloud_banner(cloud.as_ref().map(banner_text), cx);
                 if flipped {
                     panel
                         .changes
@@ -779,10 +1108,10 @@ impl Shell {
         }
     }
 
-    /// The codespace of the active cloud session, when one is in view.
-    pub(super) fn active_codespace(&self) -> Option<String> {
+    /// The workspace of the active cloud session, when one is in view.
+    pub(super) fn active_cloud(&self) -> Option<CloudRef> {
         let id = self.workspace.active?;
-        self.cloud_marks.get(&id).map(|mark| mark.codespace.clone())
+        self.cloud_marks.get(&id).map(CloudMark::cloud)
     }
 
     /// Archiving cloud sessions asks what to do with their codespaces first: one
@@ -800,11 +1129,11 @@ impl Shell {
         if ids.is_empty() || self.cloud_archive.is_some() {
             return;
         }
-        let groups = group_by_codespace(&ids, &self.cloud_marks, |codespace, selected| {
+        let groups = group_by_codespace(&ids, &self.cloud_marks, |target, selected| {
             self.cloud_marks
                 .iter()
                 .filter(|(other, m)| {
-                    m.codespace == codespace
+                    m.cloud() == *target
                         && !selected.contains(other)
                         && self
                             .session_summaries
@@ -822,6 +1151,8 @@ impl Shell {
             groups,
             title,
             phase: Phase::Choose,
+            files_only: Vec::new(),
+            deferred: Vec::new(),
             focus: cx.focus_handle(),
         };
         window.focus(&dialog.focus, cx);
@@ -849,28 +1180,43 @@ impl Shell {
         let Some(codespace) = self.live_origin_codespace(id) else {
             return;
         };
+        self.run_workspace_action(CloudRef::codespace(codespace), choice, window, cx);
+    }
+
+    /// Stops or deletes the workspace `target` without archiving a session (session menu).
+    /// Deleting saves every session still in it and asks first, as the archive dialog does.
+    pub(super) fn run_workspace_action(
+        &mut self,
+        target: CloudRef,
+        choice: ArchiveChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.cloud_archive.is_some() {
             return;
         }
         let total = self
             .cloud_marks
             .values()
-            .filter(|m| m.codespace == codespace)
+            .filter(|m| m.cloud() == target)
             .count();
         self.close_preview(cx);
         self.cloud_archive = Some(ArchiveDialog {
             groups: vec![CodespaceGroup {
-                codespace: codespace.clone(),
+                codespace: target.name.clone(),
+                kind: target.kind,
                 ids: vec![],
                 others: 0,
                 total,
             }],
             title: String::new(),
             phase: Phase::Choose,
+            files_only: Vec::new(),
+            deferred: Vec::new(),
             focus: cx.focus_handle(),
         });
         if choice == ArchiveChoice::Delete {
-            let items = self.cloud.unsaved_for(&codespace);
+            let items = self.cloud.unsaved_for_cloud(&target);
             if let Some(dialog) = self.cloud_archive.as_mut() {
                 dialog.phase = Phase::ConfirmDelete { items };
                 window.focus(&dialog.focus, cx);
@@ -943,16 +1289,18 @@ impl Shell {
         };
         let groups = dialog.groups.clone();
         let ids = dialog.ids();
+        let files_only = dialog.files_only.clone();
         window.focus(&dialog.focus, cx);
         self.cloud_busy.extend(ids.iter().copied());
         // Delete saves every session of the codespace, so all of them stop taking messages.
         let mut locked_ids = ids.clone();
         if choice == ArchiveChoice::Delete {
             for group in &groups {
+                let target = group.cloud();
                 locked_ids.extend(
                     self.cloud_marks
                         .iter()
-                        .filter(|(_, m)| m.codespace == group.codespace)
+                        .filter(|(_, m)| m.cloud() == target)
                         .map(|(id, _)| *id),
                 );
             }
@@ -970,6 +1318,7 @@ impl Shell {
                 &convert,
                 &cancel,
                 &confirmed,
+                &files_only,
                 &mut |line| {
                     if let Ok(mut current) = worker_progress.lock() {
                         *current = line.to_string();
@@ -1012,6 +1361,22 @@ impl Shell {
         cx.notify();
     }
 
+    /// The user agreed to save only the code of session `id`: run the archive again.
+    pub(super) fn confirm_files_only(
+        &mut self,
+        choice: ArchiveChoice,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(dialog) = self.cloud_archive.as_mut()
+            && !dialog.files_only.contains(&id)
+        {
+            dialog.files_only.push(id);
+        }
+        self.run_cloud_archive(choice, true, Vec::new(), window, cx);
+    }
+
     /// Stops (or resumes) message sending in the open conversations of `ids`.
     pub(super) fn lock_cloud_composer(
         &mut self,
@@ -1040,14 +1405,31 @@ impl Shell {
         let mut warnings = Vec::new();
         let mut failed: Vec<(CodespaceGroup, String)> = Vec::new();
         let mut review: Vec<(CodespaceGroup, Vec<String>)> = Vec::new();
+        let mut unreachable: Vec<Unreachable> = Vec::new();
         for outcome in outcomes {
             let GroupOutcome {
                 mut group,
                 converted,
                 result,
                 risky,
+                unreachable: unreached,
             } = outcome;
+            if let Some((id, reason)) = unreached {
+                let title = self.session_metadata(id, cx).display_title();
+                unreachable.push(Unreachable {
+                    group: group.clone(),
+                    id,
+                    title,
+                    reason,
+                });
+            }
             for saved in converted {
+                if !saved.history_saved {
+                    warnings.push(format!(
+                        "The conversation of {} could not be saved; only the code was.",
+                        quoted_title(&saved.title)
+                    ));
+                }
                 warnings.extend(saved.warnings.iter().cloned());
                 self.adopt_converted(saved, window, cx);
             }
@@ -1058,28 +1440,50 @@ impl Shell {
                     match then {
                         Then::Archive => {
                             self.cloud_states
-                                .insert(group.codespace.clone(), CloudState::Stopping);
+                                .insert(group.cloud().key(), CloudState::Stopping);
                             for id in group.ids {
                                 self.toggle_archive_now(id, cx);
                             }
                         }
                         Then::Forget => {
-                            self.cloud_gone.insert(group.codespace.clone());
-                            self.forget_codespace_sessions(&group.codespace, window, cx)
+                            self.cloud_gone.insert(group.cloud().key());
+                            self.forget_codespace_sessions(&group.cloud(), window, cx)
                         }
                     }
                 }
                 Err(error) if error == CANCELLED => {}
+                Err(error) if error == NEEDS_FILES_ONLY => {}
                 Err(error) if error == NEEDS_REVIEW => review.push((group, risky)),
                 Err(error) => failed.push((group, error)),
             }
         }
-        if failed.is_empty() && review.is_empty() {
+        // Paused groups wait while another group fails: "anyway" must not reach them.
+        if let Some(dialog) = self.cloud_archive.as_mut() {
+            if !failed.is_empty() {
+                dialog.deferred.append(&mut unreachable);
+            } else if unreachable.is_empty() && review.is_empty() {
+                unreachable = std::mem::take(&mut dialog.deferred);
+            }
+        }
+        if failed.is_empty() && review.is_empty() && unreachable.is_empty() {
             if self.cloud_archive.take().is_some() {
                 self.focus_active(window, cx);
             }
         } else if let Some(dialog) = self.cloud_archive.as_mut() {
-            if failed.is_empty() {
+            if failed.is_empty() && !unreachable.is_empty() {
+                let first = unreachable[0].clone();
+                dialog.groups = unreachable
+                    .into_iter()
+                    .map(|u| u.group)
+                    .chain(review.into_iter().map(|(group, _)| group))
+                    .collect();
+                dialog.phase = Phase::FilesOnly {
+                    choice,
+                    id: first.id,
+                    title: first.title,
+                    reason: first.reason,
+                };
+            } else if failed.is_empty() {
                 let items = review.iter().flat_map(|(_, items)| items.clone()).collect();
                 dialog.groups = review.into_iter().map(|(group, _)| group).collect();
                 dialog.phase = Phase::Review { items };
@@ -1160,39 +1564,128 @@ impl Shell {
         if self.workspace.tab_of(cloud_id).is_some() {
             self.close_pane(cloud_id, window, cx);
         }
-        self.cloud_marks.remove(&cloud_id);
+        let mark = self.cloud_marks.remove(&cloud_id);
         self.remote_marks.remove(&cloud_id);
         self.forget_session(cloud_id, cx);
         let id = saved.local_id;
-        self.cloud_origins.insert(id, saved.codespace.clone());
+        // Origins are codespace names only: a session saved from a sandbox has no codespace
+        // to stop or delete from its menu.
+        if mark.is_none_or(|mark| mark.kind == CloudBackendKind::Codespaces) {
+            self.cloud_origins.insert(id, saved.codespace.clone());
+        }
         self.workspace.add_project(&saved.summary.cwd);
         self.session_summaries.insert(id, saved.summary);
         self.order.retain(|s| *s != id);
         self.order.insert(0, id);
     }
 
-    /// Drops every session of a deleted codespace from the window.
+    /// Drops every session of a deleted codespace or sandbox from the window.
     pub(super) fn forget_codespace_sessions(
         &mut self,
-        codespace: &str,
+        target: &CloudRef,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let gone: Vec<i64> = self
             .cloud_marks
             .iter()
-            .filter(|(_, mark)| mark.codespace == codespace)
+            .filter(|(_, mark)| mark.cloud() == *target)
             .map(|(id, _)| *id)
             .collect();
         for id in gone {
-            if self.workspace.tab_of(id).is_some() {
-                self.close_pane(id, window, cx);
-            }
-            self.cloud_marks.remove(&id);
-            self.remote_marks.remove(&id);
-            self.forget_session(id, cx);
+            self.forget_cloud_row(id, window, cx);
         }
-        self.cloud_states.remove(codespace);
+        self.cloud_states.remove(&target.key());
+    }
+
+    /// Drops one cloud session from the window; its record is gone from the store already.
+    pub(super) fn forget_cloud_row(
+        &mut self,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.tab_of(id).is_some() {
+            self.close_pane(id, window, cx);
+        }
+        self.cloud_marks.remove(&id);
+        self.remote_marks.remove(&id);
+        self.forget_session(id, cx);
+    }
+
+    /// Asks before "Remove from Monoptah" of a stopped sandbox's session `id`.
+    pub(super) fn confirm_remove_cloud_session(
+        &mut self,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mark) = self.cloud_marks.get(&id).cloned() else {
+            return;
+        };
+        if self.cloud_archive.is_some() || self.cloud_busy.contains(&id) {
+            return;
+        }
+        let title = self.session_metadata(id, cx).display_title();
+        self.close_preview(cx);
+        let dialog = ArchiveDialog {
+            groups: vec![CodespaceGroup {
+                codespace: mark.codespace.clone(),
+                kind: mark.kind,
+                ids: vec![],
+                others: 0,
+                total: 1,
+            }],
+            title: String::new(),
+            phase: Phase::ConfirmRemove {
+                id,
+                title,
+                name: mark.codespace,
+            },
+            files_only: Vec::new(),
+            deferred: Vec::new(),
+            focus: cx.focus_handle(),
+        };
+        window.focus(&dialog.focus, cx);
+        self.cloud_archive = Some(dialog);
+        cx.notify();
+    }
+
+    /// "Remove from Monoptah" for a sandbox session whose sandbox is stopped: forgets the
+    /// local record only (the sandbox keeps existing) and shows the store's warning. Never
+    /// contacts the sandbox, so it can not resume it.
+    pub(super) fn remove_cloud_session_locally(
+        &mut self,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_cloud(id) || self.cloud_busy.contains(&id) {
+            return;
+        }
+        self.cloud_busy.insert(id);
+        let store = self.store.clone();
+        let work = cx.background_executor().spawn(async move {
+            locked(&store).and_then(|store| store.remove_cloud_session_locally(id))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = work.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.cloud_busy.remove(&id);
+                match result {
+                    Ok(warning) => {
+                        this.forget_cloud_row(id, window, cx);
+                        this.notice = Some(warning);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("Could not remove the session: {error}"));
+                    }
+                }
+                this.invalidate_chrome(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn cloud_archive_modal(
@@ -1202,25 +1695,24 @@ impl Shell {
     ) -> Option<AnyElement> {
         let dialog = self.cloud_archive.as_ref()?;
         let default = default_choice(dialog.others());
+        let words = words(&dialog.groups);
         let width = 560f32.min(window.viewport_size().width.as_f32() - 24.);
         let weak = cx.weak_entity();
-        let button = |id: &'static str,
-                      label: &'static str,
-                      choice: ArchiveChoice,
-                      cx: &mut Context<Self>| {
-            let base = if choice == ArchiveChoice::Delete {
-                crate::modal::danger_button(id, label)
-            } else if choice == default {
-                crate::modal::primary_button(id, label)
-            } else {
-                crate::modal::ghost_button(id, label)
+        let button =
+            |id: &'static str, label: String, choice: ArchiveChoice, cx: &mut Context<Self>| {
+                let base = if choice == ArchiveChoice::Delete {
+                    crate::modal::danger_button(id, label)
+                } else if choice == default {
+                    crate::modal::primary_button(id, label)
+                } else {
+                    crate::modal::ghost_button(id, label)
+                };
+                base.debug_selector(move || id.into())
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.confirm_cloud_archive(choice, window, cx)
+                    }))
             };
-            base.debug_selector(move || id.into())
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.confirm_cloud_archive(choice, window, cx)
-                }))
-        };
         let cancel = crate::modal::ghost_button("cloud-archive-cancel", "Cancel")
             .debug_selector(|| "cloud-archive-cancel".into())
             .cursor_pointer()
@@ -1241,7 +1733,7 @@ impl Shell {
             .gap_2();
         let (heading, body, footer) = match &dialog.phase {
             Phase::Choose => (
-                "Archive cloud session?",
+                "Archive cloud session?".to_string(),
                 div()
                     .flex()
                     .flex_col()
@@ -1249,20 +1741,21 @@ impl Shell {
                     .child(text(
                         "cloud-archive-summary",
                         format!(
-                            "{} A running codespace keeps costing money until it idles out. \
-                             Stopping or deleting it first saves an archived local copy with the \
-                             conversation, evidence and code (branches, the stash and uncommitted \
-                             changes; ignored files are listed but not saved). {}",
+                            "{} {} Stopping or deleting it first saves an archived local copy \
+                             with the conversation, evidence and code (branches, the stash and \
+                             uncommitted changes; ignored files are listed but not saved). {}",
                             archive_summary(&dialog.title, &dialog.groups),
+                            words.cost(),
                             delete_note(&dialog.groups),
                         ),
                         false,
                     ))
-                    .children(others_note(dialog.others()).map(|note| {
+                    .children(others_note(dialog.others(), words.noun).map(|note| {
                         text(
                             "cloud-archive-others",
                             format!(
-                                "{note} Deleting the codespace removes those sessions from Monoptah too."
+                                "{note} Deleting the {} removes those sessions from Monoptah too.",
+                                words.noun
                             ),
                             true,
                         )
@@ -1271,25 +1764,25 @@ impl Shell {
                     .child(cancel)
                     .child(button(
                         "cloud-archive-keep",
-                        "Keep running",
+                        "Keep running".into(),
                         ArchiveChoice::Keep,
                         cx,
                     ))
                     .child(button(
                         "cloud-archive-delete",
-                        "Delete codespace",
+                        format!("Delete {}", words.noun),
                         ArchiveChoice::Delete,
                         cx,
                     ))
                     .child(button(
                         "cloud-archive-stop",
-                        "Stop codespace",
+                        format!("Stop {}", words.noun),
                         ArchiveChoice::Stop,
                         cx,
                     )),
             ),
             Phase::Working { progress, .. } => (
-                "Saving a local copy",
+                "Saving a local copy".to_string(),
                 div().child(text(
                     "cloud-archive-progress",
                     format!(
@@ -1311,23 +1804,24 @@ impl Shell {
                     .first()
                     .map(|g| g.codespace.clone())
                     .unwrap_or_default();
-                let mut lines = vec![format!(
-                    "Delete the codespace {name}? This cannot be undone."
-                )];
+                let mut lines = vec![delete_confirm_line(&words, &name)];
+                let stopped = dialog.groups.first().is_some_and(|g| {
+                    self.cloud_states.get(&g.cloud().key()) == Some(&CloudState::Stopped)
+                });
+                lines.extend(delete_start_note(&words, stopped));
                 lines.extend(items.iter().cloned());
                 (
-                    "Delete codespace?",
+                    format!("Delete {}?", words.noun),
                     div().child(text("cloud-archive-confirm", lines.join(" "), false)),
-                    footer
-                        .child(cancel)
-                        .child(
-                            crate::modal::danger_button(
-                                "cloud-archive-confirm-delete",
-                                "Delete codespace",
-                            )
-                            .debug_selector(|| "cloud-archive-confirm-delete".into())
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                    footer.child(cancel).child(
+                        crate::modal::danger_button(
+                            "cloud-archive-confirm-delete",
+                            format!("Delete {}", words.noun),
+                        )
+                        .debug_selector(|| "cloud-archive-confirm-delete".into())
+                        .cursor_pointer()
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
                                 this.run_cloud_archive(
                                     ArchiveChoice::Delete,
                                     true,
@@ -1335,37 +1829,89 @@ impl Shell {
                                     window,
                                     cx,
                                 )
+                            },
+                        )),
+                    ),
+                )
+            }
+            Phase::ConfirmRemove { id, title, name } => {
+                let id = *id;
+                (
+                    "Remove from Monoptah?".to_string(),
+                    div().child(text(
+                        "cloud-archive-remove",
+                        remove_confirm_body(title, name),
+                        false,
+                    )),
+                    footer.child(cancel).child(
+                        crate::modal::danger_button("cloud-archive-remove-go", "Remove")
+                            .debug_selector(|| "cloud-archive-remove-go".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.cloud_archive = None;
+                                this.focus_active(window, cx);
+                                this.remove_cloud_session_locally(id, window, cx)
                             })),
+                    ),
+                )
+            }
+            Phase::FilesOnly {
+                choice,
+                id,
+                title,
+                reason,
+            } => {
+                let (choice, id) = (*choice, *id);
+                (
+                    "Archive files only?".to_string(),
+                    div().child(text(
+                        "cloud-archive-files-only",
+                        files_only_body(title, reason),
+                        false,
+                    )),
+                    footer
+                        .child(cancel)
+                        .child(
+                            crate::modal::ghost_button("cloud-archive-files-retry", "Retry")
+                                .debug_selector(|| "cloud-archive-files-retry".into())
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.run_cloud_archive(choice, true, Vec::new(), window, cx)
+                                })),
+                        )
+                        .child(
+                            crate::modal::primary_button(
+                                "cloud-archive-files-only-go",
+                                "Archive files only",
+                            )
+                            .debug_selector(|| "cloud-archive-files-only-go".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.confirm_files_only(choice, id, window, cx)
+                                },
+                            )),
                         ),
                 )
             }
             Phase::Review { items } => {
                 let seen = items.clone();
                 (
-                    "Some files are not saved",
+                    "Some files are not saved".to_string(),
                     div()
                         .flex()
                         .flex_col()
                         .gap_3()
                         .child(text("cloud-archive-risk", items.join(" "), false))
-                        .child(text(
-                            "cloud-archive-risk-note",
-                            "The local copy is saved without them. Deleting the codespace removes \
-                             them for good; stopping it keeps them. Keep running leaves it as it \
-                             is: stop or delete it later from the session menu."
-                                .into(),
-                            true,
-                        )),
+                        .child(text("cloud-archive-risk-note", review_note(&words), true)),
                     footer
                         .child(
                             crate::modal::ghost_button("cloud-archive-review-keep", "Keep running")
                                 .debug_selector(|| "cloud-archive-review-keep".into())
                                 .cursor_pointer()
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.close_cloud_archive(window, cx)
-                                    }),
-                                ),
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_cloud_archive(window, cx)
+                                })),
                         )
                         .child(
                             crate::modal::danger_button(
@@ -1374,17 +1920,19 @@ impl Shell {
                             )
                             .debug_selector(|| "cloud-archive-delete-anyway".into())
                             .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                // Copies any session that appeared meanwhile, then asks again
-                                // if that found more to lose.
-                                this.run_cloud_archive(
-                                    ArchiveChoice::Delete,
-                                    true,
-                                    seen.clone(),
-                                    window,
-                                    cx,
-                                )
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    // Copies any session that appeared meanwhile, then asks again
+                                    // if that found more to lose.
+                                    this.run_cloud_archive(
+                                        ArchiveChoice::Delete,
+                                        true,
+                                        seen.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                },
+                            )),
                         )
                         .child(
                             crate::modal::primary_button(
@@ -1393,15 +1941,17 @@ impl Shell {
                             )
                             .debug_selector(|| "cloud-archive-stop-instead".into())
                             .cursor_pointer()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.run_cloud_archive(
-                                    ArchiveChoice::Stop,
-                                    false,
-                                    Vec::new(),
-                                    window,
-                                    cx,
-                                )
-                            })),
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.run_cloud_archive(
+                                        ArchiveChoice::Stop,
+                                        false,
+                                        Vec::new(),
+                                        window,
+                                        cx,
+                                    )
+                                },
+                            )),
                         ),
                 )
             }
@@ -1413,19 +1963,13 @@ impl Shell {
                     "Stop anyway"
                 };
                 (
-                    "Could not finish",
+                    "Could not finish".to_string(),
                     div()
                         .flex()
                         .flex_col()
                         .gap_3()
                         .child(text("cloud-archive-error", error.clone(), false))
-                        .child(text(
-                            "cloud-archive-warning",
-                            "Going on without a complete local copy can lose the code and files \
-                             that only exist on the codespace."
-                                .into(),
-                            true,
-                        )),
+                        .child(text("cloud-archive-warning", failed_note(&words), true)),
                     footer
                         .child(cancel)
                         .child(

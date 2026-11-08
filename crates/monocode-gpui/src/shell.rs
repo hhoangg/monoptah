@@ -3329,9 +3329,10 @@ impl Shell {
         // A cloud session's terminal is a shell on its codespace, not on this machine.
         if !self.mono_active(cx)
             && !self.app_view_open()
-            && let Some(codespace) = self.active_codespace()
+            && let Some(id) = self.workspace.active
+            && self.is_cloud(id)
         {
-            self.new_codespace_terminal(codespace, window, cx);
+            self.new_cloud_terminal(id, window, cx);
             return;
         }
         let cwd = self.terminal_cwd(cx);

@@ -965,3 +965,161 @@ fn only_a_user_submit_reconnects_a_stopped_sandbox_view(cx: &mut TestAppContext)
         })
     });
 }
+
+// ------------------------------------------------- sandbox reconnect banner
+
+const RECREATED: &str =
+    "The sandbox container was recreated, so this session's history is gone. Start a new session.";
+
+/// A window with the conversation of a stored cloud session of `cloud`.
+fn cloud_conversation(
+    cx: &mut TestAppContext,
+    cloud: monocode_core::cloud_sessions::CloudRef,
+) -> gpui::WindowHandle<Conversation> {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let store = monocode_core::store::Store::open(Path::new(":memory:")).unwrap();
+    let project = store
+        .remember_cloud_ref_project(
+            "env-box",
+            &serde_json::json!({"id":"project-1","cwd":"/workspaces/widgets"}),
+            "/work/widgets",
+            &cloud,
+        )
+        .unwrap();
+    let mut summary = store.create("claude", &project.key).unwrap();
+    summary.has_messages = true;
+    cx.update(|cx| {
+        crate::input::bind(cx);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+                view.loaded = true;
+                view
+            })
+        })
+        .unwrap()
+    })
+}
+
+#[gpui::test]
+fn a_recreated_or_deleted_sandbox_offers_archive_and_new_session_not_reconnect(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::cloud_sessions::CloudRef;
+    for error in [RECREATED, "Sandbox was deleted. Start a new session."] {
+        let window = cloud_conversation(cx, CloudRef::sandbox("monoptah-fix-1234"));
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let view = window.root(cx).unwrap();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(
+                &view,
+                move |_, event: &crate::cloud_start_view::CloudStartAction, _| {
+                    log.borrow_mut().push(event.action)
+                },
+            )
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.remote_state.online = false;
+                view.remote_state.error = Some(error.into());
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("remote-reconnect").is_none(), "{error}");
+        assert!(visual.debug_bounds("remote-retry").is_none(), "{error}");
+        for (id, action) in [
+            (
+                "remote-archive-session",
+                crate::cloud_start_view::StartAction::ArchiveSession,
+            ),
+            (
+                "remote-new-session",
+                crate::cloud_start_view::StartAction::NewSession,
+            ),
+        ] {
+            let bounds = visual.debug_bounds(id).unwrap_or_else(|| panic!("{id}"));
+            visual.simulate_click(bounds.center(), Default::default());
+            assert_eq!(seen.borrow().last(), Some(&action), "{id}");
+        }
+    }
+}
+
+#[gpui::test]
+fn another_sandbox_error_and_every_codespace_error_keep_reconnect_and_retry(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::cloud_sessions::CloudRef;
+    for (cloud, error) in [
+        (
+            CloudRef::sandbox("monoptah-fix-1234"),
+            "Could not reach sbx",
+        ),
+        (CloudRef::codespace("octo-abc"), RECREATED),
+    ] {
+        let window = cloud_conversation(cx, cloud);
+        window
+            .update(cx, |view, _, cx| {
+                view.remote_state.online = false;
+                view.remote_state.error = Some(error.into());
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("remote-reconnect").is_some(), "{error}");
+        assert!(visual.debug_bounds("remote-retry").is_some(), "{error}");
+        assert!(visual.debug_bounds("remote-archive-session").is_none());
+    }
+}
+
+#[gpui::test]
+fn the_first_sandbox_reconnect_attempt_shows_progress_and_cancel(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::CloudRef;
+    // A sandbox: the banner appears while the first attempt runs, with Cancel only.
+    let window = cloud_conversation(cx, CloudRef::sandbox("monoptah-fix-1234"));
+    window
+        .update(cx, |view, _, cx| {
+            view.remote_state.online = false;
+            view.remote_state.waking = true;
+            view.remote_state.wake_cancel =
+                Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            view.status = "Starting the container".into();
+            cx.notify();
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("remote-reconnect-cancel").is_some());
+    assert!(visual.debug_bounds("remote-retry").is_none());
+    window
+        .update(visual, |view, _, cx| {
+            assert!(view.sandbox_reconnecting());
+            view.cancel_cloud_reconnect(cx);
+            let cancelled = view
+                .remote_state
+                .wake_cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(cancelled);
+        })
+        .unwrap();
+    // A codespace wake with no error keeps showing no banner, as before.
+    let window = cloud_conversation(cx, CloudRef::codespace("octo-abc"));
+    window
+        .update(cx, |view, _, cx| {
+            view.remote_state.online = false;
+            view.remote_state.waking = true;
+            cx.notify();
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("remote-reconnect-cancel").is_none());
+}

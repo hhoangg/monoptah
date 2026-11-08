@@ -269,6 +269,8 @@ pub(crate) struct RightPanel {
     top_inset: f32,
     /// Set while a cloud session is in view: what the panel shows is local.
     cloud_banner: Option<String>,
+    /// Name of the Codespace tab: `Codespace` or `Sandbox`, by the backend of the start shown.
+    codespace_title: &'static str,
     tab_width: f32,
     drag: Option<TabDrag>,
     reveal: Option<TabReveal>,
@@ -318,6 +320,7 @@ impl RightPanel {
             terminal_tab: false,
             top_inset: 0.,
             cloud_banner: None,
+            codespace_title: RightTab::Codespace.label(),
             tab_width: tabs_width(3),
             drag: None,
             reveal: None,
@@ -331,6 +334,16 @@ impl RightPanel {
             self.cloud_banner = banner;
             cx.notify();
         }
+    }
+    pub(crate) fn set_codespace_title(&mut self, title: &'static str, cx: &mut Context<Self>) {
+        if self.codespace_title != title {
+            self.codespace_title = title;
+            cx.notify();
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn codespace_title(&self) -> &'static str {
+        self.codespace_title
     }
     #[cfg(test)]
     pub(crate) fn cloud_banner(&self) -> Option<&str> {
@@ -553,8 +566,12 @@ impl RightPanel {
                     .child(
                         tab_button(
                             id,
-                            TabLabel::from(tab.label())
-                                .max_width(tab_label_width(self.tab_width, count)),
+                            TabLabel::from(if tab == RightTab::Codespace {
+                                self.codespace_title
+                            } else {
+                                tab.label()
+                            })
+                            .max_width(tab_label_width(self.tab_width, count)),
                             path,
                             active,
                             false,

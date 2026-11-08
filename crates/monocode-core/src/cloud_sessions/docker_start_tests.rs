@@ -2784,3 +2784,18 @@ fn background_paths_against_a_recreated_container_make_no_outer_calls() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn only_a_deleted_or_recreated_sandbox_is_unrecoverable() {
+    use super::docker_start::is_sandbox_unrecoverable;
+    assert!(is_sandbox_unrecoverable(
+        "Sandbox was deleted. Start a new session."
+    ));
+    assert!(is_sandbox_unrecoverable(
+        "The sandbox container was recreated, so this session's history is gone. Start a new session."
+    ));
+    assert!(!is_sandbox_unrecoverable(
+        "Sandbox is stopping. Try again in a minute."
+    ));
+    assert!(!is_sandbox_unrecoverable("Could not reach sbx"));
+}

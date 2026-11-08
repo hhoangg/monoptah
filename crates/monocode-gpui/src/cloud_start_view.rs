@@ -1,7 +1,7 @@
-//! What the UI knows about a cloud session whose codespace is starting. The shell owns the
-//! state and publishes an immutable [`CloudStartSnapshot`] to the conversation (composer chip,
-//! transcript status row) and to the Codespace panel.
-use monocode_core::cloud_sessions::{StartRecord, Step, StepKind, StepStatus};
+//! What the UI knows about a cloud session whose codespace (or Docker sandbox) is starting.
+//! The shell owns the state and publishes an immutable [`CloudStartSnapshot`] to the
+//! conversation (composer chip, transcript status row) and to the Codespace panel.
+use monocode_core::cloud_sessions::{CloudBackendKind, StartRecord, Step, StepKind, StepStatus};
 use std::sync::Arc;
 
 /// Log lines kept in memory per start.
@@ -35,6 +35,23 @@ pub(crate) struct CloudStartSnapshot {
 }
 
 impl CloudStartSnapshot {
+    /// The backend the start runs on, which words every label below.
+    pub(crate) fn backend(&self) -> CloudBackendKind {
+        self.record.backend()
+    }
+    /// Lowercase word for sentences: `codespace` or `sandbox`.
+    pub(crate) fn noun(&self) -> &'static str {
+        self.backend().noun()
+    }
+    /// Capitalised [`Self::noun`]: the panel tab and the headlines.
+    pub(crate) fn title(&self) -> &'static str {
+        self.backend().title()
+    }
+    /// Whether the workspace can be opened in a browser. A Docker sandbox has no web view
+    /// (`DockerBackend::web_url` is `None`), so the button is not offered.
+    pub(crate) fn offers_browser(&self) -> bool {
+        self.backend() == CloudBackendKind::Codespaces
+    }
     /// The start is not over: sends are queued and the host is not loaded.
     pub(crate) fn blocks_session(&self) -> bool {
         self.phase != StartPhase::Ready
@@ -53,7 +70,7 @@ impl CloudStartSnapshot {
                     .copied()
                     .find(|k| self.record.step(*k).status == StepStatus::Failed)
             })
-            .map_or("startup", StepKind::label)
+            .map_or("startup", |kind| kind.label_for(self.backend()))
     }
 
     /// What the step now running is called, while the start runs.
@@ -66,23 +83,27 @@ impl CloudStartSnapshot {
                     .copied()
                     .find(|k| self.record.step(*k).status == StepStatus::Running)
             })
-            .map(StepKind::running_label)
+            .map(|kind| kind.running_label_for(self.backend()))
     }
 
     /// The headline of the transcript status row.
     pub(crate) fn headline(&self) -> String {
         match self.phase {
             StartPhase::Starting => match self.running_label() {
-                Some(label) => format!("Starting codespace \u{b7} {label}"),
-                None => "Starting codespace".into(),
+                Some(label) => format!("Starting {} \u{b7} {label}", self.noun()),
+                None => format!("Starting {}", self.noun()),
             },
-            StartPhase::Failed => format!("Codespace failed at {}", self.failed_label()),
+            StartPhase::Failed => format!("{} failed at {}", self.title(), self.failed_label()),
             StartPhase::Ready => {
                 let total = self.ready.as_ref().map_or_else(
                     || self.record.elapsed_ms(monocode_core::time::now_ms()),
                     |ready| ready.total_ms,
                 );
-                format!("Codespace ready in {}", crate::shell::live_elapsed(total))
+                format!(
+                    "{} ready in {}",
+                    self.title(),
+                    crate::shell::live_elapsed(total)
+                )
             }
         }
     }
@@ -91,7 +112,8 @@ impl CloudStartSnapshot {
     pub(crate) fn chip(&self) -> Option<(String, StartPhase)> {
         match self.phase {
             StartPhase::Starting => Some((
-                self.running_label().unwrap_or("Starting codespace").into(),
+                self.running_label()
+                    .map_or_else(|| format!("Starting {}", self.noun()), str::to_owned),
                 StartPhase::Starting,
             )),
             StartPhase::Failed => Some(("Startup failed".into(), StartPhase::Failed)),
@@ -120,10 +142,12 @@ impl CloudStartSnapshot {
     }
 
     /// The note under the queued message.
-    pub(crate) fn queued_note(&self) -> Option<&'static str> {
+    pub(crate) fn queued_note(&self) -> Option<String> {
         match self.phase {
-            StartPhase::Starting => Some("Queued, sends when the codespace is ready"),
-            StartPhase::Failed => Some("Not sent, the codespace failed to start"),
+            StartPhase::Starting => {
+                Some(format!("Queued, sends when the {} is ready", self.noun()))
+            }
+            StartPhase::Failed => Some(format!("Not sent, the {} failed to start", self.noun())),
             StartPhase::Ready => None,
         }
     }
@@ -131,10 +155,29 @@ impl CloudStartSnapshot {
     /// The composer placeholder to use on top of the app's own `base`.
     pub(crate) fn placeholder(&self, base: &str) -> Option<String> {
         match self.phase {
-            StartPhase::Starting => Some(format!("{base} (sent when the codespace is ready)")),
+            StartPhase::Starting => {
+                Some(format!("{base} (sent when the {} is ready)", self.noun()))
+            }
             StartPhase::Failed => Some(format!("{base} (sent after a successful retry)")),
             StartPhase::Ready => None,
         }
+    }
+
+    /// The text of the failure box: the reason, then why a retry is safe.
+    pub(crate) fn failure_message(&self) -> String {
+        let reason = self
+            .short_error()
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or_else(|| format!("The {} failed to start.", self.noun()));
+        format!(
+            "{reason} The {} is kept, so a retry reuses it.",
+            self.noun()
+        )
+    }
+
+    /// The label of the button that deletes the workspace.
+    pub(crate) fn delete_label(&self) -> String {
+        format!("Delete {}", self.noun())
     }
 
     /// The error without the advice `created_note` appends (the status row says it once, and
@@ -182,6 +225,10 @@ pub(crate) enum StartAction {
     DeleteCodespace,
     /// Raised by "View log" and the composer chip.
     ShowPanel,
+    /// The sandbox of a session is deleted or its container was recreated: archive the session.
+    ArchiveSession,
+    /// The same: start a new cloud session in the project.
+    NewSession,
 }
 
 pub(crate) struct CloudStartAction {
@@ -231,6 +278,14 @@ pub(crate) mod fixtures {
             track_ready: true,
             sandbox_start: None,
         }
+    }
+
+    /// The same snapshot as a Docker sandbox start: the record names a sandbox, not a codespace.
+    pub(crate) fn as_sandbox(snapshot: Arc<CloudStartSnapshot>) -> Arc<CloudStartSnapshot> {
+        let mut snapshot = (*snapshot).clone();
+        snapshot.record.sandbox = Some("claude-widgets-ab12".into());
+        snapshot.record.codespace = String::new();
+        Arc::new(snapshot)
     }
 
     pub(crate) fn starting(done: usize) -> Arc<CloudStartSnapshot> {
@@ -305,6 +360,100 @@ mod tests {
     }
 
     #[test]
+    fn a_sandbox_start_uses_the_sandbox_words_everywhere() {
+        let first = as_sandbox(starting(0));
+        assert_eq!(first.backend(), CloudBackendKind::DockerSandbox);
+        assert_eq!(first.headline(), "Starting sandbox \u{b7} Creating sandbox");
+        assert_eq!(
+            as_sandbox(starting(4)).headline(),
+            "Starting sandbox \u{b7} Configuring environment"
+        );
+        assert_eq!(
+            as_sandbox(failed(4, "boom")).headline(),
+            "Sandbox failed at Configure environment"
+        );
+        assert_eq!(
+            as_sandbox(ready(554_000)).headline(),
+            "Sandbox ready in 9m 14s"
+        );
+        assert_eq!(
+            first.chip(),
+            Some(("Creating sandbox".into(), StartPhase::Starting))
+        );
+        assert_eq!(
+            as_sandbox(failed(2, "boom")).chip(),
+            Some(("Startup failed".into(), StartPhase::Failed))
+        );
+        assert_eq!(
+            first.queued_note().as_deref(),
+            Some("Queued, sends when the sandbox is ready")
+        );
+        assert_eq!(
+            as_sandbox(failed(2, "boom")).queued_note().as_deref(),
+            Some("Not sent, the sandbox failed to start")
+        );
+        let base = "Ask";
+        assert_eq!(
+            first.placeholder(base).unwrap(),
+            "Ask (sent when the sandbox is ready)"
+        );
+        assert_eq!(
+            as_sandbox(failed(2, "boom")).placeholder(base).unwrap(),
+            "Ask (sent after a successful retry)"
+        );
+        assert_eq!(first.title(), "Sandbox");
+        assert_eq!(first.delete_label(), "Delete sandbox");
+        assert!(!first.offers_browser(), "a sandbox has no web view");
+        assert_eq!(
+            as_sandbox(failed(2, "cargo fetch failed")).failure_message(),
+            "cargo fetch failed The sandbox is kept, so a retry reuses it."
+        );
+        assert_eq!(
+            as_sandbox(failed(2, "")).failure_message(),
+            "The sandbox failed to start. The sandbox is kept, so a retry reuses it."
+        );
+    }
+
+    #[test]
+    fn the_codespace_strings_are_unchanged() {
+        // Golden strings: a codespace start must read exactly as before sandboxes existed.
+        let snapshot = starting(2);
+        assert_eq!(snapshot.backend(), CloudBackendKind::Codespaces);
+        assert_eq!(snapshot.title(), "Codespace");
+        assert_eq!(snapshot.delete_label(), "Delete codespace");
+        assert!(snapshot.offers_browser());
+        assert_eq!(
+            snapshot.headline(),
+            "Starting codespace \u{b7} Building container"
+        );
+        assert_eq!(
+            starting(0).headline(),
+            "Starting codespace \u{b7} Creating codespace"
+        );
+        assert_eq!(
+            failed(4, "x").headline(),
+            "Codespace failed at Configure codespace"
+        );
+        assert_eq!(ready(1000).headline(), "Codespace ready in 1s");
+        assert_eq!(
+            failed(2, "cargo fetch failed").failure_message(),
+            "cargo fetch failed The codespace is kept, so a retry reuses it."
+        );
+        assert_eq!(
+            failed(2, "").failure_message(),
+            "The codespace failed to start. The codespace is kept, so a retry reuses it."
+        );
+        assert_eq!(
+            snapshot.queued_note().as_deref(),
+            Some("Queued, sends when the codespace is ready")
+        );
+        assert_eq!(
+            snapshot.placeholder("Ask").unwrap(),
+            "Ask (sent when the codespace is ready)"
+        );
+    }
+
+    #[test]
     fn progress_only_grows_and_stays_below_full_while_starting() {
         let mut last = 0.;
         for done in 0..StepKind::ALL.len() {
@@ -337,11 +486,11 @@ mod tests {
     fn queued_note_and_placeholder_follow_the_phase() {
         let base = "Ask, build, or describe a change\u{2026}";
         assert_eq!(
-            starting(2).queued_note(),
+            starting(2).queued_note().as_deref(),
             Some("Queued, sends when the codespace is ready")
         );
         assert_eq!(
-            failed(2, "boom").queued_note(),
+            failed(2, "boom").queued_note().as_deref(),
             Some("Not sent, the codespace failed to start")
         );
         assert_eq!(ready(1000).queued_note(), None);

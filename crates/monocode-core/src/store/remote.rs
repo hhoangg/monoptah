@@ -854,7 +854,8 @@ impl Store {
 
     /// "Remove from Monoptah" for a session whose sandbox still exists but is not connected:
     /// forgets the local record only. Returns the warning to show: the sandbox keeps existing
-    /// (and counting against its time limit) until the user deletes it.
+    /// (and costing money) until the user deletes it, and the session is gone from the app, so
+    /// the only way left is the `sbx` command.
     pub fn remove_cloud_session_locally(&self, id: i64) -> Result<String, String> {
         let remote = self.remote_session(id)?.ok_or("Session not found")?;
         let cloud = remote
@@ -863,7 +864,7 @@ impl Store {
             .ok_or("This is not a cloud session.")?;
         self.forget_cloud_session(id)?;
         Ok(format!(
-            "Removed from Monoptah. The {} {} still exists; delete it from the session menu or with `sbx --cloud rm {}`.",
+            "Removed from Monoptah. The {} {} still exists and keeps costing money until you delete it with `sbx --cloud rm {}`.",
             cloud.noun(),
             cloud.name,
             cloud.name

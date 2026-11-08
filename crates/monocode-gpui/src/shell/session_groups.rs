@@ -6,6 +6,7 @@ use super::project_removal::{
 use super::*;
 use chrono::{Local, NaiveDateTime, TimeZone};
 use gpui::EventEmitter;
+use monocode_core::cloud_sessions::{CloudBackendKind, CloudState};
 use monocode_core::{
     session_groups::{
         Entry, Groups, build_list, format_reminder, navigation_ids, parse_github_work_item,
@@ -512,10 +513,42 @@ impl Shell {
                 )
                 .into(),
             ]);
-            if self.is_cloud(id) {
+            if let Some(mark) = self.cloud_marks.get(&id) {
                 items.push(
-                    MenuAction::new("codespace-terminal", "Open terminal in codespace").into(),
+                    MenuAction::new(
+                        "codespace-terminal",
+                        format!("Open terminal in {}", mark.kind.noun()),
+                    )
+                    .into(),
                 );
+                if mark.kind == CloudBackendKind::DockerSandbox {
+                    let state = self.cloud_states.get(&mark.key()).copied();
+                    let stopped = state == Some(CloudState::Stopped);
+                    if !stopped && state != Some(CloudState::Stopping) {
+                        items.push(
+                            MenuAction::new(
+                                "sandbox-stop",
+                                format!("Stop sandbox {}", mark.codespace),
+                            )
+                            .into(),
+                        );
+                    }
+                    items.push(
+                        MenuAction::new(
+                            "sandbox-delete",
+                            format!("Delete sandbox {}", mark.codespace),
+                        )
+                        .danger()
+                        .into(),
+                    );
+                    // A stopped sandbox cannot be reached without resuming (and billing) it,
+                    // so the session can also be dropped from Monoptah alone.
+                    if stopped {
+                        items.push(
+                            MenuAction::new("sandbox-remove-local", "Remove from Monoptah").into(),
+                        );
+                    }
+                }
             }
             if self.codespace_restore_pending(id) {
                 items.push(
@@ -605,8 +638,25 @@ impl Shell {
                 self.run_origin_codespace_action(id, cloud::ArchiveChoice::Delete, window, cx)
             }
             "codespace-terminal" => {
-                if let Some(codespace) = self.cloud_marks.get(&id).map(|m| m.codespace.clone()) {
-                    self.new_codespace_terminal(codespace, window, cx);
+                self.new_cloud_terminal(id, window, cx);
+            }
+            "sandbox-stop" | "sandbox-delete" | "sandbox-remove-local" => {
+                let Some(mark) = self
+                    .cloud_marks
+                    .get(&id)
+                    .filter(|m| m.kind == CloudBackendKind::DockerSandbox)
+                else {
+                    return;
+                };
+                let target = mark.cloud();
+                match action {
+                    "sandbox-stop" => {
+                        self.run_workspace_action(target, cloud::ArchiveChoice::Stop, window, cx)
+                    }
+                    "sandbox-delete" => {
+                        self.run_workspace_action(target, cloud::ArchiveChoice::Delete, window, cx)
+                    }
+                    _ => self.confirm_remove_cloud_session(id, window, cx),
                 }
             }
             "copy-harness-session-id" | "copy-monocode-session-id" | "copy-database-session-id" => {

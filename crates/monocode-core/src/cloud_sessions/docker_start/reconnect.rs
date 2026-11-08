@@ -41,7 +41,7 @@ fn credential_key(name: &str) -> String {
     format!("sandbox-credential-at:{name}")
 }
 
-const RECREATED: &str =
+pub(super) const RECREATED: &str =
     "The sandbox container was recreated, so this session's history is gone. Start a new session.";
 
 /// Why [`CloudSessions::reconnect_sandbox_typed`] failed. The archive flow tells the first two

@@ -983,7 +983,10 @@ impl Conversation {
         }
         if self.cloud_start_blocks() {
             if self.input.read(cx).content.trim_start().starts_with('/') {
-                self.status = "Commands are available once the codespace is ready".into();
+                self.status = format!(
+                    "Commands are available once the {} is ready",
+                    self.cloud_start_noun()
+                );
                 cx.notify();
                 return;
             }
@@ -3199,14 +3202,16 @@ impl Conversation {
     /// The codespace phase on the context line: a dot and the step now running, or "Startup
     /// failed". Gone once the codespace is ready. Opens the Codespace panel.
     fn cloud_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (text, phase) = self.cloud_start.as_ref()?.chip()?;
+        let start = self.cloud_start.as_ref()?;
+        let (text, phase) = start.chip()?;
+        let title = start.title();
         let failed = phase == crate::cloud_start_view::StartPhase::Failed;
         Some(
             div()
                 .id("composer-start-chip")
                 .debug_selector(|| "composer-start-chip".into())
                 .role(Role::Button)
-                .aria_label(format!("Codespace: {text}"))
+                .aria_label(format!("{title}: {text}"))
                 .cursor_pointer()
                 .flex_shrink_0()
                 .h(px(20.))

@@ -86,6 +86,13 @@ const DEFAULT_HOST_PORT: u16 = 3774;
 const FOLLOW_ATTEMPTS: usize = 4;
 const SANDBOX_GONE: &str = "Sandbox was deleted. Start a new session.";
 
+/// Whether `error` says a reconnect can never succeed because the sandbox is deleted or its
+/// container was recreated (the session's history lived in the old one). The UI then offers
+/// archiving and a new session instead of Reconnect.
+pub fn is_sandbox_unrecoverable(error: &str) -> bool {
+    error.starts_with(SANDBOX_GONE) || error.starts_with(reconnect::RECREATED)
+}
+
 pub(super) const PROVISION_SCRIPT: &str = include_str!("backend/docker_provision.sh");
 pub(super) const UP_SCRIPT: &str = include_str!("backend/docker_up.sh");
 pub(super) const RELAY_SCRIPT: &str = include_str!("backend/docker_relay.sh");

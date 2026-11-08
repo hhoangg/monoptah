@@ -7,7 +7,7 @@ use crate::{
     right_panel::{spinner, tabular},
     settings::widgets::secondary_button,
 };
-use monocode_core::cloud_sessions::{Step, StepKind, StepStatus};
+use monocode_core::cloud_sessions::{CloudBackendKind, Step, StepKind, StepStatus};
 
 const GREEN: u32 = 0x4ade80;
 pub(super) const CLOUD_START_ROW: (usize, usize) = (SAVED_DRAFT_START, 1);
@@ -192,7 +192,12 @@ impl TranscriptView {
         cx.emit(CloudStartAction { action });
     }
 
-    fn cloud_step_line(&self, step: &Step, now: u64) -> gpui::AnyElement {
+    fn cloud_step_line(
+        &self,
+        step: &Step,
+        backend: CloudBackendKind,
+        now: u64,
+    ) -> gpui::AnyElement {
         let duration = step_ms(step, now).map(crate::shell::live_elapsed);
         let (mark, label_alpha): (gpui::AnyElement, f32) = match step.status {
             StepStatus::Done => (
@@ -252,7 +257,7 @@ impl TranscriptView {
                             } else {
                                 content(label_alpha)
                             })
-                            .child(step.kind.label()),
+                            .child(step.kind.label_for(backend)),
                     )
                     .when_some(detail, |d, detail| {
                         d.child(
@@ -311,7 +316,7 @@ impl TranscriptView {
             .map_or(record.steps.as_slice(), |ready| ready.steps.as_slice());
         let steps: Vec<_> = visible_steps(all)
             .into_iter()
-            .map(|step| self.cloud_step_line(step, now))
+            .map(|step| self.cloud_step_line(step, start.backend(), now))
             .collect();
         let tail = (start.phase == StartPhase::Starting)
             .then(|| start.log.iter().rev().find(|line| !line.trim().is_empty()))
@@ -383,13 +388,10 @@ impl TranscriptView {
                     ),
             );
         let error = failed.then(|| {
-            let reason = start
-                .short_error()
-                .filter(|reason| !reason.is_empty())
-                .unwrap_or_else(|| "The codespace failed to start.".into());
-            let message = format!("{} The codespace is kept, so a retry reuses it.", reason);
-            let button = |id: &'static str, label: &'static str, action, danger| {
-                secondary_button(id, label, danger, false)
+            let message = start.failure_message();
+            let delete_label = start.delete_label();
+            let button = |id: &'static str, label: String, action, danger| {
+                secondary_button(id, label.clone(), danger, false)
                     .debug_selector(move || id.into())
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| this.cloud_action(action, cx)))
@@ -423,25 +425,27 @@ impl TranscriptView {
                         .gap(px(6.))
                         .child(button(
                             "cloud-start-retry",
-                            "Retry",
+                            "Retry".into(),
                             StartAction::Retry,
                             false,
                         ))
                         .child(button(
                             "cloud-start-rebuild",
-                            "Rebuild container",
+                            "Rebuild container".into(),
                             StartAction::Rebuild,
                             false,
                         ))
-                        .child(button(
-                            "cloud-start-browser",
-                            "Open in browser",
-                            StartAction::OpenInBrowser,
-                            false,
-                        ))
+                        .when(start.offers_browser(), |d| {
+                            d.child(button(
+                                "cloud-start-browser",
+                                "Open in browser".into(),
+                                StartAction::OpenInBrowser,
+                                false,
+                            ))
+                        })
                         .child(button(
                             "cloud-start-delete",
-                            "Delete codespace",
+                            delete_label,
                             StartAction::DeleteCodespace,
                             true,
                         )),
@@ -613,7 +617,7 @@ pub(crate) fn cloud_dot(failed: bool) -> gpui::AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cloud_start_view::fixtures::{failed, ready, starting};
+    use crate::cloud_start_view::fixtures::{as_sandbox, failed, ready, starting};
     use gpui::{TestAppContext, WindowHandle};
 
     fn row(role: &str, text: &str) -> Row {
@@ -733,6 +737,54 @@ mod tests {
             assert_eq!(seen.borrow().last(), Some(&action), "{id}");
         }
         assert!(visual.debug_bounds("cloud-queued-note").is_some());
+    }
+
+    #[gpui::test]
+    fn a_failed_sandbox_row_has_no_browser_button_and_names_the_sandbox(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let view = window.root(cx).unwrap();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&view, move |_, event: &CloudStartAction, _| {
+                log.borrow_mut().push(event.action)
+            })
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.set_cloud_start(
+                    Some(as_sandbox(failed(2, "devcontainer up failed"))),
+                    Some("fix the bug".into()),
+                    cx,
+                )
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("cloud-start-browser").is_none());
+        for (id, action) in [
+            ("cloud-start-retry", StartAction::Retry),
+            ("cloud-start-rebuild", StartAction::Rebuild),
+            ("cloud-start-delete", StartAction::DeleteCodespace),
+            ("cloud-start-view-log", StartAction::ShowPanel),
+        ] {
+            let bounds = visual.debug_bounds(id).unwrap_or_else(|| panic!("{id}"));
+            visual.simulate_click(bounds.center(), Default::default());
+            assert_eq!(seen.borrow().last(), Some(&action), "{id}");
+        }
+        assert!(visual.debug_bounds("cloud-queued-note").is_some());
+        window
+            .update(visual, |view, _, _| {
+                let start = view.cloud_start.clone().unwrap();
+                assert_eq!(start.headline(), "Sandbox failed at Build container");
+                assert_eq!(
+                    start.failure_message(),
+                    "devcontainer up failed The sandbox is kept, so a retry reuses it."
+                );
+                assert_eq!(start.delete_label(), "Delete sandbox");
+            })
+            .unwrap();
     }
 
     #[gpui::test]

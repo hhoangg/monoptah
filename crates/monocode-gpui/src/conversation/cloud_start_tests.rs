@@ -146,3 +146,29 @@ fn startup_hides_the_loading_status_and_preserves_slash_commands(cx: &mut TestAp
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn the_start_texts_of_the_conversation_follow_the_backend(cx: &mut TestAppContext) {
+    use crate::cloud_start_view::fixtures::as_sandbox;
+    let window = conversation(cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_cloud_start(Some(as_sandbox(starting(2))), cx);
+            assert_eq!(view.cloud_start_noun(), "sandbox");
+            view.input
+                .update(cx, |input, cx| input.set_text("/model".into(), cx));
+            view.send_follow_up(false, cx);
+            assert_eq!(
+                view.status,
+                "Commands are available once the sandbox is ready"
+            );
+            view.set_cloud_start(Some(starting(2)), cx);
+            assert_eq!(view.cloud_start_noun(), "codespace");
+            view.send_follow_up(false, cx);
+            assert_eq!(
+                view.status,
+                "Commands are available once the codespace is ready"
+            );
+        })
+        .unwrap();
+}

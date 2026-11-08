@@ -932,33 +932,35 @@ impl CloudSessions {
 
     /// What deleting `codespace` would lose, as recorded when its sessions were saved.
     pub fn unsaved_for(&self, codespace: &str) -> Vec<String> {
+        self.unsaved_for_cloud(&CloudRef::codespace(codespace))
+    }
+    /// [`Self::unsaved_for`] for any backend.
+    pub fn unsaved_for_cloud(&self, cloud: &CloudRef) -> Vec<String> {
         self.store()
             .ok()
-            .and_then(|s| {
-                s.setting(&convert::unsaved_key(&CloudRef::codespace(codespace)))
-                    .ok()
-                    .flatten()
-            })
+            .and_then(|s| s.setting(&convert::unsaved_key(cloud)).ok().flatten())
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or_default()
     }
     /// Remembers `lines` for `codespace` (merged with what is already recorded), so every later
     /// delete of it asks again.
     pub fn record_unsaved(&self, codespace: &str, lines: &[String]) -> Result<(), String> {
+        self.record_unsaved_cloud(&CloudRef::codespace(codespace), lines)
+    }
+    /// [`Self::record_unsaved`] for any backend.
+    pub fn record_unsaved_cloud(&self, cloud: &CloudRef, lines: &[String]) -> Result<(), String> {
         if lines.is_empty() {
             return Ok(());
         }
-        let mut all = self.unsaved_for(codespace);
+        let mut all = self.unsaved_for_cloud(cloud);
         for line in lines {
             if !all.contains(line) {
                 all.push(line.clone());
             }
         }
         let value = serde_json::to_string(&all).map_err(|e| e.to_string())?;
-        self.store()?.save_setting(
-            &convert::unsaved_key(&CloudRef::codespace(codespace)),
-            &value,
-        )
+        self.store()?
+            .save_setting(&convert::unsaved_key(cloud), &value)
     }
     pub fn invalidate(&self, name: &str) {
         self.invalidate_ref(&CloudRef::codespace(name));
@@ -1214,6 +1216,51 @@ impl CloudSessions {
             .and_then(|store| start_record(&store, session_id))
             .map(|record| StartupSummary::of(&record));
         Some(self.session_target(cloud, startup))
+    }
+}
+
+/// The command of an interactive shell in a sandbox's container: `ssh -t <destination>
+/// <remote>`. See [`CloudSessions::sandbox_terminal`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxTerminal {
+    /// `<id>@sbx_cloud`.
+    pub destination: String,
+    /// The single remote word: `devcontainer exec ... -- bash -l`.
+    pub remote: String,
+}
+
+impl CloudSessions {
+    /// How to open a terminal in the container of sandbox session `session_id`. Reads the
+    /// store and the machine list only; the ssh that the caller then runs resumes a stopped
+    /// sandbox, so call it for a user action (the session menu) and never from the background.
+    pub fn sandbox_terminal(&self, session_id: i64) -> Result<SandboxTerminal, String> {
+        let session = self
+            .store()?
+            .remote_session(session_id)?
+            .ok_or("Session not found")?;
+        let cloud = session
+            .project
+            .cloud()
+            .filter(|c| c.kind == CloudBackendKind::DockerSandbox)
+            .ok_or("This session does not run in a sandbox.")?;
+        if crate::store::is_pending_cloud_environment(&session.project.environment_id) {
+            return Err(startup::STILL_STARTING.into());
+        }
+        let target = self
+            .host
+            .machines()?
+            .into_iter()
+            .find(|m| {
+                m.environment_id == session.project.environment_id
+                    && m.sandbox.as_ref().is_some_and(|s| s.name == cloud.name)
+            })
+            .and_then(|m| m.sandbox)
+            .ok_or("The sandbox connection was removed. Start a new session.")?;
+        crate::remote::validate_sandbox_target(&target)?;
+        Ok(SandboxTerminal {
+            destination: crate::sandboxes::ssh_destination(&target.id),
+            remote: target.exec_in_container(&["bash", "-l"]),
+        })
     }
 }
 

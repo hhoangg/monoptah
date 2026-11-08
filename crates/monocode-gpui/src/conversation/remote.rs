@@ -60,6 +60,10 @@ impl Conversation {
     pub(crate) fn cloud_queued(&self) -> Option<&str> {
         self.cloud_queued.as_deref()
     }
+    /// `codespace` or `sandbox`, by the backend of the start shown.
+    pub(super) fn cloud_start_noun(&self) -> &'static str {
+        self.cloud_start.as_ref().map_or("codespace", |s| s.noun())
+    }
     /// The codespace is not ready: the host is not loaded and sends are queued.
     pub(crate) fn cloud_start_blocks(&self) -> bool {
         self.cloud_start
@@ -116,8 +120,8 @@ impl Conversation {
             }
         }
     }
-    /// Asks the shell to Retry, Rebuild, open the browser, delete the codespace or show the
-    /// Codespace panel.
+    /// Asks the shell to Retry, Rebuild, open the browser, delete the codespace or sandbox,
+    /// show the Codespace panel, or (for a dead sandbox) archive the session or start a new one.
     pub(crate) fn request_cloud_start_action(
         &mut self,
         action: crate::cloud_start_view::StartAction,
@@ -144,7 +148,10 @@ impl Conversation {
         if self.cloud_queued.is_some() {
             self.remote_state.app_prompt_waiting = true;
         }
-        self.status = "Codespace ready".into();
+        self.status = format!(
+            "{} ready",
+            self.cloud_start.as_ref().map_or("Codespace", |s| s.title())
+        );
         self.load(cx);
         cx.emit(SessionChanged);
         cx.notify();
@@ -155,9 +162,10 @@ impl Conversation {
             return;
         }
         if !self.attachments.is_empty() {
-            self.status =
-                "Attachments cannot be sent while the codespace starts. Remove them or wait."
-                    .into();
+            self.status = format!(
+                "Attachments cannot be sent while the {} starts. Remove them or wait.",
+                self.cloud_start_noun()
+            );
             cx.notify();
             return;
         }
@@ -183,7 +191,10 @@ impl Conversation {
             Ok(queued) => {
                 self.cloud_queued = queued;
                 self.sync_cloud_chrome(cx);
-                self.status = "Queued. It is sent when the codespace is ready.".into();
+                self.status = format!(
+                    "Queued. It is sent when the {} is ready.",
+                    self.cloud_start_noun()
+                );
             }
             Err(error) => {
                 self.input.update(cx, |input, cx| input.set_text(text, cx));
@@ -738,21 +749,50 @@ impl Conversation {
         self.settings.remote_action = Some(json!({"type":"draft"}));
         self.launch_prompt(prompt, cx);
     }
+    /// A sandbox reconnect is running without having failed yet: the banner then carries the
+    /// progress line and the Cancel button (it used to appear only after an error).
+    fn sandbox_reconnecting(&self) -> bool {
+        self.remote_state.waking
+            && self.remote_state.error.is_none()
+            && !self.remote_state.pending
+            && self.cloud_noun() == Some("sandbox")
+    }
+    /// The sandbox is deleted or its container was recreated: Reconnect can not help.
+    fn sandbox_unrecoverable(&self) -> bool {
+        self.remote_state
+            .error
+            .as_deref()
+            .is_some_and(monocode_core::cloud_sessions::docker_start::is_sandbox_unrecoverable)
+            && self.cloud_noun() == Some("sandbox")
+    }
     pub(super) fn remote_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let reconnecting = self.sandbox_reconnecting();
         if !self.is_remote()
             || self.busy
-            || (self.remote_state.error.is_none() && !self.remote_state.pending)
+            || (self.remote_state.error.is_none() && !self.remote_state.pending && !reconnecting)
         {
             return None;
         }
         let legacy = self.remote_state.legacy_recovery_error();
+        let dead = legacy.is_none() && !self.remote_state.pending && self.sandbox_unrecoverable();
+        let action = |id: &'static str, label: &'static str, action, cx: &mut Context<Self>| {
+            crate::settings::widgets::secondary_button(id, label, false, false)
+                .debug_selector(move || id.into())
+                .child(label)
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.request_cloud_start_action(action, cx)),
+                )
+        };
         Some(div().mx_2().my_2().p_3().rounded_lg().bg(content(0.04)).flex().items_center().gap_2()
-            .child(div().flex_1().text_size(px(12.)).child(if let Some(error) = legacy {error.to_owned()} else if self.remote_state.pending {"A remote command needs confirmation. Retry uses its original command ID.".to_owned()} else {self.remote_state.error.clone().unwrap_or_default()}))
-            .when(legacy.is_none() && !self.remote_state.pending && self.is_cloud_session(), |d| d
+            .child(div().flex_1().text_size(px(12.)).child(if let Some(error) = legacy {error.to_owned()} else if self.remote_state.pending {"A remote command needs confirmation. Retry uses its original command ID.".to_owned()} else if reconnecting {self.status.clone()} else {self.remote_state.error.clone().unwrap_or_default()}))
+            .when(dead, |d| d
+                .child(action("remote-archive-session", "Archive session", crate::cloud_start_view::StartAction::ArchiveSession, cx))
+                .child(action("remote-new-session", "New session", crate::cloud_start_view::StartAction::NewSession, cx)))
+            .when(legacy.is_none() && !self.remote_state.pending && !dead && !reconnecting && self.is_cloud_session(), |d| d
             .child(crate::settings::widgets::secondary_button("remote-reconnect","Reconnect",!self.remote_state.waking,false).debug_selector(|| "remote-reconnect".into()).child("Reconnect").on_click(cx.listener(|this,_,_,cx| { this.reconnect_cloud(true, cx); }))))
             .when(self.remote_state.waking, |d| d
             .child(crate::settings::widgets::secondary_button("remote-reconnect-cancel","Cancel",true,false).debug_selector(|| "remote-reconnect-cancel".into()).child("Cancel").on_click(cx.listener(|this,_,_,cx| { this.cancel_cloud_reconnect(cx); }))))
-            .when(legacy.is_none(), |d| d
+            .when(legacy.is_none() && !dead && !reconnecting, |d| d
             .child(crate::settings::widgets::secondary_button("remote-retry",if self.remote_state.rejected.is_some() {"Restore message"} else {"Retry"},true,false).debug_selector(|| "remote-retry".into()).child(if self.remote_state.rejected.is_some() {"Restore message"} else {"Retry"}).on_click(cx.listener(|this,_,_,cx| {
                 if this.remote_state.rejected.is_some() { this.restore_remote_message(cx); } else {this.retry_remote(cx);}
             })))).into_any_element())
