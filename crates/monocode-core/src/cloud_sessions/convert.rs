@@ -43,6 +43,11 @@
 //! * Claude's JSONL lives in the old container, so it is skipped (a warning says so) and
 //!   `.evidence` is not pulled.
 //!
+//! A sandbox without a devcontainer ([`crate::remote::SandboxMode::Plain`]) has no container
+//! to lose: its scripts and copies run in the workspace of the outer sandbox, the session's
+//! folder is that workspace, and the files-only mode only applies when its Host cannot be
+//! brought back.
+//!
 //! Only [`CloudSessions::convert_session`] chooses this mode, and it is the user's archive
 //! action. Nothing in a background path (polls, Monos, the app API) reaches it.
 use super::*;
@@ -751,10 +756,11 @@ impl CloudSessions {
                     .then_some(settings.worktree_cwd)
                     .flatten()
             });
+        let workspace_root = self.workspace_root_of(&cloud);
         let session_cwd = host_cwd
             .map(|c| c.trim_end_matches('/').to_string())
             .filter(|c| {
-                c.starts_with(&format!("{}/", self.workspace_root)) && valid_remote_path(c).is_ok()
+                c.starts_with(&format!("{}/", workspace_root)) && valid_remote_path(c).is_ok()
             });
         let workspace = session_cwd.clone().unwrap_or_else(|| project_cwd.clone());
         // Where the snapshot script looks: the same tree, at its path in the outer sandbox

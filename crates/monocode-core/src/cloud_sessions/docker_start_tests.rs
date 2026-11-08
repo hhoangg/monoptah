@@ -7,7 +7,7 @@ use super::docker_start::{
 // Only the unix-only `scripts` tests run the embedded shell scripts.
 #[cfg(unix)]
 use super::docker_start::{
-    with_vars, GIT_CONFIG_SCRIPT, PROVISION_SCRIPT, RELAY_SCRIPT, UP_SCRIPT,
+    with_vars, DETECT_SCRIPT, GIT_CONFIG_SCRIPT, PROVISION_SCRIPT, RELAY_SCRIPT, UP_SCRIPT,
 };
 use super::startup::{
     pending_starts, save_start_record, start_record, StartEvent, StartRecord, Step, StepKind,
@@ -174,6 +174,9 @@ impl ShellCall {
     /// The `PHASE`, `MODE` or other tag of the embedded script this call carries.
     fn tag(&self) -> String {
         let text = format!("{}\n{}", self.remote, self.stdin).replace("'\\''", "'");
+        if text.contains("MONOPTAH_DEVCONTAINER=") {
+            return "detect".into();
+        }
         for key in ["PHASE", "MODE"] {
             if let Some(i) = text.find(&format!("{key}='")) {
                 let rest = &text[i + key.len() + 2..];
@@ -205,6 +208,8 @@ struct Shell {
     /// The first N follow attempts end without the exit marker.
     follow_drops: Mutex<usize>,
     fail_tag: Mutex<Option<(String, String)>>,
+    /// What the devcontainer lookup answers: `config`, `none` or `missing`.
+    devcontainer: Mutex<String>,
     /// Makes the "outer sandbox" the local disk for archive scripts: HOME and the real folder
     /// that stands for [`WORKSPACE`].
     local: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
@@ -227,6 +232,7 @@ impl Shell {
             up_exit: Mutex::new("0".into()),
             follow_drops: Mutex::new(0),
             fail_tag: Mutex::new(None),
+            devcontainer: Mutex::new("config".into()),
             local: Mutex::new(None),
         })
     }
@@ -284,6 +290,10 @@ impl SandboxShell for Shell {
                 "[monoptah] cloning the repository".into(),
                 format!("MONOPTAH_WORKSPACE={WORKSPACE}"),
             ]),
+            "detect" => lines.push(format!(
+                "MONOPTAH_DEVCONTAINER={}",
+                self.devcontainer.lock().unwrap()
+            )),
             "mode:start" | "mode:rebuild" => lines.push("MONOPTAH_UP=started".into()),
             "mode:follow" => {
                 let offset: usize = stdin
@@ -317,11 +327,15 @@ impl SandboxShell for Shell {
             ]),
             "relay" => lines.push("MONOPTAH_RELAY=started".into()),
             "evidence" => {}
+            // A script of a plain sandbox runs in the workspace of the outer sandbox.
+            "other" if remote.starts_with("cd '") && self.local.lock().unwrap().is_none() => {
+                lines.push("ran".into())
+            }
             "other" if self.local.lock().unwrap().is_some() => {
                 let (home, ws) = self.local.lock().unwrap().clone().unwrap();
                 assert!(
-                    remote.starts_with("sh -c ")
-                        && remote.contains("sh -s")
+                    (remote.starts_with("sh -c ") && remote.contains("sh -s")
+                        || remote.starts_with("cd '"))
                         && !remote.contains("devcontainer"),
                     "an archive script runs in the outer sandbox: {remote}"
                 );
@@ -857,6 +871,7 @@ fn a_start_runs_every_phase_in_order_and_ends_ready() {
             "phase:setup",
             "phase:approve",
             "phase:clone",
+            "detect",
             "mode:start",
             "mode:follow",
             "gitconfig",
@@ -874,6 +889,7 @@ fn a_start_runs_every_phase_in_order_and_ends_ready() {
             "phase:setup",
             "phase:approve",
             "phase:clone",
+            "detect",
             "mode:start",
             "mode:follow",
             "gitconfig",
@@ -1786,6 +1802,97 @@ mod scripts {
         assert!(!config.contains("password") && !config.contains("token"));
     }
 
+    /// The answer of the devcontainer lookup for a checkout holding `files`.
+    fn detect(files: &[&str], config: &str) -> String {
+        let ws = tempfile::tempdir().unwrap();
+        for file in files {
+            let path = ws.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}").unwrap();
+        }
+        let script = with_vars(
+            &[("WS", ws.path().to_str().unwrap()), ("CONFIG", config)],
+            DETECT_SCRIPT,
+        );
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn the_devcontainer_lookup_finds_the_default_files_and_honours_a_custom_path() {
+        let found = "MONOPTAH_DEVCONTAINER=config";
+        assert_eq!(detect(&[], ""), "MONOPTAH_DEVCONTAINER=none");
+        assert_eq!(detect(&["README.md"], ""), "MONOPTAH_DEVCONTAINER=none");
+        assert_eq!(detect(&[".devcontainer/devcontainer.json"], ""), found);
+        // The devcontainer spec also allows a config file at the repository root.
+        assert_eq!(detect(&[".devcontainer.json"], ""), found);
+        // A folder of that name is not a config.
+        assert_eq!(
+            detect(&[".devcontainer/other.json"], ""),
+            "MONOPTAH_DEVCONTAINER=none"
+        );
+        let custom = ".devcontainer/web/devcontainer.json";
+        assert_eq!(detect(&[custom], custom), found);
+        // A custom path never falls back to the default files.
+        assert_eq!(
+            detect(
+                &[".devcontainer/devcontainer.json", ".devcontainer.json"],
+                custom
+            ),
+            "MONOPTAH_DEVCONTAINER=missing"
+        );
+    }
+
+    #[test]
+    fn the_git_script_without_a_socket_uses_the_outer_sandbox_cache() {
+        let outer = Outer::new();
+        let git_dir: PathBuf = outer.home.path().join("gitconfig");
+        let script = with_vars(
+            &[
+                ("WANT_CRED", "1"),
+                ("CLONE_URL", "https://github.com/octo/widgets.git"),
+                ("SOCKET", ""),
+            ],
+            GIT_CONFIG_SCRIPT,
+        );
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("HOME", outer.home.path())
+            .env("GIT_CONFIG_GLOBAL", &git_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        let config = std::fs::read_to_string(&git_dir).unwrap();
+        let socket = outer.home.path().join(".monoptah/git/sock");
+        assert!(
+            config.contains(&format!("helper = cache --socket={}", socket.display())),
+            "{config}"
+        );
+    }
+
     #[test]
     fn real_credential_cache_serves_only_the_configured_url_and_hides_the_token() {
         const TOKEN: &str = "ghp_REALGITTOKEN987654321";
@@ -1949,6 +2056,7 @@ fn rebuild_forgets_the_paired_machine_because_the_container_is_new() {
         workspace: WORKSPACE.into(),
         relay_port: 47200,
         config: None,
+        mode: Default::default(),
     };
     fx.host.machines.lock().unwrap().push(Machine {
         id: "m-old".into(),
@@ -1990,6 +2098,7 @@ fn a_new_container_id_forgets_the_paired_machine() {
             workspace: WORKSPACE.into(),
             relay_port: 47200,
             config: None,
+            mode: Default::default(),
         }),
     });
     *fx.shell.fail_tag.lock().unwrap() = None;
@@ -2419,6 +2528,337 @@ fn deleting_a_stopped_sandbox_session_never_resumes_it_and_can_be_removed_locall
     assert_eq!(fx.sbx.count("rm"), 0);
 }
 
+// ------------------------------------------------ sessions without a devcontainer
+
+mod plain {
+    use super::*;
+    use crate::remote::SandboxMode;
+
+    const PLAIN_CWD: &str = "cd '/home/agent/workspaces/widgets' && ";
+
+    fn plain_fx() -> Fx {
+        let fx = fx();
+        *fx.shell.devcontainer.lock().unwrap() = "none".into();
+        fx
+    }
+    fn last_record(events: &[StartEvent]) -> StartRecord {
+        events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                StartEvent::Updated(record) => Some(record.clone()),
+                _ => None,
+            })
+            .expect("an update event")
+    }
+    /// A finished plain start whose project config is saved, like `started()`.
+    fn started_plain() -> (Fx, i64, String) {
+        let fx = plain_fx();
+        let (session, _) = fx.begin().unwrap();
+        let binding = fx.run(session.id).0.unwrap();
+        super::super::docker_config::save(
+            &fx.store.lock().unwrap(),
+            "/Users/me/widgets",
+            &config(),
+        )
+        .unwrap();
+        (fx, session.id, binding.codespace)
+    }
+    fn machine_target(fx: &Fx) -> crate::remote::SandboxTarget {
+        fx.host.machines.lock().unwrap()[0].sandbox.clone().unwrap()
+    }
+
+    #[test]
+    fn a_start_without_a_devcontainer_runs_directly_in_the_sandbox() {
+        let fx = plain_fx();
+        let (session, _) = fx.begin().unwrap();
+        let (result, events) = fx.run(session.id);
+        let binding = result.unwrap();
+        assert_eq!(
+            fx.shell.tags(),
+            [
+                "phase:setup",
+                "phase:approve",
+                "phase:clone",
+                "detect",
+                "gitconfig",
+                "bootstrap",
+                "evidence"
+            ]
+        );
+        // No devcontainer, no relay, no container exec anywhere.
+        for call in fx.shell.calls() {
+            assert!(
+                !call.remote.contains("exec --workspace-folder"),
+                "{}",
+                call.remote
+            );
+            assert!(!call.stdin.contains("CID="), "no relay");
+            assert_eq!(call.id, NEW_ID);
+        }
+        // The steps: the container ones are skipped, the rest ran.
+        let last = last_record(&events);
+        for kind in [
+            StepKind::BuildContainer,
+            StepKind::BlockingCommands,
+            StepKind::LifecycleCommands,
+        ] {
+            assert_eq!(status(&last, kind), StepStatus::Skipped, "{kind:?}");
+            assert_eq!(
+                last.step(kind).detail.as_deref(),
+                Some("No devcontainer"),
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            StepKind::Create,
+            StepKind::Provision,
+            StepKind::ConfigureCodespace,
+            StepKind::Connect,
+            StepKind::OpenProject,
+        ] {
+            assert_eq!(status(&last, kind), StepStatus::Done, "{kind:?}");
+        }
+        // The Host runs in the workspace of the outer sandbox, with the secrets on stdin only.
+        let bootstrap = fx.shell.call("bootstrap");
+        assert_eq!(bootstrap.remote, format!("{PLAIN_CWD}sh -l -s"));
+        assert!(bootstrap.stdin.contains(SECRET));
+        let git = fx.shell.call("gitconfig");
+        assert_eq!(git.remote, format!("{PLAIN_CWD}sh -l -s"));
+        assert!(git.stdin.contains("SOCKET=''\n") && git.stdin.contains("WANT_CRED='1'"));
+        assert!(fx.shell.call("phase:approve").stdin.contains(GIT_TOKEN));
+        for call in fx.shell.calls() {
+            assert!(!call.remote.contains(SECRET) && !call.remote.contains(GIT_TOKEN));
+            if call.tag() != "bootstrap" {
+                assert!(!call.stdin.contains(SECRET));
+            }
+        }
+        // The machine is a plain target, and the project opens at the outer workspace.
+        let target = machine_target(&fx);
+        assert_eq!(target.mode, SandboxMode::Plain);
+        assert_eq!(target.workspace, WORKSPACE);
+        assert_eq!(binding.remote_cwd, WORKSPACE);
+        let remote = fx
+            .store
+            .lock()
+            .unwrap()
+            .remote_session(session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.project.cwd, WORKSPACE);
+        assert!(fx
+            .host
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains(&format!("projects.open \"{WORKSPACE}\""))));
+        assert!(fx.record(session.id).is_none());
+    }
+
+    #[test]
+    fn a_repository_with_a_devcontainer_still_runs_in_it() {
+        let fx = fx();
+        let (session, _) = fx.begin().unwrap();
+        fx.run(session.id).0.unwrap();
+        let tags = fx.shell.tags();
+        assert!(tags.contains(&"detect".to_string()) && tags.contains(&"relay".to_string()));
+        assert!(tags.contains(&"mode:start".to_string()));
+        assert_eq!(machine_target(&fx).mode, SandboxMode::Container);
+        assert!(fx
+            .shell
+            .call("detect")
+            .stdin
+            .contains("WS='/home/agent/workspaces/widgets'\nCONFIG=''\n"));
+    }
+
+    #[test]
+    fn a_missing_custom_devcontainer_path_fails_clearly_instead_of_falling_back() {
+        let fx = fx();
+        *fx.shell.devcontainer.lock().unwrap() = "missing".into();
+        let mut cfg = config();
+        cfg.devcontainer_path = ".devcontainer/web/devcontainer.json".into();
+        let (session, _) = fx
+            .svc
+            .begin_sandbox_start("/Users/me/widgets", &cfg, "main", "claude")
+            .unwrap();
+        let error = fx.run(session.id).0.unwrap_err();
+        assert!(
+            error.contains(
+                "Dev container config (.devcontainer/web/devcontainer.json) not found in the repository"
+            ),
+            "{error}"
+        );
+        let stored = fx.record(session.id).unwrap();
+        assert_eq!(
+            status(&stored, StepKind::BuildContainer),
+            StepStatus::Failed
+        );
+        assert_eq!(stored.sandbox_start.as_ref().unwrap().mode, None);
+        // The custom path reached the lookup; nothing ran after it.
+        assert!(fx
+            .shell
+            .call("detect")
+            .stdin
+            .contains("CONFIG='.devcontainer/web/devcontainer.json'\n"));
+        assert_eq!(*fx.shell.tags().last().unwrap(), "detect");
+    }
+
+    #[test]
+    fn retrying_a_start_that_failed_at_build_container_for_a_missing_config_switches_to_plain() {
+        let fx = fx();
+        let (session, _) = fx.begin().unwrap();
+        // The old flow: `devcontainer up` fails because the config is not there.
+        *fx.shell.up_log.lock().unwrap() = vec![
+            r#"{"outcome":"error","message":"x","description":"Dev container config (/home/agent/workspaces/widgets/.devcontainer/devcontainer.json) not found."}"#.into(),
+        ];
+        *fx.shell.up_exit.lock().unwrap() = "1".into();
+        let error = fx.run(session.id).0.unwrap_err();
+        assert!(error.contains("not found"), "{error}");
+        let mut stored = fx.record(session.id).unwrap();
+        assert_eq!(
+            status(&stored, StepKind::BuildContainer),
+            StepStatus::Failed
+        );
+        // A record written before the mode existed.
+        stored.sandbox_start.as_mut().unwrap().mode = None;
+        save_start_record(&fx.store.lock().unwrap(), &stored).unwrap();
+        *fx.shell.devcontainer.lock().unwrap() = "none".into();
+        let before = fx.shell.tags().len();
+        let (result, events) = fx.run(session.id);
+        result.unwrap();
+        let after: Vec<String> = fx.shell.tags()[before..].to_vec();
+        assert!(!after.contains(&"phase:clone".to_string()), "{after:?}");
+        assert!(after.contains(&"detect".to_string()), "{after:?}");
+        assert!(!after.iter().any(|t| t.starts_with("mode:") || t == "relay"));
+        let last = last_record(&events);
+        assert_eq!(status(&last, StepKind::BuildContainer), StepStatus::Skipped);
+        assert_eq!(machine_target(&fx).mode, SandboxMode::Plain);
+        assert_eq!(fx.sbx.count("create"), 1, "same sandbox");
+    }
+
+    #[test]
+    fn a_decided_mode_is_kept_on_retry_and_a_start_with_a_container_stays_container() {
+        let fx = plain_fx();
+        let (session, _) = fx.begin().unwrap();
+        fx.shell.fail("bootstrap", "boom");
+        assert!(fx.run(session.id).0.is_err());
+        let stored = fx.record(session.id).unwrap();
+        assert_eq!(
+            stored.sandbox_start.as_ref().unwrap().mode,
+            Some(SandboxMode::Plain)
+        );
+        // Even if the repository grew a config meanwhile, the decided mode wins.
+        *fx.shell.devcontainer.lock().unwrap() = "config".into();
+        *fx.shell.fail_tag.lock().unwrap() = None;
+        let before = fx.shell.tags().len();
+        fx.run(session.id).0.unwrap();
+        let after: Vec<String> = fx.shell.tags()[before..].to_vec();
+        assert!(!after.contains(&"detect".to_string()), "{after:?}");
+        assert!(!after.contains(&"relay".to_string()), "{after:?}");
+    }
+
+    #[test]
+    fn a_plain_reconnect_restores_the_host_without_a_container_or_relay() {
+        let (fx, id, _) = started_plain();
+        fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+        fx.reset();
+        let (result, lines) = fx.reconnect(id);
+        result.unwrap();
+        assert_eq!(
+            fx.shell.tags(),
+            ["phase:approve", "gitconfig", "bootstrap", "evidence"]
+        );
+        for call in fx.shell.calls() {
+            assert!(
+                !call.remote.contains("exec --workspace-folder"),
+                "{}",
+                call.remote
+            );
+            assert!(!call.remote.contains(SECRET) && !call.remote.contains(GIT_TOKEN));
+        }
+        assert!(fx.shell.call("bootstrap").stdin.contains(SECRET));
+        assert!(!lines
+            .iter()
+            .any(|l| l.contains(SECRET) || l.contains(GIT_TOKEN) || l.contains("container")));
+        let log = fx.host.log.lock().unwrap().clone();
+        assert!(log.iter().any(|l| l.contains("projects.open")), "{log:?}");
+        assert_eq!(
+            fx.host.machines.lock().unwrap()[0]
+                .sandbox
+                .as_ref()
+                .unwrap()
+                .mode,
+            SandboxMode::Plain
+        );
+    }
+
+    #[test]
+    fn a_plain_sandbox_has_nothing_to_rebuild() {
+        let fx = plain_fx();
+        let (session, _) = fx.begin().unwrap();
+        fx.shell.fail("bootstrap", "boom");
+        assert!(fx.run(session.id).0.is_err());
+        let error = fx.svc.rebuild_start(session.id).unwrap_err();
+        assert_eq!(error, "This sandbox has no devcontainer to rebuild.");
+        // The record is untouched (still failed, same steps).
+        assert!(fx.record(session.id).unwrap().is_failed());
+    }
+
+    #[test]
+    fn a_plain_terminal_is_a_login_shell_in_the_workspace() {
+        let (fx, id, _) = started_plain();
+        let terminal = fx.svc.sandbox_terminal(id).unwrap();
+        assert_eq!(terminal.destination, format!("{NEW_ID}@sbx_cloud"));
+        assert_eq!(terminal.remote, format!("{PLAIN_CWD}bash -l"));
+        // The container sandbox still goes through `devcontainer exec`.
+        let (fx, id, _) = started();
+        assert!(fx
+            .svc
+            .sandbox_terminal(id)
+            .unwrap()
+            .remote
+            .contains("devcontainer"));
+    }
+
+    #[test]
+    fn scripts_of_a_plain_sandbox_run_in_its_workspace_through_the_backend() {
+        let (fx, _, name) = started_plain();
+        fx.reset();
+        let backend = fx.svc.backend(CloudBackendKind::DockerSandbox).unwrap();
+        assert_eq!(
+            backend.run_script(&name, "echo hi\n", false).unwrap(),
+            "ran\n"
+        );
+        let call = fx.shell.calls().pop().unwrap();
+        assert_eq!(call.remote, format!("{PLAIN_CWD}sh -l -s"));
+        assert_eq!(call.stdin, "echo hi\n");
+    }
+
+    #[test]
+    fn records_and_targets_from_before_the_mode_keep_their_meaning() {
+        let fx = fx();
+        let (session, _) = fx.begin().unwrap();
+        let record = fx.record(session.id).unwrap();
+        let mut value = serde_json::to_value(&record).unwrap();
+        // Undecided starts do not write the field at all.
+        assert!(value["sandboxStart"].get("mode").is_none(), "{value}");
+        value["sandboxStart"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mode");
+        let old: StartRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(old.sandbox_start.unwrap().mode, None);
+        // A decided Plain start round-trips.
+        let mut plain = record.clone();
+        plain.sandbox_start.as_mut().unwrap().mode = Some(SandboxMode::Plain);
+        let text = serde_json::to_string(&plain).unwrap();
+        assert!(text.contains(r#""mode":"plain""#), "{text}");
+        let back: StartRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.sandbox_start.unwrap().mode, Some(SandboxMode::Plain));
+    }
+}
+
 // -------------------------------------------------------------- files-only archive
 
 // The outer sandbox is Linux: these tests drive real `git` and `sh` scripts there.
@@ -2460,6 +2900,10 @@ mod files_only {
         _dir: tempfile::TempDir,
     }
     fn archivable() -> Archivable {
+        archivable_with("config")
+    }
+    /// `devcontainer` is what the repository lookup finds: `config` or `none` (plain).
+    fn archivable_with(devcontainer: &str) -> Archivable {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let origin = root.join("origin.git");
@@ -2495,6 +2939,7 @@ mod files_only {
             Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
             Store::open(&root.join("native.db")).unwrap(),
         );
+        *fx.shell.devcontainer.lock().unwrap() = devcontainer.into();
         let local = project.to_str().unwrap().to_string();
         let (session, _) = fx
             .svc
@@ -2797,6 +3242,58 @@ mod files_only {
             .remote_session(a.id)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn a_plain_sandbox_archives_its_files_when_the_host_cannot_be_reached() {
+        let a = archivable_with("none");
+        a.fx.reset();
+        a.fx.shell.fail("bootstrap", "boom");
+        // Nothing is converted before the user confirms.
+        assert!(matches!(
+            a.fx.svc
+                .convert_session_confirmed(a.id, false, &mut |_| {})
+                .unwrap_err(),
+            super::super::ConvertError::NeedsFilesOnlyConfirm { .. }
+        ));
+        let done =
+            a.fx.svc
+                .convert_session_confirmed(a.id, true, &mut |_| {})
+                .unwrap();
+        let code = done.code_dir.unwrap();
+        let patch = std::fs::read_to_string(code.join(super::super::PATCH)).unwrap();
+        assert!(patch.contains("untracked.txt"), "{patch}");
+        assert!(code.join(super::super::BUNDLE).is_file());
+        let calls = a.archive_calls();
+        assert!(calls.len() >= 3, "{calls:?}");
+        assert!(a
+            .fx
+            .shell
+            .calls()
+            .iter()
+            .all(|c| !c.remote.contains("devcontainer exec")));
+    }
+
+    #[test]
+    fn a_plain_sandbox_pulls_evidence_from_its_outer_workspace() {
+        let a = archivable_with("none");
+        let ws = a.fx.shell.local.lock().unwrap().clone().unwrap().1;
+        std::fs::create_dir_all(ws.join(".evidence")).unwrap();
+        std::fs::write(ws.join(".evidence/shot.txt"), "proof\n").unwrap();
+        a.fx.reset();
+        let pulled = a.fx.svc.pull_evidence(a.id, None).unwrap();
+        assert_eq!(pulled.remote_path, format!("{WORKSPACE}/.evidence"));
+        let shot = pulled
+            .files
+            .iter()
+            .find(|f| f.ends_with("shot.txt"))
+            .unwrap_or_else(|| panic!("{pulled:?}"));
+        assert_eq!(std::fs::read_to_string(shot).unwrap(), "proof\n");
+        let calls = a.archive_calls();
+        assert!(!calls.is_empty());
+        assert!(calls
+            .iter()
+            .all(|c| c.remote == format!("cd '{WORKSPACE}' && sh -l -s")));
     }
 }
 

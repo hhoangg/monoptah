@@ -1114,7 +1114,8 @@ impl CloudSessions {
         let backend = self.backend(cloud.kind)?;
         self.prime_backend(&cloud);
         let codespace = cloud.name.clone();
-        let remote = evidence_remote_path(&self.workspace_root, &workspace, remote_path)?;
+        let root = self.workspace_root_of(&cloud);
+        let remote = evidence_remote_path(&root, &workspace, remote_path)?;
         let local_dir = thread.join(EVIDENCE_DIR);
         let mut pull = EvidencePull {
             session_id,
@@ -1219,17 +1220,42 @@ impl CloudSessions {
     }
 }
 
-/// The command of an interactive shell in a sandbox's container: `ssh -t <destination>
-/// <remote>`. See [`CloudSessions::sandbox_terminal`].
+/// The command of an interactive shell in a sandbox's container (or, without a devcontainer,
+/// in its workspace): `ssh -t <destination> <remote>`. See [`CloudSessions::sandbox_terminal`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxTerminal {
     /// `<id>@sbx_cloud`.
     pub destination: String,
-    /// The single remote word: `devcontainer exec ... -- bash -l`.
+    /// The single remote word: `devcontainer exec ... -- bash -l`, or `cd <workspace> && bash
+    /// -l` for a sandbox without a devcontainer.
     pub remote: String,
 }
 
 impl CloudSessions {
+    /// The folder that holds the workspaces of `cloud`: `/workspaces`, or for a sandbox
+    /// without a devcontainer the parent of its checkout in the outer sandbox. Reads the
+    /// machine list only.
+    pub(crate) fn workspace_root_of(&self, cloud: &CloudRef) -> String {
+        if cloud.kind == CloudBackendKind::DockerSandbox {
+            let plain = self
+                .host
+                .machines()
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| m.sandbox)
+                .find(|s| s.name == cloud.name && s.mode == crate::remote::SandboxMode::Plain);
+            if let Some(target) = plain {
+                if let Some((parent, _)) = target.workspace.trim_end_matches('/').rsplit_once('/') {
+                    if !parent.is_empty() {
+                        return parent.to_string();
+                    }
+                }
+            }
+        }
+        self.workspace_root.clone()
+    }
+
     /// How to open a terminal in the container of sandbox session `session_id`. Reads the
     /// store and the machine list only; the ssh that the caller then runs resumes a stopped
     /// sandbox, so call it for a user action (the session menu) and never from the background.

@@ -13,7 +13,7 @@
 use super::{CloudBackend, CloudBackendKind};
 use crate::cloud_sessions::CloudState;
 use crate::codespaces;
-use crate::remote::SandboxTarget;
+use crate::remote::{SandboxMode, SandboxTarget};
 use crate::sandboxes::{self, SbxRunner};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -115,7 +115,8 @@ impl DockerBackend {
             })?;
         Ok((shell, target))
     }
-    /// Runs `stdin` as `sh -l -s` inside the container, lines to `on_line`.
+    /// Runs `stdin` as `sh -l -s` inside the container (or in the workspace of a plain
+    /// sandbox, which has no container), lines to `on_line`.
     fn exec(
         &self,
         name: &str,
@@ -173,6 +174,14 @@ impl DockerBackend {
         shell
             .run(&id, &remote, stdin, on_line, abort, timeout)
             .map_err(|e| sandboxes::redact(&e))
+    }
+    /// Whether the remembered target of `name` runs without a devcontainer.
+    fn is_plain(&self, name: &str) -> bool {
+        self.targets
+            .lock()
+            .ok()
+            .and_then(|targets| targets.get(name).map(|t| t.mode == SandboxMode::Plain))
+            .unwrap_or(false)
     }
     /// Remembers the id of the sandbox called `name`, so later calls skip the list lookup.
     pub fn remember(&self, name: &str, id: &str) {
@@ -260,7 +269,8 @@ impl CloudBackend for DockerBackend {
     fn web_url(&self, _name: &str) -> Option<Result<String, String>> {
         None
     }
-    /// ssh into the sandbox and `devcontainer exec` into the container, the script on stdin.
+    /// ssh into the sandbox and `devcontainer exec` into the container (a plain sandbox: run in
+    /// its workspace), the script on stdin.
     /// Resumes a stopped sandbox: user-initiated work only.
     fn run_script(&self, name: &str, script: &str, long: bool) -> Result<String, String> {
         let timeout = if long { SCRIPT_LONG } else { SCRIPT_SHORT };
@@ -288,7 +298,12 @@ impl CloudBackend for DockerBackend {
     }
     /// The same evidence folder and agent guidance as a codespace, set up in the container.
     fn prepare_evidence(&self, name: &str, workspace: &str) -> Result<(), String> {
-        let script = codespaces::evidence_script_for(workspace)?;
+        // A plain sandbox has no `/workspaces/<repo>`: the Host works in the outer workspace.
+        let script = if self.is_plain(name) {
+            codespaces::evidence_script_at(workspace)?
+        } else {
+            codespaces::evidence_script_for(workspace)?
+        };
         let out = self.exec(name, &script, &mut |_| {}, &|| false, SCRIPT_SHORT)?;
         if out.success {
             Ok(())

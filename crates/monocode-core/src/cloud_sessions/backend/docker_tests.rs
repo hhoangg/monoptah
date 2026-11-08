@@ -239,6 +239,7 @@ fn target() -> SandboxTarget {
         workspace: "/home/agent/workspaces/ws".into(),
         relay_port: 47200,
         config: None,
+        mode: Default::default(),
     }
 }
 fn backend(shell: &Arc<Container>) -> DockerBackend {

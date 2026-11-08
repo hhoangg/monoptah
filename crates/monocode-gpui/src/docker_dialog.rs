@@ -538,7 +538,7 @@ impl Render for DockerDialog {
             )
             .child(self.credential_section(cx))
             .child(
-                labelled("Devcontainer configuration")
+                labelled("Devcontainer configuration (optional)")
                     .child(field_box("docker-field-devcontainer", &self.devcontainer))
                     .child(muted(model::DEVCONTAINER_HINT))
                     .children(self.error_for(Field::Devcontainer)),

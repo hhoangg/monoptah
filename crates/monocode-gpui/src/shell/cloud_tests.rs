@@ -2053,6 +2053,7 @@ fn sandbox_machine() -> Machine {
             workspace: "/home/agent/widgets".into(),
             relay_port: 47200,
             config: None,
+            mode: Default::default(),
         }),
     }
 }

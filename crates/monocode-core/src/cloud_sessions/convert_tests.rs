@@ -1638,6 +1638,7 @@ fn a_sandbox_session_converts_through_the_container_exec_and_a_tar_stream() {
         workspace: "/home/agent/workspaces/ws".into(),
         relay_port: 47200,
         config: None,
+        mode: Default::default(),
     };
     // The same session, now bound to a sandbox.
     {

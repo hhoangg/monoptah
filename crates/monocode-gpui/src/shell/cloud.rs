@@ -626,7 +626,8 @@ pub(super) fn banner_text(cloud: &CloudRef) -> String {
 }
 
 /// `ssh -t <id>@sbx_cloud <devcontainer exec ... bash -l>`: an interactive shell in a
-/// sandbox's container. The remote command is one word, as the start flow sends it.
+/// sandbox's container (a sandbox without a devcontainer: `cd <workspace> && bash -l`). The
+/// remote command is one word, as the start flow sends it.
 pub(super) fn sandbox_ssh_args(terminal: &SandboxTerminal) -> Vec<OsString> {
     [
         "-t",

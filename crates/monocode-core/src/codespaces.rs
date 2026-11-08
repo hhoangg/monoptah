@@ -997,6 +997,16 @@ pub(crate) fn evidence_script_for(workspace: &str) -> Result<String, String> {
     Ok(evidence_script(&format!("/workspaces/{repo}")))
 }
 
+/// The evidence setup script for the absolute `workspace` of a session that does not live under
+/// `/workspaces` (a sandbox without a devcontainer).
+pub(crate) fn evidence_script_at(workspace: &str) -> Result<String, String> {
+    valid_remote_path(workspace)?;
+    if !workspace.starts_with('/') || workspace.len() < 2 {
+        return Err(format!("Invalid workspace `{workspace}`"));
+    }
+    Ok(evidence_script(workspace.trim_end_matches('/')))
+}
+
 /// Best-effort setup of the evidence folder and agent guidance in a running codespace.
 /// `workspace` is the repo checkout, `/workspaces/<repo>`. Bounded by `SSH_TIMEOUT` (30s).
 pub fn prepare_evidence(runner: &dyn GhRunner, name: &str, workspace: &str) -> Result<(), String> {

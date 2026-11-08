@@ -29,7 +29,26 @@ pub struct SshTarget {
     pub sandbox: Option<SandboxTarget>,
 }
 
-/// A Docker Sandbox that runs a devcontainer with the Host inside it.
+/// Where a sandbox session's Host and agent run.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SandboxMode {
+    /// In the repository's devcontainer. The default, so a record or target written before
+    /// this field existed keeps its meaning.
+    #[default]
+    Container,
+    /// Directly in the outer sandbox: the repository has no devcontainer config.
+    Plain,
+}
+
+impl SandboxMode {
+    pub fn is_container(&self) -> bool {
+        *self == Self::Container
+    }
+}
+
+/// A Docker Sandbox that runs the Host inside the repository's devcontainer, or (when the
+/// repository has none, see [`SandboxMode::Plain`]) directly in the outer sandbox.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxTarget {
@@ -39,13 +58,17 @@ pub struct SandboxTarget {
     pub name: String,
     /// Workspace folder in the OUTER sandbox, the devcontainer's workspace.
     pub workspace: String,
-    /// Loopback port in the outer sandbox where a relay bridges into the
-    /// container's Host. The tunnel forwards to this port.
+    /// Loopback port in the outer sandbox where a relay bridges into the container's Host;
+    /// the tunnel forwards to it. Unused in [`SandboxMode::Plain`]: there is no relay and the
+    /// tunnel goes to the Host's own port.
     pub relay_port: u16,
     /// Dev container config, relative to `workspace`, when it is not the default one
     /// (`devcontainer exec` finds its container by workspace and config file).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
+    /// Container or plain outer sandbox. Absent in older records: Container.
+    #[serde(default, skip_serializing_if = "SandboxMode::is_container")]
+    pub mode: SandboxMode,
 }
 
 /// Host alias written by `sbx setup ssh` into the user's ssh config.
@@ -59,9 +82,14 @@ impl SandboxTarget {
         format!("{}@{SANDBOX_SSH_HOST}", self.id)
     }
 
-    /// The single remote word that runs `remote` inside the devcontainer. The
+    /// The single remote word that runs `remote` where the Host lives: inside the
+    /// devcontainer, or, in [`SandboxMode::Plain`], in the workspace of the outer sandbox. The
     /// script itself travels on stdin, never in argv.
     pub(crate) fn exec_in_container(&self, remote: &[&str]) -> String {
+        if self.mode == SandboxMode::Plain {
+            let words: Vec<String> = remote.iter().map(|word| quote_word(word)).collect();
+            return format!("cd {} && {}", shell_quote(&self.workspace), words.join(" "));
+        }
         let mut words = vec![
             SANDBOX_DEVCONTAINER.to_string(),
             "exec".into(),
@@ -617,7 +645,7 @@ fn run_remote_command(
         }
         Transport::Sandbox(sandbox) => {
             // Everything run for a sandbox machine belongs to the Host, which
-            // lives in the devcontainer, not in the outer sandbox.
+            // lives in the devcontainer (or, for a plain sandbox, the outer sandbox).
             command.args(["--", &sandbox.destination()]);
             command.arg(sandbox.exec_in_container(remote));
         }
@@ -790,9 +818,13 @@ impl Tunnel {
             askpass.configure(&mut command)?;
         }
         // A sandbox Host listens inside the container, so the tunnel ends at
-        // the relay in the outer sandbox (the only place `-L` may point to).
+        // the relay in the outer sandbox (the only place `-L` may point to). A plain
+        // sandbox runs the Host in the outer sandbox itself: no relay.
         let remote_port = match target.transport() {
-            Transport::Sandbox(sandbox) => sandbox.relay_port,
+            Transport::Sandbox(sandbox) if sandbox.mode == SandboxMode::Container => {
+                sandbox.relay_port
+            }
+            Transport::Sandbox(_) => target.remote_port,
             Transport::Ssh | Transport::Codespace(_) => target.remote_port,
         };
         command.args([
@@ -1706,6 +1738,7 @@ mod tests {
                 workspace: "/home/agent/ws".into(),
                 relay_port: 47200,
                 config: None,
+                mode: SandboxMode::Container,
             }),
         }
     }
@@ -1856,6 +1889,62 @@ mod tests {
             "{args}"
         );
         assert!(!args.contains("3774"), "{args}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn plain_sandbox_tunnel_goes_straight_to_the_host_port() {
+        let fixture = tempfile::tempdir().unwrap();
+        let log = fixture.path().join("argv");
+        let script = fixture.path().join("fake-ssh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {:?}\nexit 1\n",
+                log.display().to_string()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut target = sandbox_target();
+        target.remote_port = 4111;
+        target.sandbox.as_mut().unwrap().mode = SandboxMode::Plain;
+        let command = command_with_program(&target, false, script.as_os_str());
+        assert!(Tunnel::start_with_command(&target, None, None, command).is_err());
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            args.contains(":127.0.0.1:4111 -- sbx_001abc@sbx_cloud"),
+            "{args}"
+        );
+        assert!(!args.contains("47200"), "{args}");
+    }
+    #[test]
+    fn plain_sandbox_scripts_run_in_the_outer_workspace_without_devcontainer() {
+        let mut target = sandbox_target().sandbox.unwrap();
+        target.mode = SandboxMode::Plain;
+        assert_eq!(
+            target.exec_in_container(&["sh", "-l", "-s"]),
+            "cd '/home/agent/ws' && sh -l -s"
+        );
+        assert_eq!(
+            target.exec_in_container(&["bash", "-l"]),
+            "cd '/home/agent/ws' && bash -l"
+        );
+    }
+    #[test]
+    fn sandbox_mode_defaults_to_container_and_is_only_written_when_plain() {
+        let old: SandboxTarget =
+            serde_json::from_str(r#"{"id":"sbx_1","name":"b","workspace":"/w","relayPort":47200}"#)
+                .unwrap();
+        assert_eq!(old.mode, SandboxMode::Container);
+        assert!(!serde_json::to_string(&old).unwrap().contains("mode"));
+        let mut plain = old.clone();
+        plain.mode = SandboxMode::Plain;
+        let text = serde_json::to_string(&plain).unwrap();
+        assert!(text.contains(r#""mode":"plain""#), "{text}");
+        assert_eq!(serde_json::from_str::<SandboxTarget>(&text).unwrap(), plain);
     }
     #[test]
     fn sandbox_fields_are_validated_before_they_reach_argv() {

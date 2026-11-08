@@ -25,6 +25,27 @@
 //! | OpenProject | [`super::open_project`] with the container's `remoteWorkspaceFolder` |
 //! | LifecycleCommands | `devcontainer run-user-commands` detached; never blocks `Ready` |
 //!
+//! # Container and Plain mode
+//!
+//! After Provision the start decides ([`CloudSessions::sandbox_mode_step`]) with one
+//! `test -f` in the outer sandbox whether the repository has a devcontainer config: the
+//! configured path, or for the default path also `.devcontainer.json` at the root. The result
+//! ([`SandboxMode`]) is kept on [`SandboxStart`] and on the [`SandboxTarget`], so every later
+//! path (reconnect, exec, terminal, archive) follows it.
+//!
+//! * `Container`: the flow above. A configured non-default path that does not exist fails
+//!   the start with a clear error instead of falling back.
+//! * `Plain` (no config at the default path): Build container and the lifecycle steps are
+//!   Skipped ("No devcontainer"). Configure environment points the OUTER sandbox's git at the
+//!   credential cache socket (no bind mount). Connect runs the same Host bootstrap with
+//!   `sh -l -s` directly in the workspace of the outer sandbox, with no relay: the tunnel
+//!   forwards to the Host's own port. The project opens at the outer workspace path. There
+//!   is nothing to rebuild.
+//!
+//! A record that failed at Build container because the config was missing has no mode yet, so
+//! Retry decides again and switches to Plain. A record that already has a container stays
+//! Container.
+//!
 //! # Where things live
 //!
 //! * Workspace in the OUTER sandbox: `$HOME/workspaces/<repo>`, the path the provision script
@@ -76,7 +97,7 @@ use super::startup::{
 use super::{require_claude, CloudBinding, CloudSessions, OpenRequest, START_ABORTED};
 use crate::git_credentials::{self, GitCredentials};
 use crate::remote::{
-    sandbox_bootstrap_script, shell_quote, validate_sandbox_workspace, SandboxTarget,
+    sandbox_bootstrap_script, shell_quote, validate_sandbox_workspace, SandboxMode, SandboxTarget,
 };
 use crate::sandboxes::{self, Compute, SbxRunner};
 use crate::store::{pending_cloud_project, Session, Store};
@@ -107,6 +128,9 @@ pub(super) const PROVISION_SCRIPT: &str = include_str!("backend/docker_provision
 pub(super) const UP_SCRIPT: &str = include_str!("backend/docker_up.sh");
 pub(super) const RELAY_SCRIPT: &str = include_str!("backend/docker_relay.sh");
 pub(super) const GIT_CONFIG_SCRIPT: &str = include_str!("backend/docker_git_config.sh");
+pub(super) const DETECT_SCRIPT: &str = include_str!("backend/docker_detect.sh");
+/// What the sandbox shows on the steps a session without a devcontainer does not run.
+const NO_DEVCONTAINER: &str = "No devcontainer";
 
 const SHORT: Duration = Duration::from_secs(120);
 const LONG: Duration = Duration::from_secs(30 * 60);
@@ -142,6 +166,11 @@ pub struct SandboxStart {
     /// Absolute checkout path in the OUTER sandbox, known once provisioned.
     pub workspace: Option<String>,
     pub container: Option<ContainerInfo>,
+    /// Container or plain, decided once after the clone (see the module docs). `None` until
+    /// then, and in records of a start that failed before it was decided (or at Build
+    /// container because the config was missing): the next run decides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SandboxMode>,
     pub relay_port: u16,
     /// The next `devcontainer up` removes the existing container (rebuild).
     #[serde(default)]
@@ -533,6 +562,7 @@ impl CloudSessions {
             repo_dir: repo_dir.clone(),
             workspace: None,
             container: None,
+            mode: None,
             relay_port: DEFAULT_RELAY_PORT,
             rebuild: false,
         };
@@ -725,6 +755,7 @@ impl CloudSessions {
 
         self.sandbox_create_step(&mut run, &name)?;
         self.sandbox_provision_step(&mut run, payload.as_deref().map(String::as_str))?;
+        self.sandbox_mode_step(&mut run)?;
         self.sandbox_build_step(&mut run)?;
         self.sandbox_configure_step(&mut run)?;
         let target = self.sandbox_connect_step(&mut run, &name, auth.as_ref())?;
@@ -1004,6 +1035,112 @@ impl CloudSessions {
         Ok(())
     }
 
+    // ---- Mode
+
+    /// The mode of the run so far: Container unless the start was decided Plain.
+    fn run_mode(run: &Run) -> SandboxMode {
+        run.record
+            .sandbox_start
+            .as_ref()
+            .and_then(|s| s.mode)
+            .unwrap_or_default()
+    }
+
+    /// Decides, once the checkout exists, whether the session runs in the repository's
+    /// devcontainer or directly in the outer sandbox, and persists it. A start that already
+    /// has a container (older records) is Container without looking. One cheap `test -f`
+    /// script in the outer sandbox. A configured non-default devcontainer path that does not
+    /// exist is an error; only the default lookup falls back to Plain.
+    fn sandbox_mode_step(&self, run: &mut Run) -> Result<(), Stop> {
+        let start = run
+            .record
+            .sandbox_start
+            .clone()
+            .ok_or("Missing sandbox data.")?;
+        if start.mode.is_some() {
+            return Ok(());
+        }
+        let mode = if start.container.is_some() {
+            SandboxMode::Container
+        } else {
+            let id = Self::sandbox_id(run)?;
+            let workspace = start
+                .workspace
+                .as_deref()
+                .ok_or("The workspace is not known yet.")?;
+            let config = config_arg(&start.config);
+            let script = with_vars(
+                &[
+                    ("WS", workspace),
+                    ("CONFIG", config.as_deref().unwrap_or("")),
+                ],
+                DETECT_SCRIPT,
+            );
+            let out = self.sandbox_exec(
+                run,
+                &id,
+                SH_S,
+                &script,
+                SHORT,
+                "Looking for the devcontainer configuration",
+            )?;
+            let found = out
+                .stdout
+                .lines()
+                .rev()
+                .find_map(|l| marker(l, "MONOPTAH_DEVCONTAINER"))
+                .map(str::trim);
+            match found {
+                Some("config") => SandboxMode::Container,
+                Some("none") => SandboxMode::Plain,
+                Some("missing") => {
+                    // Shown on the step that needed it.
+                    run.record.start_step(StepKind::BuildContainer, self.now());
+                    self.publish(run.record, run.events);
+                    return Err(Stop::Failed(format!(
+                        "Dev container config ({}) not found in the repository. Fix the path in the sandbox setup, or clear it to run without a devcontainer.",
+                        config.unwrap_or_default()
+                    )));
+                }
+                _ => {
+                    return Err(Stop::Failed(
+                        "Could not tell whether the repository has a devcontainer.".into(),
+                    ))
+                }
+            }
+        };
+        if let Some(start) = run.record.sandbox_start.as_mut() {
+            start.mode = Some(mode);
+        }
+        if mode == SandboxMode::Plain {
+            self.progress_line(
+                run,
+                "The repository has no devcontainer; the session runs directly in the sandbox",
+            );
+            if let Some(workspace) = run
+                .record
+                .sandbox_start
+                .as_ref()
+                .and_then(|s| s.workspace.clone())
+            {
+                run.record.remote_cwd = workspace;
+            }
+        }
+        self.publish(run.record, run.events);
+        Ok(())
+    }
+
+    /// Marks `kinds` as not run because the session has no devcontainer.
+    fn skip_without_devcontainer(run: &mut Run, kinds: &[StepKind]) {
+        for kind in kinds {
+            let step = run.record.step_mut(*kind);
+            step.status = StepStatus::Skipped;
+            step.started_at = None;
+            step.finished_at = None;
+            step.detail = Some(NO_DEVCONTAINER.into());
+        }
+    }
+
     // ---- Build container
 
     fn up_vars(run: &Run, mode: &str) -> Result<String, Stop> {
@@ -1037,6 +1174,14 @@ impl CloudSessions {
     }
 
     fn sandbox_build_step(&self, run: &mut Run) -> Result<(), Stop> {
+        if Self::run_mode(run) == SandboxMode::Plain {
+            Self::skip_without_devcontainer(
+                run,
+                &[StepKind::BuildContainer, StepKind::BlockingCommands],
+            );
+            self.publish(run.record, run.events);
+            return Ok(());
+        }
         let id = Self::sandbox_id(run)?;
         let rebuild = run.record.sandbox_start.as_ref().is_some_and(|s| s.rebuild);
         let name = run.record.sandbox.clone().unwrap_or_default();
@@ -1195,16 +1340,19 @@ impl CloudSessions {
 
     // ---- Configure environment
 
-    fn container_target(&self, run: &Run) -> Result<(SandboxTarget, ContainerInfo), Stop> {
+    /// The target of the run, with the container in Container mode (required there) and
+    /// without one in Plain mode.
+    fn container_target(&self, run: &Run) -> Result<(SandboxTarget, Option<ContainerInfo>), Stop> {
         let start = run
             .record
             .sandbox_start
             .as_ref()
             .ok_or("Missing sandbox data.")?;
-        let container = start
-            .container
-            .clone()
-            .ok_or("The container is not known yet.")?;
+        let mode = start.mode.unwrap_or_default();
+        let container = start.container.clone();
+        if mode == SandboxMode::Container && container.is_none() {
+            return Err("The container is not known yet.".into());
+        }
         let target = SandboxTarget {
             id: Self::sandbox_id(run)?,
             name: run.record.sandbox.clone().unwrap_or_default(),
@@ -1214,9 +1362,18 @@ impl CloudSessions {
                 .ok_or("The workspace is not known yet.")?,
             relay_port: start.relay_port,
             config: config_arg(&start.config),
+            mode,
         };
         crate::remote::validate_sandbox_target(&target)?;
         Ok((target, container))
+    }
+
+    /// The project folder the Host opens: the container's, or the outer workspace.
+    fn project_folder(target: &SandboxTarget, container: Option<&ContainerInfo>) -> String {
+        container.map_or_else(
+            || target.workspace.clone(),
+            |container| container.remote_workspace.clone(),
+        )
     }
 
     fn sandbox_configure_step(&self, run: &mut Run) -> Result<(), Stop> {
@@ -1230,7 +1387,12 @@ impl CloudSessions {
             .clone()
             .ok_or("Missing sandbox data.")?;
         let clone_url = git_credentials::clone_url(&start.config.repo_url)?;
-        let socket = format!("{CONTAINER_GIT_DIR}/sock");
+        // Without a container the script runs in the outer sandbox and finds the cache
+        // socket itself (empty SOCKET).
+        let socket = match target.mode {
+            SandboxMode::Container => format!("{CONTAINER_GIT_DIR}/sock"),
+            SandboxMode::Plain => String::new(),
+        };
         let script = with_vars(
             &[
                 (
@@ -1305,7 +1467,11 @@ impl CloudSessions {
             return Err(Stop::Aborted);
         }
 
-        // 2. The relay in the outer sandbox.
+        // 2. The relay in the outer sandbox. A plain session has none: the tunnel goes
+        // straight to the Host, which runs in the outer sandbox.
+        let Some(container) = container else {
+            return Ok(target);
+        };
         self.progress_line(run, "Starting the relay");
         let port = target.relay_port.to_string();
         let host_port = host_port.to_string();
@@ -1334,6 +1500,7 @@ impl CloudSessions {
         target: &SandboxTarget,
     ) -> Result<(CloudBinding, crate::store::RemoteProject), Stop> {
         let (_, container) = self.container_target(run)?;
+        let remote_cwd = Self::project_folder(target, container.as_ref());
         let cloud = CloudRef::sandbox(name);
         // The evidence setup and the later archive copy exec into this container.
         run.deps.backend.remember_target(target);
@@ -1344,7 +1511,7 @@ impl CloudSessions {
             sandbox: Some(target),
             display: &run.record.display.clone(),
             repo: &run.record.repo.clone(),
-            remote_cwd: &container.remote_workspace,
+            remote_cwd: &remote_cwd,
         };
         let cell = std::cell::RefCell::new((&mut *run.record, &mut *run.events));
         let halt = AtomicBool::new(false);
@@ -1382,7 +1549,7 @@ impl CloudSessions {
         let opened = result.map_err(|e| Stop::from(run.scrub.apply(&e)))?;
         // Remembered so a later reconnect can tell a recreated container (a new Host) from
         // the same one before it touches the paired machine.
-        if let Ok(store) = self.store() {
+        if let (Ok(store), Some(container)) = (self.store(), &container) {
             let _ = store.save_setting(&container_key(name), &container.id);
         }
         Ok(opened)
@@ -1393,6 +1560,11 @@ impl CloudSessions {
     /// Starts `devcontainer run-user-commands` detached. Best effort: a failure is only
     /// logged and never blocks `Ready`.
     fn sandbox_lifecycle_step(&self, run: &mut Run) {
+        if Self::run_mode(run) == SandboxMode::Plain {
+            Self::skip_without_devcontainer(run, &[StepKind::LifecycleCommands]);
+            self.publish(run.record, run.events);
+            return;
+        }
         let Ok(id) = Self::sandbox_id(run) else {
             return;
         };
@@ -1440,6 +1612,13 @@ impl CloudSessions {
             .is_some_and(|s| s.workspace.is_some());
         if !provisioned {
             return Err("This sandbox is not provisioned yet. Retry the start instead.".into());
+        }
+        if record
+            .sandbox_start
+            .as_ref()
+            .is_some_and(|s| s.mode == Some(SandboxMode::Plain))
+        {
+            return Err("This sandbox has no devcontainer to rebuild.".into());
         }
         for step in &mut record.steps {
             if !matches!(step.kind, StepKind::Create | StepKind::Provision) {

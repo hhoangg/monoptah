@@ -10,7 +10,7 @@ pub(crate) use ssh::{
     validate_sandbox_workspace,
 };
 use ssh::{Job, Tunnel, Tunnels};
-pub use ssh::{JobView, Prompt, SandboxTarget, SshTarget};
+pub use ssh::{JobView, Prompt, SandboxMode, SandboxTarget, SshTarget};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1788,6 +1788,7 @@ else:
             workspace: workspace.into(),
             relay_port,
             config: None,
+            mode: Default::default(),
         };
         for bad in [
             target("-oProxyCommand=x", "/w", 1),

@@ -12,8 +12,7 @@ use std::path::Path;
 
 pub(super) const SAVE_NOTE: &str =
     "Saving configures this project only. A sandbox is created when you click Create and open.";
-pub(super) const DEVCONTAINER_HINT: &str =
-    "Relative to repository root. Source comes from Git, not your local changes.";
+pub(super) const DEVCONTAINER_HINT: &str = "Relative to repository root. If the repository has none, the session runs directly in the sandbox.";
 pub(super) const ACCOUNT_NOTE: &str = "Fixed per sandbox: a sandbox keeps the account it was created with. Accounts use a setup-token or an API key.";
 pub(super) const NO_ACCOUNT_LINE: &str =
     "No Claude account with a setup-token or API key. Add one in Settings, Providers.";

@@ -9,11 +9,15 @@
 //! It never creates a sandbox. It inspects the state first (read-only), then re-runs the
 //! idempotent parts of the start flow that a stop or resume can lose, in this order:
 //!
-//! 1. `devcontainer up` (mode `start`): the container may be stopped or recreated.
+//! 1. `devcontainer up` (mode `start`): the container may be stopped or recreated. A plain
+//!    sandbox (no devcontainer, [`SandboxMode::Plain`]) has no container: steps 1 and 3 to
+//!    the relay are skipped, the Host runs in the outer sandbox and the tunnel goes straight
+//!    to it.
 //! 2. The Git credential back into the in-memory cache (it expires and dies with a daemon
 //!    restart), when the project config names one.
 //! 3. The container's git config for the exact repo URL.
-//! 4. The Host bootstrap WITH the Claude prelude (stdin only), then the relay.
+//! 4. The Host bootstrap WITH the Claude prelude (stdin only), then the relay (Container
+//!    mode only).
 //! 5. [`open_project`](super::super::open_project): drops the stale machine, pairs afresh
 //!    (a new tunnel), opens the project again.
 //!
@@ -249,6 +253,7 @@ impl CloudSessions {
             repo_dir,
             workspace: Some(target.workspace.clone()),
             container: None,
+            mode: Some(target.mode),
             relay_port: target.relay_port,
             rebuild: false,
         };
@@ -279,18 +284,23 @@ impl CloudSessions {
         };
         let recreated = std::cell::Cell::new(false);
         let outcome = (|| -> Result<(), Stop> {
-            self.progress_line(&mut run, "Starting the container");
+            // A plain sandbox has no container: nothing to start or compare.
+            if target.mode == SandboxMode::Container {
+                self.progress_line(&mut run, "Starting the container");
+            }
             self.sandbox_build_step(&mut run)?;
             // A recreated container has a new Host that does not know this session. Say so
             // now, before the paired machine or the project row is touched.
             let (_, container) = self.container_target(&run)?;
-            let remembered = self
-                .store()
-                .ok()
-                .and_then(|store| store.setting(&container_key(&name)).ok().flatten());
-            if remembered.is_some_and(|old| old != container.id) {
-                recreated.set(true);
-                return Err(Stop::Failed(RECREATED.into()));
+            if let Some(container) = &container {
+                let remembered = self
+                    .store()
+                    .ok()
+                    .and_then(|store| store.setting(&container_key(&name)).ok().flatten());
+                if remembered.is_some_and(|old| old != container.id) {
+                    recreated.set(true);
+                    return Err(Stop::Failed(RECREATED.into()));
+                }
             }
             if have_config && config.credential_id.is_some() {
                 self.progress_line(&mut run, "Delivering the Git credential");
@@ -305,6 +315,7 @@ impl CloudSessions {
             }
             self.sandbox_connect_step(&mut run, &name, auth.as_ref())?;
             let (_, container) = self.container_target(&run)?;
+            let remote_cwd = Self::project_folder(&target, container.as_ref());
             self.progress_line(&mut run, "Reconnecting to the sandbox");
             let display = machine.name.clone();
             let request = OpenRequest {
@@ -313,7 +324,7 @@ impl CloudSessions {
                 sandbox: Some(&target),
                 display: &display,
                 repo: &repo,
-                remote_cwd: &container.remote_workspace,
+                remote_cwd: &remote_cwd,
             };
             deps.backend.remember_target(&target);
             let backend = self.backend(CloudBackendKind::DockerSandbox)?;
