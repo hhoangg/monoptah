@@ -31,6 +31,7 @@ pub mod provider_cleanup;
 pub mod remote;
 pub mod resources;
 pub mod response;
+pub mod sandboxes;
 pub mod scm;
 pub mod session_filters;
 pub mod session_groups;
