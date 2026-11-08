@@ -229,6 +229,7 @@ pub(crate) mod fixtures {
             started_at: 1_000,
             finished_at: None,
             track_ready: true,
+            sandbox_start: None,
         }
     }
 

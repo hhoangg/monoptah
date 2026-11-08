@@ -312,7 +312,9 @@ impl Profile {
             Err(_) => Err(CLEAR_FAILED.into()),
         }
     }
-    pub(super) fn claude_secret(&self) -> Result<Option<(ClaudeCredential, String)>, String> {
+    /// The Claude credential saved for this account, `None` when there is none. Holds the
+    /// secret: callers deliver it over stdin only and never log it.
+    pub(crate) fn claude_secret(&self) -> Result<Option<(ClaudeCredential, String)>, String> {
         let Some((name, nonce, ciphertext)) = self.stored()? else {
             return Ok(None);
         };

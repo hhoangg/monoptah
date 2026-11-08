@@ -59,11 +59,17 @@
 //!   [`queued_start_message`]. [`SessionTarget::startup`] carries the phase to the app API.
 //!   `prepare_target` keeps its blocking behaviour (used by `sessions.start`).
 //!
+//! * Docker sandbox starts ([`docker_start`]): after [`CloudSessions::with_sandboxes`],
+//!   [`CloudSessions::begin_sandbox_start`] `(local_cwd, &DockerProjectConfig, branch,
+//!   harness)` creates the pending session and the sandbox (the start record is persisted
+//!   before `sbx create`), and the same `run_start` / `rebuild_start` drive it through the
+//!   same steps and events.
+//!
 //! Errors are user-facing `String`s. `CODESPACE_NOT_CONNECTED` from
 //! `Connections::request` means "stopped / not connected": render it as a state
 //! (see [`is_not_connected`]).
 use crate::codespaces::{self, GhRunner};
-use crate::remote::{self, Connections, Machine};
+use crate::remote::{self, Connections, Machine, SandboxTarget};
 use crate::store::{RemoteSession, Store};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -131,7 +137,10 @@ pub enum Availability {
 /// What [`open_project`] needs to know about the codespace.
 struct OpenRequest<'a> {
     local_cwd: &'a str,
-    codespace: &'a str,
+    /// The workspace to open the project in; a codespace or a sandbox by name.
+    cloud: &'a CloudRef,
+    /// The transport of a sandbox; `None` for a codespace.
+    sandbox: Option<&'a SandboxTarget>,
     display: &'a str,
     repo: &'a str,
     remote_cwd: &'a str,
@@ -156,14 +165,26 @@ fn open_project(
     let machine = match host
         .machines()?
         .into_iter()
-        .find(|m| m.codespace.as_deref() == Some(request.codespace))
-    {
+        .find(|m| match request.sandbox {
+            Some(sandbox) => m.sandbox.as_ref().is_some_and(|s| s.name == sandbox.name),
+            None => m.codespace.as_deref() == Some(request.cloud.name.as_str()),
+        }) {
+        // A sandbox start has just restored the relay and the Host, so it pairs afresh
+        // (waking is a codespace thing: `ensure` refuses sandboxes on purpose).
+        Some(machine) if request.sandbox.is_some() => {
+            progress("Reconnecting to the sandbox");
+            host.disconnect(&machine.id)?;
+            host.connect_sandbox(request.sandbox.cloned().unwrap(), request.display, progress)?
+        }
         Some(machine) => {
-            progress("Connecting to the codespace");
+            progress(&format!("Connecting to the {}", request.cloud.noun()));
             host.ensure(&machine.id, halt, progress)?;
             machine
         }
-        None => host.connect(request.codespace, request.display, progress)?,
+        None => match request.sandbox {
+            Some(sandbox) => host.connect_sandbox(sandbox.clone(), request.display, progress)?,
+            None => host.connect(&request.cloud.name, request.display, progress)?,
+        },
     };
     step(StepKind::Connect, StepStatus::Done);
     if aborted() {
@@ -181,7 +202,7 @@ fn open_project(
     }
     // Best effort: a failure here must not block the session, the agent just has no hint.
     progress("Preparing the evidence folder");
-    if let Err(error) = backend.prepare_evidence(request.codespace, request.remote_cwd) {
+    if let Err(error) = backend.prepare_evidence(&request.cloud.name, request.remote_cwd) {
         progress(&format!("Could not prepare the evidence folder: {error}"));
     }
     if aborted() {
@@ -190,16 +211,16 @@ fn open_project(
     let remembered = store
         .lock()
         .map_err(|_| "Native session store unavailable".to_string())?
-        .remember_cloud_project(
+        .remember_cloud_ref_project(
             &machine.environment_id,
             &project,
             request.local_cwd,
-            request.codespace,
+            request.cloud,
         )?;
     Ok((
         CloudBinding {
             local_project: request.local_cwd.into(),
-            codespace: request.codespace.into(),
+            codespace: request.cloud.name.clone(),
             repo: request.repo.into(),
             machine_id: machine.id,
             environment_id: remembered.environment_id.clone(),
@@ -305,6 +326,17 @@ pub trait Host: Send + Sync {
     /// connected). `progress` fires only when a wake actually starts; `cancel`
     /// aborts the wait with `remote::WAKE_CANCELLED`. Concurrent calls for one
     /// machine share a single reconnect.
+    /// Pair with the Host in a Docker Sandbox's devcontainer; blocks until done. The relay
+    /// on `sandbox.relay_port` must already run. A host without sandbox support refuses.
+    fn connect_sandbox(
+        &self,
+        sandbox: SandboxTarget,
+        display: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
+        let _ = (sandbox, display, progress);
+        Err("This host cannot connect to a Docker sandbox.".into())
+    }
     fn ensure(
         &self,
         machine_id: &str,
@@ -326,26 +358,16 @@ impl Host for Arc<Connections> {
         progress: &mut dyn FnMut(&str),
     ) -> Result<Machine, String> {
         let job = self.codespace_begin(codespace, Some(display))?;
-        let mut last = String::new();
-        loop {
-            let view = self.ssh_poll(&job)?;
-            if view.message != last {
-                progress(&view.message);
-                last = view.message.clone();
-            }
-            if view.prompt.is_some() {
-                let _ = self.ssh_cancel(&job);
-                return Err("The codespace connection asked an unexpected question".into());
-            }
-            if view.done {
-                return match (view.error, view.machine) {
-                    (Some(error), _) => Err(error),
-                    (None, Some(machine)) => Ok(machine),
-                    (None, None) => Err("Codespace connection finished without a machine".into()),
-                };
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        self.await_pairing(&job, "codespace", progress)
+    }
+    fn connect_sandbox(
+        &self,
+        sandbox: SandboxTarget,
+        display: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
+        let job = self.sandbox_begin(sandbox, Some(display))?;
+        self.await_pairing(&job, "sandbox", progress)
     }
     fn ensure(
         &self,
@@ -360,6 +382,46 @@ impl Host for Arc<Connections> {
     }
     fn disconnect(&self, machine_id: &str) -> Result<(), String> {
         Connections::disconnect(self, machine_id)
+    }
+}
+
+impl Connections {
+    /// Follows the pairing job `job` to its end and returns the machine it paired.
+    fn await_pairing(
+        self: &Arc<Self>,
+        job: &str,
+        noun: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
+        let mut last = String::new();
+        loop {
+            let view = self.ssh_poll(job)?;
+            if view.message != last {
+                progress(&view.message);
+                last = view.message.clone();
+            }
+            if view.prompt.is_some() {
+                let _ = self.ssh_cancel(job);
+                return Err(format!(
+                    "The {noun} connection asked an unexpected question"
+                ));
+            }
+            if view.done {
+                return match (view.error, view.machine) {
+                    (Some(error), _) => Err(error),
+                    (None, Some(machine)) => Ok(machine),
+                    (None, None) => Err(format!(
+                        "{} connection finished without a machine",
+                        if noun == "sandbox" {
+                            "Sandbox"
+                        } else {
+                            "Codespace"
+                        }
+                    )),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
@@ -419,6 +481,8 @@ pub struct CloudSessions {
     gh: Arc<dyn GhRunner>,
     /// Lifecycle operations by backend; [`Self::backend`] looks one up.
     backends: HashMap<CloudBackendKind, Arc<dyn CloudBackend>>,
+    /// Docker sandbox seams, set by [`Self::with_sandboxes`].
+    sandbox: Option<docker_start::SandboxDeps>,
     host: Arc<dyn Host>,
     store: Database,
     states: Mutex<HashMap<String, (Instant, String)>>,
@@ -445,6 +509,7 @@ impl CloudSessions {
         Self {
             gh,
             backends: HashMap::from([(CloudBackendKind::Codespaces, codespaces)]),
+            sandbox: None,
             host,
             store,
             states: Mutex::new(HashMap::new()),
@@ -484,10 +549,16 @@ impl CloudSessions {
     }
     /// Real `gh` and the app's default connections.
     pub fn system(store: Database) -> Result<Self, String> {
+        let secrets = Arc::new(docker_start::StoreSecrets::new(store.clone()));
         Ok(Self::new(
             Arc::new(codespaces::SystemGh),
             Arc::new(remote::default_connections()?),
             store,
+        )
+        .with_sandboxes(
+            Arc::new(crate::sandboxes::SystemSbx),
+            Arc::new(backend::docker::SystemShell::default()),
+            secrets,
         ))
     }
     /// Registers (or replaces) the backend for its kind.
@@ -572,7 +643,8 @@ impl CloudSessions {
             &self.store,
             &OpenRequest {
                 local_cwd,
-                codespace: &resolved.name,
+                cloud: &CloudRef::codespace(&resolved.name),
+                sandbox: None,
                 display: &resolved.display,
                 repo: &resolved.repo,
                 remote_cwd: &resolved.remote_cwd,
@@ -1256,6 +1328,7 @@ impl StartupSummary {
 
 pub mod backend;
 pub mod docker_config;
+pub mod docker_start;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod convert;
@@ -1272,6 +1345,8 @@ pub use startup::{
 mod convert_tests;
 #[cfg(test)]
 mod docker_config_tests;
+#[cfg(test)]
+mod docker_start_tests;
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]

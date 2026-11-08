@@ -5,6 +5,10 @@ pub mod protocol;
 mod ssh;
 pub mod ssh_askpass;
 
+pub(crate) use ssh::{
+    sandbox_bootstrap_script, shell_quote, validate_sandbox as validate_sandbox_target,
+    validate_sandbox_workspace,
+};
 use ssh::{Job, Tunnel, Tunnels};
 pub use ssh::{JobView, Prompt, SandboxTarget, SshTarget};
 use std::collections::HashMap;
@@ -843,6 +847,11 @@ impl Connections {
             .into_iter()
             .find(|m| m.id == machine_id)
             .ok_or("Machine is no longer connected")?;
+        if machine.sandbox.is_some() {
+            // Waking a sandbox means restoring its relay, credential cache and Claude
+            // environment; only a user-initiated sandbox reconnect does that.
+            return Err(SANDBOX_NOT_CONNECTED.into());
+        }
         if machine.codespace.is_none() {
             return Err("This connection is not a codespace".into());
         }
@@ -893,12 +902,14 @@ impl Connections {
         progress: &mut dyn FnMut(&str),
     ) -> Result<(), String> {
         self.run_coalesced(machine_id, cancel, progress, |progress| {
-            match self.request(machine_id, "environment.describe", json!({})) {
+            let noun = match self.request(machine_id, "environment.describe", json!({})) {
                 Ok(_) => return Ok(()),
-                Err(error) if error.starts_with("Codespace is not connected") => {}
+                Err(error) if error.starts_with("Codespace is not connected") => "codespace",
+                // Never wake a sandbox here (any ssh resumes and bills it, and the relay and
+                // credentials would not be restored): the caller shows the state.
                 Err(error) => return Err(error),
-            }
-            progress("Waking codespace…");
+            };
+            progress(&format!("Waking {noun}…"));
             let job = self.start_when_free(cancel, JOB_SLOT_WAIT, || {
                 self.codespace_reconnect(machine_id)
             })?;
@@ -1742,6 +1753,32 @@ else:
     }
 
     #[test]
+    fn waking_never_reconnects_a_sandbox_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("remote-machines.json"),
+            r#"[{"id":"a","name":"x","endpoint":"sbx://box","environmentId":"env","token":"t","ssh":{"target":"sbx_001abc@sbx_cloud","port":null,"remotePort":3774,"sandbox":{"id":"sbx_001abc","name":"box","workspace":"/home/agent/ws","relayPort":47200}}}]"#,
+        )
+        .unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        let mut progress = vec![];
+        let error = connections
+            .ensure_codespace_with("a", &AtomicBool::new(false), &mut |l| {
+                progress.push(l.to_string())
+            })
+            .unwrap_err();
+        assert_eq!(error, SANDBOX_NOT_CONNECTED);
+        assert!(progress.is_empty(), "no wake was announced: {progress:?}");
+        assert_eq!(
+            connections.codespace_reconnect("a").unwrap_err(),
+            SANDBOX_NOT_CONNECTED
+        );
+        // No ssh job was started for either call.
+        assert!(connections.jobs.lock().unwrap().is_empty());
+        assert!(connections.tunnels.existing("a").is_none());
+    }
+
+    #[test]
     fn sandbox_begin_rejects_bad_targets() {
         let dir = tempfile::tempdir().unwrap();
         let connections = Arc::new(Connections::new(dir.path()));
@@ -1750,6 +1787,7 @@ else:
             name: "box".into(),
             workspace: workspace.into(),
             relay_port,
+            config: None,
         };
         for bad in [
             target("-oProxyCommand=x", "/w", 1),

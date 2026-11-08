@@ -1129,7 +1129,7 @@ fn begin_pending_start(svc: &CloudSessions, cloud: &CloudRef) -> i64 {
 }
 
 #[test]
-fn a_sandbox_start_never_reaches_gh() {
+fn a_sandbox_start_without_sandbox_support_never_reaches_gh() {
     let gh = FakeGh::new(vec![]);
     let host = FakeHost::with_machine("octo-abc");
     let sandbox = Arc::new(FakeSandboxBackend::default());
@@ -1143,9 +1143,9 @@ fn a_sandbox_start_never_reaches_gh() {
     let rebuilt = svc.rebuild_start(id).unwrap_err();
     let url = svc.start_web_url(id).unwrap_err();
 
-    assert!(resumed.contains("not supported"), "{resumed}");
-    assert!(run.contains("not supported"), "{run}");
-    assert!(rebuilt.contains("not supported"), "{rebuilt}");
+    assert!(resumed.contains("not available"), "{resumed}");
+    assert!(run.contains("not available"), "{run}");
+    assert!(rebuilt.contains("not provisioned"), "{rebuilt}");
     assert!(url.contains("sandbox"), "{url}");
     assert_eq!(gh.calls(), Vec::<String>::new());
     assert_eq!(host.log(), Vec::<String>::new());

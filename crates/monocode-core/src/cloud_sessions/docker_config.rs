@@ -76,7 +76,7 @@ fn path_chars(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
 }
 /// A branch, tag or commit name under `git check-ref-format` rules.
-fn valid_ref(value: &str) -> bool {
+pub(super) fn valid_ref(value: &str) -> bool {
     path_chars(value)
         && value.len() <= 200
         && !value.contains("..")

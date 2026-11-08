@@ -243,9 +243,28 @@ impl Store {
         local_project: &str,
         codespace: &str,
     ) -> Result<RemoteProject, String> {
+        self.remember_cloud_ref_project(
+            environment_id,
+            project,
+            local_project,
+            &CloudRef::codespace(codespace),
+        )
+    }
+    /// [`Self::remember_cloud_project`] for a workspace of any backend: a codespace is
+    /// written to `codespace`, a sandbox to `sandbox`.
+    pub fn remember_cloud_ref_project(
+        &self,
+        environment_id: &str,
+        project: &Value,
+        local_project: &str,
+        cloud: &CloudRef,
+    ) -> Result<RemoteProject, String> {
         let mut remote = self.remember_remote_project(environment_id, project)?;
         remote.local_project = Some(local_project.into());
-        remote.codespace = Some(codespace.into());
+        match cloud.kind {
+            CloudBackendKind::Codespaces => remote.codespace = Some(cloud.name.clone()),
+            CloudBackendKind::DockerSandbox => remote.sandbox = Some(cloud.name.clone()),
+        }
         let mut projects = self.remote_projects()?;
         projects.insert(remote.key.clone(), remote.clone());
         self.save_setting(

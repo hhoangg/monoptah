@@ -42,6 +42,10 @@ pub struct SandboxTarget {
     /// Loopback port in the outer sandbox where a relay bridges into the
     /// container's Host. The tunnel forwards to this port.
     pub relay_port: u16,
+    /// Dev container config, relative to `workspace`, when it is not the default one
+    /// (`devcontainer exec` finds its container by workspace and config file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
 }
 
 /// Host alias written by `sbx setup ssh` into the user's ssh config.
@@ -57,14 +61,18 @@ impl SandboxTarget {
 
     /// The single remote word that runs `remote` inside the devcontainer. The
     /// script itself travels on stdin, never in argv.
-    fn exec_in_container(&self, remote: &[&str]) -> String {
+    pub(crate) fn exec_in_container(&self, remote: &[&str]) -> String {
         let mut words = vec![
             SANDBOX_DEVCONTAINER.to_string(),
             "exec".into(),
             "--workspace-folder".into(),
             shell_quote(&self.workspace),
-            "--".into(),
         ];
+        if let Some(config) = &self.config {
+            words.push("--config".into());
+            words.push(shell_quote(&format!("{}/{config}", self.workspace)));
+        }
+        words.push("--".into());
         words.extend(remote.iter().map(|word| quote_word(word)));
         words.join(" ")
     }
@@ -166,6 +174,10 @@ pub fn validate_sandbox(sandbox: &SandboxTarget) -> Result<(), String> {
     validate_sandbox_workspace(&sandbox.workspace)?;
     if sandbox.relay_port == 0 {
         return Err("Enter a valid relay port.".into());
+    }
+    if let Some(config) = &sandbox.config {
+        validate_sandbox_workspace(&format!("/{config}"))
+            .map_err(|_| "Enter a relative dev container config path.".to_string())?;
     }
     Ok(())
 }
@@ -1372,6 +1384,105 @@ mod tests {
             2
         );
     }
+    /// The sandbox prelude may pin an API key instead of a setup token; the bootstrap then
+    /// tracks that variable, and a setup token leaves exactly the marker a codespace writes.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_bootstrap_tracks_the_pinned_variable_with_the_codespace_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let run = |script: String, env: Option<(&str, &str)>| -> (Vec<String>, String) {
+            let home = tempfile::tempdir().unwrap();
+            let bin = home.path().join(".monocode-host/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let log = home.path().join("calls.log");
+            let entry = bin.join("monocode-host");
+            std::fs::write(
+                &entry,
+                format!(
+                    "#!/bin/sh\necho \"$1 $2\" >> {}\n[ \"$1\" = connection-info ] && echo '{{\"port\":3774}}'\nexit 0\n",
+                    log.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut command = Command::new("sh");
+            command
+                .arg("-s")
+                .env("HOME", home.path())
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+                .env_remove("ANTHROPIC_API_KEY");
+            if let Some((name, value)) = env {
+                command.env(name, value);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let calls = std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(String::from)
+                .collect();
+            let marker =
+                std::fs::read_to_string(home.path().join(".monocode-host/host-token.sha256"))
+                    .unwrap_or_default();
+            (calls, marker)
+        };
+        let hermetic = |script: String| {
+            script.replace(
+                "MONOCODE_HOST_INSTALL_CLAUDE=1",
+                "MONOCODE_HOST_INSTALL_CLAUDE=0",
+            )
+        };
+        let (_, codespace_marker) = run(
+            hermetic(codespace_bootstrap_script()),
+            Some(("CLAUDE_CODE_OAUTH_TOKEN", "same-secret")),
+        );
+        assert_eq!(codespace_marker.trim().len(), 64);
+        // A sandbox with a setup token writes the very same marker.
+        let token_prelude = "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN\nexport CLAUDE_CODE_OAUTH_TOKEN='same-secret'";
+        let (calls, marker) = run(
+            hermetic(sandbox_bootstrap_script(Some(token_prelude))),
+            None,
+        );
+        assert_eq!(marker, codespace_marker);
+        assert_eq!(
+            calls.iter().filter(|c| *c == "service uninstall").count(),
+            1
+        );
+        // An API key is tracked through its own variable and hashes the same way.
+        let key_prelude = "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN\nMONOCODE_HOST_TOKEN_VAR=ANTHROPIC_API_KEY\nexport ANTHROPIC_API_KEY='same-secret'";
+        let (calls, marker) = run(hermetic(sandbox_bootstrap_script(Some(key_prelude))), None);
+        assert_eq!(marker, codespace_marker);
+        assert_eq!(
+            calls.iter().filter(|c| *c == "service uninstall").count(),
+            1
+        );
+        // Without the selector an API key in the environment is not tracked (codespace rule).
+        let (calls, marker) = run(
+            hermetic(codespace_bootstrap_script()),
+            Some(("ANTHROPIC_API_KEY", "same-secret")),
+        );
+        assert!(marker.is_empty());
+        assert_eq!(
+            calls.iter().filter(|c| *c == "service uninstall").count(),
+            0
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn codespace_bootstrap_restarts_the_host_once_when_claude_appears() {
@@ -1586,6 +1697,7 @@ mod tests {
                 name: "my-box".into(),
                 workspace: "/home/agent/ws".into(),
                 relay_port: 47200,
+                config: None,
             }),
         }
     }

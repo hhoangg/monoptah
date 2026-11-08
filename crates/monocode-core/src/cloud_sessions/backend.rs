@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub mod codespaces;
+pub mod docker;
 pub use codespaces::CodespacesBackend;
+pub use docker::DockerBackend;
 
 /// Which service hosts a cloud session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -127,5 +129,7 @@ pub trait CloudBackend: Send + Sync {
     fn prepare_evidence(&self, name: &str, workspace: &str) -> Result<(), String>;
 }
 
+#[cfg(test)]
+mod docker_tests;
 #[cfg(test)]
 mod tests;

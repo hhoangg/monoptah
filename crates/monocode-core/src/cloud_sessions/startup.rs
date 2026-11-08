@@ -46,6 +46,7 @@
 //!   `Running commands...`, `Running the postCreateCommand from Feature '...'...`,
 //!   `Finished configuring codespace.`, each prefixed `2026-11-07 04:01:54.456Z: `.
 use super::backend::{CloudBackendKind, CloudRef};
+use super::docker_start::SandboxStart;
 use super::{
     created_note, require_claude, CloudBinding, CloudSessions, ResolvedCodespace, Target, WaitPlan,
     START_ABORTED,
@@ -80,7 +81,6 @@ const FOLLOW_ATTEMPTS: usize = 4;
 pub const STILL_STARTING: &str =
     "This cloud session is still starting its codespace. Send again when it is ready.";
 const NOT_STARTING: &str = "This cloud session is not starting a codespace.";
-const SANDBOX_START_UNSUPPORTED: &str = "Starting a sandbox session is not supported yet.";
 const NO_WORKSPACE: &str = "This cloud session start has no workspace.";
 
 /// One step of starting a cloud session, in display order.
@@ -207,7 +207,7 @@ pub struct Step {
 }
 
 impl Step {
-    fn pending(kind: StepKind) -> Self {
+    pub(super) fn pending(kind: StepKind) -> Self {
         Self {
             kind,
             status: StepStatus::Pending,
@@ -290,6 +290,9 @@ pub struct StartRecord {
     /// (connecting starts a stopped codespace).
     #[serde(default)]
     pub track_ready: bool,
+    /// What only a sandbox start has. Set exactly when [`Self::sandbox`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_start: Option<SandboxStart>,
 }
 
 impl StartRecord {
@@ -319,6 +322,7 @@ impl StartRecord {
             started_at: now,
             finished_at: None,
             track_ready: resolved.created,
+            sandbox_start: None,
         }
     }
     /// The backend this start runs on.
@@ -662,15 +666,6 @@ pub fn queued_start_message(store: &Store, id: i64) -> Option<String> {
     draft.id.starts_with(APP_PROMPT).then_some(draft.text)
 }
 
-/// Only codespace starts can be driven yet: `drive_start` and the step list are gh specific.
-/// A sandbox record is refused before anything (gh included) is touched.
-fn require_codespace_start(record: &StartRecord) -> Result<(), String> {
-    match record.backend() {
-        CloudBackendKind::Codespaces => Ok(()),
-        CloudBackendKind::DockerSandbox => Err(SANDBOX_START_UNSUPPORTED.into()),
-    }
-}
-
 /// Messages from the helper threads to the thread that owns the record.
 enum Msg {
     /// A raw creation-log line.
@@ -761,7 +756,7 @@ impl Drop for Follower {
 }
 
 impl CloudSessions {
-    fn now(&self) -> u64 {
+    pub(super) fn now(&self) -> u64 {
         (self.clock)()
     }
 
@@ -822,7 +817,7 @@ impl CloudSessions {
         Ok((session, record))
     }
 
-    fn start_aborted(&self, session_id: i64, cancel: &AtomicBool) -> bool {
+    pub(super) fn start_aborted(&self, session_id: i64, cancel: &AtomicBool) -> bool {
         cancel.load(Ordering::Relaxed)
             || self.store().is_ok_and(|store| {
                 start_record(&store, session_id).is_none_or(|record| record.is_failed())
@@ -837,7 +832,7 @@ impl CloudSessions {
             }
         }
     }
-    fn publish(&self, record: &StartRecord, events: &mut dyn FnMut(StartEvent)) {
+    pub(super) fn publish(&self, record: &StartRecord, events: &mut dyn FnMut(StartEvent)) {
         self.persist_start(record);
         events(StartEvent::Updated(record.clone()));
     }
@@ -864,6 +859,19 @@ impl CloudSessions {
                     "{} stopped. Choose Retry to start it again.",
                     record.backend().title()
                 )),
+                // Resuming runs ssh, which resumes (and bills) a sandbox: only a sandbox that
+                // is running now may continue on its own; every other state waits for Retry.
+                Ok(state)
+                    if record.backend() == CloudBackendKind::DockerSandbox
+                        && !self.backend(record.backend()).is_ok_and(|backend| {
+                            backend.display_state(&state) == super::CloudState::Available
+                        }) =>
+                {
+                    Some(format!(
+                        "Sandbox is {}. Choose Retry to start it again.",
+                        state.trim().to_ascii_lowercase()
+                    ))
+                }
                 Ok(_) => None,
                 Err(error) => Some(error),
             },
@@ -885,7 +893,9 @@ impl CloudSessions {
         cancel: &AtomicBool,
     ) -> Result<CloudBinding, String> {
         let mut record = start_record(&*self.store()?, session_id).ok_or(NOT_STARTING)?;
-        require_codespace_start(&record)?;
+        if record.backend() == CloudBackendKind::DockerSandbox {
+            return self.run_sandbox_start(record, events, cancel);
+        }
         record.reset_for_run();
         if cancel.load(Ordering::Relaxed) {
             return Err(START_ABORTED.into());
@@ -977,7 +987,8 @@ impl CloudSessions {
             std::thread::spawn(move || {
                 let request = super::OpenRequest {
                     local_cwd: &record.local_project,
-                    codespace: &record.codespace,
+                    cloud: &CloudRef::codespace(&record.codespace),
+                    sandbox: None,
                     display: &record.display,
                     repo: &record.repo,
                     remote_cwd: &record.remote_cwd,
@@ -1083,7 +1094,9 @@ impl CloudSessions {
     /// from Provision. `Err` when the session has no start record. Returns the new record.
     pub fn rebuild_start(&self, session_id: i64) -> Result<StartRecord, String> {
         let mut record = start_record(&*self.store()?, session_id).ok_or(NOT_STARTING)?;
-        require_codespace_start(&record)?;
+        if record.backend() == CloudBackendKind::DockerSandbox {
+            return self.rebuild_sandbox_start(record);
+        }
         let cloud = record.cloud().ok_or(NO_WORKSPACE)?;
         self.backend(cloud.kind)?.rebuild(&cloud.name)?;
         self.invalidate_ref(&cloud);
