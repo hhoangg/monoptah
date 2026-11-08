@@ -146,6 +146,8 @@ pub(super) struct CloudDraft {
     pub request: u64,
     /// A codespace this draft already created: creating again would bill a second one.
     pub created: Option<String>,
+    /// The id of the queue message holding the prompt while the create runs.
+    pub queued: Option<String>,
     _events: Vec<Subscription>,
 }
 
@@ -487,6 +489,7 @@ impl Conversation {
             error: None,
             request: 0,
             created: None,
+            queued: None,
             _events: events,
         });
         if !docker {
@@ -666,6 +669,11 @@ impl Conversation {
             CloudTarget::DockerSandbox => None,
         };
         let prompt = self.input.read(cx).content.trim().to_owned();
+        // The prompt leaves the composer for the send queue at once. The queue copy is not
+        // saved: this draft is a local session, the new cloud session gets its own stored copy.
+        let queued = (!prompt.is_empty())
+            .then(|| self.queue_composer_prompt(false, cx))
+            .flatten();
         self.cloud_request_seq += 1;
         let request_id = self.cloud_request_seq;
         let request = CloudCreate {
@@ -679,6 +687,7 @@ impl Conversation {
         };
         if let Some(draft) = &mut self.cloud_draft {
             draft.creating = true;
+            draft.queued = queued;
             draft.request = request_id;
             draft.error = None;
             let fields = [draft.branch.clone(), draft.base.clone()];
@@ -691,7 +700,8 @@ impl Conversation {
     }
 
     /// The shell finished (or refused) the creation requested by [`Self::create_cloud`]. `Ok`
-    /// says whether the composer text moved into the new session's queue.
+    /// says whether the prompt moved into the new session's queue; if not, or on an error, the
+    /// prompt returns to the composer.
     pub(crate) fn cloud_create_finished(
         &mut self,
         request_id: u64,
@@ -706,12 +716,18 @@ impl Conversation {
         {
             return;
         }
+        // The queued copy is gone either way: on success the new session holds its own, and
+        // otherwise the prompt goes back to the composer so it is never lost.
+        let keep = matches!(result, Ok(true));
+        if let Some(id) = self
+            .cloud_draft
+            .as_mut()
+            .and_then(|draft| draft.queued.take())
+        {
+            self.unqueue_composer_prompt(&id, !keep, cx);
+        }
         match result {
-            Ok(consumed) => {
-                if consumed {
-                    self.input
-                        .update(cx, |input, cx| input.set_text(String::new(), cx));
-                }
+            Ok(_) => {
                 // The resource exists: never create a second one for it.
                 self.cloud_draft = None;
             }

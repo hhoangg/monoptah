@@ -10,6 +10,7 @@ use crate::cloud_start_view::{
 use crate::right_panel::RightTab;
 use monocode_core::cloud_sessions::{
     CloudRef, CloudState, StartEvent, StartRecord, pending_starts, queued_start_message,
+    queued_start_messages,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -394,10 +395,10 @@ impl Shell {
         self.session_summaries.insert(id, session.clone());
         self.cloud_states.insert(state_key, CloudState::Available);
         // A queued message needs the conversation to send it.
-        let queued = locked(&self.store)
-            .ok()
-            .and_then(|store| queued_start_message(&store, id))
-            .is_some();
+        let queued = locked(&self.store).is_ok_and(|store| {
+            queued_start_message(&store, id).is_some()
+                || !queued_start_messages(&store, id).is_empty()
+        });
         if queued {
             self.ensure_session(id, cx);
         }

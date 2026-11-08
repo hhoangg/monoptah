@@ -647,6 +647,13 @@ pub(crate) fn run_with_client(
             binding.summary.has_messages = true;
             binding.summary.updated_at = monocode_core::time::now_ms();
             journal(&store, &binding)?;
+            // The command is durable now: a queued message that started this turn may leave
+            // the send queue (same receipt as the local runtime).
+            if let Some(id) = settings.mono_message_id.clone() {
+                let mut receipt = update("Working…", false);
+                receipt.delivered = Some(id);
+                let _ = tx.send_blocking(receipt);
+            }
             let descriptor = client.request(&machine.id, "environment.describe", json!({}))?;
             if !descriptor["providers"].as_array().is_some_and(|providers| {
                 providers

@@ -7,14 +7,19 @@ pub(super) struct State {
     pub(super) client: Option<Arc<monocode_core::remote::Connections>>,
     clock: Option<gpui::Task<()>>,
     pub(super) refreshing: bool,
+    /// Bumped when a reconnect starts and when it succeeds: a refresh that began under an older
+    /// value belongs to a host that may have been stopped, so its answer is ignored.
+    epoch: u64,
+    /// The epoch the refresh that holds `refreshing` began under.
+    refresh_epoch: u64,
+    /// Test seam: stands in for the host round trip of a refresh.
+    #[cfg(test)]
+    pub(super) refresh_stub: Option<Result<(), String>>,
     pub(super) pending: bool,
     pub(super) online: bool,
     app_prompt_waiting: bool,
     app_draft_launched: bool,
     waking: bool,
-    /// The user sent a prompt while the workspace was stopped: it goes out once, when the
-    /// resume has connected. Cleared by a connection error (the text stays in the composer).
-    resume_send: bool,
     /// Stops the reconnect that is running (set by the Cancel button).
     wake_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     error: Option<String>,
@@ -169,7 +174,8 @@ impl Conversation {
         cx.emit(SessionChanged);
         cx.notify();
     }
-    /// A send while the codespace starts keeps the text as the session's first prompt.
+    /// A send while the workspace starts joins the session's send queue, like a message sent
+    /// behind a running turn. The queue drains once the workspace is ready and loaded.
     pub(super) fn queue_start_send(&mut self, cx: &mut Context<Self>) {
         if self.attaching || self.input.read(cx).is_composing() {
             return;
@@ -185,34 +191,143 @@ impl Conversation {
         if !self.input.read(cx).has_message_text() {
             return;
         }
+        if self.queue_composer_prompt(true, cx).is_some() {
+            self.status = format!(
+                "Queued. It is sent when the {} is ready.",
+                self.cloud_start_noun()
+            );
+        }
+        cx.notify();
+    }
+    /// Moves the composer text and attachments into the send queue as a plain message (never a
+    /// steer: a cloud workspace takes no steering) and clears the composer. Returns the id of
+    /// the queued message. `save` persists the queue; the new-session draft keeps it in memory
+    /// because that local session never drains it.
+    pub(super) fn queue_composer_prompt(
+        &mut self,
+        save: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let text = self
             .input
             .update(cx, |input, cx| input.take(cx))
             .unwrap_or_default();
         let text = text.trim().to_owned();
-        if text.is_empty() {
+        if text.is_empty() && self.attachments.is_empty() {
+            return None;
+        }
+        let mode = self.settings.plan.then(|| "plan".to_owned());
+        let attachments = std::mem::take(&mut self.attachments);
+        let mut message = self.message(text, attachments, mode.clone(), cx);
+        message.steer = false;
+        let id = message.id.clone();
+        self.follow_ups.motion.insert(
+            &id,
+            self.follow_ups.state.messages.is_empty(),
+            !cx.reduce_motion(),
+        );
+        self.follow_ups.state.messages.push(message);
+        self.completion
+            .update(cx, |completion, cx| completion.dismiss(cx));
+        if mode.is_some() {
+            self.clear_submitted_mode(cx);
+        }
+        if save {
+            self.save_follow_ups(cx);
+            cx.emit(SessionChanged);
+        } else {
+            // Held while a create runs: the queue must not move on its own, and the entry is
+            // dimmed and inert like a message that is being sent.
+            self.follow_ups.sending = Some(id.clone());
+        }
+        cx.notify();
+        Some(id)
+    }
+    /// Sends the head of the send queue of a remote (cloud) session, once. The queue never
+    /// wakes or creates anything: it waits while the workspace is starting, stopped, offline,
+    /// reconnecting or has a command to confirm, and while a turn runs (the normal queue
+    /// rule, `pump_follow_ups` does not call this when busy). The message leaves the queue only
+    /// when the runtime reports it delivered; a launch that does not start fails it in place.
+    pub(super) fn drain_remote_follow_up(
+        &mut self,
+        message: monocode_core::follow_up::Message,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cloud_start_blocks()
+            || !self.remote_state.online
+            || self.remote_state.pending
+            || self.remote_state.waking
+            || self.cloud_stopped
+            || message.error.is_some()
+        {
             return;
         }
-        let id = self.summary.id;
-        let queued = locked(&self.store).and_then(|store| {
-            monocode_core::cloud_sessions::queue_start_message(&store, id, &text)?;
-            Ok(monocode_core::cloud_sessions::queued_start_message(
-                &store, id,
-            ))
-        });
-        match queued {
-            Ok(queued) => {
-                self.cloud_queued = queued;
-                self.sync_cloud_chrome(cx);
-                self.status = format!(
-                    "Queued. It is sent when the {} is ready.",
-                    self.cloud_start_noun()
-                );
-            }
-            Err(error) => {
-                self.input.update(cx, |input, cx| input.set_text(text, cx));
-                self.status = error;
-            }
+        let capabilities = &self.remote_state.capabilities;
+        let blocker = if !message.attachments.is_empty()
+            && !capabilities.contains("attachments.upload")
+        {
+            Some("Update Monoptah Host in Connections settings to send attachments.")
+        } else if message.mode.as_deref() == Some("plan") && !capabilities.contains("sessions.plan")
+        {
+            Some("Update Monoptah Host in Connections settings to use Plan mode.")
+        } else {
+            None
+        };
+        if let Some(blocker) = blocker {
+            // Pauses the queue and shows the error with a Retry, like any failed message.
+            self.fail_follow_up(&message.id, blocker.into(), cx);
+            cx.notify();
+            return;
+        }
+        // The message stays in the queue, marked as being sent, until the runtime reports the
+        // command journaled (`Update::delivered`). A launch that fails earlier (waking the
+        // host, models, attachment upload) therefore never loses the prompt.
+        let id = message.id.clone();
+        self.follow_ups.sending = Some(id.clone());
+        self.settings.mono_message_id = Some(id.clone());
+        self.launch_message(message, cx);
+        self.settings.mono_message_id = None;
+        if !self.busy {
+            self.fail_follow_up(&id, self.status.clone(), cx);
+        }
+        cx.notify();
+    }
+    /// Takes back a message put in the queue by [`Self::queue_composer_prompt`] with `save`
+    /// false. Its attachments always return to the composer; the text does when `restore` is set.
+    pub(super) fn unqueue_composer_prompt(
+        &mut self,
+        id: &str,
+        restore: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.follow_ups.sending.as_deref() == Some(id) {
+            self.follow_ups.sending = None;
+        }
+        let Some(position) = self
+            .follow_ups
+            .state
+            .messages
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return;
+        };
+        let message = self.follow_ups.state.messages.remove(position);
+        // The new session is created from the text alone: attachments and Plan mode stay here.
+        let (kept_attachments, kept_plan) = (
+            !message.attachments.is_empty(),
+            message.mode.as_deref() == Some("plan"),
+        );
+        self.attachments.extend(message.attachments);
+        if kept_plan {
+            self.settings.plan = true;
+        }
+        if !restore && (kept_attachments || kept_plan) {
+            self.status = "Attachments and Plan mode are not sent to a new session. They stay in the composer.".into();
+        }
+        if restore && self.input.read(cx).content.trim().is_empty() {
+            self.input
+                .update(cx, |input, cx| input.set_text(message.text, cx));
         }
         cx.notify();
     }
@@ -237,7 +352,6 @@ impl Conversation {
             .map(|cloud| cloud.noun())
     }
     pub(crate) fn remote_connection_error(&mut self, error: &str, cx: &mut Context<Self>) {
-        self.remote_state.resume_send = false;
         if self.is_remote() && !self.busy {
             self.remote_state.online = false;
             self.remote_state.error = Some(error.into());
@@ -264,6 +378,7 @@ impl Conversation {
             return true;
         }
         self.remote_state.waking = true;
+        self.remote_state.epoch += 1;
         let noun = self.cloud_noun().unwrap_or("codespace");
         self.status = format!("Reconnecting the {noun}...");
         cx.notify();
@@ -294,16 +409,21 @@ impl Conversation {
             let _ = this.update(cx, |this, cx| {
                 this.remote_state.waking = false;
                 this.remote_state.wake_cancel = None;
-                if !matches!(result, Ok(true)) {
-                    this.remote_state.resume_send = false;
-                }
                 match result {
                     Ok(true) => {
                         this.remote_state.error = None;
                         this.cloud_stopped = false;
                         cx.emit(CloudResumed);
+                        // Whatever refresh was in flight talked to the stopped host. Start
+                        // over: the queue drains only when a fresh refresh has reached the
+                        // host (its success path marks the view online and pumps the queue).
+                        this.remote_state.epoch += 1;
+                        this.remote_state.refreshing = false;
+                        if !this.busy {
+                            this.remote_state.online = false;
+                        }
                         this.load_remote(cx);
-                        this.send_after_resume(false, cx);
+                        this.refresh_remote_snapshot(cx);
                     }
                     Ok(false) => this.remote_connection_error(
                         &format!("This {noun} is unavailable. It may have been deleted."),
@@ -317,6 +437,15 @@ impl Conversation {
         .detach();
         true
     }
+    /// Whether the 3 second clock may refresh now. A stopped or waking workspace answers
+    /// nothing (its old tunnel can still accept), so polling it only produces timeouts.
+    pub(super) fn background_refresh_due(&self) -> bool {
+        !self.busy
+            && !self.stopping
+            && !self.history_unloaded
+            && !self.remote_state.waking
+            && !self.cloud_stopped
+    }
     pub(super) fn load_remote(&mut self, cx: &mut Context<Self>) {
         if self.remote_state.clock.is_none() && !cfg!(test) {
             self.remote_state.clock = Some(cx.spawn(async move |this, cx| {
@@ -327,7 +456,7 @@ impl Conversation {
                     if this
                         .update(cx, |this, cx| {
                             // Live turns have their own 750 ms sync and control loop.
-                            if !this.busy && !this.stopping && !this.history_unloaded {
+                            if this.background_refresh_due() {
                                 this.refresh_remote_snapshot(cx);
                             }
                         })
@@ -347,6 +476,10 @@ impl Conversation {
             return;
         }
         self.remote_state.refreshing = true;
+        let epoch = self.remote_state.epoch;
+        self.remote_state.refresh_epoch = epoch;
+        #[cfg(test)]
+        let stub = self.remote_state.refresh_stub.clone();
         let initial = !self.loaded || self.history_unloaded;
         self.loading = initial;
         let store = self.store.clone();
@@ -366,6 +499,11 @@ impl Conversation {
                     store.agent_settings(id)?.unwrap_or_default(),
                 )
             };
+            #[cfg(test)]
+            if let Some(stub) = stub {
+                stub?;
+                return Ok::<_, String>((remote, settings, None, None, None));
+            }
             let client = client.ok_or("Remote connections are unavailable")?;
             let machine = remote.machine(&client)?;
             let descriptor = if initial {
@@ -418,6 +556,17 @@ impl Conversation {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
+                if this.remote_state.epoch != epoch {
+                    // A reconnect began or ended since this started: the answer (or the
+                    // timeout) is about a host that is gone. Its result is dropped, but if it
+                    // still holds the flags (no newer refresh took over, e.g. the reconnect
+                    // failed or was cancelled) they are released so the view can refresh again.
+                    if this.remote_state.refresh_epoch == epoch {
+                        this.remote_state.refreshing = false;
+                        this.loading = false;
+                    }
+                    return;
+                }
                 this.remote_state.refreshing = false;
                 this.loading = false;
                 match result {
@@ -492,7 +641,7 @@ impl Conversation {
                             this.run_history_actions(cx);
                         }
                         this.finish_app_prompt(cx);
-                        this.send_after_resume(running, cx);
+                        this.pump_follow_ups(cx);
                         if initial {
                             let known = this.remote_state.snapshot.clone();
                             this.recover_unsent_app_prompt(known.as_ref(), cx);
@@ -558,21 +707,25 @@ impl Conversation {
                 return true;
             }
             let typed = self.input.read(cx).has_message_text();
-            if unreachable && self.remote_state.resume_send {
-                // A resume already carries this prompt: a second Enter starts nothing.
-                cx.notify();
-                return true;
-            }
-            // Only a typed prompt from the user's own hand wakes a workspace from here.
-            if unreachable && (typed || !self.user_send) && self.reconnect_cloud(self.user_send, cx)
-            {
+            // Only a typed prompt from the user's own hand wakes a workspace from here, and it
+            // goes through the send queue: it is sent once, when the reconnect has loaded.
+            if unreachable && self.user_send && typed && self.is_cloud_session() {
+                if self.input.read(cx).content.trim_start().starts_with('/') {
+                    self.status = "Commands are available once the workspace is ready".into();
+                    cx.notify();
+                    return true;
+                }
+                if self.queue_composer_prompt(true, cx).is_some() {
+                    self.reconnect_cloud(true, cx);
+                    let noun = self.cloud_noun().unwrap_or("codespace");
+                    self.status =
+                        format!("Reconnecting the {noun}. Your message is sent when it is ready.");
+                    cx.notify();
+                    return true;
+                }
+            } else if unreachable && !self.user_send && self.reconnect_cloud(false, cx) {
                 let noun = self.cloud_noun().unwrap_or("codespace");
-                self.remote_state.resume_send = self.user_send && typed;
-                self.status = if self.remote_state.resume_send {
-                    format!("Reconnecting the {noun}. Your message is sent when it is ready.")
-                } else {
-                    format!("Reconnecting the {noun}...")
-                };
+                self.status = format!("Reconnecting the {noun}...");
                 cx.notify();
                 return true;
             }
@@ -791,29 +944,8 @@ impl Conversation {
             && !self.remote_state.pending
             && self.cloud_noun() == Some("sandbox")
     }
-    /// Sends the prompt typed while the workspace was stopped, once, now that the resume has
-    /// connected and the history is loaded. The text stays in the composer until then. A turn
-    /// that is already running (attached by the load) keeps the prompt in the composer instead.
-    /// The flag never outlives this call once the history is loaded.
-    fn send_after_resume(&mut self, running: bool, cx: &mut Context<Self>) {
-        if !self.remote_state.resume_send || !self.loaded || !self.remote_state.online {
-            return;
-        }
-        self.remote_state.resume_send = false;
-        if self.cloud_stopped || !self.input.read(cx).has_message_text() {
-            return;
-        }
-        if running || self.busy || self.stopping {
-            self.status =
-                "This session is already running. Your message is still in the composer.".into();
-            cx.notify();
-            return;
-        }
-        // Not a user send: the workspace is up, so no resume is involved any more.
-        self.send_follow_up(false, cx);
-    }
     /// A send while the workspace is known to be stopped. The user's own submit with a prompt
-    /// resumes it and sends the prompt once connected; clicking the Resume pill resumes without
+    /// queues it, resumes the workspace and sends the queue once connected; clicking the Resume pill resumes without
     /// one. Enter on an empty composer never resumes. A Mono or the app API never resumes: a
     /// sandbox says it is stopped, a codespace keeps its existing path.
     pub(super) fn resume_for_user_send(&mut self, cx: &mut Context<Self>) -> bool {
@@ -836,10 +968,16 @@ impl Conversation {
             }
             return true;
         }
-        if self.remote_state.waking || self.remote_state.resume_send {
-            return true;
+        if typed {
+            if self.input.read(cx).content.trim_start().starts_with('/') {
+                self.status = "Commands are available once the workspace is ready".into();
+                cx.notify();
+                return true;
+            }
+            // The prompt leaves the composer for the send queue and goes out once, when the
+            // resume has connected and the history is loaded.
+            self.queue_composer_prompt(true, cx);
         }
-        self.remote_state.resume_send = typed;
         self.reconnect_cloud(true, cx);
         true
     }
@@ -882,11 +1020,20 @@ impl Conversation {
             .is_some_and(monocode_core::cloud_sessions::docker_start::is_sandbox_unrecoverable)
             && self.cloud_noun() == Some("sandbox")
     }
+    /// The notice of a remote session's connection state: an error, a command that needs
+    /// confirmation, a stopped or resuming workspace. It sits on the ledge above the composer in
+    /// the card style of the cloud start panel, with the actions on the right. While the start
+    /// panel is showing (a workspace that is starting or whose start failed) this stays hidden:
+    /// that panel already tells the state and nothing of the host is reachable yet.
     pub(super) fn remote_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let stopped = self.is_remote() && self.cloud_stopped_banner();
         let reconnecting = self.sandbox_reconnecting() || (stopped && self.remote_state.waking);
         if !self.is_remote()
             || self.busy
+            || self
+                .cloud_start
+                .as_ref()
+                .is_some_and(|start| start.panel_title().is_some())
             || (self.remote_state.error.is_none()
                 && !self.remote_state.pending
                 && !reconnecting
@@ -895,7 +1042,86 @@ impl Conversation {
             return None;
         }
         let legacy = self.remote_state.legacy_recovery_error();
-        let dead = legacy.is_none() && !self.remote_state.pending && self.sandbox_unrecoverable();
+        let pending = self.remote_state.pending;
+        let dead = legacy.is_none() && !pending && self.sandbox_unrecoverable();
+        let rejected = self.remote_state.rejected.is_some();
+        let waking = self.remote_state.waking;
+        let noun = match self.cloud_noun() {
+            Some("sandbox") => "Sandbox",
+            _ => "Codespace",
+        };
+        // (title, message, tone, mark): danger for errors, warning for work in progress or a
+        // command to confirm, neutral for a stopped workspace.
+        let (title, message, tone, mark) = if let Some(error) = legacy {
+            (
+                "Recovery needed".to_owned(),
+                error.to_owned(),
+                danger_color(),
+                "x",
+            )
+        } else if pending {
+            (
+                "Confirm command".to_owned(),
+                "A remote command needs confirmation. Retry uses its original command ID."
+                    .to_owned(),
+                warning_color(),
+                "circle-alert",
+            )
+        } else if stopped {
+            (
+                format!("{noun} stopped"),
+                if waking {
+                    self.status.clone()
+                } else {
+                    String::new()
+                },
+                if waking {
+                    warning_color()
+                } else {
+                    content(0.45)
+                },
+                if waking { "loader" } else { "queue-pause" },
+            )
+        } else if reconnecting {
+            (
+                format!("Reconnecting {}", noun.to_lowercase()),
+                self.status.clone(),
+                warning_color(),
+                "loader",
+            )
+        } else if dead {
+            (
+                format!("{noun} unavailable"),
+                self.remote_state.error.clone().unwrap_or_default(),
+                danger_color(),
+                "x",
+            )
+        } else {
+            (
+                if rejected {
+                    "Message rejected"
+                } else {
+                    "Connection problem"
+                }
+                .to_owned(),
+                self.remote_state.error.clone().unwrap_or_default(),
+                danger_color(),
+                "x",
+            )
+        };
+        let spinning = mark == "loader";
+        let mark: AnyElement = if spinning {
+            div()
+                .text_color(tone)
+                .child(crate::right_panel::spinner(
+                    "remote-notice-spin",
+                    "loader",
+                    14.,
+                ))
+                .into_any_element()
+        } else {
+            icon(mark, 14.).text_color(tone).into_any_element()
+        };
         let action = |id: &'static str, label: &'static str, action, cx: &mut Context<Self>| {
             crate::settings::widgets::secondary_button(id, label, false, false)
                 .debug_selector(move || id.into())
@@ -904,25 +1130,141 @@ impl Conversation {
                     cx.listener(move |this, _, _, cx| this.request_cloud_start_action(action, cx)),
                 )
         };
-        let compact = stopped;
-        Some(div().mx_2().my_2().rounded_lg().bg(content(0.04)).flex().items_center().gap_2().when(compact, |d| d.my_1().px_3().py_1().h(px(34.))).when(!compact, |d| d.p_3())
-            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(if let Some(error) = legacy {error.to_owned()} else if self.remote_state.pending {"A remote command needs confirmation. Retry uses its original command ID.".to_owned()} else if stopped {format!("{} stopped", match self.cloud_noun() {Some("sandbox") => "Sandbox", _ => "Codespace"})} else {self.remote_state.error.clone().unwrap_or_default()}))
+        let retry_label = if rejected { "Restore message" } else { "Retry" };
+        let header = div()
+            .id("remote-notice-header")
+            .debug_selector(|| "remote-notice-header".into())
+            .h(px(30.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(div().size(px(16.)).flex_shrink_0().child(mark))
+            .child(
+                div()
+                    .id("remote-notice-title")
+                    .debug_selector(|| "remote-notice-title".into())
+                    .flex_shrink_0()
+                    .text_color(if tone == content(0.45) {
+                        content(0.8)
+                    } else {
+                        tone
+                    })
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(title.clone()),
+            )
+            .child(
+                div()
+                    .id("remote-notice-message")
+                    .debug_selector(|| "remote-notice-message".into())
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(content(0.35))
+                    .child(message),
+            )
             .when(stopped, |d| {
-                let waking = self.remote_state.waking;
                 let label = if waking { "Resuming\u{2026}" } else { "Resume" };
-                d.child(crate::settings::widgets::secondary_button("cloud-resume",label,false,waking).debug_selector(|| "cloud-resume".into()).child(label).on_click(cx.listener(|this,_,_,cx| { if !this.remote_state.waking { this.reconnect_cloud(true, cx); } })))
+                d.child(
+                    crate::settings::widgets::secondary_button(
+                        "cloud-resume",
+                        label,
+                        false,
+                        waking,
+                    )
+                    .debug_selector(|| "cloud-resume".into())
+                    .child(label)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.remote_state.waking {
+                            this.reconnect_cloud(true, cx);
+                        }
+                    })),
+                )
             })
-            .when(dead, |d| d
-                .child(action("remote-archive-session", "Archive session", crate::cloud_start_view::StartAction::ArchiveSession, cx))
-                .child(action("remote-new-session", "New session", crate::cloud_start_view::StartAction::NewSession, cx)))
-            .when(legacy.is_none() && !self.remote_state.pending && !dead && !reconnecting && !stopped && self.is_cloud_session(), |d| d
-            .child(crate::settings::widgets::secondary_button("remote-reconnect","Reconnect",!self.remote_state.waking,false).debug_selector(|| "remote-reconnect".into()).child("Reconnect").on_click(cx.listener(|this,_,_,cx| { this.reconnect_cloud(true, cx); }))))
-            .when(self.remote_state.waking, |d| d
-            .child(crate::settings::widgets::secondary_button("remote-reconnect-cancel","Cancel",true,false).debug_selector(|| "remote-reconnect-cancel".into()).child("Cancel").on_click(cx.listener(|this,_,_,cx| { this.cancel_cloud_reconnect(cx); }))))
-            .when(legacy.is_none() && !dead && !reconnecting && !stopped, |d| d
-            .child(crate::settings::widgets::secondary_button("remote-retry",if self.remote_state.rejected.is_some() {"Restore message"} else {"Retry"},true,false).debug_selector(|| "remote-retry".into()).child(if self.remote_state.rejected.is_some() {"Restore message"} else {"Retry"}).on_click(cx.listener(|this,_,_,cx| {
-                if this.remote_state.rejected.is_some() { this.restore_remote_message(cx); } else {this.retry_remote(cx);}
-            })))).into_any_element())
+            .when(dead, |d| {
+                d.child(action(
+                    "remote-archive-session",
+                    "Archive session",
+                    crate::cloud_start_view::StartAction::ArchiveSession,
+                    cx,
+                ))
+                .child(action(
+                    "remote-new-session",
+                    "New session",
+                    crate::cloud_start_view::StartAction::NewSession,
+                    cx,
+                ))
+            })
+            .when(
+                legacy.is_none()
+                    && !pending
+                    && !dead
+                    && !reconnecting
+                    && !stopped
+                    && self.is_cloud_session(),
+                |d| {
+                    d.child(
+                        crate::settings::widgets::secondary_button(
+                            "remote-reconnect",
+                            "Reconnect",
+                            !waking,
+                            false,
+                        )
+                        .debug_selector(|| "remote-reconnect".into())
+                        .child("Reconnect")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reconnect_cloud(true, cx);
+                        })),
+                    )
+                },
+            )
+            .when(waking, |d| {
+                d.child(
+                    crate::settings::widgets::secondary_button(
+                        "remote-reconnect-cancel",
+                        "Cancel",
+                        true,
+                        false,
+                    )
+                    .debug_selector(|| "remote-reconnect-cancel".into())
+                    .child("Cancel")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cancel_cloud_reconnect(cx);
+                    })),
+                )
+            })
+            .when(
+                legacy.is_none() && !dead && !reconnecting && !stopped,
+                |d| {
+                    d.child(
+                        crate::settings::widgets::secondary_button(
+                            "remote-retry",
+                            retry_label,
+                            true,
+                            false,
+                        )
+                        .debug_selector(|| "remote-retry".into())
+                        .child(retry_label)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.remote_state.rejected.is_some() {
+                                this.restore_remote_message(cx);
+                            } else {
+                                this.retry_remote(cx);
+                            }
+                        })),
+                    )
+                },
+            );
+        let card = composer_shelf::card("remote-notice", self.classic_layout)
+            .debug_selector(|| "remote-notice".into())
+            .role(Role::Group)
+            .aria_label(title)
+            .child(header);
+        Some(
+            composer_shelf::shelf("remote-notice-shelf")
+                .px(px(8.))
+                .child(card)
+                .into_any_element(),
+        )
     }
     fn retry_remote(&mut self, cx: &mut Context<Self>) {
         if let Some(error) = self.remote_state.legacy_recovery_error() {

@@ -3048,6 +3048,7 @@ impl Conversation {
             .child(self.changes_shelf(window, cx))
             .child(self.background_shelf(window, cx))
             .child(self.cloud_target_panel(window, cx))
+            .children(self.remote_notice(cx))
             .child(self.cloud_start_panel(cx))
             .child(self.message_queue(window, cx))
             .children(if self.is_remote() { None } else { self.auth_notice(cx) })
@@ -3283,7 +3284,6 @@ impl Conversation {
             .children(runner.map(|runner| {
                 runner.cached(crate::composer_runner::Runner::placement())
             }))
-            .children(self.remote_notice(cx))
             .child(self.workspace_bar(cx))
             .into_any_element()
     }

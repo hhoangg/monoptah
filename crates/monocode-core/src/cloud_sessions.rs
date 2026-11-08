@@ -63,8 +63,8 @@
 //!   log, `Ready` or `Failed`) and is idempotent (first run, Retry, resume after a restart);
 //!   [`CloudSessions::rebuild_start`] and [`CloudSessions::start_web_url`] serve the
 //!   side-panel actions. Readers that need only a `&Store`: [`start_record`],
-//!   [`pending_starts`], [`starting_refusal`], [`queue_start_message`] and
-//!   [`queued_start_message`]. [`SessionTarget::startup`] carries the phase to the app API.
+//!   [`pending_starts`], [`starting_refusal`], [`queue_start_message`],
+//!   [`queued_start_messages`] and [`queued_start_message`]. [`SessionTarget::startup`] carries the phase to the app API.
 //!   `prepare_target` keeps its blocking behaviour (used by `sessions.start`).
 //!
 //! * Docker sandbox starts ([`docker_start`]): after [`CloudSessions::with_sandboxes`],
@@ -1456,8 +1456,8 @@ pub mod startup;
 pub mod view;
 pub mod view_cache;
 pub use startup::{
-    pending_starts, queue_start_message, queued_start_message, start_record, starting_refusal,
-    StartEvent, StartRecord, Step, StepKind, StepStatus,
+    pending_starts, queue_start_message, queued_start_message, queued_start_messages, start_record,
+    starting_refusal, StartEvent, StartRecord, Step, StepKind, StepStatus,
 };
 
 // These fixtures execute the Linux host scripts against local Unix paths.

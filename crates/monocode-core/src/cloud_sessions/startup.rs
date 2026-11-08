@@ -21,8 +21,9 @@
 //!    "Open in browser" URL.
 //!
 //! Readers need only a `&Store`: [`start_record`], [`pending_starts`], [`starting_refusal`]
-//! (the text for a send to a starting session) and [`queued_start_message`]. A message typed
-//! while starting is kept with [`queue_start_message`] as the session's first prompt.
+//! (the text for a send to a starting session) and [`queued_start_message`] (an app-launched
+//! first prompt). A message typed while starting is kept with [`queue_start_message`] in the
+//! session's send queue.
 //!
 //! # Steps
 //!
@@ -72,8 +73,10 @@ const LOG_STALE_MARGIN_MS: u64 = 60_000;
 pub const PROGRESS_PREFIX: &str = "[monoptah] ";
 /// Number of log lines kept in a [`StartRecord`] and persisted with a failure.
 pub const LOG_TAIL_LINES: usize = 40;
-/// Prefix of the id of the draft [`queue_start_message`] stores.
+/// Prefix of the id of the draft an app-launched first prompt is stored as.
 const APP_PROMPT: &str = "app-prompt-";
+/// Prefix of the id of a message [`queue_start_message`] adds to the send queue.
+const START_QUEUE: &str = "cloud-start-";
 /// How often the creation-log follower is (re)started while one start runs.
 const FOLLOW_ATTEMPTS: usize = 4;
 /// Refusal for a send to a session whose codespace is still starting, when the phase is not
@@ -638,29 +641,36 @@ pub fn starting_refusal(store: &Store, id: i64) -> Option<String> {
     })
 }
 
-/// Keeps `text` as the session's first prompt while its codespace starts: an unsent draft
-/// whose id starts with `app-prompt-` (the same mechanism as an app-launched prompt). When
-/// such a draft exists the text is appended after a blank line. An unrelated draft of the
-/// user is never touched: that is an `Err`.
+/// Keeps `text` as a message in the session's normal send queue while its workspace starts,
+/// exactly like a message queued behind a running turn. The conversation drains the queue once
+/// the workspace is ready and its history is loaded. The id starts with `cloud-start-`.
 pub fn queue_start_message(store: &Store, session_id: i64, text: &str) -> Result<(), String> {
     let mut state = store.follow_ups(session_id)?;
-    match state.draft.as_mut() {
-        Some(draft) if draft.id.starts_with(APP_PROMPT) => {
-            draft.text.push_str("\n\n");
-            draft.text.push_str(text);
-            state.revision += 1;
-            store.save_follow_ups(session_id, &state)
-        }
-        Some(_) => Err("This session already has a draft. Send or clear it first.".into()),
-        None => store.prepare_app_prompt(
-            session_id,
-            &format!("cloud-start-{}", uuid::Uuid::new_v4()),
-            text,
-        ),
-    }
+    state.messages.push(crate::follow_up::Message {
+        id: format!("{START_QUEUE}{}", uuid::Uuid::new_v4()),
+        text: text.to_owned(),
+        ..Default::default()
+    });
+    state.revision += 1;
+    store.save_follow_ups(session_id, &state)
 }
 
-/// The text [`queue_start_message`] kept for a session, if any.
+/// The texts [`queue_start_message`] left in the session's send queue, oldest first.
+pub fn queued_start_messages(store: &Store, id: i64) -> Vec<String> {
+    store
+        .follow_ups(id)
+        .map(|state| {
+            state
+                .messages
+                .into_iter()
+                .filter(|message| message.id.starts_with(START_QUEUE))
+                .map(|message| message.text)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The text of the app-launched first prompt kept as the session's unsent draft, if any.
 pub fn queued_start_message(store: &Store, id: i64) -> Option<String> {
     let draft = store.follow_ups(id).ok()?.draft?;
     draft.id.starts_with(APP_PROMPT).then_some(draft.text)

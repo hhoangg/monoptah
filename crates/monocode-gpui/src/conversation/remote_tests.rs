@@ -1388,6 +1388,8 @@ fn stopped_codespace(
                 let mut view = Conversation::new(summary, store.clone(), cx);
                 view.loaded = true;
                 view.remote_state.refreshing = true;
+                // The refresh after a resume reaches the (fake) host and succeeds.
+                view.remote_state.refresh_stub = Some(Ok(()));
                 view.set_cloud_stopped(true, cx);
                 view.input.update(cx, |input, cx| input.set_text(text, cx));
                 view
@@ -1491,11 +1493,57 @@ fn enter_with_text_while_stopped_wakes_once_and_sends_once_after_connect(cx: &mu
     assert_eq!(ensures(&host), 1, "{:?}", host.0.lock().unwrap());
     assert_eq!(launched(window, cx), vec!["fix it".to_owned()]);
     window
-        .update(cx, |view, _, _| {
+        .update(cx, |view, _, cx| {
             assert!(!view.cloud_stopped);
-            assert!(!view.remote_state.resume_send);
+            // The message stays queued until the runtime reports the command journaled. The
+            // fake host cannot take the turn, so it is still there (failed, never lost); the
+            // composer was emptied at once.
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            let id = view.follow_ups.state.messages[0].id.clone();
+            view.follow_up_delivered(&id, cx);
+            assert!(view.follow_ups.state.messages.is_empty());
+            assert_eq!(view.input.read(cx).content.as_ref(), "");
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn enter_with_text_while_stopped_moves_the_prompt_into_the_queue_before_the_resume_ends(
+    cx: &mut TestAppContext,
+) {
+    let (window, host) = stopped_codespace(cx, "fix it");
+    // Not online yet: the queue keeps the prompt while the wake runs.
+    submit(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            let queued: Vec<_> = view
+                .follow_ups
+                .state
+                .messages
+                .iter()
+                .map(|m| (m.text.clone(), m.steer))
+                .collect();
+            assert_eq!(queued, vec![("fix it".to_owned(), false)]);
+            assert_eq!(view.input.read(cx).content.as_ref(), "");
+            assert!(view.remote_state.waking);
+            // The queue holds still until the host is back.
+            view.pump_follow_ups(cx);
+        })
+        .unwrap();
+    assert!(launched(window, cx).is_empty());
+    assert_eq!(ensures(&host), 0, "the wake runs on a worker");
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 1);
+    // Reconnected, but the history load did not come back online in this fixture.
+    window
+        .update(cx, |view, _, cx| {
+            assert!(view.follow_ups.state.messages.len() <= 1);
+            view.remote_state.online = true;
+            view.pump_follow_ups(cx);
+            view.pump_follow_ups(cx);
+        })
+        .unwrap();
+    assert_eq!(launched(window, cx), vec!["fix it".to_owned()]);
 }
 
 #[gpui::test]
@@ -1587,13 +1635,14 @@ fn a_sandbox_resume_with_text_goes_through_the_user_path_and_never_the_codespace
     window
         .update(cx, |view, _, cx| {
             assert_eq!(view.status, super::remote::SANDBOX_STOPPED);
-            assert!(!view.remote_state.waking && !view.remote_state.resume_send);
+            assert!(!view.remote_state.waking);
             assert_eq!(view.input.read(cx).content.as_ref(), "fix it");
+            assert!(view.follow_ups.state.messages.is_empty());
         })
         .unwrap();
     assert!(host.0.lock().unwrap().is_empty() && gh.calls.lock().unwrap().is_empty());
     // The user's Enter takes the sandbox path; this fake has no sandbox backend, so the resume
-    // fails: nothing is sent, the text stays and the flag does not stick.
+    // fails: nothing is sent and the prompt stays in the queue.
     submit(window, cx);
     cx.run_until_parked();
     assert!(host.0.lock().unwrap().is_empty());
@@ -1601,64 +1650,83 @@ fn a_sandbox_resume_with_text_goes_through_the_user_path_and_never_the_codespace
     assert!(launched(window, cx).is_empty());
     window
         .update(cx, |view, _, cx| {
-            assert!(!view.remote_state.resume_send && !view.remote_state.waking);
-            assert_eq!(view.input.read(cx).content.as_ref(), "fix it");
+            assert!(!view.remote_state.waking);
+            assert_eq!(view.input.read(cx).content.as_ref(), "");
+            let queued: Vec<_> = view
+                .follow_ups
+                .state
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect();
+            assert_eq!(queued, vec!["fix it"]);
             assert!(view.status.contains("sandbox"), "{}", view.status);
         })
         .unwrap();
 }
 
 #[gpui::test]
-fn a_failed_resume_keeps_the_text_and_shows_the_error(cx: &mut TestAppContext) {
+fn a_failed_resume_keeps_the_prompt_in_the_queue_and_shows_the_error(cx: &mut TestAppContext) {
     let (window, _host) = stopped_codespace(cx, "fix it");
     window
         .update(cx, |view, _, cx| {
-            view.remote_state.resume_send = true;
-            view.busy = true;
-            // Cleared even though a busy view ignores the banner.
+            view.queue_composer_prompt(true, cx).unwrap();
             view.remote_connection_error("Could not reach the codespace", cx);
-            assert!(!view.remote_state.resume_send);
-            view.busy = false;
-            view.remote_connection_error("Could not reach the codespace", cx);
-            assert_eq!(view.input.read(cx).content.as_ref(), "fix it");
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            assert_eq!(view.follow_ups.state.messages[0].text, "fix it");
             assert_eq!(
                 view.remote_state.error.as_deref(),
                 Some("Could not reach the codespace")
             );
+            // Offline: the queue sends nothing, now or on a later pump.
+            view.pump_follow_ups(cx);
         })
         .unwrap();
     assert!(launched(window, cx).is_empty());
+    cx.run_until_parked();
+    // Back online (a successful Retry or Reconnect): the same prompt goes out, once.
+    window
+        .update(cx, |view, _, cx| {
+            view.remote_state.online = true;
+            view.cloud_stopped = false;
+            view.pump_follow_ups(cx);
+        })
+        .unwrap();
+    assert_eq!(launched(window, cx), vec!["fix it".to_owned()]);
 }
 
 #[gpui::test]
-fn a_running_turn_found_after_the_resume_keeps_the_prompt_instead_of_sending(
+fn a_running_turn_found_after_the_resume_leaves_the_prompt_waiting_in_the_queue(
     cx: &mut TestAppContext,
 ) {
     let (window, _host) = stopped_codespace(cx, "fix it");
     window
         .update(cx, |view, _, cx| {
-            view.remote_state.resume_send = true;
+            view.queue_composer_prompt(true, cx).unwrap();
             view.remote_state.online = true;
             view.cloud_stopped = false;
-            view.send_after_resume(true, cx);
-            assert!(!view.remote_state.resume_send);
-            assert_eq!(view.input.read(cx).content.as_ref(), "fix it");
-            assert!(view.status.contains("already running"), "{}", view.status);
+            // The load attached a turn that was already running.
+            view.busy = true;
+            view.pump_follow_ups(cx);
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
         })
         .unwrap();
     assert!(launched(window, cx).is_empty());
 }
 
 #[gpui::test]
-fn a_stuck_flag_is_dropped_when_the_workspace_is_still_stopped(cx: &mut TestAppContext) {
+fn a_still_stopped_workspace_does_not_drain_the_queue(cx: &mut TestAppContext) {
     let (window, _host) = stopped_codespace(cx, "fix it");
     window
         .update(cx, |view, _, cx| {
-            view.remote_state.resume_send = true;
+            view.queue_composer_prompt(true, cx).unwrap();
             view.remote_state.online = true;
             assert!(view.cloud_stopped);
-            view.send_after_resume(false, cx);
-            assert!(!view.remote_state.resume_send);
+            view.pump_follow_ups(cx);
+            view.remote_state.waking = true;
+            view.cloud_stopped = false;
+            view.pump_follow_ups(cx);
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
         })
         .unwrap();
     assert!(launched(window, cx).is_empty());
@@ -1672,9 +1740,300 @@ fn a_send_that_is_not_the_users_never_auto_sends_after_a_resume(cx: &mut TestApp
             assert!(!view.user_send);
             // The codespace keeps its existing wake path, but no prompt is queued for later.
             view.send(cx);
-            assert!(!view.remote_state.resume_send);
+            assert!(view.follow_ups.state.messages.is_empty());
         })
         .unwrap();
     cx.run_until_parked();
     assert!(launched(window, cx).is_empty());
+}
+
+#[gpui::test]
+fn every_remote_notice_variant_sits_above_the_composer(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::CloudRef;
+    type Setup = fn(&mut Conversation);
+    let sandbox = || CloudRef::sandbox("monoptah-fix-1234");
+    let cases: Vec<(&str, CloudRef, Setup, &str)> = vec![
+        (
+            "error",
+            CloudRef::codespace("octo-abc"),
+            |v| v.remote_state.error = Some("The host request did not complete.".into()),
+            "remote-retry",
+        ),
+        (
+            "rejected",
+            CloudRef::codespace("octo-abc"),
+            |v| {
+                v.remote_state.error = Some("Rejected".into());
+                v.remote_state.rejected = Some("text".into());
+            },
+            "remote-retry",
+        ),
+        (
+            "pending",
+            CloudRef::codespace("octo-abc"),
+            |v| v.remote_state.pending = true,
+            "remote-retry",
+        ),
+        (
+            "stopped",
+            CloudRef::codespace("octo-abc"),
+            |v| v.cloud_stopped = true,
+            "cloud-resume",
+        ),
+        (
+            "reconnecting",
+            sandbox(),
+            |v| {
+                v.remote_state.waking = true;
+                v.remote_state.wake_cancel =
+                    Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            },
+            "remote-reconnect-cancel",
+        ),
+        (
+            "dead",
+            sandbox(),
+            |v| v.remote_state.error = Some(RECREATED.into()),
+            "remote-archive-session",
+        ),
+    ];
+    for (name, cloud, setup, button) in cases {
+        let window = cloud_conversation(cx, cloud);
+        window
+            .update(cx, |view, _, cx| {
+                view.remote_state.online = false;
+                setup(view);
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let notice = visual
+            .debug_bounds("remote-notice")
+            .unwrap_or_else(|| panic!("{name}: no notice"));
+        let composer = visual.debug_bounds("composer-box").expect("composer");
+        assert!(
+            notice.bottom() <= composer.top(),
+            "{name}: {notice:?} {composer:?}"
+        );
+        let action = visual
+            .debug_bounds(button)
+            .unwrap_or_else(|| panic!("{name}: no {button}"));
+        // The actions are inside the card and right of the title.
+        let title = visual.debug_bounds("remote-notice-title").expect("title");
+        assert!(action.left() > title.left(), "{name}");
+        assert!(action.right() <= notice.right(), "{name}");
+    }
+}
+
+// ------------------------------------------------------ resume ordering and queue safety
+
+#[gpui::test]
+fn a_refresh_that_began_before_a_reconnect_is_ignored(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_stopped = false;
+            view.remote_state.online = true;
+            view.remote_state.refreshing = false;
+            // The old tunnel accepts but the stopped host never answers: a timeout.
+            view.remote_state.refresh_stub = Some(Err("The host request did not complete.".into()));
+            view.refresh_remote_snapshot(cx);
+            assert!(view.remote_state.refreshing);
+            // The reconnect starts while that request is still in flight.
+            view.remote_state.epoch += 1;
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert!(view.remote_state.online);
+            assert!(view.remote_state.error.is_none());
+            // No newer refresh took over, so the stale one released the flag.
+            assert!(!view.remote_state.refreshing);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_stale_refresh_does_not_keep_the_flag_when_no_newer_refresh_runs_and_yields_to_one_that_does(
+    cx: &mut TestAppContext,
+) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_stopped = false;
+            view.remote_state.refreshing = false;
+            view.remote_state.refresh_stub = Some(Ok(()));
+            view.refresh_remote_snapshot(cx);
+            // The reconnect failed or was cancelled: epoch moved, nothing new started.
+            view.remote_state.epoch += 1;
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert!(!view.remote_state.refreshing);
+            // A newer refresh in flight keeps its flag when an older answer lands.
+            view.refresh_remote_snapshot(cx);
+            view.remote_state.epoch += 1;
+            view.remote_state.refreshing = false;
+            view.refresh_remote_snapshot(cx);
+            assert!(view.remote_state.refreshing);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| assert!(!view.remote_state.refreshing))
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_clock_skips_a_stopped_or_waking_workspace(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, _| {
+            view.history_unloaded = false;
+            assert!(view.cloud_stopped);
+            assert!(!view.background_refresh_due());
+            view.cloud_stopped = false;
+            assert!(view.background_refresh_due());
+            view.remote_state.waking = true;
+            assert!(!view.background_refresh_due());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_resume_whose_fresh_refresh_fails_sends_nothing_and_keeps_the_prompt(cx: &mut TestAppContext) {
+    let (window, host) = stopped_codespace(cx, "fix it");
+    window
+        .update(cx, |view, _, _| {
+            view.remote_state.online = true;
+            view.remote_state.refreshing = false;
+            view.remote_state.refresh_stub = Some(Err("The host request did not complete.".into()));
+        })
+        .unwrap();
+    submit(window, cx);
+    cx.run_until_parked();
+    assert_eq!(ensures(&host), 1);
+    assert!(launched(window, cx).is_empty());
+    window
+        .update(cx, |view, _, _| {
+            assert!(!view.remote_state.online);
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            assert!(view.remote_state.error.is_some());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_drained_prompt_stays_queued_while_it_is_being_sent(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "fix it");
+    let id = window
+        .update(cx, |view, _, cx| {
+            view.cloud_stopped = false;
+            view.remote_state.online = true;
+            view.queue_composer_prompt(true, cx).unwrap()
+        })
+        .unwrap();
+    // The save comes back and the queue pumps; the worker has not run yet.
+    cx.executor().run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert_eq!(view.launched, vec!["fix it".to_owned()]);
+            // Not removed at launch: only the runtime's receipt does that.
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            assert_eq!(view.settings.mono_message_id, None);
+            // A failure before the command was journaled keeps the prompt with its error.
+            view.fail_follow_up(&id, "boom".into(), cx);
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            assert_eq!(
+                view.follow_ups.state.messages[0].error.as_deref(),
+                Some("boom")
+            );
+            assert!(view.follow_ups.state.paused);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn retrying_a_remote_queue_sends_no_continue_prompt(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_stopped = false;
+            view.remote_state.online = false;
+            view.input
+                .update(cx, |input, cx| input.set_text("fix it".into(), cx));
+            let id = view.queue_composer_prompt(true, cx).unwrap();
+            view.fail_follow_up(&id, "boom".into(), cx);
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            view.remote_state.online = true;
+            view.resume_queue(cx);
+            assert!(!view.follow_ups.state.paused);
+            assert!(view.follow_ups.state.messages[0].error.is_none());
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            // The queued prompt itself goes out; the synthetic continue text never does.
+            assert_eq!(view.launched, vec!["fix it".to_owned()]);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_blocked_head_message_pauses_the_queue_with_a_retry(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "");
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_stopped = false;
+            view.remote_state.online = true;
+            view.remote_state.capabilities.clear();
+            view.attachments = vec![PathBuf::from("/tmp/a.png")];
+            view.input
+                .update(cx, |input, cx| input.set_text("see this".into(), cx));
+            view.queue_composer_prompt(true, cx).unwrap();
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert!(view.launched.is_empty());
+            assert!(view.follow_ups.state.paused);
+            assert!(view.follow_ups.state.messages[0].error.is_some());
+            // Retry clears it; the capability is still missing, so it blocks again, visibly.
+            view.resume_queue(cx);
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert!(view.follow_ups.state.paused);
+            assert!(view.follow_ups.state.messages[0].error.is_some());
+            assert!(view.launched.is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn queued_messages_of_a_remote_session_offer_no_steer(cx: &mut TestAppContext) {
+    let (window, _host) = stopped_codespace(cx, "fix it");
+    submit(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.follow_ups.state.messages.is_empty() || !view.launched.is_empty())
+        })
+        .unwrap();
+    assert!(visual.debug_bounds("queue-steer").is_none());
 }

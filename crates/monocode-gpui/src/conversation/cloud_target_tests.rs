@@ -227,9 +227,20 @@ fn enter_with_text_creates_once_and_sends_the_prompt_with_the_request(cx: &mut T
     window
         .update(cx, |view, _, cx| {
             user_send(view, cx);
-            // Nothing was sent locally and the composer text stays until the answer.
+            // Nothing was sent locally: the prompt left the composer for the queue shelf and
+            // waits there, once, until the answer.
             assert!(!view.busy);
-            assert_eq!(view.input.read(cx).content.as_ref(), "  fix it  ");
+            assert_eq!(view.input.read(cx).content.as_ref(), "");
+            let queued: Vec<_> = view
+                .follow_ups
+                .state
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect();
+            assert_eq!(queued, vec!["fix it"]);
+            view.pump_follow_ups(cx);
+            assert!(view.launched.is_empty());
         })
         .unwrap();
     let requests = requests.lock().unwrap();
@@ -581,9 +592,12 @@ fn an_answer_for_another_request_is_ignored(cx: &mut TestAppContext) {
         .update(cx, |view, _, cx| {
             view.cloud_create_finished(id + 1, Ok(true), cx);
             assert!(view.cloud_creating());
-            assert_eq!(view.input.read(cx).content.as_ref(), "keep me");
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
             view.cloud_create_finished(id, Ok(true), cx);
             assert!(view.cloud_draft.is_none());
+            // The new session holds the stored copy now; this draft keeps no queued one.
+            assert!(view.follow_ups.state.messages.is_empty());
+            assert_eq!(view.input.read(cx).content.as_ref(), "");
             // With no draft left, a late answer changes nothing.
             view.input
                 .update(cx, |input, cx| input.set_text("local".into(), cx));
@@ -1771,4 +1785,142 @@ fn sends_that_are_not_the_users_never_create_a_cloud_resource(cx: &mut TestAppCo
         .unwrap();
     cx.run_until_parked();
     assert!(requests.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn a_create_that_ends_without_taking_the_prompt_puts_it_back_in_the_composer(
+    cx: &mut TestAppContext,
+) {
+    for result in [Err("boom".to_owned()), Ok(false)] {
+        let window = conversation(cx, PROJECT, false);
+        let requests = watch(window, cx);
+        window
+            .update(cx, |view, _, cx| {
+                save_config(view);
+                view.cloud_menu_choice("workspace:cloud-docker", cx);
+                type_prompt(view, "keep me", cx);
+                view.create_cloud(cx);
+                assert_eq!(view.follow_ups.state.messages.len(), 1);
+                assert_eq!(view.input.read(cx).content.as_ref(), "");
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let id = requests.lock().unwrap()[0].request_id;
+        window
+            .update(cx, |view, _, cx| {
+                view.cloud_create_finished(id, result.clone(), cx);
+                assert!(view.follow_ups.state.messages.is_empty());
+                assert!(view.follow_ups.sending.is_none());
+                assert_eq!(view.input.read(cx).content.as_ref(), "keep me");
+            })
+            .unwrap();
+    }
+}
+
+#[gpui::test]
+fn the_prompt_waiting_for_a_create_shows_in_the_queue_shelf_not_the_composer(
+    cx: &mut TestAppContext,
+) {
+    let window = conversation(cx, PROJECT, false);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            type_prompt(view, "fix it", cx);
+        })
+        .unwrap();
+    draw(visual);
+    assert!(visual.debug_bounds("message-queue-card").is_none());
+    window
+        .update(visual, |view, _, cx| user_send(view, cx))
+        .unwrap();
+    draw(visual);
+    assert!(visual.debug_bounds("message-queue-card").is_some());
+}
+
+#[gpui::test]
+fn the_prompt_held_for_a_create_is_never_persisted_with_the_local_draft(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            type_prompt(view, "fix it", cx);
+            view.create_cloud(cx);
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            // Another save while the create runs must not store the held prompt.
+            view.save_follow_ups(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            // Still shown in the queue shelf after the save came back.
+            assert_eq!(view.follow_ups.state.messages.len(), 1);
+            let id = view.summary.id;
+            let stored = view.store.lock().unwrap().follow_ups(id).unwrap().messages;
+            assert!(stored.is_empty(), "{stored:?}");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn plan_mode_stays_on_with_a_note_after_a_create(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            type_prompt(view, "fix it", cx);
+            view.settings.plan = true;
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let id = requests.lock().unwrap()[0].request_id;
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_create_finished(id, Ok(true), cx);
+            assert!(view.settings.plan);
+            assert!(
+                view.status.contains("stay in the composer"),
+                "{}",
+                view.status
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_save_that_returns_after_the_create_finished_does_not_requeue_the_prompt(
+    cx: &mut TestAppContext,
+) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            type_prompt(view, "fix it", cx);
+            view.create_cloud(cx);
+            view.save_follow_ups(cx);
+        })
+        .unwrap();
+    let id = requests.lock().unwrap()[0].request_id;
+    // The create finishes before the save comes back.
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_create_finished(id, Ok(true), cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert!(view.follow_ups.state.messages.is_empty());
+            assert!(view.launched.is_empty());
+        })
+        .unwrap();
 }

@@ -845,27 +845,29 @@ fn rebuild_resets_the_steps_and_the_browser_url_is_known() {
 // ------------------------------------------------------------ queue + refusal
 
 #[test]
-fn a_message_typed_while_starting_is_kept_as_the_first_prompt() {
+fn a_message_typed_while_starting_joins_the_send_queue_in_order() {
     let f = fx(Gh::new(&[], &[]));
     let (session, _) = f.svc.begin_start("/p", named_target(), "claude").unwrap();
     let store = f.store.lock().unwrap();
-    assert_eq!(queued_start_message(&store, session.id), None);
+    assert!(queued_start_messages(&store, session.id).is_empty());
     queue_start_message(&store, session.id, "Fix the bug").unwrap();
-    assert_eq!(
-        queued_start_message(&store, session.id).as_deref(),
-        Some("Fix the bug")
-    );
-    let draft = store.follow_ups(session.id).unwrap().draft.unwrap();
-    assert!(draft.id.starts_with("app-prompt-"));
     queue_start_message(&store, session.id, "Then add a test").unwrap();
     assert_eq!(
-        queued_start_message(&store, session.id).as_deref(),
-        Some("Fix the bug\n\nThen add a test")
+        queued_start_messages(&store, session.id),
+        vec!["Fix the bug".to_owned(), "Then add a test".to_owned()]
     );
+    let state = store.follow_ups(session.id).unwrap();
+    assert!(state
+        .messages
+        .iter()
+        .all(|m| m.id.starts_with("cloud-start-")));
+    assert!(!state.messages.iter().any(|m| m.steer));
+    // The app-launched draft is a separate mechanism.
+    assert_eq!(queued_start_message(&store, session.id), None);
 }
 
 #[test]
-fn an_unrelated_draft_is_never_overwritten() {
+fn queuing_a_start_message_never_touches_the_users_draft() {
     let f = fx(Gh::new(&[], &[]));
     let (session, _) = f.svc.begin_start("/p", named_target(), "claude").unwrap();
     let store = f.store.lock().unwrap();
@@ -876,8 +878,8 @@ fn an_unrelated_draft_is_never_overwritten() {
         ..Default::default()
     });
     store.save_follow_ups(session.id, &state).unwrap();
-    assert!(queue_start_message(&store, session.id, "x").is_err());
-    assert_eq!(queued_start_message(&store, session.id), None);
+    queue_start_message(&store, session.id, "x").unwrap();
+    assert_eq!(queued_start_messages(&store, session.id), vec!["x"]);
     assert_eq!(
         store.follow_ups(session.id).unwrap().draft.unwrap().text,
         "mine"
