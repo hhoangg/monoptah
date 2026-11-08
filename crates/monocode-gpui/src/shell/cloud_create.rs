@@ -6,8 +6,18 @@
 use super::*;
 use crate::conversation::cloud_target::{CloudCreate, CloudTarget};
 use monocode_core::cloud_sessions::{
-    CloudSessions, CodespaceChoice, HARNESS, StartRecord, queue_start_message,
+    CloudSessions, CodespaceChoice, HARNESS, StartRecord, Target, queue_start_message,
 };
+
+/// The target `begin_start` gets for a codespace request: the branch and the machine picked in
+/// the panel (`None` keeps the default machine).
+pub(super) fn codespace_target(request: &CloudCreate) -> Result<Target, String> {
+    cloud_picker::target_for(
+        CodespaceChoice::New,
+        &request.branch,
+        request.machine.as_deref(),
+    )
+}
 
 /// Creates the resource and the session for `request`. Blocking: call it on a worker.
 pub(super) fn begin_cloud_create(
@@ -16,10 +26,11 @@ pub(super) fn begin_cloud_create(
 ) -> Result<(Session, StartRecord), String> {
     match request.target {
         CloudTarget::Codespace => {
-            let target = cloud_picker::target_for(CodespaceChoice::New, &request.branch, None)?;
-            cloud_picker::begin_cloud_start(cloud, &request.project, target)
+            cloud_picker::begin_cloud_start(cloud, &request.project, codespace_target(request)?)
         }
         CloudTarget::DockerSandbox => {
+            // The config already carries this session's overrides; `begin_sandbox_start`
+            // validates it again.
             let config = request
                 .config
                 .as_ref()
@@ -43,6 +54,28 @@ impl Shell {
                 && self.github_projects.get(&cwd).copied().unwrap_or(false);
             view.update(cx, |view, cx| view.set_offers_codespace(offers, cx));
         }
+    }
+
+    /// Tells every conversation whether the workspace of its session is cached as Stopped.
+    pub(super) fn sync_cloud_stopped(&mut self, cx: &mut Context<Self>) {
+        for (id, view) in &self.sessions {
+            let stopped = self.cloud_marks.get(id).is_some_and(|mark| {
+                !mark.codespace.is_empty()
+                    && self.cloud_states.get(&mark.key())
+                        == Some(&monocode_core::cloud_sessions::CloudState::Stopped)
+            });
+            view.update(cx, |view, cx| view.set_cloud_stopped(stopped, cx));
+        }
+    }
+
+    /// How a conversation lists the machine types of its repository: `gh api` on the worker.
+    pub(super) fn machine_loader(&self) -> crate::conversation::cloud_target::MachineLoader {
+        let cloud = self.cloud.clone();
+        let gh = self.gh.clone();
+        Arc::new(move |project| {
+            let repo = cloud.repo_for(&project)?;
+            monocode_core::codespaces::list_machines(&*gh, &repo)
+        })
     }
 
     pub(super) fn create_cloud_session(

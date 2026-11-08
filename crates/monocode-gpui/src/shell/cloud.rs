@@ -887,6 +887,23 @@ impl Shell {
         self.cloud_marks.contains_key(&id)
     }
 
+    /// The user resumed the workspace of session `id`: it is no longer Stopped, whatever an
+    /// older refresh says. The cached state flips at once (hiding the banner and the menu entry)
+    /// and the real state is read again, after the refresh in flight if there is one.
+    pub(super) fn cloud_resumed(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Some(mark) = self.cloud_marks.get(&id) {
+            self.cloud_states.insert(mark.key(), CloudState::Available);
+        }
+        self.sync_cloud_stopped(cx);
+        self.invalidate_chrome(cx);
+        if self.cloud_refreshing {
+            self.cloud_refresh_again = true;
+        } else {
+            self.refresh_cloud(cx);
+        }
+        cx.notify();
+    }
+
     pub(super) fn refresh_cloud(&mut self, cx: &mut Context<Self>) {
         if self.cloud_refreshing {
             return;
@@ -905,12 +922,20 @@ impl Shell {
             .spawn(async move { collect(&cloud, &projects, &unchecked) });
         cx.spawn(async move |this, cx| {
             let snapshot = work.await;
-            let _ = this.update(cx, |this, cx| {
-                this.cloud_refreshing = false;
-                this.apply_cloud_snapshot(snapshot, cx);
-            });
+            let _ = this.update(cx, |this, cx| this.finish_cloud_refresh(snapshot, cx));
         })
         .detach();
+    }
+
+    /// A refresh answered. When a resume happened while it ran, it may still say Stopped: it is
+    /// dropped and the state is read again.
+    pub(super) fn finish_cloud_refresh(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        self.cloud_refreshing = false;
+        if std::mem::take(&mut self.cloud_refresh_again) {
+            self.refresh_cloud(cx);
+        } else {
+            self.apply_cloud_snapshot(snapshot, cx);
+        }
     }
 
     pub(super) fn apply_cloud_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
@@ -928,6 +953,7 @@ impl Shell {
         self.sync_codespace_offers(cx);
         self.cloud_marks = snapshot.marks;
         self.cloud_states = snapshot.states;
+        self.sync_cloud_stopped(cx);
         if changed {
             self.invalidate_chrome(cx);
             cx.notify();

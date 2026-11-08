@@ -720,6 +720,8 @@ pub(crate) struct Shell {
     cloud_origins: HashMap<i64, String>,
     cloud_gone: std::collections::HashSet<String>,
     cloud_refreshing: bool,
+    /// A resume happened while a refresh was in flight: its answer is stale, read again.
+    cloud_refresh_again: bool,
     cloud_archive: Option<cloud::ArchiveDialog>,
     /// Saves the local copy of a cloud session before its codespace is stopped or deleted.
     cloud_convert: cloud::ConvertFn,
@@ -1179,6 +1181,7 @@ impl Shell {
             cloud_origins: HashMap::new(),
             cloud_gone: Default::default(),
             cloud_refreshing: false,
+            cloud_refresh_again: false,
             cloud_archive: None,
             cloud_convert: cloud::default_convert(),
             cloud_busy: HashSet::new(),
@@ -1584,6 +1587,15 @@ impl Shell {
                 view.set_app_environment(bridge.environment(id));
             }
             view.set_offers_codespace(offers, cx);
+            view.set_machine_loader(self.machine_loader());
+            view.set_cloud_stopped(
+                self.cloud_marks.get(&id).is_some_and(|mark| {
+                    !mark.codespace.is_empty()
+                        && self.cloud_states.get(&mark.key())
+                            == Some(&monocode_core::cloud_sessions::CloudState::Stopped)
+                }),
+                cx,
+            );
             view.set_project_appearance(appearance, cx);
             view.transcript.update(cx, |transcript, cx| {
                 transcript.apply_preferences(&self.workspace.preferences, cx)
@@ -1592,6 +1604,10 @@ impl Shell {
                 view.set_cloud_start(Some(start), cx);
             }
         });
+        self.observations.push(cx.subscribe(
+            &view,
+            move |this, _, _: &crate::conversation::CloudResumed, cx| this.cloud_resumed(id, cx),
+        ));
         self.observations.push(cx.subscribe(
             &view,
             move |this, _, event: &crate::conversation::cloud_target::CreateCloudSession, cx| {

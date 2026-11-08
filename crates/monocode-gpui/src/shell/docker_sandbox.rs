@@ -4,7 +4,6 @@ use super::*;
 use crate::docker_dialog::{self, DockerDialog, model::AccountChoice};
 use crate::git_credential_dialog::{self, GitCredentialDialog};
 use gpui::AnyView;
-use monocode_core::accounts::ClaudeCredential;
 
 pub(super) struct OpenDocker {
     view: Entity<DockerDialog>,
@@ -20,24 +19,7 @@ struct OpenCredential {
 impl Shell {
     /// The Claude accounts that hold a setup-token or an API key.
     fn docker_accounts(&self, cx: &Context<Self>) -> Vec<AccountChoice> {
-        let Some(center) = crate::accounts::get(cx) else {
-            return Vec::new();
-        };
-        let center = center.read(cx);
-        center
-            .book
-            .list(Kind::Claude)
-            .into_iter()
-            .filter(|account| center.uses_claude_token(&account.id))
-            .map(|account| AccountChoice {
-                kind: match center.claude_credential(&account.id) {
-                    Some(ClaudeCredential::ApiKey) => "API key",
-                    _ => "setup-token",
-                },
-                id: account.id,
-                label: account.label,
-            })
-            .collect()
+        docker_dialog::claude_accounts(cx)
     }
 
     pub(super) fn open_docker_dialog(

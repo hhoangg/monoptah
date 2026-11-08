@@ -561,6 +561,19 @@ impl Shell {
                         items.push(MenuAction::new("codespace-stop-live", label).into());
                     }
                 }
+                // A stopped workspace is resumed only by this click: the cached state is
+                // Stopped (not Stopping or Unavailable) and the name is known.
+                if !mark.codespace.is_empty()
+                    && self.cloud_states.get(&mark.key()) == Some(&CloudState::Stopped)
+                {
+                    items.push(
+                        MenuAction::new(
+                            "cloud-resume",
+                            format!("Resume {} {}", mark.kind.noun(), mark.codespace),
+                        )
+                        .into(),
+                    );
+                }
                 if mark.kind == CloudBackendKind::DockerSandbox {
                     let state = self.cloud_states.get(&mark.key()).copied();
                     let stopped = state == Some(CloudState::Stopped);
@@ -684,6 +697,18 @@ impl Shell {
                 };
                 let target = mark.cloud();
                 self.run_workspace_action(target, cloud::ArchiveChoice::Stop, window, cx)
+            }
+            "cloud-resume" => {
+                let stopped = self.cloud_marks.get(&id).is_some_and(|mark| {
+                    !mark.codespace.is_empty()
+                        && self.cloud_states.get(&mark.key()) == Some(&CloudState::Stopped)
+                });
+                if stopped && let Some(view) = self.ensure_session(id, cx) {
+                    // The user's own click: the same path as the Reconnect button.
+                    view.update(cx, |view, cx| {
+                        view.reconnect_cloud(true, cx);
+                    });
+                }
             }
             "codespace-delete" => {
                 self.run_origin_codespace_action(id, cloud::ArchiveChoice::Delete, window, cx)

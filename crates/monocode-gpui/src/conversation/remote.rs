@@ -25,6 +25,11 @@ impl State {
             .map(|rejected| rejected["error"].as_str().unwrap_or("Older pending requests could not be linked to one conversation. Open the original desktop to recover them."))
     }
 }
+/// Emitted when a user-initiated reconnect (Resume or Reconnect) succeeded, so the shell
+/// refreshes the cached cloud state.
+pub(crate) struct CloudResumed;
+impl EventEmitter<CloudResumed> for Conversation {}
+
 /// Shown instead of reconnecting a Docker sandbox for a send that is not the user's own.
 pub(super) const SANDBOX_STOPPED: &str = "Sandbox is stopped. Choose Reconnect to start it.";
 
@@ -239,7 +244,7 @@ impl Conversation {
     /// `user` says the call comes from the user's own hand (the Reconnect button or a send
     /// typed in this view). A Docker sandbox is resumed (and billed) only then: for any other
     /// origin (a Mono, a workflow, the app API) this refuses and returns false.
-    pub(super) fn reconnect_cloud(&mut self, user: bool, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn reconnect_cloud(&mut self, user: bool, cx: &mut Context<Self>) -> bool {
         if !self.is_cloud_session() {
             return false;
         }
@@ -283,6 +288,8 @@ impl Conversation {
                 match result {
                     Ok(true) => {
                         this.remote_state.error = None;
+                        this.cloud_stopped = false;
+                        cx.emit(CloudResumed);
                         this.load_remote(cx);
                     }
                     Ok(false) => this.remote_connection_error(
@@ -757,6 +764,25 @@ impl Conversation {
             && !self.remote_state.pending
             && self.cloud_noun() == Some("sandbox")
     }
+    /// The shell tells whether its cached state of this session's workspace is Stopped.
+    pub(crate) fn set_cloud_stopped(&mut self, stopped: bool, cx: &mut Context<Self>) {
+        if self.cloud_stopped != stopped {
+            self.cloud_stopped = stopped;
+            cx.notify();
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn cloud_stopped_for_test(&self) -> bool {
+        self.cloud_stopped
+    }
+    /// The slim "Codespace stopped" / "Sandbox stopped" banner with a Resume button applies:
+    /// the workspace is stopped and nothing else (an error, a pending command) needs the notice.
+    fn cloud_stopped_banner(&self) -> bool {
+        self.cloud_stopped
+            && self.remote_state.error.is_none()
+            && !self.remote_state.pending
+            && self.is_cloud_session()
+    }
     /// The sandbox is deleted or its container was recreated: Reconnect can not help.
     fn sandbox_unrecoverable(&self) -> bool {
         self.remote_state
@@ -766,10 +792,14 @@ impl Conversation {
             && self.cloud_noun() == Some("sandbox")
     }
     pub(super) fn remote_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let reconnecting = self.sandbox_reconnecting();
+        let stopped = self.is_remote() && self.cloud_stopped_banner();
+        let reconnecting = self.sandbox_reconnecting() || (stopped && self.remote_state.waking);
         if !self.is_remote()
             || self.busy
-            || (self.remote_state.error.is_none() && !self.remote_state.pending && !reconnecting)
+            || (self.remote_state.error.is_none()
+                && !self.remote_state.pending
+                && !reconnecting
+                && !stopped)
         {
             return None;
         }
@@ -784,15 +814,17 @@ impl Conversation {
                 )
         };
         Some(div().mx_2().my_2().p_3().rounded_lg().bg(content(0.04)).flex().items_center().gap_2()
-            .child(div().flex_1().text_size(px(12.)).child(if let Some(error) = legacy {error.to_owned()} else if self.remote_state.pending {"A remote command needs confirmation. Retry uses its original command ID.".to_owned()} else if reconnecting {self.status.clone()} else {self.remote_state.error.clone().unwrap_or_default()}))
+            .child(div().flex_1().text_size(px(12.)).child(if let Some(error) = legacy {error.to_owned()} else if self.remote_state.pending {"A remote command needs confirmation. Retry uses its original command ID.".to_owned()} else if reconnecting {self.status.clone()} else if stopped {format!("{} stopped", match self.cloud_noun() {Some("sandbox") => "Sandbox", _ => "Codespace"})} else {self.remote_state.error.clone().unwrap_or_default()}))
+            .when(stopped && !reconnecting, |d| d
+            .child(crate::settings::widgets::secondary_button("cloud-resume","Resume",false,false).debug_selector(|| "cloud-resume".into()).child("Resume").on_click(cx.listener(|this,_,_,cx| { this.reconnect_cloud(true, cx); }))))
             .when(dead, |d| d
                 .child(action("remote-archive-session", "Archive session", crate::cloud_start_view::StartAction::ArchiveSession, cx))
                 .child(action("remote-new-session", "New session", crate::cloud_start_view::StartAction::NewSession, cx)))
-            .when(legacy.is_none() && !self.remote_state.pending && !dead && !reconnecting && self.is_cloud_session(), |d| d
+            .when(legacy.is_none() && !self.remote_state.pending && !dead && !reconnecting && !stopped && self.is_cloud_session(), |d| d
             .child(crate::settings::widgets::secondary_button("remote-reconnect","Reconnect",!self.remote_state.waking,false).debug_selector(|| "remote-reconnect".into()).child("Reconnect").on_click(cx.listener(|this,_,_,cx| { this.reconnect_cloud(true, cx); }))))
             .when(self.remote_state.waking, |d| d
             .child(crate::settings::widgets::secondary_button("remote-reconnect-cancel","Cancel",true,false).debug_selector(|| "remote-reconnect-cancel".into()).child("Cancel").on_click(cx.listener(|this,_,_,cx| { this.cancel_cloud_reconnect(cx); }))))
-            .when(legacy.is_none() && !dead && !reconnecting, |d| d
+            .when(legacy.is_none() && !dead && !reconnecting && !stopped, |d| d
             .child(crate::settings::widgets::secondary_button("remote-retry",if self.remote_state.rejected.is_some() {"Restore message"} else {"Retry"},true,false).debug_selector(|| "remote-retry".into()).child(if self.remote_state.rejected.is_some() {"Restore message"} else {"Retry"}).on_click(cx.listener(|this,_,_,cx| {
                 if this.remote_state.rejected.is_some() { this.restore_remote_message(cx); } else {this.retry_remote(cx);}
             })))).into_any_element())

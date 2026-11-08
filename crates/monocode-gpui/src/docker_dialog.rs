@@ -30,6 +30,29 @@ use std::{
     sync::Arc,
 };
 
+/// The Claude accounts that hold a setup-token or an API key: the ones a sandbox can use.
+pub(crate) fn claude_accounts(cx: &gpui::App) -> Vec<AccountChoice> {
+    use monocode_core::{accounts::ClaudeCredential, provider::Kind};
+    let Some(center) = crate::accounts::get(cx) else {
+        return Vec::new();
+    };
+    let center = center.read(cx);
+    center
+        .book
+        .list(Kind::Claude)
+        .into_iter()
+        .filter(|account| center.uses_claude_token(&account.id))
+        .map(|account| AccountChoice {
+            kind: match center.claude_credential(&account.id) {
+                Some(ClaudeCredential::ApiKey) => "API key",
+                _ => "setup-token",
+            },
+            id: account.id,
+            label: account.label,
+        })
+        .collect()
+}
+
 pub(crate) enum Event {
     Close,
     /// Open the Git credential dialog for this repository, with this profile selected.

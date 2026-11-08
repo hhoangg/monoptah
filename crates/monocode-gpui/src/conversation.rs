@@ -21,7 +21,9 @@ mod mono;
 mod notifications;
 mod question_api;
 pub(crate) use question_api::{QuestionAsked, QuestionSettled};
+mod cloud_panel;
 mod remote;
+pub(crate) use remote::CloudResumed;
 pub(crate) mod remote_plans;
 mod response_menu;
 #[cfg(test)]
@@ -113,6 +115,8 @@ fn tint(color: u32, alpha: f32) -> gpui::Hsla {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ComposerMenu {
+    /// A setting of the cloud panel above the composer.
+    CloudField(cloud_target::CloudField),
     Add,
     Model,
     /// ModelPicker's recent models, on right-click or `App: Switch Model`.
@@ -158,6 +162,11 @@ pub(crate) struct Conversation {
     cloud_placeholder: Option<SharedString>,
     /// The shell says the project is a GitHub repository, so Codespace can be chosen.
     cloud_offers_codespace: bool,
+    /// The shell's cached state says this cloud session's workspace is stopped.
+    cloud_stopped: bool,
+    /// Lists the machine types of a project's repository for the codespace panel.
+    machine_loader: Option<cloud_target::MachineLoader>,
+    cloud_anchors: [AnchorSlot; 4],
     /// "RUN ON CLOUD": the target chosen in the Workspace menu, until it is created.
     cloud_draft: Option<cloud_target::CloudDraft>,
     /// Counts "Create and open" presses, so a late answer only applies to its own draft.
@@ -757,6 +766,9 @@ impl Conversation {
             cloud_queued: None,
             cloud_placeholder: None,
             cloud_offers_codespace: false,
+            cloud_stopped: false,
+            machine_loader: None,
+            cloud_anchors: Default::default(),
             cloud_draft: None,
             cloud_request_seq: 0,
             docker_config_cache: Default::default(),
@@ -2462,6 +2474,7 @@ impl Conversation {
     }
     fn anchor(&self, kind: ComposerMenu) -> &AnchorSlot {
         match kind {
+            ComposerMenu::CloudField(field) => &self.cloud_anchors[field.index()],
             ComposerMenu::Add => &self.add_anchor,
             ComposerMenu::Model | ComposerMenu::Recent => &self.model_anchor,
             ComposerMenu::Access => &self.access_anchor,
@@ -2555,6 +2568,10 @@ impl Conversation {
     ) -> (&'static str, Vec<MenuItem>, f32, MenuStyle) {
         let provider = Kind::from_id(&self.summary.provider);
         match kind {
+            ComposerMenu::CloudField(field) => {
+                let (label, items) = self.cloud_field_menu(field);
+                (label, items, 250., MenuStyle::Explorer)
+            }
             ComposerMenu::Account => {
                 let items = crate::accounts::get(cx)
                     .map(|center| {
@@ -2982,6 +2999,7 @@ impl Conversation {
             .children(if self.is_remote() { None } else { self.usage_notice(false, cx) })
             .child(self.changes_shelf(window, cx))
             .child(self.background_shelf(window, cx))
+            .child(self.cloud_target_panel(window, cx))
             .child(self.message_queue(window, cx))
             .children(if self.is_remote() { None } else { self.auth_notice(cx) })
             .when(self.settings.worktree_removed,|d|d.child(div().mb_2().p_3().rounded_lg().border_1().border_color(content(0.1)).flex().items_center().gap_3().text_size(px(12.)).child(div().flex_1().child("Worktree deleted. Select a branch or worktree to continue this conversation.")).child(tool_pill("reattach-worktree","Select worktree").child("Select worktree").on_click(cx.listener(|this,_,window,cx|this.open_git(GitMode::Worktree,window,cx))))))
@@ -3199,7 +3217,6 @@ impl Conversation {
                 runner.cached(crate::composer_runner::Runner::placement())
             }))
             .children(self.remote_notice(cx))
-            .children(self.cloud_target_row(cx))
             .child(self.workspace_bar(cx))
             .into_any_element()
     }

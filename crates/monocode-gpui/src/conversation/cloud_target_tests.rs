@@ -2,6 +2,7 @@ use super::cloud_target::*;
 use super::*;
 use gpui::{TestAppContext, WindowHandle};
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
+use monocode_core::codespaces;
 use monocode_core::store::Store;
 use std::sync::Mutex;
 
@@ -150,7 +151,7 @@ fn choosing_a_target_changes_the_triggers_and_shows_the_cloud_row(cx: &mut TestA
         visual.refresh().unwrap();
     };
     draw(visual);
-    assert!(visual.debug_bounds("cloud-target-row").is_none());
+    assert!(visual.debug_bounds("cloud-target-panel").is_none());
     window
         .update(visual, |view, _, cx| {
             save_config(view);
@@ -166,7 +167,7 @@ fn choosing_a_target_changes_the_triggers_and_shows_the_cloud_row(cx: &mut TestA
         })
         .unwrap();
     draw(visual);
-    assert!(visual.debug_bounds("cloud-target-row").is_some());
+    assert!(visual.debug_bounds("cloud-target-panel").is_some());
     assert!(visual.debug_bounds("cloud-target-create").is_some());
     window
         .update(visual, |view, _, cx| {
@@ -177,7 +178,7 @@ fn choosing_a_target_changes_the_triggers_and_shows_the_cloud_row(cx: &mut TestA
         })
         .unwrap();
     draw(visual);
-    assert!(visual.debug_bounds("cloud-target-row").is_none());
+    assert!(visual.debug_bounds("cloud-target-panel").is_none());
 }
 
 #[gpui::test]
@@ -285,10 +286,9 @@ fn memory_and_compute_labels() {
     assert_eq!(memory_label("4g"), "4 GiB");
     assert_eq!(memory_label("512m"), "512 MiB");
     assert_eq!(memory_label("lots"), "lots");
-    assert_eq!(
-        compute_label(&DockerProjectConfig::default()),
-        "2 vCPU / 4 GiB \u{b7} 2h then stop"
-    );
+    assert_eq!(size_label(2, "4g"), "2 vCPU / 4 GiB");
+    assert_eq!(runtime_label("1h"), "1 hour then stop");
+    assert_eq!(runtime_label("4h"), "4 hours then stop");
 }
 
 fn temp_repo(head: &str) -> String {
@@ -489,6 +489,407 @@ fn the_docker_config_is_read_once_per_menu_opening(cx: &mut TestAppContext) {
             assert!(rows(view)[0].3.is_some());
             view.forget_docker_config();
             assert!(rows(view)[0].3.is_none());
+        })
+        .unwrap();
+}
+
+// ------------------------------------------------ per-session overrides of the defaults
+
+fn machine(name: &str, display: &str) -> codespaces::MachineType {
+    codespaces::MachineType {
+        name: name.into(),
+        display_name: display.into(),
+        operating_system: "linux".into(),
+        storage_in_bytes: 32 << 30,
+        memory_in_bytes: 8 << 30,
+        cpus: 2,
+    }
+}
+
+fn set_text(
+    view: &Conversation,
+    field: impl Fn(&CloudDraft) -> Entity<input::Input>,
+    text: &str,
+    cx: &mut Context<Conversation>,
+) {
+    let field = field(view.cloud_draft.as_ref().unwrap());
+    field.update(cx, |input, cx| input.set_text(text.into(), cx));
+}
+
+#[gpui::test]
+fn the_panel_starts_from_the_project_config(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            let config = DockerProjectConfig {
+                repo_url: "https://github.com/octo/widgets.git".into(),
+                base_ref: "develop".into(),
+                cpus: 4,
+                memory: "8g".into(),
+                ttl: "4h".into(),
+                claude_account: Some("work".into()),
+                ..Default::default()
+            };
+            docker_config::save(&locked(&view.store).unwrap(), PROJECT, &config).unwrap();
+            view.forget_docker_config();
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(
+                (draft.cpus, draft.memory.as_str(), draft.ttl.as_str()),
+                (4, "8g", "4h")
+            );
+            assert_eq!(draft.account.as_deref(), Some("work"));
+            assert_eq!(draft.base.read(cx).content.as_ref(), "develop");
+            assert_eq!(draft.base_text, "develop");
+            // The menus check the default.
+            let (_, compute) = view.cloud_field_menu(CloudField::Compute);
+            let checked: Vec<_> = compute
+                .iter()
+                .filter_map(|item| match item {
+                    MenuItem::Action(a) if a.checked => Some(a.label.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(checked, ["4 vCPU / 8 GiB"]);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn overrides_change_the_sandbox_request_and_never_the_project_config(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            let saved = save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            assert!(view.cloud_menu_choice("cloud-set:compute:4:8g", cx));
+            assert!(view.cloud_menu_choice("cloud-set:runtime:1h", cx));
+            assert!(view.cloud_menu_choice("cloud-set:account:personal", cx));
+            set_text(view, |d| d.base.clone(), "release/1.2", cx);
+            set_text(view, |d| d.branch.clone(), "feature/x", cx);
+            view.create_cloud(cx);
+            // The saved default is untouched.
+            let stored = docker_config::load(&locked(&view.store).unwrap(), PROJECT)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored, saved);
+            assert_eq!(stored.base_ref, "develop");
+            assert_eq!((stored.cpus, stored.ttl.as_str()), (2, "2h"));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let config = sent[0].config.as_ref().unwrap();
+    assert_eq!(
+        (config.cpus, config.memory.as_str(), config.ttl.as_str()),
+        (4, "8g", "1h")
+    );
+    assert_eq!(config.base_ref, "release/1.2");
+    assert_eq!(config.claude_account.as_deref(), Some("personal"));
+    assert_eq!(config.repo_url, "https://github.com/octo/widgets.git");
+    assert_eq!(sent[0].branch, "feature/x");
+    assert_eq!(sent[0].machine, None);
+}
+
+#[gpui::test]
+fn an_invalid_override_is_refused_inline_with_the_config_validation(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            set_text(view, |d| d.base.clone(), "bad branch name", cx);
+            view.create_cloud(cx);
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert!(!draft.creating);
+            assert_eq!(
+                draft.error.as_deref(),
+                Some("The base branch contains invalid characters.")
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn picking_the_target_again_resets_the_overrides_to_the_project_config(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            view.cloud_menu_choice("cloud-set:runtime:4h", cx);
+            set_text(view, |d| d.base.clone(), "other", cx);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(draft.ttl, "2h");
+            assert_eq!(draft.base.read(cx).content.as_ref(), "develop");
+            // Nothing changes while a create runs.
+            view.create_cloud(cx);
+            view.cloud_menu_choice("cloud-set:runtime:1h", cx);
+            assert_eq!(view.cloud_draft.as_ref().unwrap().ttl, "2h");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn machines_load_off_the_spot_and_the_pick_reaches_the_request(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    let listed = Arc::new(Mutex::new(Vec::new()));
+    let sink = listed.clone();
+    window
+        .update(cx, |view, _, cx| {
+            view.set_machine_loader(Arc::new(move |project| {
+                sink.lock().unwrap().push(project);
+                Ok(vec![
+                    machine("basicLinux32gb", "2 cores, 8 GB RAM"),
+                    machine("standardLinux32gb", "4 cores, 16 GB RAM"),
+                ])
+            }));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            // The listing runs on the executor, not inside the click; the default stays.
+            assert!(listed.lock().unwrap().is_empty());
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(draft.machines, Machines::Loading);
+            assert_eq!(view.cloud_field_value(CloudField::Machine), "Loading machines...");
+            let (_, items) = view.cloud_field_menu(CloudField::Machine);
+            assert!(matches!(&items[0], MenuItem::Action(a) if a.disabled && a.label.contains("Loading")));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(*listed.lock().unwrap(), std::slice::from_ref(&repo));
+    window
+        .update(cx, |view, _, cx| {
+            assert!(matches!(
+                view.cloud_draft.as_ref().unwrap().machines,
+                Machines::Loaded(_)
+            ));
+            // Still the default until a pick.
+            assert_eq!(
+                view.cloud_field_value(CloudField::Machine),
+                "2 cores, 8 GB RAM"
+            );
+            let (_, items) = view.cloud_field_menu(CloudField::Machine);
+            assert_eq!(items.len(), 2);
+            assert!(view.cloud_menu_choice("cloud-set:machine:standardLinux32gb", cx));
+            assert_eq!(
+                view.cloud_field_value(CloudField::Machine),
+                "4 cores, 16 GB RAM"
+            );
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].machine.as_deref(), Some("standardLinux32gb"));
+    assert_eq!(sent[0].branch, "main");
+}
+
+#[gpui::test]
+fn a_failed_machine_listing_keeps_the_default_machine(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_machine_loader(Arc::new(|_| Err("gh is not installed".into())));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert_eq!(
+                view.cloud_draft.as_ref().unwrap().machines,
+                Machines::Failed
+            );
+            assert_eq!(
+                view.cloud_field_value(CloudField::Machine),
+                codespaces::DEFAULT_MACHINE
+            );
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    // No pick: the request keeps the default machine.
+    assert_eq!(requests.lock().unwrap()[0].machine, None);
+}
+
+#[gpui::test]
+fn a_late_machine_listing_for_a_replaced_draft_is_ignored(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_machine_loader(Arc::new(|_| Ok(vec![machine("a", "A")])));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            view.clear_cloud_target(cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert!(matches!(
+                view.cloud_draft.as_ref().unwrap().machines,
+                Machines::Loaded(_)
+            ));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_panel_has_a_row_per_setting_and_a_collapse_chevron(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let draw = |visual: &mut gpui::VisualTestContext| {
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+    };
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    draw(visual);
+    for id in [
+        "cloud-target-panel",
+        "cloud-target-header",
+        "cloud-row-compute",
+        "cloud-row-runtime",
+        "cloud-row-base",
+        "cloud-row-branch",
+        "cloud-target-create",
+    ] {
+        assert!(visual.debug_bounds(id).is_some(), "{id}");
+    }
+    // Collapsed: only the header stays.
+    let header = visual.debug_bounds("cloud-target-header").unwrap();
+    visual.simulate_click(header.center(), Default::default());
+    draw(visual);
+    assert!(visual.debug_bounds("cloud-target-header").is_some());
+    assert!(visual.debug_bounds("cloud-row-compute").is_none());
+    // A codespace panel has its own rows.
+    window
+        .update(visual, |view, _, cx| {
+            view.clear_cloud_target(cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    draw(visual);
+    assert!(visual.debug_bounds("cloud-row-machine").is_some());
+    assert!(visual.debug_bounds("cloud-row-branch").is_some());
+    assert!(visual.debug_bounds("cloud-row-compute").is_none());
+    // A settings row opens its menu.
+    let machine = visual.debug_bounds("cloud-row-machine").unwrap();
+    visual.simulate_click(machine.center(), Default::default());
+    draw(visual);
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.menu_is(ComposerMenu::CloudField(CloudField::Machine)))
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn create_and_the_error_stay_visible_while_the_panel_is_collapsed(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let draw = |visual: &mut gpui::VisualTestContext| {
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+    };
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            set_text(view, |d| d.branch.clone(), "", cx);
+        })
+        .unwrap();
+    draw(visual);
+    let header = visual.debug_bounds("cloud-target-header").unwrap();
+    visual.simulate_click(header.center(), Default::default());
+    draw(visual);
+    assert!(visual.debug_bounds("cloud-row-compute").is_none());
+    let create = visual
+        .debug_bounds("cloud-target-create")
+        .expect("Create stays while collapsed");
+    visual.simulate_click(create.center(), Default::default());
+    draw(visual);
+    assert!(visual.debug_bounds("cloud-target-error").is_some());
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn the_branch_fields_are_read_only_while_creating(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            view.create_cloud(cx);
+            let draft = view.cloud_draft.as_ref().unwrap();
+            let id = draft.request;
+            assert!(draft.branch.read(cx).is_read_only());
+            assert!(draft.base.read(cx).is_read_only());
+            view.cloud_create_finished(id, Err("nope".into()), cx);
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert!(!draft.branch.read(cx).is_read_only());
+            assert!(!draft.base.read(cx).is_read_only());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn picking_the_codespace_again_resets_the_machine_branch_and_listing(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let listed = Arc::new(Mutex::new(0));
+    let count = listed.clone();
+    window
+        .update(cx, |view, _, cx| {
+            view.set_machine_loader(Arc::new(move |_| {
+                *count.lock().unwrap() += 1;
+                Ok(vec![machine("basicLinux32gb", "Basic")])
+            }));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_menu_choice("cloud-set:machine:basicLinux32gb", cx);
+            set_text(view, |d| d.branch.clone(), "other", cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(draft.machine, None);
+            assert_eq!(draft.machines, Machines::Loading);
+            assert_eq!(draft.branch.read(cx).content.as_ref(), "main");
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(*listed.lock().unwrap(), 2);
+    window
+        .update(cx, |view, _, _| {
+            assert!(matches!(
+                view.cloud_draft.as_ref().unwrap().machines,
+                Machines::Loaded(_)
+            ));
         })
         .unwrap();
 }

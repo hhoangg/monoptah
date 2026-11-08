@@ -3538,3 +3538,157 @@ fn stopping_a_sandbox_with_a_running_turn_asks_first_and_cancel_stops_nothing(
     visual.run_until_parked();
     assert!(sbx.changes()[0].contains(" stop "), "{:?}", sbx.calls());
 }
+
+// ------------------------------------------------------------ resume entry of the menu
+
+fn resume_label(shell: &Shell, id: i64, cx: &App) -> Option<String> {
+    menu_labels(shell, id, cx)
+        .into_iter()
+        .find(|label| label.starts_with("Resume "))
+}
+
+#[gpui::test]
+fn the_session_menu_offers_resume_only_for_a_stopped_sandbox(cx: &mut TestAppContext) {
+    for (state, offered) in [
+        (CloudState::Stopped, true),
+        (CloudState::Available, false),
+        (CloudState::Starting, false),
+        (CloudState::Stopping, false),
+        (CloudState::Unavailable, false),
+        (CloudState::Unknown, false),
+    ] {
+        let (window, id, _) = shell_with_sandbox(cx, "stopped", state, true);
+        window
+            .update(cx, |shell, _, cx| {
+                let expected = format!("Resume sandbox {SBX_NAME}");
+                assert_eq!(
+                    resume_label(shell, id, cx),
+                    offered.then_some(expected),
+                    "{state:?}"
+                );
+            })
+            .unwrap();
+    }
+    // No name yet: nothing to resume.
+    let (window, id, _) = shell_with_sandbox(cx, "stopped", CloudState::Stopped, true);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.cloud_marks.get_mut(&id).unwrap().codespace = String::new();
+            assert_eq!(resume_label(shell, id, cx), None);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_session_menu_offers_resume_only_for_a_stopped_codespace(cx: &mut TestAppContext) {
+    for (state, offered) in [
+        (CloudState::Stopped, true),
+        (CloudState::Available, false),
+        (CloudState::Starting, false),
+        (CloudState::Stopping, false),
+        (CloudState::Unavailable, false),
+        (CloudState::Unknown, false),
+    ] {
+        let (window, id, _) = shell_with_cloud(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.cloud_states.insert("octo-abc".into(), state);
+                assert_eq!(
+                    resume_label(shell, id, cx),
+                    offered.then(|| "Resume codespace octo-abc".to_string()),
+                    "{state:?}"
+                );
+            })
+            .unwrap();
+    }
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.cloud_marks.get_mut(&id).unwrap().codespace = String::new();
+            assert_eq!(resume_label(shell, id, cx), None);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_menu_resume_for_a_workspace_that_is_not_stopped_does_nothing(cx: &mut TestAppContext) {
+    let (window, id, sbx) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.run_session_menu(id, "cloud-resume", window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            assert!(!shell.sessions.contains_key(&id), "no view was opened");
+        })
+        .unwrap();
+    assert!(sbx.changes().is_empty(), "{:?}", sbx.calls());
+}
+
+#[gpui::test]
+fn the_shell_tells_each_conversation_whether_its_workspace_is_stopped(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_sandbox(cx, "stopped", CloudState::Stopped, true);
+    window
+        .update(cx, |shell, _, cx| {
+            let view = shell.ensure_session(id, cx).unwrap();
+            shell.sync_cloud_stopped(cx);
+            assert!(view.read(cx).cloud_stopped_for_test());
+            shell
+                .cloud_states
+                .insert(CloudRef::sandbox(SBX_NAME).key(), CloudState::Available);
+            shell.sync_cloud_stopped(cx);
+            assert!(!view.read(cx).cloud_stopped_for_test());
+        })
+        .unwrap();
+}
+
+#[test]
+fn the_create_request_turns_the_panel_picks_into_begin_start_arguments() {
+    use crate::conversation::cloud_target::{CloudCreate, CloudTarget};
+    let request = |machine: Option<&str>| CloudCreate {
+        target: CloudTarget::Codespace,
+        project: "/work/widgets".into(),
+        branch: "release/1".into(),
+        config: None,
+        machine: machine.map(str::to_owned),
+        prompt: None,
+        request_id: 1,
+    };
+    let picked =
+        super::cloud_create::codespace_target(&request(Some("standardLinux32gb"))).unwrap();
+    assert_eq!(picked.branch.as_deref(), Some("release/1"));
+    assert_eq!(picked.machine.as_deref(), Some("standardLinux32gb"));
+    // No pick keeps the default machine, chosen later by the core.
+    let default = super::cloud_create::codespace_target(&request(None)).unwrap();
+    assert_eq!(default.machine, None);
+}
+
+#[gpui::test]
+fn a_resume_during_a_refresh_drops_that_stale_answer_and_reads_again(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_sandbox(cx, "stopped", CloudState::Stopped, true);
+    let key = CloudRef::sandbox(SBX_NAME).key();
+    window
+        .update(cx, |shell, _, cx| {
+            let stale = cloud::Snapshot {
+                marks: shell.cloud_marks.clone(),
+                states: [(key.clone(), CloudState::Stopped)].into_iter().collect(),
+                ..Default::default()
+            };
+            // A refresh is in flight when the user resumes.
+            shell.cloud_refreshing = true;
+            shell.cloud_resumed(id, cx);
+            assert_eq!(shell.cloud_states.get(&key), Some(&CloudState::Available));
+            assert!(shell.cloud_refresh_again);
+            // The menu entry is gone at once.
+            assert_eq!(resume_label(shell, id, cx), None);
+            // The in-flight refresh lands with the old Stopped: dropped, and read again.
+            shell.finish_cloud_refresh(stale, cx);
+            assert_eq!(shell.cloud_states.get(&key), Some(&CloudState::Available));
+            assert!(!shell.cloud_refresh_again);
+            assert!(shell.cloud_refreshing, "a new read started");
+            assert_eq!(resume_label(shell, id, cx), None);
+        })
+        .unwrap();
+}
