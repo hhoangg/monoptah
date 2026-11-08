@@ -50,6 +50,10 @@ impl RemoteProject {
     }
 }
 
+/// Why deleting the conversation of a stopped sandbox is refused; see
+/// [`Store::remove_cloud_session_locally`].
+pub const SANDBOX_STOPPED_DELETE: &str = "This sandbox is stopped, so its conversation can not be deleted without resuming it. Reconnect the session first, or remove it from Monoptah only.";
+
 /// Prefix of the provisional environment id of a cloud session whose codespace is still
 /// starting (see [`CloudRef::pending_env`]). It never names a connected machine.
 const PENDING_ENVIRONMENT: &str = "pending-";
@@ -752,7 +756,12 @@ impl Store {
         self.save_remote_session(&remote)
     }
     pub fn delete_remote_session(&self, id: i64) -> Result<(), String> {
-        self.delete_remote_session_using(id, &crate::codespaces::SystemGh, None)
+        self.delete_remote_session_using(
+            id,
+            &crate::codespaces::SystemGh,
+            &crate::sandboxes::SystemSbx,
+            None,
+        )
     }
 
     /// Delete through injectable GitHub and host boundaries. No remote is woken here.
@@ -762,13 +771,27 @@ impl Store {
         gh: &dyn crate::codespaces::GhRunner,
         host: &dyn crate::cloud_sessions::Host,
     ) -> Result<(), String> {
-        self.delete_remote_session_using(id, gh, Some(host))
+        self.delete_remote_session_using(id, gh, &crate::sandboxes::SystemSbx, Some(host))
+    }
+
+    /// [`Self::delete_remote_session_with`] with an injectable `sbx` boundary, for sessions
+    /// that live in a Docker sandbox.
+    #[cfg(test)]
+    pub(crate) fn delete_remote_session_with_sbx(
+        &self,
+        id: i64,
+        gh: &dyn crate::codespaces::GhRunner,
+        sbx: &dyn crate::sandboxes::SbxRunner,
+        host: &dyn crate::cloud_sessions::Host,
+    ) -> Result<(), String> {
+        self.delete_remote_session_using(id, gh, sbx, Some(host))
     }
 
     fn delete_remote_session_using(
         &self,
         id: i64,
         gh: &dyn crate::codespaces::GhRunner,
+        sbx: &dyn crate::sandboxes::SbxRunner,
         host: Option<&dyn crate::cloud_sessions::Host>,
     ) -> Result<(), String> {
         let remote = self
@@ -779,8 +802,16 @@ impl Store {
         if remote.session_id.is_none() {
             return self.forget_cloud_session(id);
         }
-        if let Some(name) = &remote.project.codespace {
-            if !crate::codespaces::exists(gh, name)? {
+        // A workspace that is gone leaves no host conversation to delete. Existence is a
+        // read-only call (`gh codespace view` / `sbx ls`): nothing is woken here.
+        if let Some(cloud) = remote.project.cloud() {
+            let exists = match cloud.kind {
+                CloudBackendKind::Codespaces => crate::codespaces::exists(gh, &cloud.name)?,
+                CloudBackendKind::DockerSandbox => {
+                    crate::sandboxes::find_by_name(sbx, &cloud.name)?.is_some()
+                }
+            };
+            if !exists {
                 return self.forget_cloud_session(id);
             }
         }
@@ -802,9 +833,41 @@ impl Store {
                 &machine.id,
                 "sessions.delete",
                 json!({"sessionId": session_id,"projectId": remote.project.project_id}),
-            )?;
+            )
+            .map_err(|error| {
+                // Deleting the conversation would need the sandbox running, and a delete is
+                // never allowed to resume (and bill) it by itself.
+                if remote
+                    .project
+                    .cloud()
+                    .is_some_and(|c| c.kind == CloudBackendKind::DockerSandbox)
+                    && crate::cloud_sessions::is_not_connected(&error)
+                {
+                    SANDBOX_STOPPED_DELETE.to_string()
+                } else {
+                    error
+                }
+            })?;
         }
         self.forget_cloud_session(id)
+    }
+
+    /// "Remove from Monoptah" for a session whose sandbox still exists but is not connected:
+    /// forgets the local record only. Returns the warning to show: the sandbox keeps existing
+    /// (and counting against its time limit) until the user deletes it.
+    pub fn remove_cloud_session_locally(&self, id: i64) -> Result<String, String> {
+        let remote = self.remote_session(id)?.ok_or("Session not found")?;
+        let cloud = remote
+            .project
+            .cloud()
+            .ok_or("This is not a cloud session.")?;
+        self.forget_cloud_session(id)?;
+        Ok(format!(
+            "Removed from Monoptah. The {} {} still exists; delete it from the session menu or with `sbx --cloud rm {}`.",
+            cloud.noun(),
+            cloud.name,
+            cloud.name
+        ))
     }
 }
 

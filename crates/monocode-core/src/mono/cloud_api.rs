@@ -8,8 +8,8 @@
 //!
 //! Secret values never pass through this module: `secrets_status` reports set/missing only.
 use crate::cloud_sessions::{
-    CloudBinding, CloudSessions, CloudState, CodespaceChoice, Host, SessionTarget, StartupSummary,
-    Target,
+    CloudBackendKind, CloudBinding, CloudSessions, CloudState, CodespaceChoice, Host,
+    SessionTarget, StartupSummary, Target,
 };
 use crate::codespaces::{self, GhRunner};
 use crate::store::Store;
@@ -35,21 +35,33 @@ pub fn state_id(state: CloudState) -> String {
     state.label().to_lowercase()
 }
 
-/// `target` of a session: `{kind:"local"}` or `{kind:"codespace",codespace,state}`.
+/// Error for an app API action on a Docker Sandbox session. The app API is Codespaces-only
+/// in v1; sandbox sessions are recognised as cloud sessions but offered no action.
+pub const SANDBOX_UNSUPPORTED: &str =
+    "This action is not supported for Docker Sandbox sessions yet.";
+
+/// `target` of a session: `{kind:"local"}`, `{kind:"codespace",codespace,state}` or, for a
+/// Docker Sandbox session, `{kind:"sandbox",sandbox,state}`.
 pub fn target_json(target: Option<&SessionTarget>) -> Value {
     match target {
         None => json!({"kind":"local"}),
+        Some(t) if t.cloud.kind == CloudBackendKind::DockerSandbox => {
+            json!({"kind":"sandbox","sandbox":t.cloud.name,"state":state_id(t.state)})
+        }
         Some(t) => json!({"kind":"codespace","codespace":t.codespace,"state":state_id(t.state)}),
     }
 }
 
-/// Adds `target` to a session object, and `codespaceState` for a cloud session. A session
+/// Adds `target` to a session object, and `codespaceState` for a codespace session. A session
 /// whose codespace is still starting (or failed to) also gets `startup {step, error?}`, and
-/// its `codespaceState` is `starting` until the start fails.
+/// its `codespaceState` is `starting` until the start fails. A sandbox session gets the
+/// `sandbox` target but no `codespaceState`.
 pub fn annotate(session: &mut Value, target: Option<&SessionTarget>) {
     session["target"] = target_json(target);
     if let Some(t) = target {
-        session["codespaceState"] = json!(state_id(t.state));
+        if t.cloud.kind == CloudBackendKind::Codespaces {
+            session["codespaceState"] = json!(state_id(t.state));
+        }
         if let Some(startup) = &t.startup {
             let mut value = json!({"step": startup.step.map(|s| s.id())});
             if let Some(error) = &startup.error {
@@ -78,7 +90,7 @@ pub fn target_from_input(input: &Value) -> Option<Target> {
 pub fn is_cloud_session_of(store: &Store, id: i64, project: &str) -> bool {
     let key = crate::files::path_key(project);
     store.remote_session(id).ok().flatten().is_some_and(|s| {
-        s.project.codespace.is_some()
+        s.project.cloud().is_some()
             && s.project
                 .local_project
                 .as_deref()
@@ -182,7 +194,21 @@ impl CloudApi {
     pub fn system(store: Database) -> Result<Self, String> {
         let gh: Arc<dyn GhRunner> = Arc::new(codespaces::SystemGh);
         let host: Arc<dyn Host> = Arc::new(crate::remote::default_connections()?);
-        Ok(Self::new(gh, host, store))
+        let mut api = Self::new(gh, host, store.clone());
+        api.cloud = CloudSessions::new(api.gh.clone(), api.host.clone(), store.clone())
+            .with_system_sandboxes(store);
+        Ok(api)
+    }
+    /// User-initiated: reconnects the sandbox of cloud session `session_id` (see
+    /// [`CloudSessions::reconnect_sandbox`]). BLOCKS for minutes. Never call it from a Mono,
+    /// the app API or any other background path: it resumes, and so bills, a stopped sandbox.
+    pub fn reconnect_sandbox(
+        &self,
+        session_id: i64,
+        progress: &mut dyn FnMut(&str),
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
+        self.cloud.reconnect_sandbox(session_id, progress, cancel)
     }
     /// The process-wide service (it owns the codespace state cache). `install` replaces it.
     pub fn shared(store: &Database) -> Result<Arc<Self>, String> {
@@ -380,14 +406,16 @@ impl CloudApi {
                     // Starting: no gh read needed, the state is `starting`.
                     Some(startup) if startup.error.is_none() => SessionTarget {
                         codespace: s.codespace,
+                        cloud: s.cloud,
                         state: CloudState::Starting,
                         startup: Some(startup),
                     },
                     startup => SessionTarget {
                         state: *states
-                            .entry(s.codespace.clone())
-                            .or_insert_with(|| self.cloud.cloud_state(&s.codespace)),
+                            .entry(s.cloud.key())
+                            .or_insert_with(|| self.cloud.cloud_state_of(&s.cloud)),
                         codespace: s.codespace,
+                        cloud: s.cloud,
                         startup,
                     },
                 };
@@ -416,6 +444,15 @@ impl CloudApi {
         let Some(session) = session else {
             return Ok(());
         };
+        // The app API (and so any Mono or scheduled caller) never wakes a sandbox: that
+        // resumes and bills it. A user reconnects it from the session itself.
+        if session
+            .project
+            .cloud()
+            .is_some_and(|cloud| cloud.kind == CloudBackendKind::DockerSandbox)
+        {
+            return Err(SANDBOX_UNSUPPORTED.into());
+        }
         crate::cloud_sessions::ensure_before_send(
             &*self.host,
             &session,
@@ -440,6 +477,13 @@ impl CloudApi {
         let lock = || store.lock().map_err(|_| "Native session store unavailable");
         if !is_cloud_session_of(&*lock()?, session_id, project) {
             return Err("Session is not a cloud session of this project.".into());
+        }
+        if lock()?
+            .remote_session(session_id)?
+            .and_then(|s| s.project.cloud())
+            .is_some_and(|cloud| cloud.kind == CloudBackendKind::DockerSandbox)
+        {
+            return Err(SANDBOX_UNSUPPORTED.into());
         }
         let task = match input.get("taskId") {
             None | Some(Value::Null) => None,

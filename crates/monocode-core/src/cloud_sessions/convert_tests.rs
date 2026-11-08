@@ -132,6 +132,8 @@ impl Host for SyncHost {
         self.log.lock().unwrap().push(format!("{id} {method}"));
         match method {
             "sessions.sync" => Ok(json!({"kind":"snapshot","value":self.snapshot})),
+            // A live tunnel answers; a sandbox reconnect then has nothing to restore.
+            "environment.describe" => Ok(json!({})),
             other => Err(format!("unexpected {other}")),
         }
     }
@@ -1528,4 +1530,204 @@ fn pins_are_released_when_the_check_fails_or_the_copy_is_deleted_unrestored() {
     assert!(git(&w.project, &["for-each-ref", "refs/codespace"]).contains("/keep/head"));
     w.svc.store().unwrap().delete(done.local_id).unwrap();
     assert!(git(&w.project, &["for-each-ref", "refs/codespace"]).is_empty());
+}
+
+// ------------------------------------------------------------------- sandbox
+
+use super::backend::docker::{SandboxShell, ShellOutput};
+use super::docker_start::{ClaudeAuth, SandboxSecrets};
+use crate::sandboxes::{SbxOutput, SbxRunner};
+use std::time::Duration;
+
+/// Never called here: a connected sandbox needs no secret to be reconnected.
+struct NoSecrets;
+impl SandboxSecrets for NoSecrets {
+    fn claude_auth(&self, _: Option<&str>) -> Result<Option<ClaudeAuth>, String> {
+        panic!("a connected sandbox needs no secret")
+    }
+    fn git_payload(&self, _: &str, _: &str) -> Result<zeroize::Zeroizing<String>, String> {
+        panic!("a connected sandbox needs no secret")
+    }
+}
+
+/// `sbx` that only knows one running sandbox.
+struct OneSandbox;
+impl SbxRunner for OneSandbox {
+    fn run(&self, args: &[String], _: Option<&str>) -> Result<SbxOutput, String> {
+        let item = r#"{"id":"sbx_001abc","name":"box-1","agent":"shell","state":"running"}"#;
+        let stdout = match args.get(2).map(String::as_str) {
+            Some("ls") => format!("[{item}]"),
+            Some("inspect") => item.to_string(),
+            other => panic!("unexpected sbx call {other:?}"),
+        };
+        Ok(SbxOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })
+    }
+}
+
+/// The "container" is the local disk: every `devcontainer exec ... sh -l -s` runs `sh -s`
+/// here with the world's remote home. Records what was asked.
+struct LocalShell {
+    home: PathBuf,
+    calls: Mutex<Vec<(String, String)>>,
+}
+impl SandboxShell for LocalShell {
+    fn run(
+        &self,
+        id: &str,
+        remote: &str,
+        stdin: &str,
+        on_line: &mut dyn FnMut(&str),
+        _abort: &dyn Fn() -> bool,
+        _timeout: Duration,
+    ) -> Result<ShellOutput, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((id.to_string(), remote.to_string()));
+        assert!(
+            remote.contains("devcontainer exec --workspace-folder"),
+            "{remote}"
+        );
+        assert!(remote.ends_with("-- sh -l -s"), "{remote}");
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("HOME", &self.home)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+        for line in stdout.lines() {
+            on_line(line);
+        }
+        Ok(ShellOutput {
+            success: result.status.success(),
+            stdout,
+            stderr: String::from_utf8_lossy(&result.stderr).to_string(),
+        })
+    }
+}
+
+struct NoGh;
+impl GhRunner for NoGh {
+    fn run(&self, args: &[String], _: Option<&str>) -> Result<GhOutput, String> {
+        panic!("a sandbox conversion must not call gh: {args:?}")
+    }
+}
+
+#[test]
+fn a_sandbox_session_converts_through_the_container_exec_and_a_tar_stream() {
+    let w = world(true);
+    let target = crate::remote::SandboxTarget {
+        id: "sbx_001abc".into(),
+        name: "box-1".into(),
+        workspace: "/home/agent/workspaces/ws".into(),
+        relay_port: 47200,
+        config: None,
+    };
+    // The same session, now bound to a sandbox.
+    {
+        let store = w.svc.store().unwrap();
+        store
+            .remember_cloud_ref_project(
+                "env-1",
+                &json!({"id":"p","cwd":w.ws.to_str().unwrap()}),
+                w.project.to_str().unwrap(),
+                &CloudRef::sandbox("box-1"),
+            )
+            .unwrap();
+    }
+    let machine = Machine {
+        id: "m1".into(),
+        name: "box".into(),
+        endpoint: "sbx://box-1".into(),
+        environment_id: "env-1".into(),
+        ssh: None,
+        codespace: None,
+        sandbox: Some(target),
+    };
+    let host = Arc::new(SyncHost {
+        machines: vec![machine],
+        snapshot: w.host.snapshot.clone(),
+        log: Mutex::new(vec![]),
+    });
+    let shell = Arc::new(LocalShell {
+        home: w.root.join("cs-home"),
+        calls: Mutex::new(vec![]),
+    });
+    let svc = CloudSessions::new(Arc::new(NoGh), host.clone(), w.svc.store.clone())
+        .with_claude_dir(w.claude.clone())
+        .with_workspace_root(&w.root)
+        .with_sandboxes(Arc::new(OneSandbox), shell.clone(), Arc::new(NoSecrets));
+    let mut lines = vec![];
+    let done = svc
+        .convert_session(w.cloud_id, &mut |l| lines.push(l.to_string()))
+        .unwrap();
+    assert!(lines.iter().any(|l| l.contains("Reconnecting the sandbox")));
+    assert_eq!(done.codespace, "box-1");
+    let store = svc.store().unwrap();
+    let origin: Value = serde_json::from_str(
+        &store
+            .setting(&origin_key(CloudBackendKind::DockerSandbox, done.local_id))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(origin["codespace"], "box-1");
+    assert_eq!(origin["backend"], "dockerSandbox");
+    assert!(store
+        .setting(&origin_key(CloudBackendKind::Codespaces, done.local_id))
+        .unwrap()
+        .is_none());
+    assert!(store.remote_session(w.cloud_id).unwrap().is_none());
+    let thread = store.thread_dir(done.local_id).unwrap().unwrap();
+    drop(store);
+    // Evidence and the code state arrived through the tar stream.
+    assert_eq!(
+        std::fs::read_to_string(thread.join("evidence/shot.txt")).unwrap(),
+        "evidence\n"
+    );
+    let code = thread.join(CODESPACE_DIR);
+    assert!(code.join(BUNDLE).is_file());
+    assert!(std::fs::read_to_string(code.join(PATCH))
+        .unwrap()
+        .contains("untracked.txt"));
+    assert!(code.join(RAW_JSONL).is_file());
+    // Every script ran in the one sandbox's container; the stage was removed; the host
+    // was never asked to wake a codespace.
+    let calls = shell.calls.lock().unwrap().clone();
+    assert!(calls.len() >= 4, "{calls:?}");
+    assert!(calls.iter().all(|(id, _)| id == "sbx_001abc"));
+    assert!(host
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|l| !l.starts_with("ensure")));
+    let leftovers: Vec<_> = std::fs::read_dir("/tmp")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("monoptah-archive.")
+                && std::fs::read_to_string(e.path().join("claude.jsonl"))
+                    .is_ok_and(|t| t.contains(&w.ws.display().to_string()))
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }

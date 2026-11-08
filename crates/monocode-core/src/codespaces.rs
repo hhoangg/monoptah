@@ -987,6 +987,16 @@ fn evidence_script(workspace: &str) -> String {
     EVIDENCE_SCRIPT.replace("@WS@", workspace)
 }
 
+/// The evidence setup script for `workspace` (`/workspaces/<repo>`), validated, for backends
+/// that run it themselves.
+pub(crate) fn evidence_script_for(workspace: &str) -> Result<String, String> {
+    let repo = workspace
+        .strip_prefix("/workspaces/")
+        .filter(|repo| valid_segment(repo))
+        .ok_or_else(|| format!("Invalid workspace `{workspace}`"))?;
+    Ok(evidence_script(&format!("/workspaces/{repo}")))
+}
+
 /// Best-effort setup of the evidence folder and agent guidance in a running codespace.
 /// `workspace` is the repo checkout, `/workspaces/<repo>`. Bounded by `SSH_TIMEOUT` (30s).
 pub fn prepare_evidence(runner: &dyn GhRunner, name: &str, workspace: &str) -> Result<(), String> {

@@ -7,8 +7,16 @@
 //! (through `CloudApi::wake`) for every codespace state except Unavailable; it is a no-op when
 //! already connected. The wake runs in the background and the view reloads when it is done, which
 //! also flushes a send the Mono queued. Drafts and background polls never come here.
+//!
+//! A Docker sandbox is different: any ssh resumes (and bills) it, and its relay, Git credential
+//! and Claude environment must be restored, so [`wake_for_send`] (Monos and the app API, whose
+//! origin is not the user's hand) never wakes one. Only [`reconnect`] does, and the conversation
+//! view calls it for the Reconnect button and for a send the user typed in that session. A
+//! send into a stopped sandbox from a Mono or the app API therefore waits for the user to press
+//! Reconnect.
 use crate::{conversation::Conversation, runtime::Database};
 use gpui::{AsyncApp, Entity};
+use monocode_core::cloud_sessions::CloudBackendKind;
 use monocode_core::mono::cloud_api::{CloudApi, should_wake};
 
 /// Starts (re)connecting the codespace of cloud session `id` for a send, unless it is
@@ -24,7 +32,7 @@ pub(crate) async fn wake_for_send(
         .background_executor()
         .spawn(async move {
             let target = CloudApi::shared(&probe).ok()?.target_of(id)?;
-            Some(should_wake(target.state))
+            Some(target.cloud.kind == CloudBackendKind::Codespaces && should_wake(target.state))
         })
         .await
         .unwrap_or(false);
@@ -45,11 +53,32 @@ pub(crate) async fn wake_for_send(
 /// Reconnects the codespace of cloud session `id` for a send or an explicit "Reconnect" from the
 /// conversation view and waits for it. `Ok(false)` means nothing was done (local session or the
 /// codespace is Unavailable). Runs gh and the SSH bootstrap on the background executor.
-pub(crate) async fn reconnect(store: Database, id: i64, cx: &mut AsyncApp) -> Result<bool, String> {
+pub(crate) async fn reconnect(
+    store: Database,
+    id: i64,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    progress: async_channel::Sender<String>,
+    cx: &mut AsyncApp,
+) -> Result<bool, String> {
     cx.background_executor()
         .spawn(async move {
             let api = CloudApi::shared(&store)?;
             match api.target_of(id) {
+                // User-initiated by construction: this is the Reconnect button or a send
+                // typed in the session's own view.
+                Some(target) if target.cloud.kind == CloudBackendKind::DockerSandbox => {
+                    if !should_wake(target.state) {
+                        return Ok(false);
+                    }
+                    api.reconnect_sandbox(
+                        id,
+                        &mut |line| {
+                            let _ = progress.send_blocking(line.to_string());
+                        },
+                        &cancel,
+                    )
+                    .map(|()| true)
+                }
                 Some(target) if should_wake(target.state) => api.wake(id, &store).map(|()| true),
                 _ => Ok(false),
             }

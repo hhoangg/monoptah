@@ -132,20 +132,8 @@ pub fn validate_sandbox_id(id: &str) -> Result<(), String> {
     }
 }
 
-/// Sandbox names follow the `sbx` rules: 2 to 63 characters, first an ASCII
-/// alphanumeric, then ASCII alphanumerics and hyphens. Keep identical to
-/// `sandboxes::validate_sandbox_name`.
-pub fn validate_sandbox_name(name: &str) -> Result<(), String> {
-    if !(2..=63).contains(&name.len())
-        || !name.as_bytes()[0].is_ascii_alphanumeric()
-        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        return Err(
-            "Enter a valid sandbox name (2 to 63 letters, digits and hyphens, starting with a letter or digit).".into(),
-        );
-    }
-    Ok(())
-}
+/// Sandbox names follow the `sbx` rules; the one implementation lives in [`crate::sandboxes`].
+pub use crate::sandboxes::validate_sandbox_name;
 
 /// The workspace path reaches a remote shell (quoted). Require an absolute
 /// path of plain characters with no `..` or empty components.

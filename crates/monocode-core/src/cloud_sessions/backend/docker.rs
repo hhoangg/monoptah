@@ -12,6 +12,8 @@
 //!   fake.
 use super::{CloudBackend, CloudBackendKind};
 use crate::cloud_sessions::CloudState;
+use crate::codespaces;
+use crate::remote::SandboxTarget;
 use crate::sandboxes::{self, SbxRunner};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -21,11 +23,32 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const NOT_FOUND: &str = "was not found";
-const NOT_SUPPORTED: &str = "is not supported for sandboxes yet.";
+
+/// How long a short script may take (it may have to resume the sandbox first).
+const SCRIPT_SHORT: Duration = Duration::from_secs(120);
+/// How long a long script (a git bundle of a big tree) or a copy may take.
+const SCRIPT_LONG: Duration = Duration::from_secs(10 * 60);
+/// Most bytes [`DockerBackend::copy_from`] accepts, decoded. The archive flow already refuses
+/// a stage over 500 MB; this is the backstop for any other caller.
+pub const COPY_LIMIT_BYTES: usize = 600 * 1024 * 1024;
+/// Most entries one copy may unpack.
+const COPY_MAX_ENTRIES: usize = 100_000;
+/// Marker that ends a copy's stream, so a cut connection is not taken for a short archive.
+const TAR_END_PREFIX: &str = "MONOPTAH_TAR_END=";
+/// Prefix of every data line of a copy stream.
+const TAR_DATA_PREFIX: &str = "MONOPTAH_B:";
 
 pub struct DockerBackend {
     runner: Arc<dyn SbxRunner>,
     ids: Mutex<HashMap<String, String>>,
+    /// The ssh seam of [`Self::run_script`] and [`Self::copy_from`]; without it they refuse.
+    shell: Option<Arc<dyn SandboxShell>>,
+    /// Where each sandbox's devcontainer is, by name (set by the start and reconnect flows).
+    targets: Mutex<HashMap<String, SandboxTarget>>,
+    /// Most decoded bytes one [`Self::copy_from`] accepts.
+    copy_limit: usize,
+    /// Entries the last copies skipped (links), taken by [`CloudBackend::take_copy_notes`].
+    notes: Mutex<Vec<String>>,
 }
 
 impl DockerBackend {
@@ -33,7 +56,59 @@ impl DockerBackend {
         Self {
             runner,
             ids: Mutex::new(HashMap::new()),
+            shell: None,
+            targets: Mutex::new(HashMap::new()),
+            copy_limit: COPY_LIMIT_BYTES,
+            notes: Mutex::new(Vec::new()),
         }
+    }
+    /// Uses `bytes` as the copy size limit instead of [`COPY_LIMIT_BYTES`].
+    pub fn with_copy_limit(mut self, bytes: usize) -> Self {
+        self.copy_limit = bytes;
+        self
+    }
+    /// Lets [`Self::run_script`] and [`Self::copy_from`] work. They ssh into the sandbox
+    /// (which resumes a stopped one), so only user actions may call them.
+    pub fn with_shell(mut self, shell: Arc<dyn SandboxShell>) -> Self {
+        self.shell = Some(shell);
+        self
+    }
+    /// Remembers where the devcontainer of `target.name` is.
+    pub fn remember_target(&self, target: &SandboxTarget) {
+        self.remember(&target.name, &target.id);
+        if let Ok(mut targets) = self.targets.lock() {
+            targets.insert(target.name.clone(), target.clone());
+        }
+    }
+    fn target_of(&self, name: &str) -> Result<(Arc<dyn SandboxShell>, SandboxTarget), String> {
+        let shell = self
+            .shell
+            .clone()
+            .ok_or_else(|| "Docker sandboxes are not available.".to_string())?;
+        let target = self
+            .targets
+            .lock()
+            .ok()
+            .and_then(|targets| targets.get(name).cloned())
+            .ok_or_else(|| {
+                "This sandbox is not connected. Reconnect the session first.".to_string()
+            })?;
+        Ok((shell, target))
+    }
+    /// Runs `stdin` as `sh -l -s` inside the container, lines to `on_line`.
+    fn exec(
+        &self,
+        name: &str,
+        stdin: &str,
+        on_line: &mut dyn FnMut(&str),
+        abort: &dyn Fn() -> bool,
+        timeout: Duration,
+    ) -> Result<ShellOutput, String> {
+        let (shell, target) = self.target_of(name)?;
+        let remote = target.exec_in_container(&["sh", "-l", "-s"]);
+        shell
+            .run(&target.id, &remote, stdin, on_line, abort, timeout)
+            .map_err(|e| sandboxes::redact(&e))
     }
     /// Remembers the id of the sandbox called `name`, so later calls skip the list lookup.
     pub fn remember(&self, name: &str, id: &str) {
@@ -121,16 +196,255 @@ impl CloudBackend for DockerBackend {
     fn web_url(&self, _name: &str) -> Option<Result<String, String>> {
         None
     }
-    fn run_script(&self, _name: &str, _script: &str, _long: bool) -> Result<String, String> {
-        Err(format!("Running a script {NOT_SUPPORTED}"))
+    /// ssh into the sandbox and `devcontainer exec` into the container, the script on stdin.
+    /// Resumes a stopped sandbox: user-initiated work only.
+    fn run_script(&self, name: &str, script: &str, long: bool) -> Result<String, String> {
+        let timeout = if long { SCRIPT_LONG } else { SCRIPT_SHORT };
+        let out = self.exec(name, script, &mut |_| {}, &|| false, timeout)?;
+        if out.success {
+            Ok(out.stdout)
+        } else {
+            Err(script_failure(&out))
+        }
     }
-    fn copy_from(&self, _name: &str, _remote: &str, _local: &Path) -> Result<(), String> {
-        Err(format!("Copying files {NOT_SUPPORTED}"))
+    /// Streams `remote` (a file or folder in the container) as a base64 tar over the ssh
+    /// stdout and unpacks it into the existing absolute folder `local`, like `cp -r remote
+    /// local`. Entries are validated (relative, no `..`, files and folders only: links are
+    /// skipped) and the size and entry count are limited. A missing `remote` fails with
+    /// `<remote>: No such file or directory`, which
+    /// [`crate::codespaces::is_missing_path`] recognises.
+    fn copy_from(&self, name: &str, remote: &str, local: &Path) -> Result<(), String> {
+        codespaces::valid_remote_path(remote)?;
+        if !local.is_absolute() {
+            return Err("Local destination must be an absolute path".into());
+        }
+        if !local.is_dir() {
+            return Err("Local destination is not a folder".into());
+        }
+        let script = COPY_SCRIPT.replace("@PATH@", remote);
+        // The archive streams into a file next to the destination, never into memory.
+        let archive = local.join(format!(
+            ".monoptah-copy-{}-{}.tar",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let result = self.copy_into(name, &script, &archive, local);
+        let _ = std::fs::remove_file(&archive);
+        result
     }
-    fn prepare_evidence(&self, _name: &str, _workspace: &str) -> Result<(), String> {
-        // Nothing to prepare until copying exists; not an error, the session still opens.
+    fn take_copy_notes(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .map(|mut notes| std::mem::take(&mut *notes))
+            .unwrap_or_default()
+    }
+    /// The same evidence folder and agent guidance as a codespace, set up in the container.
+    fn prepare_evidence(&self, name: &str, workspace: &str) -> Result<(), String> {
+        let script = codespaces::evidence_script_for(workspace)?;
+        let out = self.exec(name, &script, &mut |_| {}, &|| false, SCRIPT_SHORT)?;
+        if out.success {
+            Ok(())
+        } else {
+            Err(script_failure(&out))
+        }
+    }
+}
+
+impl DockerBackend {
+    /// Runs the copy script and writes the decoded stream to `archive`, then unpacks it.
+    fn copy_into(
+        &self,
+        name: &str,
+        script: &str,
+        archive: &Path,
+        local: &Path,
+    ) -> Result<(), String> {
+        use base64::Engine as _;
+        use std::io::Write as _;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(archive)
+            .map_err(|e| format!("Could not stage the copy: {e}"))?;
+        let writer = std::cell::RefCell::new(std::io::BufWriter::new(file));
+        let written = std::cell::Cell::new(0usize);
+        let expected = std::cell::Cell::new(None::<usize>);
+        let problem = std::cell::RefCell::new(None::<String>);
+        let out = {
+            let mut on_line = |line: &str| {
+                if problem.borrow().is_some() {
+                    return;
+                }
+                let line = line.trim_end();
+                if let Some(count) = line.strip_prefix(TAR_END_PREFIX) {
+                    expected.set(count.parse().ok());
+                    return;
+                }
+                // Only data-prefixed lines carry the archive; any other line (ssh noise,
+                // stderr) is ignored.
+                let Some(data) = line.strip_prefix(TAR_DATA_PREFIX) else {
+                    return;
+                };
+                match base64::engine::general_purpose::STANDARD.decode(data) {
+                    Ok(chunk) => {
+                        if written.get() + chunk.len() > self.copy_limit {
+                            *problem.borrow_mut() = Some(format!(
+                                "The copy is over the {} MB limit.",
+                                self.copy_limit / (1024 * 1024)
+                            ));
+                        } else if let Err(e) = writer.borrow_mut().write_all(&chunk) {
+                            *problem.borrow_mut() = Some(format!("Could not stage the copy: {e}"));
+                        } else {
+                            written.set(written.get() + chunk.len());
+                        }
+                    }
+                    Err(_) => {
+                        *problem.borrow_mut() =
+                            Some("The copy arrived damaged (bad base64).".to_string());
+                    }
+                }
+            };
+            self.exec(
+                name,
+                script,
+                &mut on_line,
+                &|| problem.borrow().is_some(),
+                SCRIPT_LONG,
+            )
+        };
+        if let Some(problem) = problem.take() {
+            return Err(problem);
+        }
+        let out = out?;
+        if !out.success {
+            if let Some(tool) = out
+                .stderr
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("MONOPTAH_MISSING_TOOL="))
+            {
+                return Err(format!(
+                    "The sandbox image has no `{tool}`, which copying files out needs."
+                ));
+            }
+            return Err(script_failure(&out));
+        }
+        writer
+            .borrow_mut()
+            .flush()
+            .map_err(|e| format!("Could not stage the copy: {e}"))?;
+        match expected.get() {
+            None => return Err("The copy was cut off before it finished.".into()),
+            Some(count) if count != written.get() => {
+                return Err(format!(
+                    "The copy arrived incomplete ({} of {count} bytes).",
+                    written.get()
+                ))
+            }
+            Some(_) => {}
+        }
+        let skipped = unpack(
+            std::fs::File::open(archive).map_err(|e| e.to_string())?,
+            local,
+        )?;
+        if let Ok(mut notes) = self.notes.lock() {
+            notes.extend(skipped);
+        }
         Ok(())
     }
+}
+
+/// Streams a path as [`TAR_DATA_PREFIX`] base64 lines and ends with `MONOPTAH_TAR_END=<bytes>`. `@PATH@` is validated by
+/// [`codespaces::valid_remote_path`] before it is substituted. The archive goes through a
+/// temporary file so a failing `tar` is seen (tar exit 1 only means a file changed).
+const COPY_SCRIPT: &str = r#"set -eu
+p='@PATH@'
+for tool in tar base64 mktemp wc sed; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "MONOPTAH_MISSING_TOOL=$tool" >&2
+    exit 45
+  fi
+done
+if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+  echo "$p: No such file or directory" >&2
+  exit 44
+fi
+tmp=$(mktemp)
+enc=$(mktemp)
+trap 'rm -f "$tmp" "$enc"' EXIT
+cd "$(dirname "$p")"
+rc=0
+tar -cf "$tmp" -- "$(basename "$p")" || rc=$?
+if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+base64 < "$tmp" > "$enc"
+n=$(wc -c < "$tmp" | tr -d ' ')
+sed 's/^/MONOPTAH_B:/' < "$enc"
+echo "MONOPTAH_TAR_END=$n"
+"#;
+
+/// Last lines of a failed script's output, redacted, as one error sentence.
+fn script_failure(out: &ShellOutput) -> String {
+    let text = if out.stderr.trim().is_empty() {
+        &out.stdout
+    } else {
+        &out.stderr
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let tail = lines[lines.len().saturating_sub(4)..].join("\n");
+    let tail: String = sandboxes::redact(&tail).chars().take(600).collect();
+    if tail.is_empty() {
+        "The command in the sandbox failed".into()
+    } else {
+        tail
+    }
+}
+
+/// Unpacks `archive` into `dest`: relative paths only (the `tar` crate refuses anything that
+/// would leave `dest`), regular files and folders only (a link is skipped, never followed, and
+/// reported in the returned notes), at most [`COPY_MAX_ENTRIES`] entries.
+fn unpack(archive: impl std::io::Read, dest: &Path) -> Result<Vec<String>, String> {
+    let mut archive = tar::Archive::new(archive);
+    archive.set_preserve_permissions(false);
+    archive.set_unpack_xattrs(false);
+    let mut count = 0usize;
+    let mut skipped = Vec::new();
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        count += 1;
+        if count > COPY_MAX_ENTRIES {
+            return Err("The copy has too many files.".into());
+        }
+        let kind = entry.header().entry_type();
+        let relative = entry.path().map_err(|e| e.to_string())?.into_owned();
+        if !(kind.is_file() || kind.is_dir()) {
+            skipped.push(format!(
+                "{} (link or special file) was not copied",
+                relative.display()
+            ));
+            continue;
+        }
+        let clean = relative
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !clean || relative.as_os_str().is_empty() {
+            return Err(format!(
+                "The copy has an unsafe path: {}",
+                relative.display()
+            ));
+        }
+        if !entry.unpack_in(dest).map_err(|e| e.to_string())? {
+            return Err(format!(
+                "The copy has an unsafe path: {}",
+                relative.display()
+            ));
+        }
+    }
+    Ok(skipped)
 }
 
 // ----------------------------------------------------------------------- shell

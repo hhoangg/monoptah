@@ -125,6 +125,10 @@ pub trait CloudBackend: Send + Sync {
     /// Copies `remote` (a file or folder in the workspace) into the existing absolute local
     /// folder `local`, like `cp -r remote local`.
     fn copy_from(&self, name: &str, remote: &str, local: &Path) -> Result<(), String>;
+    /// Notes about what the last copies left out (links), once; empty for most backends.
+    fn take_copy_notes(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Best-effort setup of the evidence folder and agent guidance in `workspace`.
     fn prepare_evidence(&self, name: &str, workspace: &str) -> Result<(), String>;
 }

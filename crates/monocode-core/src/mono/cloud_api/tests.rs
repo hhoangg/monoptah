@@ -798,3 +798,51 @@ fn a_long_file_list_stays_under_the_note_cap() {
         .lines()
         .all(|l| !l.starts_with("file:") || l.ends_with(".png")));
 }
+
+impl Fixture {
+    /// A session bound to the Docker sandbox `name`, as the sandbox start flow leaves it.
+    fn bind_sandbox(&self, name: &str) -> i64 {
+        let store = self.store.lock().unwrap();
+        let project = store
+            .remember_cloud_ref_project(
+                &format!("env-{name}"),
+                &json!({"id":"project-1","cwd":"/workspaces/widgets"}),
+                &self.path(),
+                &crate::cloud_sessions::CloudRef::sandbox(name),
+            )
+            .unwrap();
+        store.create("claude", &project.key).unwrap().id
+    }
+}
+
+#[test]
+fn a_sandbox_session_is_a_cloud_session_but_the_app_api_offers_it_nothing() {
+    let gh = FakeGh::new(vec![]);
+    let fx = fixture(&gh);
+    let id = fx.bind_sandbox("monoptah-fix-1234");
+    assert!(is_cloud_session_of(
+        &fx.store.lock().unwrap(),
+        id,
+        &fx.path()
+    ));
+    // Listed, labelled `sandbox` (never `codespace`), without a codespaceState.
+    let targets = fx.api.session_targets(&fx.path());
+    let target = targets.get(&id).unwrap();
+    assert_eq!(target_json(Some(target))["kind"], "sandbox");
+    assert_eq!(target_json(Some(target))["sandbox"], "monoptah-fix-1234");
+    let mut row = json!({});
+    annotate(&mut row, Some(target));
+    assert_eq!(row["target"]["kind"], "sandbox");
+    assert!(row.get("codespaceState").is_none());
+    // Actions are refused with a clear error, and nothing is spawned or woken.
+    let error = fx.api.wake(id, &fx.store).unwrap_err();
+    assert_eq!(error, SANDBOX_UNSUPPORTED);
+    let scope = EvidenceScope::Operator;
+    let error = fx
+        .api
+        .pull_evidence(&fx.store, &fx.path(), id, &json!({}), &scope, 0)
+        .unwrap_err();
+    assert_eq!(error, SANDBOX_UNSUPPORTED);
+    assert!(fx.host.log.lock().unwrap().is_empty());
+    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+}

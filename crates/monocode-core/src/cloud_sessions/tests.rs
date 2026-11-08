@@ -1041,11 +1041,11 @@ fn a_sandbox_bound_project_is_stopped_and_deleted_through_its_own_backend() {
     };
     assert_eq!(svc.cloud_state_of(&cloud), CloudState::Available);
     assert_eq!(svc.sessions_in_cloud(&cloud), vec![session.id]);
-    // Not a codespace session: the codespace-only views do not see it.
-    assert!(svc
-        .cloud_sessions_for("/Users/me/widgets")
-        .unwrap()
-        .is_empty());
+    // The listing includes it, tagged with its backend so callers can tell it from a codespace.
+    let listed = svc.cloud_sessions_for("/Users/me/widgets").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].cloud, cloud);
+    assert_eq!(listed[0].summary.id, session.id);
 
     svc.stop_cloud(&cloud).unwrap();
     assert_eq!(

@@ -10,7 +10,7 @@ mod remote;
 mod remote_legacy;
 pub use remote::{
     is_pending_cloud_environment, pending_cloud_project, RemoteProject, RemoteSession,
-    RemoteUpload, CONVERTED,
+    RemoteUpload, CONVERTED, SANDBOX_STOPPED_DELETE,
 };
 pub(crate) use shared::handle as desktop_session_handle;
 mod session_metadata;

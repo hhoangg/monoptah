@@ -498,6 +498,23 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 impl CloudSessions {
+    /// Tells the sandbox backend where the container of `cloud` is (from the paired machine,
+    /// no ssh). A no-op for a codespace.
+    pub(super) fn prime_backend(&self, cloud: &CloudRef) {
+        if cloud.kind != CloudBackendKind::DockerSandbox {
+            return;
+        }
+        let Some(deps) = &self.sandbox else { return };
+        if let Some(target) = self.host.machines().ok().and_then(|machines| {
+            machines
+                .into_iter()
+                .filter_map(|m| m.sandbox)
+                .find(|s| s.name == cloud.name)
+        }) {
+            deps.backend.remember_target(&target);
+        }
+    }
+
     /// Whether `id` is (still) a cloud session record. A converted one is not.
     pub fn is_cloud_session(&self, id: i64) -> bool {
         self.store()
@@ -536,11 +553,11 @@ impl CloudSessions {
             .store()?
             .remote_session(cloud_id)?
             .ok_or("Session not found")?;
-        let codespace = remote
+        let cloud = remote
             .project
-            .codespace
-            .clone()
+            .cloud()
             .ok_or("This session does not run in a codespace.")?;
+        let codespace = cloud.name.clone();
         let local_project = remote
             .project
             .local_project
@@ -557,11 +574,22 @@ impl CloudSessions {
             .machines()?
             .into_iter()
             .find(|m| m.environment_id == remote.project.environment_id)
-            .ok_or("Codespace machine is no longer connected.")?;
+            .ok_or_else(|| format!("{} machine is no longer connected.", cloud.title()))?;
 
-        progress("Waking the codespace");
-        self.host
-            .ensure(&machine.id, &AtomicBool::new(false), progress)?;
+        match cloud.kind {
+            CloudBackendKind::Codespaces => {
+                progress("Waking the codespace");
+                self.host
+                    .ensure(&machine.id, &AtomicBool::new(false), progress)?;
+            }
+            // Archiving is the user's own action, so it may resume the sandbox. A connected
+            // one is left alone; this also brings the relay and the Host back.
+            CloudBackendKind::DockerSandbox => {
+                progress("Reconnecting the sandbox");
+                self.reconnect_sandbox(cloud_id, progress, &AtomicBool::new(false))?;
+            }
+        }
+        self.prime_backend(&cloud);
 
         let mut snapshot = None;
         if let Some(host_id) = &remote.session_id {
@@ -621,6 +649,7 @@ impl CloudSessions {
         let result = self.convert_staged(
             Plan {
                 remote: &remote,
+                cloud: &cloud,
                 codespace: &codespace,
                 local_project: &local_project,
                 workspace: &workspace,
@@ -661,6 +690,7 @@ impl CloudSessions {
     ) -> Result<Converted, String> {
         let Plan {
             remote,
+            cloud,
             codespace,
             local_project,
             workspace,
@@ -673,7 +703,8 @@ impl CloudSessions {
         let script = SNAPSHOT_SCRIPT
             .replace("@WS@", workspace)
             .replace("@ID@", provider_id.unwrap_or(""));
-        let backend = self.backend(CloudBackendKind::Codespaces)?;
+        let backend = self.backend(cloud.kind)?;
+        let noun = cloud.noun();
         let out = backend.run_script(codespace, &script, true)?;
         let snap = parse_snapshot(&out)?;
         let drop_stage = || {
@@ -685,7 +716,7 @@ impl CloudSessions {
         if snap.nogit || snap.nohead {
             drop_stage();
             return Err(format!(
-                "{workspace} on the codespace is not a git repository with at least one commit, so its files cannot be saved."
+                "{workspace} on the {noun} is not a git repository with at least one commit, so its files cannot be saved."
             ));
         }
         if snap.size_kb > SIZE_LIMIT_KB {
@@ -697,6 +728,7 @@ impl CloudSessions {
             ));
         }
         let copied = backend.copy_from(codespace, &snap.stage, staging);
+        warnings.extend(backend.take_copy_notes());
         drop_stage();
         copied?;
         let staged = staging.join(snap.stage.rsplit('/').next().unwrap_or_default());
@@ -710,7 +742,7 @@ impl CloudSessions {
         ] {
             if reported && !file.exists() {
                 return Err(format!(
-                    "{} was staged on the codespace but did not arrive",
+                    "{} was staged on the {noun} but did not arrive",
                     file.file_name().unwrap_or_default().to_string_lossy()
                 ));
             }
@@ -747,7 +779,7 @@ impl CloudSessions {
                 if let Some(item) = &remote.summary.work_item {
                     store.set_work_item(local_id, Some(item))?;
                 }
-                let origin = json!({
+                let mut origin = json!({
                     "codespace": codespace,
                     "remoteCwd": workspace,
                     "hostSessionId": remote.session_id,
@@ -756,10 +788,11 @@ impl CloudSessions {
                     "localProject": local_project,
                     "convertedAt": crate::time::now_ms(),
                 });
-                store.save_setting(
-                    &origin_key(CloudBackendKind::Codespaces, local_id),
-                    &origin.to_string(),
-                )
+                if cloud.kind != CloudBackendKind::Codespaces {
+                    // `codespace` keeps naming the workspace; this says which backend owns it.
+                    origin["backend"] = json!(cloud.kind);
+                }
+                store.save_setting(&origin_key(cloud.kind, local_id), &origin.to_string())
             })();
             if let Err(error) = filled {
                 let _ = store.delete(local_id);
@@ -955,6 +988,8 @@ impl CloudSessions {
 /// What one conversion works on.
 struct Plan<'a> {
     remote: &'a RemoteSession,
+    cloud: &'a CloudRef,
+    /// The workspace name (a codespace or a sandbox).
     codespace: &'a str,
     local_project: &'a str,
     /// The tree that is saved: the session's own cwd on the host.

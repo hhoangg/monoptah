@@ -198,6 +198,10 @@ pub(crate) struct Conversation {
     stopping: bool,
     /// A cloud session whose local copy is being saved: nothing may be sent meanwhile.
     pub(crate) cloud_locked: bool,
+    /// True only while a send typed by the user (the composer's own submit) runs. A Mono,
+    /// workflow or app API send reaches the same code with this false, and may not resume a
+    /// Docker sandbox.
+    pub(super) user_send: bool,
     notification_cancelled: bool,
     /// The store's saved-draft flag, until the conversation loads its own.
     pub(crate) draft_hint: bool,
@@ -547,10 +551,16 @@ impl Conversation {
             this.open_typed_btw(cx);
         });
         input.update(cx, |input, _| input.set_alternate_submit(true));
-        let submission = cx.subscribe(&input, |this, _, _: &input::Submitted, cx| this.send(cx));
-        let alternate_submission = cx
-            .subscribe(&input, |this, _, _: &input::AlternateSubmitted, cx| {
-                this.send_follow_up(true, cx)
+        let submission = cx.subscribe(&input, |this, _, _: &input::Submitted, cx| {
+            this.user_send = true;
+            this.send(cx);
+            this.user_send = false;
+        });
+        let alternate_submission =
+            cx.subscribe(&input, |this, _, _: &input::AlternateSubmitted, cx| {
+                this.user_send = true;
+                this.send_follow_up(true, cx);
+                this.user_send = false;
             });
         let review =
             cx.new(|_| crate::session_review::SessionReview::new(summary.id, summary.cwd.clone()));
@@ -663,6 +673,7 @@ impl Conversation {
             busy: false,
             stopping: false,
             cloud_locked: false,
+            user_send: false,
             notification_cancelled: false,
             draft_hint: false,
             model: std::env::var(format!(

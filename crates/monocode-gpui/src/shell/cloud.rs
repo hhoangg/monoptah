@@ -95,6 +95,12 @@ pub(super) fn collect(
             continue;
         };
         for session in sessions {
+            // The sidebar groups and the archive dialog are codespace-only until the sandbox
+            // labels land (Phase D2); `stop_cloud` / `delete_cloud_outcome` already route a
+            // sandbox through its own backend.
+            if session.cloud.kind != monocode_core::cloud_sessions::CloudBackendKind::Codespaces {
+                continue;
+            }
             let id = session.summary.id;
             snapshot.marks.insert(
                 id,

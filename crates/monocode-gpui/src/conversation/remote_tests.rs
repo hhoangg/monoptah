@@ -814,3 +814,154 @@ fn sending_to_an_unloaded_cloud_session_reconnects_its_codespace(cx: &mut TestAp
     );
     cx.update(|cx| view.update(cx, |view, _| assert!(!view.remote_state.waking)));
 }
+
+/// A Docker sandbox session is reconnected only by a user action in its own view, through
+/// `CloudApi::reconnect_sandbox`; the codespace wake (`ensure`) is never used for it, and a
+/// Mono or app API send (`wake_for_send`) wakes nothing.
+#[gpui::test]
+fn a_sandbox_session_reconnects_through_the_sandbox_path_and_background_sends_wake_nothing(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
+    use monocode_core::cloud_sessions::CloudRef;
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let summary = {
+        let guard = store.lock().unwrap();
+        let project = guard
+            .remember_cloud_ref_project(
+                "env-box",
+                &serde_json::json!({"id":"project-1","cwd":"/workspaces/widgets"}),
+                dir.0.to_str().unwrap(),
+                &CloudRef::sandbox("monoptah-fix-1234"),
+            )
+            .unwrap();
+        guard.create("claude", &project.key).unwrap()
+    };
+    let id = summary.id;
+    host.0.lock().unwrap().clear();
+    gh.calls.lock().unwrap().clear();
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, store.clone(), cx);
+            assert!(view.is_cloud_session());
+            assert_eq!(view.cloud_noun(), Some("sandbox"));
+            view.loaded = false;
+            view.remote_state.online = false;
+            view.remote_state.refreshing = true;
+            view
+        })
+    });
+    // A Mono or app API send: no wake of any kind.
+    let woke = cx.update(|cx| {
+        let store = store.clone();
+        let view = view.clone();
+        cx.spawn(async move |cx| crate::cloud_wake::wake_for_send(store, id, view, cx).await)
+    });
+    cx.run_until_parked();
+    assert!(!cx.foreground_executor().block_test(woke));
+    // The user's Reconnect: sandbox wording, and the sandbox path (not configured in this
+    // fake service, so it says so) instead of the codespace wake.
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.reconnect_cloud(true, cx));
+            assert!(
+                view.status.contains("Reconnecting the sandbox"),
+                "{}",
+                view.status
+            );
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            assert!(!view.remote_state.waking);
+            assert!(view.status.contains("sandbox"), "{}", view.status);
+        })
+    });
+    assert!(
+        host.0.lock().unwrap().is_empty(),
+        "{:?}",
+        host.0.lock().unwrap()
+    );
+    assert!(gh.calls.lock().unwrap().is_empty());
+}
+
+/// A send that is not the user's own hand (Mono, workflow, app API) reaches the same guard and
+/// must not resume a sandbox; the composer's own submit does.
+#[gpui::test]
+fn only_a_user_submit_reconnects_a_stopped_sandbox_view(cx: &mut TestAppContext) {
+    use crate::cloud_wake::fakes::{AUTH_OK, github_project, install};
+    use monocode_core::cloud_sessions::CloudRef;
+    let dir = github_project();
+    let store: Database = Arc::new(Mutex::new(
+        monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+    ));
+    let (gh, host) = install(store.clone(), AUTH_OK, "Shutdown");
+    let summary = {
+        let guard = store.lock().unwrap();
+        let project = guard
+            .remember_cloud_ref_project(
+                "env-box",
+                &serde_json::json!({"id":"project-1","cwd":"/workspaces/widgets"}),
+                dir.0.to_str().unwrap(),
+                &CloudRef::sandbox("monoptah-fix-1234"),
+            )
+            .unwrap();
+        guard.create("claude", &project.key).unwrap()
+    };
+    host.0.lock().unwrap().clear();
+    gh.calls.lock().unwrap().clear();
+    let view = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut view = Conversation::new(summary, store.clone(), cx);
+            view.loaded = true;
+            view.remote_state.online = false;
+            view.remote_state.refreshing = true;
+            view.input
+                .update(cx, |input, cx| input.set_text("hello".into(), cx));
+            view
+        })
+    });
+    // Mono external send, workflow send and app API send all end in send / draft / app prompt.
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.send(cx);
+            assert_eq!(view.status, super::remote::SANDBOX_STOPPED);
+            assert!(!view.remote_state.waking);
+            view.status.clear();
+            view.remote_save_draft(cx);
+            assert_eq!(view.status, super::remote::SANDBOX_STOPPED);
+            assert!(!view.remote_state.waking);
+            view.status.clear();
+            view.send_remote_app_prompt(cx);
+            assert_eq!(view.status, super::remote::SANDBOX_STOPPED);
+            assert!(!view.remote_state.waking);
+            assert!(!view.reconnect_cloud(false, cx));
+            assert!(!view.remote_state.waking);
+        })
+    });
+    cx.run_until_parked();
+    assert!(host.0.lock().unwrap().is_empty());
+    assert!(gh.calls.lock().unwrap().is_empty());
+    // The user's own submit reconnects.
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            let input = view.input.clone();
+            input.update(cx, |_, cx| cx.emit(crate::input::Submitted));
+        })
+    });
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            assert!(view.remote_state.waking, "{}", view.status);
+            assert!(
+                view.status.contains("Reconnecting the sandbox"),
+                "{}",
+                view.status
+            );
+        })
+    });
+}

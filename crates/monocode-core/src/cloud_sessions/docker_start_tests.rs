@@ -186,6 +186,8 @@ impl ShellCall {
             "gitconfig".into()
         } else if text.contains("MONOCODE_HOST_TRACK_TOKEN=1") {
             "bootstrap".into()
+        } else if text.contains("monoptah-evidence") {
+            "evidence".into()
         } else {
             "other".into()
         }
@@ -306,6 +308,7 @@ impl SandboxShell for Shell {
                 r#"{"port":3774,"pid":9}"#.into(),
             ]),
             "relay" => lines.push("MONOPTAH_RELAY=started".into()),
+            "evidence" => {}
             other => panic!("unexpected sandbox command {other}: {remote}"),
         }
         for line in &lines {
@@ -355,6 +358,12 @@ struct FakeHost {
     /// Shell tags seen when the host was asked to connect (ordering evidence).
     shell: Mutex<Option<Arc<Shell>>>,
     seen_before_connect: Mutex<Vec<String>>,
+    /// Environment id the next pairing reports (a recreated container has a new Host).
+    environment: Mutex<Option<String>>,
+    /// Whether the live tunnel answers `environment.describe`.
+    connected: Mutex<bool>,
+    /// `sessions.delete` answers `SANDBOX_NOT_CONNECTED`.
+    delete_offline: Mutex<bool>,
 }
 impl Host for FakeHost {
     fn machines(&self) -> Result<Vec<Machine>, String> {
@@ -381,7 +390,12 @@ impl Host for FakeHost {
             id: format!("m-{}", sandbox.name),
             name: sandbox.name.clone(),
             endpoint: format!("sbx://{}", sandbox.name),
-            environment_id: format!("env-{}", sandbox.name),
+            environment_id: self
+                .environment
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| format!("env-{}", sandbox.name)),
             ssh: None,
             codespace: None,
             sandbox: Some(sandbox),
@@ -394,6 +408,16 @@ impl Host for FakeHost {
         Ok(())
     }
     fn request(&self, machine_id: &str, method: &str, params: Value) -> Result<Value, String> {
+        if method == "environment.describe" {
+            return if *self.connected.lock().unwrap() {
+                Ok(json!({}))
+            } else {
+                Err(crate::remote::SANDBOX_NOT_CONNECTED.into())
+            };
+        }
+        if method == "sessions.delete" && *self.delete_offline.lock().unwrap() {
+            return Err(crate::remote::SANDBOX_NOT_CONNECTED.into());
+        }
         self.log
             .lock()
             .unwrap()
@@ -793,6 +817,7 @@ fn a_start_runs_every_phase_in_order_and_ends_ready() {
             "gitconfig",
             "bootstrap",
             "relay",
+            "evidence",
             "mode:lifecycle"
         ]
     );
@@ -1991,4 +2016,358 @@ fn ssh_noise_between_log_lines_is_not_counted_as_log() {
         .map(|c| c.stdin.lines().next().unwrap().to_string())
         .collect();
     assert_eq!(offsets, ["OFFSET='0'", "OFFSET='2'", "OFFSET='4'"]);
+}
+
+// ------------------------------------------------------------------ reconnect
+
+/// A finished start with its config saved, ready to be stopped and reconnected.
+fn started() -> (Fx, i64, String) {
+    let fx = fx();
+    let (session, _) = fx.begin().unwrap();
+    let binding = fx.run(session.id).0.unwrap();
+    super::docker_config::save(&fx.store.lock().unwrap(), "/Users/me/widgets", &config()).unwrap();
+    (fx, session.id, binding.codespace)
+}
+fn sandbox_id(fx: &Fx) -> String {
+    fx.sbx.sandboxes.lock().unwrap()[0].0.clone()
+}
+impl Fx {
+    fn reconnect(&self, id: i64) -> (Result<(), String>, Vec<String>) {
+        let mut lines = vec![];
+        let result = self.svc.reconnect_sandbox(
+            id,
+            &mut |l| lines.push(l.to_string()),
+            &AtomicBool::new(false),
+        );
+        (result, lines)
+    }
+    /// Forgets what the start did, so only the reconnect shows.
+    fn reset(&self) {
+        self.shell.calls.lock().unwrap().clear();
+        self.sbx.calls.lock().unwrap().clear();
+        self.host.log.lock().unwrap().clear();
+    }
+}
+
+#[test]
+fn a_user_reconnect_resumes_a_stopped_sandbox_and_restores_everything() {
+    let (fx, id, _) = started();
+    fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+    fx.reset();
+    let (result, lines) = fx.reconnect(id);
+    result.unwrap();
+    assert_eq!(
+        fx.shell.tags(),
+        [
+            "mode:start",
+            "mode:follow",
+            "phase:approve",
+            "gitconfig",
+            "bootstrap",
+            "relay",
+            "evidence"
+        ]
+    );
+    // Every call goes to the one sandbox; no secret in any remote command word.
+    for call in fx.shell.calls() {
+        assert_eq!(call.id, sandbox_id(&fx));
+        assert!(!call.remote.contains(SECRET) && !call.remote.contains(GIT_TOKEN));
+    }
+    // The Claude prelude is on the Host bootstrap's stdin, the Git token on the approve's.
+    assert!(fx.shell.call("bootstrap").stdin.contains(SECRET));
+    assert!(fx.shell.call("phase:approve").stdin.contains(GIT_TOKEN));
+    assert!(!lines
+        .iter()
+        .any(|l| l.contains(SECRET) || l.contains(GIT_TOKEN)));
+    // The stale machine is dropped and a new tunnel is paired, then the project reopens.
+    let log = fx.host.log.lock().unwrap().clone();
+    let disconnect = log
+        .iter()
+        .position(|l| l.starts_with("disconnect"))
+        .unwrap();
+    let connect = log.iter().position(|l| l.starts_with("connect")).unwrap();
+    let open = log
+        .iter()
+        .position(|l| l.contains("projects.open"))
+        .unwrap();
+    assert!(disconnect < connect && connect < open, "{log:?}");
+    // Only read-only sbx verbs: it never creates, stops or deletes.
+    assert_eq!(fx.sbx.count("create"), 0);
+    assert_eq!(fx.sbx.count("stop"), 0);
+    assert_eq!(fx.sbx.count("rm"), 0);
+    assert!(fx.sbx.count("inspect") + fx.sbx.count("ls") >= 1);
+}
+
+#[test]
+fn a_reconnect_of_a_running_sandbox_works_too_and_a_public_repo_skips_the_credential() {
+    let (fx, id, _) = started();
+    let mut public = config();
+    public.credential_id = None;
+    super::docker_config::save(&fx.store.lock().unwrap(), "/Users/me/widgets", &public).unwrap();
+    fx.reset();
+    fx.reconnect(id).0.unwrap();
+    assert!(!fx.shell.tags().contains(&"phase:approve".to_string()));
+    assert!(fx.shell.tags().contains(&"bootstrap".to_string()));
+}
+
+#[test]
+fn a_reconnect_of_a_stopping_sandbox_is_refused_without_ssh() {
+    let (fx, id, _) = started();
+    fx.sbx.set_state(&sandbox_id(&fx), "stopping");
+    fx.reset();
+    let (result, _) = fx.reconnect(id);
+    assert_eq!(
+        result.unwrap_err(),
+        "Sandbox is stopping. Try again in a minute."
+    );
+    assert!(fx.shell.calls().is_empty());
+    assert!(fx.host.log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_reconnect_of_a_deleted_or_failed_sandbox_never_ssh_es() {
+    let (fx, id, _) = started();
+    fx.sbx.set_state(&sandbox_id(&fx), "failed");
+    fx.reset();
+    let error = fx.reconnect(id).0.unwrap_err();
+    assert!(error.contains("state failed"), "{error}");
+    fx.sbx.remove(&sandbox_id(&fx));
+    let error = fx.reconnect(id).0.unwrap_err();
+    assert!(error.contains("deleted"), "{error}");
+    assert!(fx.shell.calls().is_empty());
+    assert_eq!(fx.sbx.count("create"), 0);
+}
+
+#[test]
+fn a_recreated_container_is_reported_instead_of_silently_rebinding() {
+    let (fx, id, _) = started();
+    *fx.host.environment.lock().unwrap() = Some("env-new-host".into());
+    fx.reset();
+    let error = fx.reconnect(id).0.unwrap_err();
+    assert!(error.contains("recreated"), "{error}");
+    let remote = fx
+        .store
+        .lock()
+        .unwrap()
+        .remote_session(id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(remote.project.environment_id, "env-new-host");
+}
+
+#[test]
+fn a_reconnect_needs_a_sandbox_session_with_a_paired_machine() {
+    let (fx, id, _) = started();
+    fx.host.machines.lock().unwrap().clear();
+    fx.reset();
+    let error = fx.reconnect(id).0.unwrap_err();
+    assert!(error.contains("connection was removed"), "{error}");
+    assert!(fx.shell.calls().is_empty());
+    assert!(fx.reconnect(i64::MIN).0.is_err());
+}
+
+#[test]
+fn a_reconnect_failure_is_scrubbed_and_a_second_reconnect_is_allowed_after() {
+    let (fx, id, _) = started();
+    fx.reset();
+    fx.shell.fail("bootstrap", &format!("boom {SECRET}"));
+    let error = fx.reconnect(id).0.unwrap_err();
+    assert!(!error.contains(SECRET), "{error}");
+    *fx.shell.fail_tag.lock().unwrap() = None;
+    fx.reconnect(id).0.unwrap();
+}
+
+#[test]
+fn a_cancelled_reconnect_stops_without_touching_the_host() {
+    let (fx, id, _) = started();
+    fx.reset();
+    let cancel = AtomicBool::new(true);
+    let error = fx
+        .svc
+        .reconnect_sandbox(id, &mut |_| {}, &cancel)
+        .unwrap_err();
+    assert_eq!(error, START_ABORTED);
+    assert!(fx.host.log.lock().unwrap().is_empty());
+}
+
+// ------------------------------------------------------------- call sites
+
+#[test]
+fn sandbox_sessions_are_listed_and_targeted_with_their_backend() {
+    let (fx, id, name) = started();
+    let listed = fx.svc.cloud_sessions_for("/Users/me/widgets").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].cloud, super::backend::CloudRef::sandbox(&name));
+    fx.sbx.set_state(&sandbox_id(&fx), "stopped");
+    fx.svc.invalidate_ref(&listed[0].cloud);
+    fx.reset();
+    let target = fx.svc.target_for_session(id).unwrap();
+    assert_eq!(target.cloud.kind, CloudBackendKind::DockerSandbox);
+    assert_eq!(target.state, super::CloudState::Stopped);
+    // Reading a state is inspect only: no ssh.
+    assert!(fx.shell.calls().is_empty());
+}
+
+#[test]
+fn deleting_a_sandbox_disconnects_its_machine_too() {
+    let (fx, _, name) = started();
+    fx.reset();
+    let outcome = fx
+        .svc
+        .delete_cloud_outcome(&super::backend::CloudRef::sandbox(&name))
+        .unwrap();
+    assert_eq!(outcome, super::DeleteOutcome::Deleted);
+    assert_eq!(fx.sbx.count("rm"), 1);
+    assert!(fx
+        .host
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.starts_with("disconnect m-")));
+    assert!(fx.shell.calls().is_empty());
+}
+
+#[test]
+fn stopping_a_sandbox_goes_through_the_backend_without_ssh() {
+    let (fx, _, name) = started();
+    fx.reset();
+    fx.svc
+        .stop_cloud(&super::backend::CloudRef::sandbox(&name))
+        .unwrap();
+    assert_eq!(fx.sbx.count("stop"), 1);
+    assert!(fx.shell.calls().is_empty());
+}
+
+#[test]
+fn a_session_whose_sandbox_is_gone_can_be_deleted_without_a_host() {
+    let (fx, id, _) = started();
+    let store = fx.store.lock().unwrap();
+    let mut remote = store.remote_session(id).unwrap().unwrap();
+    remote.session_id = Some("host-session".into());
+    store.save_remote_session(&remote).unwrap();
+    fx.reset();
+    // While the sandbox exists the Host is asked to delete the conversation.
+    store
+        .delete_remote_session_with_sbx(id, &NoGh, &*fx.sbx, &*fx.host)
+        .unwrap();
+    assert!(fx
+        .host
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("sessions.delete")));
+    drop(store);
+
+    let (fx, id, _) = started();
+    let store = fx.store.lock().unwrap();
+    let mut remote = store.remote_session(id).unwrap().unwrap();
+    remote.session_id = Some("host-session".into());
+    store.save_remote_session(&remote).unwrap();
+    fx.sbx.remove(&sandbox_id_of(&fx.sbx));
+    fx.reset();
+    store
+        .delete_remote_session_with_sbx(id, &NoGh, &*fx.sbx, &*fx.host)
+        .unwrap();
+    assert!(store.remote_session(id).unwrap().is_none());
+    assert!(
+        !fx.host
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("sessions.delete")),
+        "a gone sandbox has no conversation to delete"
+    );
+}
+fn sandbox_id_of(sbx: &Sbx) -> String {
+    sbx.sandboxes.lock().unwrap()[0].0.clone()
+}
+
+#[test]
+fn a_reconnect_of_a_connected_sandbox_only_refreshes_the_git_credential_when_it_is_old() {
+    let (fx, id, _) = started();
+    *fx.host.connected.lock().unwrap() = true;
+    fx.reset();
+    fx.reconnect(id).0.unwrap();
+    // Nothing is restarted or paired; only the expiring credential cache is refreshed.
+    assert_eq!(fx.shell.tags(), ["phase:approve"]);
+    assert!(fx.shell.call("phase:approve").stdin.contains(GIT_TOKEN));
+    assert!(fx.host.log.lock().unwrap().is_empty());
+    // A fresh delivery is not repeated.
+    fx.reset();
+    fx.reconnect(id).0.unwrap();
+    assert!(fx.shell.calls().is_empty());
+}
+
+#[test]
+fn a_recreated_container_is_detected_before_anything_local_changes() {
+    let (fx, id, name) = started();
+    // The start remembered the container its Host lives in.
+    assert_eq!(
+        fx.store
+            .lock()
+            .unwrap()
+            .setting(&super::docker_start::container_key(&name))
+            .unwrap()
+            .as_deref(),
+        Some(CONTAINER)
+    );
+    fx.store
+        .lock()
+        .unwrap()
+        .save_setting(
+            &super::docker_start::container_key(&name),
+            "ffffffffffffffffffff",
+        )
+        .unwrap();
+    let before = fx
+        .store
+        .lock()
+        .unwrap()
+        .remote_session(id)
+        .unwrap()
+        .unwrap();
+    fx.reset();
+    let error = fx.reconnect(id).0.unwrap_err();
+    assert!(error.contains("recreated"), "{error}");
+    // No disconnect, no pairing, no project open, no Host bootstrap.
+    assert!(fx.host.log.lock().unwrap().is_empty());
+    assert_eq!(fx.host.machines.lock().unwrap().len(), 1);
+    assert!(!fx.shell.tags().contains(&"bootstrap".to_string()));
+    let after = fx
+        .store
+        .lock()
+        .unwrap()
+        .remote_session(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.project.environment_id, after.project.environment_id);
+    assert_eq!(before.project.key, after.project.key);
+}
+
+#[test]
+fn deleting_a_stopped_sandbox_session_never_resumes_it_and_can_be_removed_locally() {
+    let (fx, id, name) = started();
+    let store = fx.store.lock().unwrap();
+    let mut remote = store.remote_session(id).unwrap().unwrap();
+    remote.session_id = Some("host-session".into());
+    store.save_remote_session(&remote).unwrap();
+    *fx.host.delete_offline.lock().unwrap() = true;
+    fx.reset();
+    let error = store
+        .delete_remote_session_with_sbx(id, &NoGh, &*fx.sbx, &*fx.host)
+        .unwrap_err();
+    assert_eq!(error, crate::store::SANDBOX_STOPPED_DELETE);
+    assert!(fx.shell.calls().is_empty());
+    assert!(store.remote_session(id).unwrap().is_some());
+    // The explicit local removal forgets the record and says the sandbox remains.
+    let warning = store.remove_cloud_session_locally(id).unwrap();
+    assert!(
+        warning.contains(&name) && warning.contains("sbx --cloud rm"),
+        "{warning}"
+    );
+    assert!(store.remote_session(id).unwrap().is_none());
+    assert_eq!(fx.sbx.count("rm"), 0);
 }

@@ -270,7 +270,11 @@ pub struct CloudBinding {
 #[derive(Clone, Debug)]
 pub struct CloudSession {
     pub summary: crate::store::Session,
+    /// Name of the workspace hosting the session: a codespace name or a sandbox name, see
+    /// [`Self::cloud`].
     pub codespace: String,
+    /// The workspace and the backend that owns it.
+    pub cloud: CloudRef,
     pub environment_id: String,
     pub session_id: Option<String>,
     pub running: bool,
@@ -501,6 +505,8 @@ pub struct CloudSessions {
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     /// Pause before the creation-log follower is started again after it ended.
     follower_retry: Duration,
+    /// Sandboxes with a user-initiated reconnect in flight, by name.
+    reconnecting: Mutex<std::collections::HashSet<String>>,
 }
 
 impl CloudSessions {
@@ -522,6 +528,7 @@ impl CloudSessions {
             sleep: Box::new(std::thread::sleep),
             clock: Box::new(crate::time::now_ms),
             follower_retry: Duration::from_secs(2),
+            reconnecting: Mutex::new(Default::default()),
         }
     }
     #[cfg(test)]
@@ -549,17 +556,22 @@ impl CloudSessions {
     }
     /// Real `gh` and the app's default connections.
     pub fn system(store: Database) -> Result<Self, String> {
-        let secrets = Arc::new(docker_start::StoreSecrets::new(store.clone()));
         Ok(Self::new(
             Arc::new(codespaces::SystemGh),
             Arc::new(remote::default_connections()?),
-            store,
+            store.clone(),
         )
-        .with_sandboxes(
+        .with_system_sandboxes(store))
+    }
+    /// Registers the Docker sandbox backend over the real `sbx`, `ssh` and the app's own
+    /// secret store. Nothing runs until a sandbox session is used.
+    pub fn with_system_sandboxes(self, store: Database) -> Self {
+        let secrets = Arc::new(docker_start::StoreSecrets::new(store));
+        self.with_sandboxes(
             Arc::new(crate::sandboxes::SystemSbx),
             Arc::new(backend::docker::SystemShell::default()),
             secrets,
-        ))
+        )
     }
     /// Registers (or replaces) the backend for its kind.
     #[cfg(test)]
@@ -825,15 +837,17 @@ impl CloudSessions {
         self.store()?.create(harness, &binding.project_key)
     }
 
-    /// Sessions of `local_cwd` that live in codespaces, newest first.
+    /// Sessions of `local_cwd` that live in codespaces or Docker sandboxes, newest first.
     pub fn cloud_sessions_for(&self, local_cwd: &str) -> Result<Vec<CloudSession>, String> {
         Ok(self
             .store()?
             .cloud_sessions(local_cwd)?
             .into_iter()
             .filter_map(|s| {
+                let cloud = s.project.cloud()?;
                 Some(CloudSession {
-                    codespace: s.project.codespace.clone()?,
+                    codespace: cloud.name.clone(),
+                    cloud,
                     environment_id: s.project.environment_id.clone(),
                     session_id: s.session_id.clone(),
                     running: s.running,
@@ -1042,11 +1056,16 @@ impl CloudSessions {
         match self.host.machines() {
             Ok(machines) => {
                 for machine in machines {
-                    // Only codespace machines carry their workspace name until the sandbox
-                    // transport exists, so a sandbox has no machine to disconnect yet.
-                    if cloud.kind == CloudBackendKind::Codespaces
-                        && machine.codespace.as_deref() == Some(&cloud.name)
-                    {
+                    let ours = match cloud.kind {
+                        CloudBackendKind::Codespaces => {
+                            machine.codespace.as_deref() == Some(&cloud.name)
+                        }
+                        CloudBackendKind::DockerSandbox => machine
+                            .sandbox
+                            .as_ref()
+                            .is_some_and(|sandbox| sandbox.name == cloud.name),
+                    };
+                    if ours {
                         if let Err(e) = self.host.disconnect(&machine.id) {
                             disconnect_error.get_or_insert(e);
                         }
@@ -1091,6 +1110,7 @@ impl CloudSessions {
             (cloud, session.project.cwd.clone(), thread)
         };
         let backend = self.backend(cloud.kind)?;
+        self.prime_backend(&cloud);
         let codespace = cloud.name.clone();
         let remote = evidence_remote_path(&self.workspace_root, &workspace, remote_path)?;
         let local_dir = thread.join(EVIDENCE_DIR);
@@ -1113,6 +1133,7 @@ impl CloudSessions {
         ));
         std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
         let copied = backend.copy_from(&cloud.name, &remote, &staging);
+        let notes = backend.take_copy_notes();
         // The copy may have started the workspace.
         self.invalidate_ref(&cloud);
         let mut problems = Vec::new();
@@ -1155,6 +1176,18 @@ impl CloudSessions {
         if let Some(error) = hard_error {
             return Err(error);
         }
+        if !notes.is_empty() {
+            let shown: Vec<&str> = notes.iter().take(3).map(String::as_str).collect();
+            let extra = notes.len().saturating_sub(3);
+            let mut text = format!("Not copied: {}", shown.join("; "));
+            if extra > 0 {
+                text.push_str(&format!("; and {extra} more"));
+            }
+            pull.warning = Some(match pull.warning.take() {
+                Some(old) => format!("{old} {text}"),
+                None => text,
+            });
+        }
         if pull.files.is_empty() {
             pull.message = Some(format!(
                 "No evidence files found at {remote} in {} {codespace}.",
@@ -1168,19 +1201,19 @@ impl CloudSessions {
     /// state. `None` for non-cloud sessions. May run `gh codespace view` on a
     /// cache miss; never wakes anything.
     pub fn target_for_session(&self, session_id: i64) -> Option<SessionTarget> {
-        let codespace = self
+        let cloud = self
             .store()
             .ok()?
             .remote_session(session_id)
             .ok()??
             .project
-            .codespace?;
+            .cloud()?;
         let startup = self
             .store()
             .ok()
             .and_then(|store| start_record(&store, session_id))
             .map(|record| StartupSummary::of(&record));
-        Some(self.session_target(codespace, startup))
+        Some(self.session_target(cloud, startup))
     }
 }
 
@@ -1189,15 +1222,16 @@ impl CloudSessions {
     /// asking gh; a failed start shows the real gh state.
     pub(crate) fn session_target(
         &self,
-        codespace: String,
+        cloud: CloudRef,
         startup: Option<StartupSummary>,
     ) -> SessionTarget {
         let state = match &startup {
             Some(summary) if summary.error.is_none() => CloudState::Starting,
-            _ => self.cloud_state(&codespace),
+            _ => self.cloud_state_of(&cloud),
         };
         SessionTarget {
-            codespace,
+            codespace: cloud.name.clone(),
+            cloud,
             state,
             startup,
         }
@@ -1300,7 +1334,10 @@ pub enum DeleteOutcome {
 /// A session's codespace and its (cached) state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionTarget {
+    /// Name of the workspace (a codespace or a sandbox), see [`Self::cloud`].
     pub codespace: String,
+    /// The workspace and the backend that owns it.
+    pub cloud: CloudRef,
     pub state: CloudState,
     /// Set while the session is still starting its codespace (or failed to).
     pub startup: Option<StartupSummary>,

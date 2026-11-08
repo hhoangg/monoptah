@@ -94,6 +94,8 @@ pub(super) const GIT_CONFIG_SCRIPT: &str = include_str!("backend/docker_git_conf
 const SHORT: Duration = Duration::from_secs(120);
 const LONG: Duration = Duration::from_secs(30 * 60);
 
+mod reconnect;
+
 // ------------------------------------------------------------------------ data
 
 /// The container `devcontainer up` reported.
@@ -437,6 +439,9 @@ struct Run<'a> {
     cancel: &'a AtomicBool,
     deps: SandboxDeps,
     scrub: Scrub,
+    /// A reconnect: the record is transient, so "aborted" means `cancel` only (a start
+    /// record that is gone or failed is how a start is aborted).
+    detached: bool,
 }
 
 // ------------------------------------------------------------------- sessions
@@ -450,7 +455,7 @@ impl CloudSessions {
         shell: Arc<dyn SandboxShell>,
         secrets: Arc<dyn SandboxSecrets>,
     ) -> Self {
-        let backend = Arc::new(DockerBackend::new(runner.clone()));
+        let backend = Arc::new(DockerBackend::new(runner.clone()).with_shell(shell.clone()));
         self.backends
             .insert(CloudBackendKind::DockerSandbox, backend.clone());
         self.sandbox = Some(SandboxDeps {
@@ -697,6 +702,7 @@ impl CloudSessions {
             cancel,
             deps,
             scrub,
+            detached: false,
         };
 
         self.sandbox_create_step(&mut run, &name)?;
@@ -743,7 +749,15 @@ impl CloudSessions {
     }
 
     fn aborted(&self, run: &Run) -> bool {
-        self.start_aborted(run.record.session_id, run.cancel)
+        self.run_halted(run.record.session_id, run.cancel, run.detached)
+    }
+
+    fn run_halted(&self, session_id: i64, cancel: &AtomicBool, detached: bool) -> bool {
+        if detached {
+            cancel.load(Ordering::Relaxed)
+        } else {
+            self.start_aborted(session_id, cancel)
+        }
     }
 
     fn log_line(&self, run: &mut Run, text: &str) {
@@ -775,7 +789,8 @@ impl CloudSessions {
         let shell = run.deps.shell.clone();
         let cancel = run.cancel;
         let session_id = run.record.session_id;
-        let abort = || self.start_aborted(session_id, cancel);
+        let detached = run.detached;
+        let abort = || self.run_halted(session_id, cancel, detached);
         let result = {
             let mut on_line = |line: &str| {
                 if !line.trim_start().starts_with("MONOPTAH_") {
@@ -1030,7 +1045,8 @@ impl CloudSessions {
             let follow = format!("OFFSET='{delivered}'\n{follow_vars}");
             let session_id = run.record.session_id;
             let cancel = run.cancel;
-            let abort = || self.start_aborted(session_id, cancel);
+            let detached = run.detached;
+            let abort = || self.run_halted(session_id, cancel, detached);
             let result = {
                 let mut on_line = |line: &str| {
                     if let Some(log) = line.strip_prefix("L ") {
@@ -1301,6 +1317,8 @@ impl CloudSessions {
     ) -> Result<(CloudBinding, crate::store::RemoteProject), Stop> {
         let (_, container) = self.container_target(run)?;
         let cloud = CloudRef::sandbox(name);
+        // The evidence setup and the later archive copy exec into this container.
+        run.deps.backend.remember_target(target);
         let backend = self.backend(CloudBackendKind::DockerSandbox)?;
         let request = OpenRequest {
             local_cwd: &run.record.local_project.clone(),
@@ -1343,7 +1361,13 @@ impl CloudSessions {
                 (**events)(StartEvent::Log(text));
             },
         );
-        result.map_err(|e| Stop::from(run.scrub.apply(&e)))
+        let opened = result.map_err(|e| Stop::from(run.scrub.apply(&e)))?;
+        // Remembered so a later reconnect can tell a recreated container (a new Host) from
+        // the same one before it touches the paired machine.
+        if let Ok(store) = self.store() {
+            let _ = store.save_setting(&container_key(name), &container.id);
+        }
+        Ok(opened)
     }
 
     // ---- Lifecycle
@@ -1464,6 +1488,11 @@ impl CreateFailure {
             ambiguous: false,
         }
     }
+}
+
+/// Setting that remembers the id of the container a sandbox's Host lives in.
+pub(super) fn container_key(name: &str) -> String {
+    format!("sandbox-container:{name}")
 }
 
 /// `--config` argument: the devcontainer path, unless it is the default one.
