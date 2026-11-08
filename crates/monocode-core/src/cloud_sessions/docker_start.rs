@@ -95,6 +95,7 @@ const SHORT: Duration = Duration::from_secs(120);
 const LONG: Duration = Duration::from_secs(30 * 60);
 
 mod reconnect;
+pub(crate) use reconnect::ReconnectError;
 
 // ------------------------------------------------------------------------ data
 

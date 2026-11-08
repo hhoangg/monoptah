@@ -38,6 +38,26 @@ const TAR_END_PREFIX: &str = "MONOPTAH_TAR_END=";
 /// Prefix of every data line of a copy stream.
 const TAR_DATA_PREFIX: &str = "MONOPTAH_B:";
 
+/// Where a script runs: inside the devcontainer, or in the outer sandbox around it. `Outer`
+/// carries a path in the outer sandbox whose owner the script runs as.
+#[derive(Clone, Copy)]
+enum Where<'a> {
+    Container,
+    Outer(&'a str),
+}
+
+/// The remote command that runs `sh -s` in the outer sandbox as the owner of `path` (the
+/// workspace, whose `.git` the script reads and whose stage it writes), so file ownership
+/// and permissions stay right. Falls back to the ssh user when the owner is the same, `stat`
+/// fails or passwordless sudo is missing. `path` must already be validated.
+fn outer_command(path: &str) -> String {
+    let script = format!(
+        "ws={}; u=$(stat -c %u \"$ws\" 2>/dev/null || true); if [ -n \"$u\" ] && [ \"$u\" != \"$(id -u)\" ] && sudo -n true 2>/dev/null; then exec sudo -n -u \"#$u\" sh -s; else exec sh -s; fi",
+        crate::remote::shell_quote(path)
+    );
+    format!("sh -c {}", crate::remote::shell_quote(&script))
+}
+
 pub struct DockerBackend {
     runner: Arc<dyn SbxRunner>,
     ids: Mutex<HashMap<String, String>>,
@@ -104,10 +124,54 @@ impl DockerBackend {
         abort: &dyn Fn() -> bool,
         timeout: Duration,
     ) -> Result<ShellOutput, String> {
-        let (shell, target) = self.target_of(name)?;
-        let remote = target.exec_in_container(&["sh", "-l", "-s"]);
+        self.exec_at(Where::Container, name, stdin, on_line, abort, timeout)
+    }
+    /// Runs `stdin` as `sh -s` directly in the OUTER sandbox (no container exec), lines to
+    /// `on_line`. Needs only the sandbox id, so it works when the container is gone.
+    fn exec_outer(
+        &self,
+        name: &str,
+        owner_path: &str,
+        stdin: &str,
+        on_line: &mut dyn FnMut(&str),
+        abort: &dyn Fn() -> bool,
+        timeout: Duration,
+    ) -> Result<ShellOutput, String> {
+        self.exec_at(
+            Where::Outer(owner_path),
+            name,
+            stdin,
+            on_line,
+            abort,
+            timeout,
+        )
+    }
+    fn exec_at(
+        &self,
+        at: Where<'_>,
+        name: &str,
+        stdin: &str,
+        on_line: &mut dyn FnMut(&str),
+        abort: &dyn Fn() -> bool,
+        timeout: Duration,
+    ) -> Result<ShellOutput, String> {
+        let (shell, id, remote) = match at {
+            Where::Container => {
+                let (shell, target) = self.target_of(name)?;
+                let remote = target.exec_in_container(&["sh", "-l", "-s"]);
+                (shell, target.id, remote)
+            }
+            Where::Outer(owner_path) => {
+                codespaces::valid_remote_path(owner_path)?;
+                let shell = self
+                    .shell
+                    .clone()
+                    .ok_or_else(|| "Docker sandboxes are not available.".to_string())?;
+                (shell, self.id_of(name)?, outer_command(owner_path))
+            }
+        };
         shell
-            .run(&target.id, &remote, stdin, on_line, abort, timeout)
+            .run(&id, &remote, stdin, on_line, abort, timeout)
             .map_err(|e| sandboxes::redact(&e))
     }
     /// Remembers the id of the sandbox called `name`, so later calls skip the list lookup.
@@ -214,25 +278,7 @@ impl CloudBackend for DockerBackend {
     /// `<remote>: No such file or directory`, which
     /// [`crate::codespaces::is_missing_path`] recognises.
     fn copy_from(&self, name: &str, remote: &str, local: &Path) -> Result<(), String> {
-        codespaces::valid_remote_path(remote)?;
-        if !local.is_absolute() {
-            return Err("Local destination must be an absolute path".into());
-        }
-        if !local.is_dir() {
-            return Err("Local destination is not a folder".into());
-        }
-        let script = COPY_SCRIPT.replace("@PATH@", remote);
-        // The archive streams into a file next to the destination, never into memory.
-        let archive = local.join(format!(
-            ".monoptah-copy-{}-{}.tar",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        let result = self.copy_into(name, &script, &archive, local);
-        let _ = std::fs::remove_file(&archive);
-        result
+        self.copy_at(Where::Container, name, remote, local)
     }
     fn take_copy_notes(&self) -> Vec<String> {
         self.notes
@@ -253,9 +299,64 @@ impl CloudBackend for DockerBackend {
 }
 
 impl DockerBackend {
+    /// Runs `script` (on stdin, never in argv) with `sh -s` in the OUTER sandbox as the owner
+    /// of `owner_path`, for the files-only archive of a session whose container was
+    /// recreated or whose Host is gone. It resumes a stopped sandbox: only the
+    /// user-initiated archive may call it.
+    pub(crate) fn run_outer_script(
+        &self,
+        name: &str,
+        owner_path: &str,
+        script: &str,
+        long: bool,
+    ) -> Result<String, String> {
+        let timeout = if long { SCRIPT_LONG } else { SCRIPT_SHORT };
+        let out = self.exec_outer(name, owner_path, script, &mut |_| {}, &|| false, timeout)?;
+        if out.success {
+            Ok(out.stdout)
+        } else {
+            Err(script_failure(&out))
+        }
+    }
+    /// [`CloudBackend::copy_from`] for a path in the OUTER sandbox (the same verified tar
+    /// stream, run without `devcontainer exec`). Same restrictions on who may call it as
+    /// [`Self::run_outer_script`].
+    pub(crate) fn copy_from_outer(
+        &self,
+        name: &str,
+        owner_path: &str,
+        remote: &str,
+        local: &Path,
+    ) -> Result<(), String> {
+        self.copy_at(Where::Outer(owner_path), name, remote, local)
+    }
+    /// Streams `remote` as a base64 tar and unpacks it into `local`, see
+    /// [`CloudBackend::copy_from`].
+    fn copy_at(&self, at: Where<'_>, name: &str, remote: &str, local: &Path) -> Result<(), String> {
+        codespaces::valid_remote_path(remote)?;
+        if !local.is_absolute() {
+            return Err("Local destination must be an absolute path".into());
+        }
+        if !local.is_dir() {
+            return Err("Local destination is not a folder".into());
+        }
+        let script = COPY_SCRIPT.replace("@PATH@", remote);
+        // The archive streams into a file next to the destination, never into memory.
+        let archive = local.join(format!(
+            ".monoptah-copy-{}-{}.tar",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let result = self.copy_into(at, name, &script, &archive, local);
+        let _ = std::fs::remove_file(&archive);
+        result
+    }
     /// Runs the copy script and writes the decoded stream to `archive`, then unpacks it.
     fn copy_into(
         &self,
+        at: Where<'_>,
         name: &str,
         script: &str,
         archive: &Path,
@@ -306,7 +407,8 @@ impl DockerBackend {
                     }
                 }
             };
-            self.exec(
+            self.exec_at(
+                at,
                 name,
                 script,
                 &mut on_line,

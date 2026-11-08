@@ -44,6 +44,38 @@ fn credential_key(name: &str) -> String {
 const RECREATED: &str =
     "The sandbox container was recreated, so this session's history is gone. Start a new session.";
 
+/// Why [`CloudSessions::reconnect_sandbox_typed`] failed. The archive flow tells the first two
+/// apart from the rest: they do not stop it from saving the files (see
+/// `CloudSessions::convert_session`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReconnectError {
+    /// The devcontainer was recreated: its Host is new and the session's history stayed in
+    /// the old container. The workspace (a bind mount) survived.
+    Recreated,
+    /// The sandbox state was fine but bringing the container and Host back failed.
+    HostUnreachable(String),
+    /// Anything else (missing session, deleted or stopping sandbox, cancel, ...).
+    Failed(String),
+}
+impl std::fmt::Display for ReconnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Recreated => f.write_str(RECREATED),
+            Self::HostUnreachable(text) | Self::Failed(text) => f.write_str(text),
+        }
+    }
+}
+impl From<String> for ReconnectError {
+    fn from(text: String) -> Self {
+        Self::Failed(text)
+    }
+}
+impl From<&str> for ReconnectError {
+    fn from(text: &str) -> Self {
+        Self::Failed(text.to_string())
+    }
+}
+
 /// Removes the in-flight mark of a reconnect, however the call ends.
 struct InFlight<'a> {
     set: &'a Mutex<std::collections::HashSet<String>>,
@@ -68,6 +100,17 @@ impl CloudSessions {
         progress: &mut dyn FnMut(&str),
         cancel: &AtomicBool,
     ) -> Result<(), String> {
+        self.reconnect_sandbox_typed(session_id, progress, cancel)
+            .map_err(|e| e.to_string())
+    }
+
+    /// [`Self::reconnect_sandbox`] with a typed error. Same rules: user-initiated only.
+    pub(crate) fn reconnect_sandbox_typed(
+        &self,
+        session_id: i64,
+        progress: &mut dyn FnMut(&str),
+        cancel: &AtomicBool,
+    ) -> Result<(), ReconnectError> {
         let deps = self.sandbox_deps()?;
         let (session, config) = {
             let store = self.store()?;
@@ -123,7 +166,8 @@ impl CloudSessions {
                 return Err(format!(
                     "The sandbox is in state {}. Delete this session and start a new one.",
                     raw.trim()
-                ));
+                )
+                .into());
             }
             CloudState::Available | CloudState::Starting | CloudState::Stopped => {}
         }
@@ -233,6 +277,7 @@ impl CloudSessions {
             scrub,
             detached: true,
         };
+        let recreated = std::cell::Cell::new(false);
         let outcome = (|| -> Result<(), Stop> {
             self.progress_line(&mut run, "Starting the container");
             self.sandbox_build_step(&mut run)?;
@@ -244,6 +289,7 @@ impl CloudSessions {
                 .ok()
                 .and_then(|store| store.setting(&container_key(&name)).ok().flatten());
             if remembered.is_some_and(|old| old != container.id) {
+                recreated.set(true);
                 return Err(Stop::Failed(RECREATED.into()));
             }
             if have_config && config.credential_id.is_some() {
@@ -288,6 +334,7 @@ impl CloudSessions {
             if binding.environment_id != session.project.environment_id {
                 // The container was recreated: its Host is a new one and this session's
                 // history stayed in the old one.
+                recreated.set(true);
                 return Err(Stop::Failed(RECREATED.into()));
             }
             Ok(())
@@ -307,7 +354,8 @@ impl CloudSessions {
         match outcome {
             Ok(()) => Ok(()),
             Err(Stop::Aborted) => Err(START_ABORTED.into()),
-            Err(Stop::Failed(error)) => Err(error),
+            Err(Stop::Failed(_)) if recreated.get() => Err(ReconnectError::Recreated),
+            Err(Stop::Failed(error)) => Err(ReconnectError::HostUnreachable(error)),
         }
     }
 }
