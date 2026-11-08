@@ -2,8 +2,12 @@ use super::backend::docker::{SandboxShell, ShellOutput};
 use super::backend::CloudBackendKind;
 use super::docker_config::DockerProjectConfig;
 use super::docker_start::{
-    parse_up_line, repo_dir_of, starts_blocking_commands, with_vars, ClaudeAuth, SandboxSecrets,
-    UpLine, GIT_CONFIG_SCRIPT, PROVISION_SCRIPT, RELAY_SCRIPT, UP_SCRIPT,
+    parse_up_line, repo_dir_of, starts_blocking_commands, ClaudeAuth, SandboxSecrets, UpLine,
+};
+// Only the unix-only `scripts` tests run the embedded shell scripts.
+#[cfg(unix)]
+use super::docker_start::{
+    with_vars, GIT_CONFIG_SCRIPT, PROVISION_SCRIPT, RELAY_SCRIPT, UP_SCRIPT,
 };
 use super::startup::{
     pending_starts, save_start_record, start_record, StartEvent, StartRecord, Step, StepKind,

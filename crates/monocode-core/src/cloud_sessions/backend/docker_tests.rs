@@ -1,4 +1,5 @@
 use super::docker::*;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 

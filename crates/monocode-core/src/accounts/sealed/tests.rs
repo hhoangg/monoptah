@@ -13,6 +13,9 @@ fn round_trip_and_key_is_private() {
     assert!(!ciphertext.windows(6).any(|w| w == b"secret"));
     let plain = open(&database, b"aad", &nonce, &ciphertext).unwrap();
     assert_eq!(plain.as_slice(), b"secret");
+    // The key file mode is only checked on unix; `dir` keeps the directory alive.
+    #[cfg(not(unix))]
+    let _ = &dir;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
