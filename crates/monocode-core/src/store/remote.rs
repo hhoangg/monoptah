@@ -366,12 +366,17 @@ impl Store {
         if sessions.remove(&id).is_none() {
             return Ok(());
         }
+        // Resolved first: the folder name needs the session to still exist.
+        let cache = self.cloud_cache_dir(id).ok().flatten();
         crate::cloud_sessions::startup::forget_session_start(self, id)?;
         self.hide_legacy_remote_sessions([id])?;
         self.save_setting(
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
-        )
+        )?;
+        // Files fetched to view the workspace are of no use once the session is gone.
+        super::thread_files::remove_dir(cache);
+        Ok(())
     }
     fn stored_remote_sessions(&self) -> Result<BTreeMap<i64, RemoteSession>, String> {
         self.setting(SESSIONS)?

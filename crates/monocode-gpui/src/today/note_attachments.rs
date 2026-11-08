@@ -528,6 +528,7 @@ impl Today {
                     Box::new(crate::document_lightbox::Open {
                         path,
                         title: title.into(),
+                        cloud: None,
                     }),
                     cx,
                 );

@@ -14,6 +14,7 @@ use monocode_core::files;
 use std::{
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 /// A native web view draws above every GPUI overlay, so it is only shown while
@@ -29,6 +30,37 @@ pub(crate) const MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub(crate) enum Kind {
     Markdown,
     Html,
+    /// Source code or plain text, shown as a code block. Only files of a cloud workspace
+    /// are opened as this kind (by [`CloudDoc`]); local notes keep Markdown and HTML.
+    Code,
+}
+
+/// A file of a cloud workspace shown by the lightbox. `kind` replaces the extension lookup.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CloudDoc {
+    pub kind: Kind,
+    /// The whole file when it was read into memory. `Open::path` then only names it (its
+    /// extension picks the code language) and nothing is read from disk.
+    pub text: Option<Arc<str>>,
+    /// For HTML opened from disk: the folder the page may read its assets from.
+    pub web_root: Option<PathBuf>,
+}
+
+/// The fence that shows `text` as code, longer than any run of backticks inside it.
+fn code_block(text: &str, path: &Path) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for ch in text.chars() {
+        run = if ch == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    let language = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| ext.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or("");
+    format!("{fence}{language}\n{text}\n{fence}")
 }
 
 /// What the lightbox can show for a file, by extension.
@@ -45,6 +77,8 @@ pub(crate) fn kind_of(path: &Path) -> Option<Kind> {
 pub(crate) struct Open {
     pub path: PathBuf,
     pub title: SharedString,
+    /// Set for a file of a cloud workspace; `None` for every local file.
+    pub cloud: Option<CloudDoc>,
 }
 
 actions!(document_lightbox, [Close]);
@@ -92,6 +126,8 @@ pub(crate) struct DocumentLightbox {
     title: SharedString,
     kind: Option<Kind>,
     text: Option<String>,
+    /// The file exists on disk, so "Open with default app" can open it.
+    on_disk: bool,
     body: Body,
     error: Option<String>,
     /// A higher-priority overlay is up, so a native web view must not show.
@@ -106,12 +142,18 @@ impl DocumentLightbox {
         let restore = window.focused(cx);
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        let kind = kind_of(&open.path);
+        let cloud = open.cloud;
+        let kind = cloud
+            .as_ref()
+            .map(|doc| doc.kind)
+            .or_else(|| kind_of(&open.path));
+        let in_memory = cloud.as_ref().is_some_and(|doc| doc.text.is_some());
         let mut this = Self {
             path: open.path.clone(),
             title: open.title,
             kind,
             text: None,
+            on_disk: !in_memory,
             body: Body::Loading,
             error: None,
             covered: false,
@@ -120,6 +162,29 @@ impl DocumentLightbox {
         };
         if kind.is_none() {
             this.body = Body::Message("This file type can't be previewed here.".into());
+            return this;
+        }
+        if let Some(CloudDoc {
+            text: Some(text), ..
+        }) = &cloud
+        {
+            this.loaded(Ok(Loaded::Text(text.to_string())), cx);
+            return this;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(CloudDoc {
+            kind: Kind::Html,
+            web_root: Some(root),
+            ..
+        }) = &cloud
+        {
+            // A downloaded page loads from disk with its assets; there is no size limit.
+            let (path, root) = (open.path.clone(), root.clone());
+            this.body = Body::Html(cx.new(|_| {
+                let mut html = Html::from_file(path, root);
+                html.set_interactive(true);
+                html
+            }));
             return this;
         }
         let path = open.path;
@@ -149,6 +214,10 @@ impl DocumentLightbox {
                 let body = match self.kind {
                     Some(Kind::Markdown) => {
                         let shown = text.clone();
+                        Body::Markdown(cx.new(|cx| TranscriptView::document(shown, cx)))
+                    }
+                    Some(Kind::Code) => {
+                        let shown = code_block(&text, &self.path);
                         Body::Markdown(cx.new(|cx| TranscriptView::document(shown, cx)))
                     }
                     #[cfg(target_os = "macos")]
@@ -284,12 +353,14 @@ impl Render for DocumentLightbox {
                 .gap(px(10.))
                 .text_color(content(0.7))
                 .child(message.unwrap_or_default())
-                .child(Self::button(
-                    "document-lightbox-message-open",
-                    "Open with default app",
-                    cx,
-                    |this, _, cx| this.open_external(cx),
-                ))
+                .when(self.on_disk, |d| {
+                    d.child(Self::button(
+                        "document-lightbox-message-open",
+                        "Open with default app",
+                        cx,
+                        |this, _, cx| this.open_external(cx),
+                    ))
+                })
                 .into_any_element(),
         };
         div()
@@ -365,12 +436,14 @@ impl Render for DocumentLightbox {
                                     |this, _, cx| this.copy_text(cx),
                                 ))
                             })
-                            .child(Self::button(
-                                "document-lightbox-open-external",
-                                "Open with default app",
-                                cx,
-                                |this, _, cx| this.open_external(cx),
-                            ))
+                            .when(self.on_disk, |d| {
+                                d.child(Self::button(
+                                    "document-lightbox-open-external",
+                                    "Open with default app",
+                                    cx,
+                                    |this, _, cx| this.open_external(cx),
+                                ))
+                            })
                             .child(Self::button(
                                 "document-lightbox-close",
                                 "Close",
@@ -427,6 +500,19 @@ mod tests {
         assert!(!shows_web_view(Some(Kind::Html), true));
         assert!(!shows_web_view(Some(Kind::Markdown), false));
         assert!(!shows_web_view(None, false));
+    }
+
+    #[test]
+    fn code_is_fenced_longer_than_any_backtick_run_it_contains() {
+        assert_eq!(
+            code_block("fn a() {}", Path::new("src/a.rs")),
+            "```rs\nfn a() {}\n```"
+        );
+        let shown = code_block("x ```` y", Path::new("notes"));
+        assert!(shown.starts_with("`````\nx ```` y"), "{shown}");
+        assert!(shown.ends_with("\n`````"), "{shown}");
+        // An odd extension never reaches the info string.
+        assert!(code_block("a", Path::new("a.r s!")).starts_with("```\n"));
     }
 
     #[test]

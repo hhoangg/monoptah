@@ -553,6 +553,7 @@ fn supported_remote_method(method: &str) -> bool {
             | "git.worktrees"
             | "git.worktreeCreate"
             | "files.read"
+            | "files.readBytes"
             | "files.list"
             | "files.index"
             | "workspace.run"
@@ -1530,6 +1531,7 @@ else:
             "git.worktreeCreate",
             "attachments.upload",
             "attachments.read",
+            "files.readBytes",
         ] {
             assert!(supported_remote_method(method), "{method}");
         }

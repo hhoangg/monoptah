@@ -14,6 +14,9 @@ mod cloud_picker;
 mod cloud_start;
 #[cfg(test)]
 mod cloud_tests;
+mod cloud_view;
+#[cfg(test)]
+mod cloud_view_tests;
 mod contributors;
 #[cfg(test)]
 mod contributors_tests;
@@ -709,6 +712,8 @@ pub(crate) struct Shell {
     cloud: Arc<monocode_core::cloud_sessions::CloudSessions>,
     /// Sessions that live in a codespace, by id, and the cached state of each codespace.
     cloud_marks: HashMap<i64, cloud::CloudMark>,
+    /// The card for the cloud file being read or downloaded.
+    cloud_view: Option<cloud_view::CloudView>,
     cloud_states: HashMap<String, monocode_core::cloud_sessions::CloudState>,
     /// Converted local sessions and the codespace each came from, and which of those no longer
     /// exist.
@@ -1169,6 +1174,7 @@ impl Shell {
             cloud,
             gh,
             cloud_marks: HashMap::new(),
+            cloud_view: None,
             cloud_states: HashMap::new(),
             cloud_origins: HashMap::new(),
             cloud_gone: Default::default(),
@@ -9248,6 +9254,10 @@ impl Render for Shell {
             }))
             .on_action(
                 cx.listener(|this, event: &crate::file_editor::OpenPath, window, cx| {
+                    // A path in the cloud workspace of the active cloud session.
+                    if this.open_cloud_path(&event.0, window, cx) {
+                        return;
+                    }
                     let cwd = this.git.read(cx).project().to_owned();
                     let (path, location) = crate::file_editor::file_location(&event.0, &cwd);
                     this.open_review(crate::review::ReviewTab::File { cwd, path }, window, cx);
@@ -9740,6 +9750,7 @@ impl Render for Shell {
             .children(self.git_credential_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.cloud_archive_modal(window, cx))
+            .children(self.cloud_view_card(cx))
             .children(self.codespace_picker_modal(window, cx))
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))

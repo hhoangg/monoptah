@@ -47,6 +47,14 @@
 //!   file paths. A missing remote folder is `Ok` with no files and a `message`. This is a
 //!   user action: `gh codespace cp` starts a stopped codespace. BLOCKS (gh).
 //!
+//! * Viewing a workspace file from the chat ([`view`], [`view_cache`]):
+//!   [`CloudSessions::resolve_cloud_file`] / [`CloudSessions::open_cloud_file`] read a
+//!   path the agent mentioned through the Host's `files.readBytes` over the live tunnel (never
+//!   waking the workspace) and return it in memory when it is previewable and at most 5 MB;
+//!   [`CloudSessions::download_cloud_file`] streams anything else into the session's
+//!   `cloud-cache/` (verified, cancellable, capped at 2 GB over all sessions) and
+//!   [`CloudSessions::clear_cloud_cache`] empties it on archive.
+//!
 //! * Non-blocking start (the GUI path; full description in [`startup`]):
 //!   [`CloudSessions::begin_start`] `(local_cwd, Target, harness) -> (Session, StartRecord)`
 //!   requests the codespace through the REST API and creates the session at once, on a
@@ -1445,6 +1453,8 @@ mod convert;
 pub use convert::*;
 
 pub mod startup;
+pub mod view;
+pub mod view_cache;
 pub use startup::{
     pending_starts, queue_start_message, queued_start_message, start_record, starting_refusal,
     StartEvent, StartRecord, Step, StepKind, StepStatus,
@@ -1461,3 +1471,5 @@ mod docker_start_tests;
 mod startup_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod view_tests;

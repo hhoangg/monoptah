@@ -10,6 +10,8 @@ use super::Store;
 use std::path::{Path, PathBuf};
 
 const ATTACHMENTS: &str = "attachments";
+/// Files fetched from a cloud workspace to be viewed; always safe to delete.
+pub const CLOUD_CACHE: &str = "cloud-cache";
 const REMOTE_PREFIX: &str = "remote:";
 /// Encoded names start with this so they never collide with a plain id.
 const ENCODED_PREFIX: &str = "x-";
@@ -62,6 +64,30 @@ impl Store {
         Ok(Some(
             root.join(folder_name(&self.persisted_session_id(id)?)),
         ))
+    }
+    /// Where files viewed from the cloud workspace of session `id` are cached.
+    pub fn cloud_cache_dir(&self, id: i64) -> Result<Option<PathBuf>, String> {
+        Ok(self.thread_dir(id)?.map(|dir| dir.join(CLOUD_CACHE)))
+    }
+    /// Every session's existing cloud cache folder (for the app-wide size cap).
+    pub fn cloud_cache_dirs(&self) -> Vec<PathBuf> {
+        let Some(root) = self.threads_root() else {
+            return Vec::new();
+        };
+        std::fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join(CLOUD_CACHE))
+            .filter(|dir| {
+                std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_dir())
+            })
+            .collect()
+    }
+    /// Deletes the cloud cache of session `id`. Missing folders are fine.
+    pub fn clear_cloud_cache(&self, id: i64) -> Result<(), String> {
+        remove_dir(self.cloud_cache_dir(id)?);
+        Ok(())
     }
     /// Where pasted images and other app-made attachments for `id` are written.
     pub fn thread_attachments_dir(&self, id: i64) -> Result<Option<PathBuf>, String> {

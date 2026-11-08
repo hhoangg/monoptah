@@ -12,7 +12,7 @@ use objc2_app_kit::{NSView, NSWindowOrderingMode};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSObject, NSObjectProtocol};
 #[cfg(target_os = "macos")]
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL};
 #[cfg(target_os = "macos")]
 use objc2_web_kit::{
     WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationType,
@@ -44,12 +44,19 @@ define_class!(
         }
     }
 );
+/// What the navigation guard needs: the app handle to open links, and for a page loaded
+/// from disk the only folder (canonical, no trailing slash) its `file:` URLs may point into.
+#[cfg(target_os = "macos")]
+struct GuardState {
+    app: gpui::AsyncApp,
+    file_root: Option<String>,
+}
 #[cfg(target_os = "macos")]
 define_class!(
     #[unsafe(super(NSObject))]
     #[name = "MonocodeArtifactNavigation"]
     #[thread_kind=MainThreadOnly]
-    #[ivars=gpui::AsyncApp]
+    #[ivars=GuardState]
     struct NavigationGuard;
     unsafe impl NSObjectProtocol for NavigationGuard {}
     unsafe impl WKNavigationDelegate for NavigationGuard {
@@ -67,12 +74,21 @@ define_class!(
                     || url.to_string().starts_with("http://"))
             {
                 let url = url.to_string();
-                self.ivars().clone().update(|cx| cx.open_url(&url));
+                self.ivars().app.clone().update(|cx| cx.open_url(&url));
             }
-            let allowed = url.is_none_or(|url| {
-                let s = url.to_string();
-                s.starts_with("about:blank") || s.starts_with("about:srcdoc")
-            });
+            let file_path = unsafe { action.request().URL() }
+                .filter(|url| url.isFileURL())
+                .and_then(|url| url.path())
+                .map(|path| path.to_string());
+            let allowed = match (&file_path, &self.ivars().file_root) {
+                // A page loaded from the cache may show files below the cache folder only.
+                (Some(path), Some(root)) => path == root || path.starts_with(&format!("{root}/")),
+                (Some(_), None) => false,
+                (None, _) => url.is_none_or(|url| {
+                    let s = url.to_string();
+                    s.starts_with("about:blank") || s.starts_with("about:srcdoc")
+                }),
+            };
             reply.call((if allowed {
                 WKNavigationActionPolicy::Allow
             } else {
@@ -94,9 +110,20 @@ struct Markup {
     accent: gpui::Hsla,
     html: Arc<str>,
 }
+/// A page that lives on disk (a download from a cloud workspace), with the folder its
+/// relative assets may be read from.
+#[cfg(target_os = "macos")]
+struct FilePage {
+    path: std::path::PathBuf,
+    root: std::path::PathBuf,
+    /// Identity of the page for the reload check; never changes.
+    marker: Arc<str>,
+}
 pub(crate) struct Html {
     body: String,
     interactive: bool,
+    #[cfg(target_os = "macos")]
+    file: Option<Rc<FilePage>>,
     #[cfg(target_os = "macos")]
     markup: Option<Markup>,
     #[cfg(target_os = "macos")]
@@ -141,13 +168,39 @@ impl Html {
             body,
             interactive: true,
             #[cfg(target_os = "macos")]
+            file: None,
+            #[cfg(target_os = "macos")]
             markup: None,
             #[cfg(target_os = "macos")]
             view: Rc::new(RefCell::new(None)),
         }
     }
+    /// Shows the page at `path` straight from disk, with read access to `root` only. Used
+    /// for files downloaded from a cloud workspace, whose relative assets sit beside them.
+    /// On other platforms the path is only named, like every `Html`.
+    pub(crate) fn from_file(path: std::path::PathBuf, root: std::path::PathBuf) -> Self {
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut this = Self::new(path.to_string_lossy().into_owned());
+        #[cfg(target_os = "macos")]
+        {
+            // Canonical forms make the guard's folder comparison reliable (/var vs /private/var).
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            let root = std::fs::canonicalize(&root).unwrap_or(root);
+            this.file = Some(Rc::new(FilePage {
+                marker: path.to_string_lossy().into_owned().into(),
+                path,
+                root,
+            }));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = root;
+        this
+    }
     #[cfg(target_os = "macos")]
     fn markup(&mut self) -> Arc<str> {
+        if let Some(file) = &self.file {
+            return file.marker.clone();
+        }
         let ink = crate::theme::content(1.);
         let accent = crate::theme::accent_color();
         if self
@@ -175,12 +228,30 @@ impl Html {
         }
     }
 }
+/// Loads `markup` as an opaque page, or the file page with read access to its folder only.
+#[cfg(target_os = "macos")]
+fn load_page(web: &WKWebView, markup: &str, file: Option<&FilePage>) {
+    unsafe {
+        match file {
+            Some(file) => {
+                let url = NSURL::fileURLWithPath(&NSString::from_str(&file.path.to_string_lossy()));
+                let root =
+                    NSURL::fileURLWithPath(&NSString::from_str(&file.root.to_string_lossy()));
+                web.loadFileURL_allowingReadAccessToURL(&url, &root);
+            }
+            None => {
+                web.loadHTMLString_baseURL(&NSString::from_str(markup), None);
+            }
+        }
+    }
+}
 impl gpui::Render for Html {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(target_os = "macos")]
         {
             let view = self.view.clone();
             let html = self.markup();
+            let file = self.file.clone();
             let app = cx.to_async();
             let interactive = self.interactive;
             canvas(
@@ -255,10 +326,15 @@ impl gpui::Render for Html {
                                 web_rect,
                                 &config,
                             );
-                            let guard = NavigationGuard::alloc(mtm).set_ivars(app.clone());
+                            let guard = NavigationGuard::alloc(mtm).set_ivars(GuardState {
+                                app: app.clone(),
+                                file_root: file
+                                    .as_ref()
+                                    .map(|file| file.root.to_string_lossy().into_owned()),
+                            });
                             let guard: Retained<NavigationGuard> = msg_send![super(guard), init];
                             web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*guard)));
-                            web.loadHTMLString_baseURL(&NSString::from_str(&html), None);
+                            load_page(&web, &html, file.as_deref());
                             clip.addSubview(&web);
                             Hosted {
                                 clip,
@@ -271,10 +347,7 @@ impl gpui::Render for Html {
                     }
                     if let Some(view) = view.as_mut() {
                         if !Arc::ptr_eq(&view.markup, &html) {
-                            unsafe {
-                                view.web
-                                    .loadHTMLString_baseURL(&NSString::from_str(&html), None);
-                            }
+                            load_page(&view.web, &html, file.as_deref());
                             view.markup = html.clone();
                         }
                         parent.addSubview_positioned_relativeTo(
