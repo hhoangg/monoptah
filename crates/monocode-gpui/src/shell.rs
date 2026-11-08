@@ -43,6 +43,7 @@ mod project_rail;
 mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
 mod codespaces;
+mod docker_sandbox;
 mod project_settings;
 mod provider_prompt;
 mod quick_composer;
@@ -651,6 +652,7 @@ pub(crate) struct Shell {
     session_tickets: HashMap<i64, String>,
     telegram: telegram::Telegram,
     codespaces: Option<codespaces::OpenCodespaces>,
+    docker_sandbox: Option<docker_sandbox::OpenDocker>,
     /// The sidebar rails under orchestrators and /operator threads.
     rails: rails::Rails,
     usage_footer: Entity<UsageFooter>,
@@ -1123,6 +1125,7 @@ impl Shell {
             session_tickets: HashMap::new(),
             telegram: telegram::Telegram::new(),
             codespaces: None,
+            docker_sandbox: None,
             rails: Default::default(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
@@ -6016,8 +6019,12 @@ impl Shell {
                             .into(),
                     );
                     items.push(
-                        MenuAction::new("codespaces", "Codespaces setup…")
+                        MenuAction::new("cloud-setup", "Cloud setup")
                             .icon("cloud-upload")
+                            .submenu(vec![
+                                MenuAction::new("codespaces", "Codespaces"),
+                                MenuAction::new("docker-sandbox", "Docker Sandbox"),
+                            ])
                             .into(),
                     );
                 }
@@ -6224,6 +6231,8 @@ impl Shell {
                     self.open_telegram_dialog(path, window, cx);
                 } else if action == "codespaces" {
                     self.open_codespaces_dialog(path, window, cx);
+                } else if action == "docker-sandbox" {
+                    self.open_docker_dialog(path, window, cx);
                 } else if action == "archive" {
                     self.archive_project(&path, window, cx);
                 } else if action == "delete" {
@@ -9465,6 +9474,10 @@ impl Render for Shell {
                     this.close_codespaces_dialog(window, cx);
                     return;
                 }
+                if this.docker_sandbox.is_some() {
+                    this.docker_escape(window, cx);
+                    return;
+                }
                 if this.action_dialog.is_some() {
                     this.close_action_dialog(window, cx);
                     return;
@@ -9692,6 +9705,8 @@ impl Render for Shell {
             .children(self.telegram_modal(window, cx))
             .children(self.telegram_topic_modal(window, cx))
             .children(self.codespaces_modal(window, cx))
+            .children(self.docker_modal(window, cx))
+            .children(self.git_credential_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.cloud_archive_modal(window, cx))
             .children(self.codespace_picker_modal(window, cx))

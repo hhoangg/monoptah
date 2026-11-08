@@ -428,3 +428,52 @@ fn saving_without_a_database_creates_no_key_file() {
     assert!(!root.path().join("credentials.key").exists());
     assert!(!root.path().join("monocode.db").exists());
 }
+
+#[test]
+fn check_token_checks_an_unsaved_token_without_touching_the_database() {
+    let root = tempfile::tempdir().unwrap();
+    let runner = Fake {
+        success: true,
+        ..Default::default()
+    };
+    let check = check_token(
+        &runner,
+        GitPlatform::GitHub,
+        "octocat",
+        Secret::new(TOKEN.into()),
+        "https://github.com/o/r.git",
+    )
+    .unwrap();
+    assert_eq!(check.status, AccessStatus::ReadOk);
+    let calls = runner.calls.lock().unwrap();
+    let (args, env, existed, askpass) = &calls[0];
+    assert!(args.iter().all(|a| !a.contains(TOKEN)));
+    assert!(env.iter().all(|(_, v)| !v.contains(TOKEN)));
+    assert!(args.iter().any(|a| a == "ls-remote"));
+    assert!(*existed);
+    assert!(!PathBuf::from(askpass.as_ref().unwrap()).exists());
+    // Nothing was created next to where a database would live.
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn check_token_validates_like_save_and_rejects_a_host_mismatch() {
+    let runner = Fake {
+        success: true,
+        ..Default::default()
+    };
+    let run = |platform, username: &str, token: &str, url: &str| {
+        check_token(&runner, platform, username, Secret::new(token.into()), url)
+    };
+    let url = "https://github.com/o/r";
+    assert!(
+        run(GitPlatform::GitHub, "", TOKEN, url).is_err(),
+        "GitHub needs a username"
+    );
+    assert!(run(GitPlatform::GitHub, "me", "", url).is_err());
+    assert!(run(GitPlatform::GitHub, "me", "two words", url).is_err());
+    assert!(run(GitPlatform::GitHub, "me", TOKEN, "https://gitlab.com/g/r").is_err());
+    assert!(run(GitPlatform::GitHub, "me", TOKEN, "git@github.com:o/r.git").is_err());
+    assert!(runner.calls.lock().unwrap().is_empty(), "nothing ran");
+    assert!(run(GitPlatform::GitLab, "", TOKEN, "https://gitlab.com/g/r").is_ok());
+}

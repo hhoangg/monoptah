@@ -506,77 +506,15 @@ impl GitCredentials {
         id: &str,
         repo_url: &str,
     ) -> Result<AccessCheck, String> {
-        let (summary, _, url) = self.summary_for(id, repo_url)?;
+        let (summary, _, _) = self.summary_for(id, repo_url)?;
         let token = self.secret(id)?;
-        let dir = tempfile::Builder::new()
-            .prefix("monoptah-askpass-")
-            .tempdir()
-            .map_err(|_| "Could not prepare the Git check.")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-                .map_err(|_| "Could not prepare the Git check.")?;
-        }
-        let script = write_askpass(dir.path(), &summary.origin, &summary.username)?;
-        let args: Vec<String> = [
-            "-c",
-            "credential.helper=",
-            "-c",
-            "http.followRedirects=false",
-            "-c",
-            "http.lowSpeedLimit=1000",
-            "-c",
-            "http.lowSpeedTime=30",
-            "ls-remote",
-            "--heads",
-            "--",
-            &url,
-        ]
-        .map(String::from)
-        .into();
-        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
-        let env = vec![
-            pair("GIT_TERMINAL_PROMPT", "0"),
-            pair("GCM_INTERACTIVE", "never"),
-            pair("GIT_CONFIG_GLOBAL", "/dev/null"),
-            pair("GIT_CONFIG_NOSYSTEM", "1"),
-            pair("GIT_ALLOW_PROTOCOL", "https"),
-            pair("GIT_ASKPASS", &script.to_string_lossy()),
-            pair(USERNAME_ENV, &summary.username),
-        ];
-        let result = runner.run(&args, &env, &token);
-        // Drop the helper before reporting, whatever happened.
-        drop(dir);
-        let output = result.map_err(|e| redact(&e, token.as_str()))?;
-        Ok(if output.success {
-            AccessCheck {
-                status: AccessStatus::ReadOk,
-                message: "Read access confirmed. Write access is not verified; pushing needs a token with write permission.".into(),
-            }
-        } else {
-            let detail = redact(output.stderr.trim(), token.as_str());
-            match classify(&detail) {
-                AccessStatus::AuthFailed => AccessCheck {
-                    status: AccessStatus::AuthFailed,
-                    message: "The token was rejected. Check that it is valid, not expired, and can read this repository.".into(),
-                },
-                AccessStatus::NotFound => AccessCheck {
-                    status: AccessStatus::NotFound,
-                    message: "Repository not found. Check the URL, and that the token can see it.".into(),
-                },
-                _ => AccessCheck {
-                    status: AccessStatus::Network,
-                    message: format!(
-                        "Could not reach {}. {}",
-                        summary.platform.host(),
-                        detail.lines().last().unwrap_or("")
-                    )
-                    .trim()
-                    .to_owned(),
-                },
-            }
-        })
+        check_with(
+            runner,
+            summary.platform,
+            &summary.username,
+            &token,
+            repo_url,
+        )
     }
 
     /// The `git credential approve` stdin payload for `repo_url`, for delivery
@@ -609,6 +547,106 @@ impl GitCredentials {
         }
         Ok(payload)
     }
+}
+
+/// Run `git ls-remote --heads` against `repo_url` with a token that is held only in
+/// memory. Shared by a saved profile ([`GitCredentials::check_access`]) and an unsaved
+/// token ([`check_token`]); it never touches the database.
+fn check_with(
+    runner: &dyn GitRunner,
+    platform: GitPlatform,
+    username: &str,
+    token: &Secret,
+    repo_url: &str,
+) -> Result<AccessCheck, String> {
+    let (found, origin, _) = normalize_origin(repo_url)?;
+    if found != platform {
+        return Err(format!("This token must be for {}.", platform.host()));
+    }
+    let url = clone_url(repo_url)?;
+    let dir = tempfile::Builder::new()
+        .prefix("monoptah-askpass-")
+        .tempdir()
+        .map_err(|_| "Could not prepare the Git check.")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| "Could not prepare the Git check.")?;
+    }
+    let script = write_askpass(dir.path(), &origin, username)?;
+    let args: Vec<String> = [
+        "-c",
+        "credential.helper=",
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "http.lowSpeedLimit=1000",
+        "-c",
+        "http.lowSpeedTime=30",
+        "ls-remote",
+        "--heads",
+        "--",
+        &url,
+    ]
+    .map(String::from)
+    .into();
+    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+    let env = vec![
+        pair("GIT_TERMINAL_PROMPT", "0"),
+        pair("GCM_INTERACTIVE", "never"),
+        pair("GIT_CONFIG_GLOBAL", "/dev/null"),
+        pair("GIT_CONFIG_NOSYSTEM", "1"),
+        pair("GIT_ALLOW_PROTOCOL", "https"),
+        pair("GIT_ASKPASS", &script.to_string_lossy()),
+        pair(USERNAME_ENV, username),
+    ];
+    let result = runner.run(&args, &env, token);
+    // Drop the helper before reporting, whatever happened.
+    drop(dir);
+    let output = result.map_err(|e| redact(&e, token.as_str()))?;
+    Ok(if output.success {
+        AccessCheck {
+                status: AccessStatus::ReadOk,
+                message: "Read access confirmed. Write access is not verified; pushing needs a token with write permission.".into(),
+            }
+    } else {
+        let detail = redact(output.stderr.trim(), token.as_str());
+        match classify(&detail) {
+                AccessStatus::AuthFailed => AccessCheck {
+                    status: AccessStatus::AuthFailed,
+                    message: "The token was rejected. Check that it is valid, not expired, and can read this repository.".into(),
+                },
+                AccessStatus::NotFound => AccessCheck {
+                    status: AccessStatus::NotFound,
+                    message: "Repository not found. Check the URL, and that the token can see it.".into(),
+                },
+                _ => AccessCheck {
+                    status: AccessStatus::Network,
+                    message: format!(
+                        "Could not reach {}. {}",
+                        platform.host(),
+                        detail.lines().last().unwrap_or("")
+                    )
+                    .trim()
+                    .to_owned(),
+                },
+            }
+    })
+}
+
+/// Check read access to `repo_url` with a token that is not saved. Validates the username
+/// and token like [`GitCredentials::save`] and stores nothing.
+pub fn check_token(
+    runner: &dyn GitRunner,
+    platform: GitPlatform,
+    username: &str,
+    token: Secret,
+    repo_url: &str,
+) -> Result<AccessCheck, String> {
+    let username = validate_username(platform, username)?;
+    validate_token(token.as_str())?;
+    check_with(runner, platform, &username, &token, repo_url)
 }
 
 /// Write the askpass helper into `dir` (a private directory). It answers only
