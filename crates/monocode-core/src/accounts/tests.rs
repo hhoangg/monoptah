@@ -347,3 +347,37 @@ fn setup_token_validation_accepts_wrapping_but_rejects_commands_without_disclosu
         assert!(!error.contains(value) || value.is_empty());
     }
 }
+
+#[test]
+fn the_preferred_account_drives_new_sessions_and_falls_back_when_removed() {
+    let mut book = Book::default();
+    let token = book.add(Kind::Claude, "Setup token").unwrap();
+    let other = book.add(Kind::Claude, "Other").unwrap();
+    assert_eq!(book.preferred(Kind::Claude), DEFAULT);
+    assert_eq!(book.selected(Kind::Claude, "/p"), DEFAULT);
+
+    book.set_preferred(Kind::Claude, &token.id).unwrap();
+    assert_eq!(book.selected(Kind::Claude, "/p"), token.id);
+    // Other providers keep their own default.
+    assert_eq!(book.selected(Kind::Codex, "/p"), DEFAULT);
+    // A project's explicit choice still wins over the default.
+    book.select(Kind::Claude, "/q", &other.id).unwrap();
+    assert_eq!(book.selected(Kind::Claude, "/q"), other.id);
+
+    // Persisted and restored through the same JSON the store writes.
+    let restored: Book = serde_json::from_str(&serde_json::to_string(&book).unwrap()).unwrap();
+    assert_eq!(restored.selected(Kind::Claude, "/p"), token.id);
+    // Settings saved before this field existed still load.
+    let legacy: Book = serde_json::from_str(r#"{"accounts":[],"selections":{}}"#).unwrap();
+    assert_eq!(legacy.preferred(Kind::Claude), DEFAULT);
+
+    assert!(book.set_preferred(Kind::Claude, "account-missing").is_err());
+    book.remove(Kind::Claude, &token.id).unwrap();
+    assert_eq!(book.preferred(Kind::Claude), DEFAULT);
+    assert!(!book.defaults.contains_key("claude"));
+    assert_eq!(book.selected(Kind::Claude, "/p"), DEFAULT);
+
+    book.set_preferred(Kind::Claude, &other.id).unwrap();
+    book.set_preferred(Kind::Claude, DEFAULT).unwrap();
+    assert!(book.defaults.is_empty());
+}
