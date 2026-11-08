@@ -808,7 +808,14 @@ pub(super) fn service(
     remote: Arc<monocode_core::remote::Connections>,
     store: Database,
 ) -> Arc<CloudSessions> {
-    Arc::new(CloudSessions::new(gh, Arc::new(remote), store))
+    let cloud = CloudSessions::new(gh, Arc::new(remote), store.clone());
+    // The app registers the real Docker sandbox backend (sbx, ssh, its own secret store).
+    // Tests inject fakes through their own constructors and never reach the real `sbx`.
+    #[cfg(not(test))]
+    let cloud = cloud.with_system_sandboxes(store);
+    #[cfg(test)]
+    drop(store);
+    Arc::new(cloud)
 }
 
 pub(super) fn refresh_loop(cx: &mut Context<Shell>) -> gpui::Task<()> {
