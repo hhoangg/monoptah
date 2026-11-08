@@ -537,7 +537,7 @@ pub(crate) fn run_with_client(
             // and its host before anything is dispatched. This closure runs on a
             // background executor thread (conversation.rs spawns it there), so
             // blocking for the boot is fine. Attaching never wakes.
-            if binding.project.codespace.is_some() {
+            if binding.project.cloud().is_some() {
                 monocode_core::cloud_sessions::require_claude(&binding.summary.provider)?;
                 // Stop cancels the wake; the status line shows it only when a
                 // reconnect actually starts (a connected codespace is instant).

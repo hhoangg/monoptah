@@ -1014,3 +1014,38 @@ fn a_deleted_record_cannot_be_resurrected_by_a_late_publish() {
     f.svc.persist_start(&original);
     assert!(f.record(session.id).is_none());
 }
+
+/// A `cloud-starts.v1` record as written before sandboxes existed.
+const OLD_START_RECORD: &str = r#"{"sessionId":4,"localProject":"/p","codespace":"cs-1","repo":"octo/widgets","branch":"main","machine":null,"display":"monoptah-main","remoteCwd":"/workspaces/widgets","webUrl":null,"created":true,"ghState":"Provisioning","steps":[],"error":null,"failedAt":null,"logTail":[],"startedAt":1000,"finishedAt":null,"trackReady":true}"#;
+
+#[test]
+fn an_old_start_record_reads_as_a_codespace_and_writes_back_unchanged() {
+    let record: StartRecord = serde_json::from_str(OLD_START_RECORD).unwrap();
+    assert_eq!(record.sandbox, None);
+    assert_eq!(record.backend(), CloudBackendKind::Codespaces);
+    assert_eq!(record.cloud(), Some(CloudRef::codespace("cs-1")));
+    assert_eq!(serde_json::to_string(&record).unwrap(), OLD_START_RECORD);
+    assert!(!serde_json::to_string(&fresh_record())
+        .unwrap()
+        .contains("sandbox"));
+}
+
+#[test]
+fn a_sandbox_start_record_round_trips_and_reports_its_backend() {
+    let mut record = fresh_record();
+    record.codespace = String::new();
+    record.sandbox = Some("sbx-1".into());
+    let json = serde_json::to_string(&record).unwrap();
+    let back: StartRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, record);
+    assert_eq!(back.backend(), CloudBackendKind::DockerSandbox);
+    assert_eq!(back.cloud(), Some(CloudRef::sandbox("sbx-1")));
+}
+
+#[test]
+fn a_start_record_without_a_codespace_names_no_workspace() {
+    let mut value: serde_json::Value = serde_json::from_str(OLD_START_RECORD).unwrap();
+    value["codespace"] = "".into();
+    let record: StartRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(record.cloud(), None);
+}

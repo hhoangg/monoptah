@@ -40,13 +40,19 @@ pub const RAW_JSONL: &str = "claude.jsonl";
 /// Written by [`restore_code`]; its presence means the action was used.
 pub const RESTORED: &str = "restored.json";
 /// Session setting recording where a converted session came from.
-pub fn origin_key(local_id: i64) -> String {
-    format!("codespace-origin:{local_id}")
+pub fn origin_key(backend: CloudBackendKind, local_id: i64) -> String {
+    match backend {
+        CloudBackendKind::Codespaces => format!("codespace-origin:{local_id}"),
+        CloudBackendKind::DockerSandbox => format!("sandbox-origin:{local_id}"),
+    }
 }
 
-/// Session-independent setting listing what deleting a codespace would lose.
-pub fn unsaved_key(codespace: &str) -> String {
-    format!("codespace-unsaved:{codespace}")
+/// Session-independent setting listing what deleting a workspace would lose.
+pub fn unsaved_key(cloud: &CloudRef) -> String {
+    match cloud.kind {
+        CloudBackendKind::Codespaces => format!("codespace-unsaved:{}", cloud.name),
+        CloudBackendKind::DockerSandbox => format!("sandbox-unsaved:{}", cloud.name),
+    }
 }
 
 /// Runs on the codespace with `sh -s`. `@WS@` and `@ID@` are substituted (validated first).
@@ -497,7 +503,7 @@ impl CloudSessions {
         self.store()
             .ok()
             .and_then(|store| store.remote_session(id).ok().flatten())
-            .is_some_and(|s| s.project.codespace.is_some())
+            .is_some_and(|s| s.project.cloud().is_some())
     }
 
     /// Where Claude Code keeps its own sessions (`CLAUDE_CONFIG_DIR` or `~/.claude`).
@@ -507,9 +513,14 @@ impl CloudSessions {
 
     /// Every cloud session bound to `codespace`, archived or not.
     pub fn sessions_in_codespace(&self, codespace: &str) -> Vec<i64> {
+        self.sessions_in_cloud(&CloudRef::codespace(codespace))
+    }
+
+    /// Every cloud session bound to `cloud`, archived or not.
+    pub fn sessions_in_cloud(&self, cloud: &CloudRef) -> Vec<i64> {
         self.store()
             .ok()
-            .and_then(|store| store.cloud_session_ids(codespace).ok())
+            .and_then(|store| store.cloud_session_ids(cloud).ok())
             .unwrap_or_default()
     }
 
@@ -662,35 +673,31 @@ impl CloudSessions {
         let script = SNAPSHOT_SCRIPT
             .replace("@WS@", workspace)
             .replace("@ID@", provider_id.unwrap_or(""));
-        let out = codespaces::run_script(&*self.gh, codespace, &script, true)?;
+        let backend = self.backend(CloudBackendKind::Codespaces)?;
+        let out = backend.run_script(codespace, &script, true)?;
         let snap = parse_snapshot(&out)?;
-        let drop_stage = |this: &Self| {
+        let drop_stage = || {
             // The stage lives in /tmp on the codespace; failing to remove it is harmless.
             if snap.stage.starts_with(STAGE_PREFIX) {
-                let _ = codespaces::run_script(
-                    &*this.gh,
-                    codespace,
-                    &format!("rm -rf '{}'\n", snap.stage),
-                    false,
-                );
+                let _ = backend.run_script(codespace, &format!("rm -rf '{}'\n", snap.stage), false);
             }
         };
         if snap.nogit || snap.nohead {
-            drop_stage(self);
+            drop_stage();
             return Err(format!(
                 "{workspace} on the codespace is not a git repository with at least one commit, so its files cannot be saved."
             ));
         }
         if snap.size_kb > SIZE_LIMIT_KB {
-            drop_stage(self);
+            drop_stage();
             return Err(format!(
                 "The code state is {} MB, over the {} MB limit for a local copy.",
                 snap.size_kb / 1024,
                 SIZE_LIMIT_KB / 1024
             ));
         }
-        let copied = codespaces::copy_from(&*self.gh, codespace, &snap.stage, staging);
-        drop_stage(self);
+        let copied = backend.copy_from(codespace, &snap.stage, staging);
+        drop_stage();
         copied?;
         let staged = staging.join(snap.stage.rsplit('/').next().unwrap_or_default());
         let code = staged.join(CODESPACE_DIR);
@@ -749,7 +756,10 @@ impl CloudSessions {
                     "localProject": local_project,
                     "convertedAt": crate::time::now_ms(),
                 });
-                store.save_setting(&origin_key(local_id), &origin.to_string())
+                store.save_setting(
+                    &origin_key(CloudBackendKind::Codespaces, local_id),
+                    &origin.to_string(),
+                )
             })();
             if let Err(error) = filled {
                 let _ = store.delete(local_id);

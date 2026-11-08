@@ -364,8 +364,13 @@ fn converting_keeps_transcript_jsonl_evidence_and_the_code_state_locally() {
     let rows = store.load(done.local_id).unwrap().rows;
     assert!(rows.iter().any(|r| r.text == "create made.txt"));
     assert!(rows.iter().any(|r| r.text.contains("Done.")));
-    let origin: Value =
-        serde_json::from_str(&store.setting(&origin_key(done.local_id)).unwrap().unwrap()).unwrap();
+    let origin: Value = serde_json::from_str(
+        &store
+            .setting(&origin_key(CloudBackendKind::Codespaces, done.local_id))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(origin["codespace"], "cs-1");
     assert_eq!(origin["remoteCwd"], w.ws.to_str().unwrap());
     // The cloud record is gone, the local copy replaces it.
@@ -989,7 +994,10 @@ fn a_converted_host_session_is_never_imported_again_and_a_retry_skips_it() {
         .register_remote_summary(&project, &snapshot)
         .unwrap_err();
     assert_eq!(error, crate::store::CONVERTED);
-    assert!(store.cloud_session_ids("cs-1").unwrap().is_empty());
+    assert!(store
+        .cloud_session_ids(&CloudRef::codespace("cs-1"))
+        .unwrap()
+        .is_empty());
     drop(store);
     assert!(!w.svc.is_cloud_session(w.cloud_id));
     assert!(w.svc.sessions_in_codespace("cs-1").is_empty());
@@ -1334,7 +1342,10 @@ fn a_session_saved_as_a_local_copy_cannot_be_journaled_back() {
         crate::store::CONVERTED
     );
     assert!(store.remote_session(w.cloud_id).unwrap().is_none());
-    assert!(store.cloud_session_ids("cs-1").unwrap().is_empty());
+    assert!(store
+        .cloud_session_ids(&CloudRef::codespace("cs-1"))
+        .unwrap()
+        .is_empty());
     drop(store);
     assert!(done.local_id != w.cloud_id);
 }

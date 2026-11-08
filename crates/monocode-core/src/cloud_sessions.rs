@@ -141,7 +141,7 @@ struct OpenRequest<'a> {
 /// sub-steps with [`START_ABORTED`]; `step` hears `Connect` and `OpenProject` start and
 /// `Connect` finish. Returns the binding and the stored project.
 fn open_project(
-    gh: &dyn GhRunner,
+    backend: &dyn CloudBackend,
     host: &dyn Host,
     store: &Database,
     request: &OpenRequest,
@@ -180,7 +180,7 @@ fn open_project(
     }
     // Best effort: a failure here must not block the session, the agent just has no hint.
     progress("Preparing the evidence folder");
-    if let Err(error) = codespaces::prepare_evidence(gh, request.codespace, request.remote_cwd) {
+    if let Err(error) = backend.prepare_evidence(request.codespace, request.remote_cwd) {
         progress(&format!("Could not prepare the evidence folder: {error}"));
     }
     if aborted() {
@@ -373,7 +373,7 @@ pub fn ensure_before_send(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
-    if session.project.codespace.is_none() {
+    if session.project.cloud().is_none() {
         return Ok(());
     }
     if crate::store::is_pending_cloud_environment(&session.project.environment_id) {
@@ -414,7 +414,10 @@ type Database = Arc<Mutex<Store>>;
 type OriginFn = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
 pub struct CloudSessions {
+    /// Codespaces-specific work (resolving, creating, waiting) still talks to gh directly.
     gh: Arc<dyn GhRunner>,
+    /// Lifecycle operations by backend; [`Self::backend`] looks one up.
+    backends: HashMap<CloudBackendKind, Arc<dyn CloudBackend>>,
     host: Arc<dyn Host>,
     store: Database,
     states: Mutex<HashMap<String, (Instant, String)>>,
@@ -437,8 +440,10 @@ pub struct CloudSessions {
 
 impl CloudSessions {
     pub fn new(gh: Arc<dyn GhRunner>, host: Arc<dyn Host>, store: Database) -> Self {
+        let codespaces: Arc<dyn CloudBackend> = Arc::new(CodespacesBackend::new(gh.clone()));
         Self {
             gh,
+            backends: HashMap::from([(CloudBackendKind::Codespaces, codespaces)]),
             host,
             store,
             states: Mutex::new(HashMap::new()),
@@ -484,6 +489,12 @@ impl CloudSessions {
             store,
         ))
     }
+    /// Registers (or replaces) the backend for its kind.
+    #[cfg(test)]
+    fn with_backend(mut self, backend: Arc<dyn CloudBackend>) -> Self {
+        self.backends.insert(backend.kind(), backend);
+        self
+    }
     #[cfg(test)]
     fn with_origin(
         mut self,
@@ -496,6 +507,13 @@ impl CloudSessions {
         self.store
             .lock()
             .map_err(|_| "Native session store unavailable".into())
+    }
+    /// The registered backend for `kind`.
+    pub(crate) fn backend(&self, kind: CloudBackendKind) -> Result<Arc<dyn CloudBackend>, String> {
+        self.backends
+            .get(&kind)
+            .cloned()
+            .ok_or_else(|| format!("No {} backend is available.", kind.noun()))
     }
 
     /// `owner/repo` of the local project's `origin`.
@@ -548,7 +566,7 @@ impl CloudSessions {
         }
         self.invalidate(&resolved.name);
         let (binding, _) = open_project(
-            &*self.gh,
+            &*self.backend(CloudBackendKind::Codespaces)?,
             &*self.host,
             &self.store,
             &OpenRequest {
@@ -755,51 +773,66 @@ impl CloudSessions {
 
     /// Raw gh state of a codespace, cached for the TTL. Never wakes it.
     pub fn codespace_state(&self, name: &str) -> Result<String, String> {
+        self.cloud_raw_state(&CloudRef::codespace(name))
+    }
+    /// Raw backend state of a workspace, cached for the TTL. Never wakes it.
+    pub fn cloud_raw_state(&self, cloud: &CloudRef) -> Result<String, String> {
+        let key = cloud.key();
         let cached = self
             .states
             .lock()
             .map_err(|_| "State cache poisoned")?
-            .get(name)
+            .get(&key)
             .filter(|(at, _)| at.elapsed() < self.ttl)
             .map(|(_, state)| state.clone());
         if let Some(state) = cached {
             return Ok(state);
         }
-        let state = codespaces::state(&*self.gh, name)?;
+        let state = self.backend(cloud.kind)?.state(&cloud.name)?;
         self.states
             .lock()
             .map_err(|_| "State cache poisoned")?
-            .insert(name.into(), (Instant::now(), state.clone()));
+            .insert(key, (Instant::now(), state.clone()));
         Ok(state)
     }
     /// Infallible, displayable variant of [`Self::codespace_state`].
     pub fn cloud_state(&self, name: &str) -> CloudState {
-        self.codespace_state(name)
-            .map_or(CloudState::Unknown, |s| CloudState::from_gh(&s))
+        self.cloud_state_of(&CloudRef::codespace(name))
+    }
+    /// Infallible, displayable variant of [`Self::cloud_raw_state`].
+    pub fn cloud_state_of(&self, cloud: &CloudRef) -> CloudState {
+        match (self.backend(cloud.kind), self.cloud_raw_state(cloud)) {
+            (Ok(backend), Ok(raw)) => backend.display_state(&raw),
+            _ => CloudState::Unknown,
+        }
     }
     /// Whether gh says the codespace no longer exists. A codespace that cannot be read for
     /// another reason (offline, not signed in) is not gone.
     pub fn codespace_gone(&self, name: &str) -> bool {
-        if self.gone.lock().is_ok_and(|g| g.contains(name)) {
+        self.cloud_gone(&CloudRef::codespace(name))
+    }
+    /// Whether the backend says the workspace no longer exists; see [`Self::codespace_gone`].
+    pub fn cloud_gone(&self, cloud: &CloudRef) -> bool {
+        if self.gone.lock().is_ok_and(|g| g.contains(&cloud.key())) {
             return true;
         }
-        match self.codespace_state(name) {
-            Ok(state) => state == "Deleted",
+        let Ok(backend) = self.backend(cloud.kind) else {
+            return false;
+        };
+        match self.cloud_raw_state(cloud) {
+            Ok(state) => backend.is_deleted_state(&state),
             Err(e) => {
-                let e = e.to_lowercase();
-                // gh prints "HTTP 404: Not Found" for a missing codespace; a missing `gh` binary
-                // says "command not found" and must not count.
-                let missing = e.contains("http 404");
+                let missing = backend.is_missing_error(&e);
                 if missing {
-                    self.mark_gone(name);
+                    self.mark_gone(cloud);
                 }
                 missing
             }
         }
     }
-    fn mark_gone(&self, name: &str) {
+    fn mark_gone(&self, cloud: &CloudRef) {
         if let Ok(mut gone) = self.gone.lock() {
-            gone.insert(name.to_string());
+            gone.insert(cloud.key());
         }
     }
 
@@ -814,7 +847,11 @@ impl CloudSessions {
     pub fn unsaved_for(&self, codespace: &str) -> Vec<String> {
         self.store()
             .ok()
-            .and_then(|s| s.setting(&convert::unsaved_key(codespace)).ok().flatten())
+            .and_then(|s| {
+                s.setting(&convert::unsaved_key(&CloudRef::codespace(codespace)))
+                    .ok()
+                    .flatten()
+            })
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or_default()
     }
@@ -831,12 +868,17 @@ impl CloudSessions {
             }
         }
         let value = serde_json::to_string(&all).map_err(|e| e.to_string())?;
-        self.store()?
-            .save_setting(&convert::unsaved_key(codespace), &value)
+        self.store()?.save_setting(
+            &convert::unsaved_key(&CloudRef::codespace(codespace)),
+            &value,
+        )
     }
     pub fn invalidate(&self, name: &str) {
+        self.invalidate_ref(&CloudRef::codespace(name));
+    }
+    pub fn invalidate_ref(&self, cloud: &CloudRef) {
         if let Ok(mut states) = self.states.lock() {
-            states.remove(name);
+            states.remove(&cloud.key());
         }
     }
 
@@ -859,31 +901,40 @@ impl CloudSessions {
     /// Fresh, read-only inventory check before an archive/delete can attempt a
     /// backup. Only confirmed absence permits forgetting bindings without a host.
     pub fn forget_missing_codespace(&self, name: &str) -> Result<bool, String> {
-        if codespaces::exists(&*self.gh, name)? {
+        self.forget_missing(&CloudRef::codespace(name))
+    }
+    /// [`Self::forget_missing_codespace`] for any backend.
+    pub fn forget_missing(&self, cloud: &CloudRef) -> Result<bool, String> {
+        if self.backend(cloud.kind)?.exists(&cloud.name)? {
             return Ok(false);
         }
-        self.store()?.forget_codespace(name)?;
-        self.invalidate(name);
-        self.mark_gone(name);
+        self.store()?.forget_cloud(cloud)?;
+        self.invalidate_ref(cloud);
+        self.mark_gone(cloud);
         Ok(true)
     }
 
     pub fn stop_codespace(&self, name: &str) -> Result<(), String> {
+        self.stop_cloud(&CloudRef::codespace(name))
+    }
+    /// Stops the workspace and pauses the starts that were waiting on it.
+    pub fn stop_cloud(&self, cloud: &CloudRef) -> Result<(), String> {
+        let backend = self.backend(cloud.kind)?;
         {
             let store = self.store()?;
             for record in startup::pending_starts(&store)
                 .into_iter()
-                .filter(|r| r.codespace == name)
+                .filter(|r| r.cloud().as_ref() == Some(cloud))
             {
                 startup::pause_start(
                     &store,
                     record.session_id,
-                    "Codespace stopped. Choose Retry to start it again.",
+                    &format!("{} stopped. Choose Retry to start it again.", cloud.title()),
                 )?;
             }
         }
-        codespaces::stop(&*self.gh, name)?;
-        self.invalidate(name);
+        backend.stop(&cloud.name)?;
+        self.invalidate_ref(cloud);
         Ok(())
     }
 
@@ -903,17 +954,26 @@ impl CloudSessions {
     /// codespace is still there; a warning means it is gone and its bindings
     /// were forgotten, but the machine could not be disconnected.
     pub fn delete_codespace_outcome(&self, name: &str) -> Result<DeleteOutcome, String> {
-        if let Err(error) = codespaces::delete(&*self.gh, name) {
-            if !error.to_lowercase().contains("http 404") {
+        self.delete_cloud_outcome(&CloudRef::codespace(name))
+    }
+    /// [`Self::delete_codespace_outcome`] for any backend.
+    pub fn delete_cloud_outcome(&self, cloud: &CloudRef) -> Result<DeleteOutcome, String> {
+        let backend = self.backend(cloud.kind)?;
+        if let Err(error) = backend.delete(&cloud.name) {
+            if !backend.is_missing_error(&error) {
                 return Err(error);
             }
         }
-        self.invalidate(name);
+        self.invalidate_ref(cloud);
         let mut disconnect_error = None;
         match self.host.machines() {
             Ok(machines) => {
                 for machine in machines {
-                    if machine.codespace.as_deref() == Some(name) {
+                    // Only codespace machines carry their workspace name until the sandbox
+                    // transport exists, so a sandbox has no machine to disconnect yet.
+                    if cloud.kind == CloudBackendKind::Codespaces
+                        && machine.codespace.as_deref() == Some(&cloud.name)
+                    {
                         if let Err(e) = self.host.disconnect(&machine.id) {
                             disconnect_error.get_or_insert(e);
                         }
@@ -922,12 +982,12 @@ impl CloudSessions {
             }
             Err(e) => disconnect_error = Some(e),
         }
-        self.mark_gone(name);
-        // The codespace is gone, so what it held is no longer a question.
+        self.mark_gone(cloud);
+        // The workspace is gone, so what it held is no longer a question.
         let _ = self
             .store()?
-            .save_setting(&convert::unsaved_key(name), "[]");
-        self.store()?.forget_codespace(name)?;
+            .save_setting(&convert::unsaved_key(cloud), "[]");
+        self.store()?.forget_cloud(cloud)?;
         Ok(match disconnect_error {
             Some(e) => DeleteOutcome::DeletedWithWarning(e),
             None => DeleteOutcome::Deleted,
@@ -943,21 +1003,22 @@ impl CloudSessions {
         session_id: i64,
         remote_path: Option<&str>,
     ) -> Result<EvidencePull, String> {
-        let (codespace, workspace, thread) = {
+        let (cloud, workspace, thread) = {
             let store = self.store()?;
             let session = store
                 .remote_session(session_id)?
                 .ok_or("Session not found")?;
-            let codespace = session
+            let cloud = session
                 .project
-                .codespace
-                .clone()
+                .cloud()
                 .ok_or("This session does not run in a codespace.")?;
             let thread = store
                 .thread_dir(session_id)?
                 .ok_or("This store keeps no session folders, so evidence cannot be saved.")?;
-            (codespace, session.project.cwd.clone(), thread)
+            (cloud, session.project.cwd.clone(), thread)
         };
+        let backend = self.backend(cloud.kind)?;
+        let codespace = cloud.name.clone();
         let remote = evidence_remote_path(&self.workspace_root, &workspace, remote_path)?;
         let local_dir = thread.join(EVIDENCE_DIR);
         let mut pull = EvidencePull {
@@ -978,9 +1039,9 @@ impl CloudSessions {
                 .map_or(0, |d| d.as_nanos())
         ));
         std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-        let copied = codespaces::copy_from(&*self.gh, &codespace, &remote, &staging);
-        // gh may have started the codespace.
-        self.invalidate(&codespace);
+        let copied = backend.copy_from(&cloud.name, &remote, &staging);
+        // The copy may have started the workspace.
+        self.invalidate_ref(&cloud);
         let mut problems = Vec::new();
         let mut hard_error = None;
         match copied {
@@ -1023,7 +1084,8 @@ impl CloudSessions {
         }
         if pull.files.is_empty() {
             pull.message = Some(format!(
-                "No evidence files found at {remote} in codespace {codespace}."
+                "No evidence files found at {remote} in {} {codespace}.",
+                cloud.noun()
             ));
         }
         Ok(pull)
@@ -1190,6 +1252,9 @@ impl StartupSummary {
         }
     }
 }
+
+pub mod backend;
+pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod convert;
 pub use convert::*;

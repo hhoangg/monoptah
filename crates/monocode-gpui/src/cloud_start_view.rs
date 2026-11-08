@@ -213,6 +213,7 @@ pub(crate) mod fixtures {
             session_id: 1,
             local_project: "/work/widgets".into(),
             codespace: "octo-widgets-x7q9".into(),
+            sandbox: None,
             repo: "octo/widgets".into(),
             branch: Some("main".into()),
             machine: None,
