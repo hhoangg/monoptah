@@ -370,7 +370,7 @@ impl GitCredentials {
         };
         let mut query = match conn.prepare(
             "SELECT id,label,platform,origin,username,created_at FROM git_credentials
-             ORDER BY created_at, id",
+             ORDER BY created_at, rowid",
         ) {
             Ok(query) => query,
             Err(e) if e.to_string().contains("no such table") => return Ok(Vec::new()),
