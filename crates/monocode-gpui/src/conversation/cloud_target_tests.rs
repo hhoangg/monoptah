@@ -1,3 +1,4 @@
+use super::cloud_branches::*;
 use super::cloud_target::*;
 use super::*;
 use gpui::{TestAppContext, WindowHandle};
@@ -805,7 +806,9 @@ fn the_panel_has_a_row_per_setting_and_a_collapse_chevron(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn create_and_the_error_stay_visible_while_the_panel_is_collapsed(cx: &mut TestAppContext) {
+fn create_and_open_and_the_error_stay_visible_while_the_panel_is_collapsed(
+    cx: &mut TestAppContext,
+) {
     let window = conversation(cx, PROJECT, false);
     let requests = watch(window, cx);
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
@@ -827,7 +830,7 @@ fn create_and_the_error_stay_visible_while_the_panel_is_collapsed(cx: &mut TestA
     assert!(visual.debug_bounds("cloud-row-compute").is_none());
     let create = visual
         .debug_bounds("cloud-target-create")
-        .expect("Create stays while collapsed");
+        .expect("the Create button lives in the header, so it stays while collapsed");
     visual.simulate_click(create.center(), Default::default());
     draw(visual);
     assert!(visual.debug_bounds("cloud-target-error").is_some());
@@ -890,6 +893,694 @@ fn picking_the_codespace_again_resets_the_machine_branch_and_listing(cx: &mut Te
                 view.cloud_draft.as_ref().unwrap().machines,
                 Machines::Loaded(_)
             ));
+        })
+        .unwrap();
+}
+
+/// Draws the window once the pending work is done.
+fn draw(visual: &mut gpui::VisualTestContext) {
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+}
+
+fn right_edge(bounds: gpui::Bounds<gpui::Pixels>) -> f32 {
+    f32::from(bounds.right())
+}
+
+#[gpui::test]
+fn each_setting_menu_anchors_to_the_value_of_the_clicked_row(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    draw(visual);
+    let mut tops = Vec::new();
+    for (field, row_id, anchor_id) in [
+        (
+            CloudField::Compute,
+            "cloud-row-compute",
+            "cloud-row-compute-anchor",
+        ),
+        (
+            CloudField::Runtime,
+            "cloud-row-runtime",
+            "cloud-row-runtime-anchor",
+        ),
+    ] {
+        let row = visual.debug_bounds(row_id).unwrap();
+        visual.simulate_click(row.center(), Default::default());
+        draw(visual);
+        let value = visual.debug_bounds(anchor_id).unwrap();
+        let slot = window
+            .update(visual, |view, _, _| {
+                assert!(view.menu_is(ComposerMenu::CloudField(field)));
+                view.anchor(ComposerMenu::CloudField(field)).get().unwrap()
+            })
+            .unwrap();
+        // The menu is anchored to this row's value, not to the panel or the whole row.
+        assert_eq!(slot, value, "{row_id}");
+        assert!(row.contains(&slot.origin) && slot.size.width < row.size.width / 2.);
+        assert!(right_edge(slot) <= right_edge(row) + 0.5);
+        assert!(slot.left() > row.left() + row.size.width / 2.);
+        tops.push(slot.top());
+        // An outside press only dismisses an open menu, so close it before the next row.
+        window
+            .update(visual, |view, window, cx| view.close_menu(window, cx))
+            .unwrap();
+        draw(visual);
+    }
+    // Each row has its own slot.
+    assert_ne!(tops[0], tops[1]);
+}
+
+#[gpui::test]
+fn create_and_open_from_the_header_button_does_not_fold_the_panel(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    draw(visual);
+    // The button sits in the header, to the left of the collapse chevron, and no bottom row is left.
+    let header = visual.debug_bounds("cloud-target-header").unwrap();
+    let create = visual.debug_bounds("cloud-target-create").unwrap();
+    assert!(header.contains(&create.center()));
+    assert!(right_edge(create) < right_edge(header));
+    assert!(visual.debug_bounds("cloud-target-actions").is_none());
+    visual.simulate_click(create.center(), Default::default());
+    draw(visual);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    window
+        .update(visual, |view, _, _| {
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert!(draft.creating);
+            assert!(!draft.collapsed, "the click must not reach the header");
+        })
+        .unwrap();
+    // Disabled while creating: another press asks for nothing and still does not fold.
+    visual.simulate_click(create.center(), Default::default());
+    draw(visual);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    window
+        .update(visual, |view, _, _| {
+            assert!(!view.cloud_draft.as_ref().unwrap().collapsed)
+        })
+        .unwrap();
+    // The chevron area of the header still folds it.
+    let chevron = gpui::point(header.right() - gpui::px(6.), header.center().y);
+    visual.simulate_click(chevron, Default::default());
+    draw(visual);
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.cloud_draft.as_ref().unwrap().collapsed)
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_created_codespace_disables_the_header_button(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            view.create_cloud(cx);
+            let id = view.cloud_draft.as_ref().unwrap().request;
+            view.cloud_create_finished(
+                id,
+                Err("Failed (codespace abc was created and kept)".into()),
+                cx,
+            );
+            assert!(view.cloud_draft.as_ref().unwrap().created.is_some());
+        })
+        .unwrap();
+    draw(visual);
+    let create = visual.debug_bounds("cloud-target-create").unwrap();
+    visual.simulate_click(create.center(), Default::default());
+    draw(visual);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+/// A branch source with fixed answers: the local tracking branches (`None`: no matching remote)
+/// and the `ls-remote` result. Records the thread the local read ran on.
+fn source(
+    local: Option<&[&str]>,
+    heads: Result<&[&str], &str>,
+    thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
+) -> BranchSource {
+    let local = local.map(|names| RemoteBranches {
+        remote: "origin".into(),
+        url: "https://github.com/octo/widgets.git".into(),
+        branches: names.iter().map(|n| n.to_string()).collect(),
+    });
+    let heads = heads
+        .map(|names| names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+        .map_err(str::to_owned);
+    BranchSource {
+        local: Arc::new(move |_, _| {
+            *thread.lock().unwrap() = Some(std::thread::current().id());
+            local.clone()
+        }),
+        heads: Arc::new(move |_, _| heads.clone()),
+    }
+}
+
+fn names(view: &Conversation) -> Vec<String> {
+    match &view.cloud_draft.as_ref().unwrap().branches {
+        BranchList::Ready { branches, .. } => branches.clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[gpui::test]
+fn the_branch_list_comes_from_a_source_off_the_click(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let thread = Arc::new(Mutex::new(None));
+    let seen = thread.clone();
+    window
+        .update(cx, |view, _, cx| {
+            view.set_branch_source(source(Some(&["main", "dev"]), Err("offline"), seen));
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            // Nothing was read inside the click: the free field stays until the answer.
+            assert!(thread.lock().unwrap().is_none());
+            assert_eq!(
+                view.cloud_draft.as_ref().unwrap().branches,
+                BranchList::Loading
+            );
+            assert!(!view.cloud_picks(CloudRefField::Base));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(thread.lock().unwrap().is_some(), "the source was asked");
+    window
+        .update(cx, |view, _, _| {
+            assert_eq!(names(view), ["main", "dev"]);
+            assert!(view.cloud_picks(CloudRefField::Base));
+            // The Branch row of a Docker sandbox stays a text field.
+            assert!(!view.cloud_picks(CloudRefField::Branch));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_repository_without_a_matching_remote_keeps_the_text_field(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            view.set_branch_source(source(None, Ok(&["main"]), Default::default()));
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    draw(visual);
+    window
+        .update(visual, |view, _, _| {
+            assert_eq!(
+                view.cloud_draft.as_ref().unwrap().branches,
+                BranchList::Unmatched
+            );
+            assert!(!view.cloud_picks(CloudRefField::Base));
+        })
+        .unwrap();
+    // The row is still there, with its text field, and the typed value reaches the request.
+    assert!(visual.debug_bounds("cloud-row-base").is_some());
+    assert!(visual.debug_bounds("cloud-row-base-anchor").is_none());
+}
+
+#[gpui::test]
+fn picking_a_base_branch_sets_the_override_and_reaches_the_request(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            view.set_branch_source(source(
+                Some(&["main", "release/1", "bad name"]),
+                Err("offline"),
+                Default::default(),
+            ));
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    draw(visual);
+    let row = visual.debug_bounds("cloud-row-base").unwrap();
+    visual.simulate_click(row.center(), Default::default());
+    draw(visual);
+    let anchor = visual.debug_bounds("cloud-row-base-anchor").unwrap();
+    let picker = window
+        .update(visual, |view, _, cx| {
+            let open = view
+                .cloud_picker
+                .as_ref()
+                .expect("the branch picker is open");
+            assert_eq!(open.field, CloudRefField::Base);
+            // The picker is anchored to this row's value, like the setting menus.
+            assert_eq!(
+                view.cloud_ref_anchors[CloudRefField::Base.index()].get(),
+                Some(anchor)
+            );
+            // The saved config's base shows as the current one.
+            assert_eq!(view.cloud_ref_value(CloudRefField::Base, cx), "develop");
+            open.picker.clone()
+        })
+        .unwrap();
+    // The default entry first, then the branches the validators accept.
+    window
+        .update(visual, |_, _, cx| {
+            picker.update(cx, |_, cx| {
+                cx.emit(GitPicked::Ref(Some("release/1".into())))
+            });
+        })
+        .unwrap();
+    draw(visual);
+    window
+        .update(visual, |view, _, cx| {
+            assert!(view.cloud_picker.is_none());
+            let draft = view.cloud_draft.as_ref().unwrap();
+            assert_eq!(draft.base_text, "release/1");
+            assert_eq!(draft.base.read(cx).content.as_ref(), "release/1");
+            // An invalid name never reaches the draft.
+            view.cloud_ref_picked(CloudRefField::Base, Some("bad name".into()), cx);
+            assert_eq!(view.cloud_draft.as_ref().unwrap().base_text, "release/1");
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    draw(visual);
+    let sent = requests.lock().unwrap().clone();
+    assert_eq!(sent[0].config.as_ref().unwrap().base_ref, "release/1");
+    // Nothing was written back to the project config.
+    window
+        .update(visual, |view, _, _| {
+            view.forget_docker_config();
+            assert_eq!(view.docker_config().unwrap().base_ref, "develop");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_default_branch_entry_clears_the_base_ref(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_branch_source(source(Some(&["main"]), Err("offline"), Default::default()));
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, window, cx| {
+            view.toggle_cloud_ref_picker(CloudRefField::Base, window, cx);
+            let picker = view.cloud_picker.as_ref().unwrap().picker.clone();
+            picker.update(cx, |_, cx| cx.emit(GitPicked::Ref(None)));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert_eq!(
+                view.cloud_ref_value(CloudRefField::Base, cx),
+                "Default branch"
+            );
+            view.create_cloud(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        requests.lock().unwrap()[0]
+            .config
+            .as_ref()
+            .unwrap()
+            .base_ref,
+        ""
+    );
+}
+
+#[gpui::test]
+fn a_codespace_branch_is_picked_from_origin_and_reaches_the_request(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_branch_source(source(
+                Some(&["main", "topic"]),
+                Err("offline"),
+                Default::default(),
+            ));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, window, cx| {
+            assert!(view.cloud_picks(CloudRefField::Branch));
+            assert!(!view.cloud_picks(CloudRefField::Base));
+            assert_eq!(view.cloud_ref_value(CloudRefField::Branch, cx), "main");
+            view.toggle_cloud_ref_picker(CloudRefField::Branch, window, cx);
+            let picker = view.cloud_picker.as_ref().unwrap().picker.clone();
+            picker.update(cx, |_, cx| cx.emit(GitPicked::Ref(Some("topic".into()))));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| view.create_cloud(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(requests.lock().unwrap()[0].branch, "topic");
+}
+
+#[gpui::test]
+fn a_failed_ls_remote_keeps_the_local_list_and_a_good_one_refreshes_it(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_branch_source(source(
+                Some(&["main", "gone"]),
+                Err("auth failed"),
+                Default::default(),
+            ));
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            assert_eq!(names(view), ["main", "gone"]);
+            assert!(view.cloud_draft.as_ref().unwrap().error.is_none());
+        })
+        .unwrap();
+    window
+        .update(cx, |view, _, cx| {
+            view.set_branch_source(source(
+                Some(&["main", "gone"]),
+                Ok(&["zeta", "main", "alpha"]),
+                Default::default(),
+            ));
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            // Branches the remote still has keep the local order; new ones follow, sorted; the
+            // stale tracking branch is dropped.
+            assert_eq!(names(view), ["main", "alpha", "zeta"]);
+        })
+        .unwrap();
+}
+
+#[test]
+fn the_matching_remote_is_chosen_by_repository_url() {
+    let remotes = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, u)| (n.to_string(), u.to_string()))
+            .collect()
+    };
+    let repo = RepoMatch::Url("https://github.com/Octo/Widgets.git".into());
+    // ssh, scp-style and https forms of the same repository all match; origin wins a tie.
+    for url in [
+        "git@github.com:octo/widgets.git",
+        "ssh://git@github.com/octo/widgets",
+        "https://github.com/octo/widgets/",
+        "https://user@github.com/octo/widgets.git",
+    ] {
+        assert_eq!(
+            pick_remote(
+                &remotes(&[("fork", "git@github.com:me/widgets.git"), ("up", url)]),
+                &repo
+            ),
+            Some("up".into()),
+            "{url}"
+        );
+    }
+    assert_eq!(
+        pick_remote(
+            &remotes(&[
+                ("up", "https://github.com/octo/widgets.git"),
+                ("origin", "git@github.com:octo/widgets.git"),
+            ]),
+            &repo
+        ),
+        Some("origin".into())
+    );
+    // Another repository, another host, or no remote at all: no match.
+    assert_eq!(
+        pick_remote(
+            &remotes(&[("origin", "git@github.com:octo/other.git")]),
+            &repo
+        ),
+        None
+    );
+    assert_eq!(
+        pick_remote(
+            &remotes(&[("origin", "git@gitlab.com:octo/widgets.git")]),
+            &repo
+        ),
+        None
+    );
+    assert_eq!(pick_remote(&[], &repo), None);
+    // A codespace always means origin, whatever its URL.
+    assert_eq!(
+        pick_remote(
+            &remotes(&[("origin", "git@github.com:me/x.git")]),
+            &RepoMatch::Origin
+        ),
+        Some("origin".into())
+    );
+    assert_eq!(
+        pick_remote(
+            &remotes(&[("up", "git@github.com:me/x.git")]),
+            &RepoMatch::Origin
+        ),
+        None
+    );
+}
+
+#[test]
+fn the_real_local_read_uses_the_tracking_branches_of_the_matching_remote() {
+    let dir = std::path::PathBuf::from(temp_repo("ref: refs/heads/main\n"));
+    std::fs::remove_dir_all(dir.join(".git")).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    git(&["remote", "add", "origin", "git@github.com:me/widgets.git"]);
+    git(&[
+        "remote",
+        "add",
+        "upstream",
+        "https://github.com/octo/widgets.git",
+    ]);
+    git(&["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+    git(&["update-ref", "refs/remotes/upstream/dev", "HEAD"]);
+    git(&[
+        "symbolic-ref",
+        "refs/remotes/upstream/HEAD",
+        "refs/remotes/upstream/main",
+    ]);
+    git(&["update-ref", "refs/remotes/origin/mine", "HEAD"]);
+    let project = dir.to_string_lossy().into_owned();
+    let source = BranchSource::default();
+    let docker = (source.local)(
+        &project,
+        &RepoMatch::Url("https://github.com/octo/widgets".into()),
+    )
+    .expect("upstream matches");
+    assert_eq!(docker.remote, "upstream");
+    let mut branches = docker.branches.clone();
+    branches.sort();
+    assert_eq!(
+        branches,
+        ["dev", "main"],
+        "the remote HEAD alias is not a branch"
+    );
+    let codespace = (source.local)(&project, &RepoMatch::Origin).unwrap();
+    assert_eq!(codespace.branches, ["mine"]);
+    assert!(
+        (source.local)(
+            &project,
+            &RepoMatch::Url("https://github.com/octo/other".into())
+        )
+        .is_none()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn ls_remote_output_is_parsed_and_merged() {
+    assert_eq!(
+        parse_heads("abc\trefs/heads/main\ndef\trefs/heads/feat/x\nghi\trefs/tags/v1\n"),
+        ["main", "feat/x"]
+    );
+    assert_eq!(
+        merge_heads(&["a".into(), "b".into()], vec!["c".into(), "b".into()]),
+        ["b", "c"]
+    );
+}
+
+#[test]
+fn remotes_are_read_nul_separated_and_option_like_names_are_refused() {
+    let config = "remote.my fork.url\nhttps://github.com/octo/widgets.git\0remote.-x.url\nhttps://github.com/octo/widgets\0";
+    let remotes = parse_remotes(config);
+    assert_eq!(remotes[0].0, "my fork");
+    let repo = RepoMatch::Url("https://github.com/octo/widgets".into());
+    // The option-like name matches the URL too but never becomes a git argument.
+    assert_eq!(pick_remote(&remotes, &repo), Some("my fork".into()));
+    assert_eq!(pick_remote(&remotes[1..], &repo), None);
+    assert_eq!(
+        pick_remote(&[("-origin".into(), "x".into())], &RepoMatch::Origin),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_timed_out_ls_remote_kills_the_whole_process_group() {
+    let dir = std::path::PathBuf::from(temp_repo("ref: refs/heads/main\n"));
+    let pidfile = dir.join("child.pid");
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg(format!(
+        "sleep 60 & echo $! > '{}'; wait",
+        pidfile.display()
+    ));
+    let result = run_with_timeout(command, std::time::Duration::from_millis(500));
+    assert_eq!(result.unwrap_err(), "git ls-remote timed out");
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The grandchild (the stand-in for ssh) dies with the group.
+    let mut alive = true;
+    for _ in 0..50 {
+        // SAFETY: signal 0 only checks that the process exists.
+        alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !alive,
+        "the child of the timed out command is still running"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+fn a_late_branch_listing_for_a_replaced_draft_is_ignored(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.set_branch_source(source(
+                Some(&["old"]),
+                Ok(&["old", "stale"]),
+                Default::default(),
+            ));
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            // Replaced before the first listing answers.
+            view.clear_cloud_target(cx);
+            view.set_branch_source(source(Some(&["new"]), Err("offline"), Default::default()));
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| assert_eq!(names(view), ["new"]))
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_stale_listing_does_not_touch_an_open_picker_or_the_new_draft(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.set_branch_source(source(Some(&["main"]), Err("offline"), Default::default()));
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, window, cx| {
+            let stale = view.cloud_draft.as_ref().unwrap().branches_request;
+            view.toggle_cloud_ref_picker(CloudRefField::Base, window, cx);
+            let picker = view.cloud_picker.as_ref().unwrap().picker.clone();
+            // Answers carrying another request id change neither the draft nor the picker.
+            view.apply_refreshed_branches(stale + 100, "origin".into(), vec!["late".into()], cx);
+            view.apply_local_branches(stale + 100, None, cx);
+            assert_eq!(names(view), ["main"]);
+            assert_eq!(picker.read(cx).offered(), ["main"]);
+            // The current one still applies to both.
+            view.apply_refreshed_branches(
+                stale,
+                "origin".into(),
+                vec!["main".into(), "fresh".into()],
+                cx,
+            );
+            assert_eq!(picker.read(cx).offered(), ["main", "fresh"]);
+            // A replaced draft drops the picker, and the old request id is then stale.
+            view.clear_cloud_target(cx);
+            assert!(view.cloud_picker.is_none());
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            view.apply_refreshed_branches(stale, "origin".into(), vec!["ghost".into()], cx);
+            assert_eq!(
+                view.cloud_draft.as_ref().unwrap().branches,
+                BranchList::Loading
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_codespace_branch_starting_with_a_dash_is_refused(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    window
+        .update(cx, |view, _, cx| {
+            view.set_branch_source(source(Some(&["main"]), Err("offline"), Default::default()));
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            view.cloud_ref_picked(CloudRefField::Branch, Some("--upload-pack=x".into()), cx);
+            assert_eq!(view.cloud_ref_value(CloudRefField::Branch, cx), "main");
+            view.cloud_ref_picked(CloudRefField::Branch, Some("v1.2.3".into()), cx);
+            assert_eq!(view.cloud_ref_value(CloudRefField::Branch, cx), "v1.2.3");
         })
         .unwrap();
 }

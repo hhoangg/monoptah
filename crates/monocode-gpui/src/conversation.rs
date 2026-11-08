@@ -21,6 +21,7 @@ mod mono;
 mod notifications;
 mod question_api;
 pub(crate) use question_api::{QuestionAsked, QuestionSettled};
+mod cloud_branches;
 mod cloud_panel;
 mod remote;
 pub(crate) use remote::CloudResumed;
@@ -167,6 +168,12 @@ pub(crate) struct Conversation {
     /// Lists the machine types of a project's repository for the codespace panel.
     machine_loader: Option<cloud_target::MachineLoader>,
     cloud_anchors: [AnchorSlot; 4],
+    /// The branch rows of the cloud panel (Base branch, Branch), indexed by `CloudRefField`.
+    cloud_ref_anchors: [AnchorSlot; 2],
+    /// The open branch picker of one of those rows.
+    cloud_picker: Option<cloud_branches::CloudRefPicker>,
+    /// Where the cloud panel's branch lists come from.
+    branch_source: cloud_branches::BranchSource,
     /// "RUN ON CLOUD": the target chosen in the Workspace menu, until it is created.
     cloud_draft: Option<cloud_target::CloudDraft>,
     /// Counts "Create and open" presses, so a late answer only applies to its own draft.
@@ -381,6 +388,7 @@ impl Conversation {
         self.menu.is_some()
             || self.response_menu.is_some()
             || self.git_picker.is_some()
+            || self.cloud_picker.is_some()
             || self.needs_approval()
             || self.input.read(cx).is_composing()
     }
@@ -769,6 +777,9 @@ impl Conversation {
             cloud_stopped: false,
             machine_loader: None,
             cloud_anchors: Default::default(),
+            cloud_ref_anchors: Default::default(),
+            cloud_picker: None,
+            branch_source: Default::default(),
             cloud_draft: None,
             cloud_request_seq: 0,
             docker_config_cache: Default::default(),
@@ -1961,6 +1972,7 @@ impl Conversation {
             return;
         }
         self.menu = None;
+        self.close_cloud_picker();
         let cwd = self.execution_cwd().into();
         let selected = if mode == GitMode::Base {
             self.settings.worktree_base.clone().or(self.branch.clone())
@@ -1989,7 +2001,7 @@ impl Conversation {
                                 return;
                             }
                         }
-                        GitPicked::Dismissed => {}
+                        GitPicked::Dismissed | GitPicked::Ref(_) => {}
                     }
                     this.git_picker = None;
                     this.git_events = None;
@@ -2513,6 +2525,7 @@ impl Conversation {
             .update(cx, |completion, cx| completion.dismiss(cx));
         self.git_picker = None;
         self.git_events = None;
+        self.close_cloud_picker();
         let mut events = Vec::new();
         let (label, items, width, style) = self.menu_items(kind, &mut events, window, cx);
         // The recent models open on the current one.
@@ -2865,7 +2878,7 @@ impl Conversation {
             self.close_response_menu(cx);
             return true;
         }
-        if self.git_picker.take().is_some() {
+        if self.git_picker.take().is_some() || self.close_cloud_picker() {
             cx.notify();
             return true;
         }
@@ -2980,6 +2993,10 @@ impl Conversation {
             .map(|open| {
                 menu_popover(&open.menu, Anchor::Slot(self.anchor(open.kind).clone()), cx)
                     .side(Side::Top)
+                    // A panel setting opens against the right edge of its row, under its value.
+                    .when(matches!(open.kind, ComposerMenu::CloudField(_)), |p| {
+                        p.align(Align::End)
+                    })
                     .when(open.kind == ComposerMenu::Account, |p| {
                         p.width(250.).max_height(260.)
                     })
@@ -3055,6 +3072,25 @@ impl Conversation {
                         .child(picker),
                 )
             })
+            .children(self.cloud_picker.as_ref().map(|open| {
+                let weak = cx.entity().downgrade();
+                popover(
+                    "cloud-ref-picker",
+                    Anchor::Slot(self.cloud_ref_anchors[open.field.index()].clone()),
+                )
+                .side(Side::Top)
+                .align(Align::End)
+                .width(300.)
+                .height(320.)
+                .on_dismiss(move |window, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.close_cloud_picker();
+                        window.focus(&this.input.focus_handle(cx), cx);
+                        cx.notify();
+                    });
+                })
+                .child(open.picker.clone())
+            }))
             .child(self.approval_shelf(window, cx))
             .child(
                 div()

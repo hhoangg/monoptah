@@ -4,12 +4,54 @@
 //! opens a small menu to change it (or holds an inline field for a branch). The last row holds
 //! "Create and open". The values are this session's overrides of the project's saved defaults,
 //! see `cloud_target.rs`.
+use super::cloud_branches::CloudRefField;
 use super::cloud_target::*;
 use super::*;
 use gpui::{Div, Stateful};
 use monocode_core::codespaces;
 
 const ROW_HEIGHT: f32 = 38.;
+
+/// A plain text hover card.
+struct Tip(SharedString);
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(280.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(shell_fill())
+            .border_1()
+            .border_color(content(0.12))
+            .text_size(px(12.))
+            .text_color(content(0.85))
+            .child(self.0.clone())
+    }
+}
+
+/// The value and chevron on the right of a row. A menu opens against this, not the whole row,
+/// so it sits under the value it changes.
+fn row_value(id: &'static str, anchor: &AnchorSlot, value: String, locked: bool) -> Stateful<Div> {
+    div()
+        .id((id, 1usize))
+        .debug_selector(move || format!("{id}-anchor"))
+        .relative()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .child(anchor.probe())
+        .child(
+            div()
+                .max_w(px(220.))
+                .truncate()
+                .text_size(px(12.))
+                .text_color(content(if locked { 0.35 } else { 0.55 }))
+                .child(value),
+        )
+        .child(icon("chevron-down", 12.).text_color(content(0.35)))
+}
 
 /// One row of the panel: a leading icon tile, the label, and whatever the caller puts on the
 /// right.
@@ -188,21 +230,39 @@ impl Conversation {
         row(id, icon_name, label)
             .aria_expanded(open)
             .when(!locked, |d| d.cursor_pointer())
-            .child(self.cloud_anchors[field.index()].probe())
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .max_w(px(220.))
-                    .truncate()
-                    .text_size(px(12.))
-                    .text_color(content(if locked { 0.35 } else { 0.55 }))
-                    .child(self.cloud_field_value(field)),
-            )
-            .child(icon("chevron-down", 12.).text_color(content(0.35)))
+            .child(row_value(
+                id,
+                &self.cloud_anchors[field.index()],
+                self.cloud_field_value(field),
+                locked,
+            ))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if !this.cloud_creating() {
                     this.toggle_menu(ComposerMenu::CloudField(field), window, cx);
                 }
+            }))
+    }
+
+    /// A branch row that opens the branch picker over the repository's branches.
+    fn cloud_ref_row(
+        &self,
+        field: CloudRefField,
+        id: &'static str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let locked = self.cloud_creating();
+        row(id, "git-branch", label)
+            .aria_expanded(self.cloud_ref_menu_open(field))
+            .when(!locked, |d| d.cursor_pointer())
+            .child(row_value(
+                id,
+                &self.cloud_ref_anchors[field.index()],
+                self.cloud_ref_value(field, cx),
+                locked,
+            ))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_cloud_ref_picker(field, window, cx);
             }))
     }
 
@@ -245,6 +305,52 @@ impl Conversation {
         let docker = draft.target == CloudTarget::DockerSandbox;
         let collapsed = draft.collapsed;
         let title = format!("Run on {}", draft.target.label());
+        let creating = draft.creating;
+        let created = draft.created.clone();
+        let locked_button = creating || created.is_some();
+        let create_tip: SharedString = if creating {
+            "Creating\u{2026}".into()
+        } else if let Some(name) = &created {
+            format!("Already created: {name}").into()
+        } else {
+            "Create and open".into()
+        };
+        // An icon button next to the collapse chevron. Its click is its own: it must not fold
+        // the panel through the header's handler.
+        let mut ink = floating_fill();
+        ink.a = 1.;
+        let create = div()
+            .id("cloud-target-create")
+            .debug_selector(|| "cloud-target-create".into())
+            .role(Role::Button)
+            .aria_label("Create and open")
+            .when(locked_button, |d| d.aria_description(create_tip.clone()))
+            .when(!locked_button, |d| d.focusable().tab_stop(true))
+            .size(px(22.))
+            .flex_shrink_0()
+            .rounded(px(6.))
+            .flex()
+            .items_center()
+            .justify_center()
+            // The primary fill and ink of `modal::primary_button`.
+            .bg(content(0.92))
+            .text_color(ink)
+            .tooltip({
+                let tip = create_tip.clone();
+                move |_, cx| cx.new(|_| Tip(tip.clone())).into()
+            })
+            .map(|d| {
+                if locked_button {
+                    d.opacity(0.4)
+                } else {
+                    d.cursor_pointer().hover(|s| s.bg(content(0.8)))
+                }
+            })
+            .child(icon("play", 12.).text_color(ink))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.create_cloud(cx);
+            }));
         let header = div()
             .id("cloud-target-header")
             .debug_selector(|| "cloud-target-header".into())
@@ -285,6 +391,7 @@ impl Conversation {
                     .text_color(content(0.35))
                     .child(draft.target.billing_note()),
             )
+            .child(create)
             .child(
                 div()
                     .size(px(20.))
@@ -304,34 +411,6 @@ impl Conversation {
                         12.,
                     )),
             );
-        let creating = draft.creating;
-        let created = draft.created.clone();
-        let locked_button = creating || created.is_some();
-        let create = div()
-            .id("cloud-target-actions")
-            .min_h(px(ROW_HEIGHT + 4.))
-            .flex()
-            .items_center()
-            .justify_end()
-            .border_t_1()
-            .border_color(content(0.05))
-            .child(
-                crate::modal::disabled(
-                    crate::modal::primary_button(
-                        "cloud-target-create",
-                        if creating {
-                            "Creating\u{2026}".to_owned()
-                        } else if let Some(name) = &created {
-                            format!("Already created: {name}")
-                        } else {
-                            "Create and open".to_owned()
-                        },
-                    ),
-                    locked_button,
-                )
-                .debug_selector(|| "cloud-target-create".into())
-                .on_click(cx.listener(|this, _, _, cx| this.create_cloud(cx))),
-            );
         let body = div()
             .id("cloud-target-rows")
             .when(docker, |d| {
@@ -349,7 +428,11 @@ impl Conversation {
                     "Runtime limit",
                     cx,
                 ))
-                .child(self.cloud_field_row("cloud-row-base", "Base branch", &draft.base))
+                .child(if self.cloud_picks(CloudRefField::Base) {
+                    self.cloud_ref_row(CloudRefField::Base, "cloud-row-base", "Base branch", cx)
+                } else {
+                    self.cloud_field_row("cloud-row-base", "Base branch", &draft.base)
+                })
                 .child(self.cloud_field_row("cloud-row-branch", "Feature branch", &draft.branch))
                 .when(
                     !draft.accounts.is_empty() || draft.account.is_some(),
@@ -372,11 +455,11 @@ impl Conversation {
                     "Machine type",
                     cx,
                 ))
-                .child(self.cloud_field_row(
-                    "cloud-row-branch",
-                    "Branch",
-                    &draft.branch,
-                ))
+                .child(if self.cloud_picks(CloudRefField::Branch) {
+                    self.cloud_ref_row(CloudRefField::Branch, "cloud-row-branch", "Branch", cx)
+                } else {
+                    self.cloud_field_row("cloud-row-branch", "Branch", &draft.branch)
+                })
             });
         let tail = div()
             .id("cloud-target-tail")
@@ -406,15 +489,14 @@ impl Conversation {
                             .child(icon("alert-circle", 13.).text_color(danger_color())),
                     )
                     .child(div().flex_1().min_w_0().child(error))
-            }))
-            .child(create);
+            }));
         let card = composer_shelf::card("cloud-target-panel", self.classic_layout)
             .debug_selector(|| "cloud-target-panel".into())
             .role(Role::Group)
             .aria_label(format!("Run on {}", draft.target.label()))
             .child(header)
             .when(!collapsed, |d| d.child(body))
-            // Create and the error stay in view while the settings are folded away.
+            // The error stays in view while the settings are folded away.
             .child(tail);
         composer_shelf::shelf("cloud-target-shelf")
             .px(inset)

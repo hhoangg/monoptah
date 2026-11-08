@@ -8,6 +8,7 @@
 //! the user override the size, lifetime, base branch, feature branch and Claude account of a
 //! sandbox, or the machine and branch of a codespace, for this session only: the overrides are
 //! applied to a copy of the config when "Create and open" is pressed and nothing is saved back.
+use super::cloud_branches::BranchList;
 use super::*;
 use crate::docker_dialog::model::AccountChoice;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
@@ -130,6 +131,10 @@ pub(super) struct CloudDraft {
     pub machines: Machines,
     /// Which listing the answer belongs to.
     pub machines_request: u64,
+    /// The repository's branches for the Base branch / Branch row.
+    pub branches: BranchList,
+    /// Which listing the answer belongs to.
+    pub branches_request: u64,
     pub collapsed: bool,
     pub creating: bool,
     pub error: Option<String>,
@@ -258,7 +263,7 @@ impl Conversation {
     }
 
     /// The saved config, read from the store once per menu opening, not per render.
-    fn docker_config(&self) -> Option<DockerProjectConfig> {
+    pub(super) fn docker_config(&self) -> Option<DockerProjectConfig> {
         self.docker_config_cache
             .borrow_mut()
             .get_or_insert_with(|| {
@@ -320,6 +325,7 @@ impl Conversation {
         if self.cloud_creating() {
             return;
         }
+        self.close_cloud_picker();
         if self.cloud_draft.take().is_some() {
             cx.notify();
         }
@@ -363,6 +369,14 @@ impl Conversation {
                 }
                 self.load_cloud_machines(request, cx);
             }
+            // The repository's branches again, as a fresh listing.
+            self.cloud_request_seq += 1;
+            let branches_request = self.cloud_request_seq;
+            if let Some(draft) = &mut self.cloud_draft {
+                draft.branches = BranchList::Loading;
+                draft.branches_request = branches_request;
+            }
+            self.load_cloud_branches(branches_request, cx);
             cx.notify();
             return;
         }
@@ -424,6 +438,8 @@ impl Conversation {
         };
         self.cloud_request_seq += 1;
         let machines_request = self.cloud_request_seq;
+        self.cloud_request_seq += 1;
+        let branches_request = self.cloud_request_seq;
         self.cloud_draft = Some(CloudDraft {
             target,
             branch,
@@ -442,6 +458,8 @@ impl Conversation {
                 Machines::Loading
             },
             machines_request,
+            branches: BranchList::Loading,
+            branches_request,
             collapsed: false,
             creating: false,
             error: None,
@@ -452,6 +470,7 @@ impl Conversation {
         if !docker {
             self.load_cloud_machines(machines_request, cx);
         }
+        self.load_cloud_branches(branches_request, cx);
         cx.notify();
     }
 
