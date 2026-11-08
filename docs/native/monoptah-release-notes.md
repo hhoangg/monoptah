@@ -1,10 +1,14 @@
-# Monoptah Native 0.49.0
+# Monoptah Native 0.50.0
 
-## Changes since 0.48.1
+## Changes since 0.49.0
 
-- Named Claude accounts can now authenticate with a token from `claude setup-token` or with an Anthropic API key instead of browser sign-in. Open the chevron next to "Sign in and add" in Settings → Providers, choose "Use setup-token" or "Use API key", and paste the value. Browser sign-in stays the default.
-- The token or key is stored encrypted in the app database, so upgrades do not ask for the macOS keychain password, and it is passed only to that account's Claude Code process. Editing an account lets you replace it, switch back to browser sign-in, or keep the current sign-in and only rename.
-- Token and API key accounts show "Token configured" or "API key configured" instead of usage limits, which the provider does not report for them.
+- Cloud sessions can now run in Docker Sandboxes (`sbx --cloud`) as well as GitHub Codespaces. Pick the cloud and its settings (machine, branch, resources) in the composer; the project's saved cloud settings are only the defaults. Requires `sbx login` and `sbx --cloud setup ssh` done once by you; the repository's devcontainer is used when there is one, otherwise the session runs directly in the sandbox.
+- Sending the first prompt creates the codespace or sandbox. The prompt waits in the message queue and is sent once the workspace is ready, while a panel above the composer shows the current step and its latest log line.
+- A stopped codespace or sandbox can be resumed from the session: the Send button turns into "Resume", and sending a prompt resumes the workspace and then sends it. Only your own send or click resumes a sandbox; background work never does.
+- Sandbox sessions keep a Git credential (GitHub or GitLab.com token, stored encrypted in the app database) and a Claude setup-token or API key out of command lines and logs.
+- Connection notices for cloud sessions now sit above the composer, and a stopped workspace no longer reports "The host request did not complete" from a stale connection.
+- Files from a cloud session can be opened in the app from their path in the chat; large files are downloaded to a temporary local folder first.
+- Mono can archive a cloud session and then keep, stop or delete its codespace or sandbox (`sessions.archive` with `cloud`). The local copy is always saved first, and deleting is only done when you ask for it.
 
 ## Downloads and updates
 
