@@ -15,6 +15,13 @@ use std::path::PathBuf;
 #[cfg(test)]
 mod tests;
 
+/// Why a message to a cloud session is refused while it is being archived.
+pub(crate) const CLOUD_ARCHIVING: &str =
+    "This cloud session is being archived; the message would be lost. Nothing was sent.";
+
+/// Why `codespaces.stop` / `delete` wait while a session archive works on that codespace.
+pub(crate) const CODESPACE_BUSY: &str = "A session archive is still working on this codespace. Nothing was changed; try again when it finishes.";
+
 type Placement = Option<(i64, Edge)>;
 enum Effect {
     None,
@@ -646,6 +653,12 @@ impl Shell {
                     }) {
                     Err(e) => Err(e),
                     Ok((id, view)) => {
+                        if matches!(action.as_str(), "sessions.send" | "sessions.draft")
+                            && (self.cloud_busy.contains(&id) || view.read(cx).cloud_locked)
+                        {
+                            self.finish_app_call(call, Err(CLOUD_ARCHIVING.into()), cx);
+                            return;
+                        }
                         if action == "sessions.send"
                             && let Some(error) = locked(&self.store).ok().and_then(|store| {
                                 monocode_core::cloud_sessions::starting_refusal(&store, id)
@@ -698,6 +711,19 @@ impl Shell {
                                 let _ = this
                                     .update(cx, |this, cx| this.finish_app_call(call, result, cx));
                             }));
+                            return;
+                        } else if action == "sessions.archive" && input.get("cloud").is_some() {
+                            let (reply, answer) = async_channel::bounded(1);
+                            let choice = input["cloud"].as_str().unwrap_or_default().to_owned();
+                            self.app_archive_cloud(id, &choice, reply, window, cx);
+                            cx.spawn(async move |this, cx| {
+                                let result = match answer.recv().await {
+                                    Ok(result) => result.map_err(|failure| failure.message),
+                                    Err(_) => Err("The outcome of the archive is unknown. Check sessions.list before retrying".into()),
+                                };
+                                let _ = this.update(cx, |this, cx| this.finish_app_call(call, result, cx));
+                            })
+                            .detach();
                             return;
                         } else if action == "sessions.archive" {
                             let ids = match self.app_archive_family(id, call.session, &project, cx)
@@ -824,6 +850,14 @@ impl Shell {
             | "codespaces.create"
             | "codespaces.stop"
             | "codespaces.secretsStatus" => {
+                if action == "codespaces.stop"
+                    && input["name"]
+                        .as_str()
+                        .is_some_and(|name| self.codespace_busy(name))
+                {
+                    self.finish_app_call(call, Err(CODESPACE_BUSY.into()), cx);
+                    return;
+                }
                 // gh calls, and for create minutes of waiting: always off the UI thread.
                 self.app_background(
                     call,

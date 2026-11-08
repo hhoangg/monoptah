@@ -786,6 +786,16 @@ pub(super) struct ArchiveDialog {
     focus: FocusHandle,
 }
 
+/// Shown when a second archive, stop or delete targets a workspace that one is working on.
+pub(super) const WORKSPACE_BUSY: &str = "Another archive, stop or delete of this workspace is still running. Try again when it finishes.";
+
+/// What is left for a dialog to ask after [`Shell::settle_cloud_archive`].
+pub(super) struct Settled {
+    pub(super) failed: Vec<(CodespaceGroup, String)>,
+    pub(super) review: Vec<(CodespaceGroup, Vec<String>)>,
+    unreachable: Vec<Unreachable>,
+}
+
 /// A paused group and what the files-only step says about it.
 #[derive(Clone)]
 struct Unreachable {
@@ -1152,6 +1162,39 @@ impl Shell {
         self.cloud_marks.get(&id).map(CloudMark::cloud)
     }
 
+    /// Whether an archive is working on codespace `name` (for `codespaces.stop` / `delete`).
+    pub(crate) fn codespace_busy(&self, name: &str) -> bool {
+        self.cloud_workspaces_busy
+            .contains(&CloudRef::codespace(name).key())
+    }
+
+    /// Whether a cloud archive is converting session `id` right now.
+    pub(crate) fn cloud_archive_in_progress(&self, id: i64) -> bool {
+        self.cloud_busy.contains(&id)
+    }
+
+    /// Whether an archive is already working on the workspace of session `id`.
+    pub(super) fn workspace_busy_of(&self, id: i64) -> bool {
+        self.cloud_marks
+            .get(&id)
+            .is_some_and(|mark| self.cloud_workspaces_busy.contains(&mark.key()))
+    }
+
+    /// Non-archived sessions outside `selected` that still use `target`.
+    pub(super) fn other_users_of(&self, target: &CloudRef, selected: &[i64]) -> usize {
+        self.cloud_marks
+            .iter()
+            .filter(|(other, m)| {
+                m.cloud() == *target
+                    && !selected.contains(other)
+                    && self
+                        .session_summaries
+                        .get(other)
+                        .is_some_and(|s| !s.archived)
+            })
+            .count()
+    }
+
     /// Archiving cloud sessions asks what to do with their codespaces first: one
     /// dialog for all of `ids`, grouped by codespace.
     pub(super) fn open_cloud_archive(
@@ -1167,18 +1210,13 @@ impl Shell {
         if ids.is_empty() || self.cloud_archive.is_some() {
             return;
         }
+        if ids.iter().any(|id| self.workspace_busy_of(*id)) {
+            self.error = Some(WORKSPACE_BUSY.into());
+            cx.notify();
+            return;
+        }
         let groups = group_by_codespace(&ids, &self.cloud_marks, |target, selected| {
-            self.cloud_marks
-                .iter()
-                .filter(|(other, m)| {
-                    m.cloud() == *target
-                        && !selected.contains(other)
-                        && self
-                            .session_summaries
-                            .get(other)
-                            .is_some_and(|s| !s.archived)
-                })
-                .count()
+            self.other_users_of(target, selected)
         });
         self.close_preview(cx);
         let title = match ids.as_slice() {
@@ -1231,6 +1269,11 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         if self.cloud_archive.is_some() {
+            return;
+        }
+        if self.cloud_workspaces_busy.contains(&target.key()) {
+            self.error = Some(WORKSPACE_BUSY.into());
+            cx.notify();
             return;
         }
         let total = self
@@ -1350,6 +1393,8 @@ impl Shell {
         let files_only = dialog.files_only.clone();
         window.focus(&dialog.focus, cx);
         self.cloud_busy.extend(ids.iter().copied());
+        let keys: Vec<String> = groups.iter().map(|g| g.cloud().key()).collect();
+        self.cloud_workspaces_busy.extend(keys.iter().cloned());
         // Delete saves every session of the codespace, so all of them stop taking messages.
         let mut locked_ids = ids.clone();
         if choice == ArchiveChoice::Delete {
@@ -1412,6 +1457,9 @@ impl Shell {
             let outcomes = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.lock_cloud_composer(&locked_ids, false, cx);
+                for key in &keys {
+                    this.cloud_workspaces_busy.remove(key);
+                }
                 this.finish_cloud_archive(choice, ids, outcomes, window, cx)
             });
         })
@@ -1449,14 +1497,17 @@ impl Shell {
         }
     }
 
-    fn finish_cloud_archive(
+    /// Applies what the archive workers did to the window (adopt the local copies, archive or
+    /// forget the sessions) without touching the dialog, so an app call can use it while the
+    /// user has a dialog of their own open.
+    pub(super) fn settle_cloud_archive(
         &mut self,
         choice: ArchiveChoice,
         ids: Vec<i64>,
         outcomes: Vec<GroupOutcome>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Settled {
         self.cloud_busy.retain(|id| !ids.contains(id));
         // Conversion warnings are notices; a partial codespace failure stays an error.
         let mut notes = Vec::new();
@@ -1497,8 +1548,10 @@ impl Shell {
                     notes.extend(warning);
                     match then {
                         Then::Archive => {
-                            self.cloud_states
-                                .insert(group.cloud().key(), CloudState::Stopping);
+                            if choice == ArchiveChoice::Stop {
+                                self.cloud_states
+                                    .insert(group.cloud().key(), CloudState::Stopping);
+                            }
                             for id in group.ids {
                                 self.toggle_archive_now(id, cx);
                             }
@@ -1515,6 +1568,32 @@ impl Shell {
                 Err(error) => failed.push((group, error)),
             }
         }
+        if !notes.is_empty() {
+            self.error = Some(notes.join(" "));
+        }
+        if !warnings.is_empty() {
+            self.notice = Some(warnings.join(" "));
+        }
+        Settled {
+            failed,
+            review,
+            unreachable,
+        }
+    }
+
+    pub(super) fn finish_cloud_archive(
+        &mut self,
+        choice: ArchiveChoice,
+        ids: Vec<i64>,
+        outcomes: Vec<GroupOutcome>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Settled {
+            failed,
+            review,
+            mut unreachable,
+        } = self.settle_cloud_archive(choice, ids, outcomes, window, cx);
         // Paused groups wait while another group fails: "anyway" must not reach them.
         if let Some(dialog) = self.cloud_archive.as_mut() {
             if !failed.is_empty() {
@@ -1561,12 +1640,6 @@ impl Shell {
                 dialog.phase = Phase::Failed { choice, error };
             }
             window.focus(&dialog.focus, cx);
-        }
-        if !notes.is_empty() {
-            self.error = Some(notes.join(" "));
-        }
-        if !warnings.is_empty() {
-            self.notice = Some(warnings.join(" "));
         }
         self.invalidate_chrome(cx);
         cx.notify();
@@ -1682,6 +1755,11 @@ impl Shell {
             return;
         };
         if self.cloud_archive.is_some() || self.cloud_busy.contains(&id) {
+            return;
+        }
+        if self.cloud_workspaces_busy.contains(&mark.key()) {
+            self.error = Some(WORKSPACE_BUSY.into());
+            cx.notify();
             return;
         }
         let title = self.session_metadata(id, cx).display_title();

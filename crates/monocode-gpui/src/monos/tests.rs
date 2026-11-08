@@ -5501,6 +5501,54 @@ fn only_other_regular_sessions_can_be_deleted(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn codespaces_stop_and_delete_wait_while_an_archive_works_on_that_codespace(
+    cx: &mut TestAppContext,
+) {
+    let s = setup(cx);
+    s.window
+        .update(cx, |shell, _, _| shell.mono_test_busy_codespace("octo-abc"))
+        .unwrap();
+    for (n, action) in ["codespaces.stop", "codespaces.delete"]
+        .into_iter()
+        .enumerate()
+    {
+        let result = call_from(
+            &s,
+            s.session,
+            &format!("busy-{n}"),
+            action,
+            json!({"name":"octo-abc"}),
+            cx,
+        )
+        .try_recv()
+        .unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            crate::shell::CODESPACE_BUSY,
+            "{action}"
+        );
+    }
+}
+
+#[gpui::test]
+fn archive_with_cloud_stop_or_delete_has_the_same_guard_as_delete(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    for (n, cloud) in ["stop", "delete"].into_iter().enumerate() {
+        let result = call_from(
+            &s,
+            s.session,
+            &format!("self-{n}"),
+            "sessions.archive",
+            json!({"sessionId":s.session,"cloud":cloud}),
+            cx,
+        )
+        .try_recv()
+        .unwrap();
+        assert_eq!(result.unwrap_err(), REFUSED, "{cloud}");
+    }
+}
+
+#[gpui::test]
 fn a_habit_run_can_delete_a_regular_session_with_its_files(cx: &mut TestAppContext) {
     let s = setup(cx);
     let seen = fake_cleanup(

@@ -9,6 +9,7 @@ mod classic_sidebar;
 mod classic_surface_tests;
 mod classic_surfaces;
 mod cloud;
+mod cloud_app_archive;
 mod cloud_create;
 mod cloud_picker;
 mod cloud_start;
@@ -32,6 +33,8 @@ mod idle_agents;
 mod image_lightbox_tests;
 mod layout;
 mod live_agents;
+pub(crate) use app_commands::{CLOUD_ARCHIVING, CODESPACE_BUSY};
+pub(crate) use cloud_app_archive::ArchiveFailure;
 pub(crate) use live_agents::live_elapsed;
 mod mobile_host;
 mod mono_panes;
@@ -726,6 +729,8 @@ pub(crate) struct Shell {
     /// Saves the local copy of a cloud session before its codespace is stopped or deleted.
     cloud_convert: cloud::ConvertFn,
     cloud_busy: HashSet<i64>,
+    /// [`CloudRef::key`] of every workspace an archive is working on right now.
+    cloud_workspaces_busy: HashSet<String>,
     /// Cloud sessions whose codespace is starting (or failed to start), by session id.
     cloud_starts: HashMap<i64, cloud_start::CloudStartView>,
     /// Where the right panel was before a startup opened the Codespace tab.
@@ -1185,6 +1190,7 @@ impl Shell {
             cloud_archive: None,
             cloud_convert: cloud::default_convert(),
             cloud_busy: HashSet::new(),
+            cloud_workspaces_busy: HashSet::new(),
             cloud_starts: HashMap::new(),
             codespace_return: None,
             github_projects: HashMap::new(),

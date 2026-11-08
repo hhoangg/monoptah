@@ -159,6 +159,22 @@ fn operator_is_refused_provider_file_removal_but_may_keep_them() {
 }
 
 #[test]
+fn operator_may_archive_cloud_sessions_keeping_or_stopping_but_not_deleting() {
+    for cloud in ["keep", "stop"] {
+        assert!(
+            validate_operator("sessions.archive", &json!({"sessionId":1,"cloud":cloud})).is_ok()
+        );
+    }
+    assert_eq!(
+        validate_operator("sessions.archive", &json!({"sessionId":1,"cloud":"delete"}))
+            .unwrap_err(),
+        "Deleting a codespace or sandbox is only available to a Mono"
+    );
+    assert!(validate_operator("sessions.archive", &json!({"sessionId":1,"cloud":"x"})).is_err());
+    assert!(validate_operator("sessions.archive", &json!({"sessionId":1})).is_ok());
+}
+
+#[test]
 fn conversation_pages_keep_source_cursors_prose_boundaries_and_character_caps() {
     let blocks = vec![
         json!({"id":"u1","role":"user","text":"/operator First"}),

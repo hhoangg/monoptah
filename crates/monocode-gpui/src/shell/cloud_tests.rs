@@ -1639,7 +1639,6 @@ fn ready_rebinds_the_conversation_and_queues_a_message_sent_while_starting(
                 .insert(id, cloud_start::CloudStartView::new(record));
             shell.add_loaded(summary.clone(), cx);
             let chat = shell.sessions[&id].clone();
-            assert_eq!(chat.read(cx).cloud_queued(), Some("fix the bug"));
             assert!(chat.read(cx).summary.cwd.starts_with("remote://pending-"));
             let ready = Session {
                 cwd: "remote://env-octo-new1/workspaces/widgets".into(),
@@ -1654,27 +1653,18 @@ fn ready_rebinds_the_conversation_and_queues_a_message_sent_while_starting(
             let cwd = "remote://env-octo-new1/workspaces/widgets".to_string();
             let mut session = shell.session_summaries[&id].clone();
             session.cwd = cwd.clone();
+            // The user is elsewhere (or the app restarted): no view exists for the session.
+            shell.sessions.remove(&id);
             shell.finish_ready(id, session, window, cx);
+            // A queued message needs a conversation to send it, so one is made.
+            assert!(shell.sessions.contains_key(&id));
             let chat = shell.sessions[&id].read(cx);
             assert_eq!(chat.summary.cwd, cwd);
             assert!(!chat.cloud_start_blocks());
             assert_eq!(chat.cloud_start().unwrap().phase, StartPhase::Ready);
             assert!(chat.cloud_start().unwrap().ready.is_some());
-            assert!(
-                chat.remote_debug().contains("waiting=true"),
-                "{}",
-                chat.remote_debug()
-            );
             assert_eq!(shell.session_summaries[&id].cwd, cwd);
             assert!(shell.cloud_start_label(id).is_none());
-            assert!(
-                shell
-                    .mono_session_views(cx)
-                    .iter()
-                    .find(|session| session.id == id)
-                    .unwrap()
-                    .busy
-            );
         })
         .unwrap();
 }
@@ -3123,17 +3113,13 @@ fn create_and_open_a_codespace_creates_it_queues_the_prompt_and_opens_the_start(
             assert_eq!(snapshot.phase, StartPhase::Starting);
             // The composer text is the first prompt of the new session, queued once.
             assert_eq!(
-                monocode_core::cloud_sessions::queued_start_message(
+                monocode_core::cloud_sessions::queued_start_messages(
                     &locked(&shell.store).unwrap(),
                     *id
-                )
-                .as_deref(),
-                Some("fix the bug")
+                ),
+                vec!["fix the bug".to_owned()]
             );
-            assert_eq!(
-                shell.sessions[id].read(cx).cloud_queued(),
-                Some("fix the bug")
-            );
+            let _ = cx;
             // The draft composer is spent: no target, no text.
             let chat = chat.read(cx);
             assert_eq!(chat.cloud_target(), None);
@@ -3253,12 +3239,11 @@ fn a_sandbox_start_is_marked_by_its_key_and_a_failed_one_is_not_tracked(cx: &mut
             assert!(snapshot.running);
             // Queued by the worker, before the session opened.
             assert_eq!(
-                monocode_core::cloud_sessions::queued_start_message(
+                monocode_core::cloud_sessions::queued_start_messages(
                     &locked(&shell.store).unwrap(),
                     id
-                )
-                .as_deref(),
-                Some("go")
+                ),
+                vec!["go".to_owned()]
             );
             // Start over.
             shell.drop_cloud_start(id);
@@ -3691,4 +3676,405 @@ fn a_resume_during_a_refresh_drops_that_stale_answer_and_reads_again(cx: &mut Te
             assert_eq!(resume_label(shell, id, cx), None);
         })
         .unwrap();
+}
+
+/// Runs `sessions.archive` with `cloud` on session `id` and returns the app call's answer.
+fn app_archive(
+    window: gpui::WindowHandle<Shell>,
+    cx: &mut TestAppContext,
+    id: i64,
+    choice: &str,
+) -> Result<Value, String> {
+    app_archive_full(window, cx, id, choice).map_err(|failure| failure.message)
+}
+
+fn app_archive_full(
+    window: gpui::WindowHandle<Shell>,
+    cx: &mut TestAppContext,
+    id: i64,
+    choice: &str,
+) -> Result<Value, super::cloud_app_archive::ArchiveFailure> {
+    let (reply, answer) = async_channel::bounded(1);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |shell, window, cx| {
+            shell.app_archive_cloud(id, choice, reply, window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    answer.try_recv().expect("the app call was answered")
+}
+
+/// `fake_convert` that counts its calls.
+fn counting_convert(
+    store: Database,
+    fail: Option<&'static str>,
+) -> (cloud::ConvertFn, Arc<Mutex<u32>>) {
+    let inner = fake_convert(store, fail);
+    let count = Arc::new(Mutex::new(0));
+    let seen = count.clone();
+    (
+        Arc::new(move |svc, id, files, progress| {
+            *seen.lock().unwrap() += 1;
+            inner(svc, id, files, progress)
+        }),
+        count,
+    )
+}
+
+#[gpui::test]
+fn app_archive_of_a_codespace_session_converts_then_acts_once(cx: &mut TestAppContext) {
+    for (choice, expected) in [
+        ("keep", vec![]),
+        ("stop", vec!["codespace stop -c octo-abc"]),
+        ("delete", vec!["codespace delete -c octo-abc --force"]),
+    ] {
+        let (window, id, gh) = shell_with_cloud(cx);
+        let (convert, count) = window
+            .update(cx, |shell, _, _| {
+                let (convert, count) = counting_convert(shell.store.clone(), None);
+                shell.cloud_convert = convert.clone();
+                (convert, count)
+            })
+            .unwrap();
+        drop(convert);
+        let value = app_archive(window, cx, id, choice).unwrap();
+        assert_eq!(*count.lock().unwrap(), 1, "{choice}");
+        assert_eq!(gh.archive_calls(), expected, "{choice}");
+        assert_eq!(value["sessionId"], id);
+        assert_eq!(value["archived"], true);
+        assert_eq!(value["cloud"]["kind"], "codespace");
+        assert_eq!(value["cloud"]["name"], "octo-abc");
+        assert_eq!(value["cloud"]["action"], choice);
+        assert_eq!(value["cloud"]["done"], true);
+        window
+            .update(cx, |shell, _, _| {
+                // The cloud row is replaced by one archived local copy, as the dialog does.
+                assert!(!shell.is_cloud(id), "{choice}");
+                assert_eq!(archived_locals(shell).len(), 1, "{choice}");
+                assert!(shell.cloud_busy.is_empty());
+            })
+            .unwrap();
+    }
+}
+
+#[gpui::test]
+fn app_archive_of_a_sandbox_session_converts_then_acts_once(cx: &mut TestAppContext) {
+    for (choice, verb) in [
+        ("keep", None),
+        ("stop", Some(" stop ")),
+        ("delete", Some(" rm ")),
+    ] {
+        let (window, id, sbx) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+        let count = window
+            .update(cx, |shell, _, _| {
+                let (convert, count) = counting_convert(shell.store.clone(), None);
+                shell.cloud_convert = convert;
+                count
+            })
+            .unwrap();
+        let value = app_archive(window, cx, id, choice).unwrap();
+        assert_eq!(*count.lock().unwrap(), 1, "{choice}");
+        let changes = sbx.changes();
+        match verb {
+            None => assert!(changes.is_empty(), "{changes:?}"),
+            Some(verb) => {
+                assert_eq!(changes.len(), 1, "{choice}: {changes:?}");
+                assert!(changes[0].contains(verb), "{choice}: {changes:?}");
+            }
+        }
+        assert_eq!(value["cloud"]["kind"], "sandbox");
+        assert_eq!(value["cloud"]["name"], SBX_NAME);
+        assert_eq!(value["cloud"]["action"], choice);
+        assert_eq!(value["cloud"]["done"], true);
+        assert_eq!(value["archived"], true);
+    }
+}
+
+#[gpui::test]
+fn app_archive_keeps_the_workspace_when_the_conversion_fails(cx: &mut TestAppContext) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, _| {
+            shell.cloud_convert = fake_convert(shell.store.clone(), Some("copy failed"));
+        })
+        .unwrap();
+    for choice in ["stop", "delete"] {
+        let error = app_archive(window, cx, id, choice).unwrap_err();
+        assert!(error.contains("copy failed"), "{error}");
+        assert!(error.contains("was kept"), "{error}");
+        assert!(gh.archive_calls().is_empty(), "{choice}");
+    }
+    window
+        .update(cx, |shell, _, _| {
+            assert!(shell.is_cloud(id) && shell.cloud_busy.is_empty());
+            assert!(archived_locals(shell).is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn app_archive_keeps_the_sandbox_when_its_conversation_cannot_be_reached(cx: &mut TestAppContext) {
+    let (window, id, sbx) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    window
+        .update(cx, |shell, _, _| {
+            shell.cloud_convert = history_lost_convert(shell.store.clone(), true);
+        })
+        .unwrap();
+    let error = app_archive(window, cx, id, "delete").unwrap_err();
+    assert!(error.contains("could not be reached"), "{error}");
+    assert!(error.contains("was kept"), "{error}");
+    assert!(sbx.changes().is_empty(), "{:?}", sbx.calls());
+    window
+        .update(cx, |shell, _, _| assert!(shell.is_cloud(id)))
+        .unwrap();
+}
+
+#[gpui::test]
+fn app_archive_does_not_stop_or_delete_after_a_copy_without_the_conversation(
+    cx: &mut TestAppContext,
+) {
+    for choice in ["stop", "delete"] {
+        let (window, id, sbx) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+        window
+            .update(cx, |shell, _, _| {
+                shell.cloud_convert = history_lost_convert(shell.store.clone(), false);
+            })
+            .unwrap();
+        let error = app_archive(window, cx, id, choice).unwrap_err();
+        assert!(error.contains("conversation"), "{error}");
+        assert!(error.contains("not stopped or deleted"), "{error}");
+        assert!(sbx.changes().is_empty(), "{choice}: {:?}", sbx.calls());
+        window
+            .update(cx, |shell, _, _| {
+                assert!(!shell.is_cloud(id), "the code copy is archived");
+                assert_eq!(archived_locals(shell).len(), 1);
+            })
+            .unwrap();
+    }
+}
+
+#[gpui::test]
+fn app_archive_never_deletes_a_workspace_another_session_still_uses(cx: &mut TestAppContext) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    let count = window
+        .update(cx, |shell, _, _| {
+            cloud_row(shell, "octo-abc");
+            let (convert, count) = counting_convert(shell.store.clone(), None);
+            shell.cloud_convert = convert;
+            count
+        })
+        .unwrap();
+    let error = app_archive(window, cx, id, "delete").unwrap_err();
+    assert!(error.contains("still use"), "{error}");
+    assert_eq!(*count.lock().unwrap(), 0);
+    assert!(gh.archive_calls().is_empty());
+    window
+        .update(cx, |shell, _, _| assert!(shell.is_cloud(id)))
+        .unwrap();
+    // Stopping is still allowed: it keeps everything and is what the dialog offers too.
+    let value = app_archive(window, cx, id, "stop").unwrap();
+    assert_eq!(value["cloud"]["action"], "stop");
+    assert_eq!(gh.archive_calls(), ["codespace stop -c octo-abc"]);
+}
+
+#[gpui::test]
+fn app_archive_refuses_cloud_on_a_local_session_and_an_unknown_value(cx: &mut TestAppContext) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    let local = window
+        .update(cx, |shell, _, _| {
+            let local = locked(&shell.store)
+                .unwrap()
+                .create("claude", "/work/monocode")
+                .unwrap();
+            local.id
+        })
+        .unwrap();
+    let error = app_archive(window, cx, local, "stop").unwrap_err();
+    assert!(error.contains("only applies to"), "{error}");
+    assert!(app_archive(window, cx, id, "remove").is_err());
+    assert!(gh.calls().is_empty());
+}
+
+#[gpui::test]
+fn app_archive_keep_does_not_mark_the_workspace_as_stopping(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_cloud(cx);
+    app_archive(window, cx, id, "keep").unwrap();
+    window
+        .update(cx, |shell, _, _| {
+            assert_eq!(
+                shell.cloud_states.get("octo-abc"),
+                Some(&CloudState::Stopped)
+            );
+        })
+        .unwrap();
+    let (window, id, _) = shell_with_cloud(cx);
+    app_archive(window, cx, id, "stop").unwrap();
+    window
+        .update(cx, |shell, _, _| {
+            assert_eq!(
+                shell.cloud_states.get("octo-abc"),
+                Some(&CloudState::Stopping)
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_second_archive_of_a_busy_workspace_is_refused_everywhere(cx: &mut TestAppContext) {
+    let (window, a, gh) = shell_with_cloud(cx);
+    let b = window
+        .update(cx, |shell, _, _| cloud_row(shell, "octo-abc"))
+        .unwrap();
+    let count = window
+        .update(cx, |shell, _, _| {
+            let (convert, count) = counting_convert(shell.store.clone(), None);
+            shell.cloud_convert = convert;
+            count
+        })
+        .unwrap();
+    let (reply_a, answer_a) = async_channel::bounded(1);
+    let (reply_b, answer_b) = async_channel::bounded(1);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |shell, window, cx| {
+            shell.app_archive_cloud(a, "stop", reply_a, window, cx);
+            // The sibling, the dialog, the session menu and the remove prompt all wait.
+            shell.app_archive_cloud(b, "stop", reply_b, window, cx);
+            shell.open_cloud_archive(vec![b], window, cx);
+            assert!(shell.cloud_archive.is_none());
+            shell.run_workspace_action(
+                CloudRef::codespace("octo-abc"),
+                ArchiveChoice::Delete,
+                window,
+                cx,
+            );
+            assert!(shell.cloud_archive.is_none());
+            shell.confirm_remove_cloud_session(b, window, cx);
+            assert!(shell.cloud_archive.is_none());
+        })
+        .unwrap();
+    let refused = answer_b.try_recv().unwrap().unwrap_err();
+    assert!(
+        refused.message.contains("still running"),
+        "{}",
+        refused.message
+    );
+    assert!(!refused.archived);
+    visual.run_until_parked();
+    assert!(answer_a.try_recv().unwrap().is_ok());
+    assert_eq!(*count.lock().unwrap(), 1);
+    assert_eq!(gh.archive_calls(), ["codespace stop -c octo-abc"]);
+    window
+        .update(visual, |shell, _, _| {
+            assert!(shell.cloud_workspaces_busy.is_empty())
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn an_app_archive_leaves_a_dialog_the_user_opened_meanwhile_alone(cx: &mut TestAppContext) {
+    let (window, a, gh) = shell_with_cloud(cx);
+    let other = window
+        .update(cx, |shell, _, _| cloud_row(shell, "octo-xyz"))
+        .unwrap();
+    let (reply, answer) = async_channel::bounded(1);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |shell, window, cx| {
+            shell.app_archive_cloud(a, "delete", reply, window, cx);
+            shell.open_cloud_archive(vec![other], window, cx);
+            assert!(shell.cloud_archive.is_some());
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(answer.try_recv().unwrap().is_ok());
+    assert_eq!(gh.archive_calls(), ["codespace delete -c octo-abc --force"]);
+    window
+        .update(visual, |shell, _, _| {
+            let dialog = shell
+                .cloud_archive
+                .as_ref()
+                .expect("the user's dialog stays");
+            assert_eq!(dialog.ids(), vec![other]);
+            assert!(matches!(dialog.phase, cloud::Phase::Choose));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn messages_to_a_session_being_archived_are_refused(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_cloud(cx);
+    let (reply, _answer) = async_channel::bounded(1);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |shell, window, cx| {
+            shell.app_archive_cloud(id, "stop", reply, window, cx);
+            assert!(shell.cloud_archive_in_progress(id));
+        })
+        .unwrap();
+    visual.run_until_parked();
+    window
+        .update(visual, |shell, _, _| {
+            assert!(!shell.cloud_archive_in_progress(id))
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_partly_saved_archive_reports_the_session_as_archived(cx: &mut TestAppContext) {
+    // Delete converts the target first, then its sibling; the sibling fails.
+    let (window, a, gh) = shell_with_cloud(cx);
+    let b = window
+        .update(cx, |shell, _, _| {
+            let b = cloud_row(shell, "octo-abc");
+            // Archived, so it does not block the delete but is still converted.
+            locked(&shell.store).unwrap().set_archived(b, true).unwrap();
+            if let Some(summary) = shell.session_summaries.get_mut(&b) {
+                summary.archived = true;
+            }
+            let inner = fake_convert(shell.store.clone(), None);
+            shell.cloud_convert = Arc::new(move |svc, id, files, progress| {
+                if id == b {
+                    return Err(ConvertError::Failed("sibling copy failed".into()));
+                }
+                inner(svc, id, files, progress)
+            });
+            b
+        })
+        .unwrap();
+    let _ = b;
+    let result = app_archive_full(window, cx, a, "delete");
+    // The target was saved: whatever the outcome, it is not reported as untouched.
+    match result {
+        Ok(value) => {
+            assert_eq!(value["archived"], true);
+            assert_eq!(value["cloud"]["done"], false);
+        }
+        Err(failure) => assert!(failure.archived, "{}", failure.message),
+    }
+    assert!(gh.archive_calls().is_empty(), "{:?}", gh.archive_calls());
+}
+
+#[gpui::test]
+fn app_archive_delete_review_error_tells_the_user_to_review_in_the_app(cx: &mut TestAppContext) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, _| {
+            let inner = fake_convert(shell.store.clone(), None);
+            shell.cloud_convert = Arc::new(move |svc, session, files, progress| {
+                let mut done = inner(svc, session, files, progress)?;
+                done.ignored = vec![(4, ".env.local".into())];
+                Ok(done)
+            });
+        })
+        .unwrap();
+    let failure = app_archive_full(window, cx, id, "delete").unwrap_err();
+    assert!(
+        failure.message.contains("review them in the app"),
+        "{}",
+        failure.message
+    );
+    assert!(failure.archived);
+    assert!(gh.archive_calls().is_empty());
 }

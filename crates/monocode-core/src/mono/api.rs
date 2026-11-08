@@ -12,7 +12,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "sessions.send"=>"sessionId prompt project notifyOnComplete completionDelivery",
         "sessions.draft"=>"sessionId prompt project",
         "sessions.pullEvidence"=>"sessionId project path taskId",
-        "sessions.stop"|"sessions.archive"=>"sessionId project",
+        "sessions.stop"=>"sessionId project",
+        "sessions.archive"=>"sessionId project cloud",
         "sessions.delete"=>"sessionId project providerFiles removeWorktree",
         "worktrees.create"=>"branch base existing project",
         "folders.move"=>"sessionId folderId newFolderName project",
@@ -142,6 +143,12 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     }
     if action.starts_with("codespaces.") {
         validate_codespace_fields(input)?;
+    }
+    if input
+        .get("cloud")
+        .is_some_and(|cloud| !matches!(cloud.as_str(), Some("keep" | "stop" | "delete")))
+    {
+        return Err("cloud must be \"keep\", \"stop\" or \"delete\"".into());
     }
     if action == "sessions.pullEvidence" {
         if input.get("sessionId").is_none() {
@@ -347,6 +354,26 @@ mod tests {
             );
         }
         assert!(delete(json!({"sessionId":1,"force":true})).is_err());
+    }
+    #[test]
+    fn cloud_is_keep_stop_or_delete_on_archive_only() {
+        for value in ["keep", "stop", "delete"] {
+            assert!(validate("sessions.archive", &json!({"sessionId":1,"cloud":value})).is_ok());
+        }
+        assert!(validate("sessions.archive", &json!({"sessionId":1})).is_ok());
+        for bad in [json!("remove"), json!("Stop")] {
+            assert_eq!(
+                validate("sessions.archive", &json!({"sessionId":1,"cloud":bad})).unwrap_err(),
+                "cloud must be \"keep\", \"stop\" or \"delete\""
+            );
+        }
+        for bad in [json!(true), json!(null), json!(1)] {
+            assert!(validate("sessions.archive", &json!({"sessionId":1,"cloud":bad})).is_err());
+        }
+        assert_eq!(
+            validate("sessions.stop", &json!({"sessionId":1,"cloud":"stop"})).unwrap_err(),
+            "sessions.stop does not take cloud"
+        );
     }
     #[test]
     fn remove_worktree_is_a_boolean_on_delete_only() {

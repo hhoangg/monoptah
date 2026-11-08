@@ -447,6 +447,62 @@ impl Monos {
         })
         .detach();
     }
+    /// `sessions.archive` with `cloud`: saves a local copy of the cloud session, then keeps,
+    /// stops or deletes its workspace. The launch flags dismissed for the archive go back if
+    /// nothing was archived.
+    fn archive_cloud(
+        &mut self,
+        call: Call,
+        session: i64,
+        flipped: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (reply, answer) = async_channel::bounded(1);
+        let owner = self.owner.clone();
+        let handle = window.window_handle();
+        let choice = call.input["cloud"].as_str().unwrap_or_default().to_owned();
+        let app: &mut App = cx;
+        app.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = owner.update(cx, |owner, cx| {
+                    owner.app_archive_cloud(session, &choice, reply, window, cx)
+                });
+            });
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = match answer.recv().await {
+                Ok(result) => result,
+                Err(_) => Err(crate::shell::ArchiveFailure {
+                    message:
+                        "The outcome of the archive is unknown. Check sessions.list before retrying"
+                            .into(),
+                    archived: false,
+                }),
+            };
+            let archived = match &outcome {
+                Ok(value) => value["archived"] == true,
+                Err(failure) => failure.archived,
+            };
+            let result = outcome.map_err(|failure| failure.message);
+            let _ = this.update(cx, |this, cx| {
+                if !archived {
+                    for m in &mut this.roster.monos {
+                        if flipped.contains(&m.id) {
+                            for launch in &mut m.launches {
+                                if launch.session_id == session {
+                                    launch.dismissed = false;
+                                }
+                            }
+                        }
+                    }
+                    this.save(cx);
+                }
+                this.finish_call(call, result, cx);
+            });
+        })
+        .detach();
+    }
     fn call_work(
         &mut self,
         call: Call,
@@ -759,7 +815,9 @@ impl Monos {
                 };
                 // Only other regular project sessions can be deleted. Checked before
                 // anything is opened or changed.
-                if action == "sessions.delete"
+                if (action == "sessions.delete"
+                    || (action == "sessions.archive"
+                        && matches!(input["cloud"].as_str(), Some("stop" | "delete"))))
                     && (session == call.session
                         || self.is_mono_session(session)
                         || self.running.contains_key(&session)
@@ -800,6 +858,16 @@ impl Monos {
                     );
                     return;
                 };
+                if matches!(action.as_str(), "sessions.send" | "sessions.draft")
+                    && (view.read(cx).cloud_locked
+                        || self
+                            .owner
+                            .upgrade()
+                            .is_some_and(|o| o.read(cx).cloud_archive_in_progress(session)))
+                {
+                    self.finish_call(call, Err(crate::shell::CLOUD_ARCHIVING.into()), cx);
+                    return;
+                }
                 if action == "sessions.send"
                     && let Some(error) = locked(&self.store).ok().and_then(|store| {
                         monocode_core::cloud_sessions::starting_refusal(&store, session)
@@ -899,6 +967,10 @@ impl Monos {
                         self.delete_removing_worktree(call, session, flipped, window, cx);
                         return;
                     }
+                    if action == "sessions.archive" && input.get("cloud").is_some() {
+                        self.archive_cloud(call, session, flipped, window, cx);
+                        return;
+                    }
                     if action == "sessions.delete" && flag(&input, "providerFiles", false) {
                         self.delete_with_files(call, session, flipped, window, cx);
                         return;
@@ -954,6 +1026,16 @@ impl Monos {
             | "codespaces.stop"
             | "codespaces.delete"
             | "codespaces.secretsStatus" => {
+                if matches!(action.as_str(), "codespaces.stop" | "codespaces.delete")
+                    && input["name"].as_str().is_some_and(|name| {
+                        self.owner
+                            .upgrade()
+                            .is_some_and(|o| o.read(cx).codespace_busy(name))
+                    })
+                {
+                    self.finish_call(call, Err(crate::shell::CODESPACE_BUSY.into()), cx);
+                    return;
+                }
                 // gh calls, and for create minutes of waiting: always off the UI thread.
                 self.call_work(
                     call,
