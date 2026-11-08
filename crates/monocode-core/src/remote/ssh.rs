@@ -696,8 +696,28 @@ fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> Str
 /// token by hash and installs Claude), plus an optional prelude that is
 /// prepended verbatim. The prelude is the seam for per-start secrets, which
 /// reach the container on stdin only.
+///
+/// Unlike a codespace, a sandbox runs the Host detached (`MONOCODE_HOST_DETACHED=1`): a
+/// devcontainer can have `/run/systemd/system` without systemd as PID 1, which sends
+/// `service install` down a systemd path that fails. The shared template is left untouched;
+/// `ensure_detached_host` from `remote_bootstrap_detached.sh` is inserted before its
+/// `service install` line. Restarts need nothing extra: the template's `service uninstall` stops a detached Host.
 pub fn sandbox_bootstrap_script(prelude: Option<&str>) -> String {
-    let script = codespace_bootstrap_script();
+    let template = include_str!("remote_bootstrap.sh").replace("\r\n", "\n");
+    let helpers = include_str!("remote_bootstrap_detached.sh").replace("\r\n", "\n");
+    let install = "\"$ENTRY\" service install --port \"$HOST_PORT\" >/dev/null";
+    // Fail loudly at run time (also in release builds) if upstream changed the install line:
+    // a script that silently skipped the detached start would only fail later on the systemd path.
+    let body = if template.matches(install).count() == 1 {
+        bootstrap_script_from_template(
+            HostPlatform::Unix,
+            &template.replace(install, &format!("ensure_detached_host\n{install}")),
+        )
+    } else {
+        "echo 'The sandbox bootstrap template changed: the service install line is missing.' >&2\nexit 1\n".to_string()
+    };
+    let script =
+        format!("MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{helpers}{body}");
     match prelude {
         Some(prelude) => format!("{prelude}\n{script}"),
         None => script,
@@ -1902,6 +1922,200 @@ mod tests {
         assert!(check_target(&target).is_err());
     }
     #[test]
+    fn detached_flag_and_helpers_exist_only_in_the_sandbox_bootstrap() {
+        let sandbox = sandbox_bootstrap_script(None);
+        assert!(sandbox.contains("MONOCODE_HOST_DETACHED=1\n"));
+        assert!(sandbox.contains("ensure_detached_host\n\"$ENTRY\" service install"));
+        assert!(!sandbox.contains("restart_detached_host"));
+        assert_eq!(
+            sandbox
+                .matches("ensure_detached_host\n\"$ENTRY\" service install --port \"$HOST_PORT\" >/dev/null")
+                .count(),
+            1
+        );
+        // Template drift gate (also under --release): the line the insertion anchors on.
+        assert_eq!(
+            include_str!("remote_bootstrap.sh")
+                .matches("\"$ENTRY\" service install --port \"$HOST_PORT\" >/dev/null")
+                .count(),
+            1
+        );
+        assert!(!sandbox.contains("template changed"));
+        for text in [
+            codespace_bootstrap_script(),
+            bootstrap_script(HostPlatform::Unix),
+        ] {
+            assert!(!text.contains("DETACHED"));
+            assert!(!text.contains("detached_host"));
+        }
+        assert!(codespace_bootstrap_script()
+            .contains("\"$ENTRY\" service uninstall >/dev/null 2>&1 || true"));
+    }
+    /// A fake Host that is its own `serve` process: `connection-info` answers (with its pid)
+    /// only while `up` exists.
+    #[cfg(unix)]
+    struct DetachedRun {
+        home: tempfile::TempDir,
+    }
+    #[cfg(unix)]
+    impl DetachedRun {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let home = tempfile::tempdir().unwrap();
+            let base = home.path().join(".monocode-host");
+            std::fs::create_dir_all(base.join("bin")).unwrap();
+            let entry = base.join("bin/monocode-host");
+            std::fs::write(
+                &entry,
+                format!(
+                    r#"#!/bin/sh
+B={base}
+echo "$*" >> "$B/../calls.log"
+case "$1" in
+  connection-info) [ -f "$B/up" ] && cat "$B/up" || exit 1 ;;
+  serve)
+    trap 'rm -f "$B/up"; exit 0' TERM
+    printf '{{"port":3774,"pid":%s}}\n' "$$" > "$B/up"
+    while :; do sleep 1; done ;;
+  service)
+    if [ "$2" = uninstall ] && [ -f "$B/up" ]; then
+      P=$(sed 's/.*"pid":\([0-9]*\).*/\1/' "$B/up")
+      kill -TERM "$P" 2>/dev/null
+      i=0; while [ -f "$B/up" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+    fi
+    [ "$2" = install ] && [ ! -f "$B/up" ] && exit 9
+    exit 0 ;;
+esac
+"#,
+                    base = base.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { home }
+        }
+        fn up(&self) -> std::path::PathBuf {
+            self.home.path().join(".monocode-host/up")
+        }
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.home.path().join("calls.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(String::from)
+                .collect()
+        }
+        fn serves(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|c| c.starts_with("serve "))
+                .count()
+        }
+        fn pid(&self) -> Option<u32> {
+            let up = std::fs::read_to_string(self.up()).ok()?;
+            serde_json::from_str::<serde_json::Value>(&up).ok()?["pid"]
+                .as_u64()
+                .map(|p| p as u32)
+        }
+        fn run(&self, token: Option<&str>) {
+            use std::io::Write;
+            let script = sandbox_bootstrap_script(None).replace(
+                "MONOCODE_HOST_INSTALL_CLAUDE=1",
+                "MONOCODE_HOST_INSTALL_CLAUDE=0",
+            );
+            let mut command = Command::new("sh");
+            command
+                .arg("-s")
+                .env("HOME", self.home.path())
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+                .env_remove("ANTHROPIC_API_KEY");
+            if let Some(token) = token {
+                command.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for DetachedRun {
+        fn drop(&mut self) {
+            if let Some(pid) = self.pid() {
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn detached_bootstrap_starts_the_host_itself_when_it_does_not_answer() {
+        let fake = DetachedRun::new();
+        fake.run(None);
+        let calls = fake.calls();
+        let base = fake.home.path().join(".monocode-host");
+        assert!(
+            calls.contains(&format!("serve --data-dir {} --port 3774", base.display())),
+            "{calls:?}"
+        );
+        // `service install` ran once the Host answered, so the real one returns early.
+        let install = calls
+            .iter()
+            .position(|c| c == "service install --port 3774");
+        let serve = calls.iter().position(|c| c.starts_with("serve "));
+        assert!(install.is_some() && serve < install, "{calls:?}");
+        assert!(fake.pid().is_some());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn detached_bootstrap_leaves_an_answering_host_alone() {
+        let fake = DetachedRun::new();
+        std::fs::write(fake.up(), r#"{"port":3774,"pid":1}"#).unwrap();
+        fake.run(None);
+        assert_eq!(fake.serves(), 0);
+        assert!(!fake.calls().iter().any(|c| c == "service uninstall"));
+        // Never leave a pid that is not ours for Drop to signal.
+        std::fs::remove_file(fake.up()).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn detached_bootstrap_stops_then_restarts_the_host_when_the_token_changes() {
+        let fake = DetachedRun::new();
+        fake.run(Some("first"));
+        let first = fake.pid().expect("host started");
+        // Same token: untouched.
+        fake.run(Some("first"));
+        assert_eq!(fake.pid(), Some(first));
+        assert_eq!(fake.serves(), 1);
+        let before = fake.calls().len();
+        fake.run(Some("second"));
+        let second = fake.pid().expect("host restarted");
+        assert_ne!(second, first);
+        let calls = fake.calls()[before..].to_vec();
+        let pos = |what: &str| calls.iter().position(|c| c.starts_with(what));
+        let (stop, serve, install) = (
+            pos("service uninstall"),
+            pos("serve "),
+            pos("service install"),
+        );
+        assert!(
+            stop < serve && serve < install && install.is_some(),
+            "{calls:?}"
+        );
+    }
+    #[test]
     fn sandbox_targets_load_and_keep_old_shapes_on_disk() {
         let old: SshTarget =
             serde_json::from_str(r#"{"target":"x","port":null,"remotePort":3774,"codespace":"x"}"#)
@@ -1919,7 +2133,7 @@ mod tests {
     #[test]
     fn sandbox_bootstrap_has_the_codespace_flags_and_an_optional_prelude() {
         let plain = sandbox_bootstrap_script(None);
-        assert_eq!(plain, codespace_bootstrap_script());
+        assert_ne!(plain, codespace_bootstrap_script());
         assert!(plain.starts_with("MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n"));
         let with = sandbox_bootstrap_script(Some("export X=1"));
         assert!(with.starts_with("export X=1\nMONOCODE_HOST_TRACK_TOKEN=1\n"));

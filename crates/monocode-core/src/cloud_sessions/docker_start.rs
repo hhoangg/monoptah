@@ -41,6 +41,16 @@
 //!   piping stdin/stdout to the Host's loopback port, so it works in any image and needs no
 //!   socat inside the container.
 //! * Host port: the one the bootstrap reports (`connection-info`), 3774 by default.
+//! * Host process: a devcontainer can have `/run/systemd/system` although systemd is not PID 1,
+//!   and the released Host's `systemdBooted()` only checks that directory, so `service install`
+//!   would fail with "needs systemd user services and lingering". The sandbox bootstrap
+//!   ([`sandbox_bootstrap_script`]) therefore sets `MONOCODE_HOST_DETACHED=1`: it starts the Host
+//!   itself like `startDetached` (same data dir, port and `host.log`) before `service install`,
+//!   which then returns early because a Host answers. A restart (token or Claude path change) is
+//!   the template's `service uninstall`, which stops a detached Host too; the same start follows.
+//!   A real fix belongs in `host/service.ts` for a future Host release: `systemdBooted` should
+//!   also require PID 1 to be systemd (for example `/proc/1/comm` equal to `systemd`); the
+//!   bootstrap workaround can go once every supported Host has it.
 //!
 //! # Accepted trade-offs
 //!

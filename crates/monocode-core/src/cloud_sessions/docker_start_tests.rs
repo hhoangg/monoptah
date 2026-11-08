@@ -1052,7 +1052,9 @@ fn the_provision_script_has_no_secret_and_the_credential_is_stdin_only() {
     // The bootstrap text after the prelude is the sandbox bootstrap, codespace flags included.
     assert!(bootstrap
         .stdin
-        .contains("MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\nset -eu\n"));
+        .contains("MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n"));
+    assert!(bootstrap.stdin.contains("MONOCODE_HOST_DETACHED=1\n"));
+    assert!(bootstrap.stdin.contains("\nset -eu\n"));
 }
 
 #[test]
