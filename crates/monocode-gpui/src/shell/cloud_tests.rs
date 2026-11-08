@@ -3036,3 +3036,256 @@ fn a_recreated_container_archives_files_only_without_asking_and_says_so(cx: &mut
         .unwrap();
     assert_eq!(sbx.changes().len(), 1);
 }
+
+// ---- "RUN ON CLOUD" from the new-session composer ----
+
+/// A draft session of `local` listed in the shell, as the new-session composer shows it, with
+/// the project known to be a GitHub repository.
+fn add_draft(
+    shell: &mut Shell,
+    local: &str,
+    cx: &mut Context<Shell>,
+) -> (i64, Entity<crate::conversation::Conversation>) {
+    let summary = locked(&shell.store)
+        .unwrap()
+        .create("claude", local)
+        .unwrap();
+    let id = summary.id;
+    shell.github_projects.insert(local.to_owned(), true);
+    shell.add_loaded(summary, cx);
+    shell.sync_codespace_offers(cx);
+    (id, shell.sessions[&id].clone())
+}
+
+#[gpui::test]
+fn create_and_open_a_codespace_creates_it_queues_the_prompt_and_opens_the_start(
+    cx: &mut TestAppContext,
+) {
+    use crate::{cloud_start_view::StartPhase, conversation::cloud_target::CloudTarget};
+    let (window, gh, checkout, _svc) = start_fixture(cx);
+    let local = checkout.path().to_string_lossy().into_owned();
+    for args in [
+        vec!["symbolic-ref", "HEAD", "refs/heads/feature"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&local)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let (draft, chat) = window
+        .update(cx, |shell, _, cx| add_draft(shell, &local, cx))
+        .unwrap();
+    window
+        .update(cx, |_, _, cx| {
+            chat.update(cx, |chat, cx| {
+                assert!(chat.cloud_menu_choice("workspace:cloud-codespace", cx));
+                assert_eq!(chat.cloud_target(), Some(CloudTarget::Codespace));
+                chat.input
+                    .update(cx, |input, cx| input.set_text("fix the bug".into(), cx));
+                // The send button never provisions on its own.
+                assert!(chat.cloud_create_pending());
+                chat.create_cloud(cx);
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            let created = gh.calls();
+            assert!(
+                created.iter().any(|call| call.contains("--method POST")),
+                "{created:?}"
+            );
+            let (id, snapshot) = shell
+                .cloud_starts
+                .keys()
+                .filter_map(|id| Some((id, shell.cloud_start_snapshot(*id)?)))
+                .find(|(_, snapshot)| snapshot.record.codespace == "octo-new1")
+                .expect("a start was opened for the new codespace");
+            assert_ne!(*id, draft);
+            assert_eq!(snapshot.record.branch.as_deref(), Some("feature"));
+            assert_eq!(shell.workspace.active, Some(*id));
+            assert_eq!(snapshot.phase, StartPhase::Starting);
+            // The composer text is the first prompt of the new session, queued once.
+            assert_eq!(
+                monocode_core::cloud_sessions::queued_start_message(
+                    &locked(&shell.store).unwrap(),
+                    *id
+                )
+                .as_deref(),
+                Some("fix the bug")
+            );
+            assert_eq!(
+                shell.sessions[id].read(cx).cloud_queued(),
+                Some("fix the bug")
+            );
+            // The draft composer is spent: no target, no text.
+            let chat = chat.read(cx);
+            assert_eq!(chat.cloud_target(), None);
+            assert_eq!(chat.input.read(cx).content.as_ref(), "");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn create_and_open_docker_passes_the_config_and_branch_and_shows_a_refusal_inline(
+    cx: &mut TestAppContext,
+) {
+    use crate::conversation::cloud_target::{CloudCreate, CloudTarget};
+    use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
+    let (window, _, _) = crate::shell::tests::window(cx);
+    let seen: Arc<std::sync::Mutex<Vec<CloudCreate>>> = Arc::default();
+    let sink = seen.clone();
+    let (draft, chat) = window
+        .update(cx, |shell, _, cx| {
+            shell.cloud_create_hook = Some(Arc::new(move |request| {
+                sink.lock().unwrap().push(request.clone());
+                Err("Docker sandboxes are not available.".into())
+            }));
+            let out = add_draft(shell, "/work/widgets", cx);
+            let config = DockerProjectConfig {
+                repo_url: "https://github.com/octo/widgets.git".into(),
+                ..Default::default()
+            };
+            docker_config::save(&locked(&shell.store).unwrap(), "/work/widgets", &config).unwrap();
+            out
+        })
+        .unwrap();
+    let sessions = window
+        .update(cx, |shell, _, cx| {
+            chat.update(cx, |chat, cx| {
+                chat.cloud_menu_choice("workspace:cloud-docker", cx);
+                chat.input
+                    .update(cx, |input, cx| input.set_text("run tests".into(), cx));
+                chat.create_cloud(cx);
+            });
+            shell.sessions.len()
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let sent = seen.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].target, CloudTarget::DockerSandbox);
+    assert_eq!(sent[0].project, "/work/widgets");
+    assert!(sent[0].branch.starts_with("monoptah/"));
+    assert_eq!(sent[0].prompt.as_deref(), Some("run tests"));
+    assert_eq!(
+        sent[0].config.as_ref().unwrap().repo_url,
+        "https://github.com/octo/widgets.git"
+    );
+    window
+        .update(cx, |shell, _, cx| {
+            // Nothing was created: no new session, the draft keeps its text and the error.
+            assert_eq!(shell.sessions.len(), sessions);
+            assert!(shell.sessions.contains_key(&draft));
+            assert!(shell.cloud_starts.is_empty());
+            let chat = chat.read(cx);
+            assert_eq!(chat.input.read(cx).content.as_ref(), "run tests");
+            assert_eq!(chat.cloud_target(), Some(CloudTarget::DockerSandbox));
+            assert!(chat.cloud_create_pending());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_sandbox_start_is_marked_by_its_key_and_a_failed_one_is_not_tracked(cx: &mut TestAppContext) {
+    use crate::{cloud_start_view::StartPhase, conversation::cloud_target::CloudCreate};
+    let (window, _, checkout, svc) = start_fixture(cx);
+    let local = checkout.path().to_string_lossy().into_owned();
+    let (summary, mut record) = begin(&svc, &checkout);
+    record.codespace = String::new();
+    record.sandbox = Some("demo-1".into());
+    let mut failed = record.clone();
+    failed.error = Some("create timed out".into());
+    let ok = (summary.clone(), record.clone());
+    let bad = (summary.clone(), failed);
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let flag = fail_next.clone();
+    let seen: Arc<std::sync::Mutex<Vec<CloudCreate>>> = Arc::default();
+    let sink = seen.clone();
+    let (_, chat) = window
+        .update(cx, |shell, _, cx| {
+            shell.cloud_create_hook = Some(Arc::new(move |request| {
+                sink.lock().unwrap().push(request.clone());
+                Ok(if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    bad.clone()
+                } else {
+                    ok.clone()
+                })
+            }));
+            add_draft(shell, &local, cx)
+        })
+        .unwrap();
+    let create = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |_, _, cx| {
+                chat.update(cx, |chat, cx| {
+                    chat.cloud_menu_choice("workspace:cloud-codespace", cx);
+                    chat.input
+                        .update(cx, |input, cx| input.set_text("go".into(), cx));
+                    chat.create_cloud(cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+    };
+    create(cx);
+    window
+        .update(cx, |shell, _, _| {
+            let id = summary.id;
+            let snapshot = shell.cloud_start_snapshot(id).unwrap();
+            assert_eq!(snapshot.phase, StartPhase::Starting);
+            assert!(snapshot.running);
+            // Queued by the worker, before the session opened.
+            assert_eq!(
+                monocode_core::cloud_sessions::queued_start_message(
+                    &locked(&shell.store).unwrap(),
+                    id
+                )
+                .as_deref(),
+                Some("go")
+            );
+            // Start over.
+            shell.drop_cloud_start(id);
+            shell.cloud_marks.remove(&id);
+        })
+        .unwrap();
+    // Right after opening (before a refresh reads the store) the mark carries the sandbox key.
+    window
+        .update(cx, |shell, window, cx| {
+            shell.open_cloud_start(summary.clone(), record, window, cx);
+            let mark = &shell.cloud_marks[&summary.id];
+            assert_eq!(mark.codespace, "demo-1");
+            assert_eq!(
+                mark.kind,
+                monocode_core::cloud_sessions::CloudBackendKind::DockerSandbox
+            );
+            assert!(shell.cloud_states.contains_key("sbx:demo-1"));
+            shell.drop_cloud_start(summary.id);
+            shell.cloud_marks.remove(&summary.id);
+        })
+        .unwrap();
+    fail_next.store(true, std::sync::atomic::Ordering::Relaxed);
+    create(cx);
+    window
+        .update(cx, |shell, _, _| {
+            let snapshot = shell.cloud_start_snapshot(summary.id).unwrap();
+            assert_eq!(snapshot.phase, StartPhase::Failed);
+            assert!(!snapshot.running, "a failed start waits for Retry");
+        })
+        .unwrap();
+}

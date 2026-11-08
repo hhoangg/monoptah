@@ -6,6 +6,9 @@ mod btw;
 mod changes_shelf;
 #[cfg(test)]
 mod cloud_start_tests;
+pub(crate) mod cloud_target;
+#[cfg(test)]
+mod cloud_target_tests;
 mod commands;
 pub(crate) mod composer_features;
 mod composer_shelf;
@@ -153,6 +156,16 @@ pub(crate) struct Conversation {
     cloud_queued: Option<String>,
     /// The composer's own placeholder, kept while the cloud start puts its own there.
     cloud_placeholder: Option<SharedString>,
+    /// The shell says the project is a GitHub repository, so Codespace can be chosen.
+    cloud_offers_codespace: bool,
+    /// "RUN ON CLOUD": the target chosen in the Workspace menu, until it is created.
+    cloud_draft: Option<cloud_target::CloudDraft>,
+    /// Counts "Create and open" presses, so a late answer only applies to its own draft.
+    cloud_request_seq: u64,
+    /// The project's saved Docker config, read when the Workspace menu opens.
+    docker_config_cache: std::cell::RefCell<
+        Option<Option<monocode_core::cloud_sessions::docker_config::DockerProjectConfig>>,
+    >,
     _cloud_events: Subscription,
     remote_plans: remote_plans::State,
     store: Database,
@@ -743,6 +756,10 @@ impl Conversation {
             cloud_start: None,
             cloud_queued: None,
             cloud_placeholder: None,
+            cloud_offers_codespace: false,
+            cloud_draft: None,
+            cloud_request_seq: 0,
+            docker_config_cache: Default::default(),
             _cloud_events: cloud_events,
             remote_plans: remote_plans::State::default(),
         }
@@ -979,6 +996,11 @@ impl Conversation {
     /// preference: queued when it steers, steering when it queues.
     fn send_follow_up(&mut self, invert: bool, cx: &mut Context<Self>) {
         if self.refuse_while_saving_copy(cx) {
+            return;
+        }
+        if self.cloud_create_pending() {
+            self.status = cloud_target::CREATE_FIRST.into();
+            cx.notify();
             return;
         }
         if self.cloud_start_blocks() {
@@ -1968,6 +1990,9 @@ impl Conversation {
         cx.notify();
     }
     fn use_existing_worktree(&mut self, path: &str, cx: &mut Context<Self>) -> bool {
+        if self.cloud_creating() {
+            return false;
+        }
         if self.summary.has_messages && !self.settings.worktree_removed {
             return false;
         }
@@ -1976,6 +2001,7 @@ impl Conversation {
             != monocode_core::files::path_key(&self.summary.cwd))
         .then(|| path.to_owned());
         self.settings.new_worktree = false;
+        self.clear_cloud_target(cx);
         self.save_settings(cx);
         self.refresh_git(cx);
         true
@@ -2077,6 +2103,9 @@ impl Conversation {
     }
     fn menu_choice(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.git_action_choice(id, cx) {
+            return;
+        }
+        if self.cloud_menu_choice(id, cx) {
             return;
         }
         if let Some(choice) = id.strip_prefix("recent-model:") {
@@ -2548,6 +2577,8 @@ impl Conversation {
                 ("Switch account", items, 250., MenuStyle::Explorer)
             }
             ComposerMenu::Workspace => {
+                // The setup dialog may have saved a config since the last open.
+                self.forget_docker_config();
                 let picker = cx.new(|cx| {
                     GitPicker::new(
                         self.summary.cwd.clone().into(),
@@ -2571,37 +2602,36 @@ impl Conversation {
                     },
                 ));
                 let focus = picker.read(cx).focus(cx);
-                (
-                    "Workspace",
-                    vec![
-                        MenuItem::Header("Workspace".into()),
-                        MenuAction::new("workspace:current", "Current checkout")
-                            .icon("folder")
-                            .checked(
-                                !self.settings.new_worktree && self.settings.worktree_cwd.is_none(),
-                            )
-                            .into(),
-                        MenuAction::new("workspace:new", "New worktree")
-                            .icon("folder-tree")
-                            .checked(self.settings.new_worktree)
-                            .into(),
-                        MenuItem::Separator,
-                        MenuAction::new("workspace:existing", "Existing worktrees")
-                            .icon("folder-tree")
-                            .flyout(Flyout {
-                                view: picker.into(),
-                                width: 300.,
-                                padding: 0.,
-                                height: None,
-                                max_height: Some(320.),
-                                focus: Some(focus),
-                                surface: None,
-                            })
-                            .into(),
-                    ],
-                    240.,
-                    MenuStyle::Settings,
-                )
+                let mut items = vec![
+                    MenuItem::Header("Workspace".into()),
+                    MenuAction::new("workspace:current", "Current checkout")
+                        .icon("folder")
+                        .checked(
+                            self.cloud_draft.is_none()
+                                && !self.settings.new_worktree
+                                && self.settings.worktree_cwd.is_none(),
+                        )
+                        .into(),
+                    MenuAction::new("workspace:new", "New worktree")
+                        .icon("folder-tree")
+                        .checked(self.cloud_draft.is_none() && self.settings.new_worktree)
+                        .into(),
+                    MenuItem::Separator,
+                    MenuAction::new("workspace:existing", "Existing worktrees")
+                        .icon("folder-tree")
+                        .flyout(Flyout {
+                            view: picker.into(),
+                            width: 300.,
+                            padding: 0.,
+                            height: None,
+                            max_height: Some(320.),
+                            focus: Some(focus),
+                            surface: None,
+                        })
+                        .into(),
+                ];
+                items.extend(self.cloud_menu_items());
+                ("Workspace", items, 240., MenuStyle::Settings)
             }
             // Composer.tsx's plus menu with native mode and attachment actions.
             ComposerMenu::Add => {
@@ -3169,6 +3199,7 @@ impl Conversation {
                 runner.cached(crate::composer_runner::Runner::placement())
             }))
             .children(self.remote_notice(cx))
+            .children(self.cloud_target_row(cx))
             .child(self.workspace_bar(cx))
             .into_any_element()
     }
@@ -3242,27 +3273,37 @@ impl Conversation {
         let linked =
             self.git.as_ref().is_some_and(|s| s.linked) || self.settings.worktree_cwd.is_some();
         let new = draft && self.settings.new_worktree;
-        let label = if new {
+        let cloud_label = self.cloud_workspace_label();
+        let label: &'static str = if cloud_label.is_some() {
+            self.cloud_target()
+                .map_or("Codespace", |target| target.label())
+        } else if new {
             "New worktree"
         } else if linked {
             "Worktree"
         } else {
             "Current checkout"
         };
-        let enabled = !self.busy && !self.preparing_worktree && self.git.is_some();
+        let enabled =
+            !self.busy && !self.preparing_worktree && !self.cloud_creating() && self.git.is_some();
         // Still reading git is not unavailable: don't dim, then brighten.
         let dimmed = !enabled && (self.loaded || self.busy || self.preparing_worktree);
         let workspace = if draft {
             bar_trigger(
                 "composer-workspace",
-                if new || linked {
+                if cloud_label.is_some() {
+                    "cloud-upload"
+                } else if new || linked {
                     "folder-tree"
                 } else {
                     "folder"
                 },
                 label.into(),
             )
-            .aria_label(format!("Workspace {label}"))
+            .aria_label(format!(
+                "Workspace {}",
+                cloud_label.as_deref().unwrap_or(label)
+            ))
             .aria_expanded(self.menu_is(ComposerMenu::Workspace))
             .child(self.workspace_anchor.probe())
             .when(dimmed, |d| d.opacity(0.4))
@@ -3295,7 +3336,10 @@ impl Conversation {
                 .child(label)
                 .into_any_element()
         };
-        let branch = if new {
+        let cloud_base = self.cloud_base_label();
+        let branch = if let Some(base) = cloud_base.clone() {
+            Some(base)
+        } else if new {
             self.settings.worktree_base.clone().or(self.branch.clone())
         } else {
             self.branch.clone()
@@ -3331,14 +3375,20 @@ impl Conversation {
                     bar_trigger("composer-branch", "git-branch", label.clone().into())
                         .aria_label(format!(
                             "{} {label}",
-                            if new { "Worktree base" } else { "Branch" }
+                            if cloud_base.is_some() {
+                                "Cloud"
+                            } else if new {
+                                "Worktree base"
+                            } else {
+                                "Branch"
+                            }
                         ))
                         .aria_description(self.execution_cwd().to_owned())
                         .max_w(px(256.))
                         .child(self.branch_anchor.probe())
                         .when(dimmed, |d| d.opacity(0.4))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            if enabled {
+                            if enabled && this.cloud_draft.is_none() {
                                 this.open_git(
                                     if new { GitMode::Base } else { GitMode::Branch },
                                     window,
@@ -3457,7 +3507,9 @@ impl Conversation {
         let follow_up = (has_value && !draft)
             .then(|| self.follow_up_action(alternate, cx))
             .flatten();
+        let cloud_pending = self.cloud_create_pending();
         let enabled = !self.attaching
+            && !cloud_pending
             && (!self.preparing_worktree || self.busy || self.stopping)
             && (busy || (has_value && self.loaded))
             && (busy || !draft || (!self.busy && self.follow_ups.state.draft.is_none()));
@@ -3484,6 +3536,7 @@ impl Conversation {
             window.request_animation_frame();
         }
         crate::send_morph::button("send-or-stop", face, &frame, enabled)
+            .when(cloud_pending, |d| d.aria_label(cloud_target::CREATE_FIRST))
             // Holding ⌘ (Ctrl elsewhere) flips Queue and Steer; redraw so the
             // label rolls to it while the key is down.
             // Only ⌘'s own changes matter, and only while it changes the action.
@@ -4215,6 +4268,12 @@ fn pill_label(label: impl Into<SharedString>) -> impl IntoElement {
 /// The checked-out branch (or short detached commit) for `cwd`, read from the
 /// repository's HEAD, including linked worktrees whose `.git` is a file.
 pub(crate) fn git_branch(cwd: &Path) -> Option<String> {
+    git_head(cwd).map(|(name, _)| name)
+}
+
+/// HEAD of the repository of `cwd`: the branch name, or the short commit with `true` when
+/// detached.
+pub(crate) fn git_head(cwd: &Path) -> Option<(String, bool)> {
     let root = cwd.ancestors().find(|d| d.join(".git").exists())?;
     let dot = root.join(".git");
     let git = if dot.is_dir() {
@@ -4226,8 +4285,8 @@ pub(crate) fn git_branch(cwd: &Path) -> Option<String> {
     let head = std::fs::read_to_string(git.join("HEAD")).ok()?;
     let head = head.trim();
     Some(match head.strip_prefix("ref: refs/heads/") {
-        Some(branch) => branch.to_owned(),
-        None => head.chars().take(7).collect(),
+        Some(branch) => (branch.to_owned(), false),
+        None => (head.chars().take(7).collect(), true),
     })
 }
 

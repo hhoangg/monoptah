@@ -914,6 +914,7 @@ impl Shell {
             self.remote_marks.insert(*id, *activity);
         }
         self.github_projects.extend(snapshot.github);
+        self.sync_codespace_offers(cx);
         self.cloud_marks = snapshot.marks;
         self.cloud_states = snapshot.states;
         if changed {

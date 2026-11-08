@@ -9,6 +9,7 @@ mod classic_sidebar;
 mod classic_surface_tests;
 mod classic_surfaces;
 mod cloud;
+mod cloud_create;
 mod cloud_picker;
 mod cloud_start;
 #[cfg(test)]
@@ -727,6 +728,8 @@ pub(crate) struct Shell {
     /// A cloud session whose archive waits for its dialog (opened on the next render).
     cloud_archive_request: Vec<i64>,
     codespace_picker: Option<cloud_picker::Open>,
+    #[cfg(test)]
+    cloud_create_hook: Option<cloud_create::CreateHook>,
     _cloud_clock: gpui::Task<()>,
     sessions: HashMap<i64, Entity<Conversation>>,
     /// Sessions that run as their provider's CLI. A session is in exactly one of
@@ -1176,6 +1179,8 @@ impl Shell {
             cloud_starts: HashMap::new(),
             codespace_return: None,
             github_projects: HashMap::new(),
+            #[cfg(test)]
+            cloud_create_hook: None,
             cloud_archive_request: Vec::new(),
             codespace_picker: None,
             _cloud_clock: cloud_clock,
@@ -1557,6 +1562,12 @@ impl Shell {
             .insert(id, cx.new(|_| SessionMark::tab(summary.provider.clone())));
         let appearance = self.appearance(&summary.cwd);
         let worktree = self.session_worktrees.get(&id).cloned().flatten();
+        let offers = !summary.cwd.starts_with("remote://")
+            && self
+                .github_projects
+                .get(&summary.cwd)
+                .copied()
+                .unwrap_or(false);
         let view = cx.new(|cx| Conversation::new(summary, self.store.clone(), cx));
         view.update(cx, |view, cx| {
             // Events may arrive before the first asynchronous agent load. Seed
@@ -1566,6 +1577,7 @@ impl Shell {
             if let Some(bridge) = &self.app_bridge {
                 view.set_app_environment(bridge.environment(id));
             }
+            view.set_offers_codespace(offers, cx);
             view.set_project_appearance(appearance, cx);
             view.transcript.update(cx, |transcript, cx| {
                 transcript.apply_preferences(&self.workspace.preferences, cx)
@@ -1574,6 +1586,24 @@ impl Shell {
                 view.set_cloud_start(Some(start), cx);
             }
         });
+        self.observations.push(cx.subscribe(
+            &view,
+            move |this, _, event: &crate::conversation::cloud_target::CreateCloudSession, cx| {
+                this.create_cloud_session(id, event.0.clone(), cx)
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            |_, _, event: &crate::conversation::cloud_target::OpenDockerSetup, cx| {
+                let path = event.0.clone();
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.open_docker_dialog(path, window, cx)
+                    });
+                })
+                .detach();
+            },
+        ));
         self.observations.push(cx.subscribe(
             &view,
             move |_, _, event: &crate::cloud_start_view::CloudStartAction, cx| {

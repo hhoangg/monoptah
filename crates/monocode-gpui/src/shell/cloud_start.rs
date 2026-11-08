@@ -217,6 +217,9 @@ impl Shell {
         self.cloud_states
             .entry(cloud.key())
             .or_insert(CloudState::Unknown);
+        // A failed record (an ambiguous create) waits for the user's Retry: tracking it would
+        // run the start again, and with it another create, without a click.
+        let failed = record.is_failed();
         let mut view = CloudStartView::new(record);
         view.auto_opened = true;
         self.cloud_starts.insert(id, view);
@@ -225,7 +228,9 @@ impl Shell {
         self.order.insert(0, id);
         self.activate_session(id, window, cx);
         self.show_codespace_panel(id, window, cx);
-        self.track_cloud_start(id, cx);
+        if !failed {
+            self.track_cloud_start(id, cx);
+        }
         self.invalidate_chrome(cx);
         self.refresh_cloud(cx);
     }
