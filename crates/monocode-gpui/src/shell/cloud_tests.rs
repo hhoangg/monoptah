@@ -3097,7 +3097,7 @@ fn create_and_open_a_codespace_creates_it_queues_the_prompt_and_opens_the_start(
                 assert_eq!(chat.cloud_target(), Some(CloudTarget::Codespace));
                 chat.input
                     .update(cx, |input, cx| input.set_text("fix the bug".into(), cx));
-                // The send button never provisions on its own.
+                // Pending: sending (Enter or the button) creates; this test drives the same path.
                 assert!(chat.cloud_create_pending());
                 chat.create_cloud(cx);
             });

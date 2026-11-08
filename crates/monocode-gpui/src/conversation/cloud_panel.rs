@@ -1,8 +1,8 @@
 //! The cloud setup panel: once a cloud target is chosen in the Workspace menu it sits attached
 //! above the composer box, like the background-tasks panel. A header (cloud icon, title, billing
 //! note, collapse chevron) and one row per setting. A row shows its label and current value and
-//! opens a small menu to change it (or holds an inline field for a branch). The last row holds
-//! "Create and open". The values are this session's overrides of the project's saved defaults,
+//! opens a small menu to change it (or holds an inline field for a branch). Creating happens when
+//! the first prompt is sent, see `cloud_target.rs`. The values are this session's overrides of the project's saved defaults,
 //! see `cloud_target.rs`.
 use super::cloud_branches::CloudRefField;
 use super::cloud_target::*;
@@ -13,7 +13,7 @@ use monocode_core::codespaces;
 const ROW_HEIGHT: f32 = 38.;
 
 /// A plain text hover card.
-struct Tip(SharedString);
+pub(super) struct Tip(pub SharedString);
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -305,52 +305,6 @@ impl Conversation {
         let docker = draft.target == CloudTarget::DockerSandbox;
         let collapsed = draft.collapsed;
         let title = format!("Run on {}", draft.target.label());
-        let creating = draft.creating;
-        let created = draft.created.clone();
-        let locked_button = creating || created.is_some();
-        let create_tip: SharedString = if creating {
-            "Creating\u{2026}".into()
-        } else if let Some(name) = &created {
-            format!("Already created: {name}").into()
-        } else {
-            "Create and open".into()
-        };
-        // An icon button next to the collapse chevron. Its click is its own: it must not fold
-        // the panel through the header's handler.
-        let mut ink = floating_fill();
-        ink.a = 1.;
-        let create = div()
-            .id("cloud-target-create")
-            .debug_selector(|| "cloud-target-create".into())
-            .role(Role::Button)
-            .aria_label("Create and open")
-            .when(locked_button, |d| d.aria_description(create_tip.clone()))
-            .when(!locked_button, |d| d.focusable().tab_stop(true))
-            .size(px(22.))
-            .flex_shrink_0()
-            .rounded(px(6.))
-            .flex()
-            .items_center()
-            .justify_center()
-            // The primary fill and ink of `modal::primary_button`.
-            .bg(content(0.92))
-            .text_color(ink)
-            .tooltip({
-                let tip = create_tip.clone();
-                move |_, cx| cx.new(|_| Tip(tip.clone())).into()
-            })
-            .map(|d| {
-                if locked_button {
-                    d.opacity(0.4)
-                } else {
-                    d.cursor_pointer().hover(|s| s.bg(content(0.8)))
-                }
-            })
-            .child(icon("play", 12.).text_color(ink))
-            .on_click(cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.create_cloud(cx);
-            }));
         let header = div()
             .id("cloud-target-header")
             .debug_selector(|| "cloud-target-header".into())
@@ -391,7 +345,6 @@ impl Conversation {
                     .text_color(content(0.35))
                     .child(draft.target.billing_note()),
             )
-            .child(create)
             .child(
                 div()
                     .size(px(20.))

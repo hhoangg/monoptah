@@ -4,6 +4,7 @@ mod attachment_drop;
 mod background_tasks;
 mod btw;
 mod changes_shelf;
+mod cloud_start_panel;
 #[cfg(test)]
 mod cloud_start_tests;
 pub(crate) mod cloud_target;
@@ -157,6 +158,10 @@ pub(crate) struct Conversation {
     /// The codespace of this cloud session is starting (or failed to): the host is not loaded and
     /// sends are queued. Also kept once ready, for the status row.
     cloud_start: Option<Arc<crate::cloud_start_view::CloudStartSnapshot>>,
+    /// The start panel above the composer is folded to its header.
+    cloud_start_collapsed: bool,
+    /// Repaints the start panel's elapsed time once a second while the start runs.
+    cloud_start_clock: Option<gpui::Task<()>>,
     /// The message sent while the codespace started, until the session has sent it.
     cloud_queued: Option<String>,
     /// The composer's own placeholder, kept while the cloud start puts its own there.
@@ -231,6 +236,11 @@ pub(crate) struct Conversation {
     /// workflow or app API send reaches the same code with this false, and may not resume a
     /// Docker sandbox.
     pub(super) user_send: bool,
+    /// True while the Resume pill's own click runs: only that may resume with an empty prompt.
+    pub(super) resume_click: bool,
+    /// Every prompt `launch_prompt` was asked to send, for tests that count sends.
+    #[cfg(test)]
+    pub(super) launched: Vec<String>,
     notification_cancelled: bool,
     /// The store's saved-draft flag, until the conversation loads its own.
     pub(crate) draft_hint: bool,
@@ -704,6 +714,9 @@ impl Conversation {
             stopping: false,
             cloud_locked: false,
             user_send: false,
+            resume_click: false,
+            #[cfg(test)]
+            launched: Vec::new(),
             notification_cancelled: false,
             draft_hint: false,
             model: std::env::var(format!(
@@ -771,6 +784,8 @@ impl Conversation {
             summary,
             remote_state: remote::State::default(),
             cloud_start: None,
+            cloud_start_collapsed: false,
+            cloud_start_clock: None,
             cloud_queued: None,
             cloud_placeholder: None,
             cloud_offers_codespace: false,
@@ -1022,8 +1037,19 @@ impl Conversation {
             return;
         }
         if self.cloud_create_pending() {
-            self.status = cloud_target::CREATE_FIRST.into();
-            cx.notify();
+            // The first prompt creates the cloud resource; `create_cloud` ignores a press while
+            // one runs or after one exists, so Enter repeats and double clicks create once.
+            // Only the user's own submit creates (and bills) a resource: a Mono, the app API or a
+            // mobile send reaches here too and must not.
+            if !self.user_send {
+                let noun = self
+                    .cloud_target()
+                    .map_or("workspace", |target| target.noun());
+                self.status = format!("Choose Send to create the {noun}");
+                cx.notify();
+            } else if self.input.read(cx).has_message_text() {
+                self.create_cloud(cx);
+            }
             return;
         }
         if self.cloud_start_blocks() {
@@ -1036,6 +1062,9 @@ impl Conversation {
                 return;
             }
             self.queue_start_send(cx);
+            return;
+        }
+        if self.resume_for_user_send(cx) {
             return;
         }
         if self.is_remote() && self.remote_send_guard(cx) {
@@ -1194,6 +1223,8 @@ impl Conversation {
                 .is_some_and(|center| !center.read(cx).book.exists(kind, &self.settings.account.id))
     }
     fn launch_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        self.launched.push(prompt.clone());
         if self.stopping && self.is_remote() {
             // Local follow-ups are never delivered to a host: queueing here would lose the prompt.
             self.status =
@@ -3017,6 +3048,7 @@ impl Conversation {
             .child(self.changes_shelf(window, cx))
             .child(self.background_shelf(window, cx))
             .child(self.cloud_target_panel(window, cx))
+            .child(self.cloud_start_panel(cx))
             .child(self.message_queue(window, cx))
             .children(if self.is_remote() { None } else { self.auth_notice(cx) })
             .when(self.settings.worktree_removed,|d|d.child(div().mb_2().p_3().rounded_lg().border_1().border_color(content(0.1)).flex().items_center().gap_3().text_size(px(12.)).child(div().flex_1().child("Worktree deleted. Select a branch or worktree to continue this conversation.")).child(tool_pill("reattach-worktree","Select worktree").child("Select worktree").on_click(cx.listener(|this,_,window,cx|this.open_git(GitMode::Worktree,window,cx))))))
@@ -3120,7 +3152,6 @@ impl Conversation {
                     .child(self.completion.read(cx).composer_probe())
                     .child(self.btw_home.0.probe())
                     .child(composer_surface(radius))
-                    .children(self.cloud_progress_bar(radius))
                     .children(self.attachment_chips(cx))
                     .child(
                         div()
@@ -3256,71 +3287,6 @@ impl Conversation {
             .child(self.workspace_bar(cx))
             .into_any_element()
     }
-    /// The 2px bar along the top edge of the composer while the codespace starts. GPUI clips to
-    /// rectangles, so it stops short of the rounded corners.
-    fn cloud_progress_bar(&self, radius: f32) -> Option<AnyElement> {
-        let start = self.cloud_start.as_ref()?;
-        if start.phase != crate::cloud_start_view::StartPhase::Starting {
-            return None;
-        }
-        let fraction = start.progress();
-        Some(
-            div()
-                .id("composer-start-progress")
-                .debug_selector(|| "composer-start-progress".into())
-                .absolute()
-                .top_0()
-                .left(px(radius * 0.5))
-                .right(px(radius * 0.5))
-                .h(px(2.))
-                .child(
-                    div()
-                        .h_full()
-                        .w(gpui::relative(fraction))
-                        .rounded_full()
-                        .bg(warning_color()),
-                )
-                .into_any_element(),
-        )
-    }
-    /// The codespace phase on the context line: a dot and the step now running, or "Startup
-    /// failed". Gone once the codespace is ready. Opens the Codespace panel.
-    fn cloud_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let start = self.cloud_start.as_ref()?;
-        let (text, phase) = start.chip()?;
-        let title = start.title();
-        let failed = phase == crate::cloud_start_view::StartPhase::Failed;
-        Some(
-            div()
-                .id("composer-start-chip")
-                .debug_selector(|| "composer-start-chip".into())
-                .role(Role::Button)
-                .aria_label(format!("{title}: {text}"))
-                .cursor_pointer()
-                .flex_shrink_0()
-                .h(px(20.))
-                .px(px(8.))
-                .rounded_full()
-                .border_1()
-                .border_color(content(0.1))
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .text_size(px(12.))
-                .text_color(if failed { danger_color() } else { content(0.7) })
-                .hover(|s| s.bg(content(0.08)))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(crate::transcript::cloud_start::cloud_dot(failed))
-                .child(text)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.request_cloud_start_action(
-                        crate::cloud_start_view::StartAction::ShowPanel,
-                        cx,
-                    )
-                }))
-                .into_any_element(),
-        )
-    }
     fn workspace_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let draft = !self.summary.has_messages;
         let linked =
@@ -3451,7 +3417,6 @@ impl Conversation {
                         })),
                 )
             })
-            .children(self.cloud_chip(cx))
             .child(
                 div()
                     .ml_auto()
@@ -3560,17 +3525,25 @@ impl Conversation {
         let follow_up = (has_value && !draft)
             .then(|| self.follow_up_action(alternate, cx))
             .flatten();
-        let cloud_pending = self.cloud_create_pending();
-        let enabled = !self.attaching
-            && !cloud_pending
-            && (!self.preparing_worktree || self.busy || self.stopping)
-            && (busy || (has_value && self.loaded))
-            && (busy || !draft || (!self.busy && self.follow_ups.state.draft.is_none()));
+        // A stopped workspace turns Send into Resume, with or without a prompt.
+        let resume = if busy { None } else { self.cloud_resume_tip() };
+        let cloud_send = resume.clone().or_else(|| self.cloud_send_tip(has_value));
+        let enabled = if resume.is_some() {
+            !self.attaching && cloud_send.as_ref().is_some_and(|(_, usable)| *usable)
+        } else {
+            !self.attaching
+                && cloud_send.as_ref().is_none_or(|(_, usable)| *usable)
+                && (!self.preparing_worktree || self.busy || self.stopping)
+                && (busy || (has_value && self.loaded))
+                && (busy || !draft || (!self.busy && self.follow_ups.state.draft.is_none()))
+        };
         // Something to send grows the button into a pill naming the action;
         // empty or stopping, it rests as a square.
         let face = crate::send_morph::Face {
             label: if busy {
                 "Stop"
+            } else if resume.is_some() {
+                "Resume"
             } else if draft {
                 "Save draft"
             } else {
@@ -3578,7 +3551,7 @@ impl Conversation {
             },
             glyph: follow_up.map_or("send", |(_, glyph)| glyph),
             stop: busy,
-            expanded: !busy && has_value,
+            expanded: !busy && (has_value || resume.is_some()),
         };
         let frame = self.send_morph.borrow_mut().frame(
             face,
@@ -3589,7 +3562,10 @@ impl Conversation {
             window.request_animation_frame();
         }
         crate::send_morph::button("send-or-stop", face, &frame, enabled)
-            .when(cloud_pending, |d| d.aria_label(cloud_target::CREATE_FIRST))
+            .when_some(cloud_send, |d, (tip, _)| {
+                d.aria_label(tip.clone())
+                    .tooltip(move |_, cx| cx.new(|_| cloud_panel::Tip(tip.clone())).into())
+            })
             // Holding ⌘ (Ctrl elsewhere) flips Queue and Steer; redraw so the
             // label rolls to it while the key is down.
             // Only ⌘'s own changes matter, and only while it changes the action.
@@ -3620,7 +3596,12 @@ impl Conversation {
                     } else {
                         modifiers.control
                     };
+                    // The click is the user's own hand: it may resume a stopped workspace.
+                    this.user_send = true;
+                    this.resume_click = true;
                     this.send_follow_up(alternate, cx);
+                    this.resume_click = false;
+                    this.user_send = false;
                 }
             }))
     }

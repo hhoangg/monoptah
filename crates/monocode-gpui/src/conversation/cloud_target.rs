@@ -1,21 +1,18 @@
 //! "RUN ON CLOUD" in the new-session composer: a manual way to put a fresh session in a
 //! Codespace or a Docker Sandbox. Choosing a target in the Workspace menu does not create
-//! anything. "Create and open" asks the shell to (see `shell/cloud_create.rs`), which makes the
-//! session at once, queues the composer text as its first prompt and follows the start. Send
-//! never provisions on its own: while a target is chosen and nothing is created it is disabled.
+//! anything. Sending the first prompt (Enter or the Send button) asks the shell to (see
+//! `shell/cloud_create.rs`), which makes the resource and the session at once, queues the composer
+//! text as its first prompt and follows the start. With an empty prompt Send stays disabled.
 //!
 //! The project's saved Docker config is only the default. The panel (see `cloud_panel.rs`) lets
 //! the user override the size, lifetime, base branch, feature branch and Claude account of a
 //! sandbox, or the machine and branch of a codespace, for this session only: the overrides are
-//! applied to a copy of the config when "Create and open" is pressed and nothing is saved back.
+//! applied to a copy of the config when the prompt is sent and nothing is saved back.
 use super::cloud_branches::BranchList;
 use super::*;
 use crate::docker_dialog::model::AccountChoice;
 use monocode_core::cloud_sessions::docker_config::{self, DockerProjectConfig};
 use monocode_core::codespaces::MachineType;
-
-/// Shown as the hint and the send button's label while a cloud target waits for "Create and open".
-pub(crate) const CREATE_FIRST: &str = "Create and open first";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloudTarget {
@@ -27,6 +24,13 @@ impl CloudTarget {
         match self {
             Self::Codespace => "Codespace",
             Self::DockerSandbox => "Docker Sandbox",
+        }
+    }
+    /// The resource this target creates, as used in button copy.
+    pub(crate) fn noun(self) -> &'static str {
+        match self {
+            Self::Codespace => "codespace",
+            Self::DockerSandbox => "Docker sandbox",
         }
     }
     /// The muted billing note under the panel title.
@@ -84,7 +88,7 @@ pub(crate) fn size_label(cpus: u32, memory: &str) -> String {
     format!("{cpus} vCPU / {}", memory_label(memory))
 }
 
-/// What "Create and open" asks the shell for.
+/// What sending the first prompt asks the shell for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CloudCreate {
     pub target: CloudTarget,
@@ -102,7 +106,7 @@ pub(crate) struct CloudCreate {
     pub request_id: u64,
 }
 
-/// Emitted by "Create and open".
+/// Emitted when the first prompt is sent with a cloud target chosen.
 pub(crate) struct CreateCloudSession(pub CloudCreate);
 /// Emitted when the Docker Sandbox row is picked and the project has no saved config.
 pub(crate) struct OpenDockerSetup(pub String);
@@ -225,9 +229,27 @@ impl Conversation {
             .is_some_and(|draft| draft.creating)
     }
 
-    /// A cloud target is chosen and nothing is created yet: the send button stays disabled.
+    /// A cloud target is chosen: sending creates the resource instead of messaging locally.
     pub(crate) fn cloud_create_pending(&self) -> bool {
         self.cloud_draft.is_some()
+    }
+
+    /// The Send button's tooltip while a cloud target is chosen, and whether it is usable.
+    pub(super) fn cloud_send_tip(&self, has_value: bool) -> Option<(SharedString, bool)> {
+        let draft = self.cloud_draft.as_ref()?;
+        let noun = draft.target.noun();
+        Some(if draft.creating {
+            (format!("Creating {noun}\u{2026}").into(), false)
+        } else if let Some(name) = &draft.created {
+            (format!("Already created: {name}").into(), false)
+        } else if !has_value {
+            (
+                format!("Type a prompt to create the {noun} and send it").into(),
+                false,
+            )
+        } else {
+            (format!("Create {noun} and send").into(), true)
+        })
     }
 
     /// Whether the Workspace menu can offer a cloud target for this session.
@@ -561,7 +583,8 @@ impl Conversation {
             .then(|| format!("base {}", self.cloud_base()))
     }
 
-    /// "Create and open": asks the shell to create the resource and the session.
+    /// Sending with a cloud target chosen: asks the shell to create the resource and the session.
+    /// One request per press: a running or finished create ignores further presses.
     pub(crate) fn create_cloud(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = &self.cloud_draft else {
             return;
@@ -689,7 +712,7 @@ impl Conversation {
                     self.input
                         .update(cx, |input, cx| input.set_text(String::new(), cx));
                 }
-                // The resource exists: never offer a second "Create and open" for it.
+                // The resource exists: never create a second one for it.
                 self.cloud_draft = None;
             }
             Err(error) => {

@@ -56,43 +56,113 @@ fn the_placeholder_follows_the_start_and_is_restored_exactly(cx: &mut TestAppCon
         .unwrap();
 }
 
+fn draw(visual: &mut gpui::VisualTestContext) {
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+}
+
 #[gpui::test]
-fn the_chip_and_bar_show_while_starting_and_the_chip_turns_red_on_failure(cx: &mut TestAppContext) {
+fn the_composer_has_no_progress_bar_or_chip(cx: &mut TestAppContext) {
     let window = conversation(cx);
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-    let draw = |visual: &mut gpui::VisualTestContext| {
-        visual.run_until_parked();
-        visual.refresh().unwrap();
-    };
+    for start in [starting(2), failed(2, "boom"), ready(1000)] {
+        window
+            .update(visual, |view, _, cx| view.set_cloud_start(Some(start), cx))
+            .unwrap();
+        draw(visual);
+        assert!(visual.debug_bounds("composer-start-chip").is_none());
+        assert!(visual.debug_bounds("composer-start-progress").is_none());
+    }
+}
+
+#[gpui::test]
+fn the_start_panel_shows_the_phase_and_the_newest_log_line_and_hides_at_ready(
+    cx: &mut TestAppContext,
+) {
+    use crate::cloud_start_view::fixtures::as_sandbox;
+    let window = conversation(cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    draw(visual);
+    assert!(visual.debug_bounds("cloud-start-panel").is_none());
     window
         .update(visual, |view, _, cx| {
             view.set_cloud_start(Some(starting(2)), cx)
         })
         .unwrap();
     draw(visual);
-    assert!(visual.debug_bounds("composer-start-chip").is_some());
-    let bar = visual.debug_bounds("composer-start-progress").unwrap();
-    assert_eq!(bar.size.height, gpui::px(2.));
+    for id in [
+        "cloud-start-panel",
+        "cloud-start-panel-header",
+        "cloud-start-panel-title",
+        "cloud-start-panel-phase",
+        "cloud-start-panel-log",
+    ] {
+        assert!(visual.debug_bounds(id).is_some(), "{id}");
+    }
+    window
+        .update(visual, |view, _, _| {
+            let start = view.cloud_start.clone().unwrap();
+            assert_eq!(start.panel_title().as_deref(), Some("Starting codespace"));
+            assert_eq!(start.panel_subtitle(), Some("Building container"));
+            assert_eq!(start.latest_log(), Some("Setting up chromium ..."));
+        })
+        .unwrap();
+    // A new log line shows up live.
     window
         .update(visual, |view, _, cx| {
-            view.set_cloud_start(Some(failed(2, "boom")), cx)
+            let mut next = (*starting(2)).clone();
+            crate::cloud_start_view::push_log(&mut next.log, "Pulling image".into());
+            view.set_cloud_start(Some(Arc::new(next.clone())), cx);
+            assert_eq!(next.latest_log(), Some("Pulling image"));
+            assert_eq!(
+                view.cloud_start.as_ref().unwrap().latest_log(),
+                Some("Pulling image")
+            );
         })
         .unwrap();
     draw(visual);
-    assert!(visual.debug_bounds("composer-start-chip").is_some());
-    assert!(visual.debug_bounds("composer-start-progress").is_none());
+    assert!(visual.debug_bounds("cloud-start-panel-log").is_some());
+    // The sandbox words.
+    window
+        .update(visual, |view, _, cx| {
+            view.set_cloud_start(Some(as_sandbox(starting(0))), cx);
+            let start = view.cloud_start.clone().unwrap();
+            assert_eq!(start.panel_title().as_deref(), Some("Starting sandbox"));
+            assert_eq!(start.panel_subtitle(), Some("Creating sandbox"));
+        })
+        .unwrap();
+    // Folding the panel keeps the header and drops the log line.
+    let header = visual.debug_bounds("cloud-start-panel-header").unwrap();
+    visual.simulate_click(header.center(), Default::default());
+    draw(visual);
+    assert!(visual.debug_bounds("cloud-start-panel-header").is_some());
+    assert!(visual.debug_bounds("cloud-start-panel-log").is_none());
+    // Failed: the header stays (error tone, failure headline) with the actions in the chat.
+    window
+        .update(visual, |view, _, cx| {
+            view.set_cloud_start(Some(as_sandbox(failed(2, "boom"))), cx);
+            let start = view.cloud_start.clone().unwrap();
+            assert_eq!(
+                start.panel_title().as_deref(),
+                Some("Sandbox failed at Build container")
+            );
+            assert_eq!(start.panel_subtitle(), None);
+        })
+        .unwrap();
+    draw(visual);
+    assert!(visual.debug_bounds("cloud-start-panel").is_some());
+    // Ready: gone.
     window
         .update(visual, |view, _, cx| {
             view.set_cloud_start(Some(ready(1000)), cx)
         })
         .unwrap();
     draw(visual);
-    assert!(visual.debug_bounds("composer-start-chip").is_none());
-    assert!(visual.debug_bounds("composer-start-progress").is_none());
+    assert!(visual.debug_bounds("cloud-start-panel").is_none());
 }
 
 #[gpui::test]
-fn the_chip_opens_the_panel_and_the_transcript_actions_reach_the_shell(cx: &mut TestAppContext) {
+fn the_transcript_actions_reach_the_shell(cx: &mut TestAppContext) {
     let window = conversation(cx);
     let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let log = seen.clone();
@@ -108,16 +178,10 @@ fn the_chip_opens_the_panel_and_the_transcript_actions_reach_the_shell(cx: &mut 
             view.set_cloud_start(Some(failed(2, "boom")), cx)
         })
         .unwrap();
-    visual.run_until_parked();
-    visual.refresh().unwrap();
-    let chip = visual.debug_bounds("composer-start-chip").unwrap();
-    visual.simulate_click(chip.center(), Default::default());
+    draw(visual);
     let retry = visual.debug_bounds("cloud-start-retry").unwrap();
     visual.simulate_click(retry.center(), Default::default());
-    assert_eq!(
-        *seen.borrow(),
-        vec![StartAction::ShowPanel, StartAction::Retry]
-    );
+    assert_eq!(*seen.borrow(), vec![StartAction::Retry]);
 }
 
 #[gpui::test]

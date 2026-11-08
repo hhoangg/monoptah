@@ -12,6 +12,9 @@ pub(super) struct State {
     app_prompt_waiting: bool,
     app_draft_launched: bool,
     waking: bool,
+    /// The user sent a prompt while the workspace was stopped: it goes out once, when the
+    /// resume has connected. Cleared by a connection error (the text stays in the composer).
+    resume_send: bool,
     /// Stops the reconnect that is running (set by the Cancel button).
     wake_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     error: Option<String>,
@@ -93,8 +96,12 @@ impl Conversation {
                 .ok()
                 .and_then(|store| monocode_core::cloud_sessions::queued_start_message(&store, id));
         }
+        if self.cloud_start.is_none() && start.is_some() {
+            self.cloud_start_collapsed = false;
+        }
         self.cloud_start = start;
         self.sync_cloud_chrome(cx);
+        self.sync_cloud_start_clock(cx);
         cx.notify();
     }
     /// Shows the start in the transcript row and the composer (placeholder), which draw it.
@@ -150,6 +157,7 @@ impl Conversation {
         self.review.update(cx, |review, cx| review.set_cwd(cwd, cx));
         self.cloud_start = Some(ready);
         self.sync_cloud_chrome(cx);
+        self.sync_cloud_start_clock(cx);
         if self.cloud_queued.is_some() {
             self.remote_state.app_prompt_waiting = true;
         }
@@ -229,6 +237,7 @@ impl Conversation {
             .map(|cloud| cloud.noun())
     }
     pub(crate) fn remote_connection_error(&mut self, error: &str, cx: &mut Context<Self>) {
+        self.remote_state.resume_send = false;
         if self.is_remote() && !self.busy {
             self.remote_state.online = false;
             self.remote_state.error = Some(error.into());
@@ -285,12 +294,16 @@ impl Conversation {
             let _ = this.update(cx, |this, cx| {
                 this.remote_state.waking = false;
                 this.remote_state.wake_cancel = None;
+                if !matches!(result, Ok(true)) {
+                    this.remote_state.resume_send = false;
+                }
                 match result {
                     Ok(true) => {
                         this.remote_state.error = None;
                         this.cloud_stopped = false;
                         cx.emit(CloudResumed);
                         this.load_remote(cx);
+                        this.send_after_resume(false, cx);
                     }
                     Ok(false) => this.remote_connection_error(
                         &format!("This {noun} is unavailable. It may have been deleted."),
@@ -479,6 +492,7 @@ impl Conversation {
                             this.run_history_actions(cx);
                         }
                         this.finish_app_prompt(cx);
+                        this.send_after_resume(running, cx);
                         if initial {
                             let known = this.remote_state.snapshot.clone();
                             this.recover_unsent_app_prompt(known.as_ref(), cx);
@@ -543,9 +557,22 @@ impl Conversation {
                 cx.notify();
                 return true;
             }
-            if unreachable && self.reconnect_cloud(self.user_send, cx) {
+            let typed = self.input.read(cx).has_message_text();
+            if unreachable && self.remote_state.resume_send {
+                // A resume already carries this prompt: a second Enter starts nothing.
+                cx.notify();
+                return true;
+            }
+            // Only a typed prompt from the user's own hand wakes a workspace from here.
+            if unreachable && (typed || !self.user_send) && self.reconnect_cloud(self.user_send, cx)
+            {
                 let noun = self.cloud_noun().unwrap_or("codespace");
-                self.status = format!("Reconnecting the {noun}. Send again when it is ready.");
+                self.remote_state.resume_send = self.user_send && typed;
+                self.status = if self.remote_state.resume_send {
+                    format!("Reconnecting the {noun}. Your message is sent when it is ready.")
+                } else {
+                    format!("Reconnecting the {noun}...")
+                };
                 cx.notify();
                 return true;
             }
@@ -764,6 +791,70 @@ impl Conversation {
             && !self.remote_state.pending
             && self.cloud_noun() == Some("sandbox")
     }
+    /// Sends the prompt typed while the workspace was stopped, once, now that the resume has
+    /// connected and the history is loaded. The text stays in the composer until then. A turn
+    /// that is already running (attached by the load) keeps the prompt in the composer instead.
+    /// The flag never outlives this call once the history is loaded.
+    fn send_after_resume(&mut self, running: bool, cx: &mut Context<Self>) {
+        if !self.remote_state.resume_send || !self.loaded || !self.remote_state.online {
+            return;
+        }
+        self.remote_state.resume_send = false;
+        if self.cloud_stopped || !self.input.read(cx).has_message_text() {
+            return;
+        }
+        if running || self.busy || self.stopping {
+            self.status =
+                "This session is already running. Your message is still in the composer.".into();
+            cx.notify();
+            return;
+        }
+        // Not a user send: the workspace is up, so no resume is involved any more.
+        self.send_follow_up(false, cx);
+    }
+    /// A send while the workspace is known to be stopped. The user's own submit with a prompt
+    /// resumes it and sends the prompt once connected; clicking the Resume pill resumes without
+    /// one. Enter on an empty composer never resumes. A Mono or the app API never resumes: a
+    /// sandbox says it is stopped, a codespace keeps its existing path.
+    pub(super) fn resume_for_user_send(&mut self, cx: &mut Context<Self>) -> bool {
+        if !(self.cloud_stopped && self.is_cloud_session() && self.is_remote()) {
+            return false;
+        }
+        if !self.user_send {
+            if self.cloud_noun() == Some("sandbox") {
+                self.status = SANDBOX_STOPPED.into();
+                cx.notify();
+                return true;
+            }
+            return false;
+        }
+        let typed = self.input.read(cx).has_message_text();
+        if !typed && !self.resume_click {
+            if !self.attachments.is_empty() {
+                self.status = "Attachments need a prompt to be sent. Write a message first.".into();
+                cx.notify();
+            }
+            return true;
+        }
+        if self.remote_state.waking || self.remote_state.resume_send {
+            return true;
+        }
+        self.remote_state.resume_send = typed;
+        self.reconnect_cloud(true, cx);
+        true
+    }
+    /// The Send button while the workspace is stopped: its tooltip and whether it can be used.
+    pub(super) fn cloud_resume_tip(&self) -> Option<(SharedString, bool)> {
+        if !(self.cloud_stopped && self.is_remote() && self.is_cloud_session()) {
+            return None;
+        }
+        let noun = self.cloud_noun().unwrap_or("codespace");
+        Some(if self.remote_state.waking {
+            (format!("Resuming {noun}\u{2026}").into(), false)
+        } else {
+            (format!("Resume {noun} and send").into(), true)
+        })
+    }
     /// The shell tells whether its cached state of this session's workspace is Stopped.
     pub(crate) fn set_cloud_stopped(&mut self, stopped: bool, cx: &mut Context<Self>) {
         if self.cloud_stopped != stopped {
@@ -813,10 +904,14 @@ impl Conversation {
                     cx.listener(move |this, _, _, cx| this.request_cloud_start_action(action, cx)),
                 )
         };
-        Some(div().mx_2().my_2().p_3().rounded_lg().bg(content(0.04)).flex().items_center().gap_2()
-            .child(div().flex_1().text_size(px(12.)).child(if let Some(error) = legacy {error.to_owned()} else if self.remote_state.pending {"A remote command needs confirmation. Retry uses its original command ID.".to_owned()} else if reconnecting {self.status.clone()} else if stopped {format!("{} stopped", match self.cloud_noun() {Some("sandbox") => "Sandbox", _ => "Codespace"})} else {self.remote_state.error.clone().unwrap_or_default()}))
-            .when(stopped && !reconnecting, |d| d
-            .child(crate::settings::widgets::secondary_button("cloud-resume","Resume",false,false).debug_selector(|| "cloud-resume".into()).child("Resume").on_click(cx.listener(|this,_,_,cx| { this.reconnect_cloud(true, cx); }))))
+        let compact = stopped;
+        Some(div().mx_2().my_2().rounded_lg().bg(content(0.04)).flex().items_center().gap_2().when(compact, |d| d.my_1().px_3().py_1().h(px(34.))).when(!compact, |d| d.p_3())
+            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(if let Some(error) = legacy {error.to_owned()} else if self.remote_state.pending {"A remote command needs confirmation. Retry uses its original command ID.".to_owned()} else if stopped {format!("{} stopped", match self.cloud_noun() {Some("sandbox") => "Sandbox", _ => "Codespace"})} else {self.remote_state.error.clone().unwrap_or_default()}))
+            .when(stopped, |d| {
+                let waking = self.remote_state.waking;
+                let label = if waking { "Resuming\u{2026}" } else { "Resume" };
+                d.child(crate::settings::widgets::secondary_button("cloud-resume",label,false,waking).debug_selector(|| "cloud-resume".into()).child(label).on_click(cx.listener(|this,_,_,cx| { if !this.remote_state.waking { this.reconnect_cloud(true, cx); } })))
+            })
             .when(dead, |d| d
                 .child(action("remote-archive-session", "Archive session", crate::cloud_start_view::StartAction::ArchiveSession, cx))
                 .child(action("remote-new-session", "New session", crate::cloud_start_view::StartAction::NewSession, cx)))

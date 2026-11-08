@@ -1,6 +1,6 @@
 //! What the UI knows about a cloud session whose codespace (or Docker sandbox) is starting.
 //! The shell owns the state and publishes an immutable [`CloudStartSnapshot`] to the
-//! conversation (composer chip, transcript status row) and to the Codespace panel.
+//! conversation (start panel above the composer, transcript status row) and to the Codespace panel.
 use monocode_core::cloud_sessions::{CloudBackendKind, StartRecord, Step, StepKind, StepStatus};
 use std::sync::Arc;
 
@@ -114,37 +114,31 @@ impl CloudStartSnapshot {
         }
     }
 
-    /// The composer's phase chip: its text and tone. `None` once the codespace is ready.
-    pub(crate) fn chip(&self) -> Option<(String, StartPhase)> {
+    /// The title of the start panel above the composer: "Starting sandbox" while it runs, the
+    /// failure headline once it failed. `None` when ready.
+    pub(crate) fn panel_title(&self) -> Option<String> {
         match self.phase {
-            StartPhase::Starting => Some((
-                self.running_label()
-                    .map_or_else(|| format!("Starting {}", self.noun()), str::to_owned),
-                StartPhase::Starting,
-            )),
-            StartPhase::Failed => Some(("Startup failed".into(), StartPhase::Failed)),
+            StartPhase::Starting => Some(format!("Starting {}", self.noun())),
+            StartPhase::Failed => Some(self.headline()),
             StartPhase::Ready => None,
         }
     }
 
-    /// How far along the start is, from 0 to under 1. Counts the steps that block `Ready` (a
-    /// finished or skipped one fully, the running one by half) out of one more than there are,
-    /// so the bar never fills before the codespace is ready. Steps only move forward, so the
-    /// fraction only grows within a start.
-    pub(crate) fn progress(&self) -> f32 {
-        let blocking: Vec<_> = StepKind::ALL
+    /// The running phase shown next to the panel title ("Building container").
+    pub(crate) fn panel_subtitle(&self) -> Option<&'static str> {
+        match self.phase {
+            StartPhase::Starting => self.running_label(),
+            _ => None,
+        }
+    }
+
+    /// The newest non-empty log line, which the start panel shows live.
+    pub(crate) fn latest_log(&self) -> Option<&str> {
+        self.log
             .iter()
-            .filter(|k| **k != StepKind::LifecycleCommands)
-            .collect();
-        let credit: f32 = blocking
-            .iter()
-            .map(|k| match self.record.step(**k).status {
-                StepStatus::Done | StepStatus::Skipped => 1.,
-                StepStatus::Running => 0.5,
-                StepStatus::Pending | StepStatus::Failed => 0.,
-            })
-            .sum();
-        (credit / (blocking.len() as f32 + 1.)).clamp(0.03, 0.97)
+            .rev()
+            .map(|line| line.trim())
+            .find(|line| !line.is_empty())
     }
 
     /// The note under the queued message.
@@ -403,13 +397,11 @@ mod tests {
             as_sandbox(ready(554_000)).headline(),
             "Sandbox ready in 9m 14s"
         );
+        assert_eq!(first.panel_title().as_deref(), Some("Starting sandbox"));
+        assert_eq!(first.panel_subtitle(), Some("Creating sandbox"));
         assert_eq!(
-            first.chip(),
-            Some(("Creating sandbox".into(), StartPhase::Starting))
-        );
-        assert_eq!(
-            as_sandbox(failed(2, "boom")).chip(),
-            Some(("Startup failed".into(), StartPhase::Failed))
+            as_sandbox(failed(2, "boom")).panel_title().as_deref(),
+            Some("Sandbox failed at Build container")
         );
         assert_eq!(
             first.queued_note().as_deref(),
@@ -488,32 +480,21 @@ mod tests {
     }
 
     #[test]
-    fn progress_only_grows_and_stays_below_full_while_starting() {
-        let mut last = 0.;
-        for done in 0..StepKind::ALL.len() {
-            let fraction = starting(done).progress();
-            assert!(fraction >= last, "{done}: {fraction} < {last}");
-            assert!(fraction < 1., "{done}: {fraction}");
-            last = fraction;
-        }
-        // Every step that blocks Ready finished, the background one not started.
-        let mut nearly = (*starting(6)).clone();
-        nearly.record.steps[6].status = StepStatus::Done;
-        assert!(nearly.progress() < 1.);
-        assert!(nearly.progress() > 0.8);
-    }
-
-    #[test]
-    fn chip_follows_the_phase_and_is_gone_when_ready() {
+    fn the_start_panel_follows_the_phase_and_is_gone_when_ready() {
+        let running = starting(2);
+        assert_eq!(running.panel_title().as_deref(), Some("Starting codespace"));
+        assert_eq!(running.panel_subtitle(), Some("Building container"));
+        assert_eq!(running.latest_log(), Some("Setting up chromium ..."));
+        let failed = failed(2, "boom");
         assert_eq!(
-            starting(2).chip(),
-            Some(("Building container".into(), StartPhase::Starting))
+            failed.panel_title().as_deref(),
+            Some("Codespace failed at Build container")
         );
-        assert_eq!(
-            failed(2, "boom").chip(),
-            Some(("Startup failed".into(), StartPhase::Failed))
-        );
-        assert_eq!(ready(1000).chip(), None);
+        assert_eq!(failed.panel_subtitle(), None);
+        assert_eq!(ready(1000).panel_title(), None);
+        let mut noisy = (*starting(2)).clone();
+        noisy.log = Arc::new(vec!["first".into(), "  last  ".into(), "  ".into()]);
+        assert_eq!(noisy.latest_log(), Some("last"));
     }
 
     #[test]

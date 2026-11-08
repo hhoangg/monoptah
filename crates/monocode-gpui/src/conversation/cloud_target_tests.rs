@@ -169,7 +169,7 @@ fn choosing_a_target_changes_the_triggers_and_shows_the_cloud_row(cx: &mut TestA
         .unwrap();
     draw(visual);
     assert!(visual.debug_bounds("cloud-target-panel").is_some());
-    assert!(visual.debug_bounds("cloud-target-create").is_some());
+    assert!(visual.debug_bounds("cloud-target-create").is_none());
     window
         .update(visual, |view, _, cx| {
             // Local checkouts mean Local again.
@@ -182,25 +182,234 @@ fn choosing_a_target_changes_the_triggers_and_shows_the_cloud_row(cx: &mut TestA
     assert!(visual.debug_bounds("cloud-target-panel").is_none());
 }
 
+/// Presses Enter in the composer, as its own update; callers run `run_until_parked` for the subscription.
+fn press_enter(window: WindowHandle<Conversation>, cx: &mut impl gpui::AppContext) {
+    window
+        .update(cx, |view, _, cx| {
+            view.input.update(cx, |_, cx| cx.emit(input::Submitted))
+        })
+        .unwrap();
+}
+
+/// The composer's own send (Enter or the button), as opposed to a Mono or API send.
+fn user_send(view: &mut Conversation, cx: &mut Context<Conversation>) {
+    view.user_send = true;
+    view.send(cx);
+    view.user_send = false;
+}
+
+fn type_prompt(view: &Conversation, text: &str, cx: &mut Context<Conversation>) {
+    view.input
+        .update(cx, |input, cx| input.set_text(text.into(), cx));
+}
+
 #[gpui::test]
-fn send_is_disabled_until_the_session_is_created(cx: &mut TestAppContext) {
+fn enter_with_text_creates_once_and_sends_the_prompt_with_the_request(cx: &mut TestAppContext) {
     let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
     window
         .update(cx, |view, _, cx| {
             save_config(view);
             view.cloud_menu_choice("workspace:cloud-docker", cx);
-            view.input
-                .update(cx, |input, cx| input.set_text("fix it".into(), cx));
-            assert!(view.cloud_create_pending());
-            view.send(cx);
-            assert_eq!(view.status, CREATE_FIRST);
-            // Nothing was sent or taken from the composer.
-            assert_eq!(view.input.read(cx).content.as_ref(), "fix it");
-            assert!(!view.busy);
-            view.clear_cloud_target(cx);
-            assert!(!view.cloud_create_pending());
+            type_prompt(view, "  fix it  ", cx);
         })
         .unwrap();
+    press_enter(window, cx);
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| assert!(view.cloud_creating()))
+        .unwrap();
+    // Enter auto-repeat and Enter plus click: still one request.
+    press_enter(window, cx);
+    cx.run_until_parked();
+    press_enter(window, cx);
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            user_send(view, cx);
+            // Nothing was sent locally and the composer text stays until the answer.
+            assert!(!view.busy);
+            assert_eq!(view.input.read(cx).content.as_ref(), "  fix it  ");
+        })
+        .unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].prompt.as_deref(), Some("fix it"));
+    assert_eq!(requests[0].target, CloudTarget::DockerSandbox);
+}
+
+#[gpui::test]
+fn the_send_button_creates_once_and_a_double_click_does_not_repeat(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            type_prompt(view, "fix it", cx);
+        })
+        .unwrap();
+    draw(visual);
+    let send = visual.debug_bounds("send-or-stop").unwrap();
+    visual.simulate_click(send.center(), Default::default());
+    draw(visual);
+    visual.simulate_click(send.center(), Default::default());
+    visual.simulate_click(send.center(), Default::default());
+    draw(visual);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        requests.lock().unwrap()[0].prompt.as_deref(),
+        Some("fix it")
+    );
+}
+
+#[gpui::test]
+fn send_with_an_empty_prompt_is_disabled_and_names_the_noun(cx: &mut TestAppContext) {
+    let repo = temp_repo("ref: refs/heads/main\n");
+    let window = conversation(cx, &repo, false);
+    let requests = watch(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.set_offers_codespace(true, cx);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            let tip = |view: &Conversation, has_value| view.cloud_send_tip(has_value);
+            let (text, usable) = tip(view, false).unwrap();
+            assert_eq!(
+                text.as_ref(),
+                "Type a prompt to create the Docker sandbox and send it"
+            );
+            assert!(!usable);
+            let (text, usable) = tip(view, true).unwrap();
+            assert_eq!(text.as_ref(), "Create Docker sandbox and send");
+            assert!(usable);
+            // Whitespace is empty, and Enter on it creates nothing.
+            type_prompt(view, "   ", cx);
+            user_send(view, cx);
+            assert!(!view.cloud_creating());
+            view.clear_cloud_target(cx);
+            view.cloud_menu_choice("workspace:cloud-codespace", cx);
+            let (text, _) = tip(view, true).unwrap();
+            assert_eq!(text.as_ref(), "Create codespace and send");
+            let (text, _) = tip(view, false).unwrap();
+            assert_eq!(
+                text.as_ref(),
+                "Type a prompt to create the codespace and send it"
+            );
+        })
+        .unwrap();
+    draw(visual);
+    let send = visual.debug_bounds("send-or-stop").unwrap();
+    visual.simulate_click(send.center(), Default::default());
+    draw(visual);
+    assert!(requests.lock().unwrap().is_empty());
+    window
+        .update(visual, |view, _, cx| {
+            type_prompt(view, "go", cx);
+            user_send(view, cx);
+            let (text, usable) = view.cloud_send_tip(true).unwrap();
+            assert_eq!(text.as_ref(), "Creating codespace\u{2026}");
+            assert!(!usable);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_failed_create_keeps_the_text_and_shows_the_error_then_send_works_again(
+    cx: &mut TestAppContext,
+) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            type_prompt(view, "fix it", cx);
+        })
+        .unwrap();
+    press_enter(window, visual);
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, cx| {
+            let id = view.cloud_draft.as_ref().unwrap().request;
+            view.cloud_create_finished(id, Err("Docker refused".into()), cx);
+            assert_eq!(view.input.read(cx).content.as_ref(), "fix it");
+            assert!(!view.cloud_creating());
+        })
+        .unwrap();
+    draw(visual);
+    assert!(visual.debug_bounds("cloud-target-error").is_some());
+    press_enter(window, visual);
+    visual.run_until_parked();
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[gpui::test]
+fn a_validation_error_from_send_is_inline_and_asks_for_nothing(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            set_text(view, |d| d.branch.clone(), "", cx);
+            type_prompt(view, "fix it", cx);
+        })
+        .unwrap();
+    press_enter(window, cx);
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            assert!(view.cloud_draft.as_ref().unwrap().error.is_some());
+            assert_eq!(view.input.read(cx).content.as_ref(), "fix it");
+        })
+        .unwrap();
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn attachments_make_send_show_the_inline_error(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            view.attachments.push("/tmp/a.png".into());
+            type_prompt(view, "fix it", cx);
+        })
+        .unwrap();
+    press_enter(window, cx);
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| {
+            let error = view.cloud_draft.as_ref().unwrap().error.clone().unwrap();
+            assert!(error.starts_with("Attachments cannot be queued"));
+        })
+        .unwrap();
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn the_local_target_still_sends_normally(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            assert!(!view.cloud_create_pending());
+            assert!(view.cloud_send_tip(true).is_none());
+            type_prompt(view, "hello", cx);
+        })
+        .unwrap();
+    press_enter(window, cx);
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, _| assert!(!view.cloud_creating()))
+        .unwrap();
+    assert!(requests.lock().unwrap().is_empty());
 }
 
 #[gpui::test]
@@ -304,7 +513,7 @@ fn temp_repo(head: &str) -> String {
     dir.to_string_lossy().into_owned()
 }
 
-/// Requests sent by "Create and open" on `window`.
+/// Create requests sent by the first prompt on `window`.
 fn watch(
     window: WindowHandle<Conversation>,
     cx: &mut TestAppContext,
@@ -773,7 +982,6 @@ fn the_panel_has_a_row_per_setting_and_a_collapse_chevron(cx: &mut TestAppContex
         "cloud-row-runtime",
         "cloud-row-base",
         "cloud-row-branch",
-        "cloud-target-create",
     ] {
         assert!(visual.debug_bounds(id).is_some(), "{id}");
     }
@@ -806,9 +1014,7 @@ fn the_panel_has_a_row_per_setting_and_a_collapse_chevron(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn create_and_open_and_the_error_stay_visible_while_the_panel_is_collapsed(
-    cx: &mut TestAppContext,
-) {
+fn the_error_from_a_send_stays_visible_while_the_panel_is_collapsed(cx: &mut TestAppContext) {
     let window = conversation(cx, PROJECT, false);
     let requests = watch(window, cx);
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
@@ -821,6 +1027,7 @@ fn create_and_open_and_the_error_stay_visible_while_the_panel_is_collapsed(
             save_config(view);
             view.cloud_menu_choice("workspace:cloud-docker", cx);
             set_text(view, |d| d.branch.clone(), "", cx);
+            type_prompt(view, "fix it", cx);
         })
         .unwrap();
     draw(visual);
@@ -828,10 +1035,8 @@ fn create_and_open_and_the_error_stay_visible_while_the_panel_is_collapsed(
     visual.simulate_click(header.center(), Default::default());
     draw(visual);
     assert!(visual.debug_bounds("cloud-row-compute").is_none());
-    let create = visual
-        .debug_bounds("cloud-target-create")
-        .expect("the Create button lives in the header, so it stays while collapsed");
-    visual.simulate_click(create.center(), Default::default());
+    let send = visual.debug_bounds("send-or-stop").unwrap();
+    visual.simulate_click(send.center(), Default::default());
     draw(visual);
     assert!(visual.debug_bounds("cloud-target-error").is_some());
     assert!(requests.lock().unwrap().is_empty());
@@ -958,55 +1163,7 @@ fn each_setting_menu_anchors_to_the_value_of_the_clicked_row(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn create_and_open_from_the_header_button_does_not_fold_the_panel(cx: &mut TestAppContext) {
-    let window = conversation(cx, PROJECT, false);
-    let requests = watch(window, cx);
-    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-    window
-        .update(visual, |view, _, cx| {
-            save_config(view);
-            view.cloud_menu_choice("workspace:cloud-docker", cx);
-        })
-        .unwrap();
-    draw(visual);
-    // The button sits in the header, to the left of the collapse chevron, and no bottom row is left.
-    let header = visual.debug_bounds("cloud-target-header").unwrap();
-    let create = visual.debug_bounds("cloud-target-create").unwrap();
-    assert!(header.contains(&create.center()));
-    assert!(right_edge(create) < right_edge(header));
-    assert!(visual.debug_bounds("cloud-target-actions").is_none());
-    visual.simulate_click(create.center(), Default::default());
-    draw(visual);
-    assert_eq!(requests.lock().unwrap().len(), 1);
-    window
-        .update(visual, |view, _, _| {
-            let draft = view.cloud_draft.as_ref().unwrap();
-            assert!(draft.creating);
-            assert!(!draft.collapsed, "the click must not reach the header");
-        })
-        .unwrap();
-    // Disabled while creating: another press asks for nothing and still does not fold.
-    visual.simulate_click(create.center(), Default::default());
-    draw(visual);
-    assert_eq!(requests.lock().unwrap().len(), 1);
-    window
-        .update(visual, |view, _, _| {
-            assert!(!view.cloud_draft.as_ref().unwrap().collapsed)
-        })
-        .unwrap();
-    // The chevron area of the header still folds it.
-    let chevron = gpui::point(header.right() - gpui::px(6.), header.center().y);
-    visual.simulate_click(chevron, Default::default());
-    draw(visual);
-    window
-        .update(visual, |view, _, _| {
-            assert!(view.cloud_draft.as_ref().unwrap().collapsed)
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn a_created_codespace_disables_the_header_button(cx: &mut TestAppContext) {
+fn a_created_codespace_disables_send(cx: &mut TestAppContext) {
     let repo = temp_repo("ref: refs/heads/main\n");
     let window = conversation(cx, &repo, false);
     let requests = watch(window, cx);
@@ -1025,9 +1182,19 @@ fn a_created_codespace_disables_the_header_button(cx: &mut TestAppContext) {
             assert!(view.cloud_draft.as_ref().unwrap().created.is_some());
         })
         .unwrap();
+    window
+        .update(visual, |view, _, cx| {
+            type_prompt(view, "again", cx);
+            let (tip, usable) = view.cloud_send_tip(true).unwrap();
+            assert!(tip.starts_with("Already created"));
+            assert!(!usable);
+        })
+        .unwrap();
     draw(visual);
-    let create = visual.debug_bounds("cloud-target-create").unwrap();
-    visual.simulate_click(create.center(), Default::default());
+    let send = visual.debug_bounds("send-or-stop").unwrap();
+    visual.simulate_click(send.center(), Default::default());
+    press_enter(window, visual);
+    visual.run_until_parked();
     draw(visual);
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
@@ -1583,4 +1750,25 @@ fn a_codespace_branch_starting_with_a_dash_is_refused(cx: &mut TestAppContext) {
             assert_eq!(view.cloud_ref_value(CloudRefField::Branch, cx), "v1.2.3");
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn sends_that_are_not_the_users_never_create_a_cloud_resource(cx: &mut TestAppContext) {
+    let window = conversation(cx, PROJECT, false);
+    let requests = watch(window, cx);
+    window
+        .update(cx, |view, _, cx| {
+            save_config(view);
+            view.cloud_menu_choice("workspace:cloud-docker", cx);
+            // The app API (`sessions.send`), Monos and mobile all end in `send`.
+            view.install_transfer(Default::default(), Some("from the API".into()), cx);
+            type_prompt(view, "from a Mono", cx);
+            view.send(cx);
+            assert!(!view.cloud_creating());
+            assert_eq!(view.status, "Choose Send to create the Docker sandbox");
+            assert_eq!(view.input.read(cx).content.as_ref(), "from a Mono");
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(requests.lock().unwrap().is_empty());
 }
