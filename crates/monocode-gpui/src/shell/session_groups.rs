@@ -521,6 +521,46 @@ impl Shell {
                     )
                     .into(),
                 );
+                if mark.kind == CloudBackendKind::Codespaces && !mark.codespace.is_empty() {
+                    // A start that has no name yet has nothing to stop. Only a codespace that
+                    // is (or may be) up offers it.
+                    let state = self
+                        .cloud_states
+                        .get(&mark.key())
+                        .copied()
+                        .unwrap_or(CloudState::Unknown);
+                    if matches!(
+                        state,
+                        CloudState::Available | CloudState::Starting | CloudState::Unknown
+                    ) {
+                        let target = mark.cloud();
+                        let others = self
+                            .cloud_marks
+                            .iter()
+                            .filter(|(other, m)| {
+                                **other != id
+                                    && !m.codespace.is_empty()
+                                    && m.cloud() == target
+                                    && !self
+                                        .session_summaries
+                                        .get(*other)
+                                        .is_some_and(|s| s.archived)
+                            })
+                            .count();
+                        let label = match others {
+                            0 => format!("Stop codespace {}", mark.codespace),
+                            1 => format!(
+                                "Stop codespace {} (also stops 1 other session)",
+                                mark.codespace
+                            ),
+                            n => format!(
+                                "Stop codespace {} (also stops {n} other sessions)",
+                                mark.codespace
+                            ),
+                        };
+                        items.push(MenuAction::new("codespace-stop-live", label).into());
+                    }
+                }
                 if mark.kind == CloudBackendKind::DockerSandbox {
                     let state = self.cloud_states.get(&mark.key()).copied();
                     let stopped = state == Some(CloudState::Stopped);
@@ -633,6 +673,17 @@ impl Shell {
             "codespace-restore" => self.restore_codespace_code(id, cx),
             "codespace-stop" => {
                 self.run_origin_codespace_action(id, cloud::ArchiveChoice::Stop, window, cx)
+            }
+            "codespace-stop-live" => {
+                let Some(mark) = self
+                    .cloud_marks
+                    .get(&id)
+                    .filter(|m| m.kind == CloudBackendKind::Codespaces)
+                else {
+                    return;
+                };
+                let target = mark.cloud();
+                self.run_workspace_action(target, cloud::ArchiveChoice::Stop, window, cx)
             }
             "codespace-delete" => {
                 self.run_origin_codespace_action(id, cloud::ArchiveChoice::Delete, window, cx)

@@ -735,11 +735,17 @@ impl CloudSessions {
                 snapshot = Some(read(machine.as_ref().ok_or_else(no_machine)?)?);
             }
         }
-        if files_only.is_some() {
-            warnings.push(if snapshot.is_some() {
-                "History may be incomplete: the sandbox's container was recreated or its Host could not be reached, so the conversation is whatever the Host still held.".to_string()
+        if let Some(target) = &files_only {
+            // A plain sandbox has no container to recreate: only its Host was unreachable.
+            let cause = if target.mode == crate::remote::SandboxMode::Plain {
+                "the sandbox's Host could not be reached"
             } else {
-                "History may be incomplete: the sandbox's container was recreated or its Host could not be reached, so the conversation could not be read and this copy has none. Only the files were saved.".to_string()
+                "the sandbox's container was recreated or its Host could not be reached"
+            };
+            warnings.push(if snapshot.is_some() {
+                format!("History may be incomplete: {cause}, so the conversation is whatever the Host still held.")
+            } else {
+                format!("History may be incomplete: {cause}, so the conversation could not be read and this copy has none. Only the files were saved.")
             });
         }
         // The session may run in its own host worktree: that is the tree to save.
@@ -795,8 +801,13 @@ impl CloudSessions {
                         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
             });
 
-        let pulled = if files_only.is_some() {
-            // `.evidence` is pulled through the container, which is what is gone.
+        let pulled = if let Some(target) = &files_only {
+            // `.evidence` is pulled through the Host's machine, which is what is gone.
+            let why = if target.mode == crate::remote::SandboxMode::Plain {
+                "it is read through the sandbox, which is unreachable"
+            } else {
+                "it is read through the container, which was recreated or is unreachable"
+            };
             EvidencePull {
                 session_id: cloud_id,
                 codespace: codespace.clone(),
@@ -804,10 +815,7 @@ impl CloudSessions {
                 local_dir: remote_thread.join(EVIDENCE_DIR),
                 files: vec![],
                 message: None,
-                warning: Some(
-                    "The evidence folder was not copied: it is read through the container, which was recreated or is unreachable."
-                        .into(),
-                ),
+                warning: Some(format!("The evidence folder was not copied: {why}.")),
             }
         } else {
             progress("Copying evidence");

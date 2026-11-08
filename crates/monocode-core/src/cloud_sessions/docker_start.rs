@@ -1052,13 +1052,16 @@ impl CloudSessions {
     /// script in the outer sandbox. A configured non-default devcontainer path that does not
     /// exist is an error; only the default lookup falls back to Plain.
     fn sandbox_mode_step(&self, run: &mut Run) -> Result<(), Stop> {
-        let start = run
+        let mut start = run
             .record
             .sandbox_start
             .clone()
             .ok_or("Missing sandbox data.")?;
         if start.mode.is_some() {
             return Ok(());
+        }
+        if start.container.is_none() {
+            self.refresh_devcontainer_path(run, &mut start);
         }
         let mode = if start.container.is_some() {
             SandboxMode::Container
@@ -1098,14 +1101,17 @@ impl CloudSessions {
                     run.record.start_step(StepKind::BuildContainer, self.now());
                     self.publish(run.record, run.events);
                     return Err(Stop::Failed(format!(
-                        "Dev container config ({}) not found in the repository. Fix the path in the sandbox setup, or clear it to run without a devcontainer.",
-                        config.unwrap_or_default()
+                        "Dev container config ({}) not found in the repository. Fix the path in the sandbox setup, or clear the devcontainer path there to run without a devcontainer.{}",
+                        config.unwrap_or_default(),
+                        self.repo_changed_note(run)
                     )));
                 }
                 _ => {
+                    run.record.start_step(StepKind::BuildContainer, self.now());
+                    self.publish(run.record, run.events);
                     return Err(Stop::Failed(
                         "Could not tell whether the repository has a devcontainer.".into(),
-                    ))
+                    ));
                 }
             }
         };
@@ -1128,6 +1134,49 @@ impl CloudSessions {
         }
         self.publish(run.record, run.events);
         Ok(())
+    }
+
+    /// The start keeps a snapshot of the project config, so a wrong devcontainer path fixed in
+    /// the sandbox setup would never reach a Retry. Before the mode is decided, take the
+    /// current path of the record's local project; everything else stays as snapshotted. A
+    /// missing or invalid project config keeps the snapshot.
+    fn refresh_devcontainer_path(&self, run: &mut Run, start: &mut SandboxStart) {
+        let current = self.store().ok().and_then(|store| {
+            super::docker_config::load(&store, &run.record.local_project)
+                .ok()
+                .flatten()
+        });
+        let Some(current) = current else { return };
+        // A project that now points at another repository must not feed this clone a path
+        // meant for that one.
+        if current.repo_url != start.config.repo_url
+            || current.devcontainer_path == start.config.devcontainer_path
+        {
+            return;
+        }
+        start.config.devcontainer_path = current.devcontainer_path.clone();
+        if let Some(stored) = run.record.sandbox_start.as_mut() {
+            stored.config.devcontainer_path = current.devcontainer_path;
+        }
+    }
+
+    /// Added to the "config not found" failure when the project's setup now names another
+    /// repository, so editing the path there can no longer help this start.
+    fn repo_changed_note(&self, run: &Run) -> &'static str {
+        let Some(start) = run.record.sandbox_start.as_ref() else {
+            return "";
+        };
+        let changed = self.store().ok().is_some_and(|store| {
+            super::docker_config::load(&store, &run.record.local_project)
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.repo_url != start.config.repo_url)
+        });
+        if changed {
+            " The project's repository changed since this session started; start a new session."
+        } else {
+            ""
+        }
     }
 
     /// Marks `kinds` as not run because the session has no devcontainer.

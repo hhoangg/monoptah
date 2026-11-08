@@ -828,7 +828,7 @@ fn guide_env() -> (tempfile::TempDir, tempfile::TempDir, String) {
     let home = tempfile::tempdir().unwrap();
     let ws = tempfile::tempdir().unwrap();
     git_init(ws.path());
-    let script = evidence_script(ws.path().to_str().unwrap());
+    let script = evidence_script(ws.path().to_str().unwrap(), CloudBackendKind::Codespaces);
     (home, ws, script)
 }
 
@@ -865,6 +865,52 @@ fn the_evidence_script_writes_a_local_guide_keeps_other_content_and_is_idempoten
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
+}
+
+/// The guide block of an evidence script, between its markers.
+fn guide_block(script: &str) -> &str {
+    let start = script.rfind("<!-- monoptah-evidence:begin -->").unwrap();
+    let end = script.rfind("<!-- monoptah-evidence:end -->").unwrap();
+    &script[start..end + "<!-- monoptah-evidence:end -->".len()]
+}
+
+#[test]
+fn the_codespace_guide_is_golden_and_the_sandbox_guide_differs_only_in_the_place() {
+    let codespace = guide_block(&evidence_script(
+        "/workspaces/w",
+        CloudBackendKind::Codespaces,
+    ))
+    .to_string();
+    assert_eq!(
+        codespace,
+        "<!-- monoptah-evidence:begin -->\n\
+         ## Evidence for the local user\n\
+         You run in a GitHub codespace. Save screenshots, test output and written reports that prove\n\
+         your work under `/workspaces/w/.evidence/` (create subfolders freely). That folder is excluded\n\
+         from git and is never committed. The user's Monoptah app copies it to their machine on request,\n\
+         so do not put secrets there. Mention the file names in your final message.\n\
+         The user can click a file path in the chat to view it.\n\
+         <!-- monoptah-evidence:end -->"
+    );
+    let sandbox = guide_block(&evidence_script(
+        "/workspaces/w",
+        CloudBackendKind::DockerSandbox,
+    ))
+    .to_string();
+    assert!(sandbox.contains("You run in a Docker sandbox. Save"));
+    assert_eq!(
+        sandbox.replace("a Docker sandbox", "a GitHub codespace"),
+        codespace
+    );
+    // Markers are shared, and the rest of the script is identical.
+    let a = evidence_script("/w", CloudBackendKind::Codespaces);
+    let b = evidence_script("/w", CloudBackendKind::DockerSandbox);
+    assert_eq!(a.replace("a GitHub codespace", "a Docker sandbox"), b);
+    assert!(
+        evidence_script_at("/home/u/w", CloudBackendKind::DockerSandbox)
+            .unwrap()
+            .contains("You run in a Docker sandbox.")
+    );
 }
 
 #[test]

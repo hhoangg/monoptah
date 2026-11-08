@@ -429,12 +429,14 @@ impl TranscriptView {
                             StartAction::Retry,
                             false,
                         ))
-                        .child(button(
-                            "cloud-start-rebuild",
-                            "Rebuild container".into(),
-                            StartAction::Rebuild,
-                            false,
-                        ))
+                        .when(start.offers_rebuild(), |d| {
+                            d.child(button(
+                                "cloud-start-rebuild",
+                                "Rebuild container".into(),
+                                StartAction::Rebuild,
+                                false,
+                            ))
+                        })
                         .when(start.offers_browser(), |d| {
                             d.child(button(
                                 "cloud-start-browser",
@@ -617,7 +619,7 @@ pub(crate) fn cloud_dot(failed: bool) -> gpui::AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cloud_start_view::fixtures::{as_sandbox, failed, ready, starting};
+    use crate::cloud_start_view::fixtures::{as_sandbox, failed, ready, starting, with_mode};
     use gpui::{TestAppContext, WindowHandle};
 
     fn row(role: &str, text: &str) -> Row {
@@ -737,6 +739,25 @@ mod tests {
             assert_eq!(seen.borrow().last(), Some(&action), "{id}");
         }
         assert!(visual.debug_bounds("cloud-queued-note").is_some());
+    }
+
+    #[gpui::test]
+    fn a_failed_plain_sandbox_row_has_no_rebuild_button(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let plain = with_mode(
+            failed(2, "git failed"),
+            Some(monocode_core::remote::SandboxMode::Plain),
+        );
+        window
+            .update(cx, |view, _, cx| {
+                view.set_cloud_start(Some(plain), Some("fix the bug".into()), cx)
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("cloud-start-retry").is_some());
+        assert!(visual.debug_bounds("cloud-start-rebuild").is_none());
     }
 
     #[gpui::test]

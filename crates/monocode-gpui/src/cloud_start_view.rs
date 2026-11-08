@@ -52,6 +52,12 @@ impl CloudStartSnapshot {
     pub(crate) fn offers_browser(&self) -> bool {
         self.backend() == CloudBackendKind::Codespaces
     }
+    /// Whether the container can be rebuilt. A sandbox decided Plain has no container to
+    /// rebuild; codespaces and container sandboxes keep the action.
+    pub(crate) fn offers_rebuild(&self) -> bool {
+        self.record.sandbox_start.as_ref().and_then(|s| s.mode)
+            != Some(monocode_core::remote::SandboxMode::Plain)
+    }
     /// The start is not over: sends are queued and the host is not loaded.
     pub(crate) fn blocks_session(&self) -> bool {
         self.phase != StartPhase::Ready
@@ -288,6 +294,27 @@ pub(crate) mod fixtures {
         Arc::new(snapshot)
     }
 
+    /// `snapshot` as a sandbox start whose mode was decided as `mode`.
+    pub(crate) fn with_mode(
+        snapshot: Arc<CloudStartSnapshot>,
+        mode: Option<monocode_core::remote::SandboxMode>,
+    ) -> Arc<CloudStartSnapshot> {
+        let mut snapshot = (*as_sandbox(snapshot)).clone();
+        snapshot.record.sandbox_start =
+            Some(monocode_core::cloud_sessions::docker_start::SandboxStart {
+                request_id: "req".into(),
+                config: Default::default(),
+                sandbox_id: None,
+                repo_dir: "widgets".into(),
+                workspace: None,
+                container: None,
+                mode,
+                relay_port: 0,
+                rebuild: false,
+            });
+        Arc::new(snapshot)
+    }
+
     pub(crate) fn starting(done: usize) -> Arc<CloudStartSnapshot> {
         Arc::new(CloudStartSnapshot {
             record: record(done),
@@ -404,6 +431,13 @@ mod tests {
         assert_eq!(first.title(), "Sandbox");
         assert_eq!(first.delete_label(), "Delete sandbox");
         assert!(!first.offers_browser(), "a sandbox has no web view");
+        assert!(first.offers_rebuild());
+        use monocode_core::remote::SandboxMode::{Container, Plain};
+        let failed_with = |mode| with_mode(failed(2, "x"), mode);
+        assert!(failed_with(None).offers_rebuild(), "mode not decided yet");
+        assert!(failed_with(Some(Container)).offers_rebuild());
+        assert!(!failed_with(Some(Plain)).offers_rebuild());
+        assert!(failed(2, "x").offers_rebuild(), "codespaces keep it");
         assert_eq!(
             as_sandbox(failed(2, "cargo fetch failed")).failure_message(),
             "cargo fetch failed The sandbox is kept, so a retry reuses it."

@@ -3290,3 +3290,251 @@ fn a_sandbox_start_is_marked_by_its_key_and_a_failed_one_is_not_tracked(cx: &mut
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn a_live_codespace_menu_stops_without_converting_and_hides_the_entry_when_stopped(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    // Stopped: no entry.
+    window
+        .update(cx, |shell, _, cx| {
+            let labels = menu_labels(shell, id, cx);
+            assert!(
+                !labels.iter().any(|l| l.starts_with("Stop codespace")),
+                "{labels:?}"
+            );
+            shell
+                .cloud_states
+                .insert("octo-abc".into(), CloudState::Available);
+            let labels = menu_labels(shell, id, cx);
+            assert!(
+                labels.contains(&"Stop codespace octo-abc".to_string()),
+                "{labels:?}"
+            );
+            shell
+                .cloud_states
+                .insert("octo-abc".into(), CloudState::Stopping);
+            let labels = menu_labels(shell, id, cx);
+            assert!(
+                !labels.iter().any(|l| l.starts_with("Stop codespace")),
+                "{labels:?}"
+            );
+            shell
+                .cloud_states
+                .insert("octo-abc".into(), CloudState::Available);
+        })
+        .unwrap();
+    window
+        .update(cx, |shell, window, cx| {
+            shell.run_session_menu(id, "codespace-stop-live", window, cx)
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert_eq!(gh.calls(), ["codespace stop -c octo-abc"]);
+    window
+        .update(visual, |shell, _, _| {
+            // No conversion: the session is still the cloud session and nothing is archived.
+            assert!(shell.is_cloud(id));
+            assert!(shell.cloud_archive.is_none());
+            assert!(archived_locals(shell).is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_shared_codespace_says_the_stop_also_stops_the_other_sessions(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell
+                .cloud_states
+                .insert("octo-abc".into(), CloudState::Available);
+            let other = id + 1000;
+            shell.cloud_marks.insert(
+                other,
+                CloudMark {
+                    local_project: "/work/monocode".into(),
+                    codespace: "octo-abc".into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            let labels = menu_labels(shell, id, cx);
+            assert!(
+                labels
+                    .contains(&"Stop codespace octo-abc (also stops 1 other session)".to_string()),
+                "{labels:?}"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_live_stop_entry_needs_a_named_codespace_in_a_running_state_and_counts_only_live_peers(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let has_stop = |shell: &Shell, cx: &App| {
+                menu_labels(shell, id, cx)
+                    .iter()
+                    .any(|l| l.starts_with("Stop codespace"))
+            };
+            for (state, shown) in [
+                (CloudState::Available, true),
+                (CloudState::Starting, true),
+                (CloudState::Unknown, true),
+                (CloudState::Stopped, false),
+                (CloudState::Stopping, false),
+                (CloudState::Unavailable, false),
+            ] {
+                shell.cloud_states.insert("octo-abc".into(), state);
+                assert_eq!(has_stop(shell, cx), shown, "{state:?}");
+            }
+            // An archived peer and a nameless start do not count as sessions to stop.
+            shell
+                .cloud_states
+                .insert("octo-abc".into(), CloudState::Available);
+            let archived = id + 1000;
+            let nameless = id + 1001;
+            for other in [archived, nameless] {
+                shell.cloud_marks.insert(
+                    other,
+                    CloudMark {
+                        local_project: "/work/monocode".into(),
+                        codespace: if other == nameless {
+                            String::new()
+                        } else {
+                            "octo-abc".into()
+                        },
+                        kind: CloudBackendKind::Codespaces,
+                    },
+                );
+            }
+            let mut summary = shell.session_summaries[&id].clone();
+            summary.id = archived;
+            summary.archived = true;
+            shell.session_summaries.insert(archived, summary);
+            let labels = menu_labels(shell, id, cx);
+            assert!(
+                labels.contains(&"Stop codespace octo-abc".to_string()),
+                "{labels:?}"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_codespace_start_without_a_name_has_no_stop_entry(cx: &mut TestAppContext) {
+    let (window, id, _) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.cloud_marks.insert(
+                id,
+                CloudMark {
+                    local_project: "/work/monocode".into(),
+                    codespace: String::new(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            shell
+                .cloud_states
+                .insert(String::new(), CloudState::Unknown);
+            let labels = menu_labels(shell, id, cx);
+            assert!(
+                !labels.iter().any(|l| l.starts_with("Stop codespace")),
+                "{labels:?}"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn stopping_a_codespace_with_a_running_turn_asks_first(cx: &mut TestAppContext) {
+    let (window, id, gh) = shell_with_cloud(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell
+                .cloud_states
+                .insert("octo-abc".into(), CloudState::Available);
+            // A turn runs in another session of the same codespace.
+            let other = id + 1000;
+            shell.cloud_marks.insert(
+                other,
+                CloudMark {
+                    local_project: "/work/monocode".into(),
+                    codespace: "octo-abc".into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            shell.remote_marks.insert(other, (true, false));
+            shell.run_session_menu(id, "codespace-stop-live", window, cx)
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    window
+        .update(visual, |shell, _, _| {
+            assert!(matches!(
+                shell.cloud_archive.as_ref().map(|d| &d.phase),
+                Some(cloud::Phase::ConfirmStop)
+            ));
+        })
+        .unwrap();
+    assert!(visual.debug_bounds("cloud-archive-cancel").is_some());
+    let go = visual
+        .debug_bounds("cloud-archive-confirm-stop")
+        .expect("Stop");
+    visual.simulate_click(go.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(gh.calls(), ["codespace stop -c octo-abc"]);
+    window
+        .update(visual, |shell, _, _| {
+            assert!(shell.cloud_archive.is_none());
+            assert!(shell.is_cloud(id));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn stopping_a_sandbox_with_a_running_turn_asks_first_and_cancel_stops_nothing(
+    cx: &mut TestAppContext,
+) {
+    let (window, id, sbx) = shell_with_sandbox(cx, "running", CloudState::Available, true);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.remote_marks.insert(id, (true, false));
+            shell.run_session_menu(id, "sandbox-stop", window, cx)
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    window
+        .update(visual, |shell, _, _| {
+            assert!(matches!(
+                shell.cloud_archive.as_ref().map(|d| &d.phase),
+                Some(cloud::Phase::ConfirmStop)
+            ));
+        })
+        .unwrap();
+    assert!(visual.debug_bounds("cloud-archive-confirm-stop").is_some());
+    window
+        .update(visual, |shell, window, cx| {
+            shell.close_cloud_archive(window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(sbx.changes().is_empty(), "{:?}", sbx.calls());
+    // Without a running turn the stop is direct, as before.
+    window
+        .update(visual, |shell, window, cx| {
+            shell.remote_marks.insert(id, (false, false));
+            shell.run_session_menu(id, "sandbox-stop", window, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(sbx.changes()[0].contains(" stop "), "{:?}", sbx.calls());
+}

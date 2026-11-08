@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::cloud_sessions::backend::CloudBackendKind;
 use serde::{Deserialize, Serialize};
 
 pub const OAUTH_SECRET_KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
@@ -973,38 +974,54 @@ fi
 cat >> "$tmp" <<'GUIDE'
 <!-- monoptah-evidence:begin -->
 ## Evidence for the local user
-You run in a GitHub codespace. Save screenshots, test output and written reports that prove
+You run in @PLACE@. Save screenshots, test output and written reports that prove
 your work under `@WS@/.evidence/` (create subfolders freely). That folder is excluded
 from git and is never committed. The user's Monoptah app copies it to their machine on request,
 so do not put secrets there. Mention the file names in your final message.
+The user can click a file path in the chat to view it.
 <!-- monoptah-evidence:end -->
 GUIDE
 mv "$tmp" "$g"
 tmp=""
 "#;
 
-fn evidence_script(workspace: &str) -> String {
-    EVIDENCE_SCRIPT.replace("@WS@", workspace)
+/// The evidence script for `workspace`, with the guide naming the place the agent runs in.
+/// The begin/end markers do not depend on `kind`, so a file written by one is updated in place
+/// by the other.
+fn evidence_script(workspace: &str, kind: CloudBackendKind) -> String {
+    let place = match kind {
+        CloudBackendKind::Codespaces => "a GitHub codespace",
+        CloudBackendKind::DockerSandbox => "a Docker sandbox",
+    };
+    EVIDENCE_SCRIPT
+        .replace("@PLACE@", place)
+        .replace("@WS@", workspace)
 }
 
 /// The evidence setup script for `workspace` (`/workspaces/<repo>`), validated, for backends
 /// that run it themselves.
-pub(crate) fn evidence_script_for(workspace: &str) -> Result<String, String> {
+pub(crate) fn evidence_script_for(
+    workspace: &str,
+    kind: CloudBackendKind,
+) -> Result<String, String> {
     let repo = workspace
         .strip_prefix("/workspaces/")
         .filter(|repo| valid_segment(repo))
         .ok_or_else(|| format!("Invalid workspace `{workspace}`"))?;
-    Ok(evidence_script(&format!("/workspaces/{repo}")))
+    Ok(evidence_script(&format!("/workspaces/{repo}"), kind))
 }
 
 /// The evidence setup script for the absolute `workspace` of a session that does not live under
 /// `/workspaces` (a sandbox without a devcontainer).
-pub(crate) fn evidence_script_at(workspace: &str) -> Result<String, String> {
+pub(crate) fn evidence_script_at(
+    workspace: &str,
+    kind: CloudBackendKind,
+) -> Result<String, String> {
     valid_remote_path(workspace)?;
     if !workspace.starts_with('/') || workspace.len() < 2 {
         return Err(format!("Invalid workspace `{workspace}`"));
     }
-    Ok(evidence_script(workspace.trim_end_matches('/')))
+    Ok(evidence_script(workspace.trim_end_matches('/'), kind))
 }
 
 /// Best-effort setup of the evidence folder and agent guidance in a running codespace.
@@ -1016,7 +1033,7 @@ pub fn prepare_evidence(runner: &dyn GhRunner, name: &str, workspace: &str) -> R
         .filter(|repo| valid_segment(repo))
         .ok_or_else(|| format!("Invalid workspace `{workspace}`"))?;
     let args = argv(&["codespace", "ssh", "-c", name, "--", "sh", "-s"]);
-    let script = evidence_script(&format!("/workspaces/{repo}"));
+    let script = evidence_script(&format!("/workspaces/{repo}"), CloudBackendKind::Codespaces);
     let out = runner.run(&args, Some(&script))?;
     if out.success {
         Ok(())

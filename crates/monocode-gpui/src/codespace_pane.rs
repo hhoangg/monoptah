@@ -400,13 +400,15 @@ impl Render for CodespacePane {
                                     false,
                                     cx,
                                 ))
-                                .child(self.action_button(
-                                    "codespace-rebuild",
-                                    "Rebuild",
-                                    StartAction::Rebuild,
-                                    false,
-                                    cx,
-                                ))
+                                .when(start.offers_rebuild(), |d| {
+                                    d.child(self.action_button(
+                                        "codespace-rebuild",
+                                        "Rebuild",
+                                        StartAction::Rebuild,
+                                        false,
+                                        cx,
+                                    ))
+                                })
                                 .child(self.action_button(
                                     "codespace-delete",
                                     start.delete_label(),

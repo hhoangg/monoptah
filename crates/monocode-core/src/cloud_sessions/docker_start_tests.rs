@@ -2705,6 +2705,89 @@ mod plain {
     }
 
     #[test]
+    fn a_retry_picks_up_a_devcontainer_path_fixed_in_the_project_setup() {
+        let fx = fx();
+        *fx.shell.devcontainer.lock().unwrap() = "missing".into();
+        let mut cfg = config();
+        cfg.devcontainer_path = ".devcontainer/typo.json".into();
+        let (session, _) = fx
+            .svc
+            .begin_sandbox_start("/Users/me/widgets", &cfg, "main", "claude")
+            .unwrap();
+        let error = fx.run(session.id).0.unwrap_err();
+        assert!(error.contains("typo.json"), "{error}");
+        // The user fixes the path in the setup; the rest of the snapshot is untouched.
+        let mut fixed = cfg.clone();
+        fixed.devcontainer_path = ".devcontainer/web/devcontainer.json".into();
+        fixed.cpus = cfg.cpus + 4;
+        crate::cloud_sessions::docker_config::save(
+            &fx.store.lock().unwrap(),
+            "/Users/me/widgets",
+            &fixed,
+        )
+        .unwrap();
+        // Still missing: the record shows that only the path was taken from the setup.
+        fx.run(session.id).0.unwrap_err();
+        let stored = fx.record(session.id).unwrap().sandbox_start.unwrap().config;
+        assert_eq!(stored.devcontainer_path, fixed.devcontainer_path);
+        assert_eq!(stored.cpus, cfg.cpus, "the rest of the snapshot is kept");
+        *fx.shell.devcontainer.lock().unwrap() = "config".into();
+        fx.run(session.id).0.unwrap();
+        let detects: Vec<_> = fx
+            .shell
+            .calls()
+            .into_iter()
+            .filter(|c| c.tag() == "detect")
+            .collect();
+        assert!(detects
+            .last()
+            .unwrap()
+            .stdin
+            .contains("CONFIG='.devcontainer/web/devcontainer.json'\n"));
+        assert_eq!(machine_target(&fx).mode, SandboxMode::Container);
+    }
+
+    #[test]
+    fn a_retry_ignores_a_setup_that_now_names_another_repository() {
+        let fx = fx();
+        *fx.shell.devcontainer.lock().unwrap() = "missing".into();
+        let mut cfg = config();
+        cfg.devcontainer_path = ".devcontainer/typo.json".into();
+        let (session, _) = fx
+            .svc
+            .begin_sandbox_start("/Users/me/widgets", &cfg, "main", "claude")
+            .unwrap();
+        fx.run(session.id).0.unwrap_err();
+        let mut other = cfg.clone();
+        other.repo_url = "https://github.com/someone/else.git".into();
+        other.devcontainer_path = ".devcontainer/other.json".into();
+        crate::cloud_sessions::docker_config::save(
+            &fx.store.lock().unwrap(),
+            "/Users/me/widgets",
+            &other,
+        )
+        .unwrap();
+        let error = fx.run(session.id).0.unwrap_err();
+        assert!(error.contains("typo.json"), "{error}");
+        assert!(error.contains("repository changed"), "{error}");
+        assert!(error.contains("clear the devcontainer path"), "{error}");
+    }
+
+    #[test]
+    fn an_unreadable_detection_result_fails_on_the_build_container_step() {
+        let fx = fx();
+        *fx.shell.devcontainer.lock().unwrap() = "garbage".into();
+        let (session, _) = fx.begin().unwrap();
+        let error = fx.run(session.id).0.unwrap_err();
+        assert!(error.contains("Could not tell"), "{error}");
+        let stored = fx.record(session.id).unwrap();
+        assert_eq!(
+            status(&stored, StepKind::BuildContainer),
+            StepStatus::Failed
+        );
+    }
+
+    #[test]
     fn retrying_a_start_that_failed_at_build_container_for_a_missing_config_switches_to_plain() {
         let fx = fx();
         let (session, _) = fx.begin().unwrap();
@@ -3260,6 +3343,12 @@ mod files_only {
             a.fx.svc
                 .convert_session_confirmed(a.id, true, &mut |_| {})
                 .unwrap();
+        // No container exists, so the warnings must not blame one.
+        let warnings = done.warnings.join("\n");
+        assert!(warnings.contains("History may be incomplete"), "{warnings}");
+        assert!(warnings.contains("Host could not be reached"), "{warnings}");
+        assert!(!warnings.contains("recreated"), "{warnings}");
+        assert!(!warnings.contains("through the container"), "{warnings}");
         let code = done.code_dir.unwrap();
         let patch = std::fs::read_to_string(code.join(super::super::PATCH)).unwrap();
         assert!(patch.contains("untracked.txt"), "{patch}");

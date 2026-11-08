@@ -763,6 +763,9 @@ pub(super) enum Phase {
     Review {
         items: Vec<String>,
     },
+    /// Stopping from the session menu while an agent turn is running in the workspace: confirm
+    /// first, since stopping interrupts it.
+    ConfirmStop,
     /// Deleting from the session menu: confirm first, listing what the codespace holds that the
     /// local copies lack.
     ConfirmDelete {
@@ -1233,7 +1236,27 @@ impl Shell {
             cx.notify();
             return;
         }
+        if choice == ArchiveChoice::Stop && self.workspace_has_running_turn(&target) {
+            if let Some(dialog) = self.cloud_archive.as_mut() {
+                dialog.phase = Phase::ConfirmStop;
+                window.focus(&dialog.focus, cx);
+            }
+            cx.notify();
+            return;
+        }
         self.run_cloud_archive(choice, false, Vec::new(), window, cx);
+    }
+
+    /// Whether any session living in `target` has an agent turn running.
+    pub(super) fn workspace_has_running_turn(&self, target: &CloudRef) -> bool {
+        self.cloud_marks
+            .iter()
+            .filter(|(_, m)| m.cloud() == *target)
+            .any(|(id, _)| {
+                self.remote_marks
+                    .get(id)
+                    .is_some_and(|(running, _)| *running)
+            })
     }
 
     pub(super) fn close_cloud_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1806,6 +1829,35 @@ impl Shell {
                 )),
                 footer.child(cancel),
             ),
+            Phase::ConfirmStop => {
+                let name = dialog
+                    .groups
+                    .first()
+                    .map(|g| g.codespace.clone())
+                    .unwrap_or_default();
+                (
+                    format!("Stop {}?", words.noun),
+                    div().child(text(
+                        "cloud-archive-confirm-stop-body",
+                        format!("{name} has a running turn. Stopping interrupts it."),
+                        false,
+                    )),
+                    footer.child(cancel).child(
+                        crate::modal::danger_button("cloud-archive-confirm-stop", "Stop")
+                            .debug_selector(|| "cloud-archive-confirm-stop".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.run_cloud_archive(
+                                    ArchiveChoice::Stop,
+                                    false,
+                                    Vec::new(),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    ),
+                )
+            }
             Phase::ConfirmDelete { items } => {
                 let seen = items.clone();
                 let name = dialog

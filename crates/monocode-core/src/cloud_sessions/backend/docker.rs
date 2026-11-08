@@ -300,9 +300,9 @@ impl CloudBackend for DockerBackend {
     fn prepare_evidence(&self, name: &str, workspace: &str) -> Result<(), String> {
         // A plain sandbox has no `/workspaces/<repo>`: the Host works in the outer workspace.
         let script = if self.is_plain(name) {
-            codespaces::evidence_script_at(workspace)?
+            codespaces::evidence_script_at(workspace, CloudBackendKind::DockerSandbox)?
         } else {
-            codespaces::evidence_script_for(workspace)?
+            codespaces::evidence_script_for(workspace, CloudBackendKind::DockerSandbox)?
         };
         let out = self.exec(name, &script, &mut |_| {}, &|| false, SCRIPT_SHORT)?;
         if out.success {
