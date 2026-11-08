@@ -6,7 +6,7 @@ mod ssh;
 pub mod ssh_askpass;
 
 use ssh::{Job, Tunnel, Tunnels};
-pub use ssh::{JobView, Prompt, SshTarget};
+pub use ssh::{JobView, Prompt, SandboxTarget, SshTarget};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -169,6 +169,9 @@ pub struct Machine {
     /// Codespace name when this machine is reached through `gh codespace ssh`.
     #[serde(default)]
     pub codespace: Option<String>,
+    /// Docker Sandbox when this machine is reached through `<id>@sbx_cloud`.
+    #[serde(default)]
+    pub sandbox: Option<SandboxTarget>,
 }
 
 impl StoredMachine {
@@ -180,6 +183,7 @@ impl StoredMachine {
             environment_id: self.environment_id.clone(),
             ssh: self.ssh.clone(),
             codespace: self.ssh.as_ref().and_then(|ssh| ssh.codespace.clone()),
+            sandbox: self.ssh.as_ref().and_then(|ssh| ssh.sandbox.clone()),
         }
     }
 }
@@ -458,16 +462,18 @@ impl Connections {
                 .find(|m| m.id == machine_id)
                 .ok_or("Machine is no longer connected")?
         };
-        let codespace = machine.ssh.as_ref().is_some_and(|t| t.codespace.is_some());
+        let cloud = machine.ssh.as_ref().is_some_and(SshTarget::is_cloud);
+        let not_connected = if machine.ssh.as_ref().is_some_and(|t| t.sandbox.is_some()) {
+            SANDBOX_NOT_CONNECTED
+        } else {
+            CODESPACE_NOT_CONNECTED
+        };
         let tunnel_lease = if let Some(target) = &machine.ssh {
-            if codespace {
+            if cloud {
                 // Background work must never wake a codespace (that is what
-                // `gh codespace ssh` does), so only a live tunnel is used.
-                Some(
-                    self.tunnels
-                        .existing(&machine.id)
-                        .ok_or(CODESPACE_NOT_CONNECTED)?,
-                )
+                // `gh codespace ssh` does) or resume a sandbox (any ssh does),
+                // so only a live tunnel is used.
+                Some(self.tunnels.existing(&machine.id).ok_or(not_connected)?)
             } else {
                 Some(self.tunnels.endpoint(&machine.id, target)?)
             }
@@ -484,7 +490,7 @@ impl Connections {
             Some(&machine.environment_id),
             method,
             params,
-            codespace,
+            cloud,
         );
         if response
             .as_ref()
@@ -494,8 +500,8 @@ impl Connections {
             if let Some(lease) = &tunnel_lease {
                 self.tunnels.invalidate(&machine.id, lease);
             }
-            if codespace {
-                return Err(CODESPACE_NOT_CONNECTED.into());
+            if cloud {
+                return Err(not_connected.into());
             }
         }
         let result = response?;
@@ -513,6 +519,11 @@ impl Connections {
 /// request answer it with `ensure_codespace`/`codespace_reconnect`.
 pub const CODESPACE_NOT_CONNECTED: &str =
     "Codespace is not connected. Reconnect to start it and restore the connection.";
+
+/// Same as `CODESPACE_NOT_CONNECTED` for a Docker Sandbox, which any ssh would
+/// resume (and bill).
+pub const SANDBOX_NOT_CONNECTED: &str =
+    "Sandbox is not connected. Reconnect to start it and restore the connection.";
 
 fn supported_remote_method(method: &str) -> bool {
     matches!(
@@ -551,6 +562,16 @@ fn supported_remote_method(method: &str) -> bool {
     )
 }
 
+/// Bootstrap script for a target: cloud targets track the token and install
+/// Claude; a sandbox has no per-start secret prelude yet.
+fn cloud_or_plain_bootstrap(target: &SshTarget, platform: ssh::HostPlatform) -> String {
+    match (&target.codespace, &target.sandbox) {
+        (Some(_), _) => ssh::codespace_bootstrap_script(),
+        (None, Some(_)) => ssh::sandbox_bootstrap_script(None),
+        (None, None) => ssh::bootstrap_script(platform),
+    }
+}
+
 impl Connections {
     fn start_ssh_job(
         self: &Arc<Self>,
@@ -559,7 +580,7 @@ impl Connections {
         existing: Option<StoredMachine>,
         upgrade: bool,
     ) -> Result<String, String> {
-        ssh::check_codespace(&target)?;
+        ssh::check_target(&target)?;
         let job = Job::new();
         let id = job.view().id;
         {
@@ -578,25 +599,25 @@ impl Connections {
             let prepared = (|| -> Result<(StoredMachine, Tunnel), String> {
                 let askpass = job.askpass()?;
                 let mut target = target;
-                let codespace = target.codespace.is_some();
+                let cloud = target.is_cloud();
                 let mut machine = if let Some(mut existing) = existing {
-                    if upgrade || codespace {
-                        // A codespace may have stopped, which also stopped its
+                    if upgrade || cloud {
+                        // A codespace or sandbox may have stopped, which also stopped its
                         // host. gh starts it on connect, and the bootstrap's
                         // service install brings the host back with its saved
                         // state, so a codespace reconnect always re-runs it.
                         let platform = ssh::detect_platform(&target, &job, &askpass)?;
                         job.message(if upgrade {
                             "Updating Monoptah Host on the machine…"
+                        } else if target.sandbox.is_some() {
+                            "Starting Monoptah Host in the sandbox…"
                         } else {
                             "Starting Monoptah Host on the codespace…"
                         });
                         let script = if upgrade {
                             ssh::upgrade_script(platform, target.remote_port)
-                        } else if codespace {
-                            ssh::codespace_bootstrap_script()
                         } else {
-                            ssh::bootstrap_script(platform)
+                            cloud_or_plain_bootstrap(&target, platform)
                         };
                         let output = ssh::run_script(&target, platform, script, &job, &askpass)?;
                         let info: Value = serde_json::from_str(output.lines().last().unwrap_or(""))
@@ -618,11 +639,7 @@ impl Connections {
                     let output = ssh::run_script(
                         &target,
                         platform,
-                        if codespace {
-                            ssh::codespace_bootstrap_script()
-                        } else {
-                            ssh::bootstrap_script(platform)
-                        },
+                        cloud_or_plain_bootstrap(&target, platform),
                         &job,
                         &askpass,
                     )?;
@@ -663,9 +680,10 @@ impl Connections {
                     StoredMachine {
                         id: uuid::Uuid::new_v4().to_string(),
                         name,
-                        endpoint: match &target.codespace {
-                            Some(name) => format!("codespace://{name}"),
-                            None => format!("ssh://{}", target.target),
+                        endpoint: match (&target.codespace, &target.sandbox) {
+                            (Some(name), _) => format!("codespace://{name}"),
+                            (None, Some(sandbox)) => format!("sbx://{}", sandbox.name),
+                            (None, None) => format!("ssh://{}", target.target),
                         },
                         environment_id,
                         token,
@@ -755,6 +773,7 @@ impl Connections {
                 port,
                 remote_port: 3774,
                 codespace: None,
+                sandbox: None,
             },
             name.trim().chars().take(100).collect(),
             None,
@@ -780,6 +799,35 @@ impl Connections {
                 port: None,
                 remote_port: 3774,
                 codespace: Some(name),
+                sandbox: None,
+            },
+            display,
+            None,
+            false,
+        )
+    }
+
+    /// Pair with the monocode-host inside a Docker Sandbox's devcontainer over
+    /// `ssh <id>@sbx_cloud`. The relay on `sandbox.relay_port` must be running
+    /// by the time the tunnel opens (the sandbox start flow sets it up). Poll
+    /// the returned job with `ssh_poll`.
+    pub fn sandbox_begin(
+        self: &Arc<Self>,
+        sandbox: SandboxTarget,
+        display_name: Option<&str>,
+    ) -> Result<String, String> {
+        ssh::validate_sandbox(&sandbox)?;
+        let display = display_name
+            .map(|d| d.trim().chars().take(100).collect::<String>())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| sandbox.name.clone());
+        self.start_ssh_job(
+            SshTarget {
+                target: sandbox.destination(),
+                port: None,
+                remote_port: 3774,
+                codespace: None,
+                sandbox: Some(sandbox),
             },
             display,
             None,
@@ -1666,5 +1714,50 @@ else:
             })
             .unwrap_err();
         assert_eq!((error.as_str(), calls.load(Ordering::SeqCst)), ("nope", 1));
+    }
+
+    #[test]
+    fn sandbox_requests_without_a_live_tunnel_never_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("remote-machines.json"),
+            r#"[{"id":"a","name":"x","endpoint":"sbx://box","environmentId":"env","token":"t","ssh":{"target":"sbx_001abc@sbx_cloud","port":null,"remotePort":3774,"sandbox":{"id":"sbx_001abc","name":"box","workspace":"/home/agent/ws","relayPort":47200}}}]"#,
+        )
+        .unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        let machine = connections.list().unwrap().remove(0);
+        assert_eq!(
+            machine.sandbox.as_ref().map(|s| s.id.as_str()),
+            Some("sbx_001abc")
+        );
+        assert_eq!(machine.codespace, None);
+        // No tunnel exists, and a request must not create one (that would ssh
+        // into, and so resume, the sandbox).
+        let error = connections
+            .request("a", "projects.list", json!({}))
+            .unwrap_err();
+        assert_eq!(error, SANDBOX_NOT_CONNECTED);
+        assert!(crate::cloud_sessions::is_not_connected(&error));
+        assert!(connections.tunnels.existing("a").is_none());
+    }
+
+    #[test]
+    fn sandbox_begin_rejects_bad_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let connections = Arc::new(Connections::new(dir.path()));
+        let target = |id: &str, workspace: &str, relay_port| SandboxTarget {
+            id: id.into(),
+            name: "box".into(),
+            workspace: workspace.into(),
+            relay_port,
+        };
+        for bad in [
+            target("-oProxyCommand=x", "/w", 1),
+            target("sbx_1", "w", 1),
+            target("sbx_1", "/w;x", 1),
+            target("sbx_1", "/w", 0),
+        ] {
+            assert!(connections.sandbox_begin(bad, None).is_err());
+        }
     }
 }

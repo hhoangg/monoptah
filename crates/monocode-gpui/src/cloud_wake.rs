@@ -122,6 +122,7 @@ pub(crate) mod fakes {
             environment_id: format!("env-{name}"),
             ssh: None,
             codespace: Some(name.into()),
+            sandbox: None,
         }
     }
     impl Host for FakeHost {

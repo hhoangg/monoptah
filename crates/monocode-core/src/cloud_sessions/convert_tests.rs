@@ -269,6 +269,7 @@ fn world_with(ran_claude: bool, worktree: bool, extras: bool) -> World {
         environment_id: "env-1".into(),
         ssh: None,
         codespace: Some("cs-1".into()),
+        sandbox: None,
     };
     let host = Arc::new(SyncHost {
         machines: vec![machine],

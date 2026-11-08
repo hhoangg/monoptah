@@ -138,6 +138,7 @@ fn machine(codespace: &str) -> Machine {
         environment_id: format!("env-{codespace}"),
         ssh: None,
         codespace: Some(codespace.into()),
+        sandbox: None,
     }
 }
 impl super::Host for Host {

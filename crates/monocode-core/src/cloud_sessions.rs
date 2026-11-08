@@ -76,9 +76,10 @@ pub const HARNESS: &str = "claude";
 pub const STATE_TTL: Duration = Duration::from_secs(30);
 const UNSUPPORTED_HARNESS: &str = "Cloud sessions support Claude only for now.";
 
-/// True when `error` is `Connections::request`'s "codespace is not connected".
+/// True when `error` is `Connections::request`'s "codespace is not connected"
+/// or "sandbox is not connected".
 pub fn is_not_connected(error: &str) -> bool {
-    error.starts_with("Codespace is not connected")
+    error.starts_with("Codespace is not connected") || error.starts_with("Sandbox is not connected")
 }
 
 /// Error text for a start that failed after its codespace was created.

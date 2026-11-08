@@ -22,6 +22,152 @@ pub struct SshTarget {
     /// only mirrors the name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codespace: Option<String>,
+    /// Docker Sandbox. When set, every connection goes through plain `ssh` to
+    /// `<id>@sbx_cloud` (the alias `sbx setup ssh` writes), and commands that
+    /// belong to the Host run inside the devcontainer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxTarget>,
+}
+
+/// A Docker Sandbox that runs a devcontainer with the Host inside it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxTarget {
+    /// Sandbox id (`sbx_...`), also the ssh user.
+    pub id: String,
+    /// Sandbox name, for display and the machine endpoint.
+    pub name: String,
+    /// Workspace folder in the OUTER sandbox, the devcontainer's workspace.
+    pub workspace: String,
+    /// Loopback port in the outer sandbox where a relay bridges into the
+    /// container's Host. The tunnel forwards to this port.
+    pub relay_port: u16,
+}
+
+/// Host alias written by `sbx setup ssh` into the user's ssh config.
+const SANDBOX_SSH_HOST: &str = "sbx_cloud";
+/// Where the standalone devcontainer CLI lives in the outer sandbox. It is not
+/// on PATH; `$HOME` is expanded by the outer sandbox's shell.
+const SANDBOX_DEVCONTAINER: &str = "$HOME/.devcontainers/bin/devcontainer";
+
+impl SandboxTarget {
+    pub(super) fn destination(&self) -> String {
+        format!("{}@{SANDBOX_SSH_HOST}", self.id)
+    }
+
+    /// The single remote word that runs `remote` inside the devcontainer. The
+    /// script itself travels on stdin, never in argv.
+    fn exec_in_container(&self, remote: &[&str]) -> String {
+        let mut words = vec![
+            SANDBOX_DEVCONTAINER.to_string(),
+            "exec".into(),
+            "--workspace-folder".into(),
+            shell_quote(&self.workspace),
+            "--".into(),
+        ];
+        words.extend(remote.iter().map(|word| quote_word(word)));
+        words.join(" ")
+    }
+}
+
+/// How a target is reached. Derived from the optional fields of `SshTarget`.
+enum Transport<'a> {
+    Ssh,
+    Codespace(&'a str),
+    Sandbox(&'a SandboxTarget),
+}
+
+impl SshTarget {
+    fn transport(&self) -> Transport<'_> {
+        match (&self.codespace, &self.sandbox) {
+            (Some(name), _) => Transport::Codespace(name),
+            (None, Some(sandbox)) => Transport::Sandbox(sandbox),
+            (None, None) => Transport::Ssh,
+        }
+    }
+
+    /// True for targets whose connection wakes a paid cloud resource, so
+    /// background work must never open a connection to them.
+    pub fn is_cloud(&self) -> bool {
+        !matches!(self.transport(), Transport::Ssh)
+    }
+}
+
+/// Quote a word only when the shell would treat it specially.
+fn quote_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./=:@%+,".contains(&b))
+    {
+        word.into()
+    } else {
+        shell_quote(word)
+    }
+}
+
+/// Sandbox ids are `sbx_` plus lowercase alphanumerics.
+pub fn validate_sandbox_id(id: &str) -> Result<(), String> {
+    match id.strip_prefix("sbx_") {
+        Some(rest)
+            if !rest.is_empty()
+                && id.len() <= 64
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) =>
+        {
+            Ok(())
+        }
+        _ => {
+            Err("Enter a valid sandbox id (sbx_ followed by lowercase letters and digits).".into())
+        }
+    }
+}
+
+/// Sandbox names follow the `sbx` rules: 2 to 63 characters, first an ASCII
+/// alphanumeric, then ASCII alphanumerics and hyphens. Keep identical to
+/// `sandboxes::validate_sandbox_name`.
+pub fn validate_sandbox_name(name: &str) -> Result<(), String> {
+    if !(2..=63).contains(&name.len())
+        || !name.as_bytes()[0].is_ascii_alphanumeric()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(
+            "Enter a valid sandbox name (2 to 63 letters, digits and hyphens, starting with a letter or digit).".into(),
+        );
+    }
+    Ok(())
+}
+
+/// The workspace path reaches a remote shell (quoted). Require an absolute
+/// path of plain characters with no `..` or empty components.
+pub fn validate_sandbox_workspace(path: &str) -> Result<(), String> {
+    let valid = path.len() > 1
+        && path.len() <= 255
+        && path.starts_with('/')
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+        && path[1..]
+            .trim_end_matches('/')
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..");
+    if valid {
+        Ok(())
+    } else {
+        Err("Enter an absolute workspace path (letters, digits, / . _ -).".into())
+    }
+}
+
+/// Re-checks everything of a sandbox target that reaches argv.
+pub fn validate_sandbox(sandbox: &SandboxTarget) -> Result<(), String> {
+    validate_sandbox_id(&sandbox.id)?;
+    validate_sandbox_name(&sandbox.name)?;
+    validate_sandbox_workspace(&sandbox.workspace)?;
+    if sandbox.relay_port == 0 {
+        return Err("Enter a valid relay port.".into());
+    }
+    Ok(())
 }
 
 /// Codespace names are generated by GitHub (`user-repo-abc123`). They end up in
@@ -221,10 +367,9 @@ fn gh_program() -> std::ffi::OsString {
 }
 
 fn command(target: &SshTarget, interactive: bool) -> Command {
-    let program = if target.codespace.is_some() {
-        gh_program()
-    } else {
-        "ssh".into()
+    let program = match target.transport() {
+        Transport::Codespace(_) => gh_program(),
+        Transport::Ssh | Transport::Sandbox(_) => "ssh".into(),
     };
     command_with_program(target, interactive, &program)
 }
@@ -232,21 +377,30 @@ fn command(target: &SshTarget, interactive: bool) -> Command {
 /// `gh codespace ssh` appends its own destination and hands everything after
 /// `--` to OpenSSH, so codespace commands carry no `-- TARGET` and no `-p`.
 /// gh also manages the host key and key pair itself, so host-key prompting is
-/// left out and BatchMode stays on.
+/// left out and BatchMode stays on. A sandbox is plain `ssh` to its
+/// `<id>@sbx_cloud` alias: the alias carries the ProxyCommand and host trust,
+/// so there is no host-key prompting, no password prompt and no `-p`.
 fn command_with_program(
     target: &SshTarget,
     interactive: bool,
     program: &std::ffi::OsStr,
 ) -> Command {
     let mut command = Command::new(program);
-    let codespace = target.codespace.as_deref();
-    if let Some(name) = codespace {
+    let transport = target.transport();
+    if let Transport::Codespace(name) = transport {
         command.args(["codespace", "ssh", "-c", name, "--"]);
     }
+    let plain = matches!(transport, Transport::Ssh);
+    // Resuming a stopped sandbox through the sbx ProxyCommand can outlast the
+    // usual 15 seconds before the ssh banner arrives.
+    let connect_timeout = match transport {
+        Transport::Sandbox(_) => "ConnectTimeout=120",
+        Transport::Ssh | Transport::Codespace(_) => "ConnectTimeout=15",
+    };
     command.args([
         "-T",
         "-o",
-        "ConnectTimeout=15",
+        connect_timeout,
         "-o",
         "ConnectionAttempts=1",
         "-o",
@@ -266,7 +420,7 @@ fn command_with_program(
         "-o",
         "ExitOnForwardFailure=yes",
     ]);
-    if codespace.is_none() {
+    if plain {
         command.args([
             "-o",
             "StrictHostKeyChecking=ask",
@@ -277,13 +431,13 @@ fn command_with_program(
     command.args(["-o", "ForkAfterAuthentication=no"]);
     command.args([
         "-o",
-        if interactive && codespace.is_none() {
+        if interactive && plain {
             "BatchMode=no"
         } else {
             "BatchMode=yes"
         },
     ]);
-    if let Some(port) = target.port.filter(|_| codespace.is_none()) {
+    if let Some(port) = target.port.filter(|_| plain) {
         command.args(["-p", &port.to_string()]);
     }
     command
@@ -291,8 +445,9 @@ fn command_with_program(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if codespace.is_some() {
-        // A Finder-launched app has launchd's bare PATH, and gh runs `ssh`.
+    if !plain {
+        // A Finder-launched app has launchd's bare PATH, and gh runs `ssh` and
+        // the sandbox alias's ProxyCommand runs `sbx`.
         command.env("PATH", crate::scm::terminal_search_path());
     }
     #[cfg(windows)]
@@ -303,22 +458,26 @@ fn command_with_program(
     command
 }
 
-/// A codespace name read back from the store is re-checked before it reaches argv.
-pub(super) fn check_codespace(target: &SshTarget) -> Result<(), String> {
-    match &target.codespace {
-        Some(name) => validate_codespace(name).map(|_| ()),
-        None => Ok(()),
+/// Names and paths read back from the store are re-checked before they reach argv.
+pub(super) fn check_target(target: &SshTarget) -> Result<(), String> {
+    if target.codespace.is_some() && target.sandbox.is_some() {
+        return Err("A connection cannot be both a codespace and a sandbox.".into());
+    }
+    match target.transport() {
+        Transport::Codespace(name) => validate_codespace(name).map(|_| ()),
+        Transport::Sandbox(sandbox) => validate_sandbox(sandbox),
+        Transport::Ssh => Ok(()),
     }
 }
 
 /// Error for a transport process that could not be spawned.
 fn spawn_error(target: &SshTarget, error: std::io::Error) -> String {
-    if target.codespace.is_none() {
-        format!("Could not start OpenSSH: {error}")
-    } else if error.kind() == std::io::ErrorKind::NotFound {
-        "GitHub CLI (gh) is not installed. Install it from https://cli.github.com and run `gh auth login`.".into()
-    } else {
-        format!("Could not start the GitHub CLI (gh): {error}")
+    match target.transport() {
+        Transport::Ssh | Transport::Sandbox(_) => format!("Could not start OpenSSH: {error}"),
+        Transport::Codespace(_) if error.kind() == std::io::ErrorKind::NotFound => {
+            "GitHub CLI (gh) is not installed. Install it from https://cli.github.com and run `gh auth login`.".into()
+        }
+        Transport::Codespace(_) => format!("Could not start the GitHub CLI (gh): {error}"),
     }
 }
 
@@ -367,8 +526,8 @@ pub fn detect_platform(
     job: &Arc<Job>,
     askpass: &Askpass,
 ) -> Result<HostPlatform, String> {
-    if target.codespace.is_some() {
-        // Codespaces are always Linux containers.
+    if target.is_cloud() {
+        // Codespaces and sandboxes are always Linux containers.
         return Ok(HostPlatform::Unix);
     }
     job.message("Checking the remote machine…");
@@ -443,15 +602,26 @@ fn run_remote_command(
     mut command: Command,
     remote: &[&str],
 ) -> Result<String, String> {
-    check_codespace(target)?;
+    check_target(target)?;
     if job.cancelled.load(Ordering::Relaxed) {
         return Err("Connection cancelled".into());
     }
     askpass.configure(&mut command)?;
-    if target.codespace.is_none() {
-        command.args(["--", &target.target]);
+    match target.transport() {
+        Transport::Ssh => {
+            command.args(["--", &target.target]);
+            command.args(remote);
+        }
+        Transport::Codespace(_) => {
+            command.args(remote);
+        }
+        Transport::Sandbox(sandbox) => {
+            // Everything run for a sandbox machine belongs to the Host, which
+            // lives in the devcontainer, not in the outer sandbox.
+            command.args(["--", &sandbox.destination()]);
+            command.arg(sandbox.exec_in_container(remote));
+        }
     }
-    command.args(remote);
     let mut child = command.spawn().map_err(|e| spawn_error(target, e))?;
     let stdout = capture(child.stdout.take().unwrap());
     let stderr = capture(child.stderr.take().unwrap());
@@ -522,6 +692,18 @@ fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> Str
     }
 }
 
+/// Bootstrap for a sandbox: the codespace flags (the Host tracks the Claude
+/// token by hash and installs Claude), plus an optional prelude that is
+/// prepended verbatim. The prelude is the seam for per-start secrets, which
+/// reach the container on stdin only.
+pub fn sandbox_bootstrap_script(prelude: Option<&str>) -> String {
+    let script = codespace_bootstrap_script();
+    match prelude {
+        Some(prelude) => format!("{prelude}\n{script}"),
+        None => script,
+    }
+}
+
 /// Bootstrap for a codespace. Codespace user secrets (CLAUDE_CODE_OAUTH_TOKEN)
 /// reach the login shell's environment, and the host's agents only inherit what
 /// the host process itself was started with. The script restarts the host once
@@ -582,18 +764,30 @@ impl Tunnel {
         askpass: Option<&Askpass>,
         mut command: Command,
     ) -> Result<Self, String> {
-        check_codespace(target)?;
+        check_target(target)?;
         let port = reserve_local_port()?;
         if let Some(askpass) = askpass {
             askpass.configure(&mut command)?;
         }
+        // A sandbox Host listens inside the container, so the tunnel ends at
+        // the relay in the outer sandbox (the only place `-L` may point to).
+        let remote_port = match target.transport() {
+            Transport::Sandbox(sandbox) => sandbox.relay_port,
+            Transport::Ssh | Transport::Codespace(_) => target.remote_port,
+        };
         command.args([
             "-N",
             "-L",
-            &format!("127.0.0.1:{port}:127.0.0.1:{}", target.remote_port),
+            &format!("127.0.0.1:{port}:127.0.0.1:{remote_port}"),
         ]);
-        if target.codespace.is_none() {
-            command.args(["--", &target.target]);
+        match target.transport() {
+            Transport::Ssh => {
+                command.args(["--", &target.target]);
+            }
+            Transport::Codespace(_) => {}
+            Transport::Sandbox(sandbox) => {
+                command.args(["--", &sandbox.destination()]);
+            }
         }
         command.stdin(Stdio::null()).stdout(Stdio::null());
         let mut child = command.spawn().map_err(|e| spawn_error(target, e))?;
@@ -617,8 +811,9 @@ impl Tunnel {
             port,
             stderr,
         };
-        // gh starts a stopped codespace before it can forward, which takes a while.
-        let patient = job.is_some() || target.codespace.is_some();
+        // gh starts a stopped codespace before it can forward, and a sandbox
+        // resumes on connect, which takes a while.
+        let patient = job.is_some() || target.is_cloud();
         let deadline = Instant::now() + Duration::from_secs(if patient { 150 } else { 20 });
         loop {
             if job.is_some_and(|j| j.cancelled.load(Ordering::Relaxed)) {
@@ -877,6 +1072,7 @@ mod tests {
             port: Some(required("MONOCODE_TEST_SSH_PORT").parse().unwrap()),
             remote_port: required("MONOCODE_TEST_HOST_PORT").parse().unwrap(),
             codespace: None,
+            sandbox: None,
         };
         let make_command = || {
             let mut command = command(&target, false);
@@ -939,7 +1135,14 @@ mod tests {
             port: None,
             remote_port: 3774,
             codespace: Some(name.into()),
+            sandbox: None,
         }
+    }
+    fn env_of(command: &Command, key: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
     }
     fn argv(command: &Command) -> Vec<String> {
         command
@@ -992,6 +1195,7 @@ mod tests {
             port: Some(2222),
             remote_port: 3774,
             codespace: None,
+            sandbox: None,
         };
         let command = command_with_program(&target, true, "ssh".as_ref());
         let args = argv(&command);
@@ -1027,6 +1231,7 @@ mod tests {
             port: None,
             remote_port: 3774,
             codespace: None,
+            sandbox: None,
         };
         assert_eq!(echo(&plain).trim(), "-- me@box sh -l -s");
     }
@@ -1369,5 +1574,264 @@ mod tests {
         job.answer(&prompt.id, "yes".into()).unwrap();
         assert_eq!(thread.join().unwrap(), Some("yes".into()));
         assert!(job.answer(&prompt.id, "yes".into()).is_err());
+    }
+    fn sandbox_target() -> SshTarget {
+        SshTarget {
+            target: "sbx_001abc@sbx_cloud".into(),
+            port: None,
+            remote_port: 3774,
+            codespace: None,
+            sandbox: Some(SandboxTarget {
+                id: "sbx_001abc".into(),
+                name: "my-box".into(),
+                workspace: "/home/agent/ws".into(),
+                relay_port: 47200,
+            }),
+        }
+    }
+    #[test]
+    fn sandbox_commands_are_plain_ssh_to_the_alias_without_prompts() {
+        let command = command_with_program(&sandbox_target(), true, "ssh".as_ref());
+        assert_eq!(command.get_program(), "ssh");
+        let args = argv(&command);
+        assert_eq!(args[0], "-T");
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
+        assert!(!args.contains(&"BatchMode=no".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("StrictHostKeyChecking")));
+        assert!(!args
+            .iter()
+            .any(|a| a.starts_with("NumberOfPasswordPrompts")));
+        assert!(!args.contains(&"-p".to_string()));
+        assert!(!args.contains(&"codespace".to_string()));
+        assert!(args.contains(&"ConnectTimeout=120".to_string()));
+        assert!(!args.contains(&"ConnectTimeout=15".to_string()));
+        // The destination is added by the caller after `--`.
+        assert!(!args.contains(&"--".to_string()));
+    }
+    #[test]
+    fn a_target_cannot_be_a_codespace_and_a_sandbox() {
+        let mut target = sandbox_target();
+        target.codespace = Some("octo-abc123".into());
+        assert!(check_target(&target).unwrap_err().contains("both"));
+    }
+    #[test]
+    fn golden_outer_argv_and_path_for_plain_ssh() {
+        let target = SshTarget {
+            target: "me@box".into(),
+            port: Some(2222),
+            remote_port: 3774,
+            codespace: None,
+            sandbox: None,
+        };
+        let command = command_with_program(&target, true, "ssh".as_ref());
+        let expected: Vec<&str> = vec![
+            "-T",
+            "-o",
+            "ConnectTimeout=15",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ForwardX11=no",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "StrictHostKeyChecking=ask",
+            "-o",
+            "NumberOfPasswordPrompts=3",
+            "-o",
+            "ForkAfterAuthentication=no",
+            "-o",
+            "BatchMode=no",
+            "-p",
+            "2222",
+        ];
+        assert_eq!(argv(&command), expected);
+        assert_eq!(env_of(&command, "LC_ALL").as_deref(), Some("C"));
+        assert_eq!(env_of(&command, "PATH"), None);
+    }
+    #[test]
+    fn golden_codespace_env_sets_the_terminal_path() {
+        let command = command_with_program(&codespace_target("octo-abc123"), false, "gh".as_ref());
+        assert_eq!(env_of(&command, "LC_ALL").as_deref(), Some("C"));
+        assert_eq!(
+            env_of(&command, "PATH").map(std::path::PathBuf::from),
+            Some(std::path::PathBuf::from(crate::scm::terminal_search_path()))
+        );
+        assert!(argv(&command).contains(&"BatchMode=yes".to_string()));
+    }
+    #[test]
+    fn sandbox_scripts_run_in_the_devcontainer_with_the_script_on_stdin() {
+        let job = Job::new();
+        let askpass = job.askpass().unwrap();
+        let mut command = Command::new("sh");
+        // Print argv (one per line), then stdin.
+        command
+            .args(["-c", "for a in \"$@\"; do echo \"ARG:$a\"; done; cat", "sh"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_remote_command(
+            &sandbox_target(),
+            "echo secret-script\n".into(),
+            &job,
+            &askpass,
+            command,
+            &["sh", "-l", "-s"],
+        )
+        .unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "ARG:--");
+        assert_eq!(lines[1], "ARG:sbx_001abc@sbx_cloud");
+        assert_eq!(
+            lines[2],
+            "ARG:$HOME/.devcontainers/bin/devcontainer exec --workspace-folder '/home/agent/ws' -- sh -l -s"
+        );
+        assert_eq!(lines[3], "echo secret-script");
+        assert!(!lines[..3].iter().any(|l| l.contains("secret-script")));
+    }
+    #[test]
+    fn sandbox_tunnel_forwards_to_the_relay_port_of_the_outer_sandbox() {
+        let fixture = tempfile::tempdir().unwrap();
+        let log = fixture.path().join("argv");
+        let script = fixture.path().join("fake-ssh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {log:?}\nexit 1\n",
+                log = log.display().to_string()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let command = command_with_program(&sandbox_target(), false, script.as_os_str());
+        // The fake exits at once, so the tunnel reports a failed connection.
+        let error = match Tunnel::start_with_command(&sandbox_target(), None, None, command) {
+            Ok(_) => panic!("fake ssh exits, tunnel must fail"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("SSH connection failed"), "{error}");
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            args.contains(" -N -L 127.0.0.1:")
+                && args.contains(":127.0.0.1:47200 -- sbx_001abc@sbx_cloud"),
+            "{args}"
+        );
+        assert!(!args.contains("3774"), "{args}");
+    }
+    #[test]
+    fn sandbox_fields_are_validated_before_they_reach_argv() {
+        for id in ["sbx_001abc", "sbx_0"] {
+            assert!(validate_sandbox_id(id).is_ok(), "{id}");
+        }
+        for id in [
+            "",
+            "sbx_",
+            "sbx_ABC",
+            "sbx-001",
+            "sbx_a b",
+            "-oProxyCommand=x",
+            "sbx_a;b",
+            "xsbx_1",
+            "sbx_a@b",
+        ] {
+            assert!(validate_sandbox_id(id).is_err(), "{id}");
+        }
+        for name in ["my-box", "ab", "a1", &"a".repeat(63)] {
+            assert!(validate_sandbox_name(name).is_ok(), "{name}");
+        }
+        for name in [
+            "",
+            "a",
+            "-x",
+            ".x",
+            "a.b",
+            "a_b",
+            "box_1.2",
+            "a b",
+            "a;b",
+            "a/b",
+            "$(x)",
+            "é1",
+            &"a".repeat(64),
+        ] {
+            assert!(validate_sandbox_name(name).is_err(), "{name}");
+        }
+        for path in ["/home/agent/ws", "/a", "/work/my-repo_1.2/"] {
+            assert!(validate_sandbox_workspace(path).is_ok(), "{path}");
+        }
+        for path in [
+            "",
+            "/",
+            "relative/ws",
+            "/a/../b",
+            "/a/./b",
+            "//a",
+            "/a//b",
+            "/a b",
+            "/a;b",
+            "/a'b",
+            "/a$(x)",
+            "/a\nb",
+            "~/ws",
+        ] {
+            assert!(validate_sandbox_workspace(path).is_err(), "{path}");
+        }
+        let mut target = sandbox_target();
+        assert!(check_target(&target).is_ok());
+        target.sandbox.as_mut().unwrap().relay_port = 0;
+        assert!(check_target(&target).is_err());
+        target.sandbox.as_mut().unwrap().relay_port = 1;
+        target.sandbox.as_mut().unwrap().workspace = "/a;rm -rf /".into();
+        assert!(check_target(&target).is_err());
+    }
+    #[test]
+    fn sandbox_targets_load_and_keep_old_shapes_on_disk() {
+        let old: SshTarget =
+            serde_json::from_str(r#"{"target":"x","port":null,"remotePort":3774,"codespace":"x"}"#)
+                .unwrap();
+        assert_eq!(old.sandbox, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("sandbox"));
+        let new: SshTarget = serde_json::from_str(
+            r#"{"target":"sbx_001abc@sbx_cloud","port":null,"remotePort":3774,"sandbox":{"id":"sbx_001abc","name":"my-box","workspace":"/home/agent/ws","relayPort":47200}}"#,
+        )
+        .unwrap();
+        assert_eq!(new, sandbox_target());
+        let again: SshTarget = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(again, new);
+    }
+    #[test]
+    fn sandbox_bootstrap_has_the_codespace_flags_and_an_optional_prelude() {
+        let plain = sandbox_bootstrap_script(None);
+        assert_eq!(plain, codespace_bootstrap_script());
+        assert!(plain.starts_with("MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n"));
+        let with = sandbox_bootstrap_script(Some("export X=1"));
+        assert!(with.starts_with("export X=1\nMONOCODE_HOST_TRACK_TOKEN=1\n"));
+    }
+    #[test]
+    fn sandbox_platform_is_unix_without_probing() {
+        let job = Job::new();
+        let askpass = job.askpass().unwrap();
+        assert_eq!(
+            detect_platform(&sandbox_target(), &job, &askpass).unwrap(),
+            HostPlatform::Unix
+        );
+        assert!(sandbox_target().is_cloud());
     }
 }
