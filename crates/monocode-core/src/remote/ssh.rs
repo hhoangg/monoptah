@@ -1822,6 +1822,8 @@ mod tests {
         assert_eq!(lines[3], "echo secret-script");
         assert!(!lines[..3].iter().any(|l| l.contains("secret-script")));
     }
+    // The fake ssh is a shell script.
+    #[cfg(unix)]
     #[test]
     fn sandbox_tunnel_forwards_to_the_relay_port_of_the_outer_sandbox() {
         let fixture = tempfile::tempdir().unwrap();

@@ -201,6 +201,8 @@ fn a_row_moved_to_another_identity_fails_to_decrypt() {
     assert!(f.creds.secret(&id).is_err());
 }
 
+// The askpass helper is unix-only (see `check_with`).
+#[cfg(unix)]
 #[test]
 fn check_access_keeps_the_token_out_of_argv_and_cleans_up() {
     let f = fixture();
@@ -289,6 +291,8 @@ fn secrets_do_not_print() {
     assert!(!format!("{secret:?}").contains(TOKEN));
 }
 
+// The askpass helper is unix-only (see `check_with`).
+#[cfg(unix)]
 #[test]
 fn git_gets_the_normalised_url_not_the_raw_input() {
     let f = fixture();
@@ -321,6 +325,8 @@ fn git_gets_the_normalised_url_not_the_raw_input() {
     }
 }
 
+// The askpass helper is unix-only (see `check_with`).
+#[cfg(unix)]
 #[test]
 fn check_access_maps_failures_and_redacts() {
     let f = fixture();
@@ -429,6 +435,8 @@ fn saving_without_a_database_creates_no_key_file() {
     assert!(!root.path().join("monocode.db").exists());
 }
 
+// The askpass helper is unix-only (see `check_with`).
+#[cfg(unix)]
 #[test]
 fn check_token_checks_an_unsaved_token_without_touching_the_database() {
     let root = tempfile::tempdir().unwrap();
@@ -456,6 +464,8 @@ fn check_token_checks_an_unsaved_token_without_touching_the_database() {
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
+// The askpass helper is unix-only (see `check_with`).
+#[cfg(unix)]
 #[test]
 fn check_token_validates_like_save_and_rejects_a_host_mismatch() {
     let runner = Fake {

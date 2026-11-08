@@ -2421,374 +2421,383 @@ fn deleting_a_stopped_sandbox_session_never_resumes_it_and_can_be_removed_locall
 
 // -------------------------------------------------------------- files-only archive
 
-fn run_git(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
-        .args([
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-        ])
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).to_string()
-}
+// The outer sandbox is Linux: these tests drive real `git` and `sh` scripts there.
+#[cfg(unix)]
+mod files_only {
+    use super::*;
 
-/// A started sandbox session whose outer workspace is a real git folder with unpushed work,
-/// an uncommitted edit and an untracked file, and a local clone of the project to archive into.
-struct Archivable {
-    fx: Fx,
-    id: i64,
-    name: String,
-    project: std::path::PathBuf,
-    _dir: tempfile::TempDir,
-}
-fn archivable() -> Archivable {
-    let dir = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
-    let origin = root.join("origin.git");
-    let ws = root.join("outer-ws");
-    let project = root.join("local-project");
-    std::fs::create_dir_all(&origin).unwrap();
-    run_git(&origin, &["init", "--bare", "-q", "-b", "main"]);
-    std::fs::create_dir_all(&ws).unwrap();
-    run_git(&ws, &["init", "-q", "-b", "main"]);
-    std::fs::write(ws.join("a.txt"), "one\n").unwrap();
-    run_git(&ws, &["add", "."]);
-    run_git(&ws, &["commit", "-q", "-m", "base"]);
-    run_git(&ws, &["remote", "add", "origin", origin.to_str().unwrap()]);
-    run_git(&ws, &["push", "-q", "origin", "main"]);
-    run_git(
-        &root,
-        &[
-            "clone",
-            "-q",
-            origin.to_str().unwrap(),
-            project.to_str().unwrap(),
-        ],
-    );
-    run_git(&ws, &["checkout", "-q", "-b", "feat/x"]);
-    std::fs::write(ws.join("made.txt"), "created in the old container\n").unwrap();
-    run_git(&ws, &["add", "made.txt"]);
-    run_git(&ws, &["commit", "-q", "-m", "unpushed work"]);
-    std::fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
-    std::fs::write(ws.join("untracked.txt"), "new file\n").unwrap();
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
 
-    let fx = fx_in(
-        CreateMode::Ok,
-        Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
-        Store::open(&root.join("native.db")).unwrap(),
-    );
-    let local = project.to_str().unwrap().to_string();
-    let (session, _) = fx
-        .svc
-        .begin_sandbox_start(&local, &config(), "fix/login", "claude")
+    /// A started sandbox session whose outer workspace is a real git folder with unpushed work,
+    /// an uncommitted edit and an untracked file, and a local clone of the project to archive into.
+    struct Archivable {
+        fx: Fx,
+        id: i64,
+        name: String,
+        project: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+    fn archivable() -> Archivable {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let origin = root.join("origin.git");
+        let ws = root.join("outer-ws");
+        let project = root.join("local-project");
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--bare", "-q", "-b", "main"]);
+        std::fs::create_dir_all(&ws).unwrap();
+        run_git(&ws, &["init", "-q", "-b", "main"]);
+        std::fs::write(ws.join("a.txt"), "one\n").unwrap();
+        run_git(&ws, &["add", "."]);
+        run_git(&ws, &["commit", "-q", "-m", "base"]);
+        run_git(&ws, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        run_git(&ws, &["push", "-q", "origin", "main"]);
+        run_git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                project.to_str().unwrap(),
+            ],
+        );
+        run_git(&ws, &["checkout", "-q", "-b", "feat/x"]);
+        std::fs::write(ws.join("made.txt"), "created in the old container\n").unwrap();
+        run_git(&ws, &["add", "made.txt"]);
+        run_git(&ws, &["commit", "-q", "-m", "unpushed work"]);
+        std::fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(ws.join("untracked.txt"), "new file\n").unwrap();
+
+        let fx = fx_in(
+            CreateMode::Ok,
+            Some(("CLAUDE_CODE_OAUTH_TOKEN", SECRET.into())),
+            Store::open(&root.join("native.db")).unwrap(),
+        );
+        let local = project.to_str().unwrap().to_string();
+        let (session, _) = fx
+            .svc
+            .begin_sandbox_start(&local, &config(), "fix/login", "claude")
+            .unwrap();
+        let binding = fx.run(session.id).0.unwrap();
+        super::super::docker_config::save(&fx.store.lock().unwrap(), &local, &config()).unwrap();
+        {
+            // The session ran Claude in the (old) container.
+            let store = fx.store.lock().unwrap();
+            let mut remote = store.remote_session(session.id).unwrap().unwrap();
+            remote.summary.provider_id = Some("claude-session-1".into());
+            remote.session_id = Some("host-1".into());
+            store.save_remote_session(&remote).unwrap();
+        }
+        *fx.shell.local.lock().unwrap() = Some((root.join("home"), ws));
+        Archivable {
+            fx,
+            id: session.id,
+            name: binding.codespace,
+            project,
+            _dir: dir,
+        }
+    }
+    impl Archivable {
+        /// The container the start remembered is no longer the one `devcontainer up` reports.
+        fn recreate(&self) {
+            self.fx
+                .store
+                .lock()
+                .unwrap()
+                .save_setting(
+                    &super::super::docker_start::container_key(&self.name),
+                    "ffffffffffffffffffff",
+                )
+                .unwrap();
+            self.fx.reset();
+        }
+        fn convert(&self) -> (Result<super::super::Converted, String>, Vec<String>) {
+            let mut lines = vec![];
+            let result = self
+                .fx
+                .svc
+                .convert_session(self.id, &mut |l| lines.push(l.to_string()));
+            (result, lines)
+        }
+        /// The calls that ran an archive script (not part of the start or reconnect flow).
+        fn archive_calls(&self) -> Vec<ShellCall> {
+            self.fx
+                .shell
+                .calls()
+                .into_iter()
+                .filter(|c| c.tag() == "other")
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_recreated_container_still_archives_its_files_from_the_outer_workspace() {
+        let a = archivable();
+        a.recreate();
+        let (result, lines) = a.convert();
+        let done = result.unwrap();
+        assert!(lines.iter().any(|l| l.contains("files only")), "{lines:?}");
+        // The local copy has the bundle and the patch (with the untracked file) from the workspace.
+        let code = done.code_dir.clone().unwrap();
+        assert!(code.join(super::super::BUNDLE).is_file());
+        let patch = std::fs::read_to_string(code.join(super::super::PATCH)).unwrap();
+        assert!(
+            patch.contains("untracked.txt") && patch.contains("two"),
+            "{patch}"
+        );
+        // Claude's JSONL lived in the old container: absent, and the warnings say so.
+        assert!(!code.join(super::super::RAW_JSONL).exists());
+        assert!(!matches!(done.resume, super::super::Resume::Installed(_)));
+        let warnings = done.warnings.join("\n");
+        assert!(warnings.contains("History may be incomplete"), "{warnings}");
+        assert!(warnings.contains("old container"), "{warnings}");
+        assert!(warnings.contains("evidence"), "{warnings}");
+        // The cloud record is gone, the copy is archived and tagged files-only.
+        let store = a.fx.store.lock().unwrap();
+        assert!(store.remote_session(a.id).unwrap().is_none());
+        let origin: Value = serde_json::from_str(
+            &store
+                .setting(&super::super::origin_key(
+                    CloudBackendKind::DockerSandbox,
+                    done.local_id,
+                ))
+                .unwrap()
+                .unwrap(),
+        )
         .unwrap();
-    let binding = fx.run(session.id).0.unwrap();
-    super::docker_config::save(&fx.store.lock().unwrap(), &local, &config()).unwrap();
-    {
-        // The session ran Claude in the (old) container.
-        let store = fx.store.lock().unwrap();
-        let mut remote = store.remote_session(session.id).unwrap().unwrap();
-        remote.summary.provider_id = Some("claude-session-1".into());
-        remote.session_id = Some("host-1".into());
-        store.save_remote_session(&remote).unwrap();
+        assert_eq!(origin["filesOnly"], true);
+        assert_eq!(origin["backend"], "dockerSandbox");
+        drop(store);
+        // Every archive script ran in the outer sandbox, none in the container.
+        let calls = a.archive_calls();
+        assert!(calls.len() >= 3, "{calls:?}");
+        assert!(calls.iter().all(|c| c.remote.starts_with("sh -c ")
+            && c.remote.contains(WORKSPACE)
+            && c.id == sandbox_id(&a.fx)));
+        // They run as the workspace's owner, and the conversation is reported as not saved.
+        assert!(
+            calls[0].remote.contains("sudo -n -u"),
+            "{}",
+            calls[0].remote
+        );
+        assert!(!done.history_saved);
+        assert!(super::super::unsaved_lines(std::slice::from_ref(&done))
+            .iter()
+            .any(|l| l.contains("conversation") && l.contains("was not saved")));
+        assert!(a
+            .fx
+            .shell
+            .calls()
+            .iter()
+            .all(|c| !c.remote.contains("devcontainer exec")));
+        // The stop or delete that follows is the ordinary one.
+        a.fx.svc
+            .stop_cloud(&super::super::backend::CloudRef::sandbox(&a.name))
+            .unwrap();
+        assert_eq!(a.fx.sbx.count("stop"), 1);
+        let _ = &a.project;
     }
-    *fx.shell.local.lock().unwrap() = Some((root.join("home"), ws));
-    Archivable {
-        fx,
-        id: session.id,
-        name: binding.codespace,
-        project,
-        _dir: dir,
+
+    #[test]
+    fn the_outer_archive_scripts_carry_no_secret_and_leave_no_stage_behind() {
+        let a = archivable();
+        a.recreate();
+        a.convert().0.unwrap();
+        for call in a.archive_calls() {
+            for secret in [SECRET, GIT_TOKEN] {
+                assert!(!call.stdin.contains(secret) && !call.remote.contains(secret));
+            }
+            assert!(!call.stdin.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+            // No Claude lookup: the JSONL is not in this sandbox's reach.
+            if call.stdin.contains("ws='") {
+                assert!(call.stdin.contains("id=''"), "{}", call.stdin);
+                assert!(!call.stdin.contains("claude-session-1"));
+            }
+        }
+        // The secret-carrying flows ran before, never after, the archive started.
+        let tags = a.fx.shell.tags();
+        assert!(
+            tags.iter().filter(|t| *t == "other").count() >= 3,
+            "{tags:?}"
+        );
+        // The stage is removed again through the same outer door.
+        assert!(a
+            .archive_calls()
+            .iter()
+            .any(|c| c.stdin.starts_with("rm -rf '/tmp/monoptah-archive.")));
     }
-}
-impl Archivable {
-    /// The container the start remembered is no longer the one `devcontainer up` reports.
-    fn recreate(&self) {
-        self.fx
+
+    #[test]
+    fn an_unreachable_host_needs_a_confirmation_before_the_files_only_archive() {
+        let a = archivable();
+        a.fx.reset();
+        a.fx.shell.fail("relay", "boom");
+        // The Host may still hold the conversation: nothing is converted or forgotten.
+        let error =
+            a.fx.svc
+                .convert_session_confirmed(a.id, false, &mut |_| {})
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                super::super::ConvertError::NeedsFilesOnlyConfirm { .. }
+            ),
+            "{error:?}"
+        );
+        assert!(a.archive_calls().is_empty());
+        assert!(a
+            .fx
             .store
             .lock()
             .unwrap()
-            .save_setting(
-                &super::docker_start::container_key(&self.name),
-                "ffffffffffffffffffff",
-            )
-            .unwrap();
-        self.fx.reset();
+            .remote_session(a.id)
+            .unwrap()
+            .is_some());
+        // The plain entry point tells the user to retry.
+        let text = a.convert().0.unwrap_err();
+        assert!(
+            text.contains("could not be reached") && text.contains("Retry"),
+            "{text}"
+        );
+        assert!(a.archive_calls().is_empty());
+        // Only an explicit confirmation archives the files.
+        let done =
+            a.fx.svc
+                .convert_session_confirmed(a.id, true, &mut |_| {})
+                .unwrap();
+        assert!(done.code_dir.unwrap().join(super::super::BUNDLE).is_file());
+        assert!(!done.history_saved);
+        assert!(done
+            .warnings
+            .iter()
+            .any(|w| w.contains("History may be incomplete")));
     }
-    fn convert(&self) -> (Result<super::Converted, String>, Vec<String>) {
-        let mut lines = vec![];
-        let result = self
+
+    #[test]
+    fn a_host_worktree_is_refused_and_a_removed_one_is_ignored() {
+        let a = archivable();
+        a.recreate();
+        let set = |cwd: &str, removed: bool| {
+            let store = a.fx.store.lock().unwrap();
+            let mut settings = store.agent_settings(a.id).unwrap().unwrap_or_default();
+            settings.worktree_cwd = Some(cwd.into());
+            settings.worktree_removed = removed;
+            store.save_agent_settings(a.id, &settings).unwrap();
+        };
+        set("/workspaces/widgets-worktrees/fix-login", false);
+        let error = a.convert().0.unwrap_err();
+        assert!(
+            error.contains("worktree lived only in the container"),
+            "{error}"
+        );
+        assert!(a.archive_calls().is_empty());
+        assert!(a
+            .fx
+            .store
+            .lock()
+            .unwrap()
+            .remote_session(a.id)
+            .unwrap()
+            .is_some());
+        // A removed worktree is not looked at: the main workspace is archived.
+        set("/workspaces/widgets-worktrees/fix-login", true);
+        a.recreate();
+        a.convert().0.unwrap();
+    }
+
+    #[test]
+    fn a_deleted_sandbox_is_not_archived_as_files_only() {
+        let a = archivable();
+        a.fx.sbx.remove(&sandbox_id(&a.fx));
+        a.fx.reset();
+        let error = a.convert().0.unwrap_err();
+        assert!(error.contains("deleted"), "{error}");
+        assert!(a.fx.shell.calls().is_empty());
+        assert!(a
+            .fx
+            .store
+            .lock()
+            .unwrap()
+            .remote_session(a.id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn the_plain_reconnect_reports_a_recreated_container_and_never_archives() {
+        let a = archivable();
+        a.recreate();
+        let error = a.fx.reconnect(a.id).0.unwrap_err();
+        assert!(error.contains("recreated"), "{error}");
+        let typed =
+            a.fx.svc
+                .reconnect_sandbox_typed(a.id, &mut |_| {}, &AtomicBool::new(false))
+                .unwrap_err();
+        assert_eq!(typed, super::super::docker_start::ReconnectError::Recreated);
+        assert!(a.archive_calls().is_empty());
+        assert!(a
+            .fx
+            .store
+            .lock()
+            .unwrap()
+            .remote_session(a.id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn background_paths_against_a_recreated_container_make_no_outer_calls() {
+        let a = archivable();
+        a.recreate();
+        // What a Mono, a poll or the app API can do: the plain reconnect (typed or not), a list
+        // and a stop. None of them archive or run anything in the outer sandbox.
+        assert!(a.fx.reconnect(a.id).0.is_err());
+        assert!(a
             .fx
             .svc
-            .convert_session(self.id, &mut |l| lines.push(l.to_string()));
-        (result, lines)
-    }
-    /// The calls that ran an archive script (not part of the start or reconnect flow).
-    fn archive_calls(&self) -> Vec<ShellCall> {
-        self.fx
+            .reconnect_sandbox_typed(a.id, &mut |_| {}, &AtomicBool::new(false))
+            .is_err());
+        let cloud = super::super::backend::CloudRef::sandbox(&a.name);
+        let _ = a.fx.svc.sessions_in_cloud(&cloud);
+        a.fx.svc.stop_cloud(&cloud).unwrap();
+        assert!(a.archive_calls().is_empty());
+        assert!(a
+            .fx
             .shell
             .calls()
-            .into_iter()
-            .filter(|c| c.tag() == "other")
-            .collect()
-    }
-}
-
-#[test]
-fn a_recreated_container_still_archives_its_files_from_the_outer_workspace() {
-    let a = archivable();
-    a.recreate();
-    let (result, lines) = a.convert();
-    let done = result.unwrap();
-    assert!(lines.iter().any(|l| l.contains("files only")), "{lines:?}");
-    // The local copy has the bundle and the patch (with the untracked file) from the workspace.
-    let code = done.code_dir.clone().unwrap();
-    assert!(code.join(super::BUNDLE).is_file());
-    let patch = std::fs::read_to_string(code.join(super::PATCH)).unwrap();
-    assert!(
-        patch.contains("untracked.txt") && patch.contains("two"),
-        "{patch}"
-    );
-    // Claude's JSONL lived in the old container: absent, and the warnings say so.
-    assert!(!code.join(super::RAW_JSONL).exists());
-    assert!(!matches!(done.resume, super::Resume::Installed(_)));
-    let warnings = done.warnings.join("\n");
-    assert!(warnings.contains("History may be incomplete"), "{warnings}");
-    assert!(warnings.contains("old container"), "{warnings}");
-    assert!(warnings.contains("evidence"), "{warnings}");
-    // The cloud record is gone, the copy is archived and tagged files-only.
-    let store = a.fx.store.lock().unwrap();
-    assert!(store.remote_session(a.id).unwrap().is_none());
-    let origin: Value = serde_json::from_str(
-        &store
-            .setting(&super::origin_key(
-                CloudBackendKind::DockerSandbox,
-                done.local_id,
-            ))
+            .iter()
+            .all(|c| !c.remote.contains("stat -c")));
+        assert!(a
+            .fx
+            .store
+            .lock()
             .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(origin["filesOnly"], true);
-    assert_eq!(origin["backend"], "dockerSandbox");
-    drop(store);
-    // Every archive script ran in the outer sandbox, none in the container.
-    let calls = a.archive_calls();
-    assert!(calls.len() >= 3, "{calls:?}");
-    assert!(calls.iter().all(|c| c.remote.starts_with("sh -c ")
-        && c.remote.contains(WORKSPACE)
-        && c.id == sandbox_id(&a.fx)));
-    // They run as the workspace's owner, and the conversation is reported as not saved.
-    assert!(
-        calls[0].remote.contains("sudo -n -u"),
-        "{}",
-        calls[0].remote
-    );
-    assert!(!done.history_saved);
-    assert!(super::unsaved_lines(std::slice::from_ref(&done))
-        .iter()
-        .any(|l| l.contains("conversation") && l.contains("was not saved")));
-    assert!(a
-        .fx
-        .shell
-        .calls()
-        .iter()
-        .all(|c| !c.remote.contains("devcontainer exec")));
-    // The stop or delete that follows is the ordinary one.
-    a.fx.svc
-        .stop_cloud(&super::backend::CloudRef::sandbox(&a.name))
-        .unwrap();
-    assert_eq!(a.fx.sbx.count("stop"), 1);
-    let _ = &a.project;
-}
-
-#[test]
-fn the_outer_archive_scripts_carry_no_secret_and_leave_no_stage_behind() {
-    let a = archivable();
-    a.recreate();
-    a.convert().0.unwrap();
-    for call in a.archive_calls() {
-        for secret in [SECRET, GIT_TOKEN] {
-            assert!(!call.stdin.contains(secret) && !call.remote.contains(secret));
-        }
-        assert!(!call.stdin.contains("CLAUDE_CODE_OAUTH_TOKEN"));
-        // No Claude lookup: the JSONL is not in this sandbox's reach.
-        if call.stdin.contains("ws='") {
-            assert!(call.stdin.contains("id=''"), "{}", call.stdin);
-            assert!(!call.stdin.contains("claude-session-1"));
-        }
+            .remote_session(a.id)
+            .unwrap()
+            .is_some());
     }
-    // The secret-carrying flows ran before, never after, the archive started.
-    let tags = a.fx.shell.tags();
-    assert!(
-        tags.iter().filter(|t| *t == "other").count() >= 3,
-        "{tags:?}"
-    );
-    // The stage is removed again through the same outer door.
-    assert!(a
-        .archive_calls()
-        .iter()
-        .any(|c| c.stdin.starts_with("rm -rf '/tmp/monoptah-archive.")));
-}
-
-#[test]
-fn an_unreachable_host_needs_a_confirmation_before_the_files_only_archive() {
-    let a = archivable();
-    a.fx.reset();
-    a.fx.shell.fail("relay", "boom");
-    // The Host may still hold the conversation: nothing is converted or forgotten.
-    let error =
-        a.fx.svc
-            .convert_session_confirmed(a.id, false, &mut |_| {})
-            .unwrap_err();
-    assert!(
-        matches!(error, super::ConvertError::NeedsFilesOnlyConfirm { .. }),
-        "{error:?}"
-    );
-    assert!(a.archive_calls().is_empty());
-    assert!(a
-        .fx
-        .store
-        .lock()
-        .unwrap()
-        .remote_session(a.id)
-        .unwrap()
-        .is_some());
-    // The plain entry point tells the user to retry.
-    let text = a.convert().0.unwrap_err();
-    assert!(
-        text.contains("could not be reached") && text.contains("Retry"),
-        "{text}"
-    );
-    assert!(a.archive_calls().is_empty());
-    // Only an explicit confirmation archives the files.
-    let done =
-        a.fx.svc
-            .convert_session_confirmed(a.id, true, &mut |_| {})
-            .unwrap();
-    assert!(done.code_dir.unwrap().join(super::BUNDLE).is_file());
-    assert!(!done.history_saved);
-    assert!(done
-        .warnings
-        .iter()
-        .any(|w| w.contains("History may be incomplete")));
-}
-
-#[test]
-fn a_host_worktree_is_refused_and_a_removed_one_is_ignored() {
-    let a = archivable();
-    a.recreate();
-    let set = |cwd: &str, removed: bool| {
-        let store = a.fx.store.lock().unwrap();
-        let mut settings = store.agent_settings(a.id).unwrap().unwrap_or_default();
-        settings.worktree_cwd = Some(cwd.into());
-        settings.worktree_removed = removed;
-        store.save_agent_settings(a.id, &settings).unwrap();
-    };
-    set("/workspaces/widgets-worktrees/fix-login", false);
-    let error = a.convert().0.unwrap_err();
-    assert!(
-        error.contains("worktree lived only in the container"),
-        "{error}"
-    );
-    assert!(a.archive_calls().is_empty());
-    assert!(a
-        .fx
-        .store
-        .lock()
-        .unwrap()
-        .remote_session(a.id)
-        .unwrap()
-        .is_some());
-    // A removed worktree is not looked at: the main workspace is archived.
-    set("/workspaces/widgets-worktrees/fix-login", true);
-    a.recreate();
-    a.convert().0.unwrap();
-}
-
-#[test]
-fn a_deleted_sandbox_is_not_archived_as_files_only() {
-    let a = archivable();
-    a.fx.sbx.remove(&sandbox_id(&a.fx));
-    a.fx.reset();
-    let error = a.convert().0.unwrap_err();
-    assert!(error.contains("deleted"), "{error}");
-    assert!(a.fx.shell.calls().is_empty());
-    assert!(a
-        .fx
-        .store
-        .lock()
-        .unwrap()
-        .remote_session(a.id)
-        .unwrap()
-        .is_some());
-}
-
-#[test]
-fn the_plain_reconnect_reports_a_recreated_container_and_never_archives() {
-    let a = archivable();
-    a.recreate();
-    let error = a.fx.reconnect(a.id).0.unwrap_err();
-    assert!(error.contains("recreated"), "{error}");
-    let typed =
-        a.fx.svc
-            .reconnect_sandbox_typed(a.id, &mut |_| {}, &AtomicBool::new(false))
-            .unwrap_err();
-    assert_eq!(typed, super::docker_start::ReconnectError::Recreated);
-    assert!(a.archive_calls().is_empty());
-    assert!(a
-        .fx
-        .store
-        .lock()
-        .unwrap()
-        .remote_session(a.id)
-        .unwrap()
-        .is_some());
-}
-
-#[test]
-fn background_paths_against_a_recreated_container_make_no_outer_calls() {
-    let a = archivable();
-    a.recreate();
-    // What a Mono, a poll or the app API can do: the plain reconnect (typed or not), a list
-    // and a stop. None of them archive or run anything in the outer sandbox.
-    assert!(a.fx.reconnect(a.id).0.is_err());
-    assert!(a
-        .fx
-        .svc
-        .reconnect_sandbox_typed(a.id, &mut |_| {}, &AtomicBool::new(false))
-        .is_err());
-    let cloud = super::backend::CloudRef::sandbox(&a.name);
-    let _ = a.fx.svc.sessions_in_cloud(&cloud);
-    a.fx.svc.stop_cloud(&cloud).unwrap();
-    assert!(a.archive_calls().is_empty());
-    assert!(a
-        .fx
-        .shell
-        .calls()
-        .iter()
-        .all(|c| !c.remote.contains("stat -c")));
-    assert!(a
-        .fx
-        .store
-        .lock()
-        .unwrap()
-        .remote_session(a.id)
-        .unwrap()
-        .is_some());
 }
 
 #[test]
