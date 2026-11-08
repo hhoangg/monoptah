@@ -136,6 +136,8 @@ impl Store {
             due_at INTEGER NOT NULL, fired_at INTEGER);").map_err(|e| e.to_string())?;
         conn.execute_batch(crate::accounts::CREDENTIALS_TABLE)
             .map_err(|e| e.to_string())?;
+        conn.execute_batch(crate::git_credentials::GIT_CREDENTIALS_TABLE)
+            .map_err(|e| e.to_string())?;
         if let Some(dir) = path.parent() {
             crate::accounts::register_database(dir, path);
         }

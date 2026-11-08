@@ -1254,6 +1254,7 @@ impl StartupSummary {
 }
 
 pub mod backend;
+pub mod docker_config;
 pub use backend::{CloudBackend, CloudBackendKind, CloudRef, CodespacesBackend};
 
 mod convert;
@@ -1268,6 +1269,8 @@ pub use startup::{
 // These fixtures execute the Linux host scripts against local Unix paths.
 #[cfg(all(test, unix))]
 mod convert_tests;
+#[cfg(test)]
+mod docker_config_tests;
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]
