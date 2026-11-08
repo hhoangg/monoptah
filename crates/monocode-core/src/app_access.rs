@@ -46,6 +46,9 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
     if input["notifyOnComplete"] == true {
         return Err("Completion notifications are only available in a Mono's chat".into());
     }
+    if action == "sessions.archive" && input["cloud"] == "delete" {
+        return Err("Deleting a codespace or sandbox is only available to a Mono".into());
+    }
     if input["providerFiles"] == true {
         return Err("Removing provider session files is only available to a Mono".into());
     }

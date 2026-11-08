@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { constants } from "node:fs";
 import { promisify } from "node:util";
 import {
   lstat,
@@ -440,6 +441,44 @@ export async function readHostFile(
   const bytes = await readFile(path);
   if (bytes.includes(0)) throw new Error("Binary file cannot be previewed");
   return bytes.toString("utf8");
+}
+
+/** Largest byte range one `files.readBytes` call returns. Divisible by three so
+ * the client can join the base64 of consecutive chunks. */
+export const MAX_READ_CHUNK = 3 * 131_072;
+
+/** Reads a byte range of any workspace file (images, large files, binaries) as
+ * base64. Paths are checked like every other file call: no `.git` segment and
+ * no symlink leaving the workspace. */
+export async function readHostFileChunk(
+  root: string,
+  input: unknown,
+  rawOffset: unknown,
+  rawLength: unknown,
+): Promise<{ data: string; offset: number; size: number }> {
+  if (!Number.isSafeInteger(rawOffset) || Number(rawOffset) < 0)
+    throw new Error("Invalid file offset");
+  if (!Number.isSafeInteger(rawLength) || Number(rawLength) < 1)
+    throw new Error("Invalid file length");
+  const offset = Number(rawOffset);
+  const length = Math.min(Number(rawLength), MAX_READ_CHUNK);
+  const path = await existingPath(root, input);
+  // The path is already resolved; O_NOFOLLOW also refuses a link swapped in since.
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error("Path is not a file");
+    if (offset > info.size) throw new Error("Invalid file offset");
+    const bytes = Buffer.alloc(Math.min(length, info.size - offset));
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, offset);
+    return {
+      data: bytes.subarray(0, bytesRead).toString("base64"),
+      offset: offset + bytesRead,
+      size: info.size,
+    };
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function writeHostFile(

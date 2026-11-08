@@ -3,7 +3,7 @@
 //! (devcontainer secrets plus CLAUDE_CODE_OAUTH_TOKEN). `model` holds what it says and
 //! decides. Every `gh` call runs on the background executor. Secret values live only in
 //! the masked inputs until Save hands them to `gh`, then the inputs are emptied.
-mod model;
+pub(crate) mod model;
 #[cfg(test)]
 mod tests;
 

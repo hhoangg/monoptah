@@ -67,11 +67,16 @@ if [ "$EXISTED" = 1 ] && [ "$FORCE_UPGRADE" = 1 ]; then
 fi
 TOKEN_MARKER="$BASE/host-token.sha256"
 TOKEN_HASH=
-if [ "${MONOCODE_HOST_TRACK_TOKEN:-0}" = 1 ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+# A sandbox may track an API key instead (MONOCODE_HOST_TOKEN_VAR); a codespace never sets it.
+case "${MONOCODE_HOST_TOKEN_VAR:-}" in
+  ANTHROPIC_API_KEY) TOKEN_VALUE=${ANTHROPIC_API_KEY:-} ;;
+  *) TOKEN_VALUE=${CLAUDE_CODE_OAUTH_TOKEN:-} ;;
+esac
+if [ "${MONOCODE_HOST_TRACK_TOKEN:-0}" = 1 ] && [ -n "$TOKEN_VALUE" ]; then
   if command -v sha256sum >/dev/null 2>&1; then
-    TOKEN_HASH=$(printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" | sha256sum | awk '{print $1}')
+    TOKEN_HASH=$(printf '%s' "$TOKEN_VALUE" | sha256sum | awk '{print $1}')
   elif command -v shasum >/dev/null 2>&1; then
-    TOKEN_HASH=$(printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" | shasum -a 256 | awk '{print $1}')
+    TOKEN_HASH=$(printf '%s' "$TOKEN_VALUE" | shasum -a 256 | awk '{print $1}')
   fi
   # A host started without (or with another) token keeps its old environment.
   if [ -n "$TOKEN_HASH" ] && [ "$(cat "$TOKEN_MARKER" 2>/dev/null || true)" != "$TOKEN_HASH" ]; then

@@ -716,8 +716,6 @@ pub(crate) struct TranscriptView {
     /// The codespace start of a cloud session and the message queued behind it.
     cloud_start: Option<Arc<crate::cloud_start_view::CloudStartSnapshot>>,
     cloud_queued: Option<String>,
-    /// Whether the user opened or closed the status row's steps, for the phase it was in.
-    cloud_steps_open: Option<(crate::cloud_start_view::StartPhase, bool)>,
     cloud_clock: Option<gpui::Task<()>>,
     /// Pending messages just taken, including any entrance still in flight.
     taken: Vec<TakenMessage>,
@@ -2522,7 +2520,6 @@ impl TranscriptView {
             saved_draft: None,
             cloud_start: None,
             cloud_queued: None,
-            cloud_steps_open: None,
             cloud_clock: None,
             taken: Vec::new(),
             pending_entrances: HashMap::new(),

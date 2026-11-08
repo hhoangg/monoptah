@@ -138,6 +138,7 @@ fn machine(codespace: &str) -> Machine {
         environment_id: format!("env-{codespace}"),
         ssh: None,
         codespace: Some(codespace.into()),
+        sandbox: None,
     }
 }
 impl super::Host for Host {
@@ -844,27 +845,29 @@ fn rebuild_resets_the_steps_and_the_browser_url_is_known() {
 // ------------------------------------------------------------ queue + refusal
 
 #[test]
-fn a_message_typed_while_starting_is_kept_as_the_first_prompt() {
+fn a_message_typed_while_starting_joins_the_send_queue_in_order() {
     let f = fx(Gh::new(&[], &[]));
     let (session, _) = f.svc.begin_start("/p", named_target(), "claude").unwrap();
     let store = f.store.lock().unwrap();
-    assert_eq!(queued_start_message(&store, session.id), None);
+    assert!(queued_start_messages(&store, session.id).is_empty());
     queue_start_message(&store, session.id, "Fix the bug").unwrap();
-    assert_eq!(
-        queued_start_message(&store, session.id).as_deref(),
-        Some("Fix the bug")
-    );
-    let draft = store.follow_ups(session.id).unwrap().draft.unwrap();
-    assert!(draft.id.starts_with("app-prompt-"));
     queue_start_message(&store, session.id, "Then add a test").unwrap();
     assert_eq!(
-        queued_start_message(&store, session.id).as_deref(),
-        Some("Fix the bug\n\nThen add a test")
+        queued_start_messages(&store, session.id),
+        vec!["Fix the bug".to_owned(), "Then add a test".to_owned()]
     );
+    let state = store.follow_ups(session.id).unwrap();
+    assert!(state
+        .messages
+        .iter()
+        .all(|m| m.id.starts_with("cloud-start-")));
+    assert!(!state.messages.iter().any(|m| m.steer));
+    // The app-launched draft is a separate mechanism.
+    assert_eq!(queued_start_message(&store, session.id), None);
 }
 
 #[test]
-fn an_unrelated_draft_is_never_overwritten() {
+fn queuing_a_start_message_never_touches_the_users_draft() {
     let f = fx(Gh::new(&[], &[]));
     let (session, _) = f.svc.begin_start("/p", named_target(), "claude").unwrap();
     let store = f.store.lock().unwrap();
@@ -875,8 +878,8 @@ fn an_unrelated_draft_is_never_overwritten() {
         ..Default::default()
     });
     store.save_follow_ups(session.id, &state).unwrap();
-    assert!(queue_start_message(&store, session.id, "x").is_err());
-    assert_eq!(queued_start_message(&store, session.id), None);
+    queue_start_message(&store, session.id, "x").unwrap();
+    assert_eq!(queued_start_messages(&store, session.id), vec!["x"]);
     assert_eq!(
         store.follow_ups(session.id).unwrap().draft.unwrap().text,
         "mine"
@@ -1013,4 +1016,39 @@ fn a_deleted_record_cannot_be_resurrected_by_a_late_publish() {
         .unwrap();
     f.svc.persist_start(&original);
     assert!(f.record(session.id).is_none());
+}
+
+/// A `cloud-starts.v1` record as written before sandboxes existed.
+const OLD_START_RECORD: &str = r#"{"sessionId":4,"localProject":"/p","codespace":"cs-1","repo":"octo/widgets","branch":"main","machine":null,"display":"monoptah-main","remoteCwd":"/workspaces/widgets","webUrl":null,"created":true,"ghState":"Provisioning","steps":[],"error":null,"failedAt":null,"logTail":[],"startedAt":1000,"finishedAt":null,"trackReady":true}"#;
+
+#[test]
+fn an_old_start_record_reads_as_a_codespace_and_writes_back_unchanged() {
+    let record: StartRecord = serde_json::from_str(OLD_START_RECORD).unwrap();
+    assert_eq!(record.sandbox, None);
+    assert_eq!(record.backend(), CloudBackendKind::Codespaces);
+    assert_eq!(record.cloud(), Some(CloudRef::codespace("cs-1")));
+    assert_eq!(serde_json::to_string(&record).unwrap(), OLD_START_RECORD);
+    assert!(!serde_json::to_string(&fresh_record())
+        .unwrap()
+        .contains("sandbox"));
+}
+
+#[test]
+fn a_sandbox_start_record_round_trips_and_reports_its_backend() {
+    let mut record = fresh_record();
+    record.codespace = String::new();
+    record.sandbox = Some("sbx-1".into());
+    let json = serde_json::to_string(&record).unwrap();
+    let back: StartRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, record);
+    assert_eq!(back.backend(), CloudBackendKind::DockerSandbox);
+    assert_eq!(back.cloud(), Some(CloudRef::sandbox("sbx-1")));
+}
+
+#[test]
+fn a_start_record_without_a_codespace_names_no_workspace() {
+    let mut value: serde_json::Value = serde_json::from_str(OLD_START_RECORD).unwrap();
+    value["codespace"] = "".into();
+    let record: StartRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(record.cloud(), None);
 }

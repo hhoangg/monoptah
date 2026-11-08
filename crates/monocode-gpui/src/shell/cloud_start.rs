@@ -1,7 +1,7 @@
-//! The startup of a cloud session in the shell: a session exists as soon as its codespace is
-//! requested, and this module follows the start in the background (`CloudSessions::run_start`),
-//! feeds the conversation and the Codespace panel, and performs Retry / Rebuild / Open in
-//! browser / Delete. State lives in `Shell::cloud_starts`, one [`CloudStartView`] per session.
+//! The startup of a cloud session in the shell: a session exists as soon as its codespace (or
+//! sandbox) is requested, and this module follows the start in the background
+//! (`CloudSessions::run_start`), feeds the conversation and the Codespace panel, and performs
+//! Retry / Rebuild / Open in browser / Delete. State lives in `Shell::cloud_starts`, one [`CloudStartView`] per session.
 use super::cloud::{CloudMark, Indicator, Tone};
 use super::*;
 use crate::cloud_start_view::{
@@ -9,7 +9,8 @@ use crate::cloud_start_view::{
 };
 use crate::right_panel::RightTab;
 use monocode_core::cloud_sessions::{
-    CloudState, StartEvent, StartRecord, pending_starts, queued_start_message,
+    CloudRef, CloudState, StartEvent, StartRecord, pending_starts, queued_start_message,
+    queued_start_messages,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -74,6 +75,24 @@ impl CloudStartView {
             self.running,
         ));
     }
+}
+
+/// The title and body of the Rebuild confirmation. A sandbox rebuild recreates the container
+/// that holds the conversations, so its text says they are lost.
+pub(super) fn rebuild_prompt(
+    backend: monocode_core::cloud_sessions::CloudBackendKind,
+) -> (String, String) {
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    let noun = backend.noun();
+    let mut body =
+        format!("This interrupts every session using this {noun} and recreates its container.");
+    if backend == CloudBackendKind::DockerSandbox {
+        body.push_str(
+            " The conversation history of those sessions is lost; archive a session first to \
+             keep it. Code in the workspace is kept.",
+        );
+    }
+    (format!("Rebuild this {noun}?"), body)
 }
 
 impl Drop for CloudStartView {
@@ -184,17 +203,24 @@ impl Shell {
         let id = summary.id;
         summary.has_messages = true;
         self.workspace.add_project(&record.local_project);
+        let cloud = record
+            .cloud()
+            .unwrap_or_else(|| CloudRef::codespace(&record.codespace));
         self.cloud_marks.insert(
             id,
             CloudMark {
                 local_project: record.local_project.clone(),
-                codespace: record.codespace.clone(),
+                codespace: cloud.name.clone(),
+                kind: cloud.kind,
             },
         );
         // The state is not known yet; never claim Available.
         self.cloud_states
-            .entry(record.codespace.clone())
+            .entry(cloud.key())
             .or_insert(CloudState::Unknown);
+        // A failed record (an ambiguous create) waits for the user's Retry: tracking it would
+        // run the start again, and with it another create, without a click.
+        let failed = record.is_failed();
         let mut view = CloudStartView::new(record);
         view.auto_opened = true;
         self.cloud_starts.insert(id, view);
@@ -203,7 +229,9 @@ impl Shell {
         self.order.insert(0, id);
         self.activate_session(id, window, cx);
         self.show_codespace_panel(id, window, cx);
-        self.track_cloud_start(id, cx);
+        if !failed {
+            self.track_cloud_start(id, cx);
+        }
         self.invalidate_chrome(cx);
         self.refresh_cloud(cx);
     }
@@ -228,6 +256,8 @@ impl Shell {
             return;
         }
         let cloud = self.cloud.clone();
+        let title = self.cloud_starts[&id].record.backend().title();
+        let stopped_title = title;
         let (events, incoming) = async_channel::unbounded::<StartEvent>();
         let worker_cancel = cancel.clone();
         let (result_tx, result_rx) = async_channel::bounded(1);
@@ -245,7 +275,7 @@ impl Shell {
                     cloud.run_start(id, &mut send, &worker_cancel).map(|_| ())
                 }
             }))
-            .unwrap_or_else(|_| Err("Codespace startup worker crashed".into()));
+            .unwrap_or_else(|_| Err(format!("{title} startup worker crashed")));
             let _ = result_tx.try_send(outcome);
         });
         cx.spawn(async move |this, cx| {
@@ -280,7 +310,7 @@ impl Shell {
             let result = result_rx
                 .recv()
                 .await
-                .unwrap_or_else(|_| Err("Codespace startup worker stopped".into()));
+                .unwrap_or_else(|_| Err(format!("{stopped_title} startup worker stopped")));
             let _ = this.update(cx, |this, cx| this.finish_start_worker(id, result, cx));
         })
         .detach();
@@ -354,17 +384,21 @@ impl Shell {
         });
         view.rebuild();
         let snapshot = view.snapshot.clone();
-        let codespace = view.record.codespace.clone();
+        let state_key = view
+            .record
+            .cloud()
+            .unwrap_or_else(|| CloudRef::codespace(&view.record.codespace))
+            .key();
         let auto_opened = view.auto_opened;
         let mut session = session;
         session.has_messages = true;
         self.session_summaries.insert(id, session.clone());
-        self.cloud_states.insert(codespace, CloudState::Available);
+        self.cloud_states.insert(state_key, CloudState::Available);
         // A queued message needs the conversation to send it.
-        let queued = locked(&self.store)
-            .ok()
-            .and_then(|store| queued_start_message(&store, id))
-            .is_some();
+        let queued = locked(&self.store).is_ok_and(|store| {
+            queued_start_message(&store, id).is_some()
+                || !queued_start_messages(&store, id).is_empty()
+        });
         if queued {
             self.ensure_session(id, cx);
         }
@@ -414,6 +448,8 @@ impl Shell {
             .workspace
             .active
             .and_then(|id| self.cloud_start_snapshot(id));
+        let title = snapshot.as_ref().map_or("Codespace", |s| s.title());
+        panel.update(cx, |panel, cx| panel.set_codespace_title(title, cx));
         if snapshot.is_none() && panel.read(cx).tab() == RightTab::Codespace {
             let tab = self
                 .codespace_return
@@ -520,17 +556,36 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // These come from a session whose sandbox is gone: it has no start view.
+        match action {
+            StartAction::ArchiveSession => {
+                self.open_cloud_archive(vec![id], window, cx);
+                return;
+            }
+            StartAction::NewSession => {
+                // A new local session in the project; running it on the cloud is offered by
+                // the project's Workspace menu.
+                self.new_chat(cx);
+                return;
+            }
+            _ => {}
+        }
         if !self.cloud_starts.contains_key(&id) {
             return;
         }
         match action {
+            StartAction::ArchiveSession | StartAction::NewSession => {}
             StartAction::ShowPanel => self.show_codespace_panel(id, window, cx),
             StartAction::Retry => self.track_cloud_start(id, cx),
             StartAction::Rebuild => {
-                let answer = window.prompt(gpui::PromptLevel::Warning,
-                    "Rebuild this codespace?",
-                    Some("This interrupts every session using this codespace and recreates its container."),
-                    &["Rebuild", "Cancel"], cx);
+                let (heading, body) = rebuild_prompt(self.cloud_starts[&id].record.backend());
+                let answer = window.prompt(
+                    gpui::PromptLevel::Warning,
+                    &heading,
+                    Some(&body),
+                    &["Rebuild", "Cancel"],
+                    cx,
+                );
                 cx.spawn(async move |this, cx| {
                     if matches!(answer.await, Ok(0)) {
                         let _ = this.update(cx, |this, cx| this.rebuild_cloud_start(id, cx));
@@ -538,6 +593,8 @@ impl Shell {
                 })
                 .detach();
             }
+            // A sandbox has no web view: the buttons are hidden, and a stray request is dropped.
+            StartAction::OpenInBrowser if !self.cloud_starts[&id].snapshot.offers_browser() => {}
             StartAction::OpenInBrowser => {
                 let name = self.cloud_starts[&id].record.codespace.clone();
                 if let Some(url) = &self.cloud_starts[&id].record.web_url {

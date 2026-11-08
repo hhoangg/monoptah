@@ -55,7 +55,7 @@ impl Conversation {
             );
             // A stopped codespace never loads in the background: wake it, as a send would.
             if send && !self.cloud_start_blocks() {
-                self.reconnect_cloud(cx);
+                self.reconnect_cloud(false, cx);
             }
             return;
         }
@@ -109,6 +109,9 @@ impl Conversation {
         draft: bool,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        if self.cloud_locked {
+            return Err(crate::shell::CLOUD_ARCHIVING.into());
+        }
         if self.busy
             || self.stopping
             || self.mono_ui.external.is_some()

@@ -42,6 +42,7 @@ fn open(
                 Box::new(crate::document_lightbox::Open {
                     path,
                     title: name.to_string().into(),
+                    cloud: None,
                 }),
                 cx,
             )
@@ -142,4 +143,46 @@ fn the_lightbox_learns_when_a_toast_sits_above_it(cx: &mut TestAppContext) {
     visual.run_until_parked();
     visual.refresh().unwrap();
     assert!(covered(window, &mut visual));
+}
+
+#[gpui::test]
+fn a_cloud_file_in_memory_opens_without_reading_disk_or_offering_the_default_app(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        crate::input::bind(cx);
+        crate::document_lightbox::bind(cx);
+        super::bind_keys(cx);
+        cx.set_reduce_motion(true);
+    });
+    let (window, _, _) = super::tests::window(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(&mut visual, |shell, w, cx| {
+            shell.focus_active(w, cx);
+            w.dispatch_action(
+                Box::new(crate::document_lightbox::Open {
+                    // Only names the file: it does not exist locally.
+                    path: "/nonexistent/cloud/src/main.rs".into(),
+                    title: "main.rs".into(),
+                    cloud: Some(crate::document_lightbox::CloudDoc {
+                        kind: crate::document_lightbox::Kind::Code,
+                        text: Some("fn main() {}".into()),
+                        web_root: None,
+                    }),
+                }),
+                cx,
+            )
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    assert!(is_open(window, &mut visual));
+    assert!(visual.debug_bounds("document-lightbox-markdown").is_some());
+    assert!(visual.debug_bounds("document-lightbox-copy").is_some());
+    assert!(
+        visual
+            .debug_bounds("document-lightbox-open-external")
+            .is_none()
+    );
 }

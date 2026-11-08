@@ -22,6 +22,180 @@ pub struct SshTarget {
     /// only mirrors the name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codespace: Option<String>,
+    /// Docker Sandbox. When set, every connection goes through plain `ssh` to
+    /// `<id>@sbx_cloud` (the alias `sbx setup ssh` writes), and commands that
+    /// belong to the Host run inside the devcontainer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxTarget>,
+}
+
+/// Where a sandbox session's Host and agent run.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SandboxMode {
+    /// In the repository's devcontainer. The default, so a record or target written before
+    /// this field existed keeps its meaning.
+    #[default]
+    Container,
+    /// Directly in the outer sandbox: the repository has no devcontainer config.
+    Plain,
+}
+
+impl SandboxMode {
+    pub fn is_container(&self) -> bool {
+        *self == Self::Container
+    }
+}
+
+/// A Docker Sandbox that runs the Host inside the repository's devcontainer, or (when the
+/// repository has none, see [`SandboxMode::Plain`]) directly in the outer sandbox.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxTarget {
+    /// Sandbox id (`sbx_...`), also the ssh user.
+    pub id: String,
+    /// Sandbox name, for display and the machine endpoint.
+    pub name: String,
+    /// Workspace folder in the OUTER sandbox, the devcontainer's workspace.
+    pub workspace: String,
+    /// Loopback port in the outer sandbox where a relay bridges into the container's Host;
+    /// the tunnel forwards to it. Unused in [`SandboxMode::Plain`]: there is no relay and the
+    /// tunnel goes to the Host's own port.
+    pub relay_port: u16,
+    /// Dev container config, relative to `workspace`, when it is not the default one
+    /// (`devcontainer exec` finds its container by workspace and config file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    /// Container or plain outer sandbox. Absent in older records: Container.
+    #[serde(default, skip_serializing_if = "SandboxMode::is_container")]
+    pub mode: SandboxMode,
+}
+
+/// Host alias written by `sbx setup ssh` into the user's ssh config.
+const SANDBOX_SSH_HOST: &str = "sbx_cloud";
+/// Where the standalone devcontainer CLI lives in the outer sandbox. It is not
+/// on PATH; `$HOME` is expanded by the outer sandbox's shell.
+const SANDBOX_DEVCONTAINER: &str = "$HOME/.devcontainers/bin/devcontainer";
+
+impl SandboxTarget {
+    pub(super) fn destination(&self) -> String {
+        format!("{}@{SANDBOX_SSH_HOST}", self.id)
+    }
+
+    /// The single remote word that runs `remote` where the Host lives: inside the
+    /// devcontainer, or, in [`SandboxMode::Plain`], in the workspace of the outer sandbox. The
+    /// script itself travels on stdin, never in argv.
+    pub(crate) fn exec_in_container(&self, remote: &[&str]) -> String {
+        if self.mode == SandboxMode::Plain {
+            let words: Vec<String> = remote.iter().map(|word| quote_word(word)).collect();
+            return format!("cd {} && {}", shell_quote(&self.workspace), words.join(" "));
+        }
+        let mut words = vec![
+            SANDBOX_DEVCONTAINER.to_string(),
+            "exec".into(),
+            "--workspace-folder".into(),
+            shell_quote(&self.workspace),
+        ];
+        if let Some(config) = &self.config {
+            words.push("--config".into());
+            words.push(shell_quote(&format!("{}/{config}", self.workspace)));
+        }
+        words.push("--".into());
+        words.extend(remote.iter().map(|word| quote_word(word)));
+        words.join(" ")
+    }
+}
+
+/// How a target is reached. Derived from the optional fields of `SshTarget`.
+enum Transport<'a> {
+    Ssh,
+    Codespace(&'a str),
+    Sandbox(&'a SandboxTarget),
+}
+
+impl SshTarget {
+    fn transport(&self) -> Transport<'_> {
+        match (&self.codespace, &self.sandbox) {
+            (Some(name), _) => Transport::Codespace(name),
+            (None, Some(sandbox)) => Transport::Sandbox(sandbox),
+            (None, None) => Transport::Ssh,
+        }
+    }
+
+    /// True for targets whose connection wakes a paid cloud resource, so
+    /// background work must never open a connection to them.
+    pub fn is_cloud(&self) -> bool {
+        !matches!(self.transport(), Transport::Ssh)
+    }
+}
+
+/// Quote a word only when the shell would treat it specially.
+fn quote_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./=:@%+,".contains(&b))
+    {
+        word.into()
+    } else {
+        shell_quote(word)
+    }
+}
+
+/// Sandbox ids are `sbx_` plus lowercase alphanumerics.
+pub fn validate_sandbox_id(id: &str) -> Result<(), String> {
+    match id.strip_prefix("sbx_") {
+        Some(rest)
+            if !rest.is_empty()
+                && id.len() <= 64
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) =>
+        {
+            Ok(())
+        }
+        _ => {
+            Err("Enter a valid sandbox id (sbx_ followed by lowercase letters and digits).".into())
+        }
+    }
+}
+
+/// Sandbox names follow the `sbx` rules; the one implementation lives in [`crate::sandboxes`].
+pub use crate::sandboxes::validate_sandbox_name;
+
+/// The workspace path reaches a remote shell (quoted). Require an absolute
+/// path of plain characters with no `..` or empty components.
+pub fn validate_sandbox_workspace(path: &str) -> Result<(), String> {
+    let valid = path.len() > 1
+        && path.len() <= 255
+        && path.starts_with('/')
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+        && path[1..]
+            .trim_end_matches('/')
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..");
+    if valid {
+        Ok(())
+    } else {
+        Err("Enter an absolute workspace path (letters, digits, / . _ -).".into())
+    }
+}
+
+/// Re-checks everything of a sandbox target that reaches argv.
+pub fn validate_sandbox(sandbox: &SandboxTarget) -> Result<(), String> {
+    validate_sandbox_id(&sandbox.id)?;
+    validate_sandbox_name(&sandbox.name)?;
+    validate_sandbox_workspace(&sandbox.workspace)?;
+    if sandbox.relay_port == 0 {
+        return Err("Enter a valid relay port.".into());
+    }
+    if let Some(config) = &sandbox.config {
+        validate_sandbox_workspace(&format!("/{config}"))
+            .map_err(|_| "Enter a relative dev container config path.".to_string())?;
+    }
+    Ok(())
 }
 
 /// Codespace names are generated by GitHub (`user-repo-abc123`). They end up in
@@ -221,10 +395,9 @@ fn gh_program() -> std::ffi::OsString {
 }
 
 fn command(target: &SshTarget, interactive: bool) -> Command {
-    let program = if target.codespace.is_some() {
-        gh_program()
-    } else {
-        "ssh".into()
+    let program = match target.transport() {
+        Transport::Codespace(_) => gh_program(),
+        Transport::Ssh | Transport::Sandbox(_) => "ssh".into(),
     };
     command_with_program(target, interactive, &program)
 }
@@ -232,21 +405,30 @@ fn command(target: &SshTarget, interactive: bool) -> Command {
 /// `gh codespace ssh` appends its own destination and hands everything after
 /// `--` to OpenSSH, so codespace commands carry no `-- TARGET` and no `-p`.
 /// gh also manages the host key and key pair itself, so host-key prompting is
-/// left out and BatchMode stays on.
+/// left out and BatchMode stays on. A sandbox is plain `ssh` to its
+/// `<id>@sbx_cloud` alias: the alias carries the ProxyCommand and host trust,
+/// so there is no host-key prompting, no password prompt and no `-p`.
 fn command_with_program(
     target: &SshTarget,
     interactive: bool,
     program: &std::ffi::OsStr,
 ) -> Command {
     let mut command = Command::new(program);
-    let codespace = target.codespace.as_deref();
-    if let Some(name) = codespace {
+    let transport = target.transport();
+    if let Transport::Codespace(name) = transport {
         command.args(["codespace", "ssh", "-c", name, "--"]);
     }
+    let plain = matches!(transport, Transport::Ssh);
+    // Resuming a stopped sandbox through the sbx ProxyCommand can outlast the
+    // usual 15 seconds before the ssh banner arrives.
+    let connect_timeout = match transport {
+        Transport::Sandbox(_) => "ConnectTimeout=120",
+        Transport::Ssh | Transport::Codespace(_) => "ConnectTimeout=15",
+    };
     command.args([
         "-T",
         "-o",
-        "ConnectTimeout=15",
+        connect_timeout,
         "-o",
         "ConnectionAttempts=1",
         "-o",
@@ -266,7 +448,7 @@ fn command_with_program(
         "-o",
         "ExitOnForwardFailure=yes",
     ]);
-    if codespace.is_none() {
+    if plain {
         command.args([
             "-o",
             "StrictHostKeyChecking=ask",
@@ -277,13 +459,13 @@ fn command_with_program(
     command.args(["-o", "ForkAfterAuthentication=no"]);
     command.args([
         "-o",
-        if interactive && codespace.is_none() {
+        if interactive && plain {
             "BatchMode=no"
         } else {
             "BatchMode=yes"
         },
     ]);
-    if let Some(port) = target.port.filter(|_| codespace.is_none()) {
+    if let Some(port) = target.port.filter(|_| plain) {
         command.args(["-p", &port.to_string()]);
     }
     command
@@ -291,8 +473,9 @@ fn command_with_program(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if codespace.is_some() {
-        // A Finder-launched app has launchd's bare PATH, and gh runs `ssh`.
+    if !plain {
+        // A Finder-launched app has launchd's bare PATH, and gh runs `ssh` and
+        // the sandbox alias's ProxyCommand runs `sbx`.
         command.env("PATH", crate::scm::terminal_search_path());
     }
     #[cfg(windows)]
@@ -303,22 +486,26 @@ fn command_with_program(
     command
 }
 
-/// A codespace name read back from the store is re-checked before it reaches argv.
-pub(super) fn check_codespace(target: &SshTarget) -> Result<(), String> {
-    match &target.codespace {
-        Some(name) => validate_codespace(name).map(|_| ()),
-        None => Ok(()),
+/// Names and paths read back from the store are re-checked before they reach argv.
+pub(super) fn check_target(target: &SshTarget) -> Result<(), String> {
+    if target.codespace.is_some() && target.sandbox.is_some() {
+        return Err("A connection cannot be both a codespace and a sandbox.".into());
+    }
+    match target.transport() {
+        Transport::Codespace(name) => validate_codespace(name).map(|_| ()),
+        Transport::Sandbox(sandbox) => validate_sandbox(sandbox),
+        Transport::Ssh => Ok(()),
     }
 }
 
 /// Error for a transport process that could not be spawned.
 fn spawn_error(target: &SshTarget, error: std::io::Error) -> String {
-    if target.codespace.is_none() {
-        format!("Could not start OpenSSH: {error}")
-    } else if error.kind() == std::io::ErrorKind::NotFound {
-        "GitHub CLI (gh) is not installed. Install it from https://cli.github.com and run `gh auth login`.".into()
-    } else {
-        format!("Could not start the GitHub CLI (gh): {error}")
+    match target.transport() {
+        Transport::Ssh | Transport::Sandbox(_) => format!("Could not start OpenSSH: {error}"),
+        Transport::Codespace(_) if error.kind() == std::io::ErrorKind::NotFound => {
+            "GitHub CLI (gh) is not installed. Install it from https://cli.github.com and run `gh auth login`.".into()
+        }
+        Transport::Codespace(_) => format!("Could not start the GitHub CLI (gh): {error}"),
     }
 }
 
@@ -367,8 +554,8 @@ pub fn detect_platform(
     job: &Arc<Job>,
     askpass: &Askpass,
 ) -> Result<HostPlatform, String> {
-    if target.codespace.is_some() {
-        // Codespaces are always Linux containers.
+    if target.is_cloud() {
+        // Codespaces and sandboxes are always Linux containers.
         return Ok(HostPlatform::Unix);
     }
     job.message("Checking the remote machine…");
@@ -443,15 +630,26 @@ fn run_remote_command(
     mut command: Command,
     remote: &[&str],
 ) -> Result<String, String> {
-    check_codespace(target)?;
+    check_target(target)?;
     if job.cancelled.load(Ordering::Relaxed) {
         return Err("Connection cancelled".into());
     }
     askpass.configure(&mut command)?;
-    if target.codespace.is_none() {
-        command.args(["--", &target.target]);
+    match target.transport() {
+        Transport::Ssh => {
+            command.args(["--", &target.target]);
+            command.args(remote);
+        }
+        Transport::Codespace(_) => {
+            command.args(remote);
+        }
+        Transport::Sandbox(sandbox) => {
+            // Everything run for a sandbox machine belongs to the Host, which
+            // lives in the devcontainer (or, for a plain sandbox, the outer sandbox).
+            command.args(["--", &sandbox.destination()]);
+            command.arg(sandbox.exec_in_container(remote));
+        }
     }
-    command.args(remote);
     let mut child = command.spawn().map_err(|e| spawn_error(target, e))?;
     let stdout = capture(child.stdout.take().unwrap());
     let stderr = capture(child.stderr.take().unwrap());
@@ -508,7 +706,7 @@ pub fn bootstrap_script(platform: HostPlatform) -> String {
 
 fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> String {
     let version = env!("CARGO_PKG_VERSION");
-    let url = format!("https://github.com/hardbeat920/monocode/releases/download/v{version}");
+    let url = format!("https://github.com/hhoangg/monoptah/releases/download/v{version}");
     match platform {
         // include_str! preserves checkout line endings, including Windows CRLF.
         HostPlatform::Unix => template
@@ -519,6 +717,38 @@ fn bootstrap_script_from_template(platform: HostPlatform, template: &str) -> Str
             .replace("@@VERSION@@", &powershell_quote(version))
             .replace("@@RELEASE@@", &powershell_quote(&url))
             .replace("@@ACL@@", include_str!("windows-acl.ps1")),
+    }
+}
+
+/// Bootstrap for a sandbox: the codespace flags (the Host tracks the Claude
+/// token by hash and installs Claude), plus an optional prelude that is
+/// prepended verbatim. The prelude is the seam for per-start secrets, which
+/// reach the container on stdin only.
+///
+/// Unlike a codespace, a sandbox runs the Host detached (`MONOCODE_HOST_DETACHED=1`): a
+/// devcontainer can have `/run/systemd/system` without systemd as PID 1, which sends
+/// `service install` down a systemd path that fails. The shared template is left untouched;
+/// `ensure_detached_host` from `remote_bootstrap_detached.sh` is inserted before its
+/// `service install` line. Restarts need nothing extra: the template's `service uninstall` stops a detached Host.
+pub fn sandbox_bootstrap_script(prelude: Option<&str>) -> String {
+    let template = include_str!("remote_bootstrap.sh").replace("\r\n", "\n");
+    let helpers = include_str!("remote_bootstrap_detached.sh").replace("\r\n", "\n");
+    let install = "\"$ENTRY\" service install --port \"$HOST_PORT\" >/dev/null";
+    // Fail loudly at run time (also in release builds) if upstream changed the install line:
+    // a script that silently skipped the detached start would only fail later on the systemd path.
+    let body = if template.matches(install).count() == 1 {
+        bootstrap_script_from_template(
+            HostPlatform::Unix,
+            &template.replace(install, &format!("ensure_detached_host\n{install}")),
+        )
+    } else {
+        "echo 'The sandbox bootstrap template changed: the service install line is missing.' >&2\nexit 1\n".to_string()
+    };
+    let script =
+        format!("MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n{helpers}{body}");
+    match prelude {
+        Some(prelude) => format!("{prelude}\n{script}"),
+        None => script,
     }
 }
 
@@ -582,18 +812,34 @@ impl Tunnel {
         askpass: Option<&Askpass>,
         mut command: Command,
     ) -> Result<Self, String> {
-        check_codespace(target)?;
+        check_target(target)?;
         let port = reserve_local_port()?;
         if let Some(askpass) = askpass {
             askpass.configure(&mut command)?;
         }
+        // A sandbox Host listens inside the container, so the tunnel ends at
+        // the relay in the outer sandbox (the only place `-L` may point to). A plain
+        // sandbox runs the Host in the outer sandbox itself: no relay.
+        let remote_port = match target.transport() {
+            Transport::Sandbox(sandbox) if sandbox.mode == SandboxMode::Container => {
+                sandbox.relay_port
+            }
+            Transport::Sandbox(_) => target.remote_port,
+            Transport::Ssh | Transport::Codespace(_) => target.remote_port,
+        };
         command.args([
             "-N",
             "-L",
-            &format!("127.0.0.1:{port}:127.0.0.1:{}", target.remote_port),
+            &format!("127.0.0.1:{port}:127.0.0.1:{remote_port}"),
         ]);
-        if target.codespace.is_none() {
-            command.args(["--", &target.target]);
+        match target.transport() {
+            Transport::Ssh => {
+                command.args(["--", &target.target]);
+            }
+            Transport::Codespace(_) => {}
+            Transport::Sandbox(sandbox) => {
+                command.args(["--", &sandbox.destination()]);
+            }
         }
         command.stdin(Stdio::null()).stdout(Stdio::null());
         let mut child = command.spawn().map_err(|e| spawn_error(target, e))?;
@@ -617,8 +863,9 @@ impl Tunnel {
             port,
             stderr,
         };
-        // gh starts a stopped codespace before it can forward, which takes a while.
-        let patient = job.is_some() || target.codespace.is_some();
+        // gh starts a stopped codespace before it can forward, and a sandbox
+        // resumes on connect, which takes a while.
+        let patient = job.is_some() || target.is_cloud();
         let deadline = Instant::now() + Duration::from_secs(if patient { 150 } else { 20 });
         loop {
             if job.is_some_and(|j| j.cancelled.load(Ordering::Relaxed)) {
@@ -877,6 +1124,7 @@ mod tests {
             port: Some(required("MONOCODE_TEST_SSH_PORT").parse().unwrap()),
             remote_port: required("MONOCODE_TEST_HOST_PORT").parse().unwrap(),
             codespace: None,
+            sandbox: None,
         };
         let make_command = || {
             let mut command = command(&target, false);
@@ -939,7 +1187,14 @@ mod tests {
             port: None,
             remote_port: 3774,
             codespace: Some(name.into()),
+            sandbox: None,
         }
+    }
+    fn env_of(command: &Command, key: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
     }
     fn argv(command: &Command) -> Vec<String> {
         command
@@ -992,6 +1247,7 @@ mod tests {
             port: Some(2222),
             remote_port: 3774,
             codespace: None,
+            sandbox: None,
         };
         let command = command_with_program(&target, true, "ssh".as_ref());
         let args = argv(&command);
@@ -1027,6 +1283,7 @@ mod tests {
             port: None,
             remote_port: 3774,
             codespace: None,
+            sandbox: None,
         };
         assert_eq!(echo(&plain).trim(), "-- me@box sh -l -s");
     }
@@ -1165,6 +1422,105 @@ mod tests {
         assert_eq!(
             uninstalls(&run(bootstrap_script(HostPlatform::Unix), Some("third"))),
             2
+        );
+    }
+    /// The sandbox prelude may pin an API key instead of a setup token; the bootstrap then
+    /// tracks that variable, and a setup token leaves exactly the marker a codespace writes.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_bootstrap_tracks_the_pinned_variable_with_the_codespace_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let run = |script: String, env: Option<(&str, &str)>| -> (Vec<String>, String) {
+            let home = tempfile::tempdir().unwrap();
+            let bin = home.path().join(".monocode-host/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let log = home.path().join("calls.log");
+            let entry = bin.join("monocode-host");
+            std::fs::write(
+                &entry,
+                format!(
+                    "#!/bin/sh\necho \"$1 $2\" >> {}\n[ \"$1\" = connection-info ] && echo '{{\"port\":3774}}'\nexit 0\n",
+                    log.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut command = Command::new("sh");
+            command
+                .arg("-s")
+                .env("HOME", home.path())
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+                .env_remove("ANTHROPIC_API_KEY");
+            if let Some((name, value)) = env {
+                command.env(name, value);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let calls = std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(String::from)
+                .collect();
+            let marker =
+                std::fs::read_to_string(home.path().join(".monocode-host/host-token.sha256"))
+                    .unwrap_or_default();
+            (calls, marker)
+        };
+        let hermetic = |script: String| {
+            script.replace(
+                "MONOCODE_HOST_INSTALL_CLAUDE=1",
+                "MONOCODE_HOST_INSTALL_CLAUDE=0",
+            )
+        };
+        let (_, codespace_marker) = run(
+            hermetic(codespace_bootstrap_script()),
+            Some(("CLAUDE_CODE_OAUTH_TOKEN", "same-secret")),
+        );
+        assert_eq!(codespace_marker.trim().len(), 64);
+        // A sandbox with a setup token writes the very same marker.
+        let token_prelude = "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN\nexport CLAUDE_CODE_OAUTH_TOKEN='same-secret'";
+        let (calls, marker) = run(
+            hermetic(sandbox_bootstrap_script(Some(token_prelude))),
+            None,
+        );
+        assert_eq!(marker, codespace_marker);
+        assert_eq!(
+            calls.iter().filter(|c| *c == "service uninstall").count(),
+            1
+        );
+        // An API key is tracked through its own variable and hashes the same way.
+        let key_prelude = "unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN\nMONOCODE_HOST_TOKEN_VAR=ANTHROPIC_API_KEY\nexport ANTHROPIC_API_KEY='same-secret'";
+        let (calls, marker) = run(hermetic(sandbox_bootstrap_script(Some(key_prelude))), None);
+        assert_eq!(marker, codespace_marker);
+        assert_eq!(
+            calls.iter().filter(|c| *c == "service uninstall").count(),
+            1
+        );
+        // Without the selector an API key in the environment is not tracked (codespace rule).
+        let (calls, marker) = run(
+            hermetic(codespace_bootstrap_script()),
+            Some(("ANTHROPIC_API_KEY", "same-secret")),
+        );
+        assert!(marker.is_empty());
+        assert_eq!(
+            calls.iter().filter(|c| *c == "service uninstall").count(),
+            0
         );
     }
     #[cfg(unix)]
@@ -1369,5 +1725,518 @@ mod tests {
         job.answer(&prompt.id, "yes".into()).unwrap();
         assert_eq!(thread.join().unwrap(), Some("yes".into()));
         assert!(job.answer(&prompt.id, "yes".into()).is_err());
+    }
+    fn sandbox_target() -> SshTarget {
+        SshTarget {
+            target: "sbx_001abc@sbx_cloud".into(),
+            port: None,
+            remote_port: 3774,
+            codespace: None,
+            sandbox: Some(SandboxTarget {
+                id: "sbx_001abc".into(),
+                name: "my-box".into(),
+                workspace: "/home/agent/ws".into(),
+                relay_port: 47200,
+                config: None,
+                mode: SandboxMode::Container,
+            }),
+        }
+    }
+    #[test]
+    fn sandbox_commands_are_plain_ssh_to_the_alias_without_prompts() {
+        let command = command_with_program(&sandbox_target(), true, "ssh".as_ref());
+        assert_eq!(command.get_program(), "ssh");
+        let args = argv(&command);
+        assert_eq!(args[0], "-T");
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
+        assert!(!args.contains(&"BatchMode=no".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("StrictHostKeyChecking")));
+        assert!(!args
+            .iter()
+            .any(|a| a.starts_with("NumberOfPasswordPrompts")));
+        assert!(!args.contains(&"-p".to_string()));
+        assert!(!args.contains(&"codespace".to_string()));
+        assert!(args.contains(&"ConnectTimeout=120".to_string()));
+        assert!(!args.contains(&"ConnectTimeout=15".to_string()));
+        // The destination is added by the caller after `--`.
+        assert!(!args.contains(&"--".to_string()));
+    }
+    #[test]
+    fn a_target_cannot_be_a_codespace_and_a_sandbox() {
+        let mut target = sandbox_target();
+        target.codespace = Some("octo-abc123".into());
+        assert!(check_target(&target).unwrap_err().contains("both"));
+    }
+    #[test]
+    fn golden_outer_argv_and_path_for_plain_ssh() {
+        let target = SshTarget {
+            target: "me@box".into(),
+            port: Some(2222),
+            remote_port: 3774,
+            codespace: None,
+            sandbox: None,
+        };
+        let command = command_with_program(&target, true, "ssh".as_ref());
+        let expected: Vec<&str> = vec![
+            "-T",
+            "-o",
+            "ConnectTimeout=15",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ForwardX11=no",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "StrictHostKeyChecking=ask",
+            "-o",
+            "NumberOfPasswordPrompts=3",
+            "-o",
+            "ForkAfterAuthentication=no",
+            "-o",
+            "BatchMode=no",
+            "-p",
+            "2222",
+        ];
+        assert_eq!(argv(&command), expected);
+        assert_eq!(env_of(&command, "LC_ALL").as_deref(), Some("C"));
+        assert_eq!(env_of(&command, "PATH"), None);
+    }
+    #[test]
+    fn golden_codespace_env_sets_the_terminal_path() {
+        let command = command_with_program(&codespace_target("octo-abc123"), false, "gh".as_ref());
+        assert_eq!(env_of(&command, "LC_ALL").as_deref(), Some("C"));
+        assert_eq!(
+            env_of(&command, "PATH").map(std::path::PathBuf::from),
+            Some(std::path::PathBuf::from(crate::scm::terminal_search_path()))
+        );
+        assert!(argv(&command).contains(&"BatchMode=yes".to_string()));
+    }
+    #[test]
+    fn sandbox_scripts_run_in_the_devcontainer_with_the_script_on_stdin() {
+        let job = Job::new();
+        let askpass = job.askpass().unwrap();
+        let mut command = Command::new("sh");
+        // Print argv (one per line), then stdin.
+        command
+            .args(["-c", "for a in \"$@\"; do echo \"ARG:$a\"; done; cat", "sh"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_remote_command(
+            &sandbox_target(),
+            "echo secret-script\n".into(),
+            &job,
+            &askpass,
+            command,
+            &["sh", "-l", "-s"],
+        )
+        .unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "ARG:--");
+        assert_eq!(lines[1], "ARG:sbx_001abc@sbx_cloud");
+        assert_eq!(
+            lines[2],
+            "ARG:$HOME/.devcontainers/bin/devcontainer exec --workspace-folder '/home/agent/ws' -- sh -l -s"
+        );
+        assert_eq!(lines[3], "echo secret-script");
+        assert!(!lines[..3].iter().any(|l| l.contains("secret-script")));
+    }
+    // The fake ssh is a shell script.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_tunnel_forwards_to_the_relay_port_of_the_outer_sandbox() {
+        let fixture = tempfile::tempdir().unwrap();
+        let log = fixture.path().join("argv");
+        let script = fixture.path().join("fake-ssh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {log:?}\nexit 1\n",
+                log = log.display().to_string()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let command = command_with_program(&sandbox_target(), false, script.as_os_str());
+        // The fake exits at once, so the tunnel reports a failed connection.
+        let error = match Tunnel::start_with_command(&sandbox_target(), None, None, command) {
+            Ok(_) => panic!("fake ssh exits, tunnel must fail"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("SSH connection failed"), "{error}");
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            args.contains(" -N -L 127.0.0.1:")
+                && args.contains(":127.0.0.1:47200 -- sbx_001abc@sbx_cloud"),
+            "{args}"
+        );
+        assert!(!args.contains("3774"), "{args}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn plain_sandbox_tunnel_goes_straight_to_the_host_port() {
+        let fixture = tempfile::tempdir().unwrap();
+        let log = fixture.path().join("argv");
+        let script = fixture.path().join("fake-ssh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {:?}\nexit 1\n",
+                log.display().to_string()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut target = sandbox_target();
+        target.remote_port = 4111;
+        target.sandbox.as_mut().unwrap().mode = SandboxMode::Plain;
+        let command = command_with_program(&target, false, script.as_os_str());
+        assert!(Tunnel::start_with_command(&target, None, None, command).is_err());
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            args.contains(":127.0.0.1:4111 -- sbx_001abc@sbx_cloud"),
+            "{args}"
+        );
+        assert!(!args.contains("47200"), "{args}");
+    }
+    #[test]
+    fn plain_sandbox_scripts_run_in_the_outer_workspace_without_devcontainer() {
+        let mut target = sandbox_target().sandbox.unwrap();
+        target.mode = SandboxMode::Plain;
+        assert_eq!(
+            target.exec_in_container(&["sh", "-l", "-s"]),
+            "cd '/home/agent/ws' && sh -l -s"
+        );
+        assert_eq!(
+            target.exec_in_container(&["bash", "-l"]),
+            "cd '/home/agent/ws' && bash -l"
+        );
+    }
+    #[test]
+    fn sandbox_mode_defaults_to_container_and_is_only_written_when_plain() {
+        let old: SandboxTarget =
+            serde_json::from_str(r#"{"id":"sbx_1","name":"b","workspace":"/w","relayPort":47200}"#)
+                .unwrap();
+        assert_eq!(old.mode, SandboxMode::Container);
+        assert!(!serde_json::to_string(&old).unwrap().contains("mode"));
+        let mut plain = old.clone();
+        plain.mode = SandboxMode::Plain;
+        let text = serde_json::to_string(&plain).unwrap();
+        assert!(text.contains(r#""mode":"plain""#), "{text}");
+        assert_eq!(serde_json::from_str::<SandboxTarget>(&text).unwrap(), plain);
+    }
+    #[test]
+    fn sandbox_fields_are_validated_before_they_reach_argv() {
+        for id in ["sbx_001abc", "sbx_0"] {
+            assert!(validate_sandbox_id(id).is_ok(), "{id}");
+        }
+        for id in [
+            "",
+            "sbx_",
+            "sbx_ABC",
+            "sbx-001",
+            "sbx_a b",
+            "-oProxyCommand=x",
+            "sbx_a;b",
+            "xsbx_1",
+            "sbx_a@b",
+        ] {
+            assert!(validate_sandbox_id(id).is_err(), "{id}");
+        }
+        for name in ["my-box", "ab", "a1", &"a".repeat(63)] {
+            assert!(validate_sandbox_name(name).is_ok(), "{name}");
+        }
+        for name in [
+            "",
+            "a",
+            "-x",
+            ".x",
+            "a.b",
+            "a_b",
+            "box_1.2",
+            "a b",
+            "a;b",
+            "a/b",
+            "$(x)",
+            "é1",
+            &"a".repeat(64),
+        ] {
+            assert!(validate_sandbox_name(name).is_err(), "{name}");
+        }
+        for path in ["/home/agent/ws", "/a", "/work/my-repo_1.2/"] {
+            assert!(validate_sandbox_workspace(path).is_ok(), "{path}");
+        }
+        for path in [
+            "",
+            "/",
+            "relative/ws",
+            "/a/../b",
+            "/a/./b",
+            "//a",
+            "/a//b",
+            "/a b",
+            "/a;b",
+            "/a'b",
+            "/a$(x)",
+            "/a\nb",
+            "~/ws",
+        ] {
+            assert!(validate_sandbox_workspace(path).is_err(), "{path}");
+        }
+        let mut target = sandbox_target();
+        assert!(check_target(&target).is_ok());
+        target.sandbox.as_mut().unwrap().relay_port = 0;
+        assert!(check_target(&target).is_err());
+        target.sandbox.as_mut().unwrap().relay_port = 1;
+        target.sandbox.as_mut().unwrap().workspace = "/a;rm -rf /".into();
+        assert!(check_target(&target).is_err());
+    }
+    #[test]
+    fn detached_flag_and_helpers_exist_only_in_the_sandbox_bootstrap() {
+        let sandbox = sandbox_bootstrap_script(None);
+        assert!(sandbox.contains("MONOCODE_HOST_DETACHED=1\n"));
+        assert!(sandbox.contains("ensure_detached_host\n\"$ENTRY\" service install"));
+        assert!(!sandbox.contains("restart_detached_host"));
+        assert_eq!(
+            sandbox
+                .matches("ensure_detached_host\n\"$ENTRY\" service install --port \"$HOST_PORT\" >/dev/null")
+                .count(),
+            1
+        );
+        // Template drift gate (also under --release): the line the insertion anchors on.
+        assert_eq!(
+            include_str!("remote_bootstrap.sh")
+                .matches("\"$ENTRY\" service install --port \"$HOST_PORT\" >/dev/null")
+                .count(),
+            1
+        );
+        assert!(!sandbox.contains("template changed"));
+        for text in [
+            codespace_bootstrap_script(),
+            bootstrap_script(HostPlatform::Unix),
+        ] {
+            assert!(!text.contains("DETACHED"));
+            assert!(!text.contains("detached_host"));
+        }
+        assert!(codespace_bootstrap_script()
+            .contains("\"$ENTRY\" service uninstall >/dev/null 2>&1 || true"));
+    }
+    /// A fake Host that is its own `serve` process: `connection-info` answers (with its pid)
+    /// only while `up` exists.
+    #[cfg(unix)]
+    struct DetachedRun {
+        home: tempfile::TempDir,
+    }
+    #[cfg(unix)]
+    impl DetachedRun {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let home = tempfile::tempdir().unwrap();
+            let base = home.path().join(".monocode-host");
+            std::fs::create_dir_all(base.join("bin")).unwrap();
+            let entry = base.join("bin/monocode-host");
+            std::fs::write(
+                &entry,
+                format!(
+                    r#"#!/bin/sh
+B={base}
+echo "$*" >> "$B/../calls.log"
+case "$1" in
+  connection-info) [ -f "$B/up" ] && cat "$B/up" || exit 1 ;;
+  serve)
+    trap 'rm -f "$B/up"; exit 0' TERM
+    printf '{{"port":3774,"pid":%s}}\n' "$$" > "$B/up"
+    while :; do sleep 1; done ;;
+  service)
+    if [ "$2" = uninstall ] && [ -f "$B/up" ]; then
+      P=$(sed 's/.*"pid":\([0-9]*\).*/\1/' "$B/up")
+      kill -TERM "$P" 2>/dev/null
+      i=0; while [ -f "$B/up" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+    fi
+    [ "$2" = install ] && [ ! -f "$B/up" ] && exit 9
+    exit 0 ;;
+esac
+"#,
+                    base = base.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { home }
+        }
+        fn up(&self) -> std::path::PathBuf {
+            self.home.path().join(".monocode-host/up")
+        }
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.home.path().join("calls.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(String::from)
+                .collect()
+        }
+        fn serves(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|c| c.starts_with("serve "))
+                .count()
+        }
+        fn pid(&self) -> Option<u32> {
+            let up = std::fs::read_to_string(self.up()).ok()?;
+            serde_json::from_str::<serde_json::Value>(&up).ok()?["pid"]
+                .as_u64()
+                .map(|p| p as u32)
+        }
+        fn run(&self, token: Option<&str>) {
+            use std::io::Write;
+            let script = sandbox_bootstrap_script(None).replace(
+                "MONOCODE_HOST_INSTALL_CLAUDE=1",
+                "MONOCODE_HOST_INSTALL_CLAUDE=0",
+            );
+            let mut command = Command::new("sh");
+            command
+                .arg("-s")
+                .env("HOME", self.home.path())
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+                .env_remove("ANTHROPIC_API_KEY");
+            if let Some(token) = token {
+                command.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for DetachedRun {
+        fn drop(&mut self) {
+            if let Some(pid) = self.pid() {
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn detached_bootstrap_starts_the_host_itself_when_it_does_not_answer() {
+        let fake = DetachedRun::new();
+        fake.run(None);
+        let calls = fake.calls();
+        let base = fake.home.path().join(".monocode-host");
+        assert!(
+            calls.contains(&format!("serve --data-dir {} --port 3774", base.display())),
+            "{calls:?}"
+        );
+        // `service install` ran once the Host answered, so the real one returns early.
+        let install = calls
+            .iter()
+            .position(|c| c == "service install --port 3774");
+        let serve = calls.iter().position(|c| c.starts_with("serve "));
+        assert!(install.is_some() && serve < install, "{calls:?}");
+        assert!(fake.pid().is_some());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn detached_bootstrap_leaves_an_answering_host_alone() {
+        let fake = DetachedRun::new();
+        std::fs::write(fake.up(), r#"{"port":3774,"pid":1}"#).unwrap();
+        fake.run(None);
+        assert_eq!(fake.serves(), 0);
+        assert!(!fake.calls().iter().any(|c| c == "service uninstall"));
+        // Never leave a pid that is not ours for Drop to signal.
+        std::fs::remove_file(fake.up()).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn detached_bootstrap_stops_then_restarts_the_host_when_the_token_changes() {
+        let fake = DetachedRun::new();
+        fake.run(Some("first"));
+        let first = fake.pid().expect("host started");
+        // Same token: untouched.
+        fake.run(Some("first"));
+        assert_eq!(fake.pid(), Some(first));
+        assert_eq!(fake.serves(), 1);
+        let before = fake.calls().len();
+        fake.run(Some("second"));
+        let second = fake.pid().expect("host restarted");
+        assert_ne!(second, first);
+        let calls = fake.calls()[before..].to_vec();
+        let pos = |what: &str| calls.iter().position(|c| c.starts_with(what));
+        let (stop, serve, install) = (
+            pos("service uninstall"),
+            pos("serve "),
+            pos("service install"),
+        );
+        assert!(
+            stop < serve && serve < install && install.is_some(),
+            "{calls:?}"
+        );
+    }
+    #[test]
+    fn sandbox_targets_load_and_keep_old_shapes_on_disk() {
+        let old: SshTarget =
+            serde_json::from_str(r#"{"target":"x","port":null,"remotePort":3774,"codespace":"x"}"#)
+                .unwrap();
+        assert_eq!(old.sandbox, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("sandbox"));
+        let new: SshTarget = serde_json::from_str(
+            r#"{"target":"sbx_001abc@sbx_cloud","port":null,"remotePort":3774,"sandbox":{"id":"sbx_001abc","name":"my-box","workspace":"/home/agent/ws","relayPort":47200}}"#,
+        )
+        .unwrap();
+        assert_eq!(new, sandbox_target());
+        let again: SshTarget = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(again, new);
+    }
+    #[test]
+    fn sandbox_bootstrap_has_the_codespace_flags_and_an_optional_prelude() {
+        let plain = sandbox_bootstrap_script(None);
+        assert_ne!(plain, codespace_bootstrap_script());
+        assert!(plain.starts_with("MONOCODE_HOST_TRACK_TOKEN=1\nMONOCODE_HOST_INSTALL_CLAUDE=1\n"));
+        let with = sandbox_bootstrap_script(Some("export X=1"));
+        assert!(with.starts_with("export X=1\nMONOCODE_HOST_TRACK_TOKEN=1\n"));
+    }
+    #[test]
+    fn sandbox_platform_is_unix_without_probing() {
+        let job = Job::new();
+        let askpass = job.askpass().unwrap();
+        assert_eq!(
+            detect_platform(&sandbox_target(), &job, &askpass).unwrap(),
+            HostPlatform::Unix
+        );
+        assert!(sandbox_target().is_cloud());
     }
 }

@@ -386,6 +386,24 @@ fn a_damaged_key_is_not_replaced_while_other_accounts_depend_on_it() {
 }
 
 #[test]
+fn a_damaged_key_is_not_replaced_while_git_credentials_depend_on_it() {
+    let fx = Fixture::new();
+    fx.db()
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS git_credentials(
+               id TEXT PRIMARY KEY, label TEXT NOT NULL, platform TEXT NOT NULL,
+               origin TEXT NOT NULL, username TEXT NOT NULL, nonce BLOB NOT NULL,
+               ciphertext BLOB NOT NULL, created_at INTEGER NOT NULL);
+             INSERT INTO git_credentials VALUES('a','l','github','https://github.com','u',x'00',x'00',0);",
+        )
+        .unwrap();
+    std::fs::write(fx.key(), b"short").unwrap();
+    let error = fx.profile("work").save_claude_token(TOKEN).unwrap_err();
+    assert_eq!(error, DAMAGED_KEY);
+    assert_eq!(std::fs::read(fx.key()).unwrap(), b"short");
+}
+
+#[test]
 fn a_failed_save_leaves_a_damaged_key_in_place() {
     let fx = Fixture::new();
     let account = fx.profile("work");

@@ -3834,6 +3834,7 @@ dependencies = [
  "uuid",
  "webpki-roots 0.26.11",
  "yaml-rust2",
+ "zeroize",
  "zstd",
 ]
 

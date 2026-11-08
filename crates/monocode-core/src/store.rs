@@ -10,7 +10,7 @@ mod remote;
 mod remote_legacy;
 pub use remote::{
     is_pending_cloud_environment, pending_cloud_project, RemoteProject, RemoteSession,
-    RemoteUpload, CONVERTED,
+    RemoteUpload, CONVERTED, SANDBOX_STOPPED_DELETE,
 };
 pub(crate) use shared::handle as desktop_session_handle;
 mod session_metadata;
@@ -135,6 +135,8 @@ impl Store {
           CREATE TABLE IF NOT EXISTS native_reminders(session_id INTEGER PRIMARY KEY REFERENCES native_sessions(id),
             due_at INTEGER NOT NULL, fired_at INTEGER);").map_err(|e| e.to_string())?;
         conn.execute_batch(crate::accounts::CREDENTIALS_TABLE)
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch(crate::git_credentials::GIT_CREDENTIALS_TABLE)
             .map_err(|e| e.to_string())?;
         if let Some(dir) = path.parent() {
             crate::accounts::register_database(dir, path);

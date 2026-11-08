@@ -78,6 +78,14 @@ pub(crate) struct OpenPath(pub String);
 
 /// File links may include a one-based line and column (`:12:4` or `#L12`).
 pub(crate) fn file_location(raw: &str, cwd: &str) -> (String, Option<(usize, usize)>) {
+    let (path, location) = split_location(raw);
+    let path = document::resolve_path(std::path::Path::new(&path), std::path::Path::new(cwd));
+    (path.to_string_lossy().into_owned(), location)
+}
+
+/// The path of a file link without its `file://` prefix, percent escapes and line/column
+/// suffix, and the one-based location when it had one. Nothing is resolved against a folder.
+pub(crate) fn split_location(raw: &str) -> (String, Option<(usize, usize)>) {
     let mut path = raw.strip_prefix("file://").unwrap_or(raw).to_owned();
     let mut location = None;
     if let Some((file, line)) = path.rsplit_once("#L")
@@ -117,8 +125,7 @@ pub(crate) fn file_location(raw: &str, cwd: &str) -> (String, Option<(usize, usi
         }
         path = String::from_utf8_lossy(&decoded).into_owned();
     }
-    let path = document::resolve_path(std::path::Path::new(&path), std::path::Path::new(cwd));
-    (path.to_string_lossy().into_owned(), location)
+    (path, location)
 }
 
 pub(crate) enum FileEvent {

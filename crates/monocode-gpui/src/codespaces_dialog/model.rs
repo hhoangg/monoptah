@@ -255,7 +255,7 @@ pub(super) fn captured_token(tail: &str) -> Option<String> {
 }
 
 /// `git remote get-url origin` for the project, if it has one.
-pub(super) fn git_origin(project: &Path) -> Option<String> {
+pub(crate) fn git_origin(project: &Path) -> Option<String> {
     let program = monocode_core::scm::resolve_gui_binary("git")?;
     let mut command = std::process::Command::new(program);
     command

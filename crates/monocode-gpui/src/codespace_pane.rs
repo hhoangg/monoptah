@@ -220,7 +220,7 @@ impl CodespacePane {
                     .flex_1()
                     .truncate()
                     .text_color(content(label_alpha))
-                    .child(kind.label()),
+                    .child(kind.label_for(snapshot.backend())),
             )
             .when_some(note, |d, note| {
                 d.child(
@@ -238,21 +238,31 @@ impl CodespacePane {
     fn action_button(
         &self,
         id: &'static str,
-        label: &'static str,
+        label: impl Into<SharedString>,
         action: StartAction,
         danger: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        secondary_button(id, label, danger, false)
+        let label: SharedString = label.into();
+        secondary_button(id, label.clone(), danger, false)
             .debug_selector(move || id.into())
             .child(label)
             .on_click(cx.listener(move |_, _, _, cx| cx.emit(PaneEvent::Action(action))))
             .into_any_element()
     }
 
-    fn header(phase: Option<StartPhase>, cx: &mut Context<Self>) -> impl IntoElement {
-        pane_header("codespace-header", "Codespace")
-            .child(div().child("Codespace"))
+    /// The pane's name: `Codespace` or `Sandbox` by the backend of the start shown.
+    pub(crate) fn title(&self) -> &'static str {
+        self.start.as_ref().map_or("Codespace", |s| s.title())
+    }
+
+    fn header(
+        title: &'static str,
+        phase: Option<StartPhase>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        pane_header("codespace-header", title)
+            .child(div().child(title))
             .when_some(phase, |d, phase| {
                 let color = match phase {
                     StartPhase::Starting => warning_color(),
@@ -279,7 +289,7 @@ impl CodespacePane {
 
 impl Render for CodespacePane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = Self::header(self.start.as_ref().map(|s| s.phase), cx);
+        let header = Self::header(self.title(), self.start.as_ref().map(|s| s.phase), cx);
         let Some(start) = self.start.clone() else {
             return div()
                 .id("codespace-pane")
@@ -312,7 +322,13 @@ impl Render for CodespacePane {
         let meta = div()
             .flex()
             .flex_col()
-            .child(Self::meta_row("Name", record.codespace.clone()))
+            .child(Self::meta_row(
+                "Name",
+                record
+                    .sandbox
+                    .clone()
+                    .unwrap_or_else(|| record.codespace.clone()),
+            ))
             .when_some(record.branch.clone(), |d, branch| {
                 d.child(Self::meta_row("Branch", branch))
             })
@@ -320,7 +336,11 @@ impl Render for CodespacePane {
                 d.child(Self::meta_row("Machine", machine))
             })
             .child(Self::meta_row(
-                "GitHub",
+                if start.offers_browser() {
+                    "GitHub"
+                } else {
+                    "State"
+                },
                 record.gh_state.clone().unwrap_or_else(|| "Unknown".into()),
             ));
         let phases = div().flex().flex_col().children(
@@ -334,7 +354,7 @@ impl Render for CodespacePane {
             .id("codespace-pane")
             .debug_selector(|| "codespace-pane".into())
             .role(Role::Group)
-            .aria_label("Codespace")
+            .aria_label(start.title())
             .size_full()
             .min_h_0()
             .flex()
@@ -380,16 +400,18 @@ impl Render for CodespacePane {
                                     false,
                                     cx,
                                 ))
-                                .child(self.action_button(
-                                    "codespace-rebuild",
-                                    "Rebuild",
-                                    StartAction::Rebuild,
-                                    false,
-                                    cx,
-                                ))
+                                .when(start.offers_rebuild(), |d| {
+                                    d.child(self.action_button(
+                                        "codespace-rebuild",
+                                        "Rebuild",
+                                        StartAction::Rebuild,
+                                        false,
+                                        cx,
+                                    ))
+                                })
                                 .child(self.action_button(
                                     "codespace-delete",
-                                    "Delete codespace",
+                                    start.delete_label(),
                                     StartAction::DeleteCodespace,
                                     true,
                                     cx,
@@ -422,14 +444,23 @@ impl Render for CodespacePane {
                                         }
                                     })),
                             )
-                            .child(
-                                secondary_button("codespace-open-browser", "Browser", false, false)
+                            .when(start.offers_browser(), |d| {
+                                d.child(
+                                    secondary_button(
+                                        "codespace-open-browser",
+                                        "Browser",
+                                        false,
+                                        false,
+                                    )
                                     .debug_selector(|| "codespace-open-browser".into())
                                     .child("Browser")
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(PaneEvent::Action(StartAction::OpenInBrowser))
-                                    })),
-                            ),
+                                    .on_click(cx.listener(
+                                        |_, _, _, cx| {
+                                            cx.emit(PaneEvent::Action(StartAction::OpenInBrowser))
+                                        },
+                                    )),
+                                )
+                            }),
                     )
                     .child(
                         div()

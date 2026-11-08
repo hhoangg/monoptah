@@ -4,6 +4,7 @@
 use super::{shared, Session, Store};
 use crate::{
     agent::{Settings, TurnInfo},
+    cloud_sessions::{CloudBackendKind, CloudRef},
     remote::{Connections, Machine},
     transcript::Transcript,
 };
@@ -30,10 +31,31 @@ pub struct RemoteProject {
     /// Cloud binding: name of the GitHub codespace hosting the project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codespace: Option<String>,
+    /// Cloud binding: name of the Docker sandbox hosting the project. Mutually exclusive
+    /// with `codespace`; absent in everything stored before sandboxes existed. An older app
+    /// does not know this field: if it rewrites `remote-projects.v2` the binding is dropped
+    /// (accepted downgrade loss).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
 }
 
+impl RemoteProject {
+    /// The workspace this project is bound to, `None` for an ordinary remote project.
+    pub fn cloud(&self) -> Option<CloudRef> {
+        match (&self.sandbox, &self.codespace) {
+            (Some(name), _) => Some(CloudRef::sandbox(name)),
+            (None, Some(name)) => Some(CloudRef::codespace(name)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Why deleting the conversation of a stopped sandbox is refused; see
+/// [`Store::remove_cloud_session_locally`].
+pub const SANDBOX_STOPPED_DELETE: &str = "This sandbox is stopped, so its conversation can not be deleted without resuming it. Reconnect the session first, or remove it from Monoptah only.";
+
 /// Prefix of the provisional environment id of a cloud session whose codespace is still
-/// starting (`pending-<codespace>`). It never names a connected machine.
+/// starting (see [`CloudRef::pending_env`]). It never names a connected machine.
 const PENDING_ENVIRONMENT: &str = "pending-";
 
 /// True for the provisional environment of a cloud session that is still starting.
@@ -42,22 +64,27 @@ pub fn is_pending_cloud_environment(environment: &str) -> bool {
 }
 
 /// The provisional project of a cloud session created before its codespace is reachable:
-/// environment `pending-<codespace>`, no host project id, `remote_cwd` as its path.
+/// environment [`CloudRef::pending_env`], no host project id, `remote_cwd` as its path.
 /// [`Store::create_pending_cloud_session`] stores a session on it and
 /// [`Store::rebind_cloud_session`] moves that session to the real project once connected.
 pub fn pending_cloud_project(
     local_project: &str,
-    codespace: &str,
+    cloud: &CloudRef,
     remote_cwd: &str,
 ) -> RemoteProject {
-    let environment_id = format!("{PENDING_ENVIRONMENT}{codespace}");
+    let environment_id = cloud.pending_env();
+    let (codespace, sandbox) = match cloud.kind {
+        CloudBackendKind::Codespaces => (Some(cloud.name.clone()), None),
+        CloudBackendKind::DockerSandbox => (None, Some(cloud.name.clone())),
+    };
     RemoteProject {
         key: crate::remote::remote_path(&environment_id, remote_cwd),
         environment_id,
         project_id: String::new(),
         cwd: remote_cwd.into(),
         local_project: Some(local_project.into()),
-        codespace: Some(codespace.into()),
+        codespace,
+        sandbox,
     }
 }
 
@@ -107,6 +134,7 @@ fn overlay_binding(session: &mut RemoteSession, projects: &BTreeMap<String, Remo
     if let Some(current) = projects.get(&session.project.key) {
         session.project.local_project = current.local_project.clone();
         session.project.codespace = current.codespace.clone();
+        session.project.sandbox = current.sandbox.clone();
     }
 }
 fn host_settings(project: &RemoteProject, host: &Value) -> Settings {
@@ -190,6 +218,7 @@ impl Store {
             cwd: cwd.into(),
             local_project: None,
             codespace: None,
+            sandbox: None,
         };
         let mut projects = self.remote_projects()?;
         // Re-opening a folder must not drop its cloud binding.
@@ -197,6 +226,7 @@ impl Store {
             Some(existing) => RemoteProject {
                 local_project: existing.local_project.clone(),
                 codespace: existing.codespace.clone(),
+                sandbox: existing.sandbox.clone(),
                 ..remote
             },
             None => remote,
@@ -217,9 +247,28 @@ impl Store {
         local_project: &str,
         codespace: &str,
     ) -> Result<RemoteProject, String> {
+        self.remember_cloud_ref_project(
+            environment_id,
+            project,
+            local_project,
+            &CloudRef::codespace(codespace),
+        )
+    }
+    /// [`Self::remember_cloud_project`] for a workspace of any backend: a codespace is
+    /// written to `codespace`, a sandbox to `sandbox`.
+    pub fn remember_cloud_ref_project(
+        &self,
+        environment_id: &str,
+        project: &Value,
+        local_project: &str,
+        cloud: &CloudRef,
+    ) -> Result<RemoteProject, String> {
         let mut remote = self.remember_remote_project(environment_id, project)?;
         remote.local_project = Some(local_project.into());
-        remote.codespace = Some(codespace.into());
+        match cloud.kind {
+            CloudBackendKind::Codespaces => remote.codespace = Some(cloud.name.clone()),
+            CloudBackendKind::DockerSandbox => remote.sandbox = Some(cloud.name.clone()),
+        }
         let mut projects = self.remote_projects()?;
         projects.insert(remote.key.clone(), remote.clone());
         self.save_setting(
@@ -234,7 +283,7 @@ impl Store {
             .remote_sessions()?
             .into_values()
             .filter_map(|session| {
-                (session.project.codespace.is_some()
+                (session.project.cloud().is_some()
                     && session.project.local_project.as_deref() == Some(local_project))
                 .then_some(session)
             })
@@ -247,13 +296,17 @@ impl Store {
         });
         Ok(found)
     }
-    /// Drop every project and session bound to `codespace` (local records
-    /// only; the host is gone or about to be).
+    /// [`Self::forget_cloud`] for a codespace.
     pub fn forget_codespace(&self, codespace: &str) -> Result<(), String> {
+        self.forget_cloud(&CloudRef::codespace(codespace))
+    }
+    /// Drop every project and session bound to `cloud` (local records
+    /// only; the host is gone or about to be).
+    pub fn forget_cloud(&self, cloud: &CloudRef) -> Result<(), String> {
         let mut sessions = self.remote_sessions()?;
         let gone: Vec<i64> = sessions
             .iter()
-            .filter(|(_, s)| s.project.codespace.as_deref() == Some(codespace))
+            .filter(|(_, s)| s.project.cloud().as_ref() == Some(cloud))
             .map(|(id, _)| *id)
             .collect();
         for id in &gone {
@@ -261,23 +314,23 @@ impl Store {
         }
         self.hide_legacy_remote_sessions(gone)?;
         let mut projects = self.remote_projects()?;
-        projects.retain(|_, p| p.codespace.as_deref() != Some(codespace));
+        projects.retain(|_, p| p.cloud().as_ref() != Some(cloud));
         self.save_setting(
             PROJECTS,
             &serde_json::to_string(&projects).map_err(|e| e.to_string())?,
         )?;
-        crate::cloud_sessions::startup::forget_codespace_starts(self, codespace)?;
+        crate::cloud_sessions::startup::forget_cloud_starts(self, cloud)?;
         self.save_setting(
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
         )
     }
-    /// Ids of every cloud session bound to `codespace`, archived or not.
-    pub fn cloud_session_ids(&self, codespace: &str) -> Result<Vec<i64>, String> {
+    /// Ids of every cloud session bound to `cloud`, archived or not.
+    pub fn cloud_session_ids(&self, cloud: &CloudRef) -> Result<Vec<i64>, String> {
         Ok(self
             .remote_sessions()?
             .into_iter()
-            .filter(|(_, s)| s.project.codespace.as_deref() == Some(codespace))
+            .filter(|(_, s)| s.project.cloud().as_ref() == Some(cloud))
             .map(|(id, _)| id)
             .collect())
     }
@@ -313,12 +366,17 @@ impl Store {
         if sessions.remove(&id).is_none() {
             return Ok(());
         }
+        // Resolved first: the folder name needs the session to still exist.
+        let cache = self.cloud_cache_dir(id).ok().flatten();
         crate::cloud_sessions::startup::forget_session_start(self, id)?;
         self.hide_legacy_remote_sessions([id])?;
         self.save_setting(
             SESSIONS,
             &serde_json::to_string(&sessions).map_err(|e| e.to_string())?,
-        )
+        )?;
+        // Files fetched to view the workspace are of no use once the session is gone.
+        super::thread_files::remove_dir(cache);
+        Ok(())
     }
     fn stored_remote_sessions(&self) -> Result<BTreeMap<i64, RemoteSession>, String> {
         self.setting(SESSIONS)?
@@ -703,7 +761,12 @@ impl Store {
         self.save_remote_session(&remote)
     }
     pub fn delete_remote_session(&self, id: i64) -> Result<(), String> {
-        self.delete_remote_session_using(id, &crate::codespaces::SystemGh, None)
+        self.delete_remote_session_using(
+            id,
+            &crate::codespaces::SystemGh,
+            &crate::sandboxes::SystemSbx,
+            None,
+        )
     }
 
     /// Delete through injectable GitHub and host boundaries. No remote is woken here.
@@ -713,13 +776,27 @@ impl Store {
         gh: &dyn crate::codespaces::GhRunner,
         host: &dyn crate::cloud_sessions::Host,
     ) -> Result<(), String> {
-        self.delete_remote_session_using(id, gh, Some(host))
+        self.delete_remote_session_using(id, gh, &crate::sandboxes::SystemSbx, Some(host))
+    }
+
+    /// [`Self::delete_remote_session_with`] with an injectable `sbx` boundary, for sessions
+    /// that live in a Docker sandbox.
+    #[cfg(test)]
+    pub(crate) fn delete_remote_session_with_sbx(
+        &self,
+        id: i64,
+        gh: &dyn crate::codespaces::GhRunner,
+        sbx: &dyn crate::sandboxes::SbxRunner,
+        host: &dyn crate::cloud_sessions::Host,
+    ) -> Result<(), String> {
+        self.delete_remote_session_using(id, gh, sbx, Some(host))
     }
 
     fn delete_remote_session_using(
         &self,
         id: i64,
         gh: &dyn crate::codespaces::GhRunner,
+        sbx: &dyn crate::sandboxes::SbxRunner,
         host: Option<&dyn crate::cloud_sessions::Host>,
     ) -> Result<(), String> {
         let remote = self
@@ -730,8 +807,16 @@ impl Store {
         if remote.session_id.is_none() {
             return self.forget_cloud_session(id);
         }
-        if let Some(name) = &remote.project.codespace {
-            if !crate::codespaces::exists(gh, name)? {
+        // A workspace that is gone leaves no host conversation to delete. Existence is a
+        // read-only call (`gh codespace view` / `sbx ls`): nothing is woken here.
+        if let Some(cloud) = remote.project.cloud() {
+            let exists = match cloud.kind {
+                CloudBackendKind::Codespaces => crate::codespaces::exists(gh, &cloud.name)?,
+                CloudBackendKind::DockerSandbox => {
+                    crate::sandboxes::find_by_name(sbx, &cloud.name)?.is_some()
+                }
+            };
+            if !exists {
                 return self.forget_cloud_session(id);
             }
         }
@@ -753,9 +838,42 @@ impl Store {
                 &machine.id,
                 "sessions.delete",
                 json!({"sessionId": session_id,"projectId": remote.project.project_id}),
-            )?;
+            )
+            .map_err(|error| {
+                // Deleting the conversation would need the sandbox running, and a delete is
+                // never allowed to resume (and bill) it by itself.
+                if remote
+                    .project
+                    .cloud()
+                    .is_some_and(|c| c.kind == CloudBackendKind::DockerSandbox)
+                    && crate::cloud_sessions::is_not_connected(&error)
+                {
+                    SANDBOX_STOPPED_DELETE.to_string()
+                } else {
+                    error
+                }
+            })?;
         }
         self.forget_cloud_session(id)
+    }
+
+    /// "Remove from Monoptah" for a session whose sandbox still exists but is not connected:
+    /// forgets the local record only. Returns the warning to show: the sandbox keeps existing
+    /// (and costing money) until the user deletes it, and the session is gone from the app, so
+    /// the only way left is the `sbx` command.
+    pub fn remove_cloud_session_locally(&self, id: i64) -> Result<String, String> {
+        let remote = self.remote_session(id)?.ok_or("Session not found")?;
+        let cloud = remote
+            .project
+            .cloud()
+            .ok_or("This is not a cloud session.")?;
+        self.forget_cloud_session(id)?;
+        Ok(format!(
+            "Removed from Monoptah. The {} {} still exists and keeps costing money until you delete it with `sbx --cloud rm {}`.",
+            cloud.noun(),
+            cloud.name,
+            cloud.name
+        ))
     }
 }
 
@@ -938,6 +1056,7 @@ mod tests {
             cwd: r"\\server\share\repo".into(),
             local_project: None,
             codespace: None,
+            sandbox: None,
         };
         store
             .save_setting(
@@ -1158,7 +1277,11 @@ mod configuration_tests {
     #[test]
     fn a_pending_cloud_session_has_its_binding_but_no_registered_project() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let pending = pending_cloud_project("/Users/me/widgets", "cs-1", "/workspaces/widgets");
+        let pending = pending_cloud_project(
+            "/Users/me/widgets",
+            &CloudRef::codespace("cs-1"),
+            "/workspaces/widgets",
+        );
         assert_eq!(pending.environment_id, "pending-cs-1");
         assert!(is_pending_cloud_environment(&pending.environment_id));
         assert!(!is_pending_cloud_environment("env-cs-1"));
@@ -1188,7 +1311,8 @@ mod configuration_tests {
     #[test]
     fn rebinding_moves_a_session_to_the_real_project_and_keeps_its_id() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let pending = pending_cloud_project("/p", "cs-1", "/workspaces/widgets");
+        let pending =
+            pending_cloud_project("/p", &CloudRef::codespace("cs-1"), "/workspaces/widgets");
         let session = store
             .create_pending_cloud_session("claude", pending)
             .unwrap();

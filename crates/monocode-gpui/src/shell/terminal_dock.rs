@@ -222,8 +222,15 @@ impl Shell {
         {
             return;
         }
-        let codespace = self.active_codespace();
-        let cwd = if codespace.is_some() {
+        // Only a codespace gets its own shell here. This runs from render and tab switches,
+        // and an ssh into a sandbox would resume (and bill) it: a sandbox terminal is opened
+        // only by the user, from the session menu.
+        let cloud_id = self.workspace.active.filter(|id| {
+            self.cloud_marks.get(id).is_some_and(|m| {
+                m.kind == monocode_core::cloud_sessions::CloudBackendKind::Codespaces
+            })
+        });
+        let cwd = if cloud_id.is_some() {
             crate::terminal::home_cwd()
         } else {
             self.terminal_cwd(cx)
@@ -232,8 +239,9 @@ impl Shell {
         dock.add(cwd.clone());
         // The dock stays shut until the terminal moves back out of the panel.
         dock.open = false;
-        let terminal = match codespace {
-            Some(codespace) => self.spawn_codespace_terminal(&codespace, cx),
+        let cloud_terminal = cloud_id.and_then(|id| self.spawn_cloud_terminal(id, cx));
+        let terminal = match cloud_terminal {
+            Some(terminal) => terminal,
             None => self.spawn_terminal(cwd, cx),
         };
         self.terminals.entry(project).or_default().push(terminal);

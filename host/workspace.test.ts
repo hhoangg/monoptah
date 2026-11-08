@@ -17,6 +17,8 @@ import {
   hostGitIndex,
   listHostFiles,
   readHostFile,
+  readHostFileChunk,
+  MAX_READ_CHUNK,
   searchHostContent,
   searchHostFiles,
   writeHostFile,
@@ -338,4 +340,27 @@ it("stages selected host diff content without replacing the working file", async
   await expect(
     hostGitAction(root, "stageContents", "../escape", undefined, "x"),
   ).rejects.toThrow("outside");
+});
+
+it("reads byte ranges of binary files and refuses paths outside the workspace", async () => {
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "monocode-chunk-")));
+  roots.push(root);
+  const bytes = Buffer.from(Array.from({ length: 1000 }, (_, i) => i % 256));
+  writeFileSync(join(root, "shot.png"), bytes);
+  const first = await readHostFileChunk(root, "shot.png", 0, 400);
+  expect(first).toEqual({ data: bytes.subarray(0, 400).toString("base64"), offset: 400, size: 1000 });
+  const rest = await readHostFileChunk(root, join(root, "shot.png"), 400, 5000);
+  expect(Buffer.from(rest.data, "base64")).toEqual(bytes.subarray(400));
+  expect(rest.offset).toBe(1000);
+  expect((await readHostFileChunk(root, "shot.png", 1000, 10)).data).toBe("");
+  expect(MAX_READ_CHUNK % 3).toBe(0);
+  await expect(readHostFileChunk(root, "shot.png", 1001, 10)).rejects.toThrow("offset");
+  await expect(readHostFileChunk(root, "shot.png", -1, 10)).rejects.toThrow("offset");
+  await expect(readHostFileChunk(root, "shot.png", 0, 0)).rejects.toThrow("length");
+  await expect(readHostFileChunk(root, ".git/config", 0, 10)).rejects.toThrow("outside");
+  await expect(readHostFileChunk(root, "..", 0, 10)).rejects.toThrow("outside");
+  mkdirSync(join(root, "dir"));
+  await expect(readHostFileChunk(root, "dir", 0, 10)).rejects.toThrow("not a file");
+  symlinkSync(tmpdir(), join(root, "link"), "dir");
+  await expect(readHostFileChunk(root, "link", 0, 10)).rejects.toThrow("outside");
 });

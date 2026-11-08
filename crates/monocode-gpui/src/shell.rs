@@ -9,10 +9,15 @@ mod classic_sidebar;
 mod classic_surface_tests;
 mod classic_surfaces;
 mod cloud;
+mod cloud_app_archive;
+mod cloud_create;
 mod cloud_picker;
 mod cloud_start;
 #[cfg(test)]
 mod cloud_tests;
+mod cloud_view;
+#[cfg(test)]
+mod cloud_view_tests;
 mod contributors;
 #[cfg(test)]
 mod contributors_tests;
@@ -28,6 +33,8 @@ mod idle_agents;
 mod image_lightbox_tests;
 mod layout;
 mod live_agents;
+pub(crate) use app_commands::{CLOUD_ARCHIVING, CODESPACE_BUSY};
+pub(crate) use cloud_app_archive::ArchiveFailure;
 pub(crate) use live_agents::live_elapsed;
 mod mobile_host;
 mod mono_panes;
@@ -43,6 +50,7 @@ mod project_rail;
 mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
 mod codespaces;
+mod docker_sandbox;
 mod project_settings;
 mod provider_prompt;
 mod quick_composer;
@@ -651,6 +659,7 @@ pub(crate) struct Shell {
     session_tickets: HashMap<i64, String>,
     telegram: telegram::Telegram,
     codespaces: Option<codespaces::OpenCodespaces>,
+    docker_sandbox: Option<docker_sandbox::OpenDocker>,
     /// The sidebar rails under orchestrators and /operator threads.
     rails: rails::Rails,
     usage_footer: Entity<UsageFooter>,
@@ -706,16 +715,22 @@ pub(crate) struct Shell {
     cloud: Arc<monocode_core::cloud_sessions::CloudSessions>,
     /// Sessions that live in a codespace, by id, and the cached state of each codespace.
     cloud_marks: HashMap<i64, cloud::CloudMark>,
+    /// The card for the cloud file being read or downloaded.
+    cloud_view: Option<cloud_view::CloudView>,
     cloud_states: HashMap<String, monocode_core::cloud_sessions::CloudState>,
     /// Converted local sessions and the codespace each came from, and which of those no longer
     /// exist.
     cloud_origins: HashMap<i64, String>,
     cloud_gone: std::collections::HashSet<String>,
     cloud_refreshing: bool,
+    /// A resume happened while a refresh was in flight: its answer is stale, read again.
+    cloud_refresh_again: bool,
     cloud_archive: Option<cloud::ArchiveDialog>,
     /// Saves the local copy of a cloud session before its codespace is stopped or deleted.
     cloud_convert: cloud::ConvertFn,
     cloud_busy: HashSet<i64>,
+    /// [`CloudRef::key`] of every workspace an archive is working on right now.
+    cloud_workspaces_busy: HashSet<String>,
     /// Cloud sessions whose codespace is starting (or failed to start), by session id.
     cloud_starts: HashMap<i64, cloud_start::CloudStartView>,
     /// Where the right panel was before a startup opened the Codespace tab.
@@ -725,6 +740,8 @@ pub(crate) struct Shell {
     /// A cloud session whose archive waits for its dialog (opened on the next render).
     cloud_archive_request: Vec<i64>,
     codespace_picker: Option<cloud_picker::Open>,
+    #[cfg(test)]
+    cloud_create_hook: Option<cloud_create::CreateHook>,
     _cloud_clock: gpui::Task<()>,
     sessions: HashMap<i64, Entity<Conversation>>,
     /// Sessions that run as their provider's CLI. A session is in exactly one of
@@ -1123,6 +1140,7 @@ impl Shell {
             session_tickets: HashMap::new(),
             telegram: telegram::Telegram::new(),
             codespaces: None,
+            docker_sandbox: None,
             rails: Default::default(),
             usage_footer: cx.new(|cx| UsageFooter::new(active_kind, cx)),
             resources,
@@ -1163,16 +1181,21 @@ impl Shell {
             cloud,
             gh,
             cloud_marks: HashMap::new(),
+            cloud_view: None,
             cloud_states: HashMap::new(),
             cloud_origins: HashMap::new(),
             cloud_gone: Default::default(),
             cloud_refreshing: false,
+            cloud_refresh_again: false,
             cloud_archive: None,
             cloud_convert: cloud::default_convert(),
             cloud_busy: HashSet::new(),
+            cloud_workspaces_busy: HashSet::new(),
             cloud_starts: HashMap::new(),
             codespace_return: None,
             github_projects: HashMap::new(),
+            #[cfg(test)]
+            cloud_create_hook: None,
             cloud_archive_request: Vec::new(),
             codespace_picker: None,
             _cloud_clock: cloud_clock,
@@ -1554,6 +1577,12 @@ impl Shell {
             .insert(id, cx.new(|_| SessionMark::tab(summary.provider.clone())));
         let appearance = self.appearance(&summary.cwd);
         let worktree = self.session_worktrees.get(&id).cloned().flatten();
+        let offers = !summary.cwd.starts_with("remote://")
+            && self
+                .github_projects
+                .get(&summary.cwd)
+                .copied()
+                .unwrap_or(false);
         let view = cx.new(|cx| Conversation::new(summary, self.store.clone(), cx));
         view.update(cx, |view, cx| {
             // Events may arrive before the first asynchronous agent load. Seed
@@ -1563,6 +1592,16 @@ impl Shell {
             if let Some(bridge) = &self.app_bridge {
                 view.set_app_environment(bridge.environment(id));
             }
+            view.set_offers_codespace(offers, cx);
+            view.set_machine_loader(self.machine_loader());
+            view.set_cloud_stopped(
+                self.cloud_marks.get(&id).is_some_and(|mark| {
+                    !mark.codespace.is_empty()
+                        && self.cloud_states.get(&mark.key())
+                            == Some(&monocode_core::cloud_sessions::CloudState::Stopped)
+                }),
+                cx,
+            );
             view.set_project_appearance(appearance, cx);
             view.transcript.update(cx, |transcript, cx| {
                 transcript.apply_preferences(&self.workspace.preferences, cx)
@@ -1571,6 +1610,28 @@ impl Shell {
                 view.set_cloud_start(Some(start), cx);
             }
         });
+        self.observations.push(cx.subscribe(
+            &view,
+            move |this, _, _: &crate::conversation::CloudResumed, cx| this.cloud_resumed(id, cx),
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            move |this, _, event: &crate::conversation::cloud_target::CreateCloudSession, cx| {
+                this.create_cloud_session(id, event.0.clone(), cx)
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            |_, _, event: &crate::conversation::cloud_target::OpenDockerSetup, cx| {
+                let path = event.0.clone();
+                cx.spawn(async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.open_docker_dialog(path, window, cx)
+                    });
+                })
+                .detach();
+            },
+        ));
         self.observations.push(cx.subscribe(
             &view,
             move |_, _, event: &crate::cloud_start_view::CloudStartAction, cx| {
@@ -3326,9 +3387,10 @@ impl Shell {
         // A cloud session's terminal is a shell on its codespace, not on this machine.
         if !self.mono_active(cx)
             && !self.app_view_open()
-            && let Some(codespace) = self.active_codespace()
+            && let Some(id) = self.workspace.active
+            && self.is_cloud(id)
         {
-            self.new_codespace_terminal(codespace, window, cx);
+            self.new_cloud_terminal(id, window, cx);
             return;
         }
         let cwd = self.terminal_cwd(cx);
@@ -6016,8 +6078,12 @@ impl Shell {
                             .into(),
                     );
                     items.push(
-                        MenuAction::new("codespaces", "Codespaces setup…")
+                        MenuAction::new("cloud-setup", "Cloud setup")
                             .icon("cloud-upload")
+                            .submenu(vec![
+                                MenuAction::new("codespaces", "Codespaces"),
+                                MenuAction::new("docker-sandbox", "Docker Sandbox"),
+                            ])
                             .into(),
                     );
                 }
@@ -6224,6 +6290,8 @@ impl Shell {
                     self.open_telegram_dialog(path, window, cx);
                 } else if action == "codespaces" {
                     self.open_codespaces_dialog(path, window, cx);
+                } else if action == "docker-sandbox" {
+                    self.open_docker_dialog(path, window, cx);
                 } else if action == "archive" {
                     self.archive_project(&path, window, cx);
                 } else if action == "delete" {
@@ -9208,6 +9276,10 @@ impl Render for Shell {
             }))
             .on_action(
                 cx.listener(|this, event: &crate::file_editor::OpenPath, window, cx| {
+                    // A path in the cloud workspace of the active cloud session.
+                    if this.open_cloud_path(&event.0, window, cx) {
+                        return;
+                    }
                     let cwd = this.git.read(cx).project().to_owned();
                     let (path, location) = crate::file_editor::file_location(&event.0, &cwd);
                     this.open_review(crate::review::ReviewTab::File { cwd, path }, window, cx);
@@ -9465,6 +9537,10 @@ impl Render for Shell {
                     this.close_codespaces_dialog(window, cx);
                     return;
                 }
+                if this.docker_sandbox.is_some() {
+                    this.docker_escape(window, cx);
+                    return;
+                }
                 if this.action_dialog.is_some() {
                     this.close_action_dialog(window, cx);
                     return;
@@ -9692,8 +9768,11 @@ impl Render for Shell {
             .children(self.telegram_modal(window, cx))
             .children(self.telegram_topic_modal(window, cx))
             .children(self.codespaces_modal(window, cx))
+            .children(self.docker_modal(window, cx))
+            .children(self.git_credential_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.cloud_archive_modal(window, cx))
+            .children(self.cloud_view_card(cx))
             .children(self.codespace_picker_modal(window, cx))
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))

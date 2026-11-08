@@ -1,12 +1,12 @@
 //! User-supplied Claude Code credentials (setup-token or API key). The secret
 //! is stored AES-256-GCM encrypted in the native store database; the key lives
 //! in a separate file next to it, never in the database itself.
+use super::sealed::{
+    create_key, decrypt, encrypt, inspect_key, read_key, write_temp_key, KeyError, KeyState,
+    KEY_FILE, KEY_LEN, NONCE_LEN,
+};
 use super::Profile;
 use crate::provider::Kind;
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Key, Nonce,
-};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::{Path, PathBuf};
 
@@ -18,9 +18,6 @@ const DAMAGED_KEY: &str = "The key file for saved Claude credentials is damaged 
 const SAVE_FAILED: &str = "Could not save the Claude credential.";
 const CLEAR_FAILED: &str = "Could not clear this account's saved credential.";
 const PROVIDER: &str = "claude";
-const KEY_FILE: &str = "credentials.key";
-const KEY_LEN: usize = 32;
-const NONCE_LEN: usize = 12;
 /// Credential kind name, nonce and ciphertext of a saved row.
 type StoredRow = (String, Vec<u8>, Vec<u8>);
 
@@ -111,63 +108,11 @@ fn associated_data(account: &str, kind: ClaudeCredential) -> Vec<u8> {
     .into_bytes()
 }
 
-fn read_key(path: &Path) -> Result<[u8; KEY_LEN], String> {
-    let bytes = std::fs::read(path).map_err(|_| UNAVAILABLE)?;
-    <[u8; KEY_LEN]>::try_from(bytes.as_slice()).map_err(|_| UNAVAILABLE.into())
-}
-
-/// Write a new key to a private temp file next to `path`.
-fn write_temp_key(path: &Path, key: &[u8; KEY_LEN]) -> Result<PathBuf, String> {
-    use std::io::Write;
-    let dir = path.parent().ok_or(SAVE_FAILED)?;
-    std::fs::create_dir_all(dir).map_err(|_| SAVE_FAILED)?;
-    let temporary = dir.join(format!(".{KEY_FILE}.{}", super::request_id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let written = options
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(key).and_then(|_| file.sync_all()));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(SAVE_FAILED.into());
-    }
-    Ok(temporary)
-}
-
-/// Create the key file once, privately and atomically: write a private temp
-/// file, then hard-link it into place. A racing creator loses the link and
-/// reads the winner's key, and no reader ever sees a partial file.
-fn create_key(path: &Path) -> Result<[u8; KEY_LEN], String> {
-    let key: [u8; KEY_LEN] = rand::random();
-    let temporary = write_temp_key(path, &key)?;
-    let linked = std::fs::hard_link(&temporary, path);
-    let _ = std::fs::remove_file(&temporary);
-    match linked {
-        Ok(()) => Ok(key),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_key(path),
-        Err(_) => Err(SAVE_FAILED.into()),
-    }
-}
-
-/// What a save finds at the key path. Only a file that is absent may be
-/// created; anything else unexpected must never be overwritten.
-enum KeyState {
-    Valid([u8; KEY_LEN]),
-    Missing,
-    WrongLength,
-}
-fn inspect_key(path: &Path) -> Result<KeyState, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(<[u8; KEY_LEN]>::try_from(bytes.as_slice())
-            .map(KeyState::Valid)
-            .unwrap_or(KeyState::WrongLength)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(KeyState::Missing),
-        Err(_) => Err(SAVE_FAILED.into()),
+/// The key operations report why they failed; this module words it for Claude.
+fn read_failure(error: KeyError) -> String {
+    match error {
+        KeyError::Unreadable => UNAVAILABLE.into(),
+        KeyError::SaveFailed => SAVE_FAILED.into(),
     }
 }
 
@@ -182,6 +127,16 @@ pub(crate) fn register_database(data_dir: &Path, database: &Path) {
     let mut databases = DATABASES.lock().unwrap_or_else(|e| e.into_inner());
     databases.retain(|(dir, _)| dir != data_dir);
     databases.push((data_dir.into(), database.into()));
+}
+
+/// The database registered for `data_dir`, if a store has opened there.
+pub(crate) fn database_for(data_dir: &Path) -> Option<PathBuf> {
+    DATABASES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(dir, _)| dir == data_dir)
+        .map(|(_, database)| database.clone())
 }
 
 impl Profile {
@@ -285,9 +240,9 @@ impl Profile {
         // is replaced only when no other account's row depends on it, and only
         // after the new row is written (see below).
         let mut replacement = None;
-        let key = match inspect_key(&key_path)? {
+        let key = match inspect_key(&key_path).map_err(read_failure)? {
             KeyState::Valid(key) => key,
-            KeyState::Missing => create_key(&key_path)?,
+            KeyState::Missing => create_key(&key_path).map_err(read_failure)?,
             KeyState::WrongLength => {
                 let others: i64 = conn
                     .query_row(
@@ -297,25 +252,26 @@ impl Profile {
                         |row| row.get(0),
                     )
                     .map_err(|_| SAVE_FAILED)?;
-                if others > 0 {
+                // Git credential tokens share this key file.
+                let git: i64 =
+                    match conn
+                        .query_row("SELECT count(*) FROM git_credentials", [], |row| row.get(0))
+                    {
+                        Ok(count) => count,
+                        Err(e) if e.to_string().contains("no such table") => 0,
+                        Err(_) => return Err(SAVE_FAILED.into()),
+                    };
+                if others > 0 || git > 0 {
                     return Err(DAMAGED_KEY.into());
                 }
                 let key: [u8; KEY_LEN] = rand::random();
-                replacement = Some((write_temp_key(&key_path, &key)?, key));
+                replacement = Some((write_temp_key(&key_path, &key).map_err(read_failure)?, key));
                 key
             }
         };
-        let nonce: [u8; NONCE_LEN] = rand::random();
-        let ciphertext = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key))
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: secret.as_bytes(),
-                    aad: &associated_data(&self.id, kind),
-                },
-            )
+        let ciphertext = encrypt(&key, &associated_data(&self.id, kind), secret.as_bytes())
             .map_err(|_| SAVE_FAILED);
-        let result = ciphertext.and_then(|ciphertext| {
+        let result = ciphertext.and_then(|(nonce, ciphertext)| {
             let tx = conn.transaction().map_err(|_| SAVE_FAILED)?;
             tx.execute(
                 "INSERT INTO provider_account_credentials(provider, account_id, kind, nonce, ciphertext)
@@ -356,7 +312,9 @@ impl Profile {
             Err(_) => Err(CLEAR_FAILED.into()),
         }
     }
-    pub(super) fn claude_secret(&self) -> Result<Option<(ClaudeCredential, String)>, String> {
+    /// The Claude credential saved for this account, `None` when there is none. Holds the
+    /// secret: callers deliver it over stdin only and never log it.
+    pub(crate) fn claude_secret(&self) -> Result<Option<(ClaudeCredential, String)>, String> {
         let Some((name, nonce, ciphertext)) = self.stored()? else {
             return Ok(None);
         };
@@ -364,17 +322,10 @@ impl Profile {
         if nonce.len() != NONCE_LEN {
             return Err(UNAVAILABLE.into());
         }
-        let key = read_key(&Self::key_path(&self.database_path()?)?)?;
-        let plain = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key))
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &ciphertext,
-                    aad: &associated_data(&self.id, kind),
-                },
-            )
+        let key = read_key(&Self::key_path(&self.database_path()?)?).map_err(read_failure)?;
+        let plain = decrypt(&key, &associated_data(&self.id, kind), &nonce, &ciphertext)
             .map_err(|_| UNAVAILABLE)?;
-        let secret = String::from_utf8(plain).map_err(|_| UNAVAILABLE)?;
+        let secret = String::from_utf8(plain.to_vec()).map_err(|_| UNAVAILABLE)?;
         kind.normalize(&secret)
             .map(|secret| Some((kind, secret)))
             .map_err(|_| UNAVAILABLE.into())

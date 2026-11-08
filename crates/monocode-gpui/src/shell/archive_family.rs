@@ -98,6 +98,10 @@ impl Shell {
         }
         for &id in written {
             self.apply_archived(id, archived, window, cx);
+            if archived {
+                // Any cloud session, however it was archived: its card and cached files go.
+                self.cloud_session_archived(id, cx);
+            }
         }
         self.invalidate_chrome(cx);
         cx.notify();
