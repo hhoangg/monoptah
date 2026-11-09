@@ -334,8 +334,14 @@ pub(super) fn rewrite_cwd(text: &str, from: &[&str], to: &str) -> String {
 pub enum Resume {
     /// Written to the local Claude folder: `claude --resume <id>` works from the project.
     Installed(PathBuf),
-    /// A file with that id already existed locally and was left alone.
+    /// A file with that id already existed locally with the same entries and was left alone.
     AlreadyThere(PathBuf),
+    /// The incoming transcript extends the local file with that id: it replaced it, and the
+    /// old file is kept next to it as `<id>.jsonl.pre-cloud`.
+    Replaced(PathBuf),
+    /// The local file with that id diverged from the incoming one and was left untouched.
+    /// The incoming transcript is installed under this new session id.
+    Forked(String),
     /// Not available; the local copy starts a fresh Claude conversation.
     Missing(String),
 }
@@ -1061,9 +1067,15 @@ impl CloudSessions {
                 (None, _) => Resume::Missing("The session never ran Claude".into()),
             };
             match &resume {
-                Resume::Installed(_) | Resume::AlreadyThere(_) => {
+                Resume::Installed(_) | Resume::AlreadyThere(_) | Resume::Replaced(_) => {
                     if let Some(id) = provider_id {
                         self.store()?.provider_id(local_id, id)?;
+                    }
+                }
+                Resume::Forked(new_id) => {
+                    self.store()?.provider_id(local_id, new_id)?;
+                    if let Some(id) = provider_id {
+                        warnings.push(super::transcript_sync::fork_notice(id, new_id));
                     }
                 }
                 Resume::Missing(why) if files_only => warnings.push(format!(
@@ -1179,7 +1191,10 @@ impl CloudSessions {
         Ok(converted)
     }
 
-    /// Writes the rewritten JSONL into the local Claude folder, never replacing a file.
+    /// Writes the rewritten JSONL into the local Claude folder (transcript_sync, rule D10):
+    /// a fresh id is installed, an extension of the existing file replaces it (the old file
+    /// is kept as `<id>.jsonl.pre-cloud`), an equal file is left alone, and a divergent one is
+    /// never overwritten: the incoming copy is installed under a new id instead.
     fn install_jsonl(
         &self,
         source: &Path,
@@ -1187,6 +1202,7 @@ impl CloudSessions {
         local_cwd: &str,
         provider_id: &str,
     ) -> Result<Resume, String> {
+        use super::transcript_sync::{decide, fork, Decision};
         let local = std::fs::canonicalize(local_cwd).map_or_else(
             |_| local_cwd.to_string(),
             |p| p.to_string_lossy().into_owned(),
@@ -1197,26 +1213,74 @@ impl CloudSessions {
         }
         let dir = self.claude_dir.join("projects").join(name);
         let dest = dir.join(format!("{provider_id}.jsonl"));
-        if dest.exists() {
-            return Ok(Resume::AlreadyThere(dest));
-        }
         let text = std::fs::read_to_string(source)
             .map_err(|e| format!("cannot read Claude's transcript: {e}"))?;
         let text = rewrite_cwd(&text, remote_cwds, &local);
+        let existing = match std::fs::read(&dest) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("cannot read the local transcript: {e}")),
+        };
+        let decision = decide(existing.as_deref(), text.as_bytes());
+        if decision == Decision::AlreadyCurrent {
+            return Ok(Resume::AlreadyThere(dest));
+        }
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let tmp = dir.join(format!(".{provider_id}.{}.tmp", nanos()));
-        std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-        // A hard link fails when the name exists, so a concurrent writer is never replaced.
-        let linked = std::fs::hard_link(&tmp, &dest);
-        let _ = std::fs::remove_file(&tmp);
-        match linked {
-            Ok(()) => Ok(Resume::Installed(dest)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Ok(Resume::AlreadyThere(dest))
+        match decision {
+            Decision::AlreadyCurrent => unreachable!("returned above"),
+            Decision::Install => {
+                std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+                // A hard link fails when the name exists, so a concurrent writer is never replaced.
+                let linked = std::fs::hard_link(&tmp, &dest);
+                let _ = std::fs::remove_file(&tmp);
+                match linked {
+                    Ok(()) => Ok(Resume::Installed(dest)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        Ok(Resume::AlreadyThere(dest))
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
             }
-            Err(e) => Err(e.to_string()),
+            Decision::Replace => {
+                std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+                let result = replace_keeping_backup(&dir, &tmp, &dest, provider_id);
+                let _ = std::fs::remove_file(&tmp);
+                result.map(|()| Resume::Replaced(dest))
+            }
+            Decision::Diverged => {
+                let new_id = uuid::Uuid::new_v4().to_string();
+                let forked = dir.join(format!("{new_id}.jsonl"));
+                std::fs::write(&tmp, fork(&text, &new_id)).map_err(|e| e.to_string())?;
+                let linked = std::fs::hard_link(&tmp, &forked);
+                let _ = std::fs::remove_file(&tmp);
+                linked.map_err(|e| e.to_string())?;
+                Ok(Resume::Forked(new_id))
+            }
         }
     }
+}
+
+/// Puts `tmp` in place of `dest` without a moment where `dest` is missing, keeping the
+/// previous file as `<id>.jsonl.pre-cloud` (a newer backup replaces an older one: both are
+/// prefixes of the new transcript).
+fn replace_keeping_backup(
+    dir: &Path,
+    tmp: &Path,
+    dest: &Path,
+    provider_id: &str,
+) -> Result<(), String> {
+    let backup = dir.join(format!("{provider_id}.jsonl.pre-cloud"));
+    let staged = dir.join(format!(".{provider_id}.{}.bak", nanos()));
+    if std::fs::hard_link(dest, &staged).is_err() {
+        std::fs::copy(dest, &staged).map_err(|e| format!("cannot back up the transcript: {e}"))?;
+    }
+    let renamed = std::fs::rename(&staged, &backup);
+    if let Err(e) = renamed {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("cannot back up the transcript: {e}"));
+    }
+    std::fs::rename(tmp, dest).map_err(|e| e.to_string())
 }
 
 /// Where the snapshot script and the copy of its stage run.

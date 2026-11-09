@@ -1,0 +1,22 @@
+{
+  "sessionId": "11111111-1111-4111-8111-111111111111",
+  "cwd": "/workspaces/app",
+  "cases": [
+    { "name": "fresh install", "existing": null, "incoming": "base.jsonl", "decision": "install" },
+    { "name": "extension replaces", "existing": "base.jsonl", "incoming": "extended.jsonl", "decision": "replace" },
+    { "name": "equal is already current", "existing": "base.jsonl", "incoming": "base.jsonl", "decision": "already_current" },
+    { "name": "different third turn diverges", "existing": "base.jsonl", "incoming": "diverged.jsonl", "decision": "diverged" },
+    { "name": "extension of the diverged copy diverges from base", "existing": "diverged.jsonl", "incoming": "extended.jsonl", "decision": "diverged" },
+    { "name": "an incoming prefix of the existing file diverges", "existing": "extended.jsonl", "incoming": "base.jsonl", "decision": "diverged" },
+    { "name": "a shorter existing file is replaced", "existing": "shorter.jsonl", "incoming": "base.jsonl", "decision": "replace" },
+    { "name": "a shorter incoming file diverges", "existing": "base.jsonl", "incoming": "shorter.jsonl", "decision": "diverged" },
+    { "name": "empty existing file is replaced", "existing": "empty.jsonl", "incoming": "base.jsonl", "decision": "replace" },
+    { "name": "empty incoming against content diverges", "existing": "base.jsonl", "incoming": "empty.jsonl", "decision": "diverged" },
+    { "name": "two empty files are equal", "existing": "empty.jsonl", "incoming": "empty.jsonl", "decision": "already_current" }
+  ],
+  "chains": [
+    { "file": "base.jsonl", "uuids": ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002", "00000000-0000-4000-8000-000000000003"] },
+    { "file": "extended.jsonl", "uuids": ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002", "00000000-0000-4000-8000-000000000003", "00000000-0000-4000-8000-000000000004", "00000000-0000-4000-8000-000000000005"] },
+    { "file": "empty.jsonl", "uuids": [] }
+  ]
+}
