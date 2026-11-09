@@ -37,6 +37,10 @@ Also confirm `src-tauri/tauri.conf.json` still has `productName: "Monoptah"`,
 `identifier: "com.monoptah.desktop"`, and the updater `pubkey` and fork `endpoints` —
 an upstream change to that file is the one most likely to hand the app back to MonoCode.
 
+If upstream changed `host/`, bump `host/VERSION` and cut a Host release (see "Releasing the
+Host"). Give any new upstream Host workflow job the
+`if: github.repository == 'hardbeat920/monocode'` gate.
+
 ## Never rename these
 
 They are identifiers, not branding. Changing them breaks working installs:
@@ -99,6 +103,29 @@ and expires: if the job fails at the tap checkout, the likely cause is an expire
 The updater private key lives at `~/.config/monoptah/updater.key` and is **not** in this
 repo. Losing it means no further updates can be published to installed apps — they only
 trust that one key, so a replacement key would strand them.
+
+### Releasing the Host
+
+The fork publishes its own remote Host (`host/`), separately from both apps. Its version lives
+in `host/VERSION` as `X.Y.Z+monoptah` (semver build metadata marks the fork flavor); the root
+`package.json` version is not used. `monocode-host --version` prints it and
+`environment.describe` reports `host: {flavor: "monoptah", version: "X.Y.Z"}`.
+
+1. `npm run host:release -- X.Y.Z` (plain `X.Y.Z`): needs a clean tree, writes `host/VERSION`,
+   commits "Release Monoptah Host X.Y.Z" and creates the tag `host-vX.Y.Z`. It never pushes; it
+   prints the push commands for you to review and run.
+2. Pushing the tag starts `.github/workflows/host-release-monoptah.yml`. It checks the tag
+   against `host/VERSION`, refuses when the release already exists, builds every target of
+   `npm run host:package -- --all` (Linux and macOS `.tar.gz`, Windows `.zip`, asset names keep
+   `monocode-host`), and publishes release `host-vX.Y.Z` with `--latest=false` (never "latest":
+   Tauri's updater reads `releases/latest`). It uploads each package with its `.sha256` and
+   `host-release.json` (`{version, assets: {target: sha256}}`, also a workflow artifact with a
+   build-provenance attestation).
+3. Never re-upload a version: the app pins the sha256 of every asset. To redo a failed release,
+   bump the version.
+4. The app pins the Host version, URL base and hashes (H2a, `host_release.rs`, written by
+   `scripts/pin-host-release.mjs` from the run's `host-release.json`). Release the Host before
+   the app that pins it.
 
 ### Releasing the native app
 
