@@ -135,6 +135,11 @@ fn load(path: &Path) -> Option<Snapshot> {
         ..snapshot
     })
 }
+/// Drop the last reading when the account's credential changes, so a new
+/// token or an API key never shows the old token's quota.
+pub(crate) fn forget(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(CACHE));
+}
 fn save(path: &Path, snapshot: &Snapshot) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);

@@ -143,6 +143,50 @@ fn background_refresh_never_probes_and_shows_the_last_reading() {
 }
 
 #[test]
+fn changing_the_credential_forgets_the_previous_reading() {
+    let fx = Fixture::new();
+    let profile = fx.setup_token();
+    let cache = profile
+        .directory(Kind::Claude)
+        .unwrap()
+        .unwrap()
+        .join(CACHE);
+    let (server, requests) = serve(OK);
+    point_at(&server);
+    crate::usage::fetch_with(Kind::Claude, &profile, None, true).unwrap();
+    requests.recv().unwrap();
+    assert!(cache.exists());
+
+    profile
+        .save_claude_token("sk-ant-oat01-replacement")
+        .unwrap();
+    assert!(!cache.exists(), "a new token kept the old reading");
+    let error = crate::usage::fetch_for(Kind::Claude, &profile, None).unwrap_err();
+    assert_eq!(error.message, IDLE);
+
+    let (server, requests) = serve(OK);
+    point_at(&server);
+    crate::usage::fetch_with(Kind::Claude, &profile, None, true).unwrap();
+    requests.recv().unwrap();
+    assert!(cache.exists());
+    profile.remove_claude_token().unwrap();
+    assert!(!cache.exists(), "removing the token kept the reading");
+
+    let (server, requests) = serve(OK);
+    point_at(&server);
+    profile.save_claude_token(TOKEN).unwrap();
+    crate::usage::fetch_with(Kind::Claude, &profile, None, true).unwrap();
+    requests.recv().unwrap();
+    profile
+        .save_claude_credential(
+            crate::accounts::ClaudeCredential::ApiKey,
+            "sk-ant-api03-fixture",
+        )
+        .unwrap();
+    assert!(!cache.exists(), "switching to an API key kept the reading");
+}
+
+#[test]
 fn manual_check_sends_one_minimal_haiku_message_with_the_setup_token() {
     let fx = Fixture::new();
     let profile = fx.setup_token();

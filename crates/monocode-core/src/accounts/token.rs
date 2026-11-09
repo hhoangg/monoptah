@@ -336,7 +336,18 @@ impl Profile {
         if let Some((temporary, _)) = replacement {
             let _ = std::fs::remove_file(temporary);
         }
+        // Only a committed change makes the last reading stale; a failed save
+        // keeps the old credential, so its reading is still right.
+        if result.is_ok() {
+            self.forget_usage_reading();
+        }
         result.map_err(Into::into)
+    }
+    /// Drop the setup-token usage reading, which belongs to the old credential.
+    fn forget_usage_reading(&self) {
+        if let Ok(Some(dir)) = self.directory(Kind::Claude) {
+            crate::usage::claude_probe::forget(&dir);
+        }
     }
     /// Remove only this saved credential, retaining the browser profile. It
     /// never reads or decrypts the row, so a lost key cannot block removal.
@@ -351,10 +362,12 @@ impl Profile {
             "DELETE FROM provider_account_credentials WHERE provider=?1 AND account_id=?2",
             params![PROVIDER, self.id],
         ) {
-            Ok(_) => Ok(()),
-            Err(e) if e.to_string().contains("no such table") => Ok(()),
-            Err(_) => Err(CLEAR_FAILED.into()),
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("no such table") => {}
+            Err(_) => return Err(CLEAR_FAILED.into()),
         }
+        self.forget_usage_reading();
+        Ok(())
     }
     pub(super) fn claude_secret(&self) -> Result<Option<(ClaudeCredential, String)>, String> {
         let Some((name, nonce, ciphertext)) = self.stored()? else {
