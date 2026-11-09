@@ -193,6 +193,14 @@ impl UsageFooter {
             cx.notify();
         }
     }
+    /// The refresh button: the only caller allowed to run the setup-token check.
+    fn refresh_manual(&mut self, cx: &mut Context<Self>) {
+        if let Some(center) = crate::accounts::get(cx) {
+            let key = self.key.clone();
+            center.update(cx, |center, _| center.request_manual(key));
+        }
+        self.refresh(true, cx);
+    }
     fn refresh(&mut self, force: bool, cx: &mut Context<Self>) {
         if let Some(center) = crate::accounts::get(cx) {
             let key = self.key.clone();
@@ -399,10 +407,16 @@ impl UsageFooter {
         let now = usage::now_ms();
         let updated = match &state.snapshot {
             Some(snapshot) if snapshot.updated_at > 0 => {
+                // A setup-token reading is only as fresh as the last click.
+                let verb = if snapshot.manual {
+                    "Checked"
+                } else {
+                    "Updated"
+                };
                 match (now - snapshot.updated_at).max(0) / 60_000 {
-                    0 => "Updated just now".to_owned(),
-                    minutes @ 1..60 => format!("Updated {minutes}m ago"),
-                    minutes => format!("Updated {}h ago", minutes / 60),
+                    0 => format!("{verb} just now"),
+                    minutes @ 1..60 => format!("{verb} {minutes}m ago"),
+                    minutes => format!("{verb} {}h ago", minutes / 60),
                 }
             }
             _ => "Rate-limit details".into(),
@@ -945,8 +959,10 @@ impl Render for UsageFooter {
                     .opacity(if fetching { 0.5 } else { 1. })
                     .when(!fetching, |d| d.hover(|s| s.bg(content(0.1))))
                     .child(icon("refresh", 12.))
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(true, cx)))
-                    .on_action(cx.listener(|this, _: &RefreshUsage, _, cx| this.refresh(true, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_manual(cx)))
+                    .on_action(
+                        cx.listener(|this, _: &RefreshUsage, _, cx| this.refresh_manual(cx)),
+                    ),
             )
             .when(self.open, |d| {
                 d.child(
@@ -1054,5 +1070,15 @@ mod tests {
         assert!(state.snapshot.is_none());
         state.complete(Ok(Snapshot::default()));
         assert!(state.error.is_none());
+    }
+    #[test]
+    fn only_a_clicked_refresh_runs_the_setup_token_check_once() {
+        // Background refreshes (timer, start-up, session switch) never mark it.
+        let mut state = CachedUsage::default();
+        assert!(!state.start());
+        state.manual = true;
+        assert!(state.start());
+        assert!(state.fetching);
+        assert!(!state.start(), "one click allows one check");
     }
 }

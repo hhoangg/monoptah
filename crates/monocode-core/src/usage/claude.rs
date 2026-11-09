@@ -2,9 +2,21 @@ use super::{now_ms, parse_claude, FetchError, Snapshot};
 use serde_json::Value;
 use std::{io::Read, path::PathBuf, time::Duration};
 
-pub(super) fn fetch_for(profile: &crate::accounts::Profile) -> Result<Snapshot, FetchError> {
-    if let Some(kind) = profile.claude_credential().map_err(FetchError::failed)? {
-        return Err(FetchError::failed(credential_message(kind)));
+pub(super) fn fetch_for(
+    profile: &crate::accounts::Profile,
+    manual: bool,
+) -> Result<Snapshot, FetchError> {
+    match profile.claude_credential().map_err(FetchError::failed)? {
+        Some(crate::accounts::ClaudeCredential::SetupToken) => {
+            return super::claude_probe::fetch(profile, manual);
+        }
+        // An API key has no subscription, so there is no quota to show.
+        Some(_) => {
+            return Err(FetchError::failed(
+                "Usage is unavailable for API key accounts: they have no subscription.",
+            ));
+        }
+        None => {}
     }
     let config = profile
         .directory(crate::provider::Kind::Claude)
@@ -53,18 +65,6 @@ pub(super) fn fetch_for(profile: &crate::accounts::Profile) -> Result<Snapshot, 
     let value = serde_json::from_str(&body)
         .map_err(|_| FetchError::failed("Claude usage response was not JSON."))?;
     parse_claude(&value)
-}
-
-/// Anthropic's usage endpoint needs the `user:profile` OAuth scope. A token
-/// from `claude setup-token` carries only `user:inference`, so the endpoint
-/// rejects it whatever the app sends; an API key has no subscription at all.
-fn credential_message(kind: crate::accounts::ClaudeCredential) -> &'static str {
-    match kind {
-        crate::accounts::ClaudeCredential::SetupToken => {
-            "Usage is unavailable for setup tokens: Anthropic gives them inference access only. Sign in with claude auth login to see usage."
-        }
-        crate::accounts::ClaudeCredential::ApiKey => "Usage is unavailable for API key accounts: they have no subscription.",
-    }
 }
 
 /// The access token lasts about 8 hours. While a refresh token is present the
@@ -212,12 +212,6 @@ fn keychain(config: Option<&std::path::Path>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn credential_accounts_explain_why_usage_is_missing() {
-        use crate::accounts::ClaudeCredential;
-        assert!(super::credential_message(ClaudeCredential::SetupToken).contains("setup tokens"));
-        assert!(super::credential_message(ClaudeCredential::ApiKey).contains("API key"));
-    }
     use super::*;
     #[test]
     fn an_expired_access_token_with_a_refresh_token_is_not_a_sign_out() {

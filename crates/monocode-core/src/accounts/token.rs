@@ -379,6 +379,12 @@ impl Profile {
             .map(|secret| Some((kind, secret)))
             .map_err(|_| UNAVAILABLE.into())
     }
+    /// The saved setup token, for the manual usage check. Never an API key.
+    pub(crate) fn claude_setup_token(&self) -> Result<Option<String>, String> {
+        Ok(self
+            .claude_secret()?
+            .and_then(|(kind, secret)| (kind == ClaudeCredential::SetupToken).then_some(secret)))
+    }
     #[cfg(test)]
     fn claude_token(&self) -> Result<Option<String>, String> {
         Ok(self.claude_secret()?.map(|(_, secret)| secret))
