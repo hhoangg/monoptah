@@ -2,11 +2,21 @@ use super::{now_ms, parse_claude, FetchError, Snapshot};
 use serde_json::Value;
 use std::{io::Read, path::PathBuf, time::Duration};
 
-pub(super) fn fetch_for(profile: &crate::accounts::Profile) -> Result<Snapshot, FetchError> {
-    if profile.uses_claude_token().map_err(FetchError::failed)? {
-        return Err(FetchError::failed(
-            "Usage is unavailable for token and API key accounts.",
-        ));
+pub(super) fn fetch_for(
+    profile: &crate::accounts::Profile,
+    manual: bool,
+) -> Result<Snapshot, FetchError> {
+    match profile.claude_credential().map_err(FetchError::failed)? {
+        Some(crate::accounts::ClaudeCredential::SetupToken) => {
+            return super::claude_probe::fetch(profile, manual);
+        }
+        // An API key has no subscription, so there is no quota to show.
+        Some(_) => {
+            return Err(FetchError::failed(
+                "Usage is unavailable for API key accounts: they have no subscription.",
+            ));
+        }
+        None => {}
     }
     let config = profile
         .directory(crate::provider::Kind::Claude)

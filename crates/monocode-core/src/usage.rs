@@ -1,6 +1,7 @@
 //! Subscription usage, ported from rateLimits.ts and src-tauri/rate_limits.rs.
 //! Blocking probes belong on a worker. Credentials are read only, never rotated.
 pub(crate) mod claude;
+pub mod claude_probe;
 mod devin;
 mod opencode;
 mod pi;
@@ -50,6 +51,9 @@ pub struct Snapshot {
     pub extra_usage_balance: Option<f64>,
     #[serde(default)]
     pub identity: Option<crate::accounts::Identity>,
+    /// Read by an explicit user check rather than a background refresh.
+    #[serde(default)]
+    pub manual: bool,
 }
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ResetCredits {
@@ -156,6 +160,16 @@ pub fn fetch_for(
     profile: &crate::accounts::Profile,
     model: Option<&str>,
 ) -> Result<Snapshot, FetchError> {
+    fetch_with(kind, profile, model, false)
+}
+/// `manual` is true only for a refresh the user asked for. It allows the
+/// setup-token quota check, which spends a message; see `claude_probe`.
+pub fn fetch_with(
+    kind: Kind,
+    profile: &crate::accounts::Profile,
+    model: Option<&str>,
+    manual: bool,
+) -> Result<Snapshot, FetchError> {
     if kind == Kind::Devin {
         return fetch_devin();
     }
@@ -172,7 +186,7 @@ pub fn fetch_for(
         )));
     }
     if kind == Kind::Claude {
-        return claude::fetch_for(profile);
+        return claude::fetch_for(profile, manual);
     }
     let value = catalog::codex_request(profile, "account/rateLimits/read", serde_json::json!({}))
         .map_err(|message| {

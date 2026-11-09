@@ -90,8 +90,18 @@ pub(crate) struct Cached {
     pub attempted: Option<Instant>,
     pub generation: u64,
     pub queued: bool,
+    /// The user clicked refresh: the next fetch may spend a message on the
+    /// setup-token quota check. Background refreshes never set it.
+    pub manual: bool,
 }
 impl Cached {
+    /// Begin a fetch. Returns whether it is the user-requested one; the flag
+    /// is consumed, so one click allows exactly one setup-token check.
+    pub(crate) fn start(&mut self) -> bool {
+        self.fetching = true;
+        self.attempted = Some(Instant::now());
+        std::mem::take(&mut self.manual)
+    }
     pub(crate) fn complete(&mut self, result: Result<Snapshot, FetchError>) {
         self.fetching = false;
         match result {
@@ -465,6 +475,11 @@ impl Accounts {
             detail: None,
         }
     }
+    /// Mark the next refresh of `key` as user-requested, which alone may run
+    /// the setup-token check. Call `refresh(key, true, ..)` after it.
+    pub(crate) fn request_manual(&mut self, key: Key) {
+        self.usage.entry(key).or_default().manual = true;
+    }
     pub(crate) fn refresh(&mut self, key: Key, force: bool, cx: &mut Context<Self>) {
         if cfg!(test) {
             return;
@@ -487,12 +502,16 @@ impl Accounts {
         {
             return;
         }
-        state.fetching = true;
-        state.attempted = Some(Instant::now());
+        let manual = state.start();
         let generation = state.generation;
         let request = key.clone();
         let work = cx.background_executor().spawn(async move {
-            usage::fetch_for(request.kind, &request.profile, request.model().as_deref())
+            usage::fetch_with(
+                request.kind,
+                &request.profile,
+                request.model().as_deref(),
+                manual,
+            )
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
